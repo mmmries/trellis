@@ -60,17 +60,18 @@ stage, drain or change state side by side.
    that find the migrations pending at once run them one after the other: the
    second finds nothing left. When `migrate` refuses (the process's role
    can't alter Trellis's tables, the history doesn't fit, the floor), the
-   process stands by, says why, and tries again every standby poll. An
+   process stands by, says why, and tries again a minute later (at the next
+   standby poll when the refusal was a fault, such as a lost connection). An
    explicit `migrate` still works, before or instead of that (`trellis run`
    migrates before it starts its pipeline, a deploy step, a release task): it
    is idempotent, and leaves a background process nothing pending. A
    define-only handle runs no background process, so nothing migrates for it
    but its own `migrate`.
 4. **Standby.** While another version is live, or this binary's migrations are
-   pending and it can't run them, a background process stages nothing, drains nothing, dispatches no
-   builds and runs no `self_check` job. A leader releases the staging-worker
-   lock first. It checks again every standby poll and takes over as soon as
-   nothing holds it back. It waits rather than exiting, so an orchestrator
+   pending and it can't run them, a background process stages nothing, drains
+   nothing, dispatches no builds and runs no `self_check` job. A leader
+   releases the staging-worker lock first. It checks again every standby poll
+   and takes over as soon as nothing holds it back. It waits rather than exiting, so an orchestrator
    doesn't crash-loop it. Its pass runs under a per-instance advisory lock, so
    two processes starting at once decide in turn: the second sees the first,
    and a process that stands by holds no other version back, so two versions

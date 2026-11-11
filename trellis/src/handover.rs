@@ -123,8 +123,9 @@ pub(crate) enum StandBy {
     MigrationsPending,
     /// This binary's migrations are pending, nothing else is live, and the
     /// process's `migrate` refused: it can't run them (its role lacks the
-    /// rights, the history doesn't fit, ...). It tries again every standby
-    /// poll.
+    /// rights, the history doesn't fit, ...). It tries again a minute later
+    /// when the refusal waits on an operator, at the next standby poll
+    /// otherwise.
     CannotMigrate(MigrationsPending),
     /// This binary is below the catalog floor (ADR-0024): it can't read the
     /// catalog, so it waits for the floor to come down, which in practice
@@ -324,8 +325,8 @@ impl fmt::Display for MigrationsPending {
         match &self.cannot_run {
             Some(reason) => write!(
                 f,
-                "; this process can't run them and stands by, trying again every standby \
-                 poll: {reason}"
+                "; this process can't run them and stands by, trying again within a \
+                 minute: {reason}"
             ),
             None => write!(
                 f,

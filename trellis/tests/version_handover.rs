@@ -392,6 +392,9 @@ async fn a_background_process_migrates_itself_once_the_old_version_is_gone() {
         .await
         .expect("pass");
     assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    // The worker stops before the old one does, so its own handover task
+    // can't run the migrations before the pass this test steps.
+    worker.shutdown().await.expect("shutdown");
 
     raw.execute("delete from worker_registry", &[])
         .await
@@ -433,9 +436,12 @@ async fn a_background_process_migrates_itself_once_the_old_version_is_gone() {
         "the process registered as taken over: {rows:?}"
     );
     // Nothing is pending now, so reads work and report nothing pending.
-    assert!(worker.definitions().await.expect("listing").is_empty());
-    assert_eq!(worker.status("anything").await.expect("status"), None);
-    worker.shutdown().await.expect("shutdown");
+    let reader = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    assert!(reader.definitions().await.expect("listing").is_empty());
+    assert_eq!(reader.status("anything").await.expect("status"), None);
+    reader.shutdown().await.expect("shutdown");
 }
 
 /// Rule 1: two background processes of this version that find the
@@ -506,7 +512,9 @@ async fn a_process_that_goes_live_before_the_migration_holds_it_back() {
         let waiting: bool = raw
             .query_one(
                 "select exists (select 1 from pg_locks \
-                 where locktype = 'advisory' and not granted)",
+                 where locktype = 'advisory' and not granted \
+                 and database = (select oid from pg_database \
+                                 where datname = current_database()))",
                 &[],
             )
             .await
@@ -532,6 +540,9 @@ async fn a_process_that_goes_live_before_the_migration_holds_it_back() {
 
     let pass = pass.await.expect("pass task").expect("pass");
     assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    // A version that went live meanwhile is no refusal to back off from: the
+    // next pass checks again.
+    assert_eq!(pass.retry_in, None, "{pass:?}");
     assert!(
         !v9_ran(&raw).await,
         "nothing migrated beside the old worker"
@@ -589,6 +600,13 @@ async fn a_role_that_cannot_migrate_stands_by_and_says_so() {
         .await
         .expect("a refused migrate is a standby, not an error");
     assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    // It waits on an operator, so the process tries again after a minute,
+    // not every standby poll.
+    assert!(
+        pass.retry_in
+            .is_some_and(|wait| wait > std::time::Duration::from_secs(30)),
+        "{pass:?}"
+    );
     let log = pass.log.expect("the standby is logged");
     assert!(log.contains("this role cannot run them"), "{log}");
     assert!(log.contains("V9__worker_versions"), "{log}");
@@ -640,6 +658,7 @@ async fn a_changed_migration_stands_the_process_by() {
     assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
     let log = pass.log.expect("the standby is logged");
     assert!(log.contains("migrate refused"), "{log}");
+    assert!(pass.retry_in.is_some(), "a changed migration backs off");
     assert!(!v9_ran(&raw).await);
 
     raw.execute(

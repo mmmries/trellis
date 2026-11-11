@@ -782,6 +782,7 @@ async fn run(
         staging_pid: Arc::new(AtomicI32::new(0)),
         migrate: Some(config.clone()),
         cannot_migrate: cannot_migrate.clone(),
+        migrate_backoff: MigrateBackoff::default(),
     };
 
     // ADR-0023 (version handover), and ADR-0010 decision 3: every background
@@ -2778,6 +2779,52 @@ struct BackgroundProcess {
     /// what [`crate::DefinitionStatus::migrations_pending`] reports as
     /// `cannot_run`.
     cannot_migrate: CannotMigrate,
+    /// When its `migrate` may run again after a refusal that waits on an
+    /// operator ([`migrate_retry_after`]), with the standby it reported:
+    /// until then each pass reports that standby without trying.
+    migrate_backoff: MigrateBackoff,
+}
+
+/// A refused `migrate`'s back-off: when the next try is due, and the standby
+/// the refusal reported (ADR-0023, rule 3).
+type MigrateBackoff = Arc<std::sync::Mutex<Option<(Instant, handover::MigrationsPending)>>>;
+
+/// How long after a refused `migrate` a background process tries again: a
+/// minute for a refusal that waits on an operator (the role lacks the
+/// rights, the history doesn't fit, the floor, the instance, a queued
+/// restore), so a standby doesn't open a connection and leave an error in the
+/// server's log every standby poll; `None`, the next standby poll, for
+/// anything else (a connection that failed, a lock that timed out).
+fn migrate_retry_after(err: &crate::error::Error) -> Option<Duration> {
+    use crate::error::Error;
+    let waits_on_an_operator = matches!(
+        err,
+        Error::Config(_)
+            | Error::IncompatibleInstance(_)
+            | Error::BelowCatalogFloor { .. }
+            | Error::MigrationHistory(_)
+            | Error::RestoreDefinition { .. }
+    ) || permission_denied(err);
+    waits_on_an_operator.then_some(MIGRATE_REFUSED_RETRY)
+}
+
+/// How long a background process waits to try `migrate` again after a
+/// refusal that waits on an operator ([`migrate_retry_after`]).
+const MIGRATE_REFUSED_RETRY: Duration = Duration::from_secs(60);
+
+/// Whether `err`'s chain carries Postgres's permission refusal (SQLSTATE
+/// 42501): the role can't do what `migrate` does.
+fn permission_denied(err: &crate::error::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(db) = current.downcast_ref::<tokio_postgres::Error>()
+            && db.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Why a background process's last `migrate` refused, shared with the
@@ -2823,6 +2870,7 @@ impl BackgroundProcess {
             staging_pid: Arc::new(AtomicI32::new(0)),
             migrate: None,
             cannot_migrate: CannotMigrate::default(),
+            migrate_backoff: MigrateBackoff::default(),
         };
         process.register_for_test().await;
         process
@@ -2889,15 +2937,22 @@ struct PassOutcome {
 /// the attach lock, and decides again under it, so it never runs beside a
 /// process that went live since the first decision, and two processes that
 /// try at once migrate one after the other (the second finds nothing
-/// pending). A refusal stands the process by with the reason, and the next
-/// pass tries again.
+/// pending). A refusal stands the process by with the reason; a pass tries
+/// again a minute later when the refusal waits on an operator
+/// ([`migrate_retry_after`]), and the next pass otherwise.
 async fn handover_pass(
     process: &BackgroundProcess,
     drain: bool,
 ) -> Result<PassOutcome, StagingError> {
     let verdict = decide_pass(process, drain).await?;
+    let backoff = process
+        .migrate_backoff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     let config = match (&verdict, &process.migrate) {
         (Verdict::StandBy(handover::StandBy::MigrationsPending), Some(config)) => config,
+        // Anything else ends a back-off: the next refusal starts its own.
         _ => {
             return Ok(PassOutcome {
                 verdict,
@@ -2905,6 +2960,21 @@ async fn handover_pass(
             });
         }
     };
+    // A refusal that waits on an operator is tried again once a minute, and
+    // reported as it was meanwhile.
+    if let Some((due, pending)) = backoff
+        && Instant::now() < due
+    {
+        let verdict = Verdict::StandBy(handover::StandBy::CannotMigrate(pending.clone()));
+        *process
+            .migrate_backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((due, pending));
+        return Ok(PassOutcome {
+            verdict,
+            migrated: Vec::new(),
+        });
+    }
     match crate::migrate::migrate_reporting(&process.pool, config).await {
         Ok(migrated) => {
             *process
@@ -2934,14 +3004,20 @@ async fn handover_pass(
                     .unwrap_or_default(),
                 Err(_) => Vec::new(),
             };
+            let pending = handover::MigrationsPending {
+                this_version: process.version.clone(),
+                migrations,
+                cannot_run: Some(reason),
+            };
+            if let Some(after) = migrate_retry_after(&err) {
+                *process
+                    .migrate_backoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((Instant::now() + after, pending.clone()));
+            }
             Ok(PassOutcome {
-                verdict: Verdict::StandBy(handover::StandBy::CannotMigrate(
-                    handover::MigrationsPending {
-                        this_version: process.version.clone(),
-                        migrations,
-                        cannot_run: Some(reason),
-                    },
-                )),
+                verdict: Verdict::StandBy(handover::StandBy::CannotMigrate(pending)),
                 migrated: Vec::new(),
             })
         }
@@ -2952,18 +3028,7 @@ async fn handover_pass(
 /// that can read and write Trellis's tables but not create or alter them gets
 /// a refusal of its own: another role has to run the migrations.
 fn cannot_migrate_reason(err: &crate::error::Error) -> String {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    let mut denied = false;
-    while let Some(current) = source {
-        if let Some(db) = current.downcast_ref::<tokio_postgres::Error>()
-            && db.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
-        {
-            denied = true;
-            break;
-        }
-        source = current.source();
-    }
-    if denied {
+    if permission_denied(err) {
         format!(
             "migrations pending and this role cannot run them: run `migrate` with a role that \
              can (`trellis run`, a deploy step) ({err})"
@@ -3064,6 +3129,7 @@ pub async fn handover_pass_as(
         staging_pid: Arc::new(AtomicI32::new(0)),
         migrate: Some(config.clone()),
         cannot_migrate: CannotMigrate::default(),
+        migrate_backoff: MigrateBackoff::default(),
     };
     handover_pass(&process, true)
         .await
@@ -3073,10 +3139,17 @@ pub async fn handover_pass_as(
                 failing: false,
             }
             .message(&outcome);
+            let retry_in = process
+                .migrate_backoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|(due, _)| due.saturating_duration_since(Instant::now()));
             HandoverPass {
                 took_over: outcome.verdict == Verdict::TakeOver,
                 migrated: outcome.migrated,
                 log,
+                retry_in,
             }
         })
         .map_err(|err| err.to_string())
@@ -3093,6 +3166,10 @@ pub struct HandoverPass {
     /// What its handover log says about the pass, for a process whose
     /// previous pass stood by: `None` when it says nothing.
     pub log: Option<String>,
+    /// How long the process would wait before it tries `migrate` again, when
+    /// the pass's refusal waits on an operator: `None` when its next pass
+    /// tries again.
+    pub retry_in: Option<Duration>,
 }
 
 /// What a background process last decided, so the log says when it starts
@@ -3581,6 +3658,46 @@ async fn open_wake_session<Sink: WakeSink + Send + 'static>(
         let _client = client;
         let _ = driver.await;
     })
+}
+
+#[cfg(test)]
+mod migrate_retry_tests {
+    use super::*;
+
+    /// A refused `migrate` that waits on an operator (the history, the
+    /// floor, the instance, a queued restore) is tried again after a minute;
+    /// anything else (a pool that timed out, a lost connection) at the next
+    /// standby poll. A permission refusal backs off too: the
+    /// `version_handover` tests drive it against a real role.
+    #[test]
+    fn a_refusal_that_waits_on_an_operator_backs_off_and_a_fault_does_not() {
+        use crate::error::Error;
+        for err in [
+            Error::MigrationHistory("a changed migration".to_string()),
+            Error::BelowCatalogFloor {
+                floor: "9.9.9".to_string(),
+                this_version: "0.2.0".to_string(),
+            },
+            Error::IncompatibleInstance("another instance".to_string()),
+            Error::Config("bad schema".to_string()),
+            Error::RestoreDefinition {
+                target: "public.t".to_string(),
+                code: crate::ErrorCode::Validation,
+                message: "refused".to_string(),
+            },
+        ] {
+            assert_eq!(
+                migrate_retry_after(&err),
+                Some(MIGRATE_REFUSED_RETRY),
+                "{err}"
+            );
+        }
+        let timeout = Error::Pool(deadpool_postgres::PoolError::Timeout(
+            deadpool_postgres::TimeoutType::Wait,
+        ));
+        assert_eq!(migrate_retry_after(&timeout), None);
+        assert!(MIGRATE_REFUSED_RETRY > STANDBY_POLL);
+    }
 }
 
 #[cfg(test)]

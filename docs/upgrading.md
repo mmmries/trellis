@@ -39,7 +39,7 @@ code when it would have to pause a definition. Keep the step when your
 workers' database role can read and write Trellis's tables but not alter them:
 their `migrate` is refused, and they stand by until a role that can runs it.
 A process that can't migrate logs why, `status()` carries it in
-`migrations_pending.cannot_run`, and the process tries again every 5 seconds.
+`migrations_pending.cannot_run`, and the process tries again every minute.
 
 A state-changing call an old-release process is in the middle of when the new
 release takes over, or when `migrate` raises the [catalog

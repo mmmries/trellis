@@ -1104,7 +1104,9 @@ impl Trellis {
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
         self.call(async {
-            let pending = self.migrations_pending_now().await?;
+            // A role that can't read the migration history still reads the
+            // status, as it did before `migrations_pending` existed.
+            let pending = self.migrations_pending_now().await.ok().flatten();
             match (self.read_status(target_table).await, pending) {
                 (Ok(status), pending) => Ok(status.map(|mut status| {
                     status.migrations_pending = pending;
