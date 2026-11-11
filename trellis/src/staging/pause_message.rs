@@ -1385,6 +1385,74 @@ mod tests {
         );
     }
 
+    /// A restore's, an unbacked `KEY`'s and a missing probe index's
+    /// sentences, with the statement each names quoted and the partitioned
+    /// table's re-attach advice.
+    #[test]
+    fn a_restore_an_unbacked_key_and_a_probe_index_name_their_remedy() {
+        assert_eq!(
+            PauseReason::Restore {
+                table: "public.s".to_string()
+            }
+            .to_string(),
+            "the database was restored from a logical dump, so the ordering state Trellis kept \
+             for this definition belongs to the original database; resume the definition to \
+             reset it and rebuild the target from the restored source, or drop the definition"
+        );
+        assert_eq!(
+            PauseReason::UnbackedKey {
+                table: "public.Order Lines".to_string(),
+                key: vec!["id".to_string(), "Kind".to_string()],
+                partitioned: false,
+                nullable: true,
+            }
+            .to_string(),
+            "no valid unique index backs KEY (id, Kind) on public.Order Lines any more, so \
+             public.Order Lines can take two rows with one key, which this definition's rows \
+             are keyed by. Create one with `create unique index concurrently on \
+             \"public\".\"Order Lines\" (\"id\", \"Kind\") nulls not distinct`, then resume the \
+             definition to rebuild it. To replace the index backing a KEY, build the replacement \
+             before dropping the old index"
+        );
+        let reattach = ". On a partitioned table, the root's index stays invalid after a \
+                        leaf's index is repaired: re-run ALTER INDEX ... ATTACH PARTITION for the \
+                        repaired leaf's index";
+        assert_eq!(
+            PauseReason::UnbackedKey {
+                table: "noschema".to_string(),
+                key: vec!["id".to_string()],
+                partitioned: true,
+                nullable: false,
+            }
+            .to_string(),
+            format!(
+                "no valid unique index backs KEY (id) on noschema any more, so noschema can take \
+                 two rows with one key, which this definition's rows are keyed by. Create one \
+                 with `create unique index on \"noschema\" (\"id\")`, then resume the \
+                 definition to rebuild it. To replace the index backing a KEY, build the \
+                 replacement before dropping the old index{reattach}"
+            )
+        );
+        assert_eq!(
+            PauseReason::MissingProbeIndex {
+                index: crate::defs::source_index::SourceIndex {
+                    table: "public.s".to_string(),
+                    columns: vec!["g".to_string(), "v".to_string()],
+                    role: crate::defs::source_index::IndexRole::GroupBy,
+                },
+                partitioned: true,
+            }
+            .to_string(),
+            format!(
+                "no valid index on public.s has led with (g, v) in that order for 5 minutes, \
+                 which this definition's MIN/MAX(v) re-reads a group's extreme through: without \
+                 one each re-read scans the group. Create one with `create index on \
+                 \"public\".\"s\" (\"g\", \"v\")`, then resume the definition to rebuild it. To \
+                 replace the index, build the replacement before dropping the old one{reattach}"
+            )
+        );
+    }
+
     /// A relabel's reason names each relabel, then the remedy.
     #[test]
     fn a_relabel_reason_names_each_relabel_then_the_remedy() {
