@@ -182,9 +182,14 @@ new ones, never an empty or partial target.
 
 ### Re-reading a table for its applying readers
 
-When the staging worker reinstalls a table's triggers while definitions
-already apply from it (a restored database's triggers came back disabled,
-say), those definitions have missed whatever committed meanwhile. An explicit
+When the staging worker installs capture on a leaf new to a captured
+partitioned source, the definitions already applying from the source have
+missed the rows the leaf already held. An aggregate or a `JOIN` that the
+partition correction engine serves is corrected for that leaf alone
+([ADR-0017](decisions/0017-partitioned-sources.md)); any other reader is
+re-read. Capture triggers disabled, dropped or recreated outside Trellis, and
+a database restored from a logical dump, pause the readers rather than re-read them
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)). An explicit
 `Trellis::request_backfill` on a captured table asks for the same re-read. It
 takes the table's `schema.table` name, or a bare name when exactly one captured
 table carries it; a bare name two captured tables share is refused, naming both.
