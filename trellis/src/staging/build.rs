@@ -1,30 +1,30 @@
 //! The scheduled build (ADR-0002 "A build is Re-derive over
 //! chunks, and applies from its first chunk"): a 1-1 target's build chunk
-//! ([`one_to_one::run_chunk`]) and its scheduling (F2). It builds the shapes
+//! ([`one_to_one::run_chunk`]) and its scheduling. It builds the shapes
 //! it serves (see "Shapes"), a fresh definition's and a resumed one's alike:
 //! a 1-1 target by chunks, and an aggregate or a `JOIN` by its plan job's one
 //! absolute write.
 //!
-//! # The scheduled build (F2, F3)
+//! # The scheduled build
 //!
 //! - **Start** ([`start_ready_builds`]). The staging worker's reconcile pass
 //!   starts each ready definition: once its source's capture gate is clear, one
 //!   transaction moves it `waiting_to_backfill -> backfilling` with
 //!   `transform_definitions.build = 'rederive'` and enqueues its plan job.
-//!   From that commit it applies (`defs::model::APPLYING_SQL`, B1): Apply
+//!   From that commit it applies (`defs::model::APPLYING_SQL`): Apply
 //!   folds its source's changes into its target, so nothing needs
 //!   a catch-up afterwards. The start also records `build_seg`, the segment active at
 //!   its commit, and a page re-derives rather than applies the keys of any
 //!   batch at or below it (see `start`). A resume leaves the rebuild to
 //!   this start (`super::quarantine::resume_transform`).
-//! - **Rebuild** (F3). A resumed 1-1 definition keeps its ledger, so its
+//! - **Rebuild**. A resumed 1-1 definition keeps its ledger, so its
 //!   build is a Re-derive over its existing entries, with no truncate. Its
 //!   start also enqueues a **sweep** job ([`run_sweep`]): once the plan job
 //!   and every chunk are done, it walks the ledger and re-derives each live
 //!   entry the chunks didn't (its `basis` is null or older than the start),
 //!   which is a key deleted while the definition was frozen. A fresh build's
 //!   ledger is empty at its start, so it gets no sweep.
-//! - **Rebuild of an applying definition** (F7). `Trellis::request_backfill`
+//! - **Rebuild of an applying definition**. `Trellis::request_backfill`
 //!   and a capture re-install repair a table's `live` readers by rebuilding
 //!   them ([`start_rebuilds`]): the call's own
 //!   transaction moves each `live -> backfilling` and enqueues one plan job
@@ -54,15 +54,15 @@
 //! - **Plan** ([`run_plan`]). For an aggregate or a `JOIN` the plan job is
 //!   the whole build ([`run_group_rebuild_held`]). Otherwise a drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
-//!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
+//!   rows, [`PLAN_BATCH`] per transaction. The walk and every chunk
 //!   compare the key under the collations the walk started under, which the
 //!   rows record (`backfill_chunks.key_collations`), so re-collating
 //!   the key mid-build doesn't reorder it under the ranges.
-//! - **Work order** ([`work_once`], B6). A drain worker takes segments first,
+//! - **Work order** ([`work_once`]). A drain worker takes segments first,
 //!   then a plan job, then one chunk, and a chunk only under the ring's backlog bound ([`chunk_allowed`]). A chunk's
 //!   entry lock gives up after [`CHUNK_LOCK_TIMEOUT`], and the chunk is
 //!   retried after a short backoff without a charge.
-//! - **Live** ([`try_complete`], B7). The flip is strict: the plan job is
+//! - **Live** ([`try_complete`]). The flip is strict: the plan job is
 //!   done and every chunk is done, checked under the definition's row lock. The same transaction
 //!   deletes the definition's done `backfill_chunks` rows, so the table holds
 //!   one build's rows at a time, not every build's.
@@ -79,7 +79,7 @@
 //! A chunk that fails on its data splits until the key fails alone, and the
 //! key is quarantined.
 //!
-//! # Seam-fed sources (F6)
+//! # Seam-fed sources
 //!
 //! A source that is another definition's target (or a `JOIN`'s joined table
 //! that is one) is never captured: its writes reach Apply through the
@@ -109,13 +109,13 @@
 //! an upstream go through the seam as any writer's do, so a rebuild of a 1-1
 //! upstream needs no rebuild of its readers.
 //!
-//! **Plain 1-1 targets (F8a, [`one_to_one`]).** A 1-1 target takes the same
+//! **Plain 1-1 targets ([`one_to_one`]).** A 1-1 target takes the same
 //! scheduled build:
 //! the start, the plan job, the sweep on a rebuild and the strict flip. Its
 //! chunk writes the target rows themselves, ordered against pages by the
 //! keys' entries on the 1-1 slim ledger.
 //!
-//! **Field builds (F8b).** `ALTER TRANSFORM ... ADD`/`ALTER` and a column
+//! **Field builds.** `ALTER TRANSFORM ... ADD`/`ALTER` and a column
 //! resume rebuild only the fields they change, in the background
 //! ([`start_field_build`]). The fields they change take in every field that
 //! reads one of them by alias, directly or through others
@@ -129,7 +129,7 @@
 //! 'rederive'`, or leaves it `backfilling` when a build is already running,
 //! and enqueues a plan job whose `backfill_chunks.fields` names the fields.
 //! The field applies from that commit, as a whole build's definition does
-//! (B1): no `column_status` row holds it out of Apply, so every page after
+//! (`defs::model::APPLYING_SQL`): no `column_status` row holds it out of Apply, so every page after
 //! the commit writes it from its change's image, and nothing needs a
 //! catch-up. The plan job enqueues chunks with the same scope, and the same
 //! strict flip moves the definition `live` once they are all done, so the
@@ -170,7 +170,8 @@ pub(crate) use join_one_to_one::{plan_step, sweep_step};
 pub mod one_to_one;
 mod orphans;
 
-/// How long a plan job waits before it looks at its fence again (F6).
+/// How long a plan job waits before it looks at its fence again (see the
+/// module doc's "Seam-fed sources").
 const FENCE_RETRY: Duration = Duration::from_millis(500);
 
 /// What one 1-1 sweep batch did ([`one_to_one::sweep_batch`]).
@@ -587,7 +588,7 @@ pub(crate) async fn resume_released_dependents(
 /// is read after it folds the source's changes into the ledger, and a
 /// change committed before it is visible to every chunk's snapshot.
 ///
-/// A definition whose ledger isn't empty (a resumed one, F3) also gets a
+/// A definition whose ledger isn't empty (a resumed one) also gets a
 /// sweep job ([`run_sweep`]); a 1-1 `JOIN` gets one whenever its target
 /// isn't empty, since its resume recreates `R` and `M` empty and keeps the
 /// target (`join_one_to_one`). Both rows carry the start's transaction id,
@@ -798,7 +799,7 @@ pub(crate) async fn rebuildable(
 /// stale entries of `R` and the target rows no `R` entry backs
 /// (`join_one_to_one`).
 ///
-/// The definition applies throughout (B1), as it did before the call. The
+/// The definition applies throughout, as it did before the call. The
 /// caller holds each definition's row `for update`, and calls
 /// [`stamp_rebuild_seg`] as the last statement before it commits.
 ///
@@ -1738,7 +1739,7 @@ const NULL_KEYS_CURSOR: &str = "trellis_null_keys_cursor";
 const NULL_KEYS_PAGE: i64 = 10_000;
 
 /// Stages an image-less `Recompute` for every key of `source_table` with a
-/// `NULL` part, for a 1-1 target's build (F6), or the `a` of a 1-1 `JOIN`'s.
+/// `NULL` part, for a 1-1 target's build, or the `a` of a 1-1 `JOIN`'s.
 /// Only a source keyed by a nullable unique index has such keys: another
 /// aggregate's or `JOIN`'s target, whose `GROUP BY` columns may be `NULL`. A
 /// 1-1 target over such a source is keyed `unique nulls not distinct` so it
@@ -1819,8 +1820,8 @@ enum FenceState {
 }
 
 /// Takes the fence of the claimed plan job `chunk` if it has none, and
-/// reports whether the oldest running transaction began after it (F6, see
-/// the module doc's "Seam-fed sources").
+/// reports whether the oldest running transaction began after it (see the
+/// module doc's "Seam-fed sources").
 ///
 /// The fence is a statement's own transaction id, assigned here in a
 /// transaction of its own, begun after the start commit: every seam writer
@@ -1913,7 +1914,7 @@ async fn run_plan(
         }
     }
     // A seam-fed source's build waits for its fence before the walk, so
-    // before any chunk (F6). A `JOIN` waits for it when either side is
+    // before any chunk. A `JOIN` waits for it when either side is
     // another definition's target, before its one transaction: a writer of
     // that target that resolved its feed before the `JOIN` applied staged
     // nothing for it, and the build's `GROUP BY` must see its row.
@@ -2126,7 +2127,7 @@ async fn run_plan(
         )
         .await?;
         if finished {
-            // The keys no range reaches (F6), in the transaction that ends
+            // The keys no range reaches, in the transaction that ends
             // the plan, so a plan that is done has staged them. A 1-1
             // target's field build stages them too: their rows hold the
             // resumed fields as well. A 1-1 `JOIN` stages those of `a`, as a

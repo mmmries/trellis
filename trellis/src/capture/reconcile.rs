@@ -19,9 +19,11 @@
 //! A partitioned root is not "in a hierarchy": the pass fingerprints its
 //! tree, pauses the readers it stopped complying for, and records the tree
 //! and the corrections for its partition maintenance once capture covers
-//! every node ([`super::partitions`], ADR-0017 P3). Then it sweeps the source
+//! every node ([`super::partitions`]; ADR-0017, "The reconcile pass detects
+//! tree changes by two persisted fingerprints"). Then it sweeps the source
 //! for groups that route to no current leaf and queues their correction
-//! ([`super::complement`], P7).
+//! ([`super::complement`]; ADR-0017, "Every pass sweeps rows that route to no
+//! current leaf, by the bounds' complement").
 //!
 //! Before it regenerates a table's functions, the pass pauses every
 //! definition that reads a column the table no longer has
@@ -103,7 +105,7 @@
 //!    its install or widen recorded ([`super::gate`]) that a pending change
 //!    still holds.
 //!
-//! Rule 3 closes C3's documented gap, "the gate only holds definitions
+//! Rule 3 closes the installer's documented gap, "the gate only holds definitions
 //! sourced from the gated table". A `JOIN` sourced from `U` that reads a
 //! new column of its joined table `T` waits on `T`'s own gate, which holds
 //! until every change to `T` staged before the widen has drained
@@ -252,7 +254,8 @@ pub(crate) async fn reconcile_with_floors(
         // after define, or was recreated as one, can't be captured: its
         // readers pause, and its capture is left as it is.
         //
-        // ADR-0017 P3: a partitioned root that is no partition and in no
+        // ADR-0017, "The reconcile pass detects tree changes by two persisted
+        // fingerprints": a partitioned root that is no partition and in no
         // inheritance hierarchy is not "in a hierarchy". The pass fingerprints
         // its tree instead, pauses the readers it stopped complying for, and
         // records what it found once capture covers every node.
@@ -477,7 +480,8 @@ pub(crate) async fn reconcile_with_floors(
                             continue;
                         }
                     }
-                    // ADR-0017 P7: groups that route to no current leaf, which
+                    // ADR-0017, "Every pass sweeps rows that route to no current
+                    // leaf": groups that route to no current leaf, which
                     // a leaf created and dropped between two passes leaves.
                     match super::complement::sweep(client, schema, &snapshot.catalog, table).await {
                         Ok(sweep) => {

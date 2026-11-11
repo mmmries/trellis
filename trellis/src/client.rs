@@ -2069,8 +2069,9 @@ async fn reconcile_source_tables(
     release_retyped_keys(pool).await;
     release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
-    // ADR-0017 P4a: the corrections the pass above queued get their rows in
-    // the same pass, so a definition reads `backfilling` from the pass that
+    // ADR-0017, "Each changed node is corrected in the pass that sees it,
+    // with no full rescan": the corrections the pass above queued get their
+    // rows in the same pass, so a definition reads `backfilling` from the pass that
     // detects the partition operation. A failure here is logged and the
     // step runs again next pass: the queue is durable, and the rest of the
     // pass doesn't depend on it.
