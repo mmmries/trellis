@@ -1080,6 +1080,14 @@ impl Partial {
         }
     }
 
+    /// `a × n`, for the integer `n`.
+    pub(crate) fn times(self, a: &str, n: &str) -> String {
+        match self {
+            Partial::Sum(part, _) => part.times(a, n),
+            _ => format!("{a} * {n}"),
+        }
+    }
+
     /// `a - b`.
     pub(crate) fn sub(self, a: &str, b: &str) -> String {
         match self {
