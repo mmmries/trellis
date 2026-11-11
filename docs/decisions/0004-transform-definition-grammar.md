@@ -36,9 +36,10 @@ context:
 
 * **Key-space** — the granularity definition, which decides the target's
   primary key: a `GROUP BY` list for aggregates, a join clause plus a
-  `GROUP BY` list for JOIN transforms, a join clause alone for a 1-1 JOIN,
-  nothing for 1-1, and a `KEY (…)` after a source table that has no primary
-  key ([ADR-0026](0026-source-keys.md)). Tiny and closed.
+  `GROUP BY` list for JOIN transforms, nothing for 1-1, and a join clause
+  alone for a 1-1 JOIN, whose target takes its `FROM` table's key as a 1-1's
+  does. A `KEY (…)` after a source table keys it by those columns instead of
+  its primary key ([ADR-0026](0026-source-keys.md)). Tiny and closed.
   Enforces that aggregate columns are wrapped in an aggregate function and
   that each of a JOIN transform's source columns is qualified by its side.
 * **Calculated-field expressions** — the scalar-expression language, reused for

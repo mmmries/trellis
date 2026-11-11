@@ -413,8 +413,11 @@ aggregate targets: it stages each change's cells before any lock, then takes
 the pair's lock row, the join keys `J`, the partial cells `P` and `M` and the
 visible groups `T`, each in one sorted statement, and moves each cell by the
 changes its basis hasn't counted, as a group does. A 1-1 `JOIN` target
-(`staging::join_one_to_one`, ADR-0021) applies last: the pair's lock row, the
-join keys, then the entries of the `FROM` side and of the joined side, each
+(`staging::join_one_to_one`, ADR-0021) applies last. Before any 1-1 `JOIN`
+lock row, the page takes, in id order, the definition row of each one that
+may hold a `FROM` row in quarantine or whose joined table it truncates, as a
+rebuild's start does. Then, per target: the pair's lock row, the join keys,
+then the entries of the `FROM` side and of the joined side, each
 on the 1-1 ledger's ordering state and each in one sorted statement; then it
 rewrites the target row of each changed `FROM` row, and of the other rows on a
 joined key the page changed.
@@ -511,7 +514,8 @@ one consistent order: its 1-1 targets, then its aggregate targets, then its
 `JOIN` targets, then its 1-1 `JOIN` targets, each in target order, and per
 target **its entries, then its rows, each in one sorted
 statement** (a `JOIN` target takes its pair's lock row first, then its
-structures in [the order above](#join-targets)). The entry lock is ordered by key
+structures, and the 1-1 `JOIN` targets' definition rows come before any of
+their lock rows, in [the order above](#join-targets)). The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
 [the group basis](#aggregate-groups-the-group-basis)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its

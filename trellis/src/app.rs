@@ -149,7 +149,7 @@ pub struct TrellisOptions {
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none. Each is a task on the background client's
     /// runtime, not an OS thread. With `n` of them the background pool holds
-    /// up to `2n + 5` connections (`2n + 4` without `staging`), each thread
+    /// up to `2n + 6` connections (`2n + 5` without `staging`), each thread
     /// holding at most two at once; they share one `LISTEN` connection and one
     /// claim keep-alive, and a paged drain opens a session of its own.
     /// `docs/embedding.md`, "What a handle uses", adds up a handle's

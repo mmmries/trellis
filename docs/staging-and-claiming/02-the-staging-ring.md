@@ -105,7 +105,7 @@ server-side; every other producer calls `staging::append::append`:
 | Producer | What it appends | Carries images? |
 |---|---|---|
 | Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image`, and `transition_images` where a re-read's images aren't the statement's own ([01](01-capture-by-triggers.md#every-transition-row-counts-once)) |
-| Downstream propagation (a page's target writes, through the target-mutation seam, `staging::target_mutations`) | a bare recompute trigger, or the change itself for a target on the seam's image feed | **no**, except on the image feed ([04](04-claiming-and-the-fold.md)) |
+| Downstream propagation (every target write, a page's, a build's or a release's, through the target-mutation seam, `staging::target_mutations`) | a bare recompute trigger, or the change itself for a target on the seam's image feed | **no**, except on the image feed ([04](04-claiming-and-the-fold.md)) |
 | A 1-1 build's keys with a `NULL` part, which no chunk reaches (`staging::build`) | a bare recompute trigger | **no** |
 | Releasing a quarantined key (`staging::quarantine::release_key`) | a bare recompute trigger carrying the parked rows' prior-image hint | **no** |
 
