@@ -7,7 +7,8 @@
 //! to completion before the next, [`POLL`] apart, and the deadline is checked
 //! only after a probe that came back unsatisfied, so a slow probe on a
 //! loaded box costs time, never a spurious failure before the condition
-//! was checked once.
+//! was checked once. A probe that never returns is not cut off: one that
+//! can hang (a query queued behind a lock, say) bounds itself.
 
 use std::fmt::{Debug, Display};
 use std::time::{Duration, Instant};

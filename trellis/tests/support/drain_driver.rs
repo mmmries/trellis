@@ -488,15 +488,10 @@ impl Driver {
             .expect("collect tombstones")
     }
 
-    /// `sql`'s rows, each rendered as a row literal, `(1,25,2)`.
+    /// [`pipeline::rows`]: `sql`'s rows, each rendered as a row literal,
+    /// `(1,25,2)`.
     pub async fn rows(&self, sql: &str) -> Vec<String> {
-        self.ctl
-            .query(&format!("select r::text from ({sql}) r"), &[])
-            .await
-            .unwrap_or_else(|e| panic!("{sql}: {e}"))
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect()
+        pipeline::rows(&self.ctl, sql).await
     }
 
     /// Every `deadlock detected` error the server has logged so far, each
