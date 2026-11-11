@@ -710,23 +710,26 @@ pub(crate) async fn admit_key_types(
 ) -> Result<Vec<super::join_key_types::JoinKey>, DdlError> {
     let mut admitted_by = Vec::with_capacity(columns.len());
     for column in columns {
-        // A live enum type joins the static allowlist above via
-        // the same dynamic `to_regtype`-based check a `JOIN` key's gets — see
-        // `join_key_types::is_enum_type_name`'s own doc comment for why admitting
-        // it is safe.
+        // A live enum type joins the static allowlist above, as a `JOIN`
+        // key's does — see `join_key_types::JoinKey::Enum`'s own doc comment
+        // for why admitting it is safe.
         if let Some(entry) =
             super::join_key_types::admit_primary_key_type(client, &column.data_type).await?
         {
             admitted_by.push(entry);
         } else {
-            // The message names the type as the source declares it, with its
-            // modifier; a copy of it has none.
+            // The message names a `pg_catalog` type as the source declares
+            // it, with its modifier (a copy of it has none), and any other
+            // type by the copy's qualified name: a domain named `"integer"`
+            // is not `integer`, and `format_type` can render it bare.
             let declared: Option<String> = client
                 .query_opt(
                     "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
                      from pg_catalog.pg_attribute a \
+                     join pg_catalog.pg_type t on t.oid = a.atttypid \
                      where a.attrelid = pg_catalog.to_regclass($1) and a.attname = $2 \
-                       and a.attnum > 0 and not a.attisdropped",
+                       and a.attnum > 0 and not a.attisdropped \
+                       and t.typnamespace = 'pg_catalog'::pg_catalog.regnamespace",
                     &[&regclass_arg(source_table), &column.name],
                 )
                 .await?

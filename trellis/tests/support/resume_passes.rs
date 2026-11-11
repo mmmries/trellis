@@ -4,92 +4,18 @@
 
 #![allow(dead_code)]
 
-use std::time::{Duration, Instant};
-
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
+use trellis::Trellis;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
 
-pub const SCHEMA: &str = "trellis";
+#[path = "pipeline.rs"]
+mod pipeline;
 
-pub async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
+#[allow(unused_imports)]
+pub use pipeline::{capture_pass, connect, definer, reconcile_pass, settle};
 
-pub async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-pub async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only.
-pub async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-pub async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "resume_key_change_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "resume_key_change_test",
-            1,
-            "resume_key_change_wake",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-pub async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    const CLAIMED_BY: &str = "resume_key_change_backfill";
-    trellis::staging::build::settle_builds(pool).await;
-}
+pub const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
 pub async fn status(trellis: &Trellis, target: &str) -> trellis::DefinitionStatus {
     trellis
@@ -108,9 +34,9 @@ pub async fn bring_live(
     targets: &[&str],
 ) {
     for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
+        reconcile_pass(raw, pool).await;
+        trellis::staging::build::settle_builds(pool).await;
+        settle(pool, raw).await;
         let mut all = true;
         for target in targets {
             let reported = status(trellis, target).await;

@@ -209,6 +209,73 @@ pub async fn watch_blocked(observer: &Client, pid: i32, during: Duration) -> Blo
     }
 }
 
+/// Waits until some backend is queued on a lock `pid` holds (`pid` is among
+/// its `pg_blocking_pids`) and returns that backend's pid, or returns `None`
+/// once `or_until()` holds instead: the work that was to queue finished
+/// without having to. A waiter is looked for first, so one seen in the same
+/// round as `or_until` is reported. Probes every [`crate::wait::POLL`];
+/// panics after `timeout`, saying what `pid` itself was doing.
+///
+/// For a test that has forced the queueing (a frozen worker holds the lock
+/// and the test starts the one that must wait for it): a wait for a
+/// backend to arrive somewhere, not for anything to converge.
+pub async fn wait_blocked_behind(
+    observer: &Client,
+    pid: i32,
+    timeout: Duration,
+    mut or_until: impl FnMut() -> bool,
+) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let waiter: Option<i32> = observer
+            .query_opt(
+                "select pid from pg_catalog.pg_stat_activity \
+                 where $1 = any(pg_catalog.pg_blocking_pids(pid)) \
+                 order by pid limit 1",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .map(|row| row.get(0));
+        if waiter.is_some() {
+            return waiter;
+        }
+        if or_until() {
+            return None;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "no backend queued behind pid {pid} within {timeout:?}; pid {pid} is {}",
+                activity_of(observer, pid).await
+            );
+        }
+        tokio::time::sleep(crate::wait::POLL).await;
+    }
+}
+
+/// What `pid` is doing, from `pg_stat_activity`, for a failure message.
+async fn activity_of(observer: &Client, pid: i32) -> String {
+    match observer
+        .query_opt(
+            "select coalesce(state, ''), coalesce(wait_event_type, ''), \
+                    coalesce(wait_event, ''), coalesce(left(query, 200), '') \
+             from pg_catalog.pg_stat_activity where pid = $1",
+            &[&pid],
+        )
+        .await
+    {
+        Ok(Some(row)) => format!(
+            "{} (waiting on {}/{}): {}",
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, String>(3)
+        ),
+        Ok(None) => "gone".to_string(),
+        Err(e) => format!("unreadable: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

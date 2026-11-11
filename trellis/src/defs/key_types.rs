@@ -439,15 +439,18 @@ pub(crate) fn refusal(
             super::validate::reject_unsupported_group_by_key_type(column, live.info.value_type)
                 .is_ok()
         }
+        // By the type's identity, not its name (ADR-0020): a domain named
+        // `"integer"` is not `integer`.
         _ => {
-            super::join_key_types::is_text_stable_join_key_type(live.display()) || live.info.is_enum
+            super::join_key_types::is_text_stable_join_key_type(live.info.type_oid)
+                || live.info.is_enum
         }
     };
     if !supported {
         return Some(format!(
             "column {column:?} of {table}, {key_use}, is now {}, a type Trellis refuses as such a \
              key at define: it can't match that type's values by their text",
-            live.display()
+            live.qualified_display()
         ));
     }
     live.nondeterministic_collation().map(|collation| {
@@ -1062,14 +1065,18 @@ mod tests {
         );
     }
 
-    /// A live column of `pg_type` (`format_type`'s rendering) and
-    /// `value_type`, with no collation.
-    fn live(pg_type: &str, value_type: super::super::ast::ValueType) -> LiveColumn {
+    /// A live column of the `pg_catalog` type `ty`, rendered `pg_type` by
+    /// `format_type`, and `value_type`, with no collation.
+    fn live(
+        pg_type: &str,
+        ty: tokio_postgres::types::Type,
+        value_type: super::super::ast::ValueType,
+    ) -> LiveColumn {
         LiveColumn {
             info: super::super::validate::JoinColumnInfo {
                 value_type,
                 pg_type: pg_type.to_string(),
-                type_oid: 0,
+                type_oid: ty.oid(),
                 typmod: -1,
                 collation_oid: 0,
                 collation: None,
@@ -1079,7 +1086,7 @@ mod tests {
                 copy_collation: None,
                 trellis_target: false,
             },
-            type_name: format!("pg_catalog.{pg_type}"),
+            type_name: format!("pg_catalog.{}", ty.name()),
         }
     }
 
@@ -1090,13 +1097,16 @@ mod tests {
     #[test]
     fn a_key_column_is_refused_by_its_own_use_s_rule() {
         use super::super::ast::ValueType;
-        let numeric = live("numeric", ValueType::Numeric);
+        use tokio_postgres::types::Type;
+        let numeric = live("numeric", Type::NUMERIC, ValueType::Numeric);
         let float = live(
             "double precision",
+            Type::FLOAT8,
             ValueType::Float(crate::float::FloatWidth::Float8),
         );
         let integer = live(
             "integer",
+            Type::INT4,
             ValueType::Integer(crate::integer::IntWidth::Int4),
         );
         let refused = |column: &LiveColumn, key_use: KeyUse| {
@@ -1109,7 +1119,7 @@ mod tests {
         for key_use in [KeyUse::SourceKey, KeyUse::GroupBy, KeyUse::JoinOn] {
             assert!(!refused(&integer, key_use.clone()), "{key_use}");
         }
-        let mut folded = live("text", ValueType::Text);
+        let mut folded = live("text", Type::TEXT, ValueType::Text);
         folded.info.collation = Some("case_insensitive".to_string());
         folded.info.collation_deterministic = false;
         let reason = refusal("public.t", "k", &KeyUse::GroupBy, &folded).unwrap();
@@ -1117,5 +1127,36 @@ mod tests {
             reason.contains(r#"nondeterministic collation "case_insensitive""#),
             "{reason}"
         );
+    }
+
+    /// A source or join key's type is told by its identity, not by the name
+    /// `format_type` gives it (ADR-0020): a domain named `"integer"` (over
+    /// `numeric`, say) is refused, and named by its qualified name, and an
+    /// enum named like a listed type is admitted as the enum it is.
+    #[test]
+    fn a_key_type_is_told_by_its_identity_not_its_name() {
+        use super::super::ast::ValueType;
+        use super::super::pg_type::PgType;
+        let mut domain = live(
+            r#""integer""#,
+            tokio_postgres::types::Type::INT4,
+            ValueType::Other(PgType::Unrecognized),
+        );
+        domain.info.type_oid = super::super::join_key_types::USER_TYPE_OID;
+        domain.info.copy_type = r#"public."integer""#.to_string();
+        domain.type_name = "public.integer".to_string();
+        for key_use in [KeyUse::SourceKey, KeyUse::JoinOn] {
+            let reason = refusal("public.t", "k", &key_use, &domain)
+                .unwrap_or_else(|| panic!("{key_use}: the domain is refused"));
+            assert!(
+                reason.contains(r#"is now public."integer", a type Trellis refuses"#),
+                "{reason}"
+            );
+        }
+        let mut named_enum = domain.clone();
+        named_enum.info.is_enum = true;
+        for key_use in [KeyUse::SourceKey, KeyUse::JoinOn] {
+            assert_eq!(refusal("public.t", "k", &key_use, &named_enum), None);
+        }
     }
 }

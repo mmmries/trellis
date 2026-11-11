@@ -482,8 +482,8 @@ types are distinct `ValueType`s, and two columns of different enum types are
 never joinable.
 
 - `enumout` is a bijection with no second renderer. Enums are join, `GROUP BY`
-  and primary keys; the join/primary-key check is a live `to_regtype` probe
-  (`join_key_types::is_enum_type_name`) rather than a static list.
+  and primary keys; the join/primary-key check reads the type's `typtype` from the catalog
+  rather than a static list.
 - There is no typed-literal syntax: a literal's keyword would be a per-schema
   identifier.
 

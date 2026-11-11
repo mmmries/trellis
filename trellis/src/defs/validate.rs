@@ -2283,7 +2283,7 @@ fn validate_join_on<'a>(
     resolve: &impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError>,
 ) -> Result<(), ValidationError> {
     let check_key_type = |column: &QualifiedColumn, info: &JoinColumnInfo| {
-        if !super::join_key_types::admit_join_key(&info.pg_type, info.is_enum) {
+        if !super::join_key_types::admit_join_key(info.type_oid, info.is_enum) {
             return Err(ValidationError::JoinUnsupportedKeyType {
                 reference: written(column),
                 pg_type: info.pg_type.clone(),
@@ -3405,7 +3405,7 @@ fn group_by_key_rule(value_type: ValueType) -> Option<super::registry::GroupByKe
         // `defs_enum.rs`) renders each value as its own label text
         // verbatim; an enum value's identity *is* that label (a `pg_enum`
         // row keyed by OID), so there is no deeper representation for two
-        // distinct values to collide under — see `join_key_types::is_enum_type_name`'s
+        // distinct values to collide under — see `join_key_types::JoinKey::Enum`'s
         // own doc comment for the fuller version of this same reasoning
         // (the join-key/PK key roles' dynamic counterpart of this
         // static gate).

@@ -11,7 +11,7 @@
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
 
-use resume_passes::{bring_live, drain_to_quiescence, full_pass, rows, setup, status};
+use resume_passes::{bring_live, reconcile_pass, rows, settle, setup, status};
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
 
@@ -95,7 +95,7 @@ async fn a_table_with_no_primary_key_is_keyed_by_its_key() {
     )
     .await
     .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     converged(&raw).await;
 
     // Build the replacement, then drop the old index: nothing changes.
@@ -106,8 +106,8 @@ async fn a_table_with_no_primary_key_is_keyed_by_its_key() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     for target in ["s_one", "s_sums"] {
         assert_eq!(status(&trellis, target).await.status, TransformStatus::Live);
     }
@@ -129,8 +129,8 @@ async fn resume_needs_an_index_backing_the_key_again() {
     raw.batch_execute("drop index public.s_key; insert into public.s values (9, 90, 1, 9)")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         status(&trellis, "s_sums").await.status,
         TransformStatus::Paused
@@ -163,8 +163,8 @@ async fn an_unbacked_key_outcome_is_the_resume_refusal() {
     raw.batch_execute("drop index public.s_key; insert into public.s values (9, 90, 1, 9)")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         status(&trellis, "s_sums").await.status,
         TransformStatus::Paused
@@ -173,8 +173,8 @@ async fn an_unbacked_key_outcome_is_the_resume_refusal() {
     raw.batch_execute("alter table public.s add primary key (k2)")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let outcome = status(&trellis, "s_sums")
         .await
         .capture_failure
@@ -221,10 +221,10 @@ async fn a_key_table_created_again_outcome_re_records_the_declared_key() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    full_pass(&mut raw, &db.pool).await;
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = status(&trellis, "s_sums").await;
     assert_eq!(reported.status, TransformStatus::Paused);
     let outcome = reported
@@ -289,9 +289,9 @@ async fn a_primary_key_change_on_a_table_keyed_by_key_pauses_nothing() {
          delete from public.p where k = 103; insert into public.p values (8, 108, 0, 8)",
     ] {
         raw.batch_execute(step).await.unwrap();
-        full_pass(&mut raw, &db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
-        full_pass(&mut raw, &db.pool).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
         for target in ["p_one", "p_sums"] {
             let reported = status(&trellis, target).await;
             assert_eq!(

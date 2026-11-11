@@ -1,0 +1,45 @@
+-- staged_ddl
+create temp table if not exists "trellis_join_p_7" on commit delete rows as select "g", null::xid8 as __txid, null::pg_lsn as __lsn, null::bigint as __n from "trellis"."join_7_p" with no data
+
+-- working_ddl
+create temp table if not exists "trellis_join_p_7" on commit delete rows as select "g", null::xid8 as __txid, null::pg_lsn as __lsn, null::bigint as __n from "trellis"."join_7_p" with no data; create temp table if not exists "trellis_join_rp_7" on commit delete rows as select "g" from "trellis"."join_7_p" with no data
+
+-- deltas_ddl
+create temp table if not exists "trellis_join_dp_7" on commit delete rows as select "g", null::bigint as __dn from "trellis"."join_7_p" with no data
+
+-- name_groups_sql
+insert into pg_temp."trellis_join_rp_7" ("g") select s."g" as "g" from ( select s.* from unnest($1::text[]) as i(x) cross join lateral jsonb_populate_record(null::"public"."s", x::jsonb) as s union all select s.* from unnest($2::text[]::integer[], $3::text[]::text[]) as u(__p0, __p1) cross join lateral (select * from "public"."s" s where s."id" = u.__p0 and (s."k" = u.__p1 or (s."k" is null and u.__p1 is null))) as s ) as s where true
+
+-- stage_sql
+with raw as (select x::jsonb as r from unnest($1::text[]) as u(x)), sides as ( select (r ->> 't')::xid8 as __txid, (r ->> 'l')::pg_lsn as __lsn, -1 as __sgn, case when jsonb_typeof(r -> 'x') = 'object' then r -> 'x' -> 'old' else r -> 'o' end as __i from raw where r ->> 'op' <> 'recompute' union all select (r ->> 't')::xid8, (r ->> 'l')::pg_lsn, 1, case when jsonb_typeof(r -> 'x') = 'object' then r -> 'x' -> 'new' else r -> 'n' end from raw where r ->> 'op' <> 'recompute' ), bad as ( select count(*) as __bad from raw where r ->> 'op' <> 'recompute' and jsonb_typeof(r -> 'x') is distinct from 'object' and ((r ->> 'op' in ('update', 'delete') and jsonb_typeof(r -> 'o') is distinct from 'object') or (r ->> 'op' in ('insert', 'update') and jsonb_typeof(r -> 'n') is distinct from 'object')) ), hinted as ( insert into pg_temp."trellis_join_rp_7" ("g") select s."g" as "g" from raw cross join lateral jsonb_populate_record(null::"public"."s", raw.r -> 'o') as s where raw.r ->> 'op' = 'recompute' and jsonb_typeof(raw.r -> 'o') = 'object' and (select __bad from bad) = 0 ), ev as ( select s."g" as "g", sd.__txid, sd.__lsn, sd.__sgn from sides sd cross join lateral jsonb_populate_record(null::"public"."s", sd.__i) as s where jsonb_typeof(sd.__i) = 'object' ), staged as ( insert into pg_temp."trellis_join_p_7" select "g", __txid, __lsn, sum(__sgn)::bigint from ev where (select __bad from bad) = 0 group by "g", __txid, __lsn returning __n ) select __bad, null::boolean[] from bad
+
+-- lock_sql
+insert into "trellis"."join_7_p" ("g") select distinct "g" from ( select "g" from pg_temp."trellis_join_p_7" union all select "g" from pg_temp."trellis_join_rp_7" ) as g order by "g" on conflict ("g") do update set __n = excluded.__n where false
+
+-- apply_sql
+with sg as ( select "g", __txid, sum(__n)::bigint as __n from pg_temp."trellis_join_p_7" where __lsn > coalesce( (select floor from ledger_truncate_floor where target_table = $1), '0/0'::pg_lsn) group by "g", __txid ), pg as (select distinct "g" from sg), b as ( select pg.*, h.__hc, h.__basis from pg cross join lateral (select x.ctid, x.__basis from "trellis"."join_7_p" x where x."g" = pg."g" union all select x.ctid, x.__basis from "trellis"."join_7_p" x where (pg."g" is null) and x."g" is null limit 1) as h(__hc, __basis) ), f as ( select sg.*, b.__hc from sg join b on array[sg."g"] = array[b."g"] where b.__basis is null or not pg_visible_in_snapshot(sg.__txid, b.__basis) ), t as (select __hc, sum(__n)::bigint as __n from f group by __hc), up as ( update "trellis"."join_7_p" u set __n = u.__n + t.__n from t where u.ctid = any(array(select t.__hc from t where t.__n <> 0)) and u.ctid = t.__hc returning u."g", t.__n as __dn, u.__n as __nn ), d as (insert into pg_temp."trellis_join_dp_7" ("g", __dn) select "g", __dn from up) select count(*) from up
+
+-- probe_rows_sql
+select s.* from "public"."s" s where s."g" = rg."g" union all select s.* from "public"."s" s where (rg."g" is null) and (s."g" = rg."g" or (rg."g" is null and s."g" is null))
+
+-- recompute_sql
+with snap as materialized ( select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), 0) as __seg ), rg as (select distinct "g" from pg_temp."trellis_join_rp_7"), r as ( select h.*, a.* from rg cross join lateral (select x.ctid, x.__n from "trellis"."join_7_p" x where x."g" = rg."g" union all select x.ctid, x.__n from "trellis"."join_7_p" x where (rg."g" is null) and x."g" is null limit 1) as h(__hc, __on) cross join lateral (select count(*)::bigint as __rn from (select s.* from "public"."s" s where s."g" = rg."g" union all select s.* from "public"."s" s where (rg."g" is null) and (s."g" = rg."g" or (rg."g" is null and s."g" is null))) s) as a ), up as ( update "trellis"."join_7_p" u set __n = r.__rn, __basis = snap.__snap, __stamp = snap.__seg from r, snap where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc returning u."g", u.__n - r.__on as __dn, u.__n as __nn ), d as (insert into pg_temp."trellis_join_dp_7" ("g", __dn) select "g", __dn from up) select count(*) from up
+
+-- recompute_sql images node
+with snap as materialized ( select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), 0) as __seg ), rg as (select distinct "g" from pg_temp."trellis_join_rp_7"), n as materialized (select s."g" as "g", count(*)::bigint as __rn from "public"."s_1" s group by 1), r as ( select h.*, coalesce(n.__rn, 0) as __rn from rg cross join lateral (select x.ctid, x.__n from "trellis"."join_7_p" x where x."g" = rg."g" union all select x.ctid, x.__n from "trellis"."join_7_p" x where (rg."g" is null) and x."g" is null limit 1) as h(__hc, __on) left join n on array[n."g"] = array[rg."g"] ), up as ( update "trellis"."join_7_p" u set __n = r.__rn, __basis = snap.__snap, __stamp = snap.__seg from r, snap where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc returning u."g", u.__n - r.__on as __dn, u.__n as __nn ), d as (insert into pg_temp."trellis_join_dp_7" ("g", __dn) select "g", __dn from up) select count(*) from up
+
+-- join_group_sql strict=false
+create temp table "g" on commit drop as select false as __meta, null::pg_snapshot as __snap, null::bigint as __seg, f.* from (select s."g" as "g", count(*)::bigint as __rn from "public"."s" s group by 1) as f union all select true, pg_catalog.pg_current_snapshot(), coalesce((select max(seg_seq) from segments), 0), null, null
+
+-- join_group_sql strict=true
+create temp table "g" on commit drop as select false as __meta, null::pg_snapshot as __snap, null::bigint as __seg, f.* from (select s."g" as "g", count(*)::bigint as __rn from "public"."s" s group by 1) as f union all select true, pg_catalog.pg_current_snapshot(), coalesce((select max(seg_seq) from segments), 0), null, null
+
+-- join_build_sql fill
+create temp table "w" on commit drop as select rg."g", h.__hc, coalesce(h.__on, 0) as __on, coalesce(n.__rn, 0) as __rn from (select distinct "g" from pg_temp."trellis_join_rp_7") rg left join (select x.ctid as __hc, x."g", x.__n as __on from "trellis"."join_7_p" x) h on array[h."g"] = array[rg."g"] left join (select * from pg_temp."g" where not __meta) n on array[n."g"] = array[rg."g"]
+
+-- join_build_sql write
+with snap as materialized (select __snap, __seg from pg_temp."g" where __meta), up as ( update "trellis"."join_7_p" u set __n = r.__rn, __basis = snap.__snap, __stamp = snap.__seg from pg_temp."w" r, snap where u.ctid = r.__hc returning r.__hc ), ins as ( insert into "trellis"."join_7_p" ("g", __n, __basis, __stamp) select r."g", r.__rn, snap.__snap, snap.__seg from pg_temp."w" r, snap where not exists (select from up where up.__hc = r.__hc) ), d as (insert into pg_temp."d" ("g", __dn) select r."g", r.__rn - r.__on from pg_temp."w" r) select count(*) from pg_temp."w"
+
+-- free apply_sql
+with sg as ( select "g", __txid, sum(__n)::bigint as __n from pg_temp."trellis_join_p_7" where __lsn > coalesce( (select floor from ledger_truncate_floor where target_table = $1), '0/0'::pg_lsn) group by "g", __txid ), pg as (select distinct "g" from sg), b as ( select pg.*, h.__hc, h.__basis from pg cross join lateral (select x.ctid, x.__basis from "trellis"."join_7_p" x where x."g" = pg."g" union all select x.ctid, x.__basis from "trellis"."join_7_p" x where (pg."g" is null) and x."g" is null limit 1) as h(__hc, __basis) ), f as ( select sg.*, b.__hc from sg join b on array[sg."g"] = array[b."g"] where b.__basis is null or not pg_visible_in_snapshot(sg.__txid, b.__basis) ), t as (select __hc, sum(__n)::bigint as __n from f group by __hc), up as ( update "trellis"."join_7_p" u set __n = u.__n + t.__n from t where u.ctid = any(array(select t.__hc from t where t.__n <> 0)) and u.ctid = t.__hc returning u."g", t.__n as __dn, u.__n as __nn ), d as (insert into pg_temp."trellis_join_dp_7" ("g", __dn) select "g", __dn from up) select count(*) from up
+

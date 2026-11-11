@@ -347,3 +347,72 @@ async fn a_primary_key_retype_to_a_refused_type_pauses_and_keeps_the_floor() {
     }
     assert!(trellis.apply("RESUME TRANSFORM r_k2").await.is_err());
 }
+
+/// A retype of a key column to a domain named after a key type Trellis
+/// admits (`"integer"` here, over `numeric`) is a retype to a type define
+/// refuses as a key, the same as a retype to `numeric` itself: `1.0` and
+/// `1.00` are one key to Postgres and two to a match by text. The type is
+/// told by its identity, not by its name (ADR-0020), so the pause names the
+/// refusal and the domain by its qualified name, for a 1-1 source key and
+/// for a `JOIN`'s `ON` key alike, and doesn't offer a resume that refuses.
+#[tokio::test]
+async fn a_key_retype_to_a_domain_named_like_a_key_type_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create domain public.\"integer\" as numeric; \
+         create table public.d1 (id int primary key, v text); \
+         insert into public.d1 select i, i::text from generate_series(1, 3) i; \
+         create table public.d2 (id int primary key, d1_id int, w int); \
+         insert into public.d2 select i, i, i from generate_series(1, 3) i; \
+         create index on public.d2 (d1_id);",
+    )
+    .await
+    .expect("sources");
+    let trellis = bigint_key_release(db.dsn()).await;
+    for text in [
+        "TRANSFORM r_d1 FROM public.d1 SELECT v AS v",
+        "TRANSFORM r_d12 FROM public.d1 JOIN public.d2 ON d1.id = d2.d1_id \
+         GROUP BY d1.v WITHOUT SOURCE INDEX SELECT d1.v AS v, SUM(d2.w) AS w",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    build_everything(&mut raw, &trellis).await;
+
+    raw.batch_execute(
+        "alter table public.d1 alter column id type public.\"integer\" using id::numeric",
+    )
+    .await
+    .expect("retype the key to the domain");
+    pass(&mut raw, &trellis).await;
+    pass(&mut raw, &trellis).await;
+
+    for target in ["r_d1", "r_d12"] {
+        let (status, _, failure) = state(&raw, target).await;
+        assert_eq!(status, TransformStatus::Paused, "{target}");
+        let failure = failure.expect("a capture failure");
+        for part in [
+            "column \"id\" of public.d1",
+            "is now public.\"integer\", a type Trellis refuses as such a key at define",
+            "RESUME would refuse",
+        ] {
+            assert!(failure.contains(part), "{target}: {part:?} in {failure}");
+        }
+        // Not the reason of a retype a resume repairs, which this isn't, and
+        // the domain is never named as the listed type it is named like.
+        assert!(
+            !failure.contains("Resume the definition")
+                && !failure.contains("changed type")
+                && !failure.contains("(\"integer\")"),
+            "{target}: {failure}"
+        );
+        assert!(
+            trellis
+                .apply(&format!("RESUME TRANSFORM {target}"))
+                .await
+                .is_err(),
+            "{target}"
+        );
+    }
+}

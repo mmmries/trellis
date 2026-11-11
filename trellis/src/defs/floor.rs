@@ -1705,7 +1705,8 @@ mod tests {
         super::super::validate::JoinColumnInfo {
             value_type,
             pg_type: pg_type.to_string(),
-            type_oid: 0,
+            type_oid: super::super::join_key_types::rendered_type(pg_type)
+                .map_or(super::super::join_key_types::USER_TYPE_OID, |ty| ty.oid()),
             typmod: -1,
             collation_oid: 0,
             collation: None,
