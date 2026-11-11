@@ -295,7 +295,8 @@ absolute write instead ([below](#aggregate-groups-the-group-basis)).
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
 `seg_seq` at or below which every segment is drained, not the highest drained
-segment (`staging::retire::collect_tombstones`). An earlier change to the same
+segment (`staging::retire::collect_tombstones`): segments drain out of order,
+and a fence is a snapshot, not a position. An earlier change to the same
 key committed before the delete's trigger ran, so it is in the delete's batch
 or an earlier one, and at or below the prefix it has been applied or refused.
 A Re-derive stamps at least the newest segment its snapshot sees, so a
@@ -316,7 +317,8 @@ length.
 
 Only a tombstone carries `__applied_seg`. A write that leaves an entry
 a tombstone raises it to `greatest(old, its segment)`; one that leaves the
-entry live leaves it alone. The ledger indexes its tombstones by it
+entry live leaves it alone, so a revival keeps the old stamp, which can only
+delay the GC. The ledger indexes its tombstones by it
 (`(__applied_seg) where __tombstone`), so a GC batch seeks the collectable
 ones under a pinned index-scan plan, however many tombstones wait
 above the drained prefix, and an Apply or Re-derive that leaves an entry live
