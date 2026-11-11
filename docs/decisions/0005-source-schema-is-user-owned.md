@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-09-02
+date: 2026-11-11
 deciders: Michael Ries
 ---
 
@@ -46,9 +46,9 @@ schema as it is, and refuse a definition that lacks one:
 * **The index a `MIN` or `MAX` field's probe reads:** on the `GROUP BY`
   columns, then the argument. `WITHOUT SOURCE INDEX` doesn't waive it.
 
-A lost correctness prerequisite pauses the transforms it affects: a change
-to the key a transform uses, or the index backing a `KEY (…)` going missing
-([ADR-0026](0026-source-keys.md#keeping-the-key)).
+A lost correctness prerequisite pauses the transforms it affects, such as a
+change to the key a transform uses, or the index backing a `KEY (…)` going
+missing ([ADR-0026](0026-source-keys.md#keeping-the-key)).
 
 A lost performance prerequisite, an index dropped or invalidated after
 define, leaves the transform running and its target correct, since an index

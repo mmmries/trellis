@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-09-10
+date: 2026-11-11
 deciders: Michael Ries
 ---
 
@@ -60,8 +60,9 @@ would also impose permanent dual-path complexity.
 
 **An oid is recorded only as a change signal, never as identity.** Trellis
 records the oid (with `xmin` and enabled mode) of each capture trigger it makes
-(`capture_triggers`), and beside its own catalog rows the oid of the catalog
-table that holds them and the cluster's `system_identifier`
+(`capture_triggers`), the oid of the table each recorded source key was taken
+from (`definition_keys`), and beside its own catalog rows the oid of the
+catalog table that holds them and the cluster's `system_identifier`
 (`capture_triggers`, `partition_sources`). A table recreated at its name, its
 triggers recreated, or the database restored from a logical dump shows up as a
 recorded oid that is gone or differs from the live one. Trellis then pauses, with a
