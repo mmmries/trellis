@@ -1055,6 +1055,23 @@ impl Partial {
         }
     }
 
+    /// Whether the plain sum of its values `value` over an aggregate's rows
+    /// is not its zero.
+    pub(crate) fn sum_nonzero(self, value: &str) -> String {
+        match self {
+            Partial::Sum(part, _) => part.nonzero(&part.total(value, None)),
+            _ => format!("sum({value}) <> 0"),
+        }
+    }
+
+    /// Its argument's 1-based index; `None` for the row count.
+    pub(crate) fn arg(self) -> Option<usize> {
+        match self {
+            Partial::Rows => None,
+            Partial::Count(i) | Partial::Sum(_, i) => Some(i),
+        }
+    }
+
     /// `a + b`.
     pub(crate) fn add(self, a: &str, b: &str) -> String {
         match self {

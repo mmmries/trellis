@@ -175,8 +175,8 @@ use crate::pool::quote_ident;
 use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{
-    self, Arg, ColumnCollations, GroupCollations, GroupShape, GroupTargetPlan, NO_SCALES, SumPart,
-    Writer,
+    self, Arg, ColumnCollations, GroupCollations, GroupShape, GroupTargetPlan, NO_SCALES, Partial,
+    SumPart, Writer,
 };
 use super::target_mutations::TargetMutations;
 
@@ -732,7 +732,6 @@ impl JoinTargetPlan {
     /// sides apply, so it reads `P` as it was before them.
     fn refill_sql(&self) -> String {
         let p_args = &self.from.plan.shape.args;
-        let m_args = &self.joined.plan.shape.args;
         // The `FROM` side's `T` group columns, which `P` holds; the joined
         // side's are `NULL` in every unmatched term.
         let from_groups: Vec<String> = self
@@ -750,38 +749,23 @@ impl JoinTargetPlan {
             })
             .collect();
         let mut insert_cols = quoted(&self.t.shape.group_cols);
-        insert_cols.extend(["__txid", "__lsn", "__n"].map(String::from));
+        insert_cols.extend(["__txid", "__lsn"].map(String::from));
         select.extend([
             "pg_current_xact_id()".to_string(),
             "'0/0'::pg_lsn".to_string(),
-            "q.__n".to_string(),
         ]);
         let mut sums = from_groups.clone();
-        sums.push("sum(__n)::bigint as __n".to_string());
-        let mut nonzero = vec!["sum(__n) <> 0".to_string()];
-        for (i, arg) in p_args.iter().chain(m_args).enumerate() {
-            let from = i < p_args.len();
-            let i = i + 1;
-            insert_cols.push(format!("__c{i}"));
-            if from {
-                sums.push(format!("sum(__count_{i})::bigint as __c{i}"));
-                nonzero.push(format!("sum(__count_{i}) <> 0"));
-                select.push(format!("q.__c{i}"));
-            } else {
-                select.push("0".to_string());
+        let mut nonzero = Vec::new();
+        for p in self.t.shape.partials() {
+            let staged = p.name("__");
+            insert_cols.push(staged.clone());
+            if p.arg().is_some_and(|i| i > p_args.len()) {
+                select.push(p.zero().to_string());
+                continue;
             }
-            for part in arg.parts() {
-                let staged = part.name("__", i);
-                insert_cols.push(staged.clone());
-                if from {
-                    let total = part.total(&part.hidden(i), None);
-                    sums.push(format!("{total} as {staged}"));
-                    nonzero.push(part.nonzero(&total));
-                    select.push(format!("q.{staged}"));
-                } else {
-                    select.push(part.zero().to_string());
-                }
-            }
+            sums.push(format!("{} as {staged}", p.total(&p.hidden(), None)));
+            nonzero.push(p.sum_nonzero(&p.hidden()));
+            select.push(format!("q.{staged}"));
         }
         let group_by = if from_groups.is_empty() {
             String::new()
@@ -829,23 +813,20 @@ impl JoinTargetPlan {
         let (dp, dm) = ("__dp", "__dm");
         let summed = |name: &str, side: &SidePlan| {
             let keys = quoted(&side.plan.shape.group_cols).join(", ");
-            let mut columns = vec![keys.clone(), "sum(__dn)::bigint as __dn".to_string()];
-            for (i, arg) in side.plan.shape.args.iter().enumerate() {
-                let i = i + 1;
-                columns.push(format!("sum(__dc{i})::bigint as __dc{i}"));
-                for part in arg.parts() {
-                    let delta = part.name("__d", i);
-                    // A map no delta holds is `NULL`, with no array
-                    // aggregate: its state would also make Postgres size the
-                    // hash table for a large state per cell, and spill.
-                    let total = if *part == SumPart::Scales && side.delta_map_free(i) {
+            let mut columns = vec![keys.clone()];
+            columns.extend(side.plan.shape.each_partial(|p| {
+                let delta = p.name("__d");
+                // A map no delta holds is `NULL`, with no array aggregate:
+                // its state would also make Postgres size the hash table for
+                // a large state per cell, and spill.
+                let total = match p {
+                    Partial::Sum(SumPart::Scales, i) if side.delta_map_free(i) => {
                         NO_SCALES.to_string()
-                    } else {
-                        part.total(&delta, None)
-                    };
-                    columns.push(format!("{total} as {delta}"));
-                }
-            }
+                    }
+                    _ => p.total(&delta, None),
+                };
+                format!("{total} as {delta}")
+            }));
             format!(
                 "{name} as materialized (select {} from {} group by {keys})",
                 columns.join(", "),
@@ -1111,35 +1092,24 @@ impl JoinTargetPlan {
         // spill, even when no term holds a map (the common page).
         let t_cols = quoted(&self.t.shape.group_cols);
         let mut insert_cols = t_cols.clone();
-        insert_cols.extend(["__txid", "__lsn", "__n"].map(String::from));
-        let mut sums = vec!["sum(__n)::bigint as __n".to_string()];
-        let mut values = vec!["a.__n".to_string()];
-        let mut nonzero = vec!["sum(__n) <> 0".to_string()];
-        let mut maps = Vec::new();
-        let mut map_values = Vec::new();
-        let mut holds = Vec::new();
-        let mut flags = Vec::new();
-        for (i, arg) in p_args.iter().chain(&m_args).enumerate() {
-            let i = i + 1;
-            insert_cols.push(format!("__c{i}"));
-            sums.push(format!("sum(__c{i})::bigint as __c{i}"));
-            values.push(format!("a.__c{i}"));
-            nonzero.push(format!("sum(__c{i}) <> 0"));
-            for part in arg.parts() {
-                let staged = part.name("__", i);
-                let total = part.total(&staged, None);
-                insert_cols.push(staged.clone());
-                if *part == SumPart::Scales {
-                    maps.push(format!("{total} as {staged}"));
-                    values.push(format!("km.{staged}"));
-                    map_values.push(format!("km.{staged} is not null"));
-                    holds.push(format!("{staged} is not null"));
-                    flags.push(format!("coalesce(bool_and(km.{staged} is null), true)"));
-                } else {
-                    nonzero.push(part.nonzero(&total));
-                    sums.push(format!("{total} as {staged}"));
-                    values.push(format!("a.{staged}"));
-                }
+        insert_cols.extend(["__txid", "__lsn"].map(String::from));
+        let (mut sums, mut values, mut nonzero) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut maps, mut map_values, mut holds, mut flags) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for p in self.t.shape.partials() {
+            let staged = p.name("__");
+            let total = p.total(&staged, None);
+            insert_cols.push(staged.clone());
+            if let Partial::Sum(SumPart::Scales, _) = p {
+                maps.push(format!("{total} as {staged}"));
+                values.push(format!("km.{staged}"));
+                map_values.push(format!("km.{staged} is not null"));
+                holds.push(format!("{staged} is not null"));
+                flags.push(format!("coalesce(bool_and(km.{staged} is null), true)"));
+            } else {
+                nonzero.push(p.sum_nonzero(&staged));
+                sums.push(format!("{total} as {staged}"));
+                values.push(format!("a.{staged}"));
             }
         }
         ctes.push(format!("terms as ({})", terms.join(" union all ")));
@@ -1252,14 +1222,11 @@ impl JoinTargetPlan {
                 hidden
             }
         };
-        columns.push(named("__dn".into(), "__n".into()));
-        for (i, arg) in side.plan.shape.args.iter().enumerate() {
-            let i = i + 1;
-            columns.push(named(format!("__dc{i}"), format!("__count_{i}")));
-            for part in arg.parts() {
-                columns.push(named(part.name("__d", i), part.hidden(i)));
-            }
-        }
+        columns.extend(
+            side.plan
+                .shape
+                .each_partial(|p| named(p.name("__d"), p.hidden())),
+        );
         columns
     }
 
