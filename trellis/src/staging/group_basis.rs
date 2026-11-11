@@ -490,7 +490,7 @@ impl GroupShape {
             .filter_map(|p| match p {
                 Partial::Sum(SumPart::Scales, _) => None,
                 Partial::Sum(..) => Some(format!("{}::text", f(p))),
-                _ => Some(f(p)),
+                Partial::Rows | Partial::Count(_) => Some(f(p)),
             })
             .collect()
     }
@@ -1002,7 +1002,7 @@ impl Partial {
     pub(crate) fn zero(self) -> &'static str {
         match self {
             Partial::Sum(part, _) => part.zero(),
-            _ => "0",
+            Partial::Rows | Partial::Count(_) => "0",
         }
     }
 
@@ -1010,7 +1010,7 @@ impl Partial {
     pub(crate) fn sql_type(self) -> &'static str {
         match self {
             Partial::Sum(part, _) => part.sql_type(),
-            _ => "bigint",
+            Partial::Rows | Partial::Count(_) => "bigint",
         }
     }
 
@@ -1018,7 +1018,9 @@ impl Partial {
     pub(crate) fn ddl(self) -> String {
         match self {
             Partial::Sum(part, i) => part.ddl(i),
-            _ => format!("{} bigint not null default 0", self.hidden()),
+            Partial::Rows | Partial::Count(_) => {
+                format!("{} bigint not null default 0", self.hidden())
+            }
         }
     }
 
@@ -1026,7 +1028,7 @@ impl Partial {
     pub(crate) fn is_zero(self) -> String {
         match self {
             Partial::Sum(part, i) => part.is_zero(&part.hidden(i)),
-            _ => format!("{} = 0", self.hidden()),
+            Partial::Rows | Partial::Count(_) => format!("{} = 0", self.hidden()),
         }
     }
 
@@ -1041,7 +1043,7 @@ impl Partial {
     pub(crate) fn nonzero(self, value: &str) -> String {
         match self {
             Partial::Sum(part, _) => part.nonzero(value),
-            _ => format!("{value} <> 0"),
+            Partial::Rows | Partial::Count(_) => format!("{value} <> 0"),
         }
     }
 
@@ -1050,8 +1052,10 @@ impl Partial {
     pub(crate) fn total(self, value: &str, condition: Option<&str>) -> String {
         match (self, condition) {
             (Partial::Sum(part, _), _) => part.total(value, condition),
-            (_, None) => format!("sum({value})::bigint"),
-            (_, Some(c)) => format!("coalesce(sum({value}) filter (where {c}), 0)::bigint"),
+            (Partial::Rows | Partial::Count(_), None) => format!("sum({value})::bigint"),
+            (Partial::Rows | Partial::Count(_), Some(c)) => {
+                format!("coalesce(sum({value}) filter (where {c}), 0)::bigint")
+            }
         }
     }
 
@@ -1060,7 +1064,7 @@ impl Partial {
     pub(crate) fn sum_nonzero(self, value: &str) -> String {
         match self {
             Partial::Sum(part, _) => part.nonzero(&part.total(value, None)),
-            _ => format!("sum({value}) <> 0"),
+            Partial::Rows | Partial::Count(_) => format!("sum({value}) <> 0"),
         }
     }
 
@@ -1076,7 +1080,7 @@ impl Partial {
     pub(crate) fn add(self, a: &str, b: &str) -> String {
         match self {
             Partial::Sum(part, _) => part.add(a, b),
-            _ => format!("{a} + {b}"),
+            Partial::Rows | Partial::Count(_) => format!("{a} + {b}"),
         }
     }
 
@@ -1084,7 +1088,7 @@ impl Partial {
     pub(crate) fn times(self, a: &str, n: &str) -> String {
         match self {
             Partial::Sum(part, _) => part.times(a, n),
-            _ => format!("{a} * {n}"),
+            Partial::Rows | Partial::Count(_) => format!("{a} * {n}"),
         }
     }
 
@@ -1092,7 +1096,7 @@ impl Partial {
     pub(crate) fn sub(self, a: &str, b: &str) -> String {
         match self {
             Partial::Sum(part, _) => part.sub(a, b),
-            _ => format!("{a} - {b}"),
+            Partial::Rows | Partial::Count(_) => format!("{a} - {b}"),
         }
     }
 }
