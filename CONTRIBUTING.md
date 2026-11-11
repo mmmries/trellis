@@ -108,11 +108,6 @@ step 4). `check-floors.py self-test` plants a violation of
 each rule. Each release's notes list the floors it raised
 (`check-floors.py notes`, [releasing](docs/releasing.md)).
 
-# Operating Principles
-
-A design that watches a source, a target or Trellis's own state follows
-[ADR-0027](docs/decisions/0027-operating-principles.md). Cite its rules by number.
-
 # Creating a Pull Request
 
 1. **Ensure the bug/feature was not already reported** by searching on GitHub under Issues.  If none exists, create a new issue so that other contributors can keep track of what you are trying to add/fix and offer suggestions (or let you know if there is already an effort in progress).
