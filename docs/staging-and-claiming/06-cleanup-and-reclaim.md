@@ -14,7 +14,7 @@ A `drained` batch is eligible for `TRUNCATE` when **all four** hold:
 
 1. **`seal_step2 IS NOT NULL`** — its successor sealed, so its own fence boundary
    is closed;
-2. **`txid_snapshot_xmin(current) > seal_step2`** — every transaction that could
+2. **`pg_snapshot_xmin(pg_current_snapshot()) > seal_step2`** — every transaction that could
    still write into it has finished;
 3. **its successor is also `drained`** — nobody needs it as the *predecessor*
    half of a both-slots read ([03](03-sealing-and-the-fence.md));
@@ -229,16 +229,25 @@ ring slot *and* blocking reads for its band forever.
 The escape hatch is a targeted purge — delete that table's rows from every ring
 table and the quarantine track — invoked only when a full schema reload still does
 not know the table. It is the **only** sanctioned write to rows a batch has
-still to apply, and worth marking as such in code so nothing else grows into
-the exception.
+still to apply while their definitions run, and worth marking as such in code
+so nothing else grows into the exception.
 
-The one other write to a ring row deletes rows every definition has already
-drained: the `RESUME` of a definition paused for an enum relabel deletes its
-tables' drained rows staged before the relabel, which still hold the old
-label. Nothing applies a drained row again, but a group-basis or `JOIN`
-rebuild names groups from the old images of every row left in a slot, and
-would fail to cast the old label
-([capture by triggers — An enum value relabelled](01-capture-by-triggers.md#an-enum-value-relabelled)).
+Two other writes delete ring rows, neither while a definition could apply
+them:
+
+- **A logical restore.** When a `pg_restore` of the database is detected,
+  one transaction pauses every definition and deletes every ring row, drained
+  or not, with the segment registry (`capture::restore`). The rows carry the
+  original cluster's positions and transaction ids, and the restored sources
+  already hold their changes, which every definition rebuilds from on
+  `RESUME`.
+- **An enum relabel's `RESUME`.** The `RESUME` of a definition paused for an
+  enum relabel deletes its tables' rows that every definition has already
+  drained and that were staged before the relabel, which still hold the old
+  label. Nothing applies a drained row again, but a group-basis or `JOIN`
+  rebuild names groups from the old images of every row left in a slot, and
+  would fail to cast the old label
+  ([capture by triggers — An enum value relabelled](01-capture-by-triggers.md#an-enum-value-relabelled)).
 
 ## Failure matrix
 

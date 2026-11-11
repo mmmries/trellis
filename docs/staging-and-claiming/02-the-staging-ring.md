@@ -85,27 +85,29 @@ the *table definition* rather than the producer, which makes them free:
 All three ride the insert that is happening anyway: no extra statement, no round
 trip, and — decisively — **no extra lock**.
 
-`route` must reach **all four producers**, which do not share a code path:
-capture triggers append server-side via `INSERT … SELECT`, and the others
-append client-rendered `VALUES` tuples. A client-stamped route would be rendered
+`route` must reach **every producer** ([below](#the-producers)), and they do
+not share a code path: capture triggers append server-side via
+`INSERT … SELECT`, and the others append client-rendered `VALUES` tuples
+(`staging::append::append`). A client-stamped route would be rendered
 twice in two languages, and the first divergence lands one key in two
 partitions. A generated column is the only shape with a single definition.
 
-It is **stored, not recomputed at read time**. `hashtext` is immutable within a
+It is **stored, not recomputed at read time**. `hashtextextended` is immutable within a
 build but not across major versions, so a batch drained partly under one hash and
 finished under another would re-apply every row that changed bucket — corruption
 on a non-idempotent delta path.
 
-## The four producers
+## The producers
 
-All four append into the active segment:
+Every producer appends into the active segment. Capture triggers insert
+server-side; every other producer calls `staging::append::append`:
 
 | Producer | What it appends | Carries images? |
 |---|---|---|
 | Capture triggers | the source change, in the writer's transaction | yes — `old_image` and/or `new_image`, and `transition_images` where a re-read's images aren't the statement's own ([01](01-capture-by-triggers.md#every-transition-row-counts-once)) |
-| Downstream propagation (a worker staging its dependents through the target-mutation seam) | a bare recompute trigger, or the change itself for a target on the seam's image feed | **no**, except on the image feed ([04](04-claiming-and-the-fold.md)) |
-| Definition re-derive (a formula changed) | a bare recompute trigger | **no** |
-| A 1-1 build's keys with a `NULL` part, which no chunk reaches | a bare recompute trigger | **no** |
+| Downstream propagation (a page's target writes, through the target-mutation seam, `staging::target_mutations`) | a bare recompute trigger, or the change itself for a target on the seam's image feed | **no**, except on the image feed ([04](04-claiming-and-the-fold.md)) |
+| A 1-1 build's keys with a `NULL` part, which no chunk reaches (`staging::build`) | a bare recompute trigger | **no** |
+| Releasing a quarantined key (`staging::quarantine::release_key`) | a bare recompute trigger carrying the parked rows' prior-image hint | **no** |
 
 That split matters. An **image-less row** is not a change — it asserts nothing
 about the row's state, only "recompute this key." The fold treats the two kinds

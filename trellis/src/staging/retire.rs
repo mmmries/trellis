@@ -46,8 +46,7 @@ use crate::pool::quote_ident;
 ///    finished. `seal_step2` is a plain `xid8` (the successor's flip
 ///    transaction), not a snapshot — compared directly against the current
 ///    snapshot's `xmin`, matching [`super::seal`]'s own `xid8`/`pg_snapshot`
-///    family choice (see that module's doc comment) rather than the design
-///    doc's legacy `txid_snapshot_xmin` spelling.
+///    family choice (see that module's doc comment).
 /// 3. The successor (`seg_seq + 1`) is also `drained` — written as *no
 ///    successor row with a state other than `drained`*, so an **absent**
 ///    successor (already retired) qualifies too.
