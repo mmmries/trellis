@@ -202,7 +202,7 @@ pub struct LastChange {
     /// the first's row lock.
     pub lsn: PgLsn,
     /// The ring row's `row_txid` (`xid8`, as text): the source transaction's
-    /// own id under trigger capture (C5).
+    /// own id under trigger capture.
     pub row_txid: String,
 }
 
@@ -565,7 +565,7 @@ fn fold_sql(
     // A `schema_changed` marker is no change to any key. The drain
     // acts on it before the fold (`staging::schema_change`), so `filtered`
     // leaves it out and no folded change ever carries its key. Nor is a
-    // `node_truncate` marker (ADR-0017 P5): the seal queued its node's
+    // `node_truncate` marker: the seal queued its node's
     // correction from it.
     //
     // ADR-0002's fold rule under I8: an image-less `delete` is
@@ -1000,7 +1000,7 @@ mod merge_tests {
 
     /// More than two contributing segments still fold to exactly one
     /// record, taking the latest post-image across all of them — the
-    /// realistic burst shape this milestone targets.
+    /// realistic burst shape segment coalescing targets.
     #[test]
     fn three_segments_touching_the_same_key_merge_to_one_record() {
         let mut a = base("1");

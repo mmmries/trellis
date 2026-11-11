@@ -4182,7 +4182,8 @@ pub(crate) struct CaptureReaderRow {
     /// The qualified `source_table`.
     pub source: String,
     pub def: TransformDef,
-    /// A `schema_changed` marker paused it (C6, `capture_failures`).
+    /// A `schema_changed` marker paused it (`staging::schema_change`,
+    /// `capture_failures`).
     pub capture_failed: bool,
     /// The stamp its paused message was written at
     /// (`capture_failures.refresh_stamp`, `staging::pause_message`).

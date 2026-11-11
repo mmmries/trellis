@@ -54,7 +54,7 @@
 //!   `src_changed = clock_timestamp()`, both read once per statement.
 //!
 //! The function records its column set in `COMMENT ON FUNCTION`, as JSON
-//! ([`comment_text`]). C3 reads the installed state back from the catalog
+//! ([`comment_text`]). The installer reads the installed state back from the catalog
 //! that way, and `pg_dump` carries it.
 //!
 //! # Names
@@ -83,7 +83,8 @@ pub const SCHEMA_CHANGED_OP: &str = "schema_changed";
 
 /// The ring `op` of the marker a partitioned source's truncate function
 /// writes when the table truncated is a leaf or middle of the tree rather
-/// than the root (ADR-0017 P5), keyed by [`NODE_TRUNCATE_SENTINEL_KEY`]
+/// than the root (ADR-0017, "A leaf or middle `TRUNCATE` queues that node's
+/// correction"), keyed by [`NODE_TRUNCATE_SENTINEL_KEY`]
 /// under the root's `src_table`. Its `new_image` names the node: `{"node":
 /// "<schema>.<table>", "oid": <oid>}`, unquoted as `src_table` is. It has no
 /// `old_image`. It is no `truncate`: it raises no truncate
@@ -321,7 +322,7 @@ pub fn trigger_name(schema: &str, event: CaptureEvent) -> String {
 /// (which keeps capture on for a session in `session_replication_role =
 /// replica`).
 ///
-/// C3 runs these in one retried transaction under `locks::DdlRetry`, with the
+/// The installer runs these in one retried transaction under `locks::DdlRetry`, with the
 /// install's gate. `CREATE OR REPLACE TRIGGER` needs PostgreSQL 14.
 pub fn install_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<String>, CaptureError> {
     let mut statements = Vec::with_capacity(CaptureEvent::ALL.len() * 5);
@@ -367,8 +368,8 @@ pub fn drop_node_trigger_statements(schema: &str, node: &str) -> Result<Vec<Stri
 
 /// Every statement that replaces `spec`'s capture functions without touching
 /// the triggers, in order: per event, the function, the revoke of `PUBLIC`'s
-/// `EXECUTE` and the comment. A widen or narrow runs these (C3,
-/// `capture::install`); `CREATE OR REPLACE FUNCTION` keeps the function's
+/// `EXECUTE` and the comment. A widen or narrow runs these
+/// (`capture::install`); `CREATE OR REPLACE FUNCTION` keeps the function's
 /// owner and privileges, and the revoke is repeated anyway so the statements
 /// stand on their own.
 pub fn function_statements(schema: &str, spec: &CaptureSpec) -> Result<Vec<String>, CaptureError> {
@@ -491,7 +492,7 @@ pub fn comment_ddl(
 
 /// What a capture function's comment records, as a JSON object: the table,
 /// the event, the key and image columns, and a hash of the
-/// function's source as generated ([`body_hash`]). C3's `installed(table)`
+/// function's source as generated ([`body_hash`]). `capture::install::installed`
 /// reads the spec back to decide whether the installed functions match the
 /// spec the catalog now asks for; the capture pass compares the hash with
 /// the live source to tell a function an older generator left behind (its
@@ -585,7 +586,7 @@ fn qualified_function_name(
 }
 
 /// What `pg_proc.prosrc` holds for the function [`function_ddl`] creates:
-/// the text between the dollar quotes. C3's `installed` compares the two to
+/// the text between the dollar quotes. `capture::install::installed` compares the two to
 /// tell a function this build would generate from one an older generator,
 /// or a hand edit, left behind.
 pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
@@ -621,7 +622,9 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// and a statement after one in the same transaction probes the new catalog.
 /// The truncate function images nothing, so it has no probe.
 ///
-/// # A table that left the tree stages nothing (ADR-0017 P2b)
+/// # A table that left the tree stages nothing
+///
+/// ADR-0017, "Capture stages nothing for a table that has left the tree".
 ///
 /// For a partitioned source, each function first compares
 /// `pg_partition_root(tg_relid)` with the source root and returns unless
@@ -675,8 +678,9 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// older than the statement (a nested or sibling statement's), a `BEFORE`
 /// with no matching capture (several `ModifyTable` nodes share one `AFTER`
 /// call), or no `start` at all (`-1`: the begin trigger was disabled or
-/// missing, which the C9 audit reports). A subtransaction that rolls back
-/// restores the setting with the writes it undid. The setting is the
+/// missing, which the capture audit (`staging::capture_audit`) reports). A
+/// subtransaction that rolls back restores the setting with the writes it
+/// undid. The setting is the
 /// application's to overwrite, as it could disable the triggers; doing so
 /// can only cost it its own derived data, and the re-read itself never reads
 /// another transaction's row either way.
@@ -846,7 +850,8 @@ fn root_guard(spec: &CaptureSpec) -> String {
 }
 
 /// The partitioned source's truncate function's second statement, after the
-/// [`root_guard`]: decide what the truncate stages (ADR-0017 P5).
+/// [`root_guard`]: decide what the truncate stages (ADR-0017, "A leaf
+/// or middle `TRUNCATE` queues that node's correction").
 ///
 /// # A node's truncate names the node
 ///

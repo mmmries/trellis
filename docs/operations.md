@@ -4,29 +4,83 @@ What to do when Trellis stops a definition, and how each repair behaves.
 Trellis stops rather than guess: it pauses a definition it can't keep
 correct, holds a key it can't apply, and holds back a page it can't commit,
 and it says so on `status()`. A stopped target is behind, not wrong.
-[Observability](observability.md#transform-status-lifecycle) defines each
-status and field. [Known correctness gaps](known-correctness-gaps.md) lists
-the ways a target can go wrong without a stop, and names the repair for each.
+The [status reference](status-reference.md) defines each status and field.
+[Known correctness gaps](known-correctness-gaps.md) lists the ways a target
+can go wrong without a stop, and names the repair for each.
 
 ## When a definition needs you
 
+### Paused definitions
+
+A definition Trellis paused reads `paused`, with the reason on its
+[`capture_failure`](status-reference.md#capture_failure): each reason below
+is one sentence of its `error`, which begins as the first column shows
+(`<…>` marks a name or value the message fills in), names its cause and says
+what to do. A definition paused for several reasons lists them all, the
+newest first, and `RESUME` honours all of them. Every row's repair ends with
+`RESUME`, which re-validates the definition and rebuilds it
+([`PAUSE` and `RESUME`](#pause-and-resume)), or with `DROP TRANSFORM` and
+define it again. Trellis never resumes a definition on its own, except where
+a row says so.
+
+| The reason begins | It means | Do |
+|---|---|---|
+| (no `capture_failure`, and no `backfill_failure`) | An operator ran `PAUSE TRANSFORM` | `RESUME` when you're ready |
+| (no `capture_failure`; the error is on `backfill_failure`) | Its build kept failing in a way no retry gets past: a chunk failure that is neither transient nor narrowed to a key, on its fifth charged attempt, or an aggregate's build, which can't be narrowed to a key ([A build that keeps failing](observability.md#a-build-that-keeps-failing)) | Fix what the error names, then `RESUME` |
+| `column <columns> of <table>, which this definition reads, was renamed or dropped` | A source column it reads was renamed or dropped; capture now leaves it out ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)). The staging worker drops the reason once the column is back | Restore the column, then `RESUME`; or `DROP TRANSFORM` and define it again |
+| `the primary key of <table> changed from (<columns>) to (<columns>)` | Its source's primary key was redefined, or another definition's resume re-recorded the table's key while this one ran. The staging worker drops the reason once the key is put back | `RESUME`, which rebuilds it over the new key, re-keying a 1-1 target in place first ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)) |
+| `no valid unique index backs KEY (<columns>) on <table> any more` | The unique index backing a declared `KEY (…)` was dropped or made invalid, so the table can take two rows with one key. The staging worker drops the reason once an index backs it | Create the index the message names (build a replacement before dropping the old one), then `RESUME`. On a partitioned table, re-run `ALTER INDEX … ATTACH PARTITION` for a repaired leaf's index |
+| `no valid index on <table> has led with (<columns>) in that order for 5 minutes` | A `MIN`/`MAX` field's probe index was missing on every staging worker pass for 5 minutes ([`extreme_index_gaps`](status-reference.md#extreme_index_gaps)). The staging worker drops the reason once the index exists | Create the index the message names, then `RESUME` |
+| `the unique key on the ON columns of <table> (<columns>) is gone` | A 1-1 `JOIN`'s joined table lost the unique key on its `ON` columns, so a row of the `FROM` table can match more than one of its rows | Create the unique index again (remove duplicates first), then `RESUME` |
+| `column "<column>" of <table> is a virtual generated column` | A column it reads became a virtual generated column, which a capture trigger can't read | Make the column `STORED`, then `RESUME`; or define it again with the expression in place of the column |
+| `column "<column>" of <table>, <key use>, …`, `column "<column>" of <table>, which this definition reads, changed type from …` or `… was dropped and re-added as …`, `ON joins …`, `column "<column>" of <table> widened to …`, or `Trellis keeps columns typed from …` | A column it reads, keys by, or keeps a typed copy of changed type or collation: define would now refuse it, a `JOIN`'s `ON` columns no longer match, its stored keys render differently, or a copy Trellis created can't hold the new type (or was re-typed outside Trellis) | Make the schema acceptable (the message says how; a resume refuses while define would), then `RESUME`, which re-types Trellis's copies and rebuilds; or `DROP TRANSFORM` and define it again |
+| `the resume of transform <name> re-typed <columns>, which this definition reads` | An upstream's resume re-typed columns of its target that this definition's own columns or keys were typed from | Nothing: it resumes on its own once `<name>` is `live`. A `PAUSE` withdraws that, and the message says so; then `RESUME` it |
+| A define refusal, then `A resume of <table> re-typed <columns>` | An upstream's resume re-typed its target into something define would refuse for this definition | Fix what the message names, then `RESUME`; or `DROP TRANSFORM` and define it again |
+| `row-level security on <table> applies to role <role>` or `row-level security on target <table> applies to role <role>` | Row-level security came to apply to a role Trellis reads a source or writes its target as, so its policies would filter Trellis's reads or writes ([row-level security](transforms.md#row-level-security-on-a-role-trellis-runs-as)) | Exempt the role (`BYPASSRLS`, or make it the owner without `FORCE ROW LEVEL SECURITY`), then `RESUME` |
+| `<table> is replicated into by logical-replication subscription <subscription>` | A subscription replicates into a table it reads, and capture never sees the changes its apply worker applies | Stop replicating into the table, or drop the subscription, then `RESUME` |
+| `<table> is a partitioned table`, `<table> became a partition of <parent>`, or `… inherits from …` | A captured plain table joined a partition or inheritance hierarchy | Make it a plain table again, then `RESUME` |
+| `partitioned table <table> …` | A partitioned source stopped meeting the shape define accepts: its partition-key column, the leaf limit, the server version | Make the tree comply ([the refusal table](transforms.md#supported-sources-and-targets)), then `RESUME` |
+| `enum value '<old>' of type <type> was renamed to '<new>'`, or `column "<column>" of <table>, which this definition reads, changed type from enum <type> to enum <type>` | `ALTER TYPE … RENAME VALUE`, or a re-type to another enum, on a column it reads: the changes it staged and the keys it holds name the old label ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)). Every definition reading a column of the type pauses | `RESUME`, which waits for the changes staged before the relabel to drain, then rebuilds the target from the source |
+| `Trellis's capture of <table> was changed outside Trellis: …` | A capture trigger is gone, was dropped and created again, is disabled, is enabled in `ORIGIN` or `REPLICA` mode, or was altered; a capture function was replaced; or the table, or a partitioned root, was dropped and created again or swapped in by renames (on a partitioned source's node, "(on `<node>`)" follows each finding). Changes made meanwhile may be missing ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)). Its `kind` is `disruption` | Put the table back if it was a mistake, then `RESUME`, which reinstalls capture and rebuilds |
+| `the table <table> no longer exists at that name` | The table was dropped, renamed away, moved to another schema, or replaced by something that isn't a table. Its `kind` is `disruption` | Put a table there again, then `RESUME`, which re-validates against it (it refuses while the table is missing) |
+| `the database was restored from a logical dump` | Every definition, whatever its kind and source, pauses: the ordering state the dump brought belongs to the original database ([ADR-0002](decisions/0002-async-data-flow.md), [ADR-0017](decisions/0017-partitioned-sources.md)). Its `kind` is `disruption` (`capture` on one already paused) | `RESUME` each definition, which resets that state and rebuilds it ([After a restore or an upgrade](#runbooks)) |
+| `transform <target> reads <upstream>, whose transform the restore of the schema dump stored paused` | A [schema dump](embedding.md#schema-dumps) restore stored its upstream paused | `RESUME` the upstream, then this one |
+| `this release can't run transform <target>: …` | Its `floor` is above this release, or it was written under a newer grammar, or a newer release stored a value for it (its status, its build, a build chunk's kind, a build job's cursor tag or a partition correction's phase), or the partition tree of a source it reads, that this one doesn't know: a later release defined, rebuilt or ran it, and this one was rolled back to ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). Trellis pauses it when it attaches, when a background process takes over, and before each state-changing call, and never reads its text. Its target keeps its rows and stops updating; the rest of the instance runs | Roll forward to the release the message names or later, then `RESUME` it there, which rebuilds it, or `DROP` it there ([before rolling back](upgrading.md#before-rolling-back)) |
+| `the stored definition was written under grammar version <n>, and this binary reads grammar versions <oldest> and later`, or `the stored definition of transform <target> is refused by this release` | Its stored text is older than this release reads, or this release refuses it | `DROP TRANSFORM` and define it again in the current grammar |
+| `transform <target> was built by an earlier release over <table>'s key with its INCLUDE columns`, or `transform <target> reads <source>, which an earlier release built over …` | A release before 0.2.0 read a source key's `INCLUDE` columns (`primary key (id) include (x)`) as key columns, so the definition's target, ledger and staged keys are keyed by them too, as is a 1-1 transform reading its 1-1 target. The upgrade pauses each such definition once | `RESUME` (a reader's waits for its upstream's), which re-keys a 1-1 target in place (its rows, your indexes and grants stay; the former key column it no longer creates is dropped) and rebuilds; it refuses, naming them, while a view or index of yours depends on that column. Or `DROP TRANSFORM` and define it again |
+| `transform <target> reads <table>, which has no primary key`, `transform <target> reads <table>, whose primary key (<columns>) is deferrable`, or `<target> must name its key as KEY (...)` | An earlier release keyed it by a key Trellis no longer takes: a unique index it chose for a table with no primary key, or a deferrable primary key ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)). The upgrade pauses it | Add the primary key the message names (not deferrable), then `RESUME`; or `DROP TRANSFORM` and define it again with a valid `KEY (…)` |
+| `the drain halted: …` or `the re-derive build of <target> couldn't start: …`, kind `halt` | A failure every key reproduces (a source key the drain can't use, a propagation wave past the hop bound, an aggregate the group basis can't apply, a read or write refused to a role Trellis runs as: a missing privilege, naming the role and the table, or row-level security), or a build start that fails the same way on every pass. It pauses the definitions it reaches and everything downstream of them ([A halting failure](observability.md#a-halting-failure)) | Fix the cause (grant the privilege, or `BYPASSRLS`), then `RESUME` each halted definition, in any order |
+
+A definition this release can't run gets that reason first, with any reason
+it was already paused for after it, and no "RESUME would …" outcome. For a
+source whose recorded partition tree this release can't read, the capture pass
+records the reason on every definition reading the source, leaving the
+record as it is. Until the definition is paused, `status()` of one whose
+status this release doesn't know refuses with the `version_floor` code, and a
+`capture_failure` whose kind it doesn't know reports kind `unknown`.
+`RESUME`, `ALTER TRANSFORM` and `self_check` of it refuse with the
+`version_floor` code while what this release can't run is still stored: its
+floor or grammar, a value a newer release stored for it other than its status
+or a capture failure's kind (the pause replaces those, so this release
+resumes it), or a source's unreadable partition record. `DROP TRANSFORM` of
+one above its floor refuses too.
+
+Two more messages describe a paused definition's state rather than a reason:
+
+| The message begins | It means | Do |
+|---|---|---|
+| `resuming: …` | A `RESUME` is re-typing copies, waiting for an upstream to go `live`, or waiting for the changes staged before an enum relabel, or a re-type to another enum, to drain | Wait. A `PAUSE` withdraws the resume |
+| `the cause it was paused for is gone` | Every reason it was paused for was fixed while it stayed paused (a column renamed back, a primary key put back); the staging worker never resumes it on its own ([`capture_failure`](status-reference.md#capture_failure)) | `RESUME`, which does what the message's "RESUME would …" says, as the schema stands when it runs |
+
+### Other stops and waits
+
 | You see | It means | Do |
 |---|---|---|
-| `paused`, with a `capture_failure` saying capture was changed outside Trellis, or the table is gone from its name | A trigger was disabled, dropped or recreated, a capture function was replaced, or the table was dropped, renamed away or swapped, so changes may be missing | Put the table back if it was a mistake, then `RESUME` |
-| `paused`, with a `capture_failure` naming a column or the primary key | A schema change the definition can't follow as written, or copies Trellis must re-type | Make the schema acceptable (the message says how), then `RESUME`; or `DROP TRANSFORM` and define it again |
-| `paused`, with a `capture_failure` naming a role and a table | A read or write refused to a role Trellis runs as: a missing privilege or row-level security ([A halting failure](observability.md#a-halting-failure)) | Grant the privilege, or `BYPASSRLS`, then `RESUME` |
-| `paused`, with a `capture_failure` naming a partition-key column or the leaf limit | A partitioned source stopped meeting the shape define accepts | Make the tree comply ([the refusal table](transforms.md#supported-sources-and-targets)), then `RESUME` |
-| `paused`, with a `capture_failure` saying an enum value was renamed | `ALTER TYPE … RENAME VALUE` on an enum it reads: the changes it staged and the keys it holds name the old label | `RESUME`, which rebuilds the target from the source ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)) |
-| `paused`, with a `capture_failure` saying the database was restored from a logical dump | Every definition's ordering state came from the original database | `RESUME` each definition, which rebuilds it ([After a restore or an upgrade](#runbooks)) |
-| `paused`, with a `capture_failure` reading "this release can't run transform …" | The definition's `floor` is above this release, or it was written under a newer grammar, or a newer release stored a value for it, or the partition tree of a source it reads, that this one doesn't know: a later release defined, rebuilt or ran it, and this one was rolled back to. Its target keeps its rows and stops updating; the rest of the instance runs. `RESUME`, `ALTER` and `self_check` of it refuse with the `version_floor` code while what this release can't run is still stored (the pause replaces an unknown status or capture failure kind, so those resume here), and `DROP` of one above its floor refuses | Roll forward to the release the message names or later, then `RESUME` it there, which rebuilds it, or `DROP` it there ([before rolling back](upgrading.md#before-rolling-back)) |
-| `paused`, with a `capture_failure` saying an earlier release built it over a key's `INCLUDE` columns | A release before 0.2.0 read a source key's `INCLUDE` columns (`primary key (id) include (x)`) as key columns, so the definition's target, ledger and staged keys are keyed by them too, as is a 1-1 transform reading its 1-1 target. The upgrade pauses each such definition once | `RESUME` (a reader's waits for its upstream's), which re-keys a 1-1 target in place (its rows, your indexes and grants stay; the former key column it no longer creates is dropped) and rebuilds; it refuses, naming them, while a view or index of yours depends on that column. Or `DROP TRANSFORM` and define it again |
-| `paused`, with a `capture_failure` reading "resuming: …" | A `RESUME` is re-typing copies, waiting for an upstream to go `live`, or waiting for the changes staged before an enum relabel, or a re-type to another enum, to drain | Wait. A `PAUSE` withdraws the resume |
-| `paused`, with a `capture_failure` reading "the cause it was paused for is gone" | Every reason it was paused for was fixed while it stayed paused (a column renamed back, a primary key put back); the staging worker never resumes it on its own ([transform status](observability.md#transform-status-lifecycle)) | `RESUME`, which does what the message's "RESUME would …" says, as the schema stands when it runs |
 | `quarantined` | Too many of its keys failed to apply, so the whole-definition fuse tripped | Fix the cause `sample_quarantined` shows, then `RESUME` |
 | A column `paused`, with a `last_error`, in `Trellis::quarantined()` (`quarantine_status("<target>.<column>")`, the `trellis.column_status` table) on a `live` definition | One field failed for too many rows (Postgres couldn't compute it: an overflow, a division by zero, a constant Postgres fails while planning), so its column fuse tripped. Rows already written keep their last value of it, new rows get `NULL` for it, and its other fields keep updating | Fix the cause `sample_quarantined("<target>.<column>")` shows, then `RESUME TRANSFORM <target>.<column>`, which rebuilds that column |
 | `held_keys` | Keys that keep failing to apply are held, with their target rows frozen | Fix the cause, then [release them](#releasing-held-keys) |
-| `drain_failure` | A page that fails in a way no key can be charged for is held back, and every watermark taken since waits on it | Fix what the error names; the next pass commits the page ([A page that fails only for several definitions together](#a-page-that-fails-only-for-several-definitions-together)) |
-| `backfill_failure` | A build or correction chunk keeps failing | Fix what the error names; it retries |
+| `drain_failure` | A page that fails in a way no key can be charged for is held back, and every watermark token taken since waits on it | Fix what the error names; the next pass commits the page ([A page that fails only for several definitions together](#a-page-that-fails-only-for-several-definitions-together)) |
+| `backfill_failure` on a definition that isn't paused | A build or correction chunk keeps failing | Fix what the error names; it retries |
 | `capture_wait` | Installing or widening capture is waiting for a table lock | Wait for the lock holder it names |
 | A `self_check` report with divergences | The target differs from a recompute of it | Find the gap in [known correctness gaps](known-correctness-gaps.md) and use its repair |
 | `version_handover`, and state-changing calls refused with the `version_handover` code | A Trellis process of another version is live on the instance: this version's background processes stand by and its changes refuse ([version handover](decisions/0023-version-handover.md)) | Stop the other version's processes; this version takes over within a standby poll (5 seconds), or the reclaim TTL (30 seconds) after a process killed without a clean shutdown ([rolling deploys](embedding.md#rolling-deploys)) |
@@ -54,11 +108,15 @@ naming both. It repairs what a rebuild repairs, with the same exceptions
 
 `PAUSE TRANSFORM <target>` freezes a definition, holding its last values
 ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)).
-`RESUME TRANSFORM <target>` rebuilds it from its sources.
+`RESUME TRANSFORM <target>` rebuilds it from its sources, returning it to
+`waiting_to_backfill`. A `PAUSE` of a definition whose resume is still
+waiting (below) withdraws the resume, and its `capture_failure` says so.
 
 **What a resume checks.** A resume first runs define's validation against the
-live schema, and refuses while define would, leaving the definition paused;
-the error names the column and what to change. A whole-transform resume also
+live schema, and refuses while define would (a column it reads is gone or
+retyped into something it can't use), leaving the definition paused and
+untouched; the error, `ApplyError::ResumeRefused`, is define's own, naming
+the column and what to change. A whole-transform resume also
 refuses, as define does, while a source index the definition's `self_check`
 pages by is missing, unless it was defined `WITHOUT SOURCE INDEX`; create the
 index the message names, then resume. It also refuses in two cases
@@ -67,9 +125,14 @@ define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 * its target table is missing;
 * its ledger table is missing.
 
-A 1-1 definition whose source key changed while it was paused has its target
-re-keyed in place to the new key first, or the resume refuses naming what
-blocks it ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
+It also refuses while a key it uses changed in a way it can't re-record: a
+table it reads has no primary key left to take, its target lost the index
+over its key, or re-keying a 1-1 target to its source's new key would take a
+column name the target already has, or drop a column or key constraint an
+object of yours depends on. A 1-1 definition whose source key changed while
+it was paused has its target re-keyed in place to the new key first, or the
+resume refuses naming what blocks it
+([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
 
 A `JOIN` has no ledger. Its resume drops and recreates its hidden tables
 instead, keeps the target, and rebuilds both sides and the target's groups
@@ -80,7 +143,8 @@ ledger either, drops and recreates its hidden partials table and keeps the
 visible target, which its rebuild rewrites; its build rebuilds the target's
 readers likewise. A field resume
 (`RESUME TRANSFORM <target>.<column>`) runs define's validation and the
-source-key check, and refuses a field whose capture is still being widened.
+source-key check, but not the ledger check, since it rebuilds nothing, and
+refuses a field whose capture is still being widened.
 It also refuses while the definition is paused, so when one field's failures
 trip both its column fuse and the whole-transform fuse, run `RESUME TRANSFORM
 <target>` first and then `RESUME TRANSFORM <target>.<column>`.
@@ -92,15 +156,21 @@ trip both its column fuse and the whole-transform fuse, run `RESUME TRANSFORM
   calculated and aggregate columns. The `RESUME`
   returns at once; the definition stays `paused`,
   its `capture_failure` reading "resuming: …", until the staging worker has
-  re-typed them and started the rebuild. A re-type that fails leaves its
+  re-typed them (an `ALTER … TYPE` that waits for the table's lock) and
+  started the rebuild. A re-type that fails leaves its
   error on `capture_failure` and the target's rows in place. When values
   can't be converted (a key moved from `text` to `uuid` by a `USING` that
   isn't a cast), the repair is to `DROP TRANSFORM` and define it again:
-  Trellis doesn't empty a target the application reads on its own.
+  Trellis doesn't empty a target the application reads on its own. A
+  re-type of a target pauses the definitions chained off it whose own
+  columns were typed from the old type: their `capture_failure` names the
+  upstream's resume, and the staging worker resumes them once the upstream is
+  `live` again ([paused definitions](#paused-definitions)).
 * A definition that reads another definition's target while that one isn't
   `live` waits for it: the `RESUME` returns at once, and the definition stays
   `paused`, its `capture_failure` reading "resuming: waiting for transform …
-  to be live", until the upstream is.
+  to be live", until the upstream is; then the staging worker resumes it. An
+  upstream `catching_up` only for a paused column it reads doesn't hold it.
 * A definition paused for an enum relabel waits for the changes staged
   before the relabel to drain: the `RESUME` returns at once, and the
   definition stays `paused`, its `capture_failure` reading "resuming:
@@ -108,7 +178,8 @@ trip both its column fuse and the whole-transform fuse, run `RESUME TRANSFORM
   drain", until none is pending. A target keyed by a source key with an
   enum column is then emptied and rebuilt as define builds it.
 * It re-reads every current source row and rewrites the target from it. It
-  doesn't replay the changes it skipped while paused, so its cost scales with
+  doesn't replay the changes it skipped while paused (the change stream is
+  drained for the definition's siblings meanwhile), so its cost scales with
   the data, not with the length of the pause.
 * It releases every key the definition holds in quarantine, and only that
   definition's. A key whose cause is still there fails again and is held
@@ -170,6 +241,21 @@ audit. What clears a held key:
   for a failure the upstream caused while it was being rebuilt clears by
   itself. A key whose failure persists is held again after one attempt, and
   a paused definition keeps its keys.
+
+A released key whose cause is still there is held again. A release first
+waits for the drain pages in flight on the key's table to commit, so it can't
+miss a change one of them is parking for the key. If that wait runs past the
+lock timeout every Trellis connection has (30 seconds at most), the release
+fails with a `timeout` error that says so, and changes nothing: the key is
+still held, and running the release again releases it once the pages commit.
+
+`trellis status` prints each held key, its table and its transform quoted for
+the shell where they need it, so they paste into `trellis release` as
+printed: text goes inside `'...'`, with a quote written `'\''`, and a control
+character, such as the separator between a composite key's columns, is
+written `$'\ooo'` in octal, which bash and zsh read. A value that is exactly
+`-h`, `--help`, `-d` or `--database-url` goes after a `--`: `trellis release
+-- <transform> <table> <key>`.
 
 After a type a definition reads is renamed or moved to another schema, the
 capture pass records its new name and then releases the keys held for a cast

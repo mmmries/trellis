@@ -5,18 +5,17 @@
 //! appends the statement's changes to the active ring segment inside the
 //! writer's own transaction. So a ring row's `row_txid` (the ring's `DEFAULT
 //! pg_current_xact_id()`) is the source commit's `xid8`: invariant I0,
-//! exact identity, which D relies on from its first ledger write.
+//! exact identity, which staging relies on from its first ledger write.
 //!
 //! This module is built in parts:
 //!
 //! - [`columns`] decides which columns a table's triggers image, from the
-//!   catalog (C2).
-//! - [`sql`] generates the functions and triggers for one table (C2).
+//!   catalog.
+//! - [`sql`] generates the functions and triggers for one table.
 //! - [`install`] installs, widens, narrows and uninstalls them under
-//!   `locks::DdlRetry`, and reads back what is installed from the catalog
-//!   (C3).
+//!   `locks::DdlRetry`, and reads back what is installed from the catalog.
 //! - [`reconcile`] is the staging worker's pass that calls it for every
-//!   table, and decides which waiting definitions' builds may start (C5).
+//!   table, and decides which waiting definitions' builds may start.
 //!
 //! # What the images must equal
 //!
@@ -75,7 +74,7 @@ pub enum CaptureError {
     /// column of the table. A renamed or dropped column lands here while a
     /// definition that isn't paused still reads it, until the reconcile
     /// pass, or the drain on the capture function's marker, pauses that
-    /// definition (C6, `staging::schema_change`).
+    /// definition (`staging::schema_change`).
     MissingColumn { table: String, column: String },
     /// A table name that isn't a `schema.table` identity with exactly one
     /// separating `.` (see `intake::qualify`).

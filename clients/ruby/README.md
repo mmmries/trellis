@@ -60,7 +60,9 @@ Nothing in the binding uses it.
   (`:transform_defined`, `:paused`, `:resumed`, ...).
   `Trellis.define(statement)` is an `apply` that refuses anything but a
   `TRANSFORM`, and returns its fully qualified target table.
-- `Trellis.status(target_table)`, `Trellis.definitions`: the catalog reads.
+- `Trellis.status(target_table)`, `Trellis.definitions`: the catalog reads
+  (each status word and field: the
+  [status reference](../../docs/status-reference.md)).
 - `Trellis.quarantined`, `Trellis.quarantine_status(target)`,
   `Trellis.sample_quarantined(target, limit:, after:)`,
   `Trellis.poisoned_since(time)`: the quarantine reads. Resuming is a
