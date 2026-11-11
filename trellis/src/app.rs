@@ -957,18 +957,24 @@ impl Trellis {
     /// with [`TrellisError::MigrationsPending`] (code `version_handover`).
     pub async fn definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
         self.call(async {
-            match self.read_definitions().await {
+            // One connection for the whole call: a call's connection goes
+            // back to the pool only once its session reset lands, so a second
+            // checkout would open a second connection.
+            let mut client = self.pool.get().await?;
+            match self.read_definitions(&mut client).await {
                 Ok(definitions) => Ok(definitions),
-                Err(error) => Err(self.unless_pending(error).await),
+                Err(error) => Err(self.unless_pending(&client, error).await),
             }
         })
         .await
     }
 
-    /// [`Trellis::definitions`]'s read of the catalog.
-    async fn read_definitions(&self) -> Result<Vec<DefinitionSummary>, TrellisError> {
+    /// [`Trellis::definitions`]'s read of the catalog, on `client`.
+    async fn read_definitions(
+        &self,
+        client: &mut deadpool_postgres::ClientWrapper,
+    ) -> Result<Vec<DefinitionSummary>, TrellisError> {
         async {
-            let mut client = self.pool.get().await?;
             // One repeatable-read transaction, so the reported statuses are
             // derived from the same catalog state the rows come from.
             let txn = client
@@ -1104,10 +1110,12 @@ impl Trellis {
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
         self.call(async {
+            // One connection for the whole call, as in `definitions`.
+            let mut client = self.pool.get().await?;
             // A role that can't read the migration history still reads the
             // status, as it did before `migrations_pending` existed.
-            let pending = self.migrations_pending_now().await.ok().flatten();
-            match (self.read_status(target_table).await, pending) {
+            let pending = self.migrations_pending_now(&client).await.ok().flatten();
+            match (self.read_status(&mut client, target_table).await, pending) {
                 (Ok(status), pending) => Ok(status.map(|mut status| {
                     status.migrations_pending = pending;
                     status
@@ -1127,10 +1135,9 @@ impl Trellis {
     /// (ADR-0023, rule 3); `None` when nothing is pending.
     async fn migrations_pending_now(
         &self,
+        client: &tokio_postgres::Client,
     ) -> Result<Option<crate::handover::MigrationsPending>, TrellisError> {
-        let client = self.pool.get().await?;
-        let migrations =
-            crate::migrate::pending_migrations(&**client, self.config.schema()).await?;
+        let migrations = crate::migrate::pending_migrations(client, self.config.schema()).await?;
         Ok(
             (!migrations.is_empty()).then(|| crate::handover::MigrationsPending {
                 this_version: self.config.binary_version().to_string(),
@@ -1143,8 +1150,12 @@ impl Trellis {
     /// `error`, unless this binary's migrations are pending: then a read
     /// that failed likely met a catalog it can't read until they run, and
     /// refuses with [`TrellisError::MigrationsPending`], carrying `error`.
-    async fn unless_pending(&self, error: TrellisError) -> TrellisError {
-        match self.migrations_pending_now().await {
+    async fn unless_pending(
+        &self,
+        client: &tokio_postgres::Client,
+        error: TrellisError,
+    ) -> TrellisError {
+        match self.migrations_pending_now(client).await {
             Ok(Some(pending)) => TrellisError::MigrationsPending {
                 pending,
                 error: Box::new(error),
@@ -1153,13 +1164,13 @@ impl Trellis {
         }
     }
 
-    /// [`Trellis::status`]'s read of the catalog.
+    /// [`Trellis::status`]'s read of the catalog, on `client`.
     async fn read_status(
         &self,
+        client: &mut deadpool_postgres::ClientWrapper,
         target_table: &str,
     ) -> Result<Option<DefinitionStatus>, TrellisError> {
         async {
-            let mut client = self.pool.get().await?;
             // `target_table` is either spelling of the transform's name, the
             // qualified one `apply` returns or the bare one its text declared
             // (`defs::catalog::target_match_sql`).
