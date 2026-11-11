@@ -861,17 +861,20 @@ Two structural notes for when faults enter the stream:
   failpoints where races live); the *schedule* is not. Seeds replay the placement;
   the oracle judges converged state at quiescence, which is schedule-independent.
 
-## 8. Four layers, one action vocabulary
+## 8. Three layers, one action vocabulary
 
-| Layer | Trigger | Judged by | Reproducible? | Cadence |
-|---|---|---|---|---|
-| 1. Deterministic (unit, integration, scripted interleaving pins) | scripted | assertion | fully | every run |
-| 2. Generative, healthy path | random program, seeded | recompute oracle at quiescence | at program level (shrinking) | every run |
-| 3. Generative + fault actions | random program incl. faults, seeded | same oracle at quiescence | at program level (shrinking) | minutes–hours |
-| 4. Black-box chaos | wall-clock random | invariants over recorded history | no | nightly / pre-release |
+The suite's place among the [testing tiers](testing-strategy.md), split by what
+judges a run:
 
-- **Layer 1** is `trellis/tests/*` and the `testkit` crash/straddler
-  pins. Every race bug found by layers 2–4 terminates as a layer-1 pin here.
+| Layer | Tiers | Trigger | Judged by | Reproducible? | Cadence |
+|---|---|---|---|---|---|
+| 1. Deterministic (unit, integration, scripted interleaving pins) | 3–4 | scripted | assertion | fully | every run |
+| 2. Generative, healthy path | 5 | random program, seeded | recompute oracle at quiescence | at program level (shrinking) | nightly, and on demand with `-- --ignored` |
+| 3. Generative + fault actions | 5 | random program incl. faults, seeded | same oracle at quiescence | at program level (shrinking) | minutes–hours |
+
+- **Layer 1** is `trellis/tests/*`, its pause-point interleaving pins, and the
+  hand-built pins in `generative/tests/pins`. Every race bug found by layers 2–3
+  terminates as a layer-1 pin.
 - **Layer 2** is the healthy-path properties of §4.
 - **Layer 3** is reachable only because a fault action is an oracle identity (§7)
   and because the generative and scripted harnesses **share one action vocabulary**:

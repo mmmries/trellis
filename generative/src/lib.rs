@@ -13,13 +13,17 @@
 //!   reads back derived state.
 //! - [`run`] — drives a program through a backend, asserts the properties.
 //!
-//! [`baseline_quarantine`] sits beside them: the planted-bug sweep's baseline
-//! bar and its checked-in list of known, filed failures. So does
-//! [`invariant`], the 1-1 `JOIN` tier's in-run check of hidden state, which
-//! reads that state through `trellis::dev` and judges it in pure code.
+//! Beside them:
 //!
-//! `generate`/`oracle`/`run` are skeletons today; [`model`] and [`backend`]
-//! are this issue's substance.
+//! - [`shrink`] — how long a property's failure may shrink before it reports.
+//! - [`expr_gen`] and [`expr_conformance`] — generated typed expressions,
+//!   and the properties that check them against a real Postgres.
+//! - [`plant_sweep`] — the planted-bug sweep: a tier's seeded cases run once
+//!   per planted bug (`trellis::dev::plant`), judged on whether it catches each.
+//! - [`baseline_quarantine`] — the sweep's baseline bar and its checked-in
+//!   list of known, filed failures.
+//! - [`invariant`] — the 1-1 `JOIN` tier's in-run check of hidden state, which
+//!   reads that state through `trellis::dev` and judges it in pure code.
 
 // Every module below names `trellis::dev` — ADR-0012's curated, uncommitted
 // re-export of the engine items this suite's oracle and backends need — which
