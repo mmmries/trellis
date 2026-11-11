@@ -5471,6 +5471,9 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
 }
 
 #[cfg(test)]
+pub(super) mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

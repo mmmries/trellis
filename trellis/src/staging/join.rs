@@ -1986,6 +1986,9 @@ pub(crate) async fn target_column_types(
 }
 
 #[cfg(test)]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
