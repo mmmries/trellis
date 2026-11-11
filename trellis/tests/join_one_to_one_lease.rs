@@ -7,10 +7,11 @@
 //! when it reaches it, and nothing it wrote commits.
 //!
 //! The scenarios fan out to 25 rows, well inside one fan-out chunk, so the
-//! page recomputes them all itself, and play the lease by hand: aging a claim and sweeping it is what a stalled worker looks like
-//! once the TTL passed (`reclaim_stale`, as `drain_paging.rs` does), and the
-//! heartbeat daemon runs for real against a short interval. Nothing sleeps:
-//! the only waits are on a concrete condition with a bound.
+//! page recomputes them all itself. They play the lease by hand: aging a
+//! claim and sweeping it is what a stalled worker looks like once the TTL
+//! passed (`reclaim_stale`, as `drain_paging.rs` does), and the heartbeat
+//! daemon runs for real against a short interval. Nothing sleeps: the only
+//! waits are on a concrete condition with a bound.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -178,7 +179,7 @@ async fn backend_xid(d: &Driver, pid: i32) -> String {
         .expect("the frozen page has written, so it holds an xid")
 }
 
-/// A fan-out of exactly one chunk whose worker loses its claim to the TTL
+/// A fan-out within one chunk whose worker loses its claim to the TTL
 /// sweep while the page is frozen before the fan-out, holding the key's
 /// locks. The second instance claims the freed bucket and queues behind the
 /// page's locks; when the first goes on it writes its 25 rows, fails its
