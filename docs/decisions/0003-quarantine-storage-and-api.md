@@ -326,7 +326,7 @@ until one of these releases it:
 * **Resume.** `RESUME TRANSFORM` deletes every key the transform holds (above)
   and re-derives every key from the source, so the parked work is superseded
   rather than replayed. Before it does, it re-validates the transform against
-  the live schema and brings every column Trellis created for it with a
+  the live schema ([ADR-0027](0027-operating-principles.md), rule 4) and brings every column Trellis created for it with a
   type from the source (its key, passthrough and `GROUP BY` copies, its
   calculated and aggregate columns) to the type define
   would give it now

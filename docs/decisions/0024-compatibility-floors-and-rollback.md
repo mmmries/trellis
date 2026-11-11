@@ -191,7 +191,7 @@ check, so a restored database's OIDs are never compared with the original's.
   table and column, the old and new types, the validator's refusal, and the
   remedies: `ALTER TRANSFORM` to a definition that validates, or change the
   column back, then `RESUME`. `RESUME` re-validates as define would, so it
-  refuses until one of them holds.
+  refuses until one of them holds ([ADR-0027](0027-operating-principles.md), rule 4).
 
 Validation runs once per definition per detected retype, never per row, so its
 cost doesn't depend on table size.
