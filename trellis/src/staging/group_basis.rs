@@ -481,6 +481,20 @@ impl GroupShape {
         partials_of(self.args.iter().map(Arg::parts))
     }
 
+    /// The partials a write's returned rows carry after the group's state
+    /// ([`written_groups`]), each read as `f`: every one but the maps, a
+    /// sum as text.
+    fn returned(&self, f: impl Fn(Partial) -> String) -> Vec<String> {
+        let partials = self.partials().into_iter();
+        partials
+            .filter_map(|p| match p {
+                Partial::Sum(SumPart::Scales, _) => None,
+                Partial::Sum(..) => Some(format!("{}::text", f(p))),
+                _ => Some(f(p)),
+            })
+            .collect()
+    }
+
     /// `f` of each of its partials ([`Self::partials`]).
     pub(crate) fn each_partial(&self, f: impl Fn(Partial) -> String) -> Vec<String> {
         self.partials().into_iter().map(f).collect()
@@ -984,11 +998,11 @@ impl Partial {
         }
     }
 
-    /// Its zero, typed.
+    /// Its zero: a sum's typed ([`SumPart::zero`]), a count's `0`.
     pub(crate) fn zero(self) -> &'static str {
         match self {
             Partial::Sum(part, _) => part.zero(),
-            _ => "0::bigint",
+            _ => "0",
         }
     }
 
@@ -1019,14 +1033,8 @@ impl Partial {
     /// Its working column under `prefix` read through `alias`, its zero
     /// where that is `NULL`: `coalesce(<alias>.<name>, <zero>) as <name>`.
     pub(crate) fn or_zero(self, alias: &str, prefix: &str) -> String {
-        let zero = match self {
-            Partial::Sum(part, _) => part.zero(),
-            _ => "0",
-        };
-        format!(
-            "coalesce({alias}.{n}, {zero}) as {n}",
-            n = self.name(prefix)
-        )
+        let n = self.name(prefix);
+        format!("coalesce({alias}.{n}, {}) as {n}", self.zero())
     }
 
     /// Whether `value` is not its zero.
@@ -2642,21 +2650,18 @@ impl GroupTargetPlan {
         )
     }
 
-    /// The SQL of aggregate `agg` over partials named by `n`, `count` (a
-    /// function of the argument's 1-based index), `sum` (of the index and
-    /// the partial, [`SumPart`]) and `extreme` (of the extreme). `args` are
-    /// the shape's arguments.
+    /// The SQL of aggregate `agg` over partials named by `partial` and
+    /// extremes named by `extreme`. `args` are the shape's arguments.
     fn agg_sql(
         agg: &Agg,
         args: &[Arg],
-        n: &str,
-        count: &dyn Fn(usize) -> String,
-        sum: &dyn Fn(usize, SumPart) -> String,
+        partial: &dyn Fn(Partial) -> String,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
+        let count = |i| partial(Partial::Count(i));
         let value = |i: usize| {
             sum_value(args[i].numeric, args[i].scale, &count(i + 1), &|part| {
-                sum(i + 1, part)
+                partial(Partial::Sum(part, i + 1))
             })
         };
         match agg {
@@ -2665,7 +2670,7 @@ impl GroupTargetPlan {
                 arg: *arg,
                 pg_type: pg_type.clone(),
             }),
-            Agg::CountStar => n.to_string(),
+            Agg::CountStar => partial(Partial::Rows),
             Agg::Count(i) => count(i + 1),
             Agg::Sum(i, cast) => format!(
                 "case when {c} = 0 then null else ({s})::{cast} end",
@@ -2681,14 +2686,12 @@ impl GroupTargetPlan {
     }
 
     /// A lateral subquery computing every field over partials named by
-    /// `n`, `count`, `sum` and `extreme`, as columns `<prefix>0`,
+    /// `partial` and extremes by `extreme`, as columns `<prefix>0`,
     /// `<prefix>1`, ….
     fn fields_lateral(
         &self,
         prefix: &str,
-        n: &str,
-        count: &dyn Fn(usize) -> String,
-        sum: &dyn Fn(usize, SumPart) -> String,
+        partial: &dyn Fn(Partial) -> String,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
         let aggs: Vec<String> = self
@@ -2699,7 +2702,7 @@ impl GroupTargetPlan {
             .map(|(k, agg)| {
                 format!(
                     "{} as {}",
-                    Self::agg_sql(agg, &self.shape.args, n, count, sum, extreme),
+                    Self::agg_sql(agg, &self.shape.args, partial, extreme),
                     quote_ident(&placeholder(k))
                 )
             })
@@ -2741,14 +2744,12 @@ impl GroupTargetPlan {
                     "null::boolean".to_string(),
                     "null::boolean".to_string(),
                     "null::text".to_string(),
-                    "lost.n".to_string(),
                 ];
-                for arg in &self.shape.args {
-                    sentinel.push("null::bigint".to_string());
-                    if arg.summed {
-                        sentinel.push("null::text".to_string());
-                    }
-                }
+                sentinel.extend(self.shape.returned(|p| match p {
+                    Partial::Rows => "lost.n".to_string(),
+                    Partial::Count(_) => "null::bigint".to_string(),
+                    Partial::Sum(..) => "null".to_string(),
+                }));
                 format!(
                     "{} union all select {} from lost where lost.n > 0",
                     self.visible_tail_sql(image_columns),
@@ -3285,7 +3286,11 @@ impl GroupTargetPlan {
         let mut sets = Vec::with_capacity(extremes.len());
         let mut returning = self.shape.each_partial(|p| {
             let (d, n) = (p.name("__d"), p.name("__n"));
-            format!("{} as {d}, u.{} as {n}", p.zero(), p.hidden())
+            let zero = match p {
+                Partial::Sum(..) => p.zero(),
+                _ => "0::bigint",
+            };
+            format!("{zero} as {d}, u.{} as {n}", p.hidden())
         });
         for x in &extremes {
             let column = x.column();
@@ -4017,15 +4022,7 @@ impl GroupTargetPlan {
     fn held_tail_sql(&self, image_columns: Option<&[String]>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let args = &self.shape.args;
-        let mut applied = vec!["cur.__nn".to_string()];
-        for (i, arg) in args.iter().enumerate() {
-            let i = i + 1;
-            applied.push(format!("cur.__nc{i}"));
-            if arg.summed {
-                applied.push(format!("cur.__ns{i}::text"));
-            }
-        }
+        let mut applied = self.shape.returned(|p| format!("cur.{}", p.name("__n")));
         // An absolute write leaves no extreme to probe.
         if !self.shape.extremes().is_empty() {
             applied.push("false".to_string());
@@ -4037,13 +4034,7 @@ impl GroupTargetPlan {
             .iter()
             .map(|(name, _, _)| quote_ident(name))
             .collect();
-        let new_fields = self.fields_lateral(
-            "__nf",
-            "up.__nn",
-            &|i| format!("up.__nc{i}"),
-            &|i, part| part.name("up.__n", i),
-            &|x| x.named("up.__n"),
-        );
+        let new_fields = self.fields_lateral("__nf", &|p| p.name("up.__n"), &|x| x.named("up.__n"));
         let nf: Vec<String> = (0..field_count).map(|j| format!("nv.__nf{j}")).collect();
         let held: Vec<String> = (0..field_count).map(|j| format!("t.__vf{j}")).collect();
         let held_names: Vec<String> = (0..field_count).map(|j| format!("__vf{j}")).collect();
@@ -4153,17 +4144,8 @@ impl GroupTargetPlan {
     fn compare_held_sql(&self, image_columns: Option<&[String]>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let mut names = vec!["__nn".to_string()];
-        let mut columns = vec!["x.__n".to_string()];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            names.push(format!("__nc{i}"));
-            columns.push(format!("x.__count_{i}"));
-            for part in arg.parts() {
-                names.push(part.name("__n", i));
-                columns.push(format!("x.{}", part.hidden(i)));
-            }
-        }
+        let names = self.shape.each_partial(|p| p.name("__n"));
+        let columns = self.shape.each_partial(|p| format!("x.{}", p.hidden()));
         let up_groups: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
         let up_values: Vec<String> = names.iter().map(|n| format!("h.{n}")).collect();
         format!(
@@ -4195,24 +4177,13 @@ impl GroupTargetPlan {
     /// zero row changes no partial.
     fn target_groups_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
-        let mut insert = vec!["__txid", "__lsn", "__n"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
+        let mut insert = vec!["__txid".to_string(), "__lsn".to_string()];
+        insert.extend(self.shape.each_partial(|p| p.name("__")));
         let mut zeros = vec![
             "pg_current_xact_id()".to_string(),
             "'0/0'::pg_lsn".to_string(),
-            "0".to_string(),
         ];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            insert.push(format!("__c{i}"));
-            zeros.push("0".to_string());
-            for part in arg.parts() {
-                insert.push(part.name("__", i));
-                zeros.push(part.zero().to_string());
-            }
-        }
+        zeros.extend(self.shape.each_partial(|p| p.zero().to_string()));
         format!(
             "insert into {staged} ({cols}, {insert}) \
              select {cols}, {zeros} from ( \
@@ -4238,32 +4209,18 @@ impl GroupTargetPlan {
     fn visible_tail_sql(&self, image_columns: Option<&[String]>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let args = &self.shape.args;
         // An extreme has no change to subtract: `up` carries its prior
         // value (`__o…`) beside its new one (`__n…`).
-        let new_fields = self.fields_lateral(
-            "__nf",
-            "up.__nn",
-            &|i| format!("up.__nc{i}"),
-            &|i, part| part.name("up.__n", i),
-            &|x| x.named("up.__n"),
-        );
+        let new_fields = self.fields_lateral("__nf", &|p| p.name("up.__n"), &|x| x.named("up.__n"));
         // The prior image's partials are the new ones less the change. A
         // map no staged side changed ([`StagedParts::free`]) is the new one.
         let staged_parts = self.staged_parts.get();
-        let prior_fields = self.fields_lateral(
-            "__pf",
-            "(up.__nn - up.__dn)",
-            &|i| format!("(up.__nc{i} - up.__dc{i})"),
-            &|i, part| {
-                if self.map_free(&staged_parts, Partial::Sum(part, i)) {
-                    part.name("up.__n", i)
-                } else {
-                    part.sub(&part.name("up.__n", i), &part.name("up.__d", i))
-                }
-            },
-            &|x| x.named("up.__o"),
-        );
+        let prior = |p: Partial| match p {
+            _ if self.map_free(&staged_parts, p) => p.name("up.__n"),
+            Partial::Sum(..) => p.sub(&p.name("up.__n"), &p.name("up.__d")),
+            _ => format!("({})", p.sub(&p.name("up.__n"), &p.name("up.__d"))),
+        };
+        let prior_fields = self.fields_lateral("__pf", &prior, &|x| x.named("up.__o"));
         let field_count = self.shape.fields.len();
         let nf: Vec<String> = (0..field_count).map(|j| format!("__nf.__nf{j}")).collect();
         let pf: Vec<String> = (0..field_count).map(|j| format!("__pf.__pf{j}")).collect();
@@ -4309,13 +4266,7 @@ impl GroupTargetPlan {
             }
             None => "null::text".to_string(),
         };
-        let mut applied: Vec<String> = vec!["vis.__dn".to_string()];
-        for (i, arg) in args.iter().enumerate() {
-            applied.push(format!("vis.__dc{}", i + 1));
-            if arg.summed {
-                applied.push(format!("vis.__ds{}::text", i + 1));
-            }
-        }
+        let mut applied = self.shape.returned(|p| format!("vis.{}", p.name("__d")));
         // Whether the group's extremes are to be probed (Rx4).
         if !self.shape.extremes().is_empty() {
             applied.push("vis.__probe".to_string());
