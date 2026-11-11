@@ -74,17 +74,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, JoinKind, Predicate, TransformDef, as_extract};
+use crate::defs::ast::{Expr, JoinKind, Predicate, TransformDef};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side as JoinSide};
 use crate::defs::model::Definition;
-use crate::defs::registry;
 use crate::pool::{Pool, quote_ident};
 
 use super::group_basis::{self, SumPart};
 use super::self_check::{
-    ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_call_arg, render_leaf,
+    AuditRender, ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_audit,
 };
 use super::self_check_groups::{
     Side, Uncertain, bound, drop_equal_values, partial_names, partial_text, weighted_partials,
@@ -196,100 +195,45 @@ pub(super) fn joined_alias(joined: &str, position: spec::Position) -> String {
 /// Renders a `JOIN` field expression, or an aggregate's argument, as SQL
 /// with every column read through its side's alias: `from` for the `FROM`
 /// table, [`joined_alias`] of `joined` for the joined table at each
-/// position. [`render_leaf`]'s twin for `JOIN`s: written fresh here, not
-/// shared with the apply path. `Err` for what a `JOIN` definition can't hold.
+/// position. The audit's own walk ([`render_audit`]), not shared with the
+/// apply path. `Err` for what a `JOIN` definition can't hold.
 pub(super) fn render(
     def: &TransformDef,
     expr: &Expr,
     from: &str,
     joined: &str,
 ) -> Result<String, String> {
-    Ok(match expr {
-        Expr::SourceColumn { table, column, .. } => {
-            let alias = match side_of(def, table) {
-                Some(JoinSide::From) => from.to_string(),
-                Some(JoinSide::Joined(position)) => joined_alias(joined, position),
-                None => return Err(format!("reads '{table}.{column}', which is neither table")),
-            };
-            format!("{alias}.{}", quote_ident(column))
-        }
-        Expr::Column(name) => {
-            return Err(format!(
-                "reads the unqualified column '{name}', which a JOIN definition can't hold"
-            ));
-        }
-        Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = registry::operator_spec(*op).symbol;
-            format!(
-                "({} {symbol} {})",
-                render(def, lhs, from, joined)?,
-                render(def, rhs, from, joined)?
-            )
-        }
-        Expr::Negate(operand) => format!("(-({}))", render(def, operand, from, joined)?),
-        Expr::Cast { expr, target } => {
-            format!("cast({} as {target})", render(def, expr, from, joined)?)
-        }
-        Expr::Not(operand) => format!("(not {})", render(def, operand, from, joined)?),
-        Expr::IsNull { expr, negated } => format!(
-            "({} {})",
-            render(def, expr, from, joined)?,
-            if *negated { "is not null" } else { "is null" }
-        ),
-        Expr::Case {
-            branches,
-            otherwise,
-        } => case_sql(branches, otherwise.as_deref(), |e| {
-            render(def, e, from, joined)
-        })?,
-        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            "count(*)".to_string()
-        }
-        Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
-            let (field, operand) = as_extract(name, args).expect("checked");
-            format!(
-                "extract({field} from {})",
-                render(def, operand, from, joined)?
-            )
-        }
-        Expr::FunctionCall { name, args } => {
-            let mut rendered = Vec::with_capacity(args.len());
-            for (i, arg) in args.iter().enumerate() {
-                rendered.push(match arg {
-                    Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
-                    _ => render(def, arg, from, joined)?,
-                });
-            }
-            format!("{}({})", name.to_lowercase(), rendered.join(", "))
-        }
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => render_leaf(expr),
-    })
+    render_audit(&mut Aliased { def, from, joined }, expr, 0)
 }
 
-/// A searched `CASE` as SQL text, each condition and result rendered by
-/// `render`.
-fn case_sql(
-    branches: &[(Expr, Expr)],
-    otherwise: Option<&Expr>,
-    mut render: impl FnMut(&Expr) -> Result<String, String>,
-) -> Result<String, String> {
-    let mut sql = String::from("(case");
-    for (condition, result) in branches {
-        sql.push_str(&format!(
-            " when {} then {}",
-            render(condition)?,
-            render(result)?
-        ));
+/// [`render`]'s columns: each read through its side's alias.
+struct Aliased<'d> {
+    def: &'d TransformDef,
+    from: &'d str,
+    joined: &'d str,
+}
+
+impl AuditRender<'_> for Aliased<'_> {
+    type Error = String;
+
+    fn column(&mut self, expr: &Expr) -> Result<String, String> {
+        match expr {
+            Expr::SourceColumn { table, column, .. } => {
+                let alias = match side_of(self.def, table) {
+                    Some(JoinSide::From) => self.from.to_string(),
+                    Some(JoinSide::Joined(position)) => joined_alias(self.joined, position),
+                    None => {
+                        return Err(format!("reads '{table}.{column}', which is neither table"));
+                    }
+                };
+                Ok(format!("{alias}.{}", quote_ident(column)))
+            }
+            Expr::Column(name) => Err(format!(
+                "reads the unqualified column '{name}', which a JOIN definition can't hold"
+            )),
+            _ => unreachable!("a column read"),
+        }
     }
-    if let Some(otherwise) = otherwise {
-        sql.push_str(&format!(" else {}", render(otherwise)?));
-    }
-    sql.push_str(" end)");
-    Ok(sql)
 }
 
 /// The fields of the visible target that aren't a `GROUP BY` key, in
@@ -1010,33 +954,50 @@ impl Audit<'_> {
 /// infinities, don't cancel out (as `NaN − NaN` and `Infinity − Infinity`
 /// would not), the infinity while one doesn't, and otherwise the weighted
 /// finite values' sum at the largest scale whose weighted count is above 0.
-/// `args` are the pairs' `__x<i>` columns, in order. [`render`]'s twin for
-/// weighted rows, written fresh here, not shared with the apply path.
+/// `args` are the pairs' `__x<i>` columns, in order. [`render`] for weighted
+/// rows, on the audit's own walk ([`render_audit`]), not shared with the
+/// apply path.
 fn render_signed(
     def: &TransformDef,
     expr: &Expr,
     args: &[Expr],
     numeric: &[bool],
 ) -> Result<String, String> {
-    let w = WEIGHT;
-    Ok(match expr {
-        Expr::FunctionCall { name, args: called } => {
-            let upper = name.to_ascii_uppercase();
-            match (upper.as_str(), called.as_slice()) {
-                ("COUNT", []) => format!("sum({w})"),
-                (aggregate @ ("COUNT" | "SUM" | "AVG"), [arg]) => {
-                    let i = args
-                        .iter()
-                        .position(|a| a == arg)
-                        .ok_or_else(|| format!("{aggregate} of an expression it doesn't read"))?;
-                    let x = format!("__x{}", i + 1);
-                    let count = format!("sum({w} * ({x} is not null)::int)");
-                    let sum = if numeric.get(i).copied().unwrap_or(false) {
-                        let net = |value: &str| {
-                            format!("coalesce(sum({w}) filter (where {x} = '{value}'), 0)")
-                        };
-                        format!(
-                            "(case when {nan} > 0 or ({pinf} > 0 and {ninf} > 0) \
+    render_audit(&mut Signed { def, args, numeric }, expr, 0)
+}
+
+/// [`render_signed`]'s aggregates and columns.
+struct Signed<'d> {
+    def: &'d TransformDef,
+    args: &'d [Expr],
+    numeric: &'d [bool],
+}
+
+impl AuditRender<'_> for Signed<'_> {
+    type Error = String;
+
+    fn special(&mut self, expr: &Expr, _depth: usize) -> Result<Option<String>, String> {
+        let w = WEIGHT;
+        let Expr::FunctionCall { name, args: called } = expr else {
+            return Ok(None);
+        };
+        let upper = name.to_ascii_uppercase();
+        Ok(Some(match (upper.as_str(), called.as_slice()) {
+            ("COUNT", []) => format!("sum({w})"),
+            (aggregate @ ("COUNT" | "SUM" | "AVG"), [arg]) => {
+                let i = self
+                    .args
+                    .iter()
+                    .position(|a| a == arg)
+                    .ok_or_else(|| format!("{aggregate} of an expression it doesn't read"))?;
+                let x = format!("__x{}", i + 1);
+                let count = format!("sum({w} * ({x} is not null)::int)");
+                let sum = if self.numeric.get(i).copied().unwrap_or(false) {
+                    let net = |value: &str| {
+                        format!("coalesce(sum({w}) filter (where {x} = '{value}'), 0)")
+                    };
+                    format!(
+                        "(case when {nan} > 0 or ({pinf} > 0 and {ninf} > 0) \
                                    then 'NaN'::numeric \
                                    when {pinf} > 0 then 'Infinity'::numeric \
                                    when {ninf} > 0 then '-Infinity'::numeric \
@@ -1050,93 +1011,47 @@ fn render_signed(
                                                        unnest(__a.__as, __a.__aw) as __u(__s, __w) \
                                                    where __u.__s is not null group by __u.__s \
                                                    having sum(__u.__w) > 0) as __z)) end)",
-                            nan = net("NaN"),
-                            pinf = net("Infinity"),
-                            ninf = net("-Infinity"),
-                        )
-                    } else {
-                        // Positive less negative, in `sum()`'s own type
-                        // (`bigint` over `integer`).
-                        format!(
-                            "(coalesce(sum({x}) filter (where {w} > 0), 0) \
-                              - coalesce(sum({x}) filter (where {w} < 0), 0))"
-                        )
-                    };
-                    match aggregate {
-                        "COUNT" => count,
-                        "SUM" => format!("(case when {count} = 0 then null else {sum} end)"),
-                        _ => format!(
-                            "(case when {count} = 0 then null \
-                              else ({sum})::numeric / ({count})::numeric end)"
-                        ),
-                    }
-                }
-                _ if as_extract(name, called).is_some() => {
-                    let (field, operand) = as_extract(name, called).expect("checked");
-                    format!(
-                        "extract({field} from {})",
-                        render_signed(def, operand, args, numeric)?
+                        nan = net("NaN"),
+                        pinf = net("Infinity"),
+                        ninf = net("-Infinity"),
                     )
-                }
-                _ => {
-                    let mut rendered = Vec::with_capacity(called.len());
-                    for (i, arg) in called.iter().enumerate() {
-                        rendered.push(match arg {
-                            Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
-                            _ => render_signed(def, arg, args, numeric)?,
-                        });
-                    }
-                    format!("{}({})", name.to_lowercase(), rendered.join(", "))
+                } else {
+                    // Positive less negative, in `sum()`'s own type
+                    // (`bigint` over `integer`).
+                    format!(
+                        "(coalesce(sum({x}) filter (where {w} > 0), 0) \
+                              - coalesce(sum({x}) filter (where {w} < 0), 0))"
+                    )
+                };
+                match aggregate {
+                    "COUNT" => count,
+                    "SUM" => format!("(case when {count} = 0 then null else {sum} end)"),
+                    _ => format!(
+                        "(case when {count} = 0 then null \
+                              else ({sum})::numeric / ({count})::numeric end)"
+                    ),
                 }
             }
-        }
-        Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = registry::operator_spec(*op).symbol;
-            format!(
-                "({} {symbol} {})",
-                render_signed(def, lhs, args, numeric)?,
-                render_signed(def, rhs, args, numeric)?
-            )
-        }
-        Expr::Negate(operand) => format!("(-({}))", render_signed(def, operand, args, numeric)?),
-        Expr::Cast { expr, target } => {
-            format!(
-                "cast({} as {target})",
-                render_signed(def, expr, args, numeric)?
-            )
-        }
-        Expr::Not(operand) => format!("(not {})", render_signed(def, operand, args, numeric)?),
-        Expr::IsNull { expr, negated } => format!(
-            "({} {})",
-            render_signed(def, expr, args, numeric)?,
-            if *negated { "is not null" } else { "is null" }
-        ),
-        Expr::Case {
-            branches,
-            otherwise,
-        } => case_sql(branches, otherwise.as_deref(), |e| {
-            render_signed(def, e, args, numeric)
-        })?,
-        Expr::SourceColumn { table, column, .. }
-            if join_of(def)
-                .group_by
-                .iter()
-                .any(|key| &key.table == table && &key.column == column) =>
-        {
-            format!("__g.{}", quote_ident(column))
-        }
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => render_leaf(expr),
-        _ => {
-            return Err(format!(
+            _ => return Ok(None),
+        }))
+    }
+
+    fn column(&mut self, expr: &Expr) -> Result<String, String> {
+        match expr {
+            Expr::SourceColumn { table, column, .. }
+                if join_of(self.def)
+                    .group_by
+                    .iter()
+                    .any(|key| &key.table == table && &key.column == column) =>
+            {
+                Ok(format!("__g.{}", quote_ident(column)))
+            }
+            _ => Err(format!(
                 "a field reading {expr:?} outside an aggregate, which a JOIN definition can't \
                  hold"
-            ));
+            )),
         }
-    })
+    }
 }
 
 /// The joined table of `def`, as the catalog records it.
@@ -1602,5 +1517,51 @@ mod tests {
                 "__scales_3"
             ]
         );
+    }
+
+    /// The audit's `JOIN` renderers, [`render`] and [`render_signed`], over
+    /// every construct a `JOIN` field holds, pinned to their text
+    /// (`crate::staging::golden_sql`), with what each refuses.
+    #[test]
+    fn the_join_audit_renderers_render_every_construct() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region WITHOUT SOURCE INDEX SELECT orders.region AS region, \
+             COUNT(*) AS n, SUM(items.qty) AS q, AVG(orders.total) AS av, \
+             COUNT(items.qty) + 1 AS c1, \
+             CASE WHEN SUM(items.qty) > 0 AND NOT (SUM(items.qty) IS NULL) \
+             THEN -(SUM(items.qty)) ELSE NULL END AS cs, \
+             ROUND(AVG(orders.total), 2) AS r, CAST(SUM(items.qty) AS numeric) AS ca, \
+             EXTRACT(year FROM DATE '2024-01-01') + COUNT(*) AS y, \
+             COALESCE(SUM(orders.total), 0) AS co, \
+             STRPOS(orders.region, 'x') AS rx, MIN(items.qty) AS lo",
+        )
+        .expect("parses");
+        let args: Vec<Expr> = spec::side_arguments(&def, JoinSide::From)
+            .into_iter()
+            .chain(spec::side_arguments(&def, spec::JOINED))
+            .collect();
+        let numeric: Vec<bool> = args
+            .iter()
+            .map(|a| matches!(a, Expr::SourceColumn { column, .. } if column == "total"))
+            .collect();
+        let mut golden = crate::staging::golden_sql::Golden::default();
+        for field in &def.fields {
+            let shown = |r: Result<String, String>| r.unwrap_or_else(|e| format!("error: {e}"));
+            golden.add(
+                &format!("render {}", field.name),
+                &shown(render(&def, &field.expr, "a", "b")),
+            );
+            golden.add(
+                &format!("render_signed {}", field.name),
+                &shown(render_signed(&def, &field.expr, &args, &numeric)),
+            );
+        }
+        let bare = Expr::Column("qty".to_string());
+        golden.add(
+            "render bare column",
+            &render(&def, &bare, "a", "b").expect_err("refused"),
+        );
+        golden.check("audit_join_renderers");
     }
 }
