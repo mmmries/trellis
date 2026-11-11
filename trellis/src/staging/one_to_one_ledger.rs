@@ -17,7 +17,7 @@
 //!    after the lock, each row as a text-valued jsonb object, the shape of
 //!    an Apply's image.
 //! 3. **The entries** ([`update_entries`], I2): a Re-derive sets `basis` to
-//!    the read's snapshot and leaves `applied_lsn` alone (the D split's Q1);
+//!    the read's snapshot and leaves `applied_lsn` alone;
 //!    an Apply sets `applied_lsn`, but only if its transaction is not visible
 //!    in `basis`, its `lsn` is above `applied_lsn` and it is above the
 //!    target's truncate floor. Either makes a tombstone when the key has no
@@ -642,7 +642,7 @@ pub(crate) fn stale_entries_statement(ledger: &str, after: bool) -> String {
 }
 
 /// Empties `ledger` for a source `TRUNCATE` and raises its
-/// truncate floor to `lsn`, the truncate's ring `lsn` (the D split's Q6). The caller
+/// truncate floor to `lsn`, the truncate's ring `lsn`. The caller
 /// clears the target rows. `lsn` is required: a truncate that raised no
 /// floor would let a change from before it apply over it.
 pub(crate) async fn truncate(

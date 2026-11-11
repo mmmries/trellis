@@ -3,7 +3,7 @@
 //! larger than the cap".
 //!
 //! A drain holds at most `ClientOptions::drain_batch_cap` folded records at
-//! once. A share that fits is folded directly, as before; a share that
+//! once. A share that fits is folded directly; a share that
 //! doesn't is walked in pages, keyset-ordered on [`PageKey`], each page its
 //! own compute-and-apply transaction that advances the bucket's
 //! `drain_cursor` row. This module is where pages come from
@@ -34,8 +34,8 @@ pub(crate) struct Page {
 /// Where an oversized share's pages come from: the share is
 /// folded once into a session `TEMP` table ([`fold::materialize_share`]),
 /// then read back a page at a time by keyset ([`fold::read_page`]). Linear in
-/// the share, where A2a's rescan pager re-scanned the fenced window for every
-/// page and was quadratic.
+/// the share, where re-scanning the fenced window for every page would be
+/// quadratic.
 ///
 /// A page never splits a key and never holds more than `cap` records;
 /// successive pages, each starting after the previous page's

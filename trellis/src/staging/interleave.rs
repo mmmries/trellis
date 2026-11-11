@@ -411,7 +411,7 @@ pub enum PausePoint {
     BeforeSelfCheckPage,
     /// After a partition correction's page has re-derived its keys and
     /// recorded its progress, just before it commits, for the definition's
-    /// target (`super::partition_correction`, ADR-0017 P4a). The page holds
+    /// target (`super::partition_correction`). The page holds
     /// its keys' entry locks and its row's claim fence.
     BeforeCorrectionCommit,
     /// After a group-basis partition correction has enumerated the groups
