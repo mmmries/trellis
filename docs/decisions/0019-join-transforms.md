@@ -43,8 +43,9 @@ The rules are strict where loosening one later is additive and tightening one
 would break a stored definition, which is stored as text and re-parsed.
 
 - **Sides.** The two sides are two tables with different bare names, each a
-  captured table with a primary key, a partitioned root, or another transform's
-  target (which needs no primary key). Trellis tells the sides apart by bare
+  captured table or a partitioned root, keyed by its primary key or a `KEY (…)`
+  ([ADR-0026](0026-source-keys.md)), or another transform's target, keyed by
+  the key Trellis gave it. Trellis tells the sides apart by bare
   table name, so two sides sharing a bare name (a self-join, or
   `shop.orders JOIN archive.orders`) are refused. A self-join stays refused
   under two aliases: one captured change would feed both sides.

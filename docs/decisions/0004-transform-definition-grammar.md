@@ -36,7 +36,9 @@ context:
 
 * **Key-space** — the granularity definition, which decides the target's
   primary key: a `GROUP BY` list for aggregates, a join clause plus a
-  `GROUP BY` list for JOIN transforms, nothing for 1-1. Tiny and closed.
+  `GROUP BY` list for JOIN transforms, a join clause alone for a 1-1 JOIN,
+  nothing for 1-1, and a `KEY (…)` after a source table that has no primary
+  key ([ADR-0026](0026-source-keys.md)). Tiny and closed.
   Enforces that aggregate columns are wrapped in an aggregate function and
   that each of a JOIN transform's source columns is qualified by its side.
 * **Calculated-field expressions** — the scalar-expression language, reused for
@@ -52,7 +54,7 @@ because the engine must know exactly what a definition means: it infers each
 field's type to declare the target column, decides which aggregates can be
 maintained by small **atomic delta adjustments** (the basis of cheap
 incremental maintenance, see [data-flow](../data-flow.md)), and checks
-constants and literals at define time.
+literals at define time.
 
 So the grammar's function set and the renderer's function set are the **same
 list**: we accept only what we render, and every addition is a paired
@@ -65,11 +67,15 @@ fragments, not whole statements. We want the accepted language to *be* the spec.
 The 1-1 statement is:
 
 ```text
-TRANSFORM <target>
-FROM <source>
+TRANSFORM <target> [ADOPT EXISTING TABLE]
+FROM <source> [KEY (<column> [, ...])]
 SELECT <expr> AS <field> [, <expr> AS <field> ...]
 [WHERE <predicate>]
 ```
+
+`ADOPT EXISTING TABLE` builds into an existing empty table instead of creating
+one ([ADR-0014](0014-pause-and-drop-a-transform.md)), and `KEY (…)` names the
+source's key ([ADR-0026](0026-source-keys.md)).
 
 `<expr>` is a column reference, a numeric or single-quoted string literal,
 `TRUE`, `FALSE`, `NULL`,
