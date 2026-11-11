@@ -80,6 +80,8 @@ pub use parser::{MAX_EXPRESSION_DEPTH, parse_statement, statement_kind};
 // fresh text directly.
 #[cfg(any(test, feature = "internals", feature = "test-util"))]
 pub use parser::parse;
+// The dev facade (`trellis::dev::defs`) re-exports it for the generative crate.
+#[cfg(any(test, feature = "internals", feature = "test-util"))]
 pub use pg_type::PgType;
 // The crate validates through `validate::validate`; the integration tests
 // reach it here.
