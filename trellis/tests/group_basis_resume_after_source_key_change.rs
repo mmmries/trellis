@@ -10,8 +10,7 @@
 mod resume_passes;
 
 use resume_passes::{
-    RECREATED, SOURCE, assert_staged, bring_live, capture_pass, drain_to_quiescence, rows, setup,
-    status,
+    RECREATED, SOURCE, assert_staged, bring_live, capture_pass, rows, settle, setup, status,
 };
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
@@ -44,7 +43,7 @@ async fn a_group_basis_aggregate_resumes_onto_a_source_recreated_with_a_wider_ke
     raw.batch_execute("insert into public.c values (4, 8, 1); delete from public.c where id = 1")
         .await
         .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
 
@@ -78,7 +77,7 @@ async fn a_group_basis_aggregate_resumes_onto_its_source_converted_to_a_partitio
     )
     .await
     .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
 
@@ -145,7 +144,7 @@ async fn a_join_resumes_onto_tables_recreated_with_wider_keys() {
     )
     .await
     .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, JOINED_ACTUAL).await,
         rows(&raw, JOINED_ORACLE).await

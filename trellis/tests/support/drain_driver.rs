@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use testkit::{TestCluster, TestDatabase};
 use tokio::task::JoinHandle;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, Progress};
 use trellis::config::DEFAULT_SCHEMA;
@@ -28,16 +28,14 @@ use trellis::intake::harness;
 
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
-    ApplyError, ApplyOutcome, StagedChange, StagingError, append, apply, collect_tombstones,
-    has_pending, retire_drained_segments, seal,
+    ApplyError, ApplyOutcome, StagedChange, append, apply, collect_tombstones,
+    retire_drained_segments,
 };
 
-pub const WAKE: &str = "interleave_wake";
+#[path = "pipeline.rs"]
+pub mod pipeline;
 
-/// How long [`Driver::seal`] waits for the seal gate: long enough for a
-/// server process stalled on a loaded box, short enough that a transaction
-/// the test itself left open fails the test in one timeout.
-pub const SEAL_GATE_WAIT: Duration = seal::SEAL_GATE_WAIT;
+pub use pipeline::WAKE;
 
 /// Splits `ddl` into its schema statements and its `insert into …` seed rows.
 /// A group-basis aggregate over a partitioned source is defined while the
@@ -57,17 +55,7 @@ pub fn split_seed(ddl: &str) -> (String, String) {
 }
 
 /// Opens a plain connection to `dsn` with the engine's schema on the path.
-pub async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
+pub use pipeline::connect;
 
 /// Fields drop in declaration order: the clients first, then the database,
 /// then the cluster, so `TestDatabase::drop`'s `dropdb` runs against a live
@@ -282,175 +270,20 @@ impl Driver {
         connect(self.db.dsn()).await
     }
 
-    /// Seals both phases and returns the sealed batch. Retires every drained
-    /// segment it can first, so a test never runs the four-slot ring full.
-    ///
-    /// The seal gate holds while a transaction that was in flight at the
-    /// previous batch's fence is still open. That is backpressure, which the
-    /// engine's own sealer retries; here the likely holder is a server
-    /// process finishing on a loaded box (autovacuum's analyze, say, which
-    /// takes an xid for its statistics writes). A full ring is backpressure
-    /// too, while the slot the seal needs holds a drained segment: the
-    /// retirement pass skips a slot another session is reading at that
-    /// instant ([`Self::seal_once`]). So this waits up to [`SEAL_GATE_WAIT`]
-    /// for either to clear. A holder the test itself leaves open never goes
-    /// away, and the panic names every open xid-holding session, and for a
-    /// full ring the ring's slots and their lock holders. A ring full of
-    /// work not yet drained panics at once.
+    /// [`pipeline::seal`]: seals both phases and returns the sealed batch,
+    /// waiting out the seal gate's or a full ring's backpressure.
     pub async fn seal(&mut self) -> i64 {
-        self.seal_within(SEAL_GATE_WAIT)
-            .await
-            .unwrap_or_else(|held| panic!("seal phase 1: {held}"))
+        pipeline::seal(&mut self.ctl).await
     }
 
-    /// [`Self::seal`], waiting at most `wait` for the seal gate or a full
-    /// ring; `Err` names what still held it when it ran out: the sessions
-    /// holding an xid open, or the ring's registry rows and the locks held
-    /// on its slots.
+    /// [`pipeline::seal_within`].
     pub async fn seal_within(&mut self, wait: Duration) -> Result<i64, String> {
-        let deadline = Instant::now() + wait;
-        loop {
-            let refused = match self.seal_once().await {
-                Ok(batch) => return Ok(batch),
-                Err(refused) => refused,
-            };
-            if Instant::now() >= deadline {
-                return Err(match refused {
-                    StagingError::RingFull { ring_slot } => format!(
-                        "the ring stayed full for {wait:?}: ring slot {ring_slot} still holds a \
-                         drained segment that retirement skipped; {}; transactions holding an \
-                         xid: {}",
-                        self.ring_state().await,
-                        self.xid_holders().await
-                    ),
-                    _ => format!(
-                        "the seal gate stayed blocked for {wait:?} ({}); transactions holding an xid: {}",
-                        self.gate_state().await,
-                        self.xid_holders().await
-                    ),
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        pipeline::seal_within(&mut self.ctl, wait).await
     }
 
-    /// The two sides of the seal gate's comparison: the current snapshot's
-    /// `xmin` (the oldest xid running now) and the predecessor fence's
-    /// `xmax`, or that the predecessor has no fence, which holds the gate
-    /// whatever is running. A holder blocks only if its xid is below that
-    /// `xmax`.
-    async fn gate_state(&self) -> String {
-        let row = self
-            .ctl
-            .query_one(
-                "select pg_snapshot_xmin(pg_current_snapshot())::text, \
-                        (select coalesce(pg_snapshot_xmax(s.fence_snapshot)::text, 'unfenced') \
-                         from segments s, segment_pointer p \
-                         where s.seg_seq = p.active_seq - 1)",
-                &[],
-            )
-            .await
-            .expect("read the seal gate's state");
-        format!(
-            "snapshot xmin {}, predecessor fence xmax {}",
-            row.get::<_, String>(0),
-            row.get::<_, Option<String>>(1)
-                .unwrap_or_else(|| "none (no predecessor)".to_string())
-        )
-    }
-
-    /// Every session (and prepared transaction) holding an xid open, one per
-    /// line: what a blocked seal gate is waiting on.
-    async fn xid_holders(&self) -> String {
-        seal::xid_holders(&self.ctl).await
-    }
-
-    /// The registry rows and every lock another session holds on a ring
-    /// slot's table: what a `RingFull` refusal is waiting on.
-    async fn ring_state(&self) -> String {
-        let segments = self
-            .rows("select seg_seq, ring_slot, state::text from segments order by seg_seq")
-            .await;
-        let locks = self
-            .rows(
-                "select l.pid, c.relname::text, l.mode, l.granted, \
-                        coalesce(left(a.query, 120), '') \
-                 from pg_locks l join pg_class c on c.oid = l.relation \
-                 left join pg_stat_activity a on a.pid = l.pid \
-                 where c.relname in ('seg_0', 'seg_1', 'seg_2', 'seg_3') \
-                   and l.pid <> pg_backend_pid()",
-            )
-            .await;
-        format!(
-            "segments (seg_seq, ring_slot, state): {}; ring slot locks held: {}",
-            segments.join(", "),
-            if locks.is_empty() {
-                "none".to_string()
-            } else {
-                locks.join("; ")
-            }
-        )
-    }
-
-    /// Whether `ring_slot`'s segment stays unretirable until the test drains
-    /// more: it, its successor, or a segment older than it is not drained.
-    /// That is retirement's eligibility less its lock and its `xmin`
-    /// condition, the two that clear on their own.
-    async fn undrained_work_holds(&self, ring_slot: i16) -> bool {
-        self.ctl
-            .query_one(
-                "select exists (select 1 from segments o join segments s \
-                                  on s.seg_seq <= o.seg_seq + 1 \
-                                where o.ring_slot = $1 and s.state <> 'drained')",
-                &[&ring_slot],
-            )
-            .await
-            .expect("read the ring slot's occupant")
-            .get(0)
-    }
-
-    /// [`Self::seal`], or `None` when the seal is refused as backpressure:
-    /// the seal gate (a transaction that may still write into the active
-    /// segment's predecessor is open) or a full ring whose needed slot holds
-    /// a drained segment (see [`Self::seal_once`]), either of which a test
-    /// running other sessions concurrently can meet.
+    /// [`pipeline::try_seal`].
     pub async fn try_seal(&mut self) -> Option<i64> {
-        self.seal_once().await.ok()
-    }
-
-    /// One retirement pass and one seal; `Err` is `seal_phase1`'s
-    /// backpressure refusal, `SealGateBlocked` or `RingFull`.
-    ///
-    /// `RingFull` is backpressure here as it is to the engine's sealer,
-    /// which retries it on its next tick, when the slot the seal needs holds
-    /// a drained segment this pass could not retire: retirement takes the
-    /// slot's table `ACCESS EXCLUSIVE ... NOWAIT` and skips it while a
-    /// concurrent reader of the ring holds it (a convergence wait's poll
-    /// reads every slot, so a `self_check` running alongside the drain is
-    /// one), and holds it back while a session holding an xid from before
-    /// the successor's seal is open. Work that is not drained keeps the ring
-    /// full until the test drains it, which it cannot do while it waits
-    /// here, so that panics at once, naming the slots.
-    async fn seal_once(&mut self) -> Result<i64, StagingError> {
-        self.retire().await;
-        let outcome = match seal::seal_phase1(&mut self.ctl).await {
-            Ok(outcome) => outcome,
-            Err(refused @ StagingError::SealGateBlocked) => return Err(refused),
-            Err(refused @ StagingError::RingFull { ring_slot }) => {
-                if self.undrained_work_holds(ring_slot).await {
-                    panic!(
-                        "seal phase 1: {refused}; work not yet drained holds it: {}",
-                        self.ring_state().await
-                    );
-                }
-                return Err(refused);
-            }
-            Err(err) => panic!("seal phase 1: {err}"),
-        };
-        seal::seal_phase2(&self.ctl, outcome.sealed_seg_seq, WAKE)
-            .await
-            .expect("seal phase 2");
-        Ok(outcome.sealed_seg_seq)
+        pipeline::try_seal(&mut self.ctl).await
     }
 
     /// Stages an image-less `Recompute` (today's Re-derive request) for each
@@ -594,27 +427,7 @@ impl Driver {
     /// starting a second drain whose page must block behind a frozen one, so
     /// the test knows it has reached that lock before letting the first go.
     pub async fn wait_blocked_behind(&self, pid: i32) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let blocked: bool = self
-                .ctl
-                .query_one(
-                    "select exists (select 1 from pg_stat_activity \
-                     where $1 = any(pg_blocking_pids(pid)))",
-                    &[&pid],
-                )
-                .await
-                .expect("read pg_stat_activity")
-                .get(0);
-            if blocked {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no backend queued behind the frozen worker (pid {pid}) within 60 s"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        testkit::wait_blocked_behind(&self.ctl, pid, Duration::from_secs(60), || false).await;
     }
 
     /// Waits until at least `n` backends are queued on a lock some other
@@ -644,23 +457,11 @@ impl Driver {
         }
     }
 
-    /// Seals and drains until nothing is pending anywhere in the ring, and
-    /// runs every 1-1 `JOIN`'s pending fan-out to its end. A bounded
-    /// deterministic loop, not a wait for convergence.
+    /// [`pipeline::settle`]: seals and drains until nothing is pending
+    /// anywhere in the ring, running every 1-1 `JOIN`'s pending fan-out to
+    /// its end. A bounded deterministic loop, not a wait for convergence.
     pub async fn settle(&mut self) {
-        for _ in 0..16 {
-            let batch = self.seal().await;
-            self.drain(batch, "settle").await;
-            self.run_fan_outs().await;
-            retire_drained_segments(&mut self.ctl)
-                .await
-                .expect("retire drained segments");
-            self.collect_tombstones().await;
-            if !has_pending(&self.ctl).await.expect("has_pending") {
-                return;
-            }
-        }
-        panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+        pipeline::settle(&self.db.pool, &mut self.ctl).await;
     }
 
     /// Runs every 1-1 `JOIN`'s pending fan-out to its end, a chunk at a time
