@@ -1840,7 +1840,7 @@ pub(crate) struct GroupTargetPlan {
 
 /// What a page's staged sides hold of each `numeric` sum's partials, read
 /// as it stages them ([`stage_sides`]), so its apply sums only what it
-/// staged ([`GroupTargetPlan::staged_total`]).
+/// staged ([`GroupTargetPlan::staged_totals`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct StagedParts {
     /// The (1-based) arguments whose every staged map of exceptions is
@@ -3317,7 +3317,7 @@ impl GroupTargetPlan {
             let (d, n) = (p.name("__d"), p.name("__n"));
             let zero = match p {
                 Partial::Sum(..) => p.zero(),
-                _ => "0::bigint",
+                Partial::Rows | Partial::Count(_) => "0::bigint",
             };
             format!("{zero} as {d}, u.{} as {n}", p.hidden())
         });
@@ -3522,7 +3522,7 @@ impl GroupTargetPlan {
         let mut nulls = vec!["null".to_string(); cols.len()];
         nulls.extend(self.shape.each_partial(|p| match p {
             Partial::Sum(part, _) => format!("null::{}", part.sql_type()),
-            _ => "null".to_string(),
+            Partial::Rows | Partial::Count(_) => "null".to_string(),
         }));
         format!(
             "create temp table {table} on commit drop as \
@@ -4247,7 +4247,9 @@ impl GroupTargetPlan {
         let prior = |p: Partial| match p {
             _ if self.map_free(&staged_parts, p) => p.name("up.__n"),
             Partial::Sum(..) => p.sub(&p.name("up.__n"), &p.name("up.__d")),
-            _ => format!("({})", p.sub(&p.name("up.__n"), &p.name("up.__d"))),
+            Partial::Rows | Partial::Count(_) => {
+                format!("({})", p.sub(&p.name("up.__n"), &p.name("up.__d")))
+            }
         };
         let prior_fields = self.fields_lateral("__pf", &prior, &|x| x.named("up.__o"));
         let field_count = self.shape.fields.len();

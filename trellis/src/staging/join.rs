@@ -876,7 +876,7 @@ impl JoinTargetPlan {
         let m_part = |p: Partial| match p {
             Partial::Count(i) if i > fa => Some(Partial::Count(i - fa)),
             Partial::Sum(part, i) if i > fa => Some(Partial::Sum(part, i - fa)),
-            _ => None,
+            Partial::Rows | Partial::Count(_) | Partial::Sum(..) => None,
         };
         // A cell's delta of `side`'s partial `p`, through `alias`: a map no
         // delta holds ([`SidePlan::delta_map_free`]) is `NULL`, so every
@@ -893,7 +893,9 @@ impl JoinTargetPlan {
                 let d = format!("coalesce({}, {})", d_delta(p), part.zero());
                 part.sub(&format!("p.{}", p.hidden()), &d)
             }
-            _ => format!("(p.{} - coalesce(d.{}, 0))", p.hidden(), p.name("__d")),
+            Partial::Rows | Partial::Count(_) => {
+                format!("(p.{} - coalesce(d.{}, 0))", p.hidden(), p.name("__d"))
+            }
         };
         let p_old_n = p_old(Partial::Rows);
         let mut terms = Vec::new();
@@ -940,7 +942,9 @@ impl JoinTargetPlan {
                     &p.times(&format!("p.{}", p.hidden()), "jd.__new"),
                     &p.times(&p_old(p), "jd.__old"),
                 ),
-                _ => format!("jd.__new * p.{} - jd.__old * {}", p.hidden(), p_old(p)),
+                (Partial::Rows | Partial::Count(_), None) => {
+                    format!("jd.__new * p.{} - jd.__old * {}", p.hidden(), p_old(p))
+                }
             };
             // With `matches_new > 0` the term is `-P_old`, which adds
             // nothing when every partial of `P_old` is 0: a cell a build
