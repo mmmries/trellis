@@ -478,12 +478,7 @@ impl GroupShape {
 
     /// Its partials, in the order every statement and table lists them.
     pub(crate) fn partials(&self) -> Vec<Partial> {
-        let mut out = vec![Partial::Rows];
-        for (i, arg) in self.args.iter().enumerate() {
-            out.push(Partial::Count(i + 1));
-            out.extend(arg.parts().iter().map(|&part| Partial::Sum(part, i + 1)));
-        }
-        out
+        partials_of(self.args.iter().map(Arg::parts))
     }
 
     /// `f` of each of its partials ([`Self::partials`]).
@@ -997,6 +992,30 @@ impl Partial {
         }
     }
 
+    /// Its SQL type.
+    pub(crate) fn sql_type(self) -> &'static str {
+        match self {
+            Partial::Sum(part, _) => part.sql_type(),
+            _ => "bigint",
+        }
+    }
+
+    /// Its hidden-table column definition.
+    pub(crate) fn ddl(self) -> String {
+        match self {
+            Partial::Sum(part, i) => part.ddl(i),
+            _ => format!("{} bigint not null default 0", self.hidden()),
+        }
+    }
+
+    /// Whether its hidden-table column is its zero.
+    pub(crate) fn is_zero(self) -> String {
+        match self {
+            Partial::Sum(part, i) => part.is_zero(&part.hidden(i)),
+            _ => format!("{} = 0", self.hidden()),
+        }
+    }
+
     /// Its working column under `prefix` read through `alias`, its zero
     /// where that is `NULL`: `coalesce(<alias>.<name>, <zero>) as <name>`.
     pub(crate) fn or_zero(self, alias: &str, prefix: &str) -> String {
@@ -1127,6 +1146,18 @@ fn strict_build_scales(x: &str, s: i32) -> String {
         "(case when bool_and(coalesce(scale(({x})) = {s}, ({x}) is null)) then {NO_SCALES} \
                else to_jsonb(('{OFF_SCALE} ' || count(*)::text)::bigint) end)"
     )
+}
+
+/// The partials of a group over arguments with sum partials `parts`, in
+/// the order every statement and table lists them: the row count, then per
+/// argument its count and its sum's partials.
+pub(crate) fn partials_of(parts: impl Iterator<Item = &'static [SumPart]>) -> Vec<Partial> {
+    let mut out = vec![Partial::Rows];
+    for (i, parts) in parts.enumerate() {
+        out.push(Partial::Count(i + 1));
+        out.extend(parts.iter().map(|&part| Partial::Sum(part, i + 1)));
+    }
+    out
 }
 
 /// The partials of an argument: none unsummed, [`NUMERIC_PARTS`] for a
@@ -1320,16 +1351,8 @@ fn hidden_table_columns(shape: &GroupShape) -> Vec<String> {
         .zip(&shape.group_types)
         .map(|(c, t)| format!("{} {t}", quote_ident(c)))
         .collect();
-    columns.push("__n bigint not null default 0".to_string());
-    let mut zero = vec!["__n = 0".to_string()];
-    for (i, arg) in shape.args.iter().enumerate() {
-        columns.push(format!("__count_{} bigint not null default 0", i + 1));
-        zero.push(format!("__count_{} = 0", i + 1));
-        for part in arg.parts() {
-            columns.push(part.ddl(i + 1));
-            zero.push(part.is_zero(&part.hidden(i + 1)));
-        }
-    }
+    columns.extend(shape.each_partial(Partial::ddl));
+    let zero = shape.each_partial(Partial::is_zero);
     let extremes = shape.extremes();
     for extreme in &extremes {
         columns.push(format!("{} {}", extreme.column(), extreme.pg_type));
@@ -1834,13 +1857,7 @@ fn staged_columns(shape: &GroupShape) -> Vec<String> {
         .collect();
     columns.push("__txid xid8".to_string());
     columns.push("__lsn pg_lsn".to_string());
-    columns.push("__n bigint".to_string());
-    for (i, arg) in shape.args.iter().enumerate() {
-        columns.push(format!("__c{} bigint", i + 1));
-        for part in arg.parts() {
-            columns.push(format!("{} {}", part.name("__", i + 1), part.sql_type()));
-        }
-    }
+    columns.extend(shape.each_partial(|p| format!("{} {}", p.name("__"), p.sql_type())));
     // Per extreme, the extreme of the insertion sides and of the
     // retraction sides, kept apart (Rx4: a sum can't say which side reached
     // the extreme).
@@ -2155,18 +2172,7 @@ impl GroupTargetPlan {
     /// the group's: `<prefix>n`, then per argument `<prefix>c<i>` and each
     /// of its partials' ([`SumPart::name`]), each `null::<type> as <name>`.
     fn working_columns(&self, prefix: &str) -> Vec<String> {
-        let mut columns = vec![format!("null::bigint as {prefix}n")];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            columns.push(format!("null::bigint as {prefix}c{}", i + 1));
-            for part in arg.parts() {
-                columns.push(format!(
-                    "null::{} as {}",
-                    part.sql_type(),
-                    part.name(prefix, i + 1)
-                ));
-            }
-        }
-        columns
+        (self.shape).each_partial(|p| format!("null::{} as {}", p.sql_type(), p.name(prefix)))
     }
 
     /// The visible target's group columns, `<col> as <col>` each, at the
