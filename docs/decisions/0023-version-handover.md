@@ -137,7 +137,7 @@ to.
   gives the same safety and lets the documented rolling deploy work.
 * **Pause definitions.** It pauses the whole instance for a process-level
   condition, and as a detect-and-pause mechanism it needs a false-positive
-  study. Standing by and refusing calls pause nothing.
+  study ([ADR-0027](0027-operating-principles.md), rule 3). Standing by and refusing calls pause nothing.
 * **Each version drains what it knows.** A release's behaviour toward
   definitions it can't parse is fixed (it pauses them at attach), claims are
   per segment bucket rather than per definition, one staging leader generates

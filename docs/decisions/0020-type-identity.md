@@ -171,7 +171,8 @@ A collation can change with no trigger firing: by an `ALTER COLUMN … COLLATE`
 that rewrites nothing, or by a collation library upgrade that changes no
 catalog row at all. Trellis can see such a change only by comparing the catalog
 afterwards. A pause driven by that comparison must first be shown not to fire on
-routine maintenance and migrations, and must not need superuser. This ADR adds
+routine maintenance and migrations, and must not need superuser
+([ADR-0027](0027-operating-principles.md), rule 3). This ADR adds
 no such detector.
 
 After a re-collation, a `JOIN` aggregate's group and key columns can sit at
@@ -250,7 +251,7 @@ evidence that it guarantees all of the following:
   from one owner, and adding a new one without covering it fails a test.
 - **Atomicity.** No drain or reader sees a mix of the old and new identity.
 - **Detection.** The signal that triggers it has a false-positive study and
-  needs no superuser.
+  needs no superuser ([ADR-0027](0027-operating-principles.md), rules 1 and 3).
 - **Evidence.** The type matrix test covers it, and mutation checks show each
   guarantee is load-bearing.
 

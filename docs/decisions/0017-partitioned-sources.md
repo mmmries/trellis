@@ -171,7 +171,8 @@ rebuild.
 
 Why not an event trigger, which would see DDL sooner? It needs a superuser, some
 hosts don't offer one, and I found it fires neither for an interrupted
-`DETACH CONCURRENTLY` nor for `TRUNCATE`. Nothing here depends on one.
+`DETACH CONCURRENTLY` nor for `TRUNCATE`. Nothing here depends on one
+([ADR-0027](0027-operating-principles.md), rule 1).
 
 ### Target rows route to nodes by each leaf's recorded bound, under pinned settings
 
@@ -405,7 +406,7 @@ A deep check compares them in this order:
    the pass pauses every reader before any deep check, like a plain table that
    is gone or swapped ([capture by
    triggers](../staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)),
-   and corrects and reinstalls nothing. A resume re-validates against the
+   and corrects and reinstalls nothing ([ADR-0027](0027-operating-principles.md), rule 2). A resume re-validates against the
    table now at the name, forgets the recorded tree and rebuilds. Only a
    leaf's or a middle's maintenance is corrected per node.
 

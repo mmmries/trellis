@@ -45,7 +45,7 @@ operator's `PAUSE`, or by the engine when it cannot maintain the definition:
 too many poisoned source rows. It is a separate status so that poison incidents stay
 distinguishable from an operator's pause. From either, an operator resumes, which
 reconciles the target with current source data, or drops it, which removes the
-definition and its data. Every freeze stays until an operator acts.
+definition and its data. Every freeze stays until an operator acts ([ADR-0027](0027-operating-principles.md), rule 2).
 
 Drop acts only on a frozen definition (`paused` or `quarantined`). There is no direct
 live-to-gone edge: quiescing first is a precondition, so the removal never has to reason
@@ -142,7 +142,7 @@ appear the same way. The deletes, the build's included, go through the target-mu
 seam like any other target write, so a live definition reading this target drops them too.
 
 Before any of that, resume re-validates the definition against the live schema, with
-the same checks define runs: its fields over the source's
+the same checks define runs ([ADR-0027](0027-operating-principles.md), rule 4): its fields over the source's
 live columns, the source key's type and collations, a `JOIN`'s `ON` columns (still on
 the allowlist, with matching types and collations), row-level security and subscriptions, and, for a 1-1 definition, a
 source key that is still the one its target is keyed by. While define would refuse

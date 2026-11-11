@@ -221,7 +221,7 @@ What it does there is one append.
 - On the privilege model, I checked that the application needs nothing on
   Trellis's schema. The Trellis role must own each source table or be a
   member of its owning role, because `ENABLE ALWAYS` needs ownership, not
-  just `TRIGGER`. It needs no superuser.
+  just `TRIGGER`. It needs no superuser ([ADR-0027](0027-operating-principles.md), rule 1).
 - **Must (I6):** `CREATE TRIGGER` and `DROP TRIGGER` run under a short
   `lock_timeout` in a retry loop, one attempt per interval, until they land.
   *Evidence:* the `lock_timeout` retry measurement under I6.
