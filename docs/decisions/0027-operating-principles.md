@@ -6,11 +6,11 @@ deciders: Michael Ries
 
 # Operating Principles
 
-Five decisions shape most features that watches a source, a target or
-Trellis's own state, and until now none of them was written down as a
-decision: each feature ADR applied them again in a paragraph of its own. A
-contributor designing a new check had to infer them from those paragraphs, and
-the paragraphs drift apart as they are edited.
+Five decisions shape most features that watch a source, a target or
+Trellis's own state. Without one place that states them, each feature ADR
+applies them again in a paragraph of its own, a contributor designing a new
+check has to infer them from those paragraphs, and the paragraphs drift apart
+as they are edited.
 
 This ADR states them once, as numbered rules that other ADRs, docs and reviews
 cite by number ("ADR-0027, rule 3"). Each rule is a constraint a design must
@@ -30,14 +30,11 @@ check or repair may need that role to be a superuser. Event triggers, which
 would see DDL that fires no trigger, are therefore out
 ([ADR-0017](0017-partitioned-sources.md)), and so is packaging Trellis as an
 extension ([ADR-0025](0025-schema-dumps-restore-definitions.md)). Capture runs
-on row triggers, which need ownership of the source (or membership in its
-owning role) because `ENABLE ALWAYS` does, and nothing more
-([ADR-0002](0002-async-data-flow.md)). The reason: some hosts don't offer a
-superuser at all.
-
-[OPEN: is there a second reason to state, such as the cost to an operator of
-justifying a superuser grant for a background process? Recommendation: state
-it only if it is yours; the hosting reason alone carries the rule.]
+on statement triggers, which need ownership of the source (or membership in
+its owning role) because `ENABLE ALWAYS` does, and nothing more
+([ADR-0002](0002-async-data-flow.md)). The reasons: some hosts don't offer a
+superuser at all, and where one exists, a superuser grant is too much to
+explain and justify to the operators who would have to make it.
 
 ### 2. When Trellis can't vouch for a target, it pauses with a reason
 
@@ -46,20 +43,26 @@ longer maintain the definition as written, it pauses the definition with a
 `capture_failure` that names what it found and the remedy, and the pause holds
 until an operator runs `RESUME` ([ADR-0014](0014-pause-and-drop-a-transform.md)).
 It does not reinstall its capture, rebuild a target or resume a definition on
-its own to get past the finding. A pause is loud and leaves the decision of
-when to pay for a rebuild, and whether the change that caused it was meant, to
-the operator, who usually made it: a table swap, a bulk load with triggers
-disabled, a migration.
+its own to get past the finding. The reason: Trellis shouldn't start an
+expensive rebuild by itself, but it must tell the operator when it can no
+longer guarantee a target's correctness. One rule for every disruption of
+Trellis's capture is also simple to document and simple for operators to
+understand: an operator who swaps a table or bulk-loads with triggers disabled
+plans a `RESUME` afterwards.
 
-The one exception: when only data was missed and every definition reading the
+The exception: when only data was missed and every definition reading the
 table is still valid as written, the staging worker rebuilds the readers
-itself, exactly as `Trellis::request_backfill` does, pausing nobody, and logs
-and counts it (`capture_auto_rebuilds_total`). A same-type `USING` rewrite of a
-read column, a stored generated column's expression replaced, and a read
-column changed where every reader stays valid are those cases
+itself, exactly as `Trellis::request_backfill` does, and pauses nobody. A
+same-type `USING` rewrite of a read column, a stored generated column's
+expression replaced, and a read column changed where every reader stays valid
+are those cases; each is logged and counted (`capture_auto_rebuilds_total`)
 ([capture by triggers](../staging-and-claiming/01-capture-by-triggers.md#what-rebuilds-what-pauses-and-whats-missed)).
-`RESUME` would run the same rebuild, so the pause would add an operator step
-and change nothing.
+Partition maintenance under a partitioned source (a leaf attached, detached,
+dropped or truncated) is the same kind of loss, and the staging worker
+corrects each changed partition by itself
+([ADR-0017](0017-partitioned-sources.md)). A pause there would interrupt an
+operator for a loss Trellis can repair by itself, and a false positive costs
+one rebuild rather than an operator's time.
 
 A restore never starts a rebuild: a logical restore pauses every definition,
 and a physical restore or `pg_upgrade` pauses and rebuilds nothing. A
@@ -67,21 +70,14 @@ condition of a whole process rather than a definition, such as another
 release live on the instance, stands the process by instead of pausing
 anything ([ADR-0023](0023-version-handover.md)).
 
-[OPEN: no ADR states why a pause is preferred to an automatic rebuild; the
-reason above (the operator decides when to pay for a rebuild, and usually made
-the change) is drafted, not quoted. Recommendation: replace it with your own
-words if they differ, for example that an automatic rebuild is expensive and
-Trellis should not start one unasked, but must say when it can no longer
-guarantee a target.]
-
 ### 3. A detector that pauses ships only after a false-positive study
 
 Before Trellis pauses on a signal it reads (a catalog comparison, a
 fingerprint, an index's validity), a study runs a matrix of routine
-maintenance and migration operations against the signal: every `VACUUM`
-variant, `CLUSTER`, `REINDEX` and `REINDEX CONCURRENTLY`, pg_repack, a catalog
-freeze, the migrations frameworks generate, partition maintenance, a restore
-and `pg_upgrade`, and whatever else the signal could see. The maintainer
+maintenance and migration operations against the signal: those the signal
+could see, such as `VACUUM` variants, `CLUSTER`, `REINDEX CONCURRENTLY`,
+pg_repack, the migrations frameworks generate, partition maintenance, a
+restore and `pg_upgrade`. The maintainer
 reviews the study and decides, even when it finds no false positive. A shape
 that can't be detected without pausing on routine work is documented in
 [known correctness gaps](../known-correctness-gaps.md) instead, and that is
@@ -91,18 +87,21 @@ The studies behind the key-rule pauses ([ADR-0026](0026-source-keys.md)) and
 the partition-tree fingerprints ([ADR-0017](0017-partitioned-sources.md)) are
 this rule applied: in the second, I found that adding the source's own
 `pg_class.xmin` would fire on a `GRANT`, an owner change or an `ADD COLUMN`,
-each forcing a full rebuild, so it is not part of the fingerprint. A pause
-that a routine operation trips sends an operator to `RESUME` and a full
-rebuild for nothing.
+each forcing a full rebuild, so it is not part of the fingerprint.
+
+The reason: a detector that pauses on false positives is worse than no
+detector. A pause every couple of days on a busy database is unacceptable to
+an operator, so how often operators are interrupted weighs more than
+detecting every case. A pause that an operator's change to Trellis's own
+capture triggers or functions trips is intended (rule 2), not a false
+positive.
 
 [OPEN: does the rule cover a detector that rebuilds by itself (rule 2's
-exception) as well as one that pauses? ADR-0017's fingerprints start
-corrections, not pauses, and were studied the same way. Recommendation: yes, say "pauses or rebuilds".]
-
-[OPEN: is a pause tripped by an operator changing Trellis's own capture
-triggers or functions a false positive for the study's purposes? The capture
-pass treats it as an intended pause. Recommendation: say it is intended, not a
-false positive.]
+exception) as well as one that pauses? In practice yes: the signals behind
+rule 2's automatic rebuilds and ADR-0017's fingerprints were studied the same
+way before they shipped. But the reason above is about interrupting
+operators, and a false positive there costs a rebuild, not an interruption.
+Recommendation: say "pauses or rebuilds", with that cost as the reason.]
 
 ### 4. Define-time validations hold for the definition's life
 
@@ -116,10 +115,19 @@ error (or, when the staging worker finishes the resume, records it on the
 resume can never be a way to run a definition define would turn away.
 
 While a definition runs, a condition define refuses that appears later pauses
-it when a check for it is cheap and has passed rule 3. Where no such check exists, the condition is a documented gap
-until the next `RESUME` catches it. Every define-time refusal states what
-happens if its condition appears after define, and the remedy, in
-[Supported sources and targets](../transforms.md#supported-sources-and-targets).
+it where that is practical: the check is cheap, it has passed rule 3, and the
+condition is worth a pause. An index that only speeds up `self_check` is not:
+losing it slows an on-demand audit and pauses nothing. Every define-time
+refusal states what happens if its condition appears after define, and the
+remedy, in
+[Supported sources and targets](../transforms.md#supported-sources-and-targets);
+a way it can leave a target wrong unnoticed is also a
+[known correctness gap](../known-correctness-gaps.md).
+
+[OPEN: the decision behind this rule is "define-time validations are enforced
+for a definition's lifetime wherever practical"; its reason (first sentence
+of this rule) is drafted, not quoted. Recommendation: replace it with your own
+words if they differ.]
 
 ### 5. Trellis does not guard what it owns against changes made outside it
 
@@ -144,9 +152,12 @@ application's tables, where routine operations (a bulk load, a fixture load, a
 table swap) disturb them, so the capture pass detects a change to them and
 pauses under rule 2.
 
-[OPEN: the reason not to guard is not written in any ADR. Recommendation:
-state the cost a guard would add (a trigger on every target write path, or a
-second role) against a misuse that `SELECT`-only grants already prevent.]
+[OPEN: no reason not to guard is written down anywhere: the record only keeps
+writes into what Trellis owns an operator rule and parks the guards (a guard
+trigger on every write path, role separation, an identity record for
+Trellis's tables) until users need enforcement. Recommendation: state your
+reason, for example the cost a guard adds against a misuse that `SELECT`-only
+grants already prevent.]
 
 ## Example
 
@@ -158,8 +169,9 @@ capture pass pauses every definition that reads `orders` with a
 `capture_failure` of kind `disruption` saying that changes made meanwhile may
 be missing (rule 2); it reinstalls nothing. `RESUME` re-validates each
 definition against `orders` as it is now (rule 4), and the next pass
-reinstalls capture and rebuilds. Had the operator instead rewritten a column
-in place, `ALTER TABLE orders ALTER COLUMN note TYPE text USING trim(note)`,
+reinstalls capture and rebuilds. Had the operator instead rewritten a `text`
+column a definition reads in place,
+`ALTER TABLE orders ALTER COLUMN note TYPE text USING trim(note)`,
 only data would have been missed and every reader stays valid, so the pass
 rebuilds the readers itself and pauses nobody.
 
