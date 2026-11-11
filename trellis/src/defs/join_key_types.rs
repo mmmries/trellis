@@ -7,8 +7,6 @@
 //! ([`super::ddl::source_primary_key`]) and the copied key types
 //! ([`super::key_types`]) all gate on it.
 
-use tokio_postgres::GenericClient;
-
 use super::floor::{BASELINE, Release};
 
 /// One type [`TEXT_STABLE_JOIN_KEY_TYPES`] admits as a join key, and the
@@ -346,15 +344,8 @@ pub(super) fn listed_join_keys() -> Vec<JoinKey> {
 }
 
 /// Whether the type whose OID is `type_oid` is in
-/// [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of truth both
-/// [`super::validate::validate_join`] (`JOIN` keys) and
-/// [`super::ddl::source_primary_key`] (1-1 transform primary keys) gate on.
-/// A modifier is no part of a type's identity, so `varchar(255)` and
-/// `varchar(100)` are both `character varying`, and `timestamp(3) without
-/// time zone` is `timestamp without time zone`.
-///
-/// A pure question: it records nothing for a floor. The validator admits a
-/// `JOIN` key through [`admit_join_key`].
+/// [`TEXT_STABLE_JOIN_KEY_TYPES`]: [`key_entry`]'s rule for a type that isn't
+/// an enum. A pure question: it records nothing for a floor.
 pub(crate) fn is_text_stable_join_key_type(type_oid: u32) -> bool {
     listed_join_key(type_oid).is_some()
 }
@@ -369,8 +360,11 @@ fn listed_join_key(type_oid: u32) -> Option<JoinKey> {
 }
 
 /// The entry that admits a key of the type whose OID is `type_oid`
-/// (`is_enum`: the catalog says it is an enum, [`JoinKey::Enum`]).
-fn key_entry(type_oid: u32, is_enum: bool) -> Option<JoinKey> {
+/// (`is_enum`: the catalog says it is an enum, [`JoinKey::Enum`]), or `None`
+/// when the type is refused: the one key-type rule for a `JOIN ... ON` key
+/// ([`admit_join_key`]) and a source's row-identity key
+/// ([`super::ddl::admit_key_types`]).
+pub(crate) fn key_entry(type_oid: u32, is_enum: bool) -> Option<JoinKey> {
     if is_enum {
         // An enum is never a `pg_catalog` type, whatever it is named.
         return Some(JoinKey::Enum);
@@ -388,34 +382,6 @@ pub(crate) fn admit_join_key(type_oid: u32, is_enum: bool) -> bool {
     };
     super::floor::record(super::floor::Feature::JoinKey(key));
     true
-}
-
-/// The entry that admits a 1-1 source's primary-key column of type `pg_type`
-/// ([`super::ddl::admitted_primary_key`]), or `None` when the type is refused:
-/// a listed type, or a live enum ([`JoinKey::Enum`]). The primary key's way
-/// to admit a type, as [`admit_join_key`] is the validator's. It is async,
-/// so it returns the entry rather than recording it
-/// ([`super::floor::record`]), and its caller hands the entry to the floor.
-///
-/// `pg_type` is the key column's type as a copy declares it
-/// ([`super::copy_type::type_sql`]): qualified unless it is a `pg_catalog`
-/// type, so `to_regtype` resolves it to that one type whatever the
-/// `search_path`. Its OID decides, never its text.
-pub(crate) async fn admit_primary_key_type(
-    client: &impl GenericClient,
-    pg_type: &str,
-) -> Result<Option<JoinKey>, tokio_postgres::Error> {
-    let Some(row) = client
-        .query_opt(
-            "select oid, typtype = 'e' from pg_catalog.pg_type \
-             where oid = pg_catalog.to_regtype($1)",
-            &[&pg_type],
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    Ok(key_entry(row.get(0), row.get(1)))
 }
 
 /// An OID no `pg_catalog` type has: the first a user type can get

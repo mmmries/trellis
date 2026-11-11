@@ -1066,6 +1066,43 @@ async fn a_source_table_with_a_numeric_primary_key_is_rejected() {
     }
 }
 
+/// A refused key type is named as the source declares a `pg_catalog` type,
+/// modifier included, and by its qualified name otherwise, so a domain named
+/// `"integer"` is never reported as `integer`.
+#[tokio::test]
+async fn a_refused_primary_key_type_is_named_with_its_modifier_or_qualified() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("connection");
+    client
+        .batch_execute(
+            "create domain \"integer\" as numeric;
+             create table priced (amount numeric(10,2) primary key);
+             create table counted (n \"integer\" primary key);",
+        )
+        .await
+        .expect("seed tables with refused primary key types");
+    // Created on the `search_path`, so `format_type` renders it bare.
+    let schema: String = client
+        .query_one(
+            "select typnamespace::regnamespace::text from pg_type \
+             where typname = 'integer' and typtype = 'd'",
+            &[],
+        )
+        .await
+        .expect("the domain's schema")
+        .get(0);
+    let domain = format!("{schema}.\"integer\"");
+    for (table, expected) in [("priced", "numeric(10,2)"), ("counted", domain.as_str())] {
+        match source_primary_key(&db.pool, table).await.unwrap_err() {
+            DdlError::UnsupportedPrimaryKeyType { pg_type, .. } => {
+                assert_eq!(pg_type, expected, "{table}");
+            }
+            other => panic!("expected UnsupportedPrimaryKeyType, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_nulls_distinct_unique_index_is_not_accepted_as_a_primary_key_stand_in() {
     // A plain `UNIQUE` index on a nullable column

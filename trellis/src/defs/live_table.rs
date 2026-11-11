@@ -160,9 +160,9 @@ impl LiveTable {
         Ok(table)
     }
 
-    /// The column named `name`, of any type.
-    pub(crate) fn column(&self, name: &str) -> Option<&LiveColumn> {
-        self.columns.get(name)
+    /// The column named `name`, of any type, as the validator reads it.
+    pub(crate) fn info(&self, name: &str) -> Option<&JoinColumnInfo> {
+        self.columns.get(name).map(|column| &column.info)
     }
 
     /// The columns the validator can type, as
