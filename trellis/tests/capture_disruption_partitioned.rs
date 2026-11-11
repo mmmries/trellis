@@ -10,127 +10,21 @@
 //! The case's windows run between calls of the capture pass, which is called
 //! directly. Nothing polls for convergence.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
+use trellis::Trellis;
 use trellis::capture::reconcile;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live_all, capture_pass, connect, definer, reconcile_pass, statuses};
+use trellis::staging::build::settle_builds;
 
 const SCHEMA: &str = "trellis";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_disruption_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_disruption_test",
-            1,
-            "trellis_capture_missed_ddl_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-/// Every definition's status, by bare target name.
-async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
-    raw.query(
-        "select split_part(target_table, '.', 2), status from transform_definitions",
-        &[],
-    )
-    .await
-    .expect("read statuses")
-    .into_iter()
-    .map(|row| {
-        (
-            row.get(0),
-            trellis::defs::StoredStatus::from_persisted(row.get(1))
-                .expect("a stored status")
-                .into(),
-        )
-    })
-    .collect()
-}
-
-/// Alternates staging-worker passes, builds and drains until every
-/// definition is live: a bounded number of explicit steps.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
-    for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let statuses = statuses(raw).await;
-        if statuses.values().all(|s| *s == TransformStatus::Live) {
-            return;
-        }
-    }
-    panic!("not every definition went live: {:?}", statuses(raw).await);
-}
 
 async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
     raw.query(sql, &[])
@@ -258,7 +152,7 @@ async fn run_cases(cases: &[Case]) {
     let trellis = definer(db.dsn()).await;
     let ids: Vec<String> = cases.iter().map(|(id, _, _)| id.to_lowercase()).collect();
     create_case_tables(&raw, &trellis, &ids).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
 
     let app = connect(db.dsn()).await;
     let mut failures = Vec::new();
@@ -585,7 +479,7 @@ async fn nodes_added_by_maintenance_are_recorded_and_then_checked() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["m".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     let table = "public.p_m";
     assert_eq!(record_size(&raw, table).await, (6, 30));
@@ -649,7 +543,7 @@ async fn resume_reinstalls_and_records_a_disrupted_tree() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["rs".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     let table = "public.p_rs";
 
@@ -863,7 +757,7 @@ async fn a_root_swapped_recreated_or_renamed_away_pauses_both_readers_until_resu
     let trellis = definer(db.dsn()).await;
     let ids: Vec<String> = cases.iter().map(|c| c.0.to_string()).collect();
     create_case_tables(&raw, &trellis, &ids).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
 
     let mut failures = Vec::new();
@@ -917,7 +811,7 @@ async fn a_root_swapped_recreated_or_renamed_away_pauses_both_readers_until_resu
                 .unwrap_or_else(|e| panic!("{id}: resume {reader}: {e}"));
         }
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     for (id, ..) in &cases {
         let t = format!("p_{id}");
         let target = rows(
@@ -968,7 +862,7 @@ async fn a_root_swapped_during_the_pass_pauses_both_readers() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["race".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     let gate = connect(db.dsn()).await;
     let recorded_root = || async {
@@ -1069,7 +963,7 @@ async fn tree_changes_while_every_reader_is_paused_are_covered_by_the_resume() {
     let trellis = definer(db.dsn()).await;
     let ids = ["node".to_string(), "away".to_string()];
     create_case_tables(&raw, &trellis, &ids).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     // `{t}` the root's name now, `{l}` its leaves' prefix.
     let maintenance = "create table public.{l}_l4 (like public.{t} including defaults); \
@@ -1108,9 +1002,9 @@ async fn tree_changes_while_every_reader_is_paused_are_covered_by_the_resume() {
         .await
         .unwrap();
     for _ in 0..3 {
-        full_pass(&mut raw, &db.pool).await;
-        run_backfill_chunks(&db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle_builds(&db.pool).await;
+        pipeline::settle(&db.pool, &mut raw).await;
     }
     for (t, s) in statuses(&raw).await {
         assert_eq!(s, TransformStatus::Paused, "{t}");
@@ -1140,7 +1034,7 @@ async fn tree_changes_while_every_reader_is_paused_are_covered_by_the_resume() {
         .await
         .unwrap();
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     for id in &ids {
         app.batch_execute(&format!(
             "insert into public.p_{id}_l4 select i + 3000, 3, i, i, i from generate_series(1, 4) i"
@@ -1148,7 +1042,7 @@ async fn tree_changes_while_every_reader_is_paused_are_covered_by_the_resume() {
         .await
         .unwrap();
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let mut failures = Vec::new();
     for id in &ids {
         oracle(&raw, id, &mut failures).await;

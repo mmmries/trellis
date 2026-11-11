@@ -13,76 +13,27 @@
 //! staging-worker passes and seal/drain rounds. Nothing polls.
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::sql::pinned_output_settings;
 use trellis::defs::TransformStatus;
 use trellis::{Config, Trellis, TrellisOptions};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_with, reconcile_pass, settle};
+use trellis::staging::build::settle_builds;
 
 const SCHEMA: &str = "trellis";
 
 /// A connection pinned the way the staging worker's is: Trellis's schema
 /// first, plus every pinned output setting.
 async fn connect_pinned(dsn: &str) -> Client {
-    let client = connect(dsn).await;
-    client
-        .batch_execute(&format!(
-            "set search_path to {SCHEMA}, public; {}",
-            pinned_output_settings().join("; ")
-        ))
-        .await
-        .expect("pin the session");
-    client
-}
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// Seals and drains through the engine's own apply path until nothing is
-/// pending anywhere in the ring (as in `capture_schema_change.rs`).
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "ledger_xmloption_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "ledger_xmloption_test",
-            1,
-            "trellis_ledger_xmloption_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-/// Claims, runs and finishes every pending backfill chunk (as in
-/// `capture_schema_change.rs`).
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
+    let setup = format!(
+        "set search_path to {SCHEMA}, public; {}",
+        pinned_output_settings().join("; ")
+    );
+    connect_with(dsn, &setup).await
 }
 
 async fn status(raw: &Client, target: &str) -> TransformStatus {
@@ -113,7 +64,7 @@ async fn an_xml_fragment_applies_to_an_aggregate_under_a_document_xmloption() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     {
-        let setup = connect(db.dsn()).await;
+        let setup = connect_with(db.dsn(), "").await;
         setup
             .batch_execute(&format!(
                 "create table public.x (id int primary key, g int, doc xml); \
@@ -125,7 +76,7 @@ async fn an_xml_fragment_applies_to_an_aggregate_under_a_document_xmloption() {
             .expect("seed, then make document the database's xmloption");
     }
     // A session that pins nothing now refuses a fragment: the hazard is real.
-    let unpinned = connect(db.dsn()).await;
+    let unpinned = connect_with(db.dsn(), "").await;
     assert!(
         unpinned.batch_execute("select 'a<b/>'::xml").await.is_err(),
         "a fragment must not parse under the database's xmloption, or this test proves nothing"
@@ -144,9 +95,9 @@ async fn an_xml_fragment_applies_to_an_aggregate_under_a_document_xmloption() {
         .expect("define");
     let mut raw = connect_pinned(db.dsn()).await;
     for _ in 0..8 {
-        full_pass(&mut raw, &pool).await;
-        run_backfill_chunks(&pool).await;
-        drain_to_quiescence(&pool, &mut raw).await;
+        reconcile_pass(&mut raw, &pool).await;
+        settle_builds(&pool).await;
+        settle(&pool, &mut raw).await;
         if status(&raw, "tx").await == TransformStatus::Live {
             break;
         }
@@ -154,7 +105,7 @@ async fn an_xml_fragment_applies_to_an_aggregate_under_a_document_xmloption() {
     assert_eq!(status(&raw, "tx").await, TransformStatus::Live);
 
     // The application stores fragments under its own `content` session.
-    let writer = connect(db.dsn()).await;
+    let writer = connect_with(db.dsn(), "").await;
     writer
         .batch_execute(
             "set xmloption to content; \
@@ -164,7 +115,7 @@ async fn an_xml_fragment_applies_to_an_aggregate_under_a_document_xmloption() {
         )
         .await
         .expect("the application's writes");
-    drain_to_quiescence(&pool, &mut raw).await;
+    settle(&pool, &mut raw).await;
 
     assert_eq!(
         counts(&raw, "select g, n from public.tx where n <> 0 order by g").await,

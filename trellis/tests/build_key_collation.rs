@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::chunk_queue;
 use trellis::defs::{Statement, ValueType, alter_transform, parse_statement};
@@ -38,24 +38,17 @@ const OPTIONS: WorkerOptions = WorkerOptions {
     reclaim_ttl: Duration::from_secs(30),
 };
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
+
 const MAX_STEPS: usize = 2_000;
 
 struct Fixture {
     db: TestDatabase,
     raw: Client,
     _cluster: TestCluster,
-}
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
 }
 
 impl Fixture {

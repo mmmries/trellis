@@ -14,87 +14,18 @@
 //! Every test is stepped by hand: writes, then explicit capture passes,
 //! drains and backfill runs. Nothing polls for convergence.
 
-use std::time::{Duration, Instant};
-
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisError, TrellisOptions};
+use trellis::{Trellis, TrellisError};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, settle, status};
+use trellis::staging::build::settle_builds;
 
 const SCHEMA: &str = "trellis";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only. Asserts no table failed.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_key_retype_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_key_retype_test",
-            1,
-            "trellis_capture_key_retype_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
 
 /// Drains the active segment, whose rows include a key whose write fails:
 /// each failed drain charges the key a death, until it is quarantined and
@@ -130,51 +61,11 @@ async fn drain_past_failures(pool: &trellis::pool::Pool, client: &mut Client) {
         .expect("retire drained segments");
 }
 
-/// Claims, runs and finishes every pending backfill chunk.
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
 /// Whether a stored `status` is a rebuild's: the Re-derive build's own. (A
 /// reader of a rebuilding upstream stays stored `live`; it only reports
 /// `catching_up`.)
 fn rebuilding(status: TransformStatus) -> bool {
     status == TransformStatus::Backfilling
-}
-
-async fn status(raw: &Client, target: &str) -> TransformStatus {
-    let text: String = raw
-        .query_one(
-            "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
-            &[&target],
-        )
-        .await
-        .expect("read status")
-        .get(0);
-    trellis::defs::StoredStatus::from_persisted(&text)
-        .expect("a stored status")
-        .into()
-}
-
-/// Alternates staging-worker passes and drains until every one of
-/// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
-    for _ in 0..8 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let mut all_live = true;
-        for target in targets {
-            all_live &= status(raw, target).await == TransformStatus::Live;
-        }
-        if all_live {
-            return;
-        }
-    }
-    for target in targets {
-        eprintln!("{target}: {:?}", status(raw, target).await);
-    }
-    panic!("{targets:?} did not all go live within 8 pass/drain rounds");
 }
 
 async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
@@ -364,8 +255,8 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
     )
     .await
     .expect("writes");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     // `per_price` keeps the rendering each group was first written with,
     // so its groups are compared as numbers.
     for (target, column) in [
@@ -486,8 +377,8 @@ async fn widening_a_one_to_one_key_pauses_and_resume_widens_the_target_key() {
     raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
         .await
         .expect("a key above 2^31");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
     assert_item_names_match(&raw).await;
 
@@ -550,8 +441,8 @@ async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it(
     raw.batch_execute("insert into public.items values (3000000000, 'a much longer name', 3)")
         .await
         .expect("a longer value");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
     assert_item_names_match(&raw).await;
 }
@@ -598,8 +489,8 @@ async fn widening_a_group_by_key_pauses_and_resume_widens_its_copies() {
     )
     .await
     .expect("groups above 2^31");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
     assert_eq!(
         rows(
@@ -692,8 +583,8 @@ async fn a_crash_between_the_re_type_and_the_rebuild_leaves_the_resume_to_finish
     raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
         .await
         .expect("a key above 2^31");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_item_names_match(&raw).await;
 }
 
@@ -827,8 +718,8 @@ async fn a_type_change_that_re_renders_the_keys_pauses_and_resume_rebuilds_it() 
     raw.batch_execute("insert into public.readings values ('2024-01-04 10:00', '2024-01-02', 8)")
         .await
         .expect("a write");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         rows(
             &raw,
@@ -977,8 +868,8 @@ async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower
     )
     .await
     .expect("writes to rows the rewrite re-rendered, and at the wider scale");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "per_price").await, TransformStatus::Live);
     groups_match(&raw).await;
 
@@ -1249,8 +1140,8 @@ async fn widening_a_summed_column_on_the_group_basis_pauses_and_resume_re_types_
     )
     .await
     .expect("values above 2^31 and a sum above 2^63");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
     assert_eq!(
         rows(
@@ -1472,8 +1363,8 @@ async fn widening_a_column_a_calculated_field_reads_pauses_and_resume_re_types_t
     raw.batch_execute("insert into public.items values (3, 'three', 3000000000)")
         .await
         .expect("a value above 2^31");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
     assert_item_names_match(&raw).await;
 }
@@ -1555,9 +1446,9 @@ async fn step_until_live(
                 return;
             }
             match step {
-                0 => full_pass(raw, pool).await,
-                1 => run_backfill_chunks(pool).await,
-                _ => drain_to_quiescence(pool, raw).await,
+                0 => reconcile_pass(raw, pool).await,
+                1 => settle_builds(pool).await,
+                _ => settle(pool, raw).await,
             }
             if status(raw, upstream).await != TransformStatus::Live {
                 for target in waiting {
@@ -1612,8 +1503,8 @@ async fn assert_chain_converges(trellis: &Trellis, raw: &mut Client, pool: &trel
     raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
         .await
         .expect("a key above 2^31");
-    full_pass(raw, pool).await;
-    drain_to_quiescence(pool, raw).await;
+    reconcile_pass(raw, pool).await;
+    settle(pool, raw).await;
     for target in ["item_names", "b_names", "c_names"] {
         assert_unpaused(trellis, target).await;
         assert_eq!(status(raw, target).await, TransformStatus::Live, "{target}");
@@ -1968,9 +1859,9 @@ async fn step_until_live_requested(
                 return;
             }
             match step {
-                0 => full_pass(raw, pool).await,
-                1 => run_backfill_chunks(pool).await,
-                _ => drain_to_quiescence(pool, raw).await,
+                0 => reconcile_pass(raw, pool).await,
+                1 => settle_builds(pool).await,
+                _ => settle(pool, raw).await,
             }
             if status(raw, upstream).await != TransformStatus::Live {
                 for (target, its_upstream) in waiting {
@@ -2005,7 +1896,7 @@ async fn a_stack_resumed_in_any_order_comes_up_in_dependency_order() {
     resume(&trellis, "b_names").await;
     assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
     // Passes while A is paused change nothing.
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
     assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
 
@@ -2097,9 +1988,9 @@ async fn a_resume_waits_for_an_upstream_that_reports_catching_up() {
         rounds += 1;
         assert!(rounds <= 36, "b_names did not report live");
         match rounds % 3 {
-            1 => full_pass(&mut raw, &db.pool).await,
-            2 => run_backfill_chunks(&db.pool).await,
-            _ => drain_to_quiescence(&db.pool, &mut raw).await,
+            1 => reconcile_pass(&mut raw, &db.pool).await,
+            2 => settle_builds(&db.pool).await,
+            _ => settle(&db.pool, &mut raw).await,
         }
         if reported_b().await != TransformStatus::Live {
             assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
@@ -2177,9 +2068,9 @@ async fn a_downstream_waits_on_a_paused_upstream_until_a_pause_withdraws_it() {
     assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
     let detected_at = failure_detected_at(&raw, "b_names").await;
     for _ in 0..3 {
-        full_pass(&mut raw, &db.pool).await;
-        run_backfill_chunks(&db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle_builds(&db.pool).await;
+        settle(&db.pool, &mut raw).await;
         assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
     }
     assert_eq!(detected_at, failure_detected_at(&raw, "b_names").await);
@@ -2195,8 +2086,8 @@ async fn a_downstream_waits_on_a_paused_upstream_until_a_pause_withdraws_it() {
     resume(&trellis, "item_names").await;
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
     for _ in 0..2 {
-        full_pass(&mut raw, &db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
     }
     assert_eq!(status(&raw, "b_names").await, TransformStatus::Paused);
     assert!(!requested(&raw, "b_names").await);
@@ -2298,8 +2189,8 @@ async fn a_pause_of_a_definition_waiting_on_its_cause_takes_it_out_of_the_chain(
 
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
     for _ in 0..2 {
-        full_pass(&mut raw, &db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
     }
     assert_eq!(
         paused_for(&trellis, "b_names", "public.item_names", &["id"]).await,
@@ -2327,8 +2218,8 @@ async fn a_definition_paused_by_the_operator_before_the_chain_stays_paused() {
     assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
     bring_live(&mut raw, &db.pool, &["item_names", "b_names"]).await;
     for _ in 0..2 {
-        full_pass(&mut raw, &db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
     }
     assert_eq!(status(&raw, "c_names").await, TransformStatus::Paused);
     assert_eq!(caused_by(&raw, "c_names").await, None);
@@ -2647,8 +2538,8 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
     )
     .await
     .expect("writes");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     for target in targets {
         assert_eq!(
             status(&raw, target).await,
@@ -2808,10 +2699,10 @@ async fn a_modifier_widening_re_types_no_copy(
         // The copies of a string column are unbounded, so the drain
         // applies these with no pass in between.
         write_long(&raw).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        settle(&db.pool, &mut raw).await;
         assert_widening_targets_match(&raw).await;
     }
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
 
     for target in WIDENING_TARGETS {
         assert_eq!(
@@ -2852,8 +2743,8 @@ async fn a_modifier_widening_re_types_no_copy(
     if !written_before_the_pass {
         write_long(&raw).await;
     }
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     for target in WIDENING_TARGETS {
         assert_eq!(
             status(&raw, target).await,
@@ -3012,7 +2903,7 @@ async fn a_value_the_old_modifier_couldnt_hold_applies_with_no_pass_and_no_hold(
         "only the check holds a key"
     );
 
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     drain_past_failures(&db.pool, &mut raw).await;
     for target in targets {
         assert_eq!(
@@ -3232,7 +3123,7 @@ async fn a_key_re_typed_in_place_is_measured_from_its_new_type() {
     raw.batch_execute("alter table public.codes alter column code type varchar(40) collate \"C\"")
         .await
         .expect("widen the key");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "code_counts").await, TransformStatus::Live);
     assert_eq!(
         column_type(&raw, "public.code_counts", "code").await,
@@ -3246,8 +3137,8 @@ async fn a_key_re_typed_in_place_is_measured_from_its_new_type() {
     raw.batch_execute("insert into public.codes values ('a code past twenty chars', 3)")
         .await
         .expect("a key the old type couldn't hold");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
 
     raw.batch_execute(
         "alter table public.codes alter column code type varchar(20) collate \"C\" \
@@ -3457,8 +3348,8 @@ async fn drop_transform_and_define_again_works_after_a_re_type_request_ended_on_
     raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
         .await
         .expect("a key above 2^31");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
     assert_item_names_match(&raw).await;
 }
@@ -3581,7 +3472,7 @@ async fn passes_over_an_unchanged_schema_compare_no_copies() {
     for _ in 0..3 {
         capture_pass(&mut raw, &db.pool).await;
     }
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(copy_checks(&raw).await, settled);
 
     // Writes to the source change no column.
@@ -3839,7 +3730,7 @@ async fn a_group_basis_count_tells_a_json_null_from_a_sql_null() {
     let o = "select g::text, count(doc)::text, count(j)::text, count(*)::text from public.docs group by g order by g";
     assert_eq!(rows(&raw, q).await, rows(&raw, o).await, "the build");
     raw.batch_execute("insert into public.docs values (4, 1, 'null', 'null'), (5, 2, 'null', 'null'); update public.docs set doc = 'null', j = 'null' where id = 3; delete from public.docs where id = 1").await.unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, q).await, rows(&raw, o).await, "applied changes");
 }

@@ -14,90 +14,18 @@
 //! drains. Nothing polls for convergence.
 
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
+use trellis::Trellis;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
 
-const SCHEMA: &str = "trellis";
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, settle, status};
 
 const TARGETS: [&str; 5] = ["tone_pass", "per_tone", "kind_v", "by_tone_join", "chained"];
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, the release of the keys a
-/// re-type asked for, and the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only. Asserts no table failed.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_type_rename_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_type_rename_test",
-            1,
-            "trellis_capture_type_rename_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
 
 /// Drains the active segment, whose rows include keys whose write fails:
 /// each failed drain charges the key a death, until it is held and the
@@ -130,45 +58,6 @@ async fn drain_past_failures(pool: &trellis::pool::Pool, client: &mut Client) {
     retire_drained_segments(client)
         .await
         .expect("retire drained segments");
-}
-
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-async fn status(raw: &Client, target: &str) -> TransformStatus {
-    let text: String = raw
-        .query_one(
-            "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
-            &[&target],
-        )
-        .await
-        .expect("read status")
-        .get(0);
-    trellis::defs::StoredStatus::from_persisted(&text)
-        .expect("a stored status")
-        .into()
-}
-
-/// Alternates staging-worker passes and drains until every one of
-/// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
-    for _ in 0..8 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let mut all_live = true;
-        for target in targets {
-            all_live &= status(raw, target).await == TransformStatus::Live;
-        }
-        if all_live {
-            return;
-        }
-    }
-    for target in targets {
-        eprintln!("{target}: {:?}", status(raw, target).await);
-    }
-    panic!("{targets:?} did not all go live within 8 pass/drain rounds");
 }
 
 async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
@@ -268,8 +157,8 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trell
     )
     .await
     .expect("seed");
-    full_pass(raw, pool).await;
-    drain_to_quiescence(pool, raw).await;
+    reconcile_pass(raw, pool).await;
+    settle(pool, raw).await;
     assert_converged(raw).await;
     trellis
 }
@@ -337,8 +226,8 @@ async fn follows(alter: &str, tone_type: &str, recorded: &[&str]) {
     );
 
     write(&raw, "tone", 1).await;
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_converged(&raw).await;
 
     raw.batch_execute(alter).await.expect("alter the type");
@@ -363,14 +252,14 @@ async fn follows(alter: &str, tone_type: &str, recorded: &[&str]) {
     assert_eq!(recorded_names(&raw).await, recorded);
 
     // The release follows the capture in a whole pass.
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_converged(&raw).await;
 
     // Writes after the pass cast by the new name.
     write(&raw, tone_type, 3).await;
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_converged(&raw).await;
 }
 
@@ -439,8 +328,8 @@ async fn a_relabelled_value_pauses_every_reader_and_resume_rebuilds() {
     let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
 
     write(&raw, "tone", 1).await;
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     raw.batch_execute("alter type public.tone rename value 'brisk' to 'zippy'")
         .await
         .expect("relabel");
@@ -507,8 +396,8 @@ async fn a_new_type_at_the_old_name_keeps_its_own_readers() {
     raw.batch_execute("insert into public.items values (1, 'calm'), (2, 'loud')")
         .await
         .expect("write");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
 
     raw.batch_execute(
         "alter type public.tone rename to tone_old; \
@@ -538,8 +427,8 @@ async fn a_new_type_at_the_old_name_keeps_its_own_readers() {
     )
     .await
     .expect("write");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(held_keys(&raw).await, 0, "no key is held");
     for target in ["tone_pass", "fresh_pass"] {
         assert_eq!(
@@ -592,8 +481,8 @@ async fn a_renamed_type_of_a_partitioned_source_is_followed_in_place() {
     raw.batch_execute("insert into public.items values (1, 1, 'calm'), (9, 2, 'loud')")
         .await
         .expect("write");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
 
     raw.batch_execute(
         "alter type public.tone rename to tone2; \
@@ -605,8 +494,8 @@ async fn a_renamed_type_of_a_partitioned_source_is_followed_in_place() {
     drain_past_failures(&db.pool, &mut raw).await;
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "per_tone").await, TransformStatus::Live);
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(held_keys(&raw).await, 0, "no key is held");
     assert_eq!(
         rows(
@@ -654,8 +543,8 @@ async fn a_paused_reader_resumes_after_a_rename() {
         )
         .await
         .expect("write");
-        full_pass(&mut raw, &db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
 
         for text in ["PAUSE TRANSFORM tone_pass", "PAUSE TRANSFORM kind_v"] {
             trellis.apply(text).await.expect(text);
@@ -831,8 +720,8 @@ async fn a_rename_before_the_first_pass_is_followed() {
     )
     .await
     .expect("write");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_pass_and_counts(&raw).await;
     assert_eq!(
         capture_failures(&raw).await,
@@ -873,8 +762,8 @@ async fn a_rename_is_followed_for_a_chained_reader_of_a_paused_upstream() {
     )
     .await
     .expect("write");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
 
     // The upstream pauses for a column it reads, dropped.
     raw.batch_execute("alter table public.items drop column x")
@@ -906,8 +795,8 @@ async fn a_rename_is_followed_for_a_chained_reader_of_a_paused_upstream() {
         assert_eq!(row[1].as_deref(), Some(oid.as_str()), "{row:?}");
         assert_eq!(row[2].as_deref(), Some("public.tone2"), "{row:?}");
     }
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "chained").await, TransformStatus::Live);
     assert_eq!(held_keys(&raw).await, 0, "no key is held");
     assert_eq!(
@@ -960,8 +849,8 @@ async fn a_logical_restore_is_re_recorded_by_resume_and_a_later_rename_followed(
     raw.batch_execute("insert into public.items values (1, 'calm', 1), (2, 'loud', 2)")
         .await
         .expect("write");
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     let original_oid = type_oid(&raw, "public.tone").await;
     let dump = cluster.root().join("type_identity.dump");
     run(Command::new("pg_dump")
@@ -1045,13 +934,13 @@ async fn a_logical_restore_is_re_recorded_by_resume_and_a_later_rename_followed(
     )
     .await
     .expect("rename and write");
-    full_pass(&mut raw, &restored.pool).await;
+    reconcile_pass(&mut raw, &restored.pool).await;
     assert_eq!(
         capture_failures(&raw).await,
         Vec::<Vec<Option<String>>>::new()
     );
-    full_pass(&mut raw, &restored.pool).await;
-    drain_to_quiescence(&restored.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &restored.pool).await;
+    settle(&restored.pool, &mut raw).await;
     assert_pass_and_counts(&raw).await;
     for row in recorded_oids(&raw).await {
         assert_eq!(row[2].as_deref(), Some("public.tone2"), "{row:?}");
@@ -1083,8 +972,8 @@ async fn a_simulated_pg_upgrade_re_records_nothing() {
     assert_eq!(recorded_oids(&raw).await, oids);
     assert_eq!(recorded_names(&raw).await, names);
     write(&raw, "tone", 1).await;
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_converged(&raw).await;
 }
 
@@ -1146,9 +1035,9 @@ async fn a_rename_blocked_by_a_locked_definition_is_followed_by_a_later_pass() {
         source_column_token(&raw, "tone_pass", "tone").await,
         "enum:public.tone2"
     );
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_pass_and_counts(&raw).await;
 }
