@@ -399,9 +399,12 @@ async fn a_key_retype_to_a_domain_named_like_a_key_type_is_refused() {
         ] {
             assert!(failure.contains(part), "{target}: {part:?} in {failure}");
         }
-        // Not the reason of a retype a resume repairs, which this isn't.
+        // Not the reason of a retype a resume repairs, which this isn't, and
+        // the domain is never named as the listed type it is named like.
         assert!(
-            !failure.contains("Resume the definition") && !failure.contains("changed type"),
+            !failure.contains("Resume the definition")
+                && !failure.contains("changed type")
+                && !failure.contains("(\"integer\")"),
             "{target}: {failure}"
         );
         assert!(

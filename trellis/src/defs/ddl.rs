@@ -718,14 +718,18 @@ pub(crate) async fn admit_key_types(
         {
             admitted_by.push(entry);
         } else {
-            // The message names the type as the source declares it, with its
-            // modifier; a copy of it has none.
+            // The message names a `pg_catalog` type as the source declares
+            // it, with its modifier (a copy of it has none), and any other
+            // type by the copy's qualified name: a domain named `"integer"`
+            // is not `integer`, and `format_type` can render it bare.
             let declared: Option<String> = client
                 .query_opt(
                     "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
                      from pg_catalog.pg_attribute a \
+                     join pg_catalog.pg_type t on t.oid = a.atttypid \
                      where a.attrelid = pg_catalog.to_regclass($1) and a.attname = $2 \
-                       and a.attnum > 0 and not a.attisdropped",
+                       and a.attnum > 0 and not a.attisdropped \
+                       and t.typnamespace = 'pg_catalog'::pg_catalog.regnamespace",
                     &[&regclass_arg(source_table), &column.name],
                 )
                 .await?
