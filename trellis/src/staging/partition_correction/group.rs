@@ -331,19 +331,9 @@ async fn routed_groups(
         .isolation_level(IsolationLevel::ReadCommitted)
         .start()
         .await?;
-    // The node is read under the session's own lock wait (its `lock_timeout`
-    // cap, which a `set local ... to default` would drop): an operation on it
-    // still running holds it only until it commits.
-    let session_lock_timeout: String = txn
-        .query_one("select current_setting('lock_timeout')", &[])
-        .await?
-        .get(0);
-    txn.batch_execute(&partitions::pinned_settings()).await?;
-    txn.execute(
-        "select set_config('lock_timeout', $1, true)",
-        &[&session_lock_timeout],
-    )
-    .await?;
+    // The node is read under the session's own lock wait: an operation on
+    // it still running holds it only until it commits.
+    group_basis::pin_settings(&txn).await?;
     // A gone node routed by its text needs no read of its rows: every row
     // it held satisfied the text, so its group is the target's or a ring
     // image's (`super::reads_node`).
