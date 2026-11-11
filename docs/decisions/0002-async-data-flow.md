@@ -425,9 +425,8 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
   per-group partials: the row count, each argument's non-null count, and
   each `SUM` or `AVG` argument's sum, kept as `numeric` whatever the
   argument type so a sum (or, on a JOIN, a product of a sum and a count)
-  never overflows where Postgres's own `sum()` wouldn't. A `numeric`
-  argument's sum is of its finite values only, beside a count per display
-  scale and counts of `NaN`, `Infinity` and `-Infinity` (next section).
+  never overflows where Postgres's own `sum()` wouldn't; a `numeric`
+  argument adds counts of its scales and special values (next section).
 - **Must:** every other aggregate is refused at define, named by family:
   `MIN`/`MAX` on a JOIN; `bool_and`/`bool_or` and `bit_and`/`bit_or`;
   `SUM`/`AVG` over a float, `interval` or any other type; and `array_agg`, `string_agg` and `jsonb_agg`. The
@@ -465,27 +464,21 @@ extremes matched a fresh `GROUP BY` in all 680 soak runs.
   large target Trellis owns.
 - **Must:** the probe reads one endpoint of a valid, non-partial btree whose
   leading columns are the `GROUP BY` columns in order, then the argument, in
-  the argument's collation. Define requires that index of a `MIN` or `MAX`
-  field, as it requires the `GROUP BY` index; the
+  the argument's collation; define requires it. Without it a probe scans
+  the group, exact but able to outrun `statement_timeout` on a large group,
+  so an index dropped after define pauses the definition after a grace that
+  lets a rebuild dropping the old index first finish. The
   [Supported sources and targets](../transforms.md#supported-sources-and-targets)
-  table states the refusal and what a definition defined
-  `WITHOUT SOURCE INDEX` may do. One such index serves both `self_check`'s
-  paging and the probe, and the fields reading one argument share it.
-  Without it a probe scans the group, which is exact but reads every row of
-  each probed group. An index dropped after define leaves the target exact:
-  `status` warns and the probe scans the group instead. Once no valid such
-  index has existed on any staging-worker pass for a fixed 5 minutes of
-  wall-clock time, the pass pauses the definition, since a probe scanning a
-  large group can outrun `statement_timeout`; the grace lets a rebuild that
-  drops the old index first finish without a pause.
+  table states the refusal, the grace and what a definition defined
+  `WITHOUT SOURCE INDEX` may do.
 - **Must (Rx1, hidden state):** a group keeps each extreme (one per distinct
-  call) at the argument's type. The group's extremes share a basis of their
-  own, `xbasis`, and a stamp of their own, `xstamp`, beside the partials'
-  basis and stamp; one `xbasis` serves them all because a probe re-reads
-  every extreme of the group. One basis for the partials and the extremes
-  is wrong: a probe that stamped the group's basis would
-  make the partials refuse the counts of a change the probe saw, and in my
-  model that mutation left wrong counts.
+  call). The group's extremes share a basis of their own, `xbasis`, and a
+  stamp of their own, `xstamp`, beside the partials' basis and stamp
+  ([layout](../staging-and-claiming/group-basis.md#where-a-groups-state-lives));
+  one `xbasis` serves them all because a probe re-reads every extreme of the
+  group. One basis for the partials and the extremes is wrong: a probe that
+  stamped the group's basis would make the partials refuse the counts of a
+  change the probe saw, and in my model that mutation left wrong counts.
 - **Must (Rx2, I2 for extremes):** a (group, transaction) sum applies to the
   extremes only when its transaction isn't visible in `xbasis`, and to the
   partials only when it isn't visible in the basis, both above the truncate
@@ -493,22 +486,18 @@ extremes matched a fresh `GROUP BY` in all 680 soak runs.
 - **Must (Rx3, insertions):** an insertion moves an extreme by
   `least`/`greatest`, and is filtered by `xbasis` like any side. `least` is
   idempotent, but an insertion of a row since deleted, applied after the
-  deletion's probe, would bring the deleted value back. A page keeps the
-  insertion sides of a (group, transaction, statement) apart from its
-  retraction sides.
+  deletion's probe, would bring the deleted value back.
 - **Must (Rx4, the trigger):** a group is probed when a retraction side
   reaches an extreme (at or below a minimum, at or above a maximum), or when
   its extreme is `NULL` and it has a non-`NULL` retraction: a retraction can
   arrive before the insertion it undoes.
 - **Must (Rx5, the probe, I1 for extremes):** the probe runs in the page's
-  transaction, after its lock statement and its apply. One statement takes
-  the snapshot and the newest segment, reads each extreme of each probed
-  group as one index endpoint (`arg is not null`; a `NULL` group key matched
-  as `NULL`, as the target's `UNIQUE NULLS NOT DISTINCT` identity does), and
-  writes the snapshot as `xbasis` and the segment as `xstamp`. A probe read
+  transaction, after its lock statement and its apply, and one statement
+  takes the snapshot and the newest segment, re-reads the group's extremes
+  and writes the snapshot as `xbasis` and the segment as `xstamp`
+  ([the probe](../staging-and-claiming/group-basis.md#a-page)). A probe read
   before the lock misses a change another page applied in between; in my
-  model that mutation was wrong. The probe takes the source's `ACCESS SHARE`
-  lock under `lock_timeout`, and a timeout retries the page (I6, I7).
+  model that mutation was wrong.
 - **Must (Rx6, absolute writes):** a build, rebuild, recompute, release and
   partition correction write the extremes, `xbasis` and `xstamp` from the
   snapshot they write the partials from (R1, R5).
@@ -545,51 +534,22 @@ reason.
 
 - **Must:** a `SUM` or `AVG` over a `numeric` argument (a column with or
   without a declared scale, a `numeric` column of a Trellis target, or an
-  expression whose result is `numeric`) keeps, per group, on the group's
-  hidden row: the sum of its finite values, and one map of exceptions that
-  counts every non-null value *except* the finite ones at the argument's
-  reference scale: a key per display scale (`scale(x)`, 0 to 16383; no
-  value has a negative scale) and one per special value (`NaN`, `Infinity`,
-  `-Infinity`), each to its count, with no zero entry. An empty map is
-  stored as `NULL`. The count of finite values at the reference scale is the
-  non-null count less the map's counts. An integer argument keeps its sum
-  alone.
-- **Must:** the reference scale is the scale the argument's column declares
-  (`numeric(p,s)`'s `s`, a negative `s` as 0) when the hidden table is
-  created, recorded with the table and read back by every statement, so a
-  later change of the column's type never changes what a stored map means.
-  An argument with no declared scale (an unconstrained column, an
-  expression) has none, and its map counts every value. So a
-  `numeric(p,s)` argument's map stays `NULL` while its values are finite:
-  no page, build, recompute or product builds, merges or writes one.
-- **Must:** every partial operation keeps all of them: a page's deltas
-  carry each side's scale and special-value class inside the side sums it
-  computes; a build, a locked recompute and a partition correction count
-  them from the source; a JOIN product multiplies every count, special ones
-  included, by the match count (`max(n, 1)` for `LEFT`), as it does a sum;
-  and a group is zero, and collected, only when they are all zero.
-- **Must:** the visible `SUM` is `NULL` while the non-null count is 0;
-  `NaN` while the `NaN` count is above 0 or both infinity counts are; the
-  infinity while one infinity count is; and otherwise the finite sum
-  rounded to the largest scale whose count is above 0, which is exact:
-  that is how many places the true sum has. The visible `AVG` is that
-  value divided by the non-null count as `numeric`, as Postgres's
-  `numeric_div` does. Through a build and through pages alike, the sum and
-  the average then carry exactly the scale and value Postgres would show.
-- **Must:** every `numeric` argument has this one layout; only the
-  reference scale differs. The visible `SUM` of a group whose map is `NULL`
-  is its finite sum at the reference scale, read without the map. A page
-  whose values are all finite at the reference scale stages a `NULL` map,
-  and its apply leaves every row's map as it is. A build's grouping of such
-  rows counts them with no array aggregate; one that meets a value off the
-  reference scale fails and runs again the general way in the same
-  transaction, so the specialisation never changes a result.
+  expression whose result is `numeric`) keeps, per group, the sum of its
+  finite values and a count of its values per display scale and per special
+  value, as partials every partial operation keeps; a group is zero only
+  when they are all zero. Through a build and through pages alike, the sum
+  and the average then carry exactly the scale and value Postgres would show.
+- **Must:** every `numeric` argument has this one layout; only its reference
+  scale (the scale its column declares) differs. Values finite at the
+  reference scale aren't counted, so a `numeric(p,s)` argument's counts stay
+  empty while its values are finite
+  ([layout](../staging-and-claiming/group-basis.md#numeric-sums)).
 - **Must:** a retype of an argument column after define goes through the
   capture pass's re-validation like any other. A `numeric(p,s)` column
   re-typed to an unconstrained `numeric` keeps every value's text, and its
   stored maps keep their reference scale, so nothing pauses or rebuilds:
-  values at other scales are counted in the map from then on. A change
-  between two declared scales re-renders values, so its readers rebuild.
+  values at other scales are counted from then on. A change between two
+  declared scales re-renders values, so its readers rebuild.
 
 ### Apply sums sides per group and transaction
 
@@ -636,11 +596,10 @@ image-less change names.
   enumeration was wrong in 39 of 50 soak runs. A partition correction is a
   recompute of the groups routed to the partition, never a blind zero:
   `TRUNCATE` of a partition and an `INSERT` into it in one transaction
-  leave a row that a zero would erase and the basis would then refuse. Its
-  groups include those a page still undrained from before the DDL can
-  create. Which groups an absolute
-  write must cover is where a new producer's bugs would appear, so each
-  producer's enumeration is stated and tested on its own.
+  leave a row that a zero would erase and the basis would then refuse.
+  Which groups an absolute write must cover is where a new producer's bugs
+  would appear, so each producer's enumeration is stated and tested on its
+  own ([per producer](../staging-and-claiming/group-basis.md#absolute-writes)).
 - A recompute holds its groups' locks for its whole `GROUP BY`: 1.3 ms for
   a 10k-row group, 9 ms at 100k and about 80 ms at 890k rows, with an index
   whose leading column is the group key. A page of 5,000 changes to one
@@ -662,12 +621,8 @@ exact.
   group identity, with no partial columns, so users can query, join and
   index it, and a chained reader finds its key through the constraint. The
   partials, basis and stamp of every group, zero groups and transiently
-  negative ones included, live in a hidden table in the instance's catalog
-  schema, named by definition id. Readers get no grant on it, and its shape
-  is internal. A page writes the hidden row, then the visible row, for each
-  group it touches, and skips the visible write when no visible value
-  changed. A drop removes the hidden table by definition id; a resume drops
-  and recreates it.
+  negative ones included, live in a hidden table readers get no grant on
+  ([where it lives](../staging-and-claiming/group-basis.md#where-a-groups-state-lives)).
 - **The contract:** before `await_converged`, aggregate values may be
   inconsistent; after it they are exact. Groups of many rows (thousands or
   more) read as slightly behind or ahead by the changes in flight, with no
