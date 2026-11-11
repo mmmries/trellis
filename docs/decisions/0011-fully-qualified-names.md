@@ -65,12 +65,13 @@ from (`definition_keys`), and beside its own catalog rows the oid of the
 catalog table that holds them and the cluster's `system_identifier`
 (`capture_triggers`, `partition_sources`). A table recreated at its name, its
 triggers recreated, or the database restored from a logical dump shows up as a
-recorded oid that is gone or differs from the live one. Trellis then pauses, with a
-reason, every definition that reads the table (every definition, for a
+recorded oid that is gone or differs from the live one. Trellis then pauses
+([ADR-0027](0027-operating-principles.md), rule 2), with a reason, every
+definition that reads the table (every definition, for a
 restore), instead of following the new object or holding on to the old oid
 ([capture changed outside Trellis](../staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis),
 [ADR-0017 — a restore pauses for a rebuild](0017-partitioned-sources.md#pg_upgrade-re-baselines-the-recorded-state-a-restore-pauses-for-a-rebuild)).
-`RESUME` re-validates against the table now at the name and rebuilds. A key's
+`RESUME` re-validates (rule 4) against the table now at the name and rebuilds. A key's
 backing index is matched by shape, never by its oid
 ([ADR-0026](0026-source-keys.md#a-key-is-backed-by-a-unique-index-matched-by-shape)).
 

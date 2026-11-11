@@ -32,8 +32,8 @@ Instead:
 
 ## Define refuses a missing prerequisite; after define, a lost key pauses and a lost index is reported
 
-Define and a whole-transform `RESUME` check every prerequisite against the
-schema as it is, and refuse a definition that lacks one:
+Define and a whole-transform `RESUME` refuse a definition that lacks a
+prerequisite ([ADR-0027](0027-operating-principles.md), rule 4):
 
 * **Correctness prerequisites:** a supported type, and a source key: the
   table's primary key or a `KEY (…)` the definition names, backed by a unique
@@ -46,8 +46,8 @@ schema as it is, and refuse a definition that lacks one:
 * **The index a `MIN` or `MAX` field's probe reads:** on the `GROUP BY`
   columns, then the argument. `WITHOUT SOURCE INDEX` doesn't waive it.
 
-A lost correctness prerequisite pauses the transforms it affects, such as a
-change to the key a transform uses, or the index backing a `KEY (…)` going
+A lost correctness prerequisite pauses the transforms it affects (rule 4), such
+as a change to the key a transform uses, or the index backing a `KEY (…)` going
 missing ([ADR-0026](0026-source-keys.md#keeping-the-key)).
 
 A lost performance prerequisite, an index dropped or invalidated after
