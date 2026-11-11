@@ -184,14 +184,19 @@ What it does there is one append.
   `DateStyle`, `TimeZone`, `bytea_output`, `IntervalStyle` and
   `extra_float_digits`; an encoding that reads every column costs 3.3 ms and
   323 KB per row on a 100 KB column, 40x the control, where naming only the
-  read columns costs +30 µs. The no-op filter, and the live re-read of the
-  NEW image and its gate, are in
-  [stage 01](../staging-and-claiming/01-capture-by-triggers.md#when-capture-re-reads).
+  read columns costs +30 µs. The `WHEN` clause is a filter inside the
+  function, since a statement trigger with transition tables can't take one.
+  The NEW image is the live row, re-read only when another write to the
+  table ran inside the statement's span, which the fifth trigger,
+  `<schema>_capture_begin` (`BEFORE … FOR EACH STATEMENT`), marks: an
+  unconditional re-read failed 50–87% of concurrent `SERIALIZABLE`
+  auto-increment inserts with `40001`; gated, none fail
+  ([stage 01](../staging-and-claiming/01-capture-by-triggers.md#when-capture-re-reads)).
 - **Must (R3, the image chain):** a row's images form a chain, each change's old
   image being the previous change's new image, so a group-basis reader's
-  sides telescope to the row's current contribution. Where the live re-read
-  breaks the chain, a group-basis reader counts every transition row
-  exactly once
+  sides telescope to the row's current contribution. A 1-1 reader keeps the
+  live row; where the live re-read breaks the chain, a group-basis reader
+  counts every transition row exactly once
   ([stage 01](../staging-and-claiming/01-capture-by-triggers.md#every-transition-row-counts-once)).
   *Evidence:* in my group-basis model the live images left
   groups wrong in every soak run with application triggers that rewrite rows
@@ -708,11 +713,11 @@ parallelism the group basis relies on. Readers that need consistency use
 - **Must (I8):** a batch folds, re-reads and applies at most a fixed number
   of changes (a per-batch cap on folded records, on the order of 10^5) and
   pages through a larger bucket in key-range pages; per-key `(lsn,
-  change_id)` order holds inside the fold. Cross-key order is arbitrary,
-  which I3 allows. A segment's pages become visible to the drainers in one
-  step, never page by page. Page order and the per-page claim and cursor are
-  in
-  [stage 04](../staging-and-claiming/04-claiming-and-the-fold.md#paging-a-share-larger-than-the-cap).
+  change_id)` order holds inside the fold. A key never splits across pages,
+  so the fold's whole-window rules hold per page. Cross-key order is
+  arbitrary, which I3 allows, so the page order is permanent. A segment's
+  pages become visible to the drainers in one step, never page by page
+  ([stage 04](../staging-and-claiming/04-claiming-and-the-fold.md#paging-a-share-larger-than-the-cap)).
   *Evidence:* the one-pass build's memory measurement under I8.
 - **Must (I7):** every lock statement in Apply runs under `lock_timeout`; a
   timeout releases the claim's transaction and retries the page after a
@@ -951,9 +956,8 @@ partition at 100M.
 
 - **Should:** the watermark token is `pg_current_wal_insert_lsn()` read after
   the caller's commit, and `origin_lsn` is stamped from the trigger's
-  pre-commit `pg_current_wal_insert_lsn()`. Why that is sound over ring rows
-  alone:
-  [stage 07](../staging-and-claiming/07-convergence-and-await.md#watermark-tokens).
+  pre-commit `pg_current_wal_insert_lsn()`
+  ([stage 07](../staging-and-claiming/07-convergence-and-await.md#watermark-tokens)).
 - **Must:** three stored statuses: `waiting_to_backfill` (registered, chunk
   plan not yet written; normally momentary), `backfilling` (applying, chunks
   outstanding), `live`. Plus `paused` and
@@ -969,9 +973,8 @@ partition at 100M.
   and maintenance deletes each tombstone whose `applied_seg` is at or below
   the **contiguous drained prefix**: the highest `seg_seq` at or below which
   every segment is drained, because segments drain out of order. The GC
-  skips the ledger of a definition under a build. Why each part holds, and
-  how a Re-derive stamps a tombstone:
-  [stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#the-ledger).
+  skips the ledger of a definition under a build
+  ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#the-ledger)).
 - **Must (R4, I4 per group):** a group whose partials are all zero and that
   has a basis stays, as a zero group, until the contiguous drained prefix
   passes its stamp, and, for a group with `MIN`/`MAX` extremes, its
@@ -1096,9 +1099,9 @@ combination of values a reader sees
   raises the target's
   truncate floor (`ledger_truncate_floor`) to the truncate's ring `lsn`.
   I2 then also refuses any change at or below the floor, a second line of
-  defence behind the barrier. Why the floor is exact:
-  [stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-group-basis)
-  ("Truncate"). A truncate of a leaf or middle of a partitioned source resets
+  defence behind the barrier
+  ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-group-basis),
+  "Truncate"). A truncate of a leaf or middle of a partitioned source resets
   nothing and sets no floor or barrier: it queues that node's correction
   ([ADR-0017](0017-partitioned-sources.md#a-leaf-or-middle-truncate-queues-that-nodes-correction)).
 - Source `ALTER TABLE` on a read column follows the schema-changed marker

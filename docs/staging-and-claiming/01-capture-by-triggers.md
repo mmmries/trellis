@@ -795,7 +795,7 @@ neighbouring keys then form the read-write conflict chains Postgres cancels
 with `40001`. Every insert of an auto-increment id lands on the rightmost
 leaf, so with an unconditional re-read 50% of single-row serializable
 inserts failed at 4 writers and 87% at 8 and 16, where none fail without
-capture (`benchmark` scenario `ssi-tax`).
+capture or with the gate below (`benchmark` scenario `ssi-tax`).
 
 So capture re-reads only when the live row can differ from the transition
 row: when some other write to the same table changed it after the
