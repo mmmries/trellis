@@ -53,7 +53,7 @@
 //! [`TYPED_LITERALS`] pairs each accepted type keyword with a checker that
 //! [`super::validate`] runs at definition time, and those checkers are
 //! strict to the point of pedantry: `DATE '2024-1-5'` is rejected even
-//! though Postgres accepts it. Two independent reasons, both load-bearing:
+//! though Postgres accepts it. Two reasons:
 //!
 //! 1. **Immutability** (ADR-0004's actual admission bar). `pg_proc` says
 //!    `date_in` and `timestamp_in` are **`STABLE`, not `IMMUTABLE`** — a
@@ -64,28 +64,20 @@
 //!    different instant every call. A checker that admits only an absolute
 //!    ISO-8601 calendar spelling removes exactly that surface, which is what
 //!    lets a `date`/`timestamp` constant be treated as immutable here
-//!    without lying about `provolatile`.
+//!    without lying about `provolatile`. A leading-4-digit-year ISO spelling
+//!    also *parses* to the same value under every `DateStyle`.
 //!
-//! 2. **Round-trip identity.** The literal is rendered into SQL verbatim and
-//!    Postgres casts it to its native type. Engine-side text that is compared
-//!    with Postgres's rendering (a `self_check` walk compares `::text`) would
-//!    disagree on a non-canonical spelling: `2024-1-5` renders back as
-//!    `2024-01-05` the way `date_out` does. Requiring the canonical spelling
-//!    up front makes the two agree by construction, rather than by adding a
-//!    per-family normalizer.
+//! 2. **Offline validity.** The check is pure and runs on every path that
+//!    types an expression, including run-time re-inference and hand-built
+//!    ASTs, so a literal Postgres would reject never reaches the renderer.
+//!    It doesn't depend on the running Postgres version and needs no floor
+//!    feature. A newer Postgres that changes an output function can only make
+//!    it stricter than necessary, never wrong: older canonical output stays
+//!    valid input, and Postgres renders both sides of every comparison.
 //!
-//! Half 2 has a dependency worth naming, because it is *not* a property of
-//! the literal alone: "canonical" means canonical **under the session's
-//! output GUCs**. Under `DateStyle = 'SQL, MDY'`, `('2024-01-01'::date)::text`
-//! renders `01/01/2024`, and the two renderers would disagree again. That is
-//! why [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`] pins `DateStyle` and
-//! `bytea_output` on every connection Trellis opens — see that constant for
-//! the full reasoning, and extend *it* (not this module) when a future type
-//! family needs `TimeZone`/`IntervalStyle`/`extra_float_digits`.
-//!
-//! Half 1, by contrast, needs no help: a leading-4-digit-year ISO spelling
-//! *parses* to the same value under every `DateStyle`, so a definition
-//! installed against one server stays correct when read on another.
+//! "Canonical" means Postgres's output under the GUCs
+//! [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`] pins (`DateStyle`,
+//! `bytea_output`).
 //!
 //! This is the same "safe subset, gaps named explicitly" shape ADR-0004
 //! already documents for `COALESCE`.
@@ -433,9 +425,8 @@ fn canonical_float(text: &str, width: FloatWidth) -> Result<(), &'static str> {
 /// sign, never pads, and never emits a leading zero, so a canonical literal
 /// is just digits with no redundant leading `0`. A negative or
 /// `+`-prefixed spelling is rejected even though `oidin` would accept
-/// `-1` (wrapping it to `4294967295`) — a literal whose own text differs
-/// from what the value renders back as is precisely what breaks the
-/// round-trip identity this module's doc comment describes.
+/// `-1` (wrapping it to `4294967295`): its text differs from what the value
+/// renders back as.
 fn canonical_oid(text: &str) -> Result<(), &'static str> {
     const SHAPE: &str = "an unsigned decimal in 0..=4294967295, with no sign and no leading zeros";
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -474,7 +465,7 @@ fn canonical_date(text: &str) -> Result<(), &'static str> {
 ///
 /// The fractional-seconds part is optional and, when present, must have no
 /// trailing zero: Postgres renders `12:00:00.100` back as `12:00:00.1`, so
-/// accepting the padded form would break round-trip identity. Six digits is
+/// the padded form is not canonical. Six digits is
 /// `timestamp`'s full microsecond resolution — a seventh is silently rounded
 /// away by `timestamp_in`, so it can't round-trip either.
 ///

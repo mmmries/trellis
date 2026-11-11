@@ -146,21 +146,23 @@ Deliberately out:
 
 The literal's text must be in that family's **canonical Postgres output
 spelling** — `DATE '2024-1-5'` is refused even though Postgres parses it. This
-is a safe subset in the same style as `COALESCE`'s gaps below, and both halves
-of the ADR's bar drive it:
+is a safe subset in the same style as `COALESCE`'s gaps below, for two
+reasons:
 
 * **Immutability.** `pg_proc` marks `date_in` and `timestamp_in` `STABLE`, not
   `IMMUTABLE` — an intuition worth checking, since `jsonb_in`/`byteain` beside
   them *are* immutable. The reason is the relative spellings they accept
   (`DATE 'today'`, `TIMESTAMP 'now'`). Admitting only absolute ISO-8601
   removes exactly that surface.
-* **Round-trip identity.** A value travels as text, and the generative suite
-  compares a target's text against Postgres's rendering byte-for-byte.
-  Requiring canonical form makes the literal's spelling and Postgres's
-  rendering agree by construction instead of needing a per-family
-  normalizer.
+* **Offline validity.** Pure `validate` checks it on every path (run-time
+  `infer_field_types`, hand-built ASTs), the same on every supported Postgres
+  (ADR-0022) and rollback-safe, with no floor feature. A newer Postgres that
+  changes an output function (as PG 12 did for floats) can only make it
+  stricter than necessary, never wrong: older canonical output stays valid
+  input, and Postgres renders both sides of every comparison. Updating the
+  mirrors for a new major is routine upkeep.
 
-`jsonb` is the family this second rule costs most: `jsonb_out` re-sorts object
+`jsonb` is the family this rule costs most: `jsonb_out` re-sorts object
 keys by length then bytes, collapses duplicates, and renormalizes numbers. The
 literal is checked, not normalized: one with exponent notation, an
 out-of-order or duplicate object key, or a non-canonical string escape is
