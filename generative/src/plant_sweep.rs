@@ -87,8 +87,9 @@ pub enum PlantPath {
     Join,
     /// A 1-1 `JOIN` (ADR-0021): the 1-1 `JOIN` tier
     /// (`join_one_to_one_convergence.rs`) draws these, and no other tier does.
-    /// `trellis`'s `join_one_to_one_interleavings` (and the build,
-    /// quarantine and over-targets tests) pin them deterministically.
+    /// `trellis`'s `join_one_to_one_interleavings`, `join_star_families` and
+    /// `join_star_joined_families` (and the build, quarantine and
+    /// over-targets tests) pin them deterministically.
     OneToOneJoin,
     /// The target-mutation seam's feed to a definition reading another's
     /// target: the chained-reader tier (`join_chained_convergence.rs`)

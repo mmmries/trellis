@@ -98,6 +98,17 @@ pub const KINDS_4: [&[Kind]; 5] = [
     &[I, I, I, L],
 ];
 
+/// The shapes a per-position pin runs at: the two-table `JOIN`, and the last
+/// position of a three-table star, with position 1 present, matched and
+/// idle.
+pub const SHAPES: [Shape; 2] = [
+    Shape::TWO,
+    Shape {
+        positions: 2,
+        at: 2,
+    },
+];
+
 /// A star's number of joined positions, and the position under test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shape {

@@ -17,26 +17,15 @@
 //! A scenario runs on both join kinds, `LEFT` and `INNER`. A test is named
 //! for the #1371 or #1375 family it ports, where it has one:
 //!
-//! - `r17_…`: a stale Apply after a Re-derive (R17, the #392 shape).
-//! - `n…`: `NULL` join keys (N1–N6).
-//! - `f1_…` to `f15_…`: #1371's families of an `a` writer against a `b`
-//!   writer, each run with either page frozen at its commit while the other
-//!   queues on `J`: F1 an `a` insert ‖ a `b` insert of its key, F2 ‖ a `b`
-//!   delete of it, F3 an `a` move `k1 → k2` ‖ a `b` update of `k2`, F4 ‖ of
-//!   `k1` (and a `b` row moving off a key), F5 an `a` delete ‖ a `b` update
-//!   of its key, F7/F7b a `b` unique-key hand-off applied out of order, F13 a
-//!   fan-out past one batch, F15 a new `b` row's insert and update applied
-//!   out of order.
-//! - `m…`: #1375's mixed pages (M1–M6): a page holding an `a` key move and
-//!   the `b` change of its new key, racing another mixed page.
-//!
-//! - `r…`: #1375's Re-derives of either side (R1–R19) against a change of
-//!   the same row, of the other side, or a key move: R17 a stale Apply after
-//!   a Re-derive, R18/R19 a row that moved onto a key after the page's
-//!   unlocked read of it, which the page then holds no `J` row for.
-//!
+//! - `f13_…`: #1371's F13, a fan-out past one batch racing an `a` move onto
+//!   its key.
 //! - `t…`: #1375's truncates (T1–T8) of either side or both, alone or with
 //!   later inserts, and the rebuild a `TRUNCATE` of `b` starts (#1399).
+//!
+//! The rest of #1371's F families, #1375's M, N and R families, and their
+//! Re-derives are written once against "the joined table at `at`" and run
+//! at the two-table shape and on a star: `join_star_families.rs` (root
+//! writers) and `join_star_joined_families.rs` (joined-table writers).
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -165,12 +154,6 @@ async fn definition_id(d: &Driver, target: &str) -> i64 {
         .await
         .expect("the definition")
         .get(0)
-}
-
-/// The label a page's `R` pause points carry for `kind`'s definition.
-async fn r_label(d: &Driver, kind: Kind) -> String {
-    let id = definition_id(d, kind.target()).await;
-    format!("{}.join1_{id}_r", trellis::config::DEFAULT_SCHEMA)
 }
 
 /// Asserts `kind`'s target equals the live join, and its `R` holds exactly
@@ -442,75 +425,6 @@ async fn a_hot_moving_key_exhausts_the_budget_and_surfaces() {
     assert_oracle(&mut d, &[Kind::Left]).await;
 }
 
-/// Two pages on a row with a NULL join key take no `J` row: the entry lock
-/// orders them (`join1_no_entry_lock`, N2–N6).
-#[tokio::test]
-async fn n_two_pages_on_a_null_keyed_row_queue_on_its_entry() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        let label = r_label(&d, kind).await;
-        write(&d, "update public.a set x = 41 where id = 4").await;
-        let first = d.seal().await;
-        write(&d, "update public.a set x = 42 where id = 4").await;
-        let second = d.seal().await;
-        let mut held = d
-            .drain_frozen(
-                first,
-                "first",
-                &[(PausePoint::AfterJoin1REntryLock, &label)],
-            )
-            .await;
-        let reached = held.reached(PausePoint::AfterJoin1REntryLock).await;
-        let queued = d.drain_frozen(second, "second", &[]).await;
-        d.wait_blocked_behind(reached.backend_pid).await;
-        assert!(!queued.is_finished());
-        d.release(&mut held, PausePoint::AfterJoin1REntryLock).await;
-        held.finish().await;
-        queued.finish().await;
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// R17, the #392 shape: a Re-derive read the row after two changes, then the
-/// older change's Apply arrives. The entry's basis saw its transaction, so
-/// it is refused (`join1_lsn_only`); the target keeps the re-derived value
-/// after that page and after the other's.
-#[tokio::test]
-async fn r17_a_stale_apply_after_a_rederive_is_refused() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        write(&d, "update public.a set x = 11 where id = 1").await;
-        let older = d.seal().await;
-        // The newer change and a Re-derive request fold to one Re-derive.
-        write(&d, "update public.a set x = 12 where id = 1").await;
-        d.stage_recomputes("public.a", &["1"]).await;
-        let rederive = d.seal().await;
-        // The Re-derive reads x = 12; the older Apply must not put 11 back.
-        d.drain(rederive, "rederive").await;
-        assert_eq!(total(&d, kind, 1).await, Some(12 + 100));
-        d.drain(older, "older").await;
-        assert_eq!(total(&d, kind, 1).await, Some(12 + 100), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// An Apply older than the entry's applied position is refused even when the
-/// entry has no basis (`join1_vis_only`).
-#[tokio::test]
-async fn an_older_apply_after_a_newer_one_is_refused() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        write(&d, "update public.a set x = 11 where id = 1").await;
-        let older = d.seal().await;
-        write(&d, "update public.a set x = 12 where id = 1").await;
-        let newer = d.seal().await;
-        d.drain(newer, "newer").await;
-        d.drain(older, "older").await;
-        assert_eq!(total(&d, kind, 1).await, Some(12 + 100), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
 /// `kind`'s target `total` for `id`.
 async fn total(d: &Driver, kind: Kind, id: i32) -> Option<i32> {
     d.ctl
@@ -523,14 +437,10 @@ async fn total(d: &Driver, kind: Kind, id: i32) -> Option<i32> {
         .map(|row| row.get(0))
 }
 
-/// Runs `sql` on `a` with its capture triggers disabled, in one transaction:
-/// a change no entry will ever hear about.
-async fn write_uncaptured(d: &Driver, sql: &str) {
-    write_uncaptured_on(d, "public.a", sql).await;
-}
-
-/// [`write_uncaptured`] on `table`. (Capture triggers are `ENABLE ALWAYS`, so
-/// `session_replication_role = replica` doesn't skip them.)
+/// Runs `sql` on `table` with its capture triggers disabled, in one
+/// transaction: a change no entry will ever hear about. (Capture triggers
+/// are `ENABLE ALWAYS`, so `session_replication_role = replica` doesn't skip
+/// them.)
 async fn write_uncaptured_on(d: &Driver, table: &str, sql: &str) {
     let toggle = |action: &str| {
         format!(
@@ -550,71 +460,6 @@ async fn write_uncaptured_on(d: &Driver, table: &str, sql: &str) {
         ))
         .await
         .expect("write past capture");
-}
-
-/// A Re-derive of a row that has no `R` entry reads its live key before the
-/// `J` lock, so it commits on its first attempt, and writes the row.
-#[tokio::test]
-async fn a_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        write_uncaptured(&d, "insert into public.a values (8, 10, 8, 'eight')").await;
-        d.stage_recomputes("public.a", &["8"]).await;
-        let batch = d.seal().await;
-        let moves = d.join_key_moves();
-        d.drain(batch, "rederive").await;
-        assert_eq!(
-            d.join_key_moves(),
-            moves,
-            "no retry for a row the entry doesn't hold yet"
-        );
-        assert_eq!(total(&d, kind, 8).await, Some(8 + 100), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// A Re-derive repairs a row that changed without capture, and drops one
-/// that was deleted without it.
-#[tokio::test]
-async fn a_rederive_repairs_uncaptured_changes() {
-    let mut d = start(A_ROWS, B_ROWS).await;
-    write_uncaptured(&d, "update public.a set x = 100, k = 20 where id = 1").await;
-    write_uncaptured(&d, "delete from public.a where id = 2").await;
-    d.stage_recomputes("public.a", &["1", "2"]).await;
-    let batch = d.seal().await;
-    d.drain(batch, "rederive").await;
-    assert_oracle(&mut d, &KINDS).await;
-}
-
-/// A Re-derive whose row moved keys after the page's unlocked read finds a
-/// key outside its locked set: it rolls back once and its retry commits.
-#[tokio::test]
-async fn a_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        d.stage_recomputes("public.a", &["1"]).await;
-        let batch = d.seal().await;
-        let moves = d.join_key_moves();
-        let mut page = d
-            .drain_frozen(
-                batch,
-                "rederive",
-                &[(PausePoint::BeforeJoin1Lock, kind.target())],
-            )
-            .await;
-        page.reached(PausePoint::BeforeJoin1Lock).await;
-        // Captured, into a later batch: the frozen page's read of `a` would
-        // block a trigger toggle.
-        write(&d, "update public.a set k = 20 where id = 1").await;
-        d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
-        page.finish().await;
-        assert_eq!(
-            d.join_key_moves(),
-            moves + 1,
-            "the Re-derive's read found a key it hadn't locked"
-        );
-        assert_oracle(&mut d, &[kind]).await;
-    }
 }
 
 /// A page whose segment predates the build re-derives its keys rather than
@@ -644,60 +489,6 @@ async fn a_page_that_predates_the_build_rederives() {
     trellis::staging::build::settle_builds(d.pool()).await;
     d.settle().await;
     assert_kind(&d, Kind::Left).await;
-}
-
-/// A change that commits after a Re-derive's read statement is not in the
-/// row the Re-derive wrote, so it must not be in the entry's basis either
-/// (`join1_snapshot_after_read`, `rd_latesnap`): its Apply, drained after the
-/// Re-derive, applies.
-#[tokio::test]
-async fn a_change_between_a_rederives_read_and_its_snapshot_is_applied() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        d.stage_recomputes("public.a", &["1"]).await;
-        let rederive = d.seal().await;
-        let mut page = d
-            .drain_frozen(
-                rederive,
-                "rederive",
-                &[(PausePoint::AfterRederiveRead, kind.target())],
-            )
-            .await;
-        page.reached(PausePoint::AfterRederiveRead).await;
-        write(&d, "update public.a set x = 500 where id = 1").await;
-        let change = d.seal().await;
-        d.release(&mut page, PausePoint::AfterRederiveRead).await;
-        page.finish().await;
-        d.drain(change, "change").await;
-        assert_eq!(total(&d, kind, 1).await, Some(500 + 100), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// Two pages on a row no `R` entry exists for yet: the newer page's
-/// placeholder insert is uncommitted, so the older page queues on it rather
-/// than overwriting it (`join1_no_placeholder`).
-#[tokio::test]
-async fn two_pages_on_a_new_row_queue_on_the_placeholder() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        let label = r_label(&d, kind).await;
-        write(&d, "insert into public.a values (9, 10, 9, 'nine')").await;
-        let older = d.seal().await;
-        write(&d, "update public.a set x = 99 where id = 9").await;
-        let newer = d.seal().await;
-        let mut held = d
-            .drain_frozen(newer, "newer", &[(PausePoint::AfterPlaceholders, &label)])
-            .await;
-        let reached = held.reached(PausePoint::AfterPlaceholders).await;
-        let queued = d.drain_frozen(older, "older", &[]).await;
-        d.wait_blocked_behind(reached.backend_pid).await;
-        d.release(&mut held, PausePoint::AfterPlaceholders).await;
-        held.finish().await;
-        queued.finish().await;
-        assert_eq!(total(&d, kind, 9).await, Some(99 + 100), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
 }
 
 /// A field that overflows for one row fails the page's statement with a data
@@ -757,12 +548,6 @@ async fn the_newest_m_entry_on_a_key_is_the_applied_one() {
         .expect("a second live M entry on key 10");
     step(&mut d, "update public.a set x = 2 where id = 1").await;
     assert_eq!(total(&d, Kind::Left, 1).await, Some(2 + 5000));
-}
-
-/// The label a page's `M` pause points carry for `kind`'s definition.
-async fn m_label(d: &Driver, kind: Kind) -> String {
-    let id = definition_id(d, kind.target()).await;
-    format!("{}.join1_{id}_m", trellis::config::DEFAULT_SCHEMA)
 }
 
 /// Waits until some backend queues on a lock `pid` holds (`true`), or until
@@ -848,14 +633,10 @@ enum First {
     B,
 }
 
-/// One #1371 family: an `a` writer (`a_sql`) against a `b` writer (`b_sql`)
-/// on a key they share, each in its own batch. For both join kinds, the `a`
-/// page frozen at its commit while the `b` page queues, then the other way
-/// round.
-async fn family(a_sql: &str, b_sql: &str) {
-    family_on(A_ROWS, B_ROWS, a_sql, b_sql).await;
-}
-
+/// One #1371 family over `a_rows` and `b_rows`: an `a` writer (`a_sql`)
+/// against a `b` writer (`b_sql`) on a key they share, each in its own
+/// batch. For both join kinds, the `a` page frozen at its commit while the
+/// `b` page queues, then the other way round.
 async fn family_on(a_rows: &str, b_rows: &str, a_sql: &str, b_sql: &str) {
     for kind in KINDS {
         for first in [First::A, First::B] {
@@ -908,114 +689,6 @@ async fn a_page_with_several_changes_to_one_b_row_applies_the_newest() {
     let batch = d.seal().await;
     d.drain(batch, "w").await;
     assert_oracle(&mut d, &KINDS).await;
-}
-
-/// F1: an `a` insert on a key no `b` row has ‖ the `b` insert of that key.
-/// The page that runs second queues on `J[30]` and reads the other side's
-/// copy only once it has the lock, so whichever commits first, the other
-/// sees it (`join1_m_before_j`, `join1_no_j_lock`).
-#[tokio::test]
-async fn f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits() {
-    family(
-        "insert into public.a values (5, 30, 5, 'five')",
-        "insert into public.b values (4, 30, 300, 'thirty')",
-    )
-    .await;
-}
-
-/// F2: an `a` insert ‖ the `b` delete of its key.
-#[tokio::test]
-async fn f2_an_a_insert_races_the_b_delete_of_its_key() {
-    family(
-        "insert into public.a values (5, 10, 5, 'five')",
-        "delete from public.b where id = 1",
-    )
-    .await;
-}
-
-/// F3: an `a` key move `10 → 20` ‖ a `b` update of `20`.
-#[tokio::test]
-async fn f3_an_a_move_races_a_b_update_of_its_new_key() {
-    family(
-        "update public.a set k = 20 where id = 1",
-        "update public.b set w = 222 where id = 2",
-    )
-    .await;
-}
-
-/// F4: an `a` key move `10 → 20` ‖ a `b` update of `10`, the key it leaves.
-#[tokio::test]
-async fn f4_an_a_move_races_a_b_update_of_the_key_it_leaves() {
-    family(
-        "update public.a set k = 20 where id = 1",
-        "update public.b set w = 111 where id = 1",
-    )
-    .await;
-}
-
-/// F4 on the `b` side: a `b` row moving off key 10 locks the key it leaves,
-/// which its `M` entry holds and its image's old key names
-/// (`join1_old_key_unlocked`), so it queues behind an `a` page inserting a
-/// row there, and its fan-out then finds that row.
-#[tokio::test]
-async fn f4_a_b_row_moving_off_a_key_locks_the_key_it_leaves() {
-    family(
-        "insert into public.a values (5, 10, 5, 'five')",
-        "update public.b set k = 50 where id = 1",
-    )
-    .await;
-}
-
-/// F5: an `a` delete ‖ a `b` update of its key.
-#[tokio::test]
-async fn f5_an_a_delete_races_a_b_update_of_its_key() {
-    family(
-        "delete from public.a where id = 1",
-        "update public.b set w = 111 where id = 1",
-    )
-    .await;
-}
-
-/// F7: a `b` unique-key hand-off (row 1 leaves key 10, row 2 takes it),
-/// drained in the wrong order, with an `a` insert on the key in the take's
-/// page. While only the take has applied, `M` holds two live entries on key
-/// 10 and the recompute reads the one the newer Apply wrote; the leave then
-/// recomputes the key again.
-#[tokio::test]
-async fn f7_a_b_hand_off_applied_out_of_order() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        write(&d, "update public.b set k = 60 where id = 1").await;
-        let leave = d.seal().await;
-        write(&d, "update public.b set k = 10 where id = 2").await;
-        write(&d, "insert into public.a values (5, 10, 5, 'five')").await;
-        let take = d.seal().await;
-        d.drain(take, "take").await;
-        assert_eq!(total(&d, kind, 1).await, Some(1 + 200), "{kind:?}");
-        assert_eq!(total(&d, kind, 5).await, Some(5 + 200), "{kind:?}");
-        d.drain(leave, "leave").await;
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// F7b: the two pages of a hand-off racing each other. Both lock key 10, so
-/// the second queues on it.
-#[tokio::test]
-async fn f7b_two_hand_off_pages_race() {
-    for kind in KINDS {
-        for take_first in [true, false] {
-            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-            write(&d, "update public.b set k = 60 where id = 1").await;
-            let leave = d.seal().await;
-            write(&d, "update public.b set k = 10 where id = 2").await;
-            let take = d.seal().await;
-            if take_first {
-                race(&mut d, kind, take, leave).await;
-            } else {
-                race(&mut d, kind, leave, take).await;
-            }
-        }
-    }
 }
 
 /// F13: a fan-out past one keyset batch (25,000 `a` rows on key 10, three
@@ -1105,136 +778,6 @@ async fn a_fan_out_batch_probes_r_by_its_key_and_never_scans_it_whole() {
                 || plan.contains(&format!("Bitmap Index Scan on {r}_pkey ")),
             "{kind:?}: each entry is a probe of R's primary key:\n{plan}"
         );
-    }
-}
-
-/// F15: a new `b` row's insert and update drained out of order, the update's
-/// page holding its placeholder: the insert's page queues on it rather than
-/// overwriting it (`join1_no_placeholder`), and is then refused by I2.
-#[tokio::test]
-async fn f15_a_new_b_rows_insert_and_update_applied_out_of_order() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        let label = m_label(&d, kind).await;
-        write(&d, "insert into public.b values (4, 30, 300, 'thirty')").await;
-        let older = d.seal().await;
-        write(&d, "update public.b set w = 333 where id = 4").await;
-        let newer = d.seal().await;
-        let mut held = d
-            .drain_frozen(newer, "newer", &[(PausePoint::AfterPlaceholders, &label)])
-            .await;
-        let reached = held.reached(PausePoint::AfterPlaceholders).await;
-        let queued = d.drain_frozen(older, "older", &[]).await;
-        d.wait_blocked_behind(reached.backend_pid).await;
-        d.release(&mut held, PausePoint::AfterPlaceholders).await;
-        held.finish().await;
-        queued.finish().await;
-        assert_eq!(total(&d, kind, 3).await, Some(3 + 333), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// An older `b` Apply drained after a newer one is refused by its `M` entry's
-/// applied position (F12 on the `b` side, `join1_vis_only`).
-#[tokio::test]
-async fn an_older_b_apply_after_a_newer_one_is_refused() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        write(&d, "update public.b set w = 101 where id = 1").await;
-        let older = d.seal().await;
-        write(&d, "update public.b set w = 102 where id = 1").await;
-        let newer = d.seal().await;
-        d.drain(newer, "newer").await;
-        d.drain(older, "older").await;
-        assert_eq!(total(&d, kind, 1).await, Some(1 + 102), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// A mixed page: an `a` row moving onto key 20 and the `b` change of key 20,
-/// in one page. The `a` row is written from the page's own new `M` entry, and
-/// the fan-out recomputes the key's other rows. Then the two changes in two
-/// pages, the `b` change drained before the `a` change and after it.
-#[tokio::test]
-async fn m_a_mixed_page_applies_an_a_move_and_the_b_change_of_its_new_key() {
-    let a_change = "update public.a set k = 20 where id = 1";
-    let b_change = "update public.b set w = 250 where id = 2";
-    let mut d = start(A_ROWS, B_ROWS).await;
-    write(&d, a_change).await;
-    write(&d, b_change).await;
-    let batch = d.seal().await;
-    d.drain(batch, "mixed").await;
-    assert_oracle(&mut d, &KINDS).await;
-    for b_first in [true, false] {
-        let mut d = start(A_ROWS, B_ROWS).await;
-        write(&d, a_change).await;
-        let a = d.seal().await;
-        write(&d, b_change).await;
-        let b = d.seal().await;
-        let order = if b_first { [b, a] } else { [a, b] };
-        for batch in order {
-            d.drain(batch, "one").await;
-        }
-        assert_oracle(&mut d, &KINDS).await;
-    }
-}
-
-/// Two mixed pages racing (M1–M6). In the first pair one moves `a` row 1
-/// from 10 to 20 and changes `b`'s key 20, the other moves `a` row 2 from 20
-/// to 10 and changes key 10. In the second the other page moves row 3 from 30
-/// onto 10 instead, so its own `a` write touches no row the first page wrote,
-/// and only `J[10]` stops its fan-out from reading row 1 on key 10 while the
-/// first page moves it off (`join1_no_j_lock`). Each page locks both its keys
-/// in one sorted `J` statement, so the second queues on the first and
-/// neither deadlocks, in either order.
-#[tokio::test]
-async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
-    for other_a in [
-        "update public.a set k = 10 where id = 2",
-        "update public.a set k = 10 where id = 3",
-    ] {
-        for kind in KINDS {
-            for one_first in [true, false] {
-                let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-                write(&d, "update public.a set k = 20 where id = 1").await;
-                write(&d, "update public.b set w = 250 where id = 2").await;
-                let one = d.seal().await;
-                write(&d, other_a).await;
-                write(&d, "update public.b set w = 150 where id = 1").await;
-                let two = d.seal().await;
-                if one_first {
-                    race(&mut d, kind, one, two).await;
-                } else {
-                    race(&mut d, kind, two, one).await;
-                }
-            }
-        }
-    }
-}
-
-/// A mixed page racing a `b` page on the key its `a` row moves to and a
-/// page of `a` changes on the key it leaves.
-#[tokio::test]
-async fn m_a_mixed_page_races_pages_of_either_side() {
-    for kind in KINDS {
-        for (other, a_first) in [
-            ("update public.b set w = 222 where id = 2", true),
-            ("update public.b set w = 222 where id = 2", false),
-            ("insert into public.a values (5, 10, 5, 'five')", true),
-            ("insert into public.a values (5, 10, 5, 'five')", false),
-        ] {
-            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-            write(&d, "update public.a set k = 20 where id = 1").await;
-            write(&d, "update public.b set w = 111 where id = 1").await;
-            let mixed = d.seal().await;
-            write(&d, other).await;
-            let single = d.seal().await;
-            if a_first {
-                race(&mut d, kind, mixed, single).await;
-            } else {
-                race(&mut d, kind, single, mixed).await;
-            }
-        }
     }
 }
 
@@ -1334,129 +877,6 @@ async fn a_b_page_that_predates_the_build_rederives() {
     assert_eq!(status, "live", "{reason:?}");
 }
 
-/// R18 (`brd_nokey`): a `b` row moves onto key 30 after a Re-derive page's
-/// unlocked read of it, while an `a` page inserting a row on 30 holds `J[30]`
-/// uncommitted. The Re-derive's read finds 30 outside its locked set, so it
-/// rolls back and its retry queues on `J[30]`; its fan-out then reaches the
-/// new `a` row. Planted `join1_brd_no_key` writes the `M` entry and fans out
-/// on 30 without the lock, around the `a` row, which keeps no match.
-#[tokio::test]
-async fn r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        d.stage_recomputes("public.b", &["1"]).await;
-        let rederive = d.seal().await;
-        write(&d, "insert into public.a values (5, 30, 5, 'five')").await;
-        let insert = d.seal().await;
-        let moves = d.join_key_moves();
-        let mut page = d
-            .drain_frozen(
-                rederive,
-                "rederive b",
-                &[(PausePoint::BeforeJoin1Lock, kind.target())],
-            )
-            .await;
-        page.reached(PausePoint::BeforeJoin1Lock).await;
-        // Captured, left for the settle to drain: the Re-derive's basis sees
-        // it, so its Apply is refused.
-        write(&d, "update public.b set k = 30 where id = 1").await;
-        let mut held = d
-            .drain_frozen(insert, "a", &[(PausePoint::BeforeCommit, kind.target())])
-            .await;
-        let reached = held.reached(PausePoint::BeforeCommit).await;
-        d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
-        let blocked = queued_or_finished(&d, reached.backend_pid, &page).await;
-        d.release(&mut held, PausePoint::BeforeCommit).await;
-        held.finish().await;
-        let result = page.finish_result().await;
-        if !blocked {
-            ran_through(&mut d, kind, result, moves).await;
-        }
-        result.expect("the Re-derive page");
-        assert_eq!(
-            d.join_key_moves(),
-            moves + 1,
-            "the Re-derive's read found a key it hadn't locked"
-        );
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// R19 (`rd_nokey`), R18's mirror: an `a` row moves onto key 30 after a
-/// Re-derive page's unlocked read of it, while a `b` page inserting a row on
-/// 30 holds `J[30]` uncommitted. The retry queues on `J[30]` and reads the
-/// new `M` entry. Planted `join1_rd_no_key` writes the row on 30 without the
-/// lock, from `M` as it was before the `b` page.
-#[tokio::test]
-async fn r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        d.stage_recomputes("public.a", &["1"]).await;
-        let rederive = d.seal().await;
-        write(&d, "insert into public.b values (4, 30, 300, 'thirty')").await;
-        let insert = d.seal().await;
-        let moves = d.join_key_moves();
-        let mut page = d
-            .drain_frozen(
-                rederive,
-                "rederive a",
-                &[(PausePoint::BeforeJoin1Lock, kind.target())],
-            )
-            .await;
-        page.reached(PausePoint::BeforeJoin1Lock).await;
-        write(&d, "update public.a set k = 30 where id = 1").await;
-        let mut held = d
-            .drain_frozen(insert, "b", &[(PausePoint::BeforeCommit, kind.target())])
-            .await;
-        let reached = held.reached(PausePoint::BeforeCommit).await;
-        d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
-        let blocked = queued_or_finished(&d, reached.backend_pid, &page).await;
-        d.release(&mut held, PausePoint::BeforeCommit).await;
-        held.finish().await;
-        let result = page.finish_result().await;
-        if !blocked {
-            ran_through(&mut d, kind, result, moves).await;
-        }
-        result.expect("the Re-derive page");
-        assert_eq!(
-            d.join_key_moves(),
-            moves + 1,
-            "the Re-derive's read found a key it hadn't locked"
-        );
-        assert_eq!(total(&d, kind, 1).await, Some(1 + 300), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// `rd_latesnap` on `M`: a `b` change that commits after a `b` Re-derive's
-/// read statement is not in the row it wrote, so it must not be in the
-/// entry's basis (`join1_snapshot_after_read`): its Apply, drained after the
-/// Re-derive, applies and fans out.
-#[tokio::test]
-async fn a_b_change_between_a_b_rederives_read_and_its_snapshot_is_applied() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        let label = m_label(&d, kind).await;
-        d.stage_recomputes("public.b", &["1"]).await;
-        let rederive = d.seal().await;
-        let mut page = d
-            .drain_frozen(
-                rederive,
-                "rederive b",
-                &[(PausePoint::AfterRederiveRead, &label)],
-            )
-            .await;
-        page.reached(PausePoint::AfterRederiveRead).await;
-        write(&d, "update public.b set w = 500 where id = 1").await;
-        let change = d.seal().await;
-        d.release(&mut page, PausePoint::AfterRederiveRead).await;
-        page.finish().await;
-        d.drain(change, "change").await;
-        assert_eq!(total(&d, kind, 1).await, Some(1 + 500), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
 /// A page re-deriving rows of both sides reads each side in its own
 /// statement, and each read's snapshot is the basis of its own side's
 /// entries only. Changes of both rows that commit between the `a` read and
@@ -1515,191 +935,6 @@ async fn a_rederive_that_changes_nothing_writes_no_target_row() {
         assert_eq!(d.rows(&versions).await, before, "{kind:?}");
         assert_oracle(&mut d, &[kind]).await;
     }
-}
-
-/// R17 on `M`: a `b` Re-derive read the row after two changes, then the
-/// older change's Apply arrives. The entry's basis saw it, so it is refused
-/// (`join1_lsn_only`) and the fan-out keeps the re-derived `w`.
-#[tokio::test]
-async fn r17_a_stale_b_apply_after_a_b_rederive_is_refused() {
-    for kind in KINDS {
-        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-        write(&d, "update public.b set w = 110 where id = 1").await;
-        let older = d.seal().await;
-        write(&d, "update public.b set w = 120 where id = 1").await;
-        d.stage_recomputes("public.b", &["1"]).await;
-        let rederive = d.seal().await;
-        d.drain(rederive, "rederive").await;
-        assert_eq!(total(&d, kind, 1).await, Some(1 + 120));
-        d.drain(older, "older").await;
-        assert_eq!(total(&d, kind, 1).await, Some(1 + 120), "{kind:?}");
-        assert_oracle(&mut d, &[kind]).await;
-    }
-}
-
-/// One writer of a Re-derive family: a Re-derive of `table`'s `keys`, a
-/// captured change, or both in one page.
-#[derive(Debug, Clone, Copy)]
-enum Writer {
-    Rederive(&'static str, &'static [&'static str]),
-    Change(&'static str),
-    Both(&'static str, &'static [&'static str], &'static str),
-}
-
-impl Writer {
-    async fn seal(self, d: &mut Driver) -> i64 {
-        match self {
-            Writer::Rederive(table, keys) => d.stage_recomputes(table, keys).await,
-            Writer::Change(sql) => write(d, sql).await,
-            Writer::Both(table, keys, sql) => {
-                write(d, sql).await;
-                d.stage_recomputes(table, keys).await;
-            }
-        }
-        d.seal().await
-    }
-}
-
-/// One Re-derive family: two writers on a key they share, each in its own
-/// batch, for both join kinds, with either one's page frozen at its commit
-/// while the other queues.
-async fn rederive_family(first: Writer, second: Writer) {
-    for kind in KINDS {
-        for flip in [false, true] {
-            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-            let one = first.seal(&mut d).await;
-            let two = second.seal(&mut d).await;
-            if flip {
-                race(&mut d, kind, two, one).await;
-            } else {
-                race(&mut d, kind, one, two).await;
-            }
-        }
-    }
-}
-
-/// Re-derives of either side against a change of the same row, of the other
-/// side on its key, a key move onto or off it, another Re-derive and a mixed
-/// page: each pair queues on a shared `J` row, nothing deadlocks, and the
-/// target is the live join whichever page commits first.
-#[tokio::test]
-async fn r_rederives_race_changes_of_either_side() {
-    const B1: Writer = Writer::Rederive("public.b", &["1"]);
-    const A1: Writer = Writer::Rederive("public.a", &["1"]);
-    for (first, second) in [
-        // A `b` Re-derive against an `a` insert on its key, an update of the
-        // same row, and the row's move off the key.
-        (
-            B1,
-            Writer::Change("insert into public.a values (5, 10, 5, 'five')"),
-        ),
-        (
-            B1,
-            Writer::Change("update public.b set w = 101 where id = 1"),
-        ),
-        (
-            B1,
-            Writer::Change("update public.b set k = 50 where id = 1"),
-        ),
-        // An `a` Re-derive against a `b` update of its key, a `b` row moving
-        // onto its key, and its own move.
-        (
-            A1,
-            Writer::Change("update public.b set w = 102 where id = 1"),
-        ),
-        (
-            Writer::Rederive("public.a", &["3"]),
-            Writer::Change("update public.b set k = 30 where id = 3"),
-        ),
-        (
-            A1,
-            Writer::Change("update public.a set k = 20 where id = 1"),
-        ),
-        // Re-derives of both sides on one key, and a page with both against
-        // a `b` change of the key.
-        (A1, B1),
-        (
-            Writer::Both("public.b", &["1"], "update public.a set x = 9 where id = 1"),
-            Writer::Change("update public.b set w = 103 where id = 1"),
-        ),
-    ] {
-        rederive_family(first, second).await;
-    }
-}
-
-/// N-family: a row with a `NULL` join key has no `J` row, so only its entry
-/// lock orders a Re-derive of it against an Apply (`join1_no_entry_lock`).
-/// The Re-derive is frozen after its read; the Apply's change commits after
-/// that read and its page queues on the entry, then applies over the
-/// re-derived state. Planted, the Apply runs first and the Re-derive then
-/// writes the older row over it. For both sides: `a` row 4 and a `b` row on
-/// a `NULL` key.
-#[tokio::test]
-async fn n_a_rederive_and_an_apply_of_a_null_keyed_row_queue_on_its_entry() {
-    for kind in KINDS {
-        for (table, change) in [
-            ("public.a", "update public.a set x = 44 where id = 4"),
-            ("public.b", "update public.b set w = 4400 where id = 4"),
-        ] {
-            let mut d = start_kinds(
-                &[kind],
-                A_ROWS,
-                &format!("{B_ROWS}, (4, null, 4000, 'none')"),
-            )
-            .await;
-            let label = if table == "public.a" {
-                kind.target().to_string()
-            } else {
-                m_label(&d, kind).await
-            };
-            d.stage_recomputes(table, &["4"]).await;
-            let rederive = d.seal().await;
-            let mut page = d
-                .drain_frozen(
-                    rederive,
-                    "rederive",
-                    &[(PausePoint::AfterRederiveRead, &label)],
-                )
-                .await;
-            let reached = page.reached(PausePoint::AfterRederiveRead).await;
-            write(&d, change).await;
-            let batch = d.seal().await;
-            let moves = d.join_key_moves();
-            let apply = d.drain_frozen(batch, "apply", &[]).await;
-            let blocked = queued_or_finished(&d, reached.backend_pid, &apply).await;
-            d.release(&mut page, PausePoint::AfterRederiveRead).await;
-            page.finish().await;
-            let result = apply.finish_result().await;
-            if !blocked {
-                ran_through(&mut d, kind, result, moves).await;
-            }
-            result.expect("the Apply page");
-            assert_oracle(&mut d, &[kind]).await;
-        }
-    }
-}
-
-/// N-family: Re-derives move rows of either side onto and off a `NULL` key
-/// (changes capture never saw), and re-derive a row that stays on one.
-#[tokio::test]
-async fn n_rederives_move_rows_onto_and_off_a_null_key() {
-    let mut d = start(A_ROWS, &format!("{B_ROWS}, (4, null, 4000, 'none')")).await;
-    write_uncaptured(&d, "update public.a set k = 10 where id = 4").await;
-    write_uncaptured(&d, "update public.a set k = null where id = 2").await;
-    write_uncaptured_on(&d, "public.b", "update public.b set k = 30 where id = 4").await;
-    write_uncaptured_on(&d, "public.b", "update public.b set k = null where id = 1").await;
-    d.stage_recomputes("public.a", &["2", "4"]).await;
-    d.stage_recomputes("public.b", &["1", "3", "4"]).await;
-    let batch = d.seal().await;
-    d.drain(batch, "rederive").await;
-    assert_oracle(&mut d, &KINDS).await;
-    // A row that stays on a `NULL` key re-derives to the same state.
-    write_uncaptured_on(&d, "public.b", "update public.b set w = 1 where id = 1").await;
-    d.stage_recomputes("public.a", &["2"]).await;
-    d.stage_recomputes("public.b", &["1"]).await;
-    let batch = d.seal().await;
-    d.drain(batch, "again").await;
-    assert_oracle(&mut d, &KINDS).await;
 }
 
 /// A `b` side that is another transform's 1-1 target, joined on its primary

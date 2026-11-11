@@ -181,9 +181,10 @@ pub enum Plant {
     /// read of `M` and its target write.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `an_a_page_holds_its_j_row_until_it_commits` and
+    /// `an_a_page_holds_its_j_row_until_it_commits` and `join_star_families`'s
     /// `f3_an_a_move_races_a_b_update_of_its_new_key`. The R-entry lock
     /// (#1774) orders two mixed pages on one row without `J`, so
+    /// `join_star_families`'s
     /// `m_two_crossing_mixed_pages_queue_on_j_without_deadlock` passes it.
     Join1NoJLock,
     /// ADR-0021 (#1375 `join1_no_recheck`): a 1-1 `JOIN` page doesn't check
@@ -205,27 +206,32 @@ pub enum Plant {
     /// an Apply the entry's basis already saw is applied again, so an older
     /// change drained after a Re-derive read a newer one puts its value back.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `r17_a_stale_apply_after_a_rederive_is_refused` (`R`) and
-    /// `r17_a_stale_b_apply_after_a_b_rederive_is_refused` (`M`).
+    /// Pinned by `join_star_families`'s
+    /// `r17_a_stale_root_apply_after_a_rederive_is_refused` (`R`) and
+    /// `join_star_joined_families`'s
+    /// `r17_a_stale_joined_apply_after_a_joined_rederive_is_refused` (`M`).
     Join1LsnOnly,
     /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
     /// visibility check: an Apply older than the entry's applied position
     /// whose transaction the basis didn't see overwrites a newer state.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `an_older_apply_after_a_newer_one_is_refused` (`R`) and
-    /// `an_older_b_apply_after_a_newer_one_is_refused` (`M`).
+    /// Pinned by `join_star_families`'s
+    /// `an_older_root_apply_after_a_newer_one_is_refused` (`R`) and
+    /// `join_star_joined_families`'s
+    /// `an_older_joined_apply_after_a_newer_one_is_refused` (`M`).
     Join1VisOnly,
     /// ADR-0021 (#1375 `join1_no_entry_lock`): a 1-1 `JOIN` page reads its
     /// `R` entries without locking them. The entry lock is the only thing
     /// ordering two writers of a row with a NULL join key, which has no `J`
     /// row.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `n_two_pages_on_a_null_keyed_row_queue_on_its_entry` and
-    /// `n_a_rederive_and_an_apply_of_a_null_keyed_row_queue_on_its_entry`
-    /// (`R` and `M`).
+    /// Pinned by `join_star_families`'s
+    /// `n_two_pages_on_a_row_null_keyed_at_the_position_queue_on_its_entry`
+    /// and
+    /// `n_a_rederive_and_an_apply_of_a_row_null_keyed_at_the_position_queue_on_its_entry`
+    /// (`R`), and `join_star_joined_families`'s
+    /// `n_a_joined_rederive_and_an_apply_of_a_row_null_keyed_queue_on_its_entry`
+    /// (`M`).
     Join1NoEntryLock,
     /// ADR-0021 (#1371 F4/F5, #1375 `join1_old_key_unlocked`): a 1-1 `JOIN`
     /// page locks only its changes' new keys: it leaves the key its `R` or
@@ -235,7 +241,9 @@ pub enum Plant {
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
     /// `a_row_moving_off_a_key_locks_the_key_it_leaves` (the `a` side) and
-    /// `f4_a_b_row_moving_off_a_key_locks_the_key_it_leaves` (the `b` side).
+    /// `join_star_joined_families`'s
+    /// `f4_a_joined_row_moving_off_a_key_locks_the_key_it_leaves` (the `b`
+    /// side).
     Join1OldKeyUnlocked,
     /// ADR-0021 (#1375 `join1_snapshot_after_read`, `rd_latesnap`): a 1-1
     /// `JOIN` Re-derive takes the entry's basis one statement after its read
@@ -243,9 +251,10 @@ pub enum Plant {
     /// two is in the basis without being in the row, and its Apply is
     /// refused.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_change_between_a_rederives_read_and_its_snapshot_is_applied` (`R`)
-    /// and `a_b_change_between_a_b_rederives_read_and_its_snapshot_is_applied`
+    /// Pinned by `join_star_families`'s
+    /// `a_root_change_between_a_rederives_read_and_its_snapshot_is_applied`
+    /// (`R`) and `join_star_joined_families`'s
+    /// `a_joined_change_between_a_joined_rederives_read_and_its_snapshot_is_applied`
     /// (`M`).
     Join1SnapshotAfterRead,
     /// ADR-0021 (#1375 R19, `rd_nokey`): a 1-1 `JOIN` page doesn't check that
@@ -256,8 +265,8 @@ pub enum Plant {
     ///
     /// A build chunk runs the same check on the rows it re-derives.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries`, and in a
+    /// Pinned by `join_star_families`'s
+    /// `r19_a_root_rederive_whose_row_moved_onto_a_held_key_retries`, and in a
     /// chunk by `join_one_to_one_build`'s
     /// `c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retries`.
     Join1RdNoKey,
@@ -265,17 +274,18 @@ pub enum Plant {
     /// row: its `M` entry is written, and its new key fanned out to, under no
     /// `J` lock on that key, so an `a` page on the key reads around it.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries`.
+    /// Pinned by `join_star_joined_families`'s
+    /// `r18_a_joined_rederive_whose_row_moved_onto_a_held_key_retries`.
     Join1BrdNoKey,
     /// ADR-0021 (#1371 F14/F15, #1375 `join1_no_placeholder`): a 1-1 `JOIN`
     /// page inserts no placeholder for an `R` or `M` entry it doesn't find,
     /// so a page that finds none locks nothing and its change is lost, and
     /// two pages on a new row don't queue on its insert.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `two_pages_on_a_new_row_queue_on_the_placeholder` (`R`) and
-    /// `f15_a_new_b_rows_insert_and_update_applied_out_of_order` (`M`).
+    /// Pinned by `join_star_families`'s
+    /// `two_root_pages_on_a_new_row_queue_on_the_placeholder` (`R`) and
+    /// `join_star_joined_families`'s
+    /// `f15_a_new_joined_rows_insert_and_update_applied_out_of_order` (`M`).
     Join1NoPlaceholder,
     /// ADR-0021 (#1371 and #1375 `join1_m_before_j`, `rd_mearly`): a 1-1
     /// `JOIN` page reads `M` (and `R`, for its fan-out) before it locks `J`:
@@ -284,7 +294,7 @@ pub enum Plant {
     /// around, and a row the `b` page's fan-out couldn't see keeps the old
     /// `b` value.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
+    /// Pinned by `join_star_families`'s
     /// `f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits`
     /// (`m_two_crossing_mixed_pages_queue_on_j_without_deadlock` passes it
     /// since the R-entry lock, #1774).
