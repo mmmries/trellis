@@ -13,24 +13,21 @@
 //! Nothing polls for convergence: every seal, capture pass and drain
 //! is stepped by hand, one drain call at a time.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 use trellis::intake::harness;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{apply, quarantine, seal};
 
-const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+use pipeline::{capture_pass, connect_with};
+
+const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
 struct Instance {
     db: testkit::TestDatabase,
@@ -46,7 +43,7 @@ struct Instance {
 /// `ddl`'s definitions, live, with nothing left to drain.
 async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
     let db = cluster.create_empty_database().await;
-    let admin = connect(db.dsn()).await;
+    let admin = connect_with(db.dsn(), "").await;
     admin
         .batch_execute(&format!(
             "create role holdup_trellis login; \
@@ -72,7 +69,7 @@ async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
     trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate");
-    let mut raw = connect(&dsn).await;
+    let mut raw = connect_with(&dsn, "").await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
         .expect("set search_path");
@@ -108,22 +105,6 @@ fn targets<'a>(ddl: &[&'a str]) -> Vec<&'a str> {
     ddl.iter()
         .map(|statement| statement.split_whitespace().nth(1).expect("a target"))
         .collect()
-}
-
-/// The capture half of one staging-worker pass.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = trellis::capture::reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
 /// A drain role, `holdup_worker`, holding every privilege the drain uses on
@@ -558,7 +539,7 @@ async fn a_transient_failure_records_no_holdup() {
         .expect("write the source");
     let seg = seal(&mut it.raw).await;
 
-    let holder = connect(it.db.dsn()).await;
+    let holder = connect_with(it.db.dsn(), "").await;
     holder
         .batch_execute("begin; lock table public.c_copy in access exclusive mode")
         .await

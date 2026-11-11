@@ -14,52 +14,16 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{Config, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisOptions};
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, settle};
+
 const SCHEMA: &str = "trellis";
-const WAKE: &str = "capture_set_expression_wake";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, WAKE)
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_set_expression_test",
-            1,
-            WAKE,
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
 
 /// `n` rounds of a whole staging-worker pass (capture, then the start of
 /// ready builds), the builds run, and the ring drained.
@@ -69,7 +33,7 @@ async fn work(raw: &mut Client, pool: &trellis::pool::Pool, n: usize) {
             .await
             .expect("reconcile pass");
         trellis::staging::build::settle_builds(pool).await;
-        drain_to_quiescence(pool, raw).await;
+        settle(pool, raw).await;
     }
 }
 

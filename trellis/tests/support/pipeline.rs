@@ -15,11 +15,13 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::Client;
 use trellis::capture::reconcile::{self, PassOutcome};
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::{StoredStatus, TransformStatus};
 use trellis::staging::{
     ApplyOutcome, StagingError, apply, collect_tombstones, has_pending, retire_drained_segments,
     seal as seal_api,
@@ -229,6 +231,78 @@ pub async fn settle(pool: &trellis::pool::Pool, client: &mut Client) {
         }
     }
     panic!("pipeline did not reach quiescence within {SETTLE_ROUNDS} seal/drain rounds");
+}
+
+/// `target`'s stored status, read from the catalog by bare target name.
+pub async fn status(raw: &Client, target: &str) -> TransformStatus {
+    let text: String = raw
+        .query_one(
+            "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read status")
+        .get(0);
+    StoredStatus::from_persisted(&text)
+        .expect("a stored status")
+        .into()
+}
+
+/// Every definition's stored status, by bare target name.
+pub async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
+    raw.query(
+        "select split_part(target_table, '.', 2), status from transform_definitions",
+        &[],
+    )
+    .await
+    .expect("read statuses")
+    .into_iter()
+    .map(|row| {
+        let status = StoredStatus::from_persisted(row.get(1)).expect("a stored status");
+        (row.get(0), status.into())
+    })
+    .collect()
+}
+
+/// Alternates [`reconcile_pass`], builds and [`settle`] until each of
+/// `targets` is live: at most 8 rounds, not a wait for convergence.
+pub async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
+    for _ in 0..8 {
+        bring_live_round(raw, pool).await;
+        let all = statuses(raw).await;
+        if targets
+            .iter()
+            .all(|t| all.get(*t) == Some(&TransformStatus::Live))
+        {
+            return;
+        }
+    }
+    panic!(
+        "{targets:?} did not all go live within 8 rounds: {:?}",
+        statuses(raw).await
+    );
+}
+
+/// [`bring_live`] for every definition, within 10 rounds.
+pub async fn bring_live_all(raw: &mut Client, pool: &trellis::pool::Pool) {
+    for _ in 0..10 {
+        bring_live_round(raw, pool).await;
+        if statuses(raw)
+            .await
+            .values()
+            .all(|s| *s == TransformStatus::Live)
+        {
+            return;
+        }
+    }
+    panic!("not every definition went live: {:?}", statuses(raw).await);
+}
+
+/// One staging-worker pass, the builds it starts, and a [`settle`].
+async fn bring_live_round(raw: &mut Client, pool: &trellis::pool::Pool) {
+    reconcile_pass(raw, pool).await;
+    trellis::staging::build::settle_builds(pool).await;
+    settle(pool, raw).await;
 }
 
 /// The two sides of the seal gate's comparison: the current snapshot's

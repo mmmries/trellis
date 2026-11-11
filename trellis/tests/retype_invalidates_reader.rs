@@ -20,115 +20,16 @@ use std::time::Duration;
 
 use drain_driver::Driver;
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::{TransformStatus, ValueType};
 use trellis::integer::IntWidth;
-use trellis::{Config, Trellis, TrellisError, TrellisOptions};
+use trellis::{Trellis, TrellisError};
+
+use drain_driver::pipeline::{bring_live, connect, definer, reconcile_pass, settle, status};
+use trellis::staging::build::settle_builds;
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
-
-const SCHEMA: &str = "trellis";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(
-            client,
-            outcome.sealed_seg_seq,
-            "retype_invalidates_reader_wake",
-        )
-        .await
-        .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "retype_invalidates_reader_test",
-            1,
-            "trellis_retype_invalidates_reader_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-/// Claims, runs and finishes every pending backfill chunk.
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-async fn status(raw: &Client, target: &str) -> TransformStatus {
-    let text: String = raw
-        .query_one(
-            "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
-            &[&target],
-        )
-        .await
-        .expect("read status")
-        .get(0);
-    trellis::defs::StoredStatus::from_persisted(&text)
-        .expect("a stored status")
-        .into()
-}
-
-/// Alternates staging-worker passes and drains until every one of
-/// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
-    for _ in 0..8 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let mut all_live = true;
-        for target in targets {
-            all_live &= status(raw, target).await == TransformStatus::Live;
-        }
-        if all_live {
-            return;
-        }
-    }
-    for target in targets {
-        eprintln!("{target}: {:?}", status(raw, target).await);
-    }
-    panic!("{targets:?} did not all go live within 8 pass/drain rounds");
-}
 
 /// `public.src (id, g, price int, d date)`, with `t` a passthrough of
 /// `price` as `p` and of `d`, and these readers of `t.p`, all live:
@@ -221,7 +122,7 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
     raw.batch_execute("alter table public.src alter column price type numeric")
         .await
         .expect("widen the source");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
     trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
     // `t` is rebuilt and live again before a reader's resume is judged.
@@ -328,7 +229,7 @@ async fn resume_retype_against_a_reader_row_holder(stall: Duration, expect_retry
     raw.batch_execute("alter table public.src alter column price type numeric")
         .await
         .expect("widen the source");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
     trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
 
@@ -351,7 +252,7 @@ async fn resume_retype_against_a_reader_row_holder(stall: Duration, expect_retry
     let dsn = db.dsn().to_string();
     let pass = tokio::spawn(async move {
         let mut pass_client = connect(&dsn).await;
-        full_pass(&mut pass_client, &pool).await;
+        reconcile_pass(&mut pass_client, &pool).await;
     });
     // The pass's re-type of `t.p` now waits on `roll`'s row.
     wait_blocked_behind(&raw, holder_pid).await;
@@ -392,7 +293,7 @@ async fn resume_retype_against_a_reader_row_holder(stall: Duration, expect_retry
             "the re-type failed other than by its lock_timeout (a deadlock is the ordering \
              bug): {failure}"
         );
-        full_pass(&mut raw, &db.pool).await;
+        reconcile_pass(&mut raw, &db.pool).await;
     }
     assert_eq!(
         column_type(&raw, "public.t", "p").await,
@@ -443,7 +344,7 @@ async fn a_chained_resume_retype_pauses_the_reader_define_would_refuse() {
     raw.batch_execute("alter table public.src alter column price type numeric")
         .await
         .expect("widen the source");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
     trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
     bring_live(&mut raw, &db.pool, &["t", "c"]).await;
@@ -509,7 +410,7 @@ async fn a_source_retype_to_unscaled_numeric_keeps_its_sum_readers_exact() {
     raw.batch_execute("alter table public.src alter column price type numeric")
         .await
         .expect("widen the source");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     for reader in ["agg", "j"] {
         let reported = trellis.status(reader).await.expect("status").expect(reader);
         assert_eq!(
@@ -522,14 +423,14 @@ async fn a_source_retype_to_unscaled_numeric_keeps_its_sum_readers_exact() {
     raw.batch_execute("insert into public.src values (3, 1, 1.12345)")
         .await
         .expect("a value at scale 5");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     for reader in ["agg", "j"] {
         assert_sums_exact(&raw, reader, "public.src", "price").await;
     }
     raw.batch_execute("delete from public.src where id = 3")
         .await
         .expect("the value leaves");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     for reader in ["agg", "j"] {
         assert_eq!(
             status(&raw, reader).await,
@@ -598,7 +499,7 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
     raw.batch_execute("alter table public.src alter column q type double precision")
         .await
         .expect("retype q");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = trellis.status("agg").await.expect("status").expect("agg");
     assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
 
@@ -654,7 +555,7 @@ async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_quarantines_its
     raw.batch_execute("alter table public.src alter column x type real")
         .await
         .expect("retype x");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = trellis.status("one").await.expect("status").expect("one");
     assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
 
@@ -662,8 +563,8 @@ async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_quarantines_its
         .apply("RESUME TRANSFORM one")
         .await
         .expect("the resume re-validates and accepts");
-    full_pass(&mut raw, &db.pool).await;
-    run_backfill_chunks(&db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle_builds(&db.pool).await;
     let held: Vec<(String, String, Option<String>)> = raw
         .query("select key, last_error, sqlstate from poison", &[])
         .await
@@ -710,7 +611,7 @@ async fn a_constant_beside_a_column_retyped_to_a_float_pauses_on_the_targets_re_
     raw.batch_execute("alter table public.src alter column n type double precision")
         .await
         .expect("retype n");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = trellis.status("one").await.expect("status").expect("one");
     assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
 
@@ -718,7 +619,7 @@ async fn a_constant_beside_a_column_retyped_to_a_float_pauses_on_the_targets_re_
         .apply("RESUME TRANSFORM one")
         .await
         .expect("the resume re-validates and accepts");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = trellis.status("one").await.expect("status").expect("one");
     assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
     let failure = reported

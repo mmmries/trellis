@@ -43,6 +43,7 @@ a key, index or policy itself.
 | [A `REGEXP_COUNT` pattern that isn't a literal or that Postgres rejects](#a-regexp_count-pattern-that-isnt-a-literal-or-that-postgres-rejects) | Yes (`NonLiteralRegexPattern`, `InvalidRegexPattern`) | Rows quarantined after a Postgres upgrade |
 | **Constants** | | |
 | [A literal zero divisor](#a-literal-zero-divisor) | Yes (`ConstantDivisorZero`) | n/a |
+| [A typed literal not in its type's canonical spelling](#a-typed-literal-not-in-its-types-canonical-spelling) | Yes (`InvalidTypedLiteral`) | n/a |
 | **Comparisons** | | |
 | [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | Yes (`MixedFloatExactComparison`) | A retype pauses the transform |
 | [A comparison between two temporal types](#a-comparison-between-two-temporal-types) | Yes (`MixedTemporalComparison`) | A retype pauses the transform |
@@ -599,6 +600,26 @@ division as written, for the definition and an `ALTER TRANSFORM`.
 
 **Remedy:** Use a nonzero divisor, or a column; `x / NULLIF(col, 0)` gives
 `NULL` where `col` is zero.
+
+#### A typed literal not in its type's canonical spelling
+
+**Condition:** A `DATE`, `TIMESTAMP`, `TIME`, `TIMETZ`, `BYTEA`, `OID`,
+`REAL`, `DOUBLE PRECISION`, `INET`, `CIDR`, `MACADDR`, `MACADDR8`, `VARBIT`
+or `JSONB` literal (or the `CAST('…' AS <type>)` spelling of one) whose text
+is not what Postgres's output function prints for the value: `DATE '2024-1-5'`,
+`DATE 'today'`, `REAL '1.50'`, `JSONB '{"b": 1, "a": 2}'`. Postgres accepts
+many of these, but relative date and time spellings are not immutable, and
+the check needs no Postgres (see
+[ADR-0004](decisions/0004-transform-definition-grammar.md)).
+
+**Refused at define:** Yes (`InvalidTypedLiteral`), naming the field and the
+literal and describing the spelling the type expects, for the definition and
+an `ALTER TRANSFORM`.
+
+**If it appears after define:** n/a: the text does not change.
+
+**Remedy:** Write the spelling Postgres prints for the value
+(`SELECT CAST('2024-1-5' AS date)::text` shows it): `DATE '2024-01-05'`.
 
 ### Comparisons
 
@@ -2260,11 +2281,9 @@ Treat a target as read-only, and specifically:
   next event that recomputes it, and a row added or re-keyed by hand stays
   until a rebuild. `self_check`
   ([0013](decisions/0013-self-check-production-recompute-audit.md)) reports the
-  divergence; it does not repair it. On a 1-1 target, `PAUSE` then `RESUME`
-  rebuilds the table from source and deletes the rows the source doesn't back,
-  including rows added or re-keyed by hand; on an aggregate target it keeps
-  group rows edited by hand, and `PAUSE`, `DROP TRANSFORM` and define again
-  repairs it ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)).
+  divergence; it does not repair it. `PAUSE` then `RESUME` rebuilds the table
+  from source and deletes the rows the source doesn't back
+  ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)).
 * **Do not add, drop, rename or retype columns.** Trellis addresses its columns
   by name and type. Redefining the transform is how a column changes
   ([Changing a definition](#changing-a-definition)).
@@ -2274,10 +2293,9 @@ Treat a target as read-only, and specifically:
   upserts or deletes it.
 * **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
   the table and its definition together, and refuses while another definition
-  still chains off it. A hand `TRUNCATE` leaves the table empty until a 1-1
-  transform is paused and resumed, or an aggregate dropped and defined again.
-  A resume refuses while the table is missing, and the repair is
-  `DROP TRANSFORM` and defining it again.
+  still chains off it. A hand `TRUNCATE` leaves the table empty until the
+  transform is paused and resumed. A resume refuses while the table is
+  missing, and the repair is `DROP TRANSFORM` and defining it again.
 * **Don't let row-level security apply to the role that writes it.**
   Trellis writes a target as the role each worker connects as, with
   `row_security = off`, so a write that policies applying to that role would

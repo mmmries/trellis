@@ -14,131 +14,20 @@
 //! explicit seal/drain rounds and staging-worker passes. Nothing polls for
 //! convergence.
 
-use std::time::{Duration, Instant};
-
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::install::{Installed, installed};
-use trellis::capture::reconcile;
 use trellis::defs::TransformStatus;
 use trellis::staging::apply::ApplyError;
-use trellis::{CaptureFailureKind, Config, Trellis, TrellisError, TrellisOptions};
+use trellis::{CaptureFailureKind, Trellis, TrellisError};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, settle, status};
+use trellis::staging::build::settle_builds;
 
 const SCHEMA: &str = "trellis";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) -> reconcile::PassOutcome {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass")
-}
-
-/// Seals and drains through the engine's own apply path until nothing is
-/// pending anywhere in the ring (as in `capture_join.rs`).
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_schema_change_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_schema_change_test",
-            1,
-            "trellis_capture_schema_change_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-async fn status(raw: &Client, target: &str) -> TransformStatus {
-    let text: String = raw
-        .query_one(
-            "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
-            &[&target],
-        )
-        .await
-        .expect("read status")
-        .get(0);
-    trellis::defs::StoredStatus::from_persisted(&text)
-        .expect("a stored status")
-        .into()
-}
-
-/// Alternates staging-worker passes and drains until every one of
-/// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
-    for _ in 0..8 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let mut all_live = true;
-        for target in targets {
-            all_live &= status(raw, target).await == TransformStatus::Live;
-        }
-        if all_live {
-            return;
-        }
-    }
-    for target in targets {
-        eprintln!("{target}: {:?}", status(raw, target).await);
-    }
-    panic!("{targets:?} did not all go live within 8 pass/drain rounds");
-}
-
-/// Claims, runs and finishes every pending backfill chunk: the hand-driven
-/// stand-in for a drain worker's build half (as in `alter_transform.rs`).
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
 
 /// The key and image columns `table`'s installed capture images.
 async fn captured(raw: &Client, table: &str) -> (Vec<String>, Vec<String>) {
@@ -332,7 +221,7 @@ async fn renaming_a_read_column_pauses_its_reader_and_never_fails_a_write() {
         "{marked:?}"
     );
 
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "ta").await, TransformStatus::Paused);
     let reported = trellis
         .status("ta")
@@ -361,8 +250,7 @@ async fn renaming_a_read_column_pauses_its_reader_and_never_fails_a_write() {
     b_readers_converged(&raw).await;
 
     // The next pass regenerates capture over what the live readers need.
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
         captured(&raw, "public.u").await.1,
         vec!["b", "g", "id"],
@@ -376,7 +264,7 @@ async fn renaming_a_read_column_pauses_its_reader_and_never_fails_a_write() {
         markers(&raw, since).await.is_empty(),
         "the regenerated functions no longer miss a column"
     );
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     b_readers_converged(&raw).await;
 
     // Put the column back and resume the reader: capture widens again and
@@ -408,7 +296,7 @@ async fn renaming_a_read_column_pauses_its_reader_and_never_fails_a_write() {
     app.batch_execute("update public.u set a = a + 1, c = c + 1")
         .await
         .expect("a write after the widen");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, "select id::text, a::text from public.ta order by id").await,
         rows(&raw, "select id::text, a::text from public.u order by id").await,
@@ -448,7 +336,7 @@ async fn dropping_a_read_column_pauses_its_reader_and_never_fails_a_write() {
             .all(|(_, image)| image.contains("\"missing\": [\"a\"]")),
         "{marked:?}"
     );
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
 
     let failure = trellis
         .status("ta")
@@ -467,8 +355,7 @@ async fn dropping_a_read_column_pauses_its_reader_and_never_fails_a_write() {
     for statement in ["DROP TRANSFORM ta"] {
         trellis.apply(statement).await.expect(statement);
     }
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
         captured(&raw, "public.u").await.1,
         vec!["b", "c", "g", "id"]
@@ -494,7 +381,7 @@ async fn renaming_an_unread_column_marks_and_pauses_nothing() {
     .await
     .expect("writes after the rename");
     assert!(markers(&raw, since).await.is_empty());
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     for target in ["ta", "tb", "tc", "tsum"] {
         assert_eq!(
             status(&raw, target).await,
@@ -542,7 +429,7 @@ async fn renaming_a_key_column_pauses_every_reader_and_never_fails_a_write() {
         "without its key the function images nothing"
     );
 
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     for target in ["ta", "tb", "tc", "tsum"] {
         assert_eq!(
             status(&raw, target).await,
@@ -561,8 +448,7 @@ async fn renaming_a_key_column_pauses_every_reader_and_never_fails_a_write() {
 
     // Every reader is paused, so the next pass regenerates capture over the
     // new key alone, and a write stages keyed rows again.
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
         captured(&raw, "public.u").await,
         (vec!["uid".to_string()], vec!["uid".to_string()])
@@ -698,8 +584,7 @@ async fn a_key_rename_the_capture_pass_sees_first_pauses_every_reader() {
     app.batch_execute("alter table public.u rename column id to uid")
         .await
         .expect("rename the key");
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     for target in ["ta", "tb", "tc", "tsum"] {
         assert_eq!(
             status(&raw, target).await,
@@ -728,9 +613,8 @@ async fn a_key_rename_the_capture_pass_sees_first_pauses_every_reader() {
     )
     .await
     .expect("no write fails");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    settle(&db.pool, &mut raw).await;
+    capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
         captured(&raw, "public.u").await,
         (vec!["uid".to_string()], vec!["uid".to_string()])
@@ -760,8 +644,7 @@ async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
     .await
     .expect("redefine the key, and write");
 
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     for target in ["ta", "tb", "tc", "tsum"] {
         let reported = trellis.status(target).await.expect("status").expect(target);
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
@@ -779,13 +662,12 @@ async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
         "the pass that pauses leaves the functions for the next one"
     );
 
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     app.batch_execute("insert into public.u values (5, 1, 5, 50, 500, 0)")
         .await
         .expect("no write fails");
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    settle(&db.pool, &mut raw).await;
+    capture_pass(&mut raw, &db.pool).await;
     assert_eq!(
         captured(&raw, "public.u").await.0,
         vec!["id".to_string(), "g".to_string()],
@@ -813,7 +695,7 @@ async fn a_page_before_the_pass_pauses_on_a_redefined_key(alter: &str, new_key: 
     .await
     .expect("redefine the key, and write");
 
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     for target in ["ta", "tb", "tc", "tsum"] {
         let reported = trellis.status(target).await.expect("status").expect(target);
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
@@ -841,12 +723,11 @@ async fn a_page_before_the_pass_pauses_on_a_redefined_key(alter: &str, new_key: 
         "nothing is charged to quarantine"
     );
 
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     app.batch_execute("update public.u set b = b + 1")
         .await
         .expect("no write fails");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
 }
 
 #[tokio::test]
@@ -898,7 +779,7 @@ async fn a_drain_page_pauses_nothing_for_a_key_rebuilt_on_the_same_columns() {
         ))
         .await
         .expect(alter);
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        settle(&db.pool, &mut raw).await;
         for target in ["ta", "tb", "tc", "tsum"] {
             assert_eq!(
                 status(&raw, target).await,
@@ -925,10 +806,9 @@ async fn resuming_while_the_column_is_still_missing_is_refused() {
     app.batch_execute("alter table public.u rename column a to a2; update public.u set b = b + 1")
         .await
         .expect("writes after the rename");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "ta").await, TransformStatus::Paused);
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
 
     match trellis.apply("RESUME TRANSFORM ta").await {
         Err(TrellisError::Apply(ApplyError::ResumeRefused { reason, .. })) => {
@@ -936,8 +816,7 @@ async fn resuming_while_the_column_is_still_missing_is_refused() {
         }
         other => panic!("expected the resume to be refused, got {other:?}"),
     }
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     let reported = trellis.status("ta").await.expect("status").expect("ta");
     assert_eq!(reported.status, TransformStatus::Paused);
     assert_eq!(
@@ -945,12 +824,11 @@ async fn resuming_while_the_column_is_still_missing_is_refused() {
         vec!["a".to_string()]
     );
 
-    let outcome = capture_pass(&mut raw, &db.pool).await;
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+    capture_pass(&mut raw, &db.pool).await;
     app.batch_execute("update public.u set b = b + 1")
         .await
         .expect("a write");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     b_readers_converged(&raw).await;
 }
 
@@ -1072,7 +950,7 @@ async fn a_definition_paused_for_a_missing_column_does_not_hold_the_tables_catch
     raw.batch_execute("alter table public.u rename column a to a2; update public.u set b = b + 1")
         .await
         .expect("writes after the rename");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(status(&raw, "ta").await, TransformStatus::Paused);
 
     trellis
@@ -1166,10 +1044,10 @@ async fn the_release_of_a_field_awaiting_capture_builds_a_reader_added_after_it(
         .apply("ALTER TRANSFORM ta ADD spare2 + 1 AS spare3")
         .await
         .expect("add a reader of it");
-    run_backfill_chunks(&db.pool).await;
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
-    run_backfill_chunks(&db.pool).await;
+    settle_builds(&db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    settle_builds(&db.pool).await;
     bring_live(&mut raw, &db.pool, &["ta"]).await;
     assert_eq!(
         rows(
@@ -1411,7 +1289,7 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
         ))
         .await
         .expect("write the halted table and the unrelated one");
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        settle(&db.pool, &mut raw).await;
     }
     assert!(
         !has_pending(&raw).await.expect("has_pending"),
@@ -1510,7 +1388,7 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
     )
     .await
     .expect("retype the key and write it");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(halting_stops(&db.pool).await, stops + 1);
 
     for target in ["posts_named", "users_copy"] {
@@ -1555,7 +1433,7 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
     )
     .await
     .expect("retype the key again and write it");
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         halting_stops(&db.pool).await,
         stops + 2,

@@ -478,7 +478,8 @@ table's. A change to Trellis's schema isn't detected.
   hand: `DROP TRANSFORM` and define it again.
 * **An aggregate target:** `request_backfill` of its source rewrites every
   group of the target and `agg_<id>`, and `PAUSE`/`RESUME` drops and
-  recreates `agg_<id>` and rewrites every group.
+  recreates `agg_<id>` and rewrites every group, removing a row no source row
+  backs.
 * **A `JOIN` or 1-1 `JOIN` target:** `PAUSE`/`RESUME` repairs the target's
   rows and every `join_<id>_*` or `join1_<id>_*` table: the resume recreates
   the hidden tables, rebuilds them from every table the definition reads and

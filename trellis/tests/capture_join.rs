@@ -17,58 +17,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::CaptureError;
 use trellis::capture::install::{Installed, LockingOperation, installed};
 use trellis::capture::reconcile::{self, PassOutcome};
 use trellis::defs::TransformStatus;
 use trellis::locks::{USER_TABLE_DDL_LOCK_TIMEOUT, USER_TABLE_DDL_RETRY_INTERVAL};
-use trellis::{ClientOptions, Config, Trellis, TrellisOptions};
+use trellis::{ClientOptions, Trellis};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live, capture_pass_within, connect, definer, reconcile_pass, status};
+use trellis::staging::build::settle_builds;
 
 const SCHEMA: &str = "trellis";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// The capture half of one pass, over the tables the catalog says to
-/// capture, with `budget` for locked tables.
-async fn capture_pass(
-    raw: &mut Client,
-    pool: &trellis::pool::Pool,
-    budget: Duration,
-) -> PassOutcome {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    reconcile::reconcile(raw, SCHEMA, &desired, Instant::now() + budget)
-        .await
-        .expect("capture pass")
-}
-
-/// One whole staging-worker pass: capture, then the builds it readies.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
 
 /// The columns `table`'s installed capture images, or `None` when nothing
 /// is installed.
@@ -96,20 +59,6 @@ async fn definition_id(raw: &Client, target: &str) -> i64 {
     .get(0)
 }
 
-async fn status(raw: &Client, target: &str) -> TransformStatus {
-    let text: String = raw
-        .query_one(
-            "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
-            &[&target],
-        )
-        .await
-        .expect("read status")
-        .get(0);
-    trellis::defs::StoredStatus::from_persisted(&text)
-        .expect("a stored status")
-        .into()
-}
-
 /// `Some(true)` when `table` has a capture gate, `None` when it has none.
 async fn gate_exists(raw: &Client, table: &str) -> Option<bool> {
     raw.query_opt(
@@ -126,7 +75,7 @@ async fn gate_exists(raw: &Client, table: &str) -> Option<bool> {
 /// them; a few passes always suffice.
 async fn settle(raw: &mut Client, pool: &trellis::pool::Pool, table: &str) {
     for _ in 0..5 {
-        full_pass(raw, pool).await;
+        reconcile_pass(raw, pool).await;
         if gate_exists(raw, table).await.is_none() {
             return;
         }
@@ -179,7 +128,7 @@ async fn a_registration_makes_the_next_pass_install_capture_with_its_gate() {
         "apply only registers: the install is the staging worker's, in the background"
     );
 
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert!(outcome.waiting.is_empty() && outcome.failed.is_empty());
     assert_eq!(
         captured_columns(&raw, "public.u").await,
@@ -192,7 +141,7 @@ async fn a_registration_makes_the_next_pass_install_capture_with_its_gate() {
     );
     assert_eq!(outcome.ready, vec![definition_id(&raw, "tu").await]);
 
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_ne!(
         status(&raw, "tu").await,
         TransformStatus::WaitingToBackfill,
@@ -219,7 +168,7 @@ async fn dropping_readers_narrows_then_uninstalls_capture() {
         .apply("TRANSFORM tb FROM public.u SELECT b AS b")
         .await
         .expect("define tb");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(
         captured_columns(&raw, "public.u").await,
         Some(vec!["a".to_string(), "b".to_string(), "id".to_string()])
@@ -228,7 +177,7 @@ async fn dropping_readers_narrows_then_uninstalls_capture() {
     for statement in ["PAUSE TRANSFORM tb", "DROP TRANSFORM tb"] {
         trellis.apply(statement).await.expect(statement);
     }
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(
         captured_columns(&raw, "public.u").await,
         Some(vec!["a".to_string(), "id".to_string()]),
@@ -238,7 +187,7 @@ async fn dropping_readers_narrows_then_uninstalls_capture() {
     for statement in ["PAUSE TRANSFORM ta", "DROP TRANSFORM ta"] {
         trellis.apply(statement).await.expect(statement);
     }
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(captured_columns(&raw, "public.u").await, None);
     let triggers: i64 = raw
         .query_one(
@@ -273,7 +222,7 @@ async fn a_second_definition_reading_a_new_column_widens_capture() {
         .apply("TRANSFORM tb FROM public.u SELECT b AS b")
         .await
         .expect("define tb");
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert_eq!(
         captured_columns(&raw, "public.u").await,
         Some(vec!["a".to_string(), "b".to_string(), "id".to_string()])
@@ -313,7 +262,7 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
 
     let holder = hold_table(db.dsn(), "public.u").await;
     let holder_pid = backend_pid(&holder).await;
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_millis(300)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_millis(300)).await;
 
     assert!(outcome.captured.contains("public.v"), "{outcome:?}");
     assert!(!outcome.captured.contains("public.u"), "{outcome:?}");
@@ -357,7 +306,7 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
     assert_eq!(other.capture_wait, None);
 
     holder.batch_execute("commit").await.expect("release u");
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert!(outcome.waiting.is_empty(), "{outcome:?}");
     assert!(captured_columns(&raw, "public.u").await.is_some());
     let status = trellis.status("tu").await.expect("status").expect("tu");
@@ -384,9 +333,12 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
 #[tokio::test]
 async fn a_pass_respects_its_budget_on_locked_tables() {
     async fn pass(raw: &mut Client, pool: &trellis::pool::Pool, budget: Duration) -> PassOutcome {
-        tokio::time::timeout(Duration::from_secs(60), capture_pass(raw, pool, budget))
-            .await
-            .expect("a pass stops retrying at its deadline")
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            capture_pass_within(raw, pool, budget),
+        )
+        .await
+        .expect("a pass stops retrying at its deadline")
     }
 
     let cluster = TestCluster::start();
@@ -491,7 +443,7 @@ async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
         "tv's source isn't captured yet: {outcome:?}"
     );
 
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert!(
         outcome.ready.contains(&definition_id(&raw, "tv").await),
         "the next pass captures v: {outcome:?}"
@@ -518,7 +470,7 @@ async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
         .expect("define");
 
     let holder = hold_table(db.dsn(), "public.u").await;
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_millis(200)).await;
     assert_eq!(outcome.waiting.len(), 1, "{outcome:?}");
     let reported = trellis.status("tu").await.expect("status").expect("tu");
     assert!(reported.capture_wait.is_some(), "{reported:?}");
@@ -530,7 +482,7 @@ async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
     raw.batch_execute("alter table public.u drop constraint u_pkey")
         .await
         .expect("drop the primary key");
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
     assert!(
         matches!(outcome.failed[0].1, CaptureError::NoPrimaryKey { .. }),
@@ -571,7 +523,7 @@ async fn another_handle_sees_the_capture_wait_and_failure() {
 
     let holder = hold_table(db.dsn(), "public.u").await;
     let holder_pid = backend_pid(&holder).await;
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_millis(200)).await;
     assert_eq!(outcome.waiting.len(), 1, "{outcome:?}");
     reconcile::forget_instance(&database, SCHEMA);
     let web = definer(db.dsn()).await;
@@ -588,7 +540,7 @@ async fn another_handle_sees_the_capture_wait_and_failure() {
         "{wait:?}"
     );
     // A second waiting pass keeps when the wait began.
-    capture_pass(&mut raw, &db.pool, Duration::from_millis(200)).await;
+    capture_pass_within(&mut raw, &db.pool, Duration::from_millis(200)).await;
     let again = web
         .status("tu")
         .await
@@ -605,7 +557,7 @@ async fn another_handle_sees_the_capture_wait_and_failure() {
     raw.batch_execute("alter table public.u drop constraint u_pkey")
         .await
         .expect("drop the primary key");
-    capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     reconcile::forget_instance(&database, SCHEMA);
     let reported = definer(db.dsn())
         .await
@@ -622,7 +574,7 @@ async fn another_handle_sees_the_capture_wait_and_failure() {
     raw.batch_execute("alter table public.u add primary key (id)")
         .await
         .expect("restore the primary key");
-    capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     let reported = web.status("tu").await.expect("status").expect("tu");
     assert_eq!(
         (reported.capture_wait, reported.capture_failure),
@@ -1061,7 +1013,7 @@ async fn drain_to_quiescence_drains_a_segment_sealed_before_it_ran() {
         .apply("TRANSFORM tu FROM public.u SELECT a AS a")
         .await
         .expect("define");
-    bring_live(&mut raw, &db.pool, "tu").await;
+    bring_live(&mut raw, &db.pool, &["tu"]).await;
 
     raw.batch_execute("update public.u set a = a + 100")
         .await
@@ -1163,8 +1115,8 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
 
     // A pass: the widen waits out the holder, and the edit's field build
     // waits for it, so b2 stays paused.
-    full_pass(&mut raw, &db.pool).await;
-    run_backfill_chunks(&db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle_builds(&db.pool).await;
     assert_eq!(
         captured_columns(&raw, "public.u").await,
         Some(vec!["a".to_string(), "id".to_string()]),
@@ -1188,9 +1140,9 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
         .await
         .expect("end the holder");
     for _ in 0..5 {
-        full_pass(&mut raw, &db.pool).await;
+        reconcile_pass(&mut raw, &db.pool).await;
         drain_to_quiescence(&db.pool, &mut ring).await;
-        run_backfill_chunks(&db.pool).await;
+        settle_builds(&db.pool).await;
         if status(&raw, "tu").await == TransformStatus::Live {
             break;
         }
@@ -1228,27 +1180,6 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
     assert_eq!(paused, 0, "b2 unpaused once its capture covered it");
 }
 
-/// Claims, runs and finishes every pending backfill chunk, running every
-/// started build to its end: the hand-driven stand-in for a drain worker's
-/// build half (as in `capture_schema_change.rs`).
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-/// Alternates staging-worker passes, chunk runs and drains until `target`
-/// is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, target: &str) {
-    for _ in 0..8 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        if status(raw, target).await == TransformStatus::Live {
-            return;
-        }
-    }
-    panic!("{target} did not go live within 8 pass/drain rounds");
-}
-
 /// `tu` over `public.u (id, a, b)`, live and reading `a` only, then an
 /// `ALTER TRANSFORM tu ADD b AS b2` whose widen of `u`'s capture waits on
 /// the returned open writer through one staging-worker pass, so `b2` stays
@@ -1270,20 +1201,20 @@ async fn edit_held_by_a_writer(
         .apply("TRANSFORM tu FROM public.u SELECT a AS a")
         .await
         .expect("define");
-    bring_live(raw, pool, "tu").await;
+    bring_live(raw, pool, &["tu"]).await;
 
     let holder = hold_table(dsn, "public.u").await;
     trellis
         .apply("ALTER TRANSFORM tu ADD b AS b2")
         .await
         .expect("alter: apply never waits on the table");
-    full_pass(raw, pool).await;
+    reconcile_pass(raw, pool).await;
     assert_eq!(
         captured_columns(raw, "public.u").await,
         Some(vec!["a".to_string(), "id".to_string()]),
         "the widen waits out the open writer"
     );
-    run_backfill_chunks(pool).await;
+    settle_builds(pool).await;
     assert!(b2_awaits_capture(raw).await);
     assert_eq!(status(raw, "tu").await, TransformStatus::Backfilling);
     (trellis, holder)
@@ -1320,7 +1251,7 @@ async fn an_edit_whose_widen_waits_on_a_lock_reports_the_wait() {
         .batch_execute("commit")
         .await
         .expect("end the holder");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = trellis.status("tu").await.expect("status").expect("tu");
     assert_eq!(
         reported.capture_wait, None,
@@ -1360,7 +1291,7 @@ async fn resuming_a_field_awaiting_its_widen_is_refused() {
         .batch_execute("commit")
         .await
         .expect("end the holder");
-    bring_live(&mut raw, &db.pool, "tu").await;
+    bring_live(&mut raw, &db.pool, &["tu"]).await;
     let (poisoned, failed, wrong, paused): (i64, i64, i64, i64) = {
         let row = raw
             .query_one(
@@ -1405,7 +1336,7 @@ async fn an_install_failure_is_reported_on_the_waiting_definition() {
         .await
         .expect("drop the primary key");
 
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert_eq!(outcome.failed.len(), 1, "{outcome:?}");
     let reported = trellis.status("tu").await.expect("status").expect("tu");
     assert_eq!(reported.status, TransformStatus::WaitingToBackfill);
@@ -1417,7 +1348,7 @@ async fn an_install_failure_is_reported_on_the_waiting_definition() {
     assert!(failure.error.contains("no primary key"), "{failure:?}");
 
     // A second failing pass keeps the first detection time.
-    capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     let again = trellis
         .status("tu")
         .await
@@ -1430,7 +1361,7 @@ async fn an_install_failure_is_reported_on_the_waiting_definition() {
     raw.batch_execute("alter table public.u add primary key (id)")
         .await
         .expect("restore the primary key");
-    let outcome = capture_pass(&mut raw, &db.pool, Duration::from_secs(1)).await;
+    let outcome = capture_pass_within(&mut raw, &db.pool, Duration::from_secs(1)).await;
     assert!(outcome.failed.is_empty(), "{outcome:?}");
     let reported = trellis.status("tu").await.expect("status").expect("tu");
     assert_eq!(reported.capture_failure, None, "a landed install clears it");

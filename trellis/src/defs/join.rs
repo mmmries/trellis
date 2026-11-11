@@ -47,6 +47,7 @@ use super::ast::{
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::integer::IntWidth;
 use crate::pool::quote_ident;
+use crate::staging::group_basis::{Partial, partials_of, sum_parts};
 
 /// Which table of a `JOIN` definition a column or table is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -498,15 +499,13 @@ pub(crate) fn lock_row_ddl(lock: &str) -> String {
 /// (`crate::staging::group_basis::SumPart`): a `numeric` argument's
 /// (`numeric`, one flag per argument) keep both, any other's its sum.
 fn partial_columns(numeric: &[bool]) -> Vec<String> {
-    let mut columns = vec!["__n bigint not null default 0".to_string()];
-    for (i, numeric) in numeric.iter().enumerate() {
-        let i = i + 1;
-        columns.push(format!("__count_{i} bigint not null default 0"));
-        for part in crate::staging::group_basis::sum_parts(true, *numeric) {
-            columns.push(part.ddl(i));
-        }
-    }
-    columns
+    partials(numeric).into_iter().map(Partial::ddl).collect()
+}
+
+/// The partials of a hidden table over arguments `numeric` (as
+/// [`partial_columns`]').
+fn partials(numeric: &[bool]) -> Vec<Partial> {
+    partials_of(numeric.iter().map(|&numeric| sum_parts(true, numeric)))
 }
 
 /// The `__zero` column of a hidden partials table over arguments
@@ -516,14 +515,10 @@ fn partial_columns(numeric: &[bool]) -> Vec<String> {
 /// pass collects zero rows through a partial index `where __zero` on the
 /// table's identity.
 pub(crate) fn zero_column(numeric: &[bool]) -> String {
-    let mut zero = vec!["__n = 0".to_string()];
-    for (i, numeric) in numeric.iter().enumerate() {
-        let i = i + 1;
-        zero.push(format!("__count_{i} = 0"));
-        for part in crate::staging::group_basis::sum_parts(true, *numeric) {
-            zero.push(part.is_zero(&part.hidden(i)));
-        }
-    }
+    let zero: Vec<String> = partials(numeric)
+        .into_iter()
+        .map(Partial::is_zero)
+        .collect();
     format!(
         "__zero boolean not null generated always as ({}) stored",
         zero.join(" and ")
