@@ -388,8 +388,7 @@ pub enum ValidationError {
     /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
     /// why the bar is canonical form rather than "Postgres would parse it":
     /// in short, immutability (`date_in` is `STABLE` precisely because of
-    /// `'today'`) and text round-trip identity between the literal and
-    /// Postgres's rendering of the value.
+    /// `'today'`) and a validity check that needs no Postgres.
     InvalidTypedLiteral {
         field: String,
         value_type: ValueType,
