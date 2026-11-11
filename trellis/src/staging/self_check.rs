@@ -1942,6 +1942,65 @@ mod tests {
         );
     }
 
+    /// The inliner's accounting, pinned: every node but a field read costs
+    /// one, a memo hit costs the read field's nodes, and a number literal a
+    /// call takes as an argument costs nothing.
+    #[test]
+    fn inlining_charges_one_per_node_but_a_field_read() {
+        let fields = vec![
+            // `+`, `c` and `1`: 3.
+            field("x", sum(col("c"), Expr::NumberLiteral("1".into()))),
+            // `+`, `ROUND`, `x` (its 3), `2` (free) and `NULL`: 6.
+            field(
+                "r",
+                sum(
+                    Expr::FunctionCall {
+                        name: "ROUND".into(),
+                        args: vec![col("x"), Expr::NumberLiteral("2".into())],
+                    },
+                    Expr::Null,
+                ),
+            ),
+        ];
+        let mut inliner = FieldInliner::new("t", &fields);
+        inliner.render(&fields[0]).expect("renders");
+        assert_eq!(inliner.nodes, 3);
+        inliner.render(&fields[1]).expect("renders");
+        assert_eq!(inliner.nodes, 3 + 6);
+    }
+
+    /// The inliner's nesting bound, pinned at its edge: a node is rendered
+    /// at most [`MAX_INLINED_DEPTH`] levels down, and an inlined field's
+    /// body is one level below its read.
+    #[test]
+    fn inlining_bounds_the_nesting_at_max_inlined_depth() {
+        let negated = |levels: usize| {
+            let mut expr = col("c");
+            for _ in 0..levels {
+                expr = Expr::Negate(Box::new(expr));
+            }
+            vec![field("x", expr)]
+        };
+        // Each field reads the previous one: `f<n>`'s `c` is `n` levels down.
+        let chain = |n: usize| {
+            let mut fields = vec![field("f0", col("c"))];
+            for k in 1..=n {
+                fields.push(field(&format!("f{k}"), col(&format!("f{}", k - 1))));
+            }
+            fields
+        };
+        for (fields, fits) in [
+            (negated(MAX_INLINED_DEPTH), true),
+            (negated(MAX_INLINED_DEPTH + 1), false),
+            (chain(MAX_INLINED_DEPTH), true),
+            (chain(MAX_INLINED_DEPTH + 1), false),
+        ] {
+            let last = fields.last().expect("a field");
+            let rendered = FieldInliner::new("t", &fields).render(last);
+            assert_eq!(rendered.is_ok(), fits, "{}: {rendered:?}", last.name);
+        }
+    }
+
     /// The largest definition of `shape(n)` define admits (`n` grown until
     /// validation refuses it).
     fn largest_admitted(shape: impl Fn(usize) -> Vec<String>) -> crate::defs::TransformDef {
