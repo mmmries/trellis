@@ -710,10 +710,9 @@ pub(crate) async fn admit_key_types(
 ) -> Result<Vec<super::join_key_types::JoinKey>, DdlError> {
     let mut admitted_by = Vec::with_capacity(columns.len());
     for column in columns {
-        // A live enum type joins the static allowlist above via
-        // the same dynamic `to_regtype`-based check a `JOIN` key's gets — see
-        // `join_key_types::is_enum_type_name`'s own doc comment for why admitting
-        // it is safe.
+        // A live enum type joins the static allowlist above, as a `JOIN`
+        // key's does — see `join_key_types::JoinKey::Enum`'s own doc comment
+        // for why admitting it is safe.
         if let Some(entry) =
             super::join_key_types::admit_primary_key_type(client, &column.data_type).await?
         {

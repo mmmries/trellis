@@ -675,12 +675,16 @@ fn manifest() -> String {
             || super::validate::reject_unsupported_group_by_key_type("c", t),
         );
     }
-    // A `JOIN ... ON` key and a source's primary key are admitted by a
-    // `format_type` rendering, not a `ValueType`: every allowlisted name and
-    // every partition-key name, the name of every `PgType`, and the other
-    // renderings of the families those cover (modifiers, the SQL-standard
-    // spellings, refused neighbours). A new entry is a new `feature` line
-    // above; a probe here catches an old entry made to admit another name.
+    // A `JOIN ... ON` key and a source's primary key are admitted by the
+    // type's identity, its OID (ADR-0020), and a partition key by its
+    // `format_type` rendering, neither by a `ValueType`. Probed with every
+    // allowlisted name and every partition-key name, the name of every
+    // `PgType`, and the other renderings of the families those cover
+    // (modifiers, the SQL-standard spellings, refused neighbours): a key as
+    // the type the rendering names
+    // ([`super::join_key_types::rendered_type`]). A new entry is a new
+    // `feature` line above; a probe here catches an old entry made to admit
+    // another type.
     let (partition_keys, admit_partition_key) = super::partition_tree::key_type_admissions();
     let mut key_names: Vec<&str> = super::join_key_types::listed_join_keys()
         .into_iter()
@@ -702,14 +706,16 @@ fn manifest() -> String {
         &mut lines,
         "key(enum)".to_string(),
         |admitted: &bool| *admitted,
-        || super::join_key_types::admit_join_key("public.e", true),
+        || super::join_key_types::admit_join_key(super::join_key_types::USER_TYPE_OID, true),
     );
     for name in key_names {
+        let oid = super::join_key_types::rendered_type(name)
+            .map_or(super::join_key_types::USER_TYPE_OID, |ty| ty.oid());
         admissions(
             &mut lines,
             format!("key({name:?})"),
             |admitted: &bool| *admitted,
-            || super::join_key_types::admit_join_key(name, false),
+            || super::join_key_types::admit_join_key(oid, false),
         );
         if let Some(entry) = admit_partition_key(name) {
             let feature = Feature::PartitionKeyType(entry);

@@ -46,6 +46,17 @@ impl LiveColumn {
         &self.info.pg_type
     }
 
+    /// [`LiveColumn::display`] for a `pg_catalog` type, and the type's
+    /// qualified name otherwise, so a message can't name a user type as the
+    /// built-in one it is named like (`public."integer"`, not `"integer"`).
+    pub(crate) fn qualified_display(&self) -> &str {
+        if self.type_name.starts_with("pg_catalog.") {
+            self.display()
+        } else {
+            &self.info.copy_type
+        }
+    }
+
     /// The collation's name, when the column has one that is
     /// nondeterministic.
     pub(crate) fn nondeterministic_collation(&self) -> Option<&str> {
