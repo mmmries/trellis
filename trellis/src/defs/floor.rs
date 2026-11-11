@@ -1081,10 +1081,16 @@ pub(crate) async fn on_live_retype(
         .chain(joined.iter().copied())
         .collect();
     let partitioned = any_partitioned(client, &tables).await?;
-    let from = super::catalog::column_infos(client, source).await?;
+    let from = super::live_table::LiveTable::read(client, source)
+        .await?
+        .typed();
     let mut joined_maps = Vec::with_capacity(joined.len());
     for table in joined {
-        joined_maps.push(super::catalog::column_infos(client, table).await?);
+        joined_maps.push(
+            super::live_table::LiveTable::read(client, table)
+                .await?
+                .typed(),
+        );
     }
     let joined_refs: Vec<_> = joined_maps.iter().collect();
     let joined_columns = (!joined_refs.is_empty()).then_some(joined_refs.as_slice());

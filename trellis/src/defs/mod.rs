@@ -49,6 +49,7 @@ pub(crate) mod key_types;
 pub mod ledger;
 mod lexer;
 pub mod lifecycle;
+pub(crate) mod live_table;
 pub mod model;
 pub(crate) mod numeric_sums;
 pub mod oracle;

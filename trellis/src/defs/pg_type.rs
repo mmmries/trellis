@@ -477,6 +477,24 @@ pub async fn value_type_for_oid(
     })
 }
 
+/// [`value_type_for_oid`] over a type whose catalog row is already read
+/// (`super::live_table`): `enum_name` is the type's `(nspname, typname)`
+/// when it is a live enum (`typtype = 'e'`), `None` otherwise. Classifies
+/// exactly as [`value_type_for_oid`] does, without a query.
+pub(crate) fn value_type_for_read_type(
+    type_oid: u32,
+    enum_name: Option<(&str, &str)>,
+) -> ValueType {
+    let builtin = value_type_for_builtin_oid(type_oid);
+    if builtin != ValueType::Other(PgType::Unrecognized) {
+        return builtin;
+    }
+    match enum_name.and_then(|(schema, typname)| crate::intake::qualify(schema, typname).ok()) {
+        Some(qualified) => ValueType::Other(PgType::for_enum(&qualified)),
+        None => ValueType::Other(PgType::Unrecognized),
+    }
+}
+
 /// Looks up `type_oid` in `pg_catalog` and returns its schema-qualified name
 /// (`"schema.typname"`, [`intake::qualify`]'s joining
 /// convention) iff it names a live enum type (`pg_type.typtype = 'e'`) —

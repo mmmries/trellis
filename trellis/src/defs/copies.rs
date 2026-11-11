@@ -591,12 +591,9 @@ async fn inferred_copies(
     source: &str,
     target: &str,
 ) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
-    use super::catalog::CatalogError;
-    let source_columns = match super::catalog::live_source_columns(client, source).await {
-        Ok(columns) => columns,
-        Err(CatalogError::Db(err)) => return Err(err),
-        Err(_) => return Ok(Vec::new()),
-    };
+    let source_columns = super::live_table::LiveTable::read(client, source)
+        .await?
+        .value_types();
     let Ok(field_types) = super::validate::infer_field_types(def, &source_columns) else {
         return Ok(Vec::new());
     };

@@ -1246,27 +1246,27 @@ pub(crate) async fn pause_readers_of_retyped(
             let Some(now) = live.get(&column) else {
                 continue;
             };
-            if let Some(reason) =
-                key_types::refusal(&*client, table, &column, &key_use, now).await?
-            {
+            if let Some(reason) = key_types::refusal(table, &column, &key_use, now) {
                 refused = true;
                 flag(&column, reason, &mut columns);
                 continue;
             }
             if let Some((old, was)) = recorded.get(&(reader.id, column.clone()))
-                && old != &now.ty
+                && old != &now.ty()
             {
-                moved.push((column.clone(), was.clone(), now.display.clone()));
+                moved.push((column.clone(), was.clone(), now.display().to_string()));
             }
             match recorded.get(&(reader.id, column.clone())) {
-                Some((old, was)) if key_types::renders_differently(old, &now.ty) => {
+                Some((old, was)) if key_types::renders_differently(old, &now.ty()) => {
                     flag(
                         &column,
                         key_types::retyped_error(table, &column, &key_use, was, now),
                         &mut columns,
                     );
                 }
-                Some((old, _)) if old != &now.ty => widened_keys.push((reader.id, column.clone())),
+                Some((old, _)) if old != &now.ty() => {
+                    widened_keys.push((reader.id, column.clone()))
+                }
                 Some(_) => {}
                 None => {
                     if !unrecorded.contains(&(reader.id, column.clone())) {
@@ -1288,7 +1288,7 @@ pub(crate) async fn pause_readers_of_retyped(
         let join_key_moved = join_key.iter().any(|column| {
             matches!(
                 (recorded.get(&(reader.id, column.clone())), live.get(column)),
-                (Some((old, _)), Some(now)) if old != &now.ty
+                (Some((old, _)), Some(now)) if old != &now.ty()
             )
         });
         if !reader.joined.is_empty() && join_key_moved {
@@ -1999,7 +1999,7 @@ async fn retype_causes(
         let new_type_oid = row.get::<_, i64>(5) as u32;
         if live
             .get(&column)
-            .is_none_or(|now| now.type_oid != new_type_oid)
+            .is_none_or(|now| now.info.type_oid != new_type_oid)
         {
             continue;
         }
@@ -2111,14 +2111,8 @@ async fn changed_inputs(
             continue;
         }
         if !live.contains_key(table) {
-            let columns = crate::defs::catalog::column_infos(client, table).await?;
-            live.insert(
-                table.clone(),
-                columns
-                    .into_iter()
-                    .map(|(name, info)| (name, info.value_type))
-                    .collect(),
-            );
+            let columns = crate::defs::live_table::LiveTable::read(client, table).await?;
+            live.insert(table.clone(), columns.value_types());
         }
         if let (Some(was), Some(now)) = (
             recorded.get(table).and_then(|c| c.get(column)),
@@ -2192,7 +2186,7 @@ async fn input_types(
         .into_iter()
         .map(|(t, c)| {
             let display = if t == table {
-                live.get(c).map(|now| now.display.clone())
+                live.get(c).map(|now| now.display().to_string())
             } else {
                 next += 1;
                 other.get(&(next - 1)).cloned()
@@ -2290,7 +2284,7 @@ async fn copies_retyped_by_hand(
             was,
             ValueType::Integer(_) | ValueType::Float(_) | ValueType::Boolean | ValueType::Uuid
         );
-        if !exact || crate::defs::pg_type::value_type_for_oid(client, now.type_oid).await? != *was {
+        if !exact || now.info.value_type != *was {
             return Ok(false);
         }
     }

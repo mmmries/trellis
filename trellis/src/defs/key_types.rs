@@ -57,7 +57,6 @@ use std::collections::HashMap;
 use std::fmt;
 
 use tokio_postgres::GenericClient;
-use tokio_postgres::types::Type;
 
 use super::ast::{KeySpace, TransformDef};
 
@@ -402,61 +401,19 @@ fn interval_narrows(old: i32, new: i32) -> bool {
     finest(new) < finest(old)
 }
 
-/// A live column's type, as [`refusal`] and [`renders_differently`] need it.
-#[derive(Debug, Clone)]
-pub(crate) struct LiveColumn {
-    pub ty: ColumnType,
-    /// `format_type`'s rendering, which the key allowlist is written in.
-    pub display: String,
-    pub type_oid: u32,
-    pub is_enum: bool,
-    /// The collation's name, when the column has one that is
-    /// nondeterministic.
-    pub nondeterministic_collation: Option<String>,
-}
+pub(crate) use super::live_table::LiveColumn;
 
-/// Every live column of `table` (an unquoted `schema.table`) with its type,
-/// and the table's row-identity key ([`super::ddl::identity_key_columns`]).
-/// Both empty for a table that doesn't exist.
+/// Every live column of `table` (an unquoted `schema.table`)
+/// ([`super::live_table::LiveTable::read`]), and the table's row-identity
+/// key ([`super::ddl::identity_key_columns`]). Both empty for a table that
+/// doesn't exist.
 pub(crate) async fn live_columns(
     client: &impl GenericClient,
     table: &str,
 ) -> Result<(HashMap<String, LiveColumn>, Vec<String>), tokio_postgres::Error> {
-    let rows = client
-        .query_typed(
-            "select a.attname::text, n.nspname::text || '.' || t.typname::text, a.atttypmod, \
-                    pg_catalog.format_type(a.atttypid, a.atttypmod), a.atttypid, \
-                    t.typtype = 'e', \
-                    case when not coalesce(c.collisdeterministic, true) \
-                         then c.collname::text end \
-             from pg_catalog.pg_attribute a \
-             join pg_catalog.pg_type t on t.oid = a.atttypid \
-             join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
-             left join pg_catalog.pg_collation c on c.oid = a.attcollation \
-             where a.attrelid = pg_catalog.to_regclass($1) \
-               and a.attnum > 0 and not a.attisdropped",
-            &[(&super::ddl::regclass_arg(table), Type::TEXT)],
-        )
-        .await?;
-    let columns: HashMap<String, LiveColumn> = rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.get(0),
-                LiveColumn {
-                    ty: ColumnType {
-                        type_oid: row.get(4),
-                        type_name: row.get(1),
-                        typmod: row.get(2),
-                    },
-                    display: row.get(3),
-                    type_oid: row.get(4),
-                    is_enum: row.get(5),
-                    nondeterministic_collation: row.get(6),
-                },
-            )
-        })
-        .collect();
+    let columns = super::live_table::LiveTable::read(client, table)
+        .await?
+        .columns;
     if columns.is_empty() {
         return Ok((columns, Vec::new()));
     }
@@ -471,34 +428,35 @@ pub(crate) async fn live_columns(
 /// Why define would refuse `column`, with `live`'s type, for `key_use`, or
 /// `None` if it wouldn't. The sentence names the column, its use and its new
 /// type or collation.
-pub(crate) async fn refusal(
-    client: &impl GenericClient,
+pub(crate) fn refusal(
     table: &str,
     column: &str,
     key_use: &KeyUse,
     live: &LiveColumn,
-) -> Result<Option<String>, tokio_postgres::Error> {
+) -> Option<String> {
     let supported = match key_use {
         KeyUse::GroupBy => {
-            let value_type = super::pg_type::value_type_for_oid(client, live.type_oid).await?;
-            super::validate::reject_unsupported_group_by_key_type(column, value_type).is_ok()
+            super::validate::reject_unsupported_group_by_key_type(column, live.info.value_type)
+                .is_ok()
         }
-        _ => super::join_key_types::is_text_stable_join_key_type(&live.display) || live.is_enum,
+        _ => {
+            super::join_key_types::is_text_stable_join_key_type(live.display()) || live.info.is_enum
+        }
     };
     if !supported {
-        return Ok(Some(format!(
+        return Some(format!(
             "column {column:?} of {table}, {key_use}, is now {}, a type Trellis refuses as such a \
              key at define: it can't match that type's values by their text",
-            live.display
-        )));
+            live.display()
+        ));
     }
-    Ok(live.nondeterministic_collation.as_ref().map(|collation| {
+    live.nondeterministic_collation().map(|collation| {
         format!(
             "column {column:?} of {table}, {key_use}, now has the nondeterministic collation \
              {collation:?}, which Trellis refuses for a key at define: its `=` matches strings \
              that differ (e.g. by case), while Trellis matches keys by their exact text"
         )
-    }))
+    })
 }
 
 /// The sentence for `column` of `table`, used as `key_use`, having changed
@@ -515,7 +473,7 @@ pub(crate) fn retyped_error(
         "column {column:?} of {table}, {key_use}, changed type from {was} to {}, which renders \
          its existing values differently, so the keys Trellis stored for this definition no \
          longer match",
-        new.display
+        new.display()
     )
 }
 
@@ -1101,6 +1059,63 @@ mod tests {
                 ("id".to_string(), KeyUse::SourceKey),
                 ("j".to_string(), KeyUse::JoinOn)
             ]
+        );
+    }
+
+    /// A live column of `pg_type` (`format_type`'s rendering) and
+    /// `value_type`, with no collation.
+    fn live(pg_type: &str, value_type: super::super::ast::ValueType) -> LiveColumn {
+        LiveColumn {
+            info: super::super::validate::JoinColumnInfo {
+                value_type,
+                pg_type: pg_type.to_string(),
+                type_oid: 0,
+                typmod: -1,
+                collation_oid: 0,
+                collation: None,
+                collation_deterministic: true,
+                is_enum: false,
+                copy_type: pg_type.to_string(),
+                copy_collation: None,
+                trellis_target: false,
+            },
+            type_name: format!("pg_catalog.{pg_type}"),
+        }
+    }
+
+    /// Each key use is held to its own type rule: a `GROUP BY` key to the
+    /// `GROUP BY` gate (which admits `numeric`), a source or join key to the
+    /// key allowlist (which doesn't), and every key to a deterministic
+    /// collation.
+    #[test]
+    fn a_key_column_is_refused_by_its_own_use_s_rule() {
+        use super::super::ast::ValueType;
+        let numeric = live("numeric", ValueType::Numeric);
+        let float = live(
+            "double precision",
+            ValueType::Float(crate::float::FloatWidth::Float8),
+        );
+        let integer = live(
+            "integer",
+            ValueType::Integer(crate::integer::IntWidth::Int4),
+        );
+        let refused = |column: &LiveColumn, key_use: KeyUse| {
+            refusal("public.t", "k", &key_use, column).is_some()
+        };
+        assert!(!refused(&numeric, KeyUse::GroupBy));
+        assert!(refused(&float, KeyUse::GroupBy));
+        assert!(refused(&numeric, KeyUse::SourceKey));
+        assert!(refused(&numeric, KeyUse::JoinOn));
+        for key_use in [KeyUse::SourceKey, KeyUse::GroupBy, KeyUse::JoinOn] {
+            assert!(!refused(&integer, key_use.clone()), "{key_use}");
+        }
+        let mut folded = live("text", ValueType::Text);
+        folded.info.collation = Some("case_insensitive".to_string());
+        folded.info.collation_deterministic = false;
+        let reason = refusal("public.t", "k", &KeyUse::GroupBy, &folded).unwrap();
+        assert!(
+            reason.contains(r#"nondeterministic collation "case_insensitive""#),
+            "{reason}"
         );
     }
 }
