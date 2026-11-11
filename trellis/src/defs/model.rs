@@ -74,7 +74,7 @@ pub fn applying_sql(alias: &str) -> String {
 }
 
 /// A transform's persisted lifecycle status, `transform_definitions.status`:
-/// `docs/transforms.md`'s "Status" section documents the full state machine
+/// `docs/status-reference.md` documents the full state machine
 /// this mirrors. Registration (`super::catalog::install_definition`) persists
 /// [`StoredStatus::WaitingToBackfill`]. The staging worker's capture pass
 /// moves it on, to [`StoredStatus::Backfilling`] with its Re-derive build's

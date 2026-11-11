@@ -1,7 +1,7 @@
 //! Installs, widens, narrows and uninstalls one table's capture triggers,
 //! and reads back what is installed.
 //!
-//! The staging worker's reconcile pass ([`super::reconcile`], C5) computes
+//! The staging worker's reconcile pass ([`super::reconcile`]) computes
 //! each captured table's [`CaptureSpec`] from the catalog
 //! ([`super::columns::capture_spec`]) and hands it to [`reconcile`], one
 //! table at a time, so a table whose lock is held doesn't hold back another
@@ -129,7 +129,7 @@
 //! start checks the gate of its definition's `source_table`. A widen of a
 //! `JOIN`'s joined table `T` for a new `JOIN` sourced from `U` (it reads a new
 //! column of `T`) gates `T`, but the new definition is sourced from `U`,
-//! which no gate holds. C5 closes this in the reconcile pass
+//! which no gate holds. The reconcile pass closes this
 //! ([`super::reconcile`], rule 3): such a definition isn't started while `T`
 //! has a gate a pending change holds.
 //!
@@ -139,7 +139,7 @@
 //!   evaluating them would be the cheaper wait, but apply had no
 //!   per-definition horizon, and every consumer path (1-1, aggregate,
 //!   `JOIN`) would need one.
-//!   That is D's ledger, not C's.
+//!   That is a ledger change, not a capture one.
 //! - **A seal after the widen** would bound the pre-widen rows to the
 //!   batches up to the widen's, but a batch drained doesn't mean every row in
 //!   it did (`poison_held`, re-staged reverses), and a phase-gap straggler
@@ -869,7 +869,8 @@ async fn install_tree(
 /// Installs `spec`'s capture on its whole tree in one transaction, whatever
 /// the tree's size: the shape [`install`] gives a tree of fewer than
 /// [`SINGLE_TRANSACTION_TABLES`] tables. For measuring what that shape would
-/// stall writers for on a larger tree (ADR-0017 P10).
+/// stall writers for on a larger tree (ADR-0017, "Up to 100 nodes install in
+/// one transaction; a larger tree installs node by node").
 #[cfg(any(test, feature = "internals"))]
 pub async fn install_in_one_transaction(
     client: &mut Client,
@@ -1505,7 +1506,8 @@ impl LockingOperation {
 
 /// What a capture operation that ran out of its deadline was waiting for
 /// (see "Waiting, never cancelling"). Every field is plain data (text,
-/// integers, timestamps and a three-way enum), so C5 can store one as it is.
+/// integers, timestamps and a three-way enum), so the reconcile pass can store
+/// one as it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockWait {
     /// The table the operation locks, as its spec names it.

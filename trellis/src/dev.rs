@@ -192,8 +192,8 @@ pub mod staging {
 
 /// Trigger capture, for `benchmark`'s `write-tax` and
 /// `capture-ceiling`: the write-path benchmark installs the capture
-/// triggers through the real installer, with nothing draining, before C5
-/// wires the installer into the staging worker.
+/// triggers through the real installer, with no staging worker and so
+/// nothing draining.
 pub mod capture {
     pub use crate::capture::CaptureError;
     pub use crate::capture::columns::{capture_spec, load_catalog};

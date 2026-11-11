@@ -76,7 +76,7 @@ for a database that builds large targets.
   before it. `log_checkpoints = on` logs why each one started.
 
 To watch a build's progress, see
-[observability — Transform status lifecycle](observability.md#transform-status-lifecycle).
+[the status reference](status-reference.md#backfilling).
 
 ## Ring sizing
 
@@ -297,7 +297,7 @@ number of tables, and there is no step up at the five-table limit.
 warning per joined position past the threshold, naming the position, the key,
 the number of root rows on it and the threshold, which is 250,000 rows per
 key unless `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another
-([observability](observability.md#transform-status-lifecycle)). `trellis
+([status reference](status-reference.md#join)). `trellis
 status` prints each as a warning line. The warning fires on a key that is already
 large; a lookup under the threshold still costs its fan-out on every edit.
 

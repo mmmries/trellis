@@ -2081,7 +2081,7 @@ key. Then:
   chunk at most, and a watermark token past the `b` change converges once the
   last chunk commits. `status()` warns, per position, when a join key holds
   more than 250,000 `a` rows, a key whose `b` change takes seconds to reach
-  every row ([observability](observability.md#transform-status-lifecycle)).
+  every row ([status reference](status-reference.md#join)).
 - A `TRUNCATE` of `a` empties the target; one of a joined table, at any
   position, rebuilds it.
 - A row whose field Postgres can't compute (an overflow, a division by zero)
@@ -2340,97 +2340,20 @@ primary key, so it is read that way only with a `KEY (…)` naming its group key
 
 ## Status
 
-Every defined transform carries an observable **status**:
+Every defined transform carries an observable **status**, one of six words:
 
-* **`waiting_to_backfill`** — defined, but pre-existing source rows not yet read.
-  Every new transform starts here: defining one returns before any source row
-  is read ([data-flow — Capturing a table's existing rows](data-flow.md#capturing-a-tables-existing-rows)).
-* **`backfilling`** — those rows have been read and the target is being built.
-  An aggregate, a `JOIN`, and a plain 1-1 transform (over a table rather than
-  another transform's target) are built while their live changes are applied,
-  and go from here straight to `live`
-  ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build),
-  [An aggregate's or a `JOIN`'s build](data-flow.md#an-aggregates-or-a-joins-build)).
-  A `live` 1-1 transform comes back here while an `ALTER TRANSFORM` that adds
-  or changes a field, or a resumed column, is rebuilt in the background
-  ([Changing a definition](#changing-a-definition)). A `live` transform also comes back here, from the call's return, while
-  `request_backfill` on its source (or a re-install of its source's capture
-  triggers) rebuilds it. A `live` aggregate over a partitioned source, or a
-  `live` `JOIN` with a partitioned table on either side, comes back here when
-  a partition of that table is attached, detached, dropped or truncated, or
-  when it still counts rows that route to no partition: from
-  the staging worker pass that detects it (until then, for at most one pass,
-  it still reads `live`) until the keys the change touched are re-derived and
-  folded into its target, then it is `live` again. A restart in the middle
-  resumes the correction, and the transform still reads `backfilling`. Its
-  status lists each partition it is being corrected for in `correcting`, with
-  when the pass queued the correction and how many keys are left
-  ([observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
-* **`catching_up`** — reported, never stored, while a transform that is
-  otherwise `live` reads an upstream transform (or a paused column of one) that
-  isn't `live`: live changes are applied, but the target doesn't reflect its
-  source yet. It reads `live` again once the upstream does.
-* **`live`** — the steady state: once a transform reports `live`, awaiting a
-  watermark token taken after a commit guarantees its target reflects that
-  commit ([embedding — Reading your own writes](embedding.md#reading-your-own-writes)).
-* **`quarantined`** — broken and no longer maintained (the quarantine fuse tripped);
-  resuming re-runs the backfill, returning it to `waiting_to_backfill`.
-* **`paused`** — frozen deliberately, by an operator's `PAUSE` rather than by the
-  fuse. The same frozen state `quarantined` is, reached by the other trigger: the
-  target stops being written to and holds its current, now-stale value. Resuming
-  likewise re-runs the backfill from `waiting_to_backfill`. Trellis also pauses
-  a transform itself when a source column it reads is renamed or dropped, or a
-  column it keys by, or that a column Trellis created takes its type from,
-  changes type, with the reason on
-  its status (`capture_failure`)
-  ([stage 01](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column),
-  [Supported sources and targets](#supported-sources-and-targets)). Every
-  resume first re-validates the transform as define would, and refuses while
-  define would refuse it, or while its target's tables are no longer what define
-  would create ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)).
+* **`waiting_to_backfill`**: defined, but its source's existing rows not yet read.
+* **`backfilling`**: its target is being built, or rebuilt.
+* **`catching_up`**: maintained, but reading an upstream (or an upstream column) that isn't `live`.
+* **`live`**: the steady state, where a watermark token guarantees read-your-writes.
+* **`quarantined`**: frozen because too many of its keys failed to apply.
+* **`paused`**: frozen by `PAUSE TRANSFORM`, or by Trellis because it can't keep the target correct.
 
-A transform can also hold single source keys in quarantine whatever its status,
-`live` included: a key whose change kept failing in this transform's apply (a
-value its target refuses, say) is left out of its apply, and its target row
-stays as it was. Every other transform reading the key keeps applying it. The
-status reports them as `held_keys`: how many keys the transform holds, and when
-the one held longest was poisoned. `self_check` reports the same with every
-audit. `sample_quarantined` lists the keys with their errors, and once a key's
-cause is fixed, `release_key(transform, source_table, key)` releases it (the CLI's
-`trellis release`, and `release_key` in each binding): the key is re-derived from
-its current row, and a key whose cause is still there is quarantined again.
-Resuming the transform releases every key it holds
-([ADR-0003 — Releasing held keys](decisions/0003-quarantine-storage-and-api.md#releasing-held-keys)).
-`trellis status` prints each held key, its table and its transform quoted for the
-shell where they need it, so they paste into `trellis release` as printed: text
-goes inside `'...'`, with a quote written `'\''`, and a control character, such as
-the separator between a composite key's columns, is written `$'\ooo'` in octal,
-which bash and zsh read. A value that is exactly `-h`, `--help`, `-d` or
-`--database-url` goes after a `--`: `trellis release -- <transform> <table> <key>`.
-
-A release first waits for the drain pages in flight on the key's table to commit,
-so it can't miss a change one of them is parking for the key. If that wait runs
-past the lock timeout every Trellis connection has (30 seconds at most), the
-release fails with a `timeout` error that says so, and changes nothing: the key is
-still held, and running the release again releases it once the pages commit.
-
-A failure the drain can't charge to a key and that pauses nothing (a read
-Postgres refuses that the catalog can't pin on a table, records that fail only
-together) holds a whole page back instead. Every drain pass retries it, and the
-status of each transform reading a table on the page reports it as `drain_failure`, with the error, the tables, and
-since when, while the status word stays what it was. `self_check` reports every
-such page. It clears when the page commits, so fix the cause the error names
-([observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
-
-An application can list defined transforms and read each one's status — enough to
-tell a newly-defined transform is still populating, without a metrics pipeline
-([embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)
-has the polling pattern).
-
-A transform can sit in `waiting_to_backfill` while a long-lived cluster
-transaction holds the backfill's fence open — a safe wait, explained with its
-remedy under
-[observability — Transform status lifecycle](observability.md#transform-status-lifecycle).
+The [status reference](status-reference.md) defines each word and every field
+of the status. [Operations](operations.md#when-a-definition-needs-you) lists
+every reason a transform stops and what to do, and
+[embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)
+has the polling pattern.
 
 ## Changing a definition
 
