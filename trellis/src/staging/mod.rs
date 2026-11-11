@@ -64,6 +64,8 @@ pub mod converge;
 pub(crate) mod drift_memo;
 pub mod error;
 pub mod fold;
+#[cfg(test)]
+pub(crate) mod golden_sql;
 pub(crate) mod group_basis;
 pub(crate) mod halt;
 pub(crate) mod holdup;

@@ -518,6 +518,58 @@ async fn a_dropped_or_detached_leaf_with_undrained_changes_is_recomputed() {
     }
 }
 
+/// A correction's recompute stages the visible rows it changed for a reader
+/// of the `JOIN`'s target, in its own transaction, and the reader follows
+/// them.
+#[tokio::test]
+async fn a_correction_reaches_a_reader_of_the_target_through_the_seam() {
+    let mut fx = Fx::start(Part::Fact, &tree(Part::Fact, "list"), SEED).await;
+    let int8 = ValueType::Integer(IntWidth::Int8);
+    let columns = [
+        ("ga", int4()),
+        ("gb", int4()),
+        ("n", int8),
+        ("sx", int8),
+        ("sy", int8),
+    ]
+    .into_iter()
+    .map(|(name, ty)| (name.to_string(), ty))
+    .collect();
+    trellis::defs::install_definition(
+        fx.d.pool(),
+        "TRANSFORM ir FROM public.i SELECT n AS n, sx AS sx",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("install the reader");
+    trellis::intake::harness::settle_builds(fx.d.pool()).await;
+    fx.d.settle().await;
+    const READER: &str = "select ga, gb, n, sx from public.ir order by ga, gb";
+    const TARGET: &str = "select ga, gb, n, sx from public.i order by ga, gb";
+    assert_eq!(fx.d.rows(READER).await, fx.d.rows(TARGET).await);
+    // The seam's rows for the target, staged and not yet drained.
+    const STAGED: &str = "select 1 from (select src_table from seg_0 \
+                          union all select src_table from seg_1 \
+                          union all select src_table from seg_2 \
+                          union all select src_table from seg_3) r \
+                          where src_table = 'public.i'";
+    let staged = fx.d.rows(STAGED).await.len();
+    fx.exec("drop table public.a_p1").await;
+    fx.pass().await;
+    let outcome = partition_correction::run_pending(fx.d.pool(), &Options::default())
+        .await
+        .expect("run the pending corrections");
+    assert_eq!(outcome.remaining, 0);
+    assert!(
+        fx.d.rows(STAGED).await.len() > staged,
+        "the correction stages the rows it changed for the reader"
+    );
+    fx.d.settle().await;
+    assert_eq!(fx.wrong_targets().await, Vec::<String>::new());
+    assert_eq!(fx.d.rows(READER).await, fx.d.rows(TARGET).await);
+}
+
 /// `P.stale-new-group`: an undrained insert creates a cell no hidden table
 /// has yet, in the leaf that is then dropped. The correction's set takes
 /// the cells of undrained ring images, so the stale page is refused rather

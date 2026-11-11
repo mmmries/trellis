@@ -1771,8 +1771,7 @@ pub(crate) async fn release(
     group_basis::name_groups(txn, &side_plan.plan, cells, &[key.to_string()]).await?;
     let mut mutations = TargetMutations::new();
     write_locked(txn, &plan, &mut mutations, false, false).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(true)
 }
 
@@ -1809,8 +1808,7 @@ pub(crate) async fn recompute_routed(
     group_basis::name_groups(txn, &side_plan.plan, cells, &[]).await?;
     let mut mutations = TargetMutations::new();
     write_locked(txn, &plan, &mut mutations, false, false).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(())
 }
 
@@ -1906,8 +1904,7 @@ pub(crate) async fn build(
             group_basis::apply_join_build_groups(txn, &plan.t, &mut mutations).await?
         }
     };
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(counts)
 }
 
@@ -1984,6 +1981,9 @@ pub(crate) async fn target_column_types(
         .map(|row| (row.get(0), row.get(1)))
         .collect())
 }
+
+#[cfg(test)]
+mod golden;
 
 #[cfg(test)]
 mod tests {

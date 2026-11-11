@@ -1831,6 +1831,37 @@ impl GroupTargetPlan {
         }
     }
 
+    /// The plan of `definition`'s group-basis target over `shape` (its
+    /// [`route`]), with what it reads from the catalog in `client`: each
+    /// `numeric` sum's reference scale, the source's row identity and the
+    /// target's group identity. The drain builds its plans with
+    /// [`Self::new`] instead: it reads each source's identity once per page
+    /// and shares it among that source's definitions.
+    pub(crate) async fn read(
+        client: &impl tokio_postgres::GenericClient,
+        catalog_schema: &str,
+        definition: &crate::defs::model::Definition,
+        mut shape: GroupShape,
+    ) -> Result<Self, ApplyError> {
+        shape
+            .read_scales(
+                client,
+                &hidden_table_qualified(catalog_schema, definition.id),
+            )
+            .await?;
+        let source_pk = ddl::source_primary_key_in_txn(client, &definition.source_table).await?;
+        let identity = ddl::identity_key_columns(client, &definition.target_table).await?;
+        Ok(Self::new(
+            catalog_schema,
+            definition.id,
+            &definition.target_table,
+            &definition.source_table,
+            source_pk,
+            identity,
+            shape,
+        ))
+    }
+
     /// The plan of one `JOIN` structure (`super::join`): `hidden` is its
     /// hidden table (quoted, qualified), `staged` its session staging table
     /// (a bare name, made `pg_temp.`), and `target` the `JOIN`'s target,
@@ -4900,23 +4931,12 @@ async fn plan_of(
     catalog_schema: &str,
     definition: &crate::defs::model::Definition,
 ) -> Result<Option<GroupTargetPlan>, ApplyError> {
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Ok(None);
     };
-    shape
-        .read_scales(txn, &hidden_table_qualified(catalog_schema, definition.id))
-        .await?;
-    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
-    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
-    Ok(Some(GroupTargetPlan::new(
-        catalog_schema,
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        source_pk,
-        identity,
-        shape,
-    )))
+    Ok(Some(
+        GroupTargetPlan::read(txn, catalog_schema, definition, shape).await?,
+    ))
 }
 
 /// A partition correction's recompute on a group-basis target
@@ -4944,8 +4964,7 @@ pub(crate) async fn recompute_routed(
     };
     let mut mutations = TargetMutations::new();
     let counts = recompute_named_groups(txn, &plan, groups, node, &mut mutations).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(Some(counts))
 }
 
@@ -4966,8 +4985,7 @@ pub(crate) async fn release(
     };
     let mut mutations = TargetMutations::new();
     recompute_groups(txn, &plan, groups, key, &mut mutations).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(true)
 }
 
@@ -5129,27 +5147,12 @@ pub(crate) async fn rebuild_definition(
     definition: &crate::defs::model::Definition,
     scope: Option<&RebuildScope>,
 ) -> Result<Option<(usize, usize)>, ApplyError> {
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(plan) = plan_of(txn, catalog_schema, definition).await? else {
         return Ok(None);
     };
-    shape
-        .read_scales(txn, &hidden_table_qualified(catalog_schema, definition.id))
-        .await?;
-    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
-    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        catalog_schema,
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        source_pk,
-        identity,
-        shape,
-    );
     let mut mutations = TargetMutations::new();
     let counts = rebuild(txn, &plan, scope, &mut mutations).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(Some(counts))
 }
 
@@ -5304,29 +5307,14 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
             transform: target.to_string(),
         });
     };
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Err(ApplyError::GroupBasisUnsupported {
             target: definition.target_table,
             what: "a definition the group basis doesn't take",
         });
     };
     let mut client = pool.get().await?;
-    shape
-        .read_scales(
-            &**client,
-            &hidden_table_qualified(pool.schema(), definition.id),
-        )
-        .await?;
-    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        pool.schema(),
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
-        identity,
-        shape,
-    );
+    let plan = GroupTargetPlan::read(&**client, pool.schema(), &definition, shape).await?;
     let txn = client.transaction().await?;
     txn.batch_execute(&plan.staged_ddl()).await?;
     txn.batch_execute(PLAN_SETTINGS).await?;
@@ -5363,29 +5351,14 @@ pub async fn explain_whole_source_reads(
             transform: target.to_string(),
         });
     };
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Err(ApplyError::GroupBasisUnsupported {
             target: definition.target_table,
             what: "a definition the group basis doesn't take",
         });
     };
     let mut client = pool.get().await?;
-    shape
-        .read_scales(
-            &**client,
-            &hidden_table_qualified(pool.schema(), definition.id),
-        )
-        .await?;
-    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        pool.schema(),
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
-        identity,
-        shape,
-    );
+    let plan = GroupTargetPlan::read(&**client, pool.schema(), &definition, shape).await?;
     let txn = client.transaction().await?;
     txn.batch_execute(&format!(
         "{}; {}; set local enable_nestloop = off",
@@ -5423,7 +5396,7 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
             transform: target.to_string(),
         });
     };
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Err(ApplyError::GroupBasisUnsupported {
             target: definition.target_table,
             what: "a definition the group basis doesn't take",
@@ -5436,22 +5409,7 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
         });
     }
     let mut client = pool.get().await?;
-    shape
-        .read_scales(
-            &**client,
-            &hidden_table_qualified(pool.schema(), definition.id),
-        )
-        .await?;
-    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        pool.schema(),
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
-        identity,
-        shape,
-    );
+    let plan = GroupTargetPlan::read(&**client, pool.schema(), &definition, shape).await?;
     let txn = client.transaction().await?;
     txn.batch_execute(&format!(
         "{}; {}; set local enable_seqscan = off",
@@ -5469,6 +5427,9 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
         .collect::<Vec<_>>()
         .join("\n"))
 }
+
+#[cfg(test)]
+pub(super) mod golden;
 
 #[cfg(test)]
 mod tests {

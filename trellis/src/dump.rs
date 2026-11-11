@@ -43,7 +43,7 @@
 
 use crate::app::TrellisError;
 use crate::config::Config;
-use crate::pool::Pool;
+use crate::pool::{Pool, quote_ident};
 
 /// What loading a table does.
 #[derive(Debug, Clone, Copy)]
@@ -246,10 +246,6 @@ pub const RESOLVE_TYPE_OIDS: &[&str] = &[
     "drop table trellis_resolved_enum_values",
     "drop table trellis_resolved_types",
 ];
-
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
 
 /// `template` with each placeholder of `values` replaced by its value, in
 /// one pass over the template, so a value that has a placeholder's text in

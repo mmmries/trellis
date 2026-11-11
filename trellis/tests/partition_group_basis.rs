@@ -359,6 +359,47 @@ async fn a_dropped_or_detached_leaf_with_undrained_changes_is_recomputed() {
     }
 }
 
+/// A correction's recompute stages the visible rows it changed for a reader
+/// of the target, in its own transaction, and the reader follows them.
+#[tokio::test]
+async fn a_correction_reaches_a_reader_of_the_target_through_the_seam() {
+    let mut fx = Fx::start(&tree("list"), SEED).await;
+    let columns = [("g", int4()), ("total", int8()), ("n", int8())]
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect();
+    trellis::defs::install_definition(
+        fx.d.pool(),
+        "TRANSFORM aggr FROM public.agg SELECT total AS total, n AS n",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("install the reader");
+    trellis::intake::harness::settle_builds(fx.d.pool()).await;
+    fx.d.settle().await;
+    const READER: &str = "select g, total, n from public.aggr order by g";
+    const AGG: &str = "select g, total, n from public.agg order by g";
+    assert_eq!(fx.d.rows(READER).await, fx.d.rows(AGG).await);
+    // The seam's rows for the target, staged and not yet drained.
+    const STAGED: &str = "select 1 from (select src_table from seg_0 \
+                          union all select src_table from seg_1 \
+                          union all select src_table from seg_2 \
+                          union all select src_table from seg_3) r \
+                          where src_table = 'public.agg'";
+    let staged = fx.d.rows(STAGED).await.len();
+    fx.exec("drop table public.items_p1").await;
+    fx.pass().await;
+    assert_eq!(fx.run().await.completed, 1);
+    assert!(
+        fx.d.rows(STAGED).await.len() > staged,
+        "the correction stages the rows it changed for the reader"
+    );
+    fx.d.settle().await;
+    fx.assert_right("dropped").await;
+    assert_eq!(fx.d.rows(READER).await, fx.d.rows(AGG).await);
+}
+
 /// `P.stale-new-group`: an undrained insert creates a group the target
 /// doesn't have yet, in the leaf that is then dropped. The correction's set
 /// takes the groups of undrained ring images, so the stale page is refused
