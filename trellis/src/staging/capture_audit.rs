@@ -47,10 +47,10 @@
 //! What `capture::install` installs (one Trellis role does
 //! everything):
 //!
-//! - **Four triggers per captured table**, named by
+//! - **Five triggers per captured table**, named by
 //!   [`crate::capture::sql::trigger_name`], each `ENABLE ALWAYS`
 //!   (`tgenabled = 'A'`) and calling its event's function.
-//! - **Four functions in the instance schema**, named by
+//! - **Five functions in the instance schema**, named by
 //!   [`crate::capture::sql::function_name`], each `SECURITY DEFINER` and
 //!   owned by the role that owns the ring, the one `capture::install` hands
 //!   them to (its `RING_OWNER` query, which this audit shares). That is the

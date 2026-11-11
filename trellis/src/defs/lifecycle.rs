@@ -2,10 +2,10 @@
 //! **pause** and **drop**.
 //!
 //! ```text
-//! [*] --define--> Backfilling --> Live --pause--> Paused --drop--> [*]
-//!                                   ^                 |
-//!                                   +---- resume -----+   (a fresh backfill,
-//!                                                          not a catch-up)
+//! [*] --define--> WaitingToBackfill --> Backfilling --> Live --pause--> Paused --drop--> [*]
+//!                        ^                                                 |
+//!                        +-------------------- resume ---------------------+
+//!                                   (a fresh backfill, not a catch-up)
 //! ```
 //!
 //! Three things this module deliberately does *not* do, each straight out of

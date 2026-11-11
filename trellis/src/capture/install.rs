@@ -212,12 +212,19 @@
 //!
 //! # What is installed
 //!
-//! The catalog is the only record: the triggers in
+//! What is installed is read from the catalog: the triggers in
 //! `pg_trigger`, and each function's spec in its `COMMENT ON FUNCTION`
-//! ([`sql::comment_text`]). `pg_dump` carries both, and there is no
-//! Trellis table to disagree with them. [`installed`] reads them back, and
-//! also compares each function's source with what this build generates, so
-//! a function an older generator left behind is replaced.
+//! ([`sql::comment_text`]). `pg_dump` carries both. [`installed`] reads them
+//! back, and also compares each function's source with what this build
+//! generates, so a function an older generator left behind is replaced.
+//!
+//! An install also records what it did, in the same transaction, so the
+//! capture pass can tell a change it made from one made under it: the
+//! triggers' oids, `xmin` and enabled mode in `capture_triggers`
+//! ([`super::triggers`]), and the read columns as they were in
+//! `capture_baselines` ([`super::baseline`]). Those records never decide what
+//! is installed; one that disagrees with the catalog is a disruption the pass
+//! pauses for.
 //!
 //! Nothing else this module writes is installed state. The capture gate is
 //! a row of its own ([`super::gate`]) that goes when no pending change holds
