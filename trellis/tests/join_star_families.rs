@@ -347,7 +347,11 @@ async fn r17_a_stale_root_apply_after_a_rederive_is_refused() {
             d.stage_recomputes("public.a", &["1"]).await;
             let rederive = d.seal().await;
             d.drain(rederive, "rederive").await;
-            assert_eq!(total(&d, star, 1).await, joined_total(shape, 12, 100));
+            assert_eq!(
+                total(&d, star, 1).await,
+                joined_total(shape, 12, 100),
+                "{star:?}"
+            );
             d.drain(older, "older").await;
             assert_eq!(
                 total(&d, star, 1).await,
@@ -422,8 +426,12 @@ async fn r19_a_root_rederive_whose_row_moved_onto_a_held_key_retries() {
             page.finish_result().await.expect("the Re-derive page");
             star::assert_oracle(&mut d, &[star]).await;
             assert!(blocked, "{}: the retry queued on J", star.name());
-            assert_eq!(d.join_key_moves(), moves + 1);
-            assert_eq!(total(&d, star, 1).await, joined_total(shape, 1, 300));
+            assert_eq!(d.join_key_moves(), moves + 1, "{star:?}");
+            assert_eq!(
+                total(&d, star, 1).await,
+                joined_total(shape, 1, 300),
+                "{star:?}"
+            );
         }
     }
 }
@@ -449,15 +457,16 @@ async fn a_root_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() 
             star::write(&d, &shape.sql("update public.a set {k} = 20 where id = 1")).await;
             d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
             page.finish().await;
-            assert_eq!(d.join_key_moves(), moves + 1);
+            assert_eq!(d.join_key_moves(), moves + 1, "{star:?}");
             star::assert_oracle(&mut d, &[star]).await;
         }
     }
 }
 
 /// A Re-derive repairs root rows changed (at the position, and at each idle
-/// one) or deleted without capture, and writes one that has no entry yet on
-/// its first attempt: it reads the row's live key before the `J` lock.
+/// one) or deleted without capture. Row 1 moves off key 10, which no other
+/// row of the page holds, so the page must lock the key its entry holds
+/// (`join1_old_key_unlocked`).
 #[tokio::test]
 async fn root_rederives_repair_uncaptured_changes() {
     for shape in SHAPES {
@@ -478,18 +487,42 @@ async fn root_rederives_repair_uncaptured_changes() {
             .await;
         }
         star::write_uncaptured(&d, "public.a", "delete from public.a where id = 2").await;
-        star::write_uncaptured(
-            &d,
-            "public.a",
-            &shape.sql("insert into {a_ins} values (8, 10, 8, 'eight')"),
-        )
-        .await;
-        d.stage_recomputes("public.a", &["1", "2", "3", "8"]).await;
+        d.stage_recomputes("public.a", &["1", "2", "3"]).await;
         let batch = d.seal().await;
-        let moves = d.join_key_moves();
         d.drain(batch, "rederive").await;
-        assert_eq!(d.join_key_moves(), moves, "no retry: {shape:?}");
         star::assert_oracle(&mut d, &stars).await;
+    }
+}
+
+/// A Re-derive of a root row that has no `R` entry reads its live key before
+/// the `J` lock, so it commits on its first attempt, and writes the row.
+#[tokio::test]
+async fn a_root_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            star::write_uncaptured(
+                &d,
+                "public.a",
+                &shape.sql("insert into {a_ins} values (8, 10, 8, 'eight')"),
+            )
+            .await;
+            d.stage_recomputes("public.a", &["8"]).await;
+            let batch = d.seal().await;
+            let moves = d.join_key_moves();
+            d.drain(batch, "rederive").await;
+            assert_eq!(
+                d.join_key_moves(),
+                moves,
+                "{star:?}: no retry for a row the entry doesn't hold yet"
+            );
+            assert_eq!(
+                total(&d, star, 8).await,
+                joined_total(shape, 8, 100),
+                "{star:?}"
+            );
+            star::assert_oracle(&mut d, &[star]).await;
+        }
     }
 }
 
