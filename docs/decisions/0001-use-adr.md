@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-08-14
+date: 2026-11-11
 deciders: Michael Ries
 ---
 
@@ -10,6 +10,20 @@ Data-intensive tooling is a web of tradeoffs: one pattern is CPU-bound,
 the next is limited by disk IOPS. We use Architecture Decision Records to
 capture the key decisions, the tradeoffs they make, and the use-cases they
 optimize for.
+
+## ADRs are zoning rules, not a description of the code
+
+An ADR records a key design decision, and all code work must agree with it.
+It may describe design the code doesn't match yet, or no longer matches. Work
+that conflicts with an ADR, or finds one unclear or outdated, stops and asks
+the maintainer to clarify it; it never edits the ADR to fit the code. An ADR
+changes only when the maintainer decides a design change, and is then edited
+in place. A plain fact that a later ADR or the code reversed may be corrected
+without changing a decision; the maintainer reviews that change.
+
+How the code carries out a decision (steps, tables, statements, lock order)
+lives in the [stage docs](../staging-and-claiming/README.md), which feature
+work edits freely; an ADR links there.
 
 ## Writing an ADR
 
@@ -21,8 +35,9 @@ changed) and `deciders`. The status is `draft` while any point is undecided, and
 An ADR whose design is being replaced is `superseded` until the code it
 describes is gone.
 
-- **Record the decision, not the journey.** Describe the design as it is, in the
-  present tense, and edit the ADR in place when the design changes. Earlier
+- **Record the decision, not the journey.** State the decision in the present
+  tense, with no amendment notes or history of its own (it may note amendments
+  to *other* ADRs). Earlier
   designs, PRs, branches and follow-up plans belong in git history and issues;
   an ADR doesn't link to or cite issues, pull requests or experiment ids, so it
   stands on its own.
