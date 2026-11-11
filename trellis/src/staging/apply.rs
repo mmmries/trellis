@@ -3515,9 +3515,8 @@ pub(super) fn pk_keyset_col(i: usize) -> String {
 /// column match [`apply_target`] needs once a composite (arity > 1) primary
 /// key means a plain `= any($1::text[]::cast[])` doesn't identify a row
 /// on its own — arity 1 keeps that simpler form
-/// instead (see [`apply_target`]'s own arity branch). A column recompute
-/// uses it at every arity, since joining on the target's own
-/// key columns is what lets its write-back use the index.
+/// instead (see [`apply_target`]'s own arity branch). A 1-1 `JOIN`'s target
+/// write (`super::join_one_to_one`) uses it at every arity.
 pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
     let arrays: Vec<String> = pk
         .iter()
@@ -4206,7 +4205,8 @@ async fn apply_target(
         // The composite key's own canonical identity text —
         // what this statement's `RETURNING` reports as each written row's
         // key, matching `ddl::pk_key_sql_expr`'s row-identity encoding at any
-        // arity (a bare `{col}::text` at arity 1) so a downstream chained definition's live re-fetch
+        // arity (a bare `{col}::text` at arity 1) so a downstream chained
+        // definition's live re-fetch
         // parses it back the same way.
         let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, None);
 

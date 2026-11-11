@@ -678,8 +678,9 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// older than the statement (a nested or sibling statement's), a `BEFORE`
 /// with no matching capture (several `ModifyTable` nodes share one `AFTER`
 /// call), or no `start` at all (`-1`: the begin trigger was disabled or
-/// missing, which the capture audit (`staging::capture_audit`) reports). A subtransaction that rolls back
-/// restores the setting with the writes it undid. The setting is the
+/// missing, which the capture audit (`staging::capture_audit`) reports). A
+/// subtransaction that rolls back restores the setting with the writes it
+/// undid. The setting is the
 /// application's to overwrite, as it could disable the triggers; doing so
 /// can only cost it its own derived data, and the re-read itself never reads
 /// another transaction's row either way.

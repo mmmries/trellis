@@ -37,9 +37,11 @@
 //! checked is per process), and every pass while the source is recorded as
 //! non-compliant. It reads the tree, then
 //!
-//! 1. pauses every reader the source no longer complies for (the compliance
-//!    checks, [`PartitionTree::refusal`]), recording why in `capture_failure`; a
-//!    `RESUME` refuses until it complies, and rebuilds;
+//! 1. pauses every reader the source no longer complies for (define's checks,
+//!    [`PartitionTree::refusal`]; ADR-0017, "Define refuses a shape routing
+//!    can't serve, and the pass pauses one that appears later"), recording why
+//!    in `capture_failure`; a `RESUME` refuses until it complies, and
+//!    rebuilds;
 //! 2. classifies each node against the recorded ones ([`plan`]): created,
 //!    attached or re-attached (a new `pg_inherits.xmin`, parent or bound),
 //!    a `DEFAULT` whose sibling set changed (treated as new), gone (dropped,
@@ -561,7 +563,7 @@ pub fn live_from(
 }
 
 /// The readers of `table` the tree no longer complies for, each with the
-/// first reason (the compliance checks, [`PartitionTree::refusal`]): an aggregate
+/// first reason (define's checks, [`PartitionTree::refusal`]): an aggregate
 /// whose `GROUP BY` lacks a partition-key column, a `JOIN` side whose
 /// `GROUP BY` and join key lack one, or a 1-1 transform's `FROM`. A
 /// definition already paused counts too: one the pass paused for this tree

@@ -233,7 +233,8 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// - Every row in that window committed before `S_k` was taken, so the count
 ///   is final. Counting the slot at the flip would miss a straddler that
 ///   resolved the slot before the flip and committed after it, including one
-///   committing a truncate, and would never look at the predecessor half, where a straddler still open at `S_{k-1}` lands.
+///   committing a truncate, and would never look at the predecessor half,
+///   where a straddler still open at `S_{k-1}` lands.
 /// - The truncate barrier (`truncate-propagation-spec.md`) needs
 ///   `has_truncate` on every batch whose window holds a truncate row, and
 ///   such a batch seals single-bucket so one claimant runs the clear and the
