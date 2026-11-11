@@ -219,7 +219,7 @@ Median and p99 are computed at query time from exported bucket counts
 Histograms **aggregate across instances**; summaries do not — and a deployment
 may run more than one engine process against the same cluster. The cost is
 choosing bucket boundaries up front: a single global exponential set spanning
-~10ms–60s, not per-transform in this pass.
+~10ms–60s, not per-transform.
 
 ### Exposition: a mountable handler, not a bound port
 

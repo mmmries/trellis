@@ -2,8 +2,8 @@
 
 Every Trellis instance owns exactly one **named PostgreSQL schema**, and all of
 its internal state lives there: the [staging
-ring](staging-and-claiming/02-the-staging-ring.md), the migration ledger, and —
-as the project grows — the transform catalog and other bookkeeping. Nothing
+ring](staging-and-claiming/02-the-staging-ring.md), the migration ledger, the
+transform catalog and its other bookkeeping. Nothing
 Trellis owns lives in `public` or under unqualified names.
 
 ## Why a named schema
@@ -134,22 +134,21 @@ as privately its own has to be scoped by that schema too, or two instances in
 one database will collide on it even though every table they own is separate.
 The two-instance generative property
 (`generative/tests/two_instance_noise.rs`) runs two instances side by side in
-one database to keep this honest; it found two real gaps, both since closed.
-The column-pause lock was the same trap again, found by review:
+one database to keep this honest. The rules that keep two instances apart:
 
 * **The producer singleton is keyed by schema.** Postgres advisory locks are
   keyed by `(database, key)` — a session's `search_path` is not part of the
   lock tag. So the one-leader staging-worker guard
-  (`staging::session`) must derive its key from the instance schema, as
-  `staging::session::producer_singleton_lock_key` now does; a global constant
-  made the guard fire across instances.
+  (`staging::session`) derives its key from the instance schema
+  (`staging::session::producer_singleton_lock_key`); a global constant would
+  make the guard fire across instances.
 * **The column-pause lock is keyed by schema too.** The advisory lock that
   orders every column-pause write and read
   ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)) is a two-int key
   whose second int hashes the instance schema
   (`locks::column_pause_lock_key`), so one instance's pause, resume, fuse trip,
-  define or drop never waits for another's. A constant key would have coupled
-  every instance in the database and counted the other's holds as its own lock
+  define or drop never waits for another's. A constant key would couple every
+  instance in the database and count the other's holds as its own lock
   timeouts.
 * **A configured schema must be carried, not re-resolved.**
   `Client::start_with_config` takes the caller's already-resolved `Config`.
@@ -232,12 +231,14 @@ in one instance never waits on another's.
 ## One instance reading another's target
 
 An instance can read another instance's 1-1 target as a source, exactly as it
-would any other table with a primary key. Its capture triggers sit on the
+would any other keyed table. Its capture triggers sit on the
 owner's target table, so every row the owner's drain writes there fires them,
 as an application's write would, and the owner needs no change. It cannot read
-another instance's aggregate target, or a 1-1 target over one. Trellis requires a source table to have a primary key
-([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)), and an aggregate
-target has none: its grouping columns may be `NULL`, so its identity is a
+another instance's aggregate target, or a 1-1 target over one, unless the
+definition names its key. Trellis keys a source table by its primary key or by
+the columns a `KEY (…)` names
+([transforms — Supported sources and targets](transforms.md#the-key-a-transform-keys-each-table-by)), and an aggregate
+target has no primary key: its grouping columns may be `NULL`, so its identity is a
 `UNIQUE NULLS NOT DISTINCT` constraint. A 1-1 target over it takes the same
 identity. Inside the owning instance that never
 matters, because an instance hands each write to one of its own targets on to

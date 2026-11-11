@@ -1,10 +1,11 @@
 # Defining Transforms
 
 A transform describes how one derived (target) table is produced from one or
-more source tables. Its definition is three separately-chosen pieces: the
-**granularity** of the target's primary-key space, the **calculated fields**
-that populate its non-key columns, and an optional **partial-data** predicate
-restricting which source rows participate.
+more source tables. Its definition is two separately-chosen pieces: the
+**granularity** of the target's primary-key space, and the **calculated
+fields** that populate its non-key columns. Every source row participates: a
+`WHERE` other than `TRUE` is refused
+([#804](https://github.com/salesforce-misc/trellis/issues/804)).
 
 Trellis maintains these tables **incrementally** as source data changes, trading
 spikey read load for a steady write load that keeps the table cheap to read (see
@@ -1037,10 +1038,13 @@ Widenings are `integer` → `bigint` (and `smallint` up), an integer → `numeri
 ([ADR-0020](decisions/0020-type-identity.md)).
 
 **Refused at define:** n/a: each column takes its type from the source at
-define, or when an `ALTER TRANSFORM … ADD` adds it. A column Trellis creates
+define, or when an `ALTER TRANSFORM … ADD` adds it. A column Trellis copies
 has the source column's type with no modifier (a 1-1 key column and a `JOIN`'s
 `GROUP BY` and `ON` columns also keep its collation; any other takes the
-database default), so a change of a modifier (a string bound, a `numeric`
+database default), and a calculated column, an aggregate's field and a plain
+aggregate's `GROUP BY` key take their value family's type, which has no
+modifier either ([the types of the columns Trellis
+creates](type-support.md#the-types-of-the-columns-trellis-creates)), so a change of a modifier (a string bound, a `numeric`
 precision, a temporal precision, a move to `text`) changes nothing there.
 
 **If it appears after define:** A widening of a modifier that changes only the
@@ -1570,7 +1574,7 @@ unchanged), but `RESUME` refuses the pair until the collations match too.
 whose argument is not a plain source column (`MAX(a + b)`, a cast, a calculated
 field), is of a type other than `smallint`, `integer`, `bigint`, `numeric`,
 `real`, `double precision`, `date`, `time`, `timestamp`, `timestamptz`,
-`interval` and `oid` (`text` among them, until collation is settled), or is a
+`interval` and `oid` (`text` among them), or is a
 column of another transform's target; a definition with such a field declared
 `WITHOUT SOURCE INDEX`; or one whose source lacks, for each argument, a valid,
 non-partial btree index whose leading columns are the `GROUP BY` columns in
@@ -2087,7 +2091,7 @@ key. Then:
 
 A schema change of any of its tables pauses the whole transform as it does a
 join aggregate. `self_check` compares the target, every copy and the uniqueness
-of each joined table's join key ([known correctness gaps](known-correctness-gaps.md#what-self_check-cant-see)).
+of each joined table's join key.
 The same read contract applies: a value read before `await_converged` may be
 inconsistent, and is exact after it
 ([Reading derived data](data-flow.md#reading-derived-data)).
@@ -2239,16 +2243,6 @@ It does not cross into another instance.
 **Cycles are rejected at definition time across the whole graph.** A definition
 that would introduce a cycle, directly or transitively, is invalid and rejected
 before it runs, keeping the computation order well-defined.
-
-## Partial data
-
-**Not supported:** the grammar accepts only `WHERE TRUE`, and any other
-predicate is a parse error. This section describes the intended design.
-
-Any target table, regardless of granularity, may be defined over a *subset* of
-its source rows via a row-level predicate. Like a partial index, materializing
-only a narrow, high-value slice keeps the write load small; excluded rows never
-enter the target or incur maintenance cost.
 
 ## Target tables are Trellis-owned
 
