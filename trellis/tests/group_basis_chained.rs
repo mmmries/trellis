@@ -12,8 +12,9 @@
 //! The first tests cover a chained aggregate over a single-column and a composite
 //! group key, and one whose upstream 1-1 target loses a row. The rest cover a row
 //! that moves group upstream, a rollup whose upstream group is emptied and refilled
-//! in one page, a reader defined while an upstream writer is in flight, and an
-//! upstream rebuild that rebuilds the reader. The last group is a reader's build
+//! in one page, a reader defined while an upstream writer is in flight, an
+//! upstream rebuild that rebuilds the reader, and an upstream release or
+//! `JOIN` rebuild whose seam rows reach the reader. The last group is a reader's build
 //! over an upstream target whose keys have `NULL` parts, with writes and source
 //! `TRUNCATE`s around it.
 
@@ -434,6 +435,174 @@ async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
     assert_equal(&mut d, ROLL, ORACLE).await;
     step(&mut d, "insert into public.src values (6, 3, 0, 4)").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
+}
+
+// ------------------------- an upstream release or JOIN rebuild, through the seam
+
+/// Holds `key` of `src_table` for the definition whose target is `target`,
+/// as an eviction would: from now on every page parks its changes.
+async fn hold(d: &Driver, target: &str, src_table: &str, key: &str) {
+    d.ctl
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, $2, 'test' from transform_definitions \
+             where target_table = $3",
+            &[&src_table, &key, &target],
+        )
+        .await
+        .expect("hold the key");
+}
+
+/// How many rows the ring holds for `src_table`: a writer's staged seam rows
+/// for a target, before any page drains them.
+async fn ring_rows(d: &Driver, src_table: &str) -> usize {
+    d.rows(&format!(
+        "select 1 from (select src_table from seg_0 union all select src_table from seg_1 \
+         union all select src_table from seg_2 union all select src_table from seg_3) r \
+         where src_table = '{src_table}'"
+    ))
+    .await
+    .len()
+}
+
+/// A release of a held key on a group-basis upstream reaches its reader
+/// through the seam: the release stages the visible rows it changed, in its
+/// own transaction, and the reader follows them.
+#[tokio::test]
+async fn an_upstream_release_reaches_its_reader_through_the_seam() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups, SUM(total) AS t",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const ROLL: &str = "select n, groups, t from public.roll order by n";
+    const ORACLE: &str = "select n, count(*), sum(total) from ( \
+                              select count(*) as n, sum(v) as total from public.src group by g \
+                          ) s group by n order by n";
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    hold(&d, "public.agg", SRC, "1").await;
+    write(&d, "update public.src set g = 2, v = 9 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "held").await;
+    assert_ne!(
+        d.rows(ROLL).await,
+        d.rows(ORACLE).await,
+        "the held change is parked"
+    );
+    let staged = ring_rows(&d, "public.agg").await;
+    trellis::staging::release_key(d.pool(), "agg", SRC, "1")
+        .await
+        .expect("release the key");
+    assert!(
+        ring_rows(&d, "public.agg").await > staged,
+        "the release stages the rows it changed for the reader"
+    );
+    assert_equal(&mut d, ROLL, ORACLE).await;
+}
+
+const JR: &str = "select ga, n, sy1 from public.jr order by ga";
+const JR_ORACLE: &str = "select a.ga, count(*), sum(b.y) + 1 from public.a join public.b \
+                         on a.k = b.k group by a.ga order by a.ga";
+
+/// A `JOIN` upstream, `j`, over `public.a` and `public.b`, with a 1-1
+/// reader, `jr`, both live, and a few rows in either table.
+async fn join_with_reader() -> Driver {
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, ga integer, k integer, x integer); \
+         create table public.b (id integer primary key, k integer, y integer); \
+         create index on public.a (k); create index on public.b (k)",
+        &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],
+        &[
+            "TRANSFORM j FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    install(
+        &d,
+        "TRANSFORM jr FROM public.j SELECT n AS n, sy + 1 AS sy1",
+        &[("ga", int4()), ("n", int8()), ("sy", int8())],
+    )
+    .await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    step(&mut d, "insert into public.b values (1, 1, 10), (2, 2, 20)").await;
+    step(
+        &mut d,
+        "insert into public.a values (1, 1, 1, 0), (2, 2, 2, 0)",
+    )
+    .await;
+    assert_equal(&mut d, JR, JR_ORACLE).await;
+    d
+}
+
+/// The same for a `JOIN` upstream: its release carries the key's cells to
+/// `T` and stages the visible rows that changed for the reader.
+#[tokio::test]
+async fn an_upstream_join_release_reaches_its_reader_through_the_seam() {
+    let mut d = join_with_reader().await;
+    hold(&d, "public.j", "public.a", "1").await;
+    write(&d, "update public.a set ga = 2 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "held").await;
+    assert_ne!(
+        d.rows(JR).await,
+        d.rows(JR_ORACLE).await,
+        "the held change is parked"
+    );
+    let staged = ring_rows(&d, "public.j").await;
+    trellis::staging::release_key(d.pool(), "j", "public.a", "1")
+        .await
+        .expect("release the key");
+    assert!(
+        ring_rows(&d, "public.j").await > staged,
+        "the release stages the rows it changed for the reader"
+    );
+    assert_equal(&mut d, JR, JR_ORACLE).await;
+}
+
+/// A rebuild in place of a `JOIN` upstream reaches its reader through the
+/// seam, with changes its snapshot saw before they drained folded in.
+#[tokio::test]
+async fn an_upstream_join_rebuild_reaches_its_reader_through_the_seam() {
+    let mut d = join_with_reader().await;
+    write(
+        &d,
+        "update public.a set ga = 2 where id = 1; insert into public.a values (3, 3, 2, 0)",
+    )
+    .await;
+    let undrained = d.seal().await;
+    let trellis = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    let staged = ring_rows(&d, "public.j").await;
+    trellis
+        .request_backfill("a")
+        .await
+        .expect("request a rebuild");
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    assert!(
+        ring_rows(&d, "public.j").await > staged,
+        "the rebuild stages the rows it changed for the reader"
+    );
+    d.drain(undrained, "undrained").await;
+    assert_equal(&mut d, JR, JR_ORACLE).await;
 }
 
 // ------------------------------------- 1-1 readers of a nullable key
