@@ -2624,6 +2624,80 @@ impl GroupTargetPlan {
         self.apply_sql_with("n as (select 1) select count(*), (select n from lost) from up")
     }
 
+    /// Whether `T`'s JOIN build write takes the bulk path
+    /// ([`Self::match_hidden_build_sql`]): no extremes, so `T` holds no
+    /// basis and every staged change applies.
+    fn hidden_build_is_bulk(&self) -> bool {
+        self.shape.extremes().is_empty() && self.floor_key.is_none()
+    }
+
+    /// The first statement of [`Self::apply_hidden_sql`] with no extremes
+    /// (#1844): sums the staged rows once per group and matches each sum to
+    /// its hidden row with one join instead of a lookup per group, into
+    /// [`HIDDEN_MATCH`] in the hidden rows' `ctid` order. A staged group with
+    /// no hidden row has a null `__hc`, and is lost as [`Self::lost_cte_sql`]
+    /// counts it.
+    fn match_hidden_build_sql(&self) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let staged_parts = self.staged_parts.get();
+        let mut totals = vec!["sum(__n)::bigint as __n".to_string()];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            totals.push(format!("sum(__c{i})::bigint as __c{i}"));
+            for part in arg.parts() {
+                let total = self.staged_total(&staged_parts, i, *part, None);
+                totals.push(format!("{total} as {}", part.name("__", i)));
+            }
+        }
+        format!(
+            "create temp table {HIDDEN_MATCH} on commit drop as \
+             select s.*, x.ctid as __hc \
+             from (select {cols}, {totals} from {staged} group by {cols}) s \
+             left join {hidden} x on {matched} order by x.ctid",
+            cols = cols.join(", "),
+            totals = totals.join(", "),
+            staged = self.staged,
+            hidden = self.hidden_ident,
+            matched = self.group_match("x", "s"),
+        )
+    }
+
+    /// The second statement of [`Self::apply_hidden_sql`] with no extremes:
+    /// adds each matched sum in [`HIDDEN_MATCH`] to its hidden row by
+    /// `ctid`. Run under [`HIDDEN_UPDATE_SETTINGS`], it reads the match in
+    /// order and fetches each row by a TID scan, so it rewrites `T`'s pages
+    /// in disk order: in hash order, every row dirties a random page, and at
+    /// millions of groups the checkpoints that follow write each page again
+    /// as a full-page image.
+    fn update_hidden_build_sql(&self) -> String {
+        let staged_parts = self.staged_parts.get();
+        let mut sets = vec!["__n = u.__n + t.__n".to_string()];
+        let mut nonzero = vec!["t.__n <> 0".to_string()];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            sets.push(format!("__count_{i} = u.__count_{i} + t.__c{i}"));
+            nonzero.push(format!("t.__c{i} <> 0"));
+            for part in arg.parts() {
+                if *part == SumPart::Scales && self.map_free(&staged_parts, i) {
+                    continue;
+                }
+                let (staged, hidden) = (part.name("__", i), part.hidden(i));
+                sets.push(format!(
+                    "{hidden} = {}",
+                    part.add(&format!("u.{hidden}"), &format!("t.{staged}"), arg.scale)
+                ));
+                nonzero.push(part.nonzero(&format!("t.{staged}")));
+            }
+        }
+        format!(
+            "update {hidden} u set {sets} from {HIDDEN_MATCH} t \
+             where u.ctid = t.__hc and ({nonzero})",
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            nonzero = nonzero.join(" or "),
+        )
+    }
+
     /// The error for `groups` staged groups with no hidden row.
     fn lock_gap(&self, groups: i64) -> ApplyError {
         ApplyError::GroupLockGap {
@@ -4571,10 +4645,14 @@ pub(super) async fn apply_join_build_groups(
     plan: &GroupTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
-    txn.batch_execute(PLAN_SETTINGS).await?;
-    let applied = txn.query_one(&plan.apply_hidden_sql(), &[]).await?;
-    txn.batch_execute(PLAN_RESET).await?;
-    let lost: i64 = applied.get(1);
+    let lost = if plan.hidden_build_is_bulk() {
+        apply_hidden_build(txn, plan).await?
+    } else {
+        txn.batch_execute(PLAN_SETTINGS).await?;
+        let applied = txn.query_one(&plan.apply_hidden_sql(), &[]).await?;
+        txn.batch_execute(PLAN_RESET).await?;
+        applied.get(1)
+    };
     if lost > 0 {
         return Err(plan.lock_gap(lost));
     }
@@ -4585,6 +4663,52 @@ pub(super) async fn apply_join_build_groups(
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
 }
+
+/// `T`'s bulk write in a JOIN build (#1844): [`GroupTargetPlan::match_hidden_build_sql`]
+/// then [`GroupTargetPlan::update_hidden_build_sql`]. Returns how many staged
+/// groups had no hidden row, and writes nothing if any had.
+async fn apply_hidden_build(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+) -> Result<i64, ApplyError> {
+    // `T` is written in this transaction, where no other session's
+    // statistics see it (#1839); the match wants a hash join.
+    analyze(txn, &[&plan.hidden_ident]).await?;
+    txn.batch_execute(&format!(
+        "drop table if exists {HIDDEN_MATCH}; {BULK_PLAN_SETTINGS}"
+    ))
+    .await?;
+    txn.batch_execute(&plan.match_hidden_build_sql()).await?;
+    let lost: i64 = txn
+        .query_one(
+            &format!("select count(*) from {HIDDEN_MATCH} where __hc is null"),
+            &[],
+        )
+        .await?
+        .get(0);
+    if lost > 0 {
+        txn.batch_execute(BULK_PLAN_RESET).await?;
+        return Ok(lost);
+    }
+    txn.batch_execute(HIDDEN_UPDATE_SETTINGS).await?;
+    txn.execute(&plan.update_hidden_build_sql(), &[]).await?;
+    txn.batch_execute(&format!(
+        "{HIDDEN_UPDATE_RESET}; {BULK_PLAN_RESET}; drop table {HIDDEN_MATCH}"
+    ))
+    .await?;
+    Ok(0)
+}
+
+/// [`apply_hidden_build`]'s match of staged sums to `T`'s hidden rows, in
+/// `ctid` order: a session temp table, dropped at commit.
+const HIDDEN_MATCH: &str = "pg_temp.trellis_join_hidden_match";
+
+/// The settings [`GroupTargetPlan::update_hidden_build_sql`] runs under, on
+/// top of [`BULK_PLAN_SETTINGS`]: with no hash join either, the join of the
+/// match to `T` on `ctid` is a nested loop over the match, in its order,
+/// with a TID scan of `T` inside.
+const HIDDEN_UPDATE_SETTINGS: &str = "set local enable_hashjoin = off";
+const HIDDEN_UPDATE_RESET: &str = "set local enable_hashjoin to default";
 
 /// The recompute of the groups in [`GroupTargetPlan::recomputed`], which
 /// the caller has locked (R1: [`lock_groups`] for a page, [`recompute_groups`]

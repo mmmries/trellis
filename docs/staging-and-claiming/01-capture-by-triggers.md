@@ -455,7 +455,8 @@ acted on once (`capture::baseline`). It costs two catalog reads per table.
   a metadata change to the same column in the same window. One that restates
   the expression the column already has is a same-type rewrite.
 
-The response follows whether the definitions are still valid as written:
+The response follows whether the definitions are still valid as written
+([ADR-0027](../decisions/0027-operating-principles.md), rule 2):
 
 - **Rebuilt automatically, pausing nobody.** A same-type rewrite, a stored
   generated column's expression replaced, and a changed column every
@@ -566,11 +567,10 @@ label was added since: then the text casts to that value, with no error
 
 A statement trigger captures only what it sees, so an operator who removes,
 swaps, disables or recreates Trellis's capture triggers leaves writes that
-the table's current state can't recover. The pass therefore never repairs
-that by itself. It pauses every definition that reads the table, with a
-`capture_failure` naming what it found and saying that changes made
-meanwhile may be missing, so correctness can't be guaranteed, and waits for a
-`RESUME`.
+the table's current state can't recover. So the pass pauses every definition
+that reads the table ([ADR-0027](../decisions/0027-operating-principles.md),
+rule 2), with a `capture_failure` naming what it found and saying that changes
+made meanwhile may be missing, so correctness can't be guaranteed.
 
 Each install, widen, narrow and repair records, in the transaction that makes
 it, the oid, `xmin` and enabled mode of each of the five capture triggers of a
@@ -795,7 +795,7 @@ neighbouring keys then form the read-write conflict chains Postgres cancels
 with `40001`. Every insert of an auto-increment id lands on the rightmost
 leaf, so with an unconditional re-read 50% of single-row serializable
 inserts failed at 4 writers and 87% at 8 and 16, where none fail without
-capture (`benchmark` scenario `ssi-tax`).
+capture or with the gate below (`benchmark` scenario `ssi-tax`).
 
 So capture re-reads only when the live row can differ from the transition
 row: when some other write to the same table changed it after the

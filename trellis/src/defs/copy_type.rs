@@ -107,12 +107,6 @@ mod tests {
              modifiers; the probe is created from what define creates",
         ),
         (
-            "defs/catalog.rs",
-            1,
-            "a JOIN column's declared type, for the key allowlist and \
-             messages; its copy is `copy_type`",
-        ),
-        (
             "defs/copies.rs",
             1,
             "`CopyType::display`, for messages; the copy is `CopyType::sql`",
@@ -128,9 +122,10 @@ mod tests {
             "the type a refused primary key column declares, for the message",
         ),
         (
-            "defs/key_types.rs",
+            "defs/live_table.rs",
             1,
-            "`LiveColumn::display`, for the key allowlist and messages",
+            "a live column's declared type (`LiveColumn::display`), for the key \
+             allowlist and messages; its copy is `copy_type`",
         ),
         (
             "defs/partition_tree.rs",

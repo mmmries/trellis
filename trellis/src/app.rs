@@ -2235,8 +2235,10 @@ impl Trellis {
         // The same introspection a resume re-validates against
         // (`defs::catalog::revalidate`).
         let client = self.pool.get().await?;
-        let (columns, virtual_columns) =
-            defs::catalog::live_source_columns_and_virtual(&**client, &qualified).await?;
+        let live = defs::live_table::LiveTable::read(&**client, &qualified)
+            .await
+            .map_err(CatalogError::from)?;
+        let (columns, virtual_columns) = (live.value_types(), live.virtual_columns);
         if columns.is_empty() {
             return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
         }

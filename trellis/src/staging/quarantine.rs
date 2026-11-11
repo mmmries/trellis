@@ -4217,6 +4217,57 @@ async fn request_drain(
     set_capture_failure(txn, id, source_table, &[], DRAINING_FAILURE).await
 }
 
+/// What holds a resume back before it checks anything.
+enum Hold {
+    /// An upstream isn't `live` ([`upstream_not_live`]).
+    Upstream(Upstream),
+    /// The changes staged before an enum relabel or re-type still drain
+    /// ([`relabel_changes_pending`]).
+    Draining,
+}
+
+/// What holds back a resume of definition `id` (on `source_table`), in the
+/// order a resume meets it: an upstream first, then a relabel's changes.
+/// [`resume_locked`] and the staging worker's check before it re-types
+/// ([`finish_requested_resume`]) both wait on it.
+async fn resume_hold(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+) -> Result<Option<Hold>, ApplyError> {
+    if let Some(upstream) = upstream_not_live(txn, id, source_table).await? {
+        return Ok(Some(Hold::Upstream(upstream)));
+    }
+    if relabel_changes_pending(txn, id, source_table).await? {
+        return Ok(Some(Hold::Draining));
+    }
+    Ok(None)
+}
+
+/// A resume's checks of `definition`, in `txn`, refusing as define would:
+/// a 1-1 target keyed by another key than its source's now is re-keyed in
+/// place (#1746, #1722), and a table whose key changed while the definition
+/// was paused has it re-recorded or refuses (#1719)
+/// ([`crate::defs::recorded_keys::rekey_for_resume`]), so the re-validation
+/// ([`catalog::revalidate`], [`catalog::check_owned_tables`]) and the
+/// rebuild see the key define would key by now. The caller's savepoint
+/// decides what of the re-keying is kept: [`resume_locked`] keeps it unless
+/// it refuses, and [`finish_requested_resume`]'s check before it re-types
+/// never does, since `resume_locked` re-keys under the definition's row
+/// lock. Both refuse alike, so the check refuses exactly the resumes
+/// `resume_locked` would.
+async fn rekey_and_revalidate(
+    txn: &Transaction<'_>,
+    schema: &str,
+    floors: &crate::defs::floor::Floors,
+    definition: &crate::defs::model::Definition,
+) -> Result<catalog::Revalidated, catalog::CatalogError> {
+    crate::defs::recorded_keys::rekey_for_resume(txn, definition).await?;
+    let revalidated = catalog::revalidate(txn, schema, floors, definition).await?;
+    catalog::check_owned_tables(txn, schema, definition, &revalidated).await?;
+    Ok(revalidated)
+}
+
 /// A resume of frozen definition `id` (bare target `target`, qualified
 /// source `source_table`), in `txn`, which [`lock_frozen`] has locked it
 /// in. Every resume goes through here: the operator's
@@ -4272,32 +4323,25 @@ async fn resume_locked(
             transform: target.to_string(),
         });
     };
-    if let Some(upstream) = upstream_not_live(txn, id, source_table).await? {
-        if !from_pass {
-            request_wait(txn, id, &upstream).await?;
+    match resume_hold(txn, id, source_table).await? {
+        Some(Hold::Upstream(upstream)) => {
+            if !from_pass {
+                request_wait(txn, id, &upstream).await?;
+            }
+            return Ok(ResumeStep::Waiting(upstream));
         }
-        return Ok(ResumeStep::Waiting(upstream));
-    }
-    if relabel_changes_pending(txn, id, source_table).await? {
-        if !from_pass {
-            request_drain(txn, id, source_table).await?;
+        Some(Hold::Draining) => {
+            if !from_pass {
+                request_drain(txn, id, source_table).await?;
+            }
+            return Ok(ResumeStep::Draining);
         }
-        return Ok(ResumeStep::Draining);
+        None => {}
     }
-    // Before the re-validation: a 1-1 target keyed by another key than its
-    // source's now is re-keyed in place (#1746, #1722), and a table whose
-    // key changed while the definition was paused has it re-recorded or
-    // refuses (#1719), so the re-validation and the rebuild see the key
-    // define would key by now. Under a savepoint: a refusal keeps none of
-    // it, and the caller still records the refusal in `txn`.
+    // Under a savepoint: a refusal keeps none of the re-keying, and the
+    // caller still records the refusal in `txn`.
     txn.batch_execute("savepoint resume_rekey").await?;
-    let checked = async {
-        crate::defs::recorded_keys::rekey_for_resume(txn, &definition).await?;
-        let revalidated = catalog::revalidate(txn, schema, floors, &definition).await?;
-        catalog::check_owned_tables(txn, schema, &definition, &revalidated).await?;
-        Ok::<_, catalog::CatalogError>(revalidated)
-    }
-    .await;
+    let checked = rekey_and_revalidate(txn, schema, floors, &definition).await;
     let revalidated = match checked {
         Ok(revalidated) => {
             txn.batch_execute("release savepoint resume_rekey").await?;
@@ -4315,19 +4359,12 @@ async fn resume_locked(
             });
         }
     };
-    let copies = crate::defs::copies::typed_copies(
-        txn,
-        schema,
-        &definition.def,
-        source_table,
-        &definition.target_table,
-    )
-    .await?;
-    let drifted: Vec<crate::defs::copies::CopyState> = crate::defs::copies::inspect(txn, copies)
-        .await?
-        .into_iter()
-        .filter(|s| s.drifted() && !s.copy.kind.recreated_by_resume())
-        .collect();
+    let drifted: Vec<crate::defs::copies::CopyState> =
+        crate::defs::copies::resume_states(txn, schema, &definition)
+            .await?
+            .into_iter()
+            .filter(|s| s.drifted())
+            .collect();
     if !drifted.is_empty() {
         let labels: Vec<String> = drifted.iter().map(|s| s.copy.label()).collect();
         if !from_pass {
@@ -4510,7 +4547,7 @@ async fn complete_resume(
     .await?;
     // A definition paused by a logical restore starts over on this
     // database's own positions. The rebuild below keeps the ledger's
-    // `__applied_lsn` (B4), which is right for an ordinary one and would skip
+    // `__applied_lsn`, which is right for an ordinary one and would skip
     // every later change to a key the dump held.
     if restored {
         reset_ordering_state(txn, schema, id, &definition.target_table).await?;
@@ -4598,7 +4635,7 @@ async fn complete_resume(
 
     // The staging worker's next pass starts the rebuild from
     // `waiting_to_backfill` (`super::build::start_ready_builds`): a 1-1 build
-    // runs over the ledger the freeze left (B4), and its sweep drops the keys
+    // runs over the ledger the freeze left, and its sweep drops the keys
     // deleted meanwhile; a group-basis aggregate's or a `JOIN`'s plan job
     // rewrites its groups.
     // Release every key this definition holds. The fresh build below
@@ -5118,29 +5155,29 @@ async fn finish_requested_resume(
         };
         // Nothing is re-validated or re-typed until every upstream is
         // live: its re-type may change the types this definition's copies
-        // take from it.
-        if let Some(upstream) = upstream_not_live(&txn, id, &source_table).await? {
-            let error = waiting_failure(&upstream);
-            let current: Option<String> = txn
-                .query_opt(
-                    "select error from capture_failures where transform_id = $1",
-                    &[&id],
-                )
-                .await?
-                .map(|row| row.get(0));
-            drop(txn);
-            if current.as_deref() != Some(error.as_str()) {
-                rewrite_waiting(client, id, &source_table, &upstream, &error).await?;
-            }
-            return Ok(());
-        }
-        // Nor while the changes staged before an enum change still
-        // drain ([`relabel_changes_pending`]): a re-type to another enum
-        // deletes a key's rows, which only the resume's rebuild writes back,
-        // so the target keeps them until the resume goes on to it. The
+        // take from it. Nor while the changes staged before an enum change
+        // still drain ([`relabel_changes_pending`]): a re-type to another
+        // enum deletes a key's rows, which only the resume's rebuild writes
+        // back, so the target keeps them until the resume goes on to it. The
         // request keeps its `resuming: waiting ...` text.
-        if relabel_changes_pending(&txn, id, &source_table).await? {
-            return Ok(());
+        match resume_hold(&txn, id, &source_table).await? {
+            Some(Hold::Upstream(upstream)) => {
+                let error = waiting_failure(&upstream);
+                let current: Option<String> = txn
+                    .query_opt(
+                        "select error from capture_failures where transform_id = $1",
+                        &[&id],
+                    )
+                    .await?
+                    .map(|row| row.get(0));
+                drop(txn);
+                if current.as_deref() != Some(error.as_str()) {
+                    rewrite_waiting(client, id, &source_table, &upstream, &error).await?;
+                }
+                return Ok(());
+            }
+            Some(Hold::Draining) => return Ok(()),
+            None => {}
         }
         // A 1-1 target's ledger is checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
@@ -5151,18 +5188,12 @@ async fn finish_requested_resume(
         // row lock.
         let checked = {
             let rekeyed = txn.savepoint("resume_precheck").await?;
-            let checked = async {
-                crate::defs::recorded_keys::rekey_for_resume(&rekeyed, &definition).await?;
-                let revalidated =
-                    catalog::revalidate(&rekeyed, schema, floors, &definition).await?;
-                catalog::check_owned_tables(&rekeyed, schema, &definition, &revalidated).await
-            }
-            .await;
+            let checked = rekey_and_revalidate(&rekeyed, schema, floors, &definition).await;
             rekeyed.rollback().await?;
             checked
         };
         match checked {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
                 return Err(err.into());
             }
@@ -5172,20 +5203,7 @@ async fn finish_requested_resume(
                 return Ok(());
             }
         }
-        let copies = crate::defs::copies::typed_copies(
-            &txn,
-            schema,
-            &definition.def,
-            &source_table,
-            &definition.target_table,
-        )
-        .await?;
-        let states: Vec<crate::defs::copies::CopyState> =
-            crate::defs::copies::inspect(&txn, copies)
-                .await?
-                .into_iter()
-                .filter(|s| !s.copy.kind.recreated_by_resume())
-                .collect();
+        let states = crate::defs::copies::resume_states(&txn, schema, &definition).await?;
         let retrying = retyping_failure(&source_table, states.iter().filter(|s| s.drifted()));
         // Each table's statements, with the columns of the definition's
         // target they re-type: what a definition chained off the target
@@ -5480,16 +5498,13 @@ async fn pause_refused_readers(
             first.table,
             retyped.join(", "),
         );
-        match crate::defs::lifecycle::pause_for_capture_failure(
-            txn,
-            reader.id,
-            &first.table,
-            &names,
-            &error,
-            None,
-        )
-        .await
-        {
+        let reason = super::pause_message::PauseReason::Capture {
+            table: first.table.clone(),
+            columns: names.clone(),
+            text: error,
+            caused_by: None,
+        };
+        match crate::defs::lifecycle::pause(txn, reader.id, &reason).await {
             Ok(_) => {}
             Err(catalog::CatalogError::Db(err)) => return Err(err),
             Err(_) => {}

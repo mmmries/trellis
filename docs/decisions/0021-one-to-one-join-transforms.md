@@ -1,5 +1,5 @@
 ---
-status: draft
+status: accepted
 date: 2026-10-24
 deciders: Michael Ries
 ---
@@ -556,7 +556,7 @@ transform with a `capture_failure` naming the table and the column when:
 
 Any of its tables dropped, renamed away, swapped or joining a hierarchy
 pauses it too, as for any source. `RESUME` re-validates every table as define would
-and refuses while define would. Otherwise the staging worker re-types the
+and refuses while define would ([ADR-0027](0027-operating-principles.md), rule 4). Otherwise the staging worker re-types the
 target's drifted copies first, and the resume then creates `R`, `M` and `J`
 again at the types define gives them now, so each position's group of `J` takes
 its `ON` pairs' new types, and rebuilds as above.

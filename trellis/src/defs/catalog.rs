@@ -87,6 +87,7 @@ use crate::error_code::{self, ErrorCode};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
+use crate::staging::pause_message::PauseReason;
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
@@ -97,15 +98,16 @@ use super::ddl::{self, DdlError};
 use super::error::ParseError;
 use super::floor::Floors;
 use super::grammar;
+use super::live_table::LiveTable;
 #[cfg(any(test, feature = "internals"))]
 use super::model::SchemaEdge;
 use super::model::{Definition, EdgeKind, NodeKind, SchemaNode, StoredStatus, TransformStatus};
 use super::parser::parse;
 use super::pg_type::PgType;
 use super::validate::{
-    KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
-    ValidationError, infer_field_types, reject_primary_key_named_fields, validate,
-    validate_qualified_columns,
+    JoinColumnInfo, KeyColumnRole, NondeterministicCollationTextFunction,
+    NondeterministicKeyCollation, ValidationError, infer_field_types,
+    reject_primary_key_named_fields, validate, validate_qualified_columns,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -1349,15 +1351,8 @@ pub(crate) async fn store_unrunnable(
             super::lifecycle::pause_for_unrunnable(&txn, id, unparsed.source_table, reason).await?
         }
         Held::Other(reason) => {
-            super::lifecycle::pause_for_capture_failure(
-                &txn,
-                id,
-                unparsed.source_table,
-                &[],
-                reason,
-                None,
-            )
-            .await?
+            let reason = PauseReason::capture(unparsed.source_table, reason);
+            super::lifecycle::pause(&txn, id, &reason).await?
         }
     };
     txn.execute(
@@ -2358,8 +2353,8 @@ pub async fn alter_transform(
     // `REGEXP_COUNT` can't read a nondeterministic-collation column, exactly
     // as at install. Before any DDL, like the rechecks above.
     let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
-    assert_collation_safe_text_functions(&txn, &merged, &current.source_table, Some(&edited))
-        .await?;
+    let live = LiveTable::read(&*txn, &current.source_table).await?;
+    assert_collation_safe_text_functions(&merged, &current.source_table, &live, Some(&edited))?;
     assert_regexp_patterns_accepted(&txn, &merged, Some(&edited)).await?;
 
     for field in &real_drops {
@@ -2568,7 +2563,7 @@ pub async fn alter_transform(
 
 /// What [`validate_edit`] read from the live schema.
 struct EditedSchema {
-    /// The source's columns and their value types ([`live_source_columns`]).
+    /// The source's columns and their value types ([`LiveTable::value_types`]).
     source_columns: HashMap<String, ValueType>,
     /// The result type of each of the edited definition's fields.
     field_types: HashMap<String, ValueType>,
@@ -2603,8 +2598,8 @@ async fn validate_edit(
     build_fields: &[String],
     recorded: &HashMap<String, ValueType>,
 ) -> Result<EditedSchema, CatalogError> {
-    let (source_columns, virtual_columns) =
-        live_source_columns_and_virtual(client, source_table).await?;
+    let live = LiveTable::read(client, source_table).await?;
+    let source_columns = live.value_types();
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source_table.to_string()));
     }
@@ -2618,7 +2613,7 @@ async fn validate_edit(
     // re-run.
     validate_with_source(merged, &source_columns, source_table)?;
     // Nor read a virtual generated column, as define refuses.
-    reject_virtual_generated_reads(merged, None, source_table, &virtual_columns)?;
+    reject_virtual_generated_reads(merged, None, source_table, &live.virtual_columns)?;
     if let Some(read) = field_over_retyped_column(merged, build_fields, recorded, &source_columns) {
         let target = &merged.target;
         return Err(CatalogError::UnsupportedAlter(format!(
@@ -3804,12 +3799,11 @@ async fn create_definition_inner(
     // a `numeric`-grouped aggregate (whose identity is its `GROUP BY` key),
     // used to be accepted here and then halt on its first live change.
     // The same checks every resume runs again ([`validate_live_schema`]).
-    match &join_sides {
-        Some(sides) => validate_live_join_schema(&txn, pool.schema(), &def, sides, None).await?,
-        None => {
-            validate_live_schema(&txn, pool.schema(), &def, &qualified_source, None).await?;
-        }
-    }
+    let tables = match &join_sides {
+        Some(sides) => sides.read_tables(),
+        None => vec![(qualified_source.as_str(), None)],
+    };
+    validate_live_schema(&txn, pool.schema(), &def, &tables, None).await?;
 
     // Registration creates the target here, in the transaction
     // that records the definition, so a failure anywhere after this rolls the
@@ -4182,7 +4176,8 @@ pub(crate) struct CaptureReaderRow {
     /// The qualified `source_table`.
     pub source: String,
     pub def: TransformDef,
-    /// A `schema_changed` marker paused it (C6, `capture_failures`).
+    /// A `schema_changed` marker paused it (`staging::schema_change`,
+    /// `capture_failures`).
     pub capture_failed: bool,
     /// The stamp its paused message was written at
     /// (`capture_failures.refresh_stamp`, `staging::pause_message`).
@@ -4808,14 +4803,15 @@ impl JoinSides {
         joined: Vec<String>,
     ) -> Result<JoinSides, CatalogError> {
         assert!(!joined.is_empty(), "a JOIN joins at least one table");
-        let (from_columns, from_virtual) = join_columns_of(client, &from).await?;
+        let from_live = LiveTable::read(client, &from).await?;
+        let (from_columns, from_virtual) = (from_live.typed(), from_live.virtual_columns);
         let mut sides = Vec::with_capacity(joined.len());
         for table in joined {
-            let (columns, virtual_columns) = join_columns_of(client, &table).await?;
+            let live = LiveTable::read(client, &table).await?;
             sides.push(JoinedSide {
                 table,
-                columns,
-                virtual_columns,
+                columns: live.typed(),
+                virtual_columns: live.virtual_columns,
             });
         }
         Ok(JoinSides {
@@ -4862,6 +4858,21 @@ impl JoinSides {
         std::iter::once(self.from.as_str()).chain(self.joined_tables())
     }
 
+    /// [`JoinSides::tables`], each with its side, as
+    /// [`validate_live_schema`] reads them.
+    fn read_tables(&self) -> Vec<(&str, Option<super::join::Side>)> {
+        self.tables()
+            .enumerate()
+            .map(|(index, table)| {
+                let side = match index {
+                    0 => super::join::Side::From,
+                    _ => super::join::Side::Joined(super::join::Position::of_index(index - 1)),
+                };
+                (table, Some(side))
+            })
+            .collect()
+    }
+
     /// Every table in table-name order: the order define and a resume
     /// bump their version fences in.
     fn tables_in_order(&self) -> Vec<&str> {
@@ -4891,97 +4902,8 @@ async fn check_aggregate_admitted(
     if !matches!(def.key_space, KeySpace::Aggregate { .. }) {
         return Ok(());
     }
-    let (columns, _) = join_columns_of(client, qualified_source).await?;
+    let columns = LiveTable::read(client, qualified_source).await?.typed();
     Ok(super::validate::validate_aggregate_admitted(def, &columns)?)
-}
-
-/// Every column of `qualified` as the validator reads it ([`join_columns_of`]
-/// without the virtual columns): what a definition's floor is computed over
-/// ([`super::floor::of_live`]).
-pub(crate) async fn column_infos(
-    client: &impl GenericClient,
-    qualified: &str,
-) -> Result<HashMap<String, super::validate::JoinColumnInfo>, CatalogError> {
-    Ok(join_columns_of(client, qualified).await?.0)
-}
-
-/// Every column of `qualified` as [`super::validate::validate_join`] reads
-/// it. Like [`live_source_columns`], a column whose type the registry can't
-/// place is left out, so a reference to it is an unresolved column. Also,
-/// from the same query, the table's virtual generated columns.
-async fn join_columns_of(
-    client: &impl GenericClient,
-    qualified: &str,
-) -> Result<
-    (
-        HashMap<String, super::validate::JoinColumnInfo>,
-        VirtualColumns,
-    ),
-    CatalogError,
-> {
-    let rows = client
-        .query(
-            &format!(
-                "select a.attname::text,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod),
-                    a.atttypid,
-                    a.atttypmod,
-                    a.attcollation,
-                    co.collname::text,
-                    coalesce(co.collisdeterministic, true),
-                    t.typtype = 'e',
-                    {},
-                    {},
-                    {VIRTUAL_EXPRESSION_SQL}
-             from pg_attribute a
-             join pg_catalog.pg_type t on t.oid = a.atttypid
-             left join pg_catalog.pg_collation co on co.oid = a.attcollation
-             where a.attrelid = pg_catalog.to_regclass($1)
-               and a.attnum > 0
-               and not a.attisdropped",
-                super::copy_type::type_sql("a.atttypid"),
-                super::copy_type::collation_sql("a.attcollation")
-            ),
-            &[&ddl::regclass_arg(qualified)],
-        )
-        .await?;
-    // A column of a table Trellis creates has no type modifier (ADR-0020).
-    let trellis_target: bool = client
-        .query_one(
-            "select exists (select 1 from transform_definitions where target_table = $1)",
-            &[&qualified],
-        )
-        .await?
-        .get(0);
-    let mut columns = HashMap::with_capacity(rows.len());
-    let mut virtual_columns = VirtualColumns::new();
-    for row in rows {
-        if let Some(expression) = row.get::<_, Option<String>>(10) {
-            virtual_columns.insert(row.get(0), expression);
-        }
-        let type_oid: u32 = row.get(2);
-        let value_type = super::pg_type::value_type_for_oid(client, type_oid).await?;
-        if value_type == ValueType::Other(PgType::Unrecognized) {
-            continue;
-        }
-        columns.insert(
-            row.get::<_, String>(0),
-            super::validate::JoinColumnInfo {
-                value_type,
-                pg_type: row.get(1),
-                type_oid,
-                typmod: row.get(3),
-                collation_oid: row.get(4),
-                collation: row.get(5),
-                collation_deterministic: row.get(6),
-                is_enum: row.get(7),
-                copy_type: row.get(8),
-                copy_collation: row.get(9),
-                trellis_target,
-            },
-        );
-    }
-    Ok((columns, virtual_columns))
 }
 
 /// The fully-qualified source [`install_definition`]'s own DDL steps read
@@ -5050,67 +4972,8 @@ async fn qualified_table_exists(
     Ok(exists)
 }
 
-/// A column's type and collation as Postgres reports them (`pg_attribute`,
-/// `pg_collation`), for [`assert_deterministic_key_collation`]
-/// and the collation check of a text function's argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveColumn {
-    /// The collation's `collname` (`default` for the database default),
-    /// `None` for a type that isn't collatable.
-    collation: Option<String>,
-    /// `pg_collation.collisdeterministic`; `true` when there is no
-    /// collation.
-    collation_deterministic: bool,
-}
-
-/// `query_table.column`'s collation: `None` for a table or column that
-/// doesn't exist. Serves the key-column collation check
-/// ([`assert_deterministic_key_collation_in_txn`]), whose caller
-/// has already resolved the column some other way.
-async fn column_in_txn(
-    txn: &impl GenericClient,
-    query_table: &str,
-    column: &str,
-) -> Result<Option<LiveColumn>, CatalogError> {
-    let row = txn
-        .query_opt(
-            "select co.collname::text, coalesce(co.collisdeterministic, true)
-             from pg_attribute a
-             left join pg_catalog.pg_collation co on co.oid = a.attcollation
-             where a.attrelid = pg_catalog.to_regclass($1)
-               and a.attname = $2
-               and a.attnum > 0
-               and not a.attisdropped",
-            &[&ddl::regclass_arg(query_table), &column],
-        )
-        .await?;
-    Ok(row.map(|row| LiveColumn {
-        collation: row.get(0),
-        collation_deterministic: row.get(1),
-    }))
-}
-
 /// Rejects `table.column`, a column the engine matches as a key in the role
-/// `key`, if [`column_in_txn`] finds it has a nondeterministic collation.
-/// A column that doesn't exist passes: every caller has already
-/// resolved it (it came from the table's own key index, or [`validate`]
-/// checked it), and the check that resolved it owns that error.
-async fn assert_deterministic_key_collation_in_txn(
-    txn: &tokio_postgres::Transaction<'_>,
-    key: KeyColumnRole,
-    table: &str,
-    column: &str,
-) -> Result<(), CatalogError> {
-    match column_in_txn(txn, table, column).await? {
-        Some(resolved) => Ok(assert_deterministic_key_collation(
-            key, table, column, &resolved,
-        )?),
-        None => Ok(()),
-    }
-}
-
-/// [`assert_deterministic_key_collation_in_txn`]'s decision, on a column
-/// already looked up. The key-column twin of
+/// `key`, if it has a nondeterministic collation. The key-column twin of
 /// [`assert_deterministic_join_collation`]: a nondeterministic collation's
 /// `=` (and so its `GROUP BY` and unique indexes) treats distinct strings as
 /// equal, while the engine matches keys by their exact text, so Postgres
@@ -5128,7 +4991,7 @@ fn assert_deterministic_key_collation(
     key: KeyColumnRole,
     table: &str,
     column: &str,
-    resolved: &LiveColumn,
+    resolved: &JoinColumnInfo,
 ) -> Result<(), ValidationError> {
     if resolved.collation_deterministic {
         return Ok(());
@@ -5143,21 +5006,24 @@ fn assert_deterministic_key_collation(
     )))
 }
 
-/// Every check of definition `def`, sourced from `qualified_source`, that
-/// reads the live schema, in the order define runs them once its source
-/// resolves. Define runs it before it creates the target; every resume runs
-/// it again ([`revalidate`]), so a definition the schema has
-/// drifted from is refused, by the same rule and with the same error, on
-/// either path. Returns the source's row-identity key.
+/// Every check of definition `def` that reads the live schema of the tables
+/// it reads, in the order define runs them once those tables resolve.
+/// `tables` is the source alone (side `None`), or a `JOIN`'s tables, the
+/// `FROM` table first, each with its side. Define runs it before it creates
+/// the target; every resume runs it again ([`revalidate`]), so a definition
+/// the schema has drifted from is refused, by the same rule and with the same
+/// error, on either path. Returns the first table's row-identity key.
 ///
-/// - **The source key** ([`ddl::source_primary_key_in_txn`]): every
+/// - **Each table's key** ([`super::source_key::admitted_key`]): every
 ///   key-space's, since live apply keys an aggregate's changes by it too,
 ///   and a type off the key allowlist would halt its readers. Its
-///   columns, and any `GROUP BY` key, need a deterministic collation, and
-///   so does any column a field's `STRPOS`/`REGEXP_COUNT` reads. A
-///   source that capture can't key is refused.
+///   columns, and any `GROUP BY` key, need a deterministic collation. A
+///   table that capture can't key is refused.
+/// - **A plain definition's text functions**: any column a field's
+///   `STRPOS`/`REGEXP_COUNT` reads needs a deterministic collation. A
+///   `JOIN`'s are [`super::validate::validate_join`]'s.
 /// - **Row-level security and subscriptions**: row-level
-///   security that applies to a role reading the source
+///   security that applies to a role reading a table
 ///   ([`side_read_table`]) would refuse the reads (every Trellis session runs
 ///   with `row_security = off`), and a table a logical-replication
 ///   subscription writes is one whose changes capture never sees. Define
@@ -5167,72 +5033,43 @@ pub(crate) async fn validate_live_schema(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
     def: &TransformDef,
-    qualified_source: &str,
+    tables: &[(&str, Option<super::join::Side>)],
     this: Option<&str>,
 ) -> Result<Vec<ddl::PrimaryKeyColumn>, CatalogError> {
-    let declared = def.source_key.as_deref();
-    let source_key = super::source_key::admitted_key(txn, qualified_source, declared)
-        .await
-        .map_err(CatalogError::Ddl)?
-        .0;
-    super::source_key::check_one_key(txn, qualified_source, declared, this)
-        .await
-        .map_err(CatalogError::Ddl)?;
-    assert_deterministic_definition_keys(txn, def, qualified_source, &source_key).await?;
-    assert_collation_safe_text_functions(txn, def, qualified_source, None).await?;
-    assert_regexp_patterns_accepted(txn, def, None).await?;
-    reject_unkeyed_source(txn, qualified_source, def).await?;
-
-    let read_tables = vec![side_read_table(txn, qualified_source).await?];
-    reject_row_security(txn, schema, &read_tables).await?;
-    let read_tables: Vec<&str> = read_tables
-        .iter()
-        .map(|(table, _)| table.as_str())
-        .collect();
-    reject_subscribed(txn, &read_tables).await?;
-    Ok(source_key)
-}
-
-/// [`validate_live_schema`] for a `JOIN` definition: each side is
-/// held to the rules a definition's source is (a usable row-identity key of
-/// deterministic collation, a primary key or another definition's target),
-/// and neither may be under row-level security that applies to its readers
-/// or replicated into by a subscription. The join and `GROUP BY` columns'
-/// types and collations are [`super::validate::validate_join`]'s.
-pub(crate) async fn validate_live_join_schema(
-    txn: &tokio_postgres::Transaction<'_>,
-    schema: &str,
-    def: &TransformDef,
-    sides: &JoinSides,
-    this: Option<&str>,
-) -> Result<(), CatalogError> {
-    let joined = sides.joined.iter().enumerate().map(|(index, side)| {
-        (
-            side.table.as_str(),
-            super::join::Side::Joined(super::join::Position::of_index(index)),
-        )
-    });
-    for (side, which) in
-        std::iter::once((sides.from.as_str(), super::join::Side::From)).chain(joined)
-    {
-        let declared = super::source_key::declared_on(def, Some(which));
-        let key = super::source_key::admitted_key(txn, side, declared)
+    let plain = matches!(tables, [(_, None)]);
+    let mut first_key = None;
+    for &(table, side) in tables {
+        let declared = super::source_key::declared_on(def, side);
+        let key = super::source_key::admitted_key(txn, table, declared)
             .await
             .map_err(CatalogError::Ddl)?
             .0;
-        super::source_key::check_one_key(txn, side, declared, this)
+        super::source_key::check_one_key(txn, table, declared, this)
             .await
             .map_err(CatalogError::Ddl)?;
-        assert_deterministic_definition_keys(txn, def, side, &key).await?;
-        reject_unkeyed_source(txn, side, def).await?;
+        let live = LiveTable::read(txn, table).await?;
+        assert_deterministic_definition_keys(def, table, &live, &key)?;
+        if plain {
+            assert_collation_safe_text_functions(def, table, &live, None)?;
+            assert_regexp_patterns_accepted(txn, def, None).await?;
+        }
+        reject_unkeyed_source(txn, table, def).await?;
+        first_key.get_or_insert(key);
     }
-    let mut read_tables = Vec::with_capacity(1 + sides.joined.len());
-    for table in sides.tables() {
+    let mut read_tables = Vec::with_capacity(tables.len());
+    for &(table, _) in tables {
         read_tables.push(side_read_table(txn, table).await?);
     }
-    assert_regexp_patterns_accepted(txn, def, None).await?;
+    // A `JOIN` probes its patterns once, after every table's key; a plain
+    // definition did above, ahead of its unkeyed-source refusal. The order
+    // decides which refusal a definition with both gets.
+    if !plain {
+        assert_regexp_patterns_accepted(txn, def, None).await?;
+    }
     reject_row_security(txn, schema, &read_tables).await?;
-    reject_subscribed(txn, &sides.tables().collect::<Vec<_>>()).await
+    let read_tables: Vec<&str> = tables.iter().map(|&(table, _)| table).collect();
+    reject_subscribed(txn, &read_tables).await?;
+    Ok(first_key.unwrap_or_default())
 }
 
 /// A table a definition reads (its source, or a side of a `JOIN`) with the
@@ -5331,7 +5168,7 @@ async fn reject_target_in_catalog_schema(
 #[derive(Debug, Clone)]
 pub(crate) struct Revalidated {
     /// The source's columns and their value types, as define reads them
-    /// ([`live_source_columns`]).
+    /// ([`LiveTable::value_types`]).
     pub source_columns: HashMap<String, ValueType>,
     /// A `JOIN` definition's two tables and their live columns.
     pub join: Option<JoinSides>,
@@ -5383,7 +5220,8 @@ pub(crate) async fn revalidate_keyed(
     if !joined.is_empty() {
         return revalidate_join(txn, schema, floors, definition, joined).await;
     }
-    let (source_columns, virtual_columns) = live_source_columns_and_virtual(txn, source).await?;
+    let live = LiveTable::read(txn, source).await?;
+    let source_columns = live.value_types();
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
     }
@@ -5395,29 +5233,17 @@ pub(crate) async fn revalidate_keyed(
         }
         return Err(err.into());
     }
-    reject_virtual_generated_reads(&definition.def, None, source, &virtual_columns)?;
+    reject_virtual_generated_reads(&definition.def, None, source, &live.virtual_columns)?;
     let source_key = validate_live_schema(
         txn,
         schema,
         &definition.def,
-        source,
+        &[(source, None)],
         Some(&definition.target_table),
     )
     .await?;
     if let KeySpace::OneToOne = definition.def.key_space {
-        let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
-            .await?
-            .into_iter()
-            .map(|c| c.name)
-            .collect();
-        let source_key: Vec<String> = source_key.into_iter().map(|c| c.name).collect();
-        if !target_key.is_empty() && target_key != source_key {
-            return Err(CatalogError::SourceKeyChanged {
-                source_table: source.to_string(),
-                target_key,
-                source_key,
-            });
-        }
+        reject_target_rekeyed(txn, &definition.target_table, source, source_key).await?;
     }
     // The aggregates define refuses by family (a `SUM`/`AVG` over a column
     // re-typed to a float), which define makes once the table exists.
@@ -5435,6 +5261,32 @@ pub(crate) async fn revalidate_keyed(
         source_columns,
         join: None,
     })
+}
+
+/// Refuses a resume of a definition whose target is keyed by `target_table`'s
+/// own key columns ([`ddl::identity_key_columns`]) when they are no longer
+/// `source_key`, the key of `source_table` it mirrors: a changed key's only
+/// repair is to drop and define again. A target with no key passes.
+async fn reject_target_rekeyed(
+    txn: &tokio_postgres::Transaction<'_>,
+    target_table: &str,
+    source_table: &str,
+    source_key: Vec<ddl::PrimaryKeyColumn>,
+) -> Result<(), CatalogError> {
+    let target_key: Vec<String> = ddl::identity_key_columns(txn, target_table)
+        .await?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    let source_key: Vec<String> = source_key.into_iter().map(|c| c.name).collect();
+    if !target_key.is_empty() && target_key != source_key {
+        return Err(CatalogError::SourceKeyChanged {
+            source_table: source_table.to_string(),
+            target_key,
+            source_key,
+        });
+    }
+    Ok(())
 }
 
 /// [`revalidate`] for a `JOIN` definition: both tables, and every
@@ -5461,11 +5313,11 @@ async fn revalidate_join(
         &sides.joined_column_maps(),
     )?;
     reject_virtual_join_reads(&definition.def, &sides)?;
-    validate_live_join_schema(
+    validate_live_schema(
         txn,
         schema,
         &definition.def,
-        &sides,
+        &sides.read_tables(),
         Some(&definition.target_table),
     )
     .await?;
@@ -5480,24 +5332,12 @@ async fn revalidate_join(
             &sides.joined_tables().collect::<Vec<_>>(),
         )
         .await?;
-        let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
-            .await?
-            .into_iter()
-            .map(|c| c.name)
-            .collect();
-        let source_key: Vec<String> = ddl::source_primary_key_in_txn(txn, &sides.from)
+        // The `FROM` table's recorded key, where a plain 1-1 compares the
+        // key `validate_live_schema` admits, which honours a declared `KEY`.
+        let source_key = ddl::source_primary_key_in_txn(txn, &sides.from)
             .await
-            .map_err(CatalogError::Ddl)?
-            .into_iter()
-            .map(|c| c.name)
-            .collect();
-        if !target_key.is_empty() && target_key != source_key {
-            return Err(CatalogError::SourceKeyChanged {
-                source_table: sides.from.clone(),
-                target_key,
-                source_key,
-            });
-        }
+            .map_err(CatalogError::Ddl)?;
+        reject_target_rekeyed(txn, &definition.target_table, &sides.from, source_key).await?;
     }
     reject_row_security(
         txn,
@@ -5960,62 +5800,6 @@ pub(crate) async fn record_source_columns(
     Ok(())
 }
 
-/// The live columns of `qualified` (an unquoted `schema.table`) the
-/// validator can type, with their [`ValueType`]s, as define reads them.
-/// Empty for a table that doesn't exist.
-///
-/// Classified by each column's `atttypid` through
-/// [`super::pg_type::value_type_for_oid`], which also places a user-defined
-/// enum. A column whose type the registry can't place at all
-/// (an array, a range, a composite, a domain, `citext`) is left out, so the
-/// validator reports a reference to it as an unknown column: everything
-/// downstream needs its real Postgres type, and `Unrecognized` isn't one.
-/// Promoting those families is `docs/type-support.md`'s deferred work
-/// (#122).
-pub(crate) async fn live_source_columns(
-    client: &impl GenericClient,
-    qualified: &str,
-) -> Result<HashMap<String, ValueType>, CatalogError> {
-    Ok(live_source_columns_and_virtual(client, qualified).await?.0)
-}
-
-/// [`live_source_columns`], and, from the same query, `qualified`'s virtual
-/// generated columns with their expressions ([`VirtualColumns`]), for
-/// [`reject_virtual_generated_reads`].
-pub(crate) async fn live_source_columns_and_virtual(
-    client: &impl GenericClient,
-    qualified: &str,
-) -> Result<(HashMap<String, ValueType>, VirtualColumns), CatalogError> {
-    let rows = client
-        .query(
-            &format!(
-                "select a.attname::text, a.atttypid, {VIRTUAL_EXPRESSION_SQL} \
-                 from pg_attribute a \
-                 where a.attrelid = pg_catalog.to_regclass($1) \
-                   and a.attnum > 0 \
-                   and not a.attisdropped"
-            ),
-            &[&ddl::regclass_arg(qualified)],
-        )
-        .await?;
-    let mut columns = HashMap::with_capacity(rows.len());
-    let mut virtual_columns = VirtualColumns::new();
-    for row in rows {
-        let column_name: String = row.get(0);
-        let type_oid: u32 = row.get(1);
-        if let Some(expression) = row.get::<_, Option<String>>(2) {
-            virtual_columns.insert(column_name.clone(), expression);
-        }
-        match super::pg_type::value_type_for_oid(client, type_oid).await? {
-            ValueType::Other(super::PgType::Unrecognized) => {}
-            value_type => {
-                columns.insert(column_name, value_type);
-            }
-        }
-    }
-    Ok((columns, virtual_columns))
-}
-
 /// A table's virtual generated columns (`pg_attribute.attgenerated = 'v'`,
 /// PostgreSQL 18 and later; never present before), each with its
 /// generation expression as `pg_get_expr` pretty-prints it (`img * 2`, with
@@ -6102,41 +5886,40 @@ pub(crate) fn virtual_column_text(table: &str, column: &str, expression: &str) -
 /// of its keys has a nondeterministic collation
 /// ([`assert_deterministic_key_collation`]). Those keys are:
 ///
-/// - the source's row-identity key (`source_key`, which
-///   [`ddl::source_primary_key_in_txn`] just resolved): apply keys every
+/// - `table`'s row-identity key (`source_key`, which
+///   [`super::source_key::admitted_key`] just resolved): apply keys every
 ///   staged change by it, and a 1-1 target mirrors it as its own key;
 /// - an aggregate's `GROUP BY` keys. The target's group key is their exact
 ///   text.
 ///
+/// Each column is looked up in `live`, `table`'s columns. A column that
+/// isn't there passes: every caller has already resolved it (it came from
+/// the table's own key index, or [`validate`] checked it), and the check
+/// that resolved it owns that error.
+///
 /// The target's own key columns need no check: Trellis creates the target
 /// with no `COLLATE` clause, so they take the database default, which is
 /// always deterministic.
-async fn assert_deterministic_definition_keys(
-    txn: &tokio_postgres::Transaction<'_>,
+fn assert_deterministic_definition_keys(
     def: &TransformDef,
-    qualified_source: &str,
+    table: &str,
+    live: &LiveTable,
     source_key: &[ddl::PrimaryKeyColumn],
-) -> Result<(), CatalogError> {
-    for column in source_key {
-        assert_deterministic_key_collation_in_txn(
-            txn,
-            KeyColumnRole::SourceKey,
-            qualified_source,
-            &column.name,
-        )
-        .await?;
-    }
-    let KeySpace::Aggregate { group_by } = &def.key_space else {
-        return Ok(());
+) -> Result<(), ValidationError> {
+    let source_key = source_key
+        .iter()
+        .map(|column| (KeyColumnRole::SourceKey, column.name.as_str()));
+    let group_by = match &def.key_space {
+        KeySpace::Aggregate { group_by } => group_by.as_slice(),
+        _ => &[],
     };
-    for column in group_by {
-        assert_deterministic_key_collation_in_txn(
-            txn,
-            KeyColumnRole::GroupBy,
-            qualified_source,
-            column,
-        )
-        .await?;
+    let group_by = group_by
+        .iter()
+        .map(|column| (KeyColumnRole::GroupBy, column.as_str()));
+    for (role, column) in source_key.chain(group_by) {
+        if let Some(resolved) = live.column(column) {
+            assert_deterministic_key_collation(role, table, column, &resolved.info)?;
+        }
     }
     Ok(())
 }
@@ -6201,37 +5984,34 @@ pub async fn assert_regexp_patterns_accepted(
 /// `0A000` for both under such a collation, while the engine computes them
 /// from the exact text, so the two would disagree. `only_fields`, if given,
 /// limits the check to those fields (`ALTER TRANSFORM`'s added and altered
-/// ones). A column that doesn't exist passes, as in
-/// [`assert_deterministic_key_collation_in_txn`]: `validate` owns that error.
-async fn assert_collation_safe_text_functions(
-    txn: &tokio_postgres::Transaction<'_>,
+/// ones). `live` is `qualified_source`'s columns. A column that doesn't
+/// exist passes, as in [`assert_deterministic_definition_keys`]: `validate`
+/// owns that error.
+fn assert_collation_safe_text_functions(
     def: &TransformDef,
     qualified_source: &str,
+    live: &LiveTable,
     only_fields: Option<&[FieldDef]>,
-) -> Result<(), CatalogError> {
+) -> Result<(), ValidationError> {
     for read in super::validate::collation_refusing_function_reads(def) {
         if let Some(only) = only_fields
             && !only.iter().any(|field| field.name == read.field)
         {
             continue;
         }
-        let (table, column) = (qualified_source.to_string(), &read.column);
-        let Some(resolved) = column_in_txn(txn, &table, column).await? else {
+        let Some(resolved) = live.column(&read.column) else {
             continue;
         };
-        if !resolved.collation_deterministic {
-            return Err(
-                ValidationError::NondeterministicCollationTextFunction(Box::new(
-                    NondeterministicCollationTextFunction {
-                        field: read.field,
-                        function: read.function,
-                        table,
-                        column: column.clone(),
-                        collation: resolved.collation.unwrap_or_default(),
-                    },
-                ))
-                .into(),
-            );
+        if !resolved.info.collation_deterministic {
+            return Err(ValidationError::NondeterministicCollationTextFunction(
+                Box::new(NondeterministicCollationTextFunction {
+                    field: read.field,
+                    function: read.function,
+                    table: qualified_source.to_string(),
+                    column: read.column,
+                    collation: resolved.info.collation.clone().unwrap_or_default(),
+                }),
+            ));
         }
     }
     Ok(())
@@ -8601,19 +8381,28 @@ mod reported_status_tests {
 }
 
 /// The pure key-collation check, over hand-built
-/// [`LiveColumn`]s carrying the OIDs Postgres reports.
+/// columns carrying the collations Postgres reports.
 #[cfg(test)]
 mod key_collation_tests {
     use super::*;
 
-    fn column() -> LiveColumn {
-        LiveColumn {
+    fn column() -> JoinColumnInfo {
+        JoinColumnInfo {
+            value_type: ValueType::Text,
+            pg_type: "text".to_string(),
+            type_oid: 25,
+            typmod: -1,
+            collation_oid: 0,
             collation: None,
             collation_deterministic: true,
+            is_enum: false,
+            copy_type: "text".to_string(),
+            copy_collation: None,
+            trellis_target: false,
         }
     }
 
-    fn collated(mut column: LiveColumn, name: &str) -> LiveColumn {
+    fn collated(mut column: JoinColumnInfo, name: &str) -> JoinColumnInfo {
         column.collation = Some(name.to_string());
         column
     }

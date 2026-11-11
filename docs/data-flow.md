@@ -182,9 +182,14 @@ new ones, never an empty or partial target.
 
 ### Re-reading a table for its applying readers
 
-When the staging worker reinstalls a table's triggers while definitions
-already apply from it (a restored database's triggers came back disabled,
-say), those definitions have missed whatever committed meanwhile. An explicit
+When the staging worker installs capture on a leaf new to a captured
+partitioned source, the definitions already applying from the source have
+missed the rows the leaf already held. An aggregate or a `JOIN` that the
+partition correction engine serves is corrected for that leaf alone
+([ADR-0017](decisions/0017-partitioned-sources.md)); any other reader is
+re-read. Capture triggers disabled, dropped or recreated outside Trellis, and
+a database restored from a logical dump, pause the readers rather than re-read them
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)). An explicit
 `Trellis::request_backfill` on a captured table asks for the same re-read. It
 takes the table's `schema.table` name, or a bare name when exactly one captured
 table carries it; a bare name two captured tables share is refused, naming both.
@@ -334,7 +339,7 @@ dependents, and the rest stays readable.
 Quarantine storage and the API to discover and clear quarantines are
 [ADR-0003](decisions/0003-quarantine-storage-and-api.md). Quarantine is
 one state of a transform's broader **lifecycle status** (see
-[observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
+[the status reference](status-reference.md)).
 For how a killer change is isolated, evicted, and its parked work kept honest so
 a quarantined key still blocks a waiting reader, see
 [stage 06](staging-and-claiming/06-cleanup-and-reclaim.md).
@@ -382,7 +387,7 @@ re-install, or an automatic rebuild) never empties its target: it rewrites
 the target's rows in place while changes keep applying, so a reader sees
 each row's previous value until the rebuild rewrites it. The transform reads
 `backfilling` until the rebuild is done
-([observability](observability.md#transform-status-lifecycle)).
+([status reference](status-reference.md#backfilling)).
 
 ## Correctness
 

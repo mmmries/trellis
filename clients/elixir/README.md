@@ -56,7 +56,8 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   value (`{:transform_defined, target_table}`, `:paused`,
   `{:resumed, addresses}`, ...). `define/2` is an `apply/2` that refuses
   anything but a `TRANSFORM`.
-- `status/2`, `definitions/1`: the catalog reads.
+- `status/2`, `definitions/1`: the catalog reads (each status word and
+  field: the [status reference](../../docs/status-reference.md)).
 - `quarantined/1`, `quarantine_status/2`, `sample_quarantined/3`,
   `poisoned_since/2`: the quarantine reads. Resuming is a statement.
   `release_key/4` releases one key a transform holds, once its cause is

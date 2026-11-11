@@ -242,8 +242,9 @@ So:
   function, a drain or build refused a read halts the definitions it reaches,
   and `self_check` reports it.
 * **Tables Trellis can read.** Row-level security that applies to the Trellis
-  role, a logical-replication subscription into a source, a source without a
-  primary key, and a partition or a table in an inheritance hierarchy: each
+  role, a logical-replication subscription into a source, a source with
+  neither a primary key nor a `KEY (…)` naming its key, and a partition or a
+  table in an inheritance hierarchy: each
   is refused at define time, and pauses the transform if it comes about
   later. A partitioned table is a source when its partition key is in the
   group key, read through its root. The full list
@@ -289,7 +290,7 @@ So:
   `waiting_to_backfill` (or `backfilling`, after an `ALTER TRANSFORM` that reads
   a new source column), and `status()` reports what it waits on
   (`capture_wait`), or `capture_failure` when the install fails for another
-  reason, such as a source that lost its primary key. Every process's
+  reason, such as a source that lost the key it is read by. Every process's
   `status()` reports both, wherever the worker runs.
 
 ```rust
@@ -599,149 +600,25 @@ Poll on a timer (not once at boot, since a worker process can be scaled to
 zero well after a healthy start), and treat `false` as "every transform in
 this fleet may be silently stuck," not as a transient blip to retry past.
 
-### Halted definitions
+### Definitions that stopped
 
 The worker checks say the fleet is running; they can't say a definition has
-stopped. A halting failure (a source key the drain can't use, a propagation
-wave past the hop bound, an aggregate the group basis can't apply, or Postgres refusing the
-drain's role a read or write) pauses the definitions it reaches, and every
-other definition keeps converging
-([observability — A halting failure](observability.md#a-halting-failure)). A
-halted definition reports `paused`, the same word as an operator pause, so
-check `DefinitionSummary::halt` rather than the status: it is set only on a
-halted definition, and carries the table the failure named, the error and when
-it was found. For an aggregate the group basis can't apply, that table is the
-aggregate's target, not a source. One `definitions()` call answers for every definition:
+stopped while every other one keeps converging. Poll these on the same timer,
+from `definitions()` and `status(target)`; the
+[status reference](status-reference.md) has each with its binding types and
+an example:
 
-```rust
-let halted: Vec<_> = trellis
-    .definitions()
-    .await?
-    .into_iter()
-    .filter(|summary| summary.halt.is_some())
-    .collect();
-if !halted.is_empty() {
-    // Each stays paused, and its target stale, until it is fixed and
-    // resumed — page someone.
-}
-```
-
-In Elixir, `halt` is a `%Trellis.CaptureFailure{kind: :halt}` or
-`nil`; in Ruby, a `Trellis::CaptureFailure` with `kind` `:halt`, or `nil`:
-
-```elixir
-halted = Enum.filter(Trellis.definitions!(trellis), & &1.halt)
-```
-
-```ruby
-halted = Trellis.definitions.select(&:halt)
-```
-
-Poll it on the same timer as the worker checks. Clear a halt by fixing its
-cause and resuming each halted definition (`RESUME TRANSFORM`), in any order;
-resuming while the cause persists halts it again.
-
-### Drain holdups
-
-Some failures stall a drain page without pausing anything or charging a key: a
-refused read or write the catalog can't pin on a table (a column grant, a
-function's `EXECUTE`, one of Trellis's own tables), records that fail only
-together, or a failure that keeps reproducing until the page's retries run out.
-Every drain pass retries the page, and the targets of the tables on it stop
-short of it, so every watermark token taken since waits on it
-([observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
-The drain records each as a *drain holdup*, which `status(target)` reports as
-`drain_failure` on every definition that isn't paused or quarantined and reads
-a table on the page: the segment, the
-tables, the latest error and its SQLSTATE, when it started and last failed, and
-how many passes have. The definition's status stays what it was (`live`, say),
-so check the field, not the word. `self_check` reports every open holdup with
-each audit (`drain_failures`), whichever target it audits. A holdup clears in
-the transaction that commits its page, so fix the cause the error names; there
-is nothing to resume.
-
-`status` takes a target's `target_table` as `definitions()` lists it, or the bare
-table name; every call that names a transform takes either form:
-
-```rust
-for summary in trellis.definitions().await? {
-    if let Some(status) = trellis.status(&summary.target_table).await?
-        && let Some(held) = &status.drain_failure
-    {
-        // The drain has failed on segment `held.seg_seq` since `held.since`,
-        // `held.attempts` times: page someone with `held.error`.
-    }
-}
-```
-
-In Elixir, `drain_failure` is a `%Trellis.DrainFailure{}` or `nil`, and
-`self_check`'s report lists them in `drain_failures`; in Ruby, a
-`Trellis::DrainFailure` or `nil`, and `SelfCheckReport#drain_failures`. Both
-carry `seg_seq`, `tables`, `error`, `sqlstate` (`nil` for a failure that didn't
-come from Postgres), `since` and `last_seen` (a `DateTime` in Elixir, a `Time`
-in Ruby) and `attempts`:
-
-```elixir
-held_up =
-  Enum.flat_map(Trellis.definitions!(trellis), fn summary ->
-    case Trellis.status!(trellis, summary.target_table) do
-      %Trellis.Status{drain_failure: %Trellis.DrainFailure{} = held} ->
-        [{summary.target_table, held}]
-
-      _ -> []
-    end
-  end)
-```
-
-```ruby
-held_up = Trellis.definitions.filter_map do |summary|
-  held = Trellis.status(summary.target_table)&.drain_failure
-  [summary.target_table, held] if held
-end
-```
-
-The CLI's `trellis status` prints each one on an indented line under the
-definition it holds back.
-
-### Source indexes
-
-A `GROUP BY` aggregate on the group basis and a `JOIN` need an index on their
-source tables, which you create alongside the definition; Trellis never does.
-For an aggregate it is a btree index leading with the `GROUP BY` columns, in `GROUP BY` order
-(`create index on orders (customer_id)`); for a `JOIN`, one on each side leading
-with that side's `ON` columns, in `ON` order. A primary key or unique constraint
-that leads with them is enough. Define and `RESUME` refuse without it, with the
-`create index` to run in the message, unless the definition says `WITHOUT SOURCE
-INDEX` after its `GROUP BY` or `JOIN` clause. `status(target)` reports an index
-dropped since, or one an opted-out definition lacks, as `source_index_gaps`
-(`table`, `columns`, `role`, `opted_out` and `fix`, the statement to run); `role`
-says which part of the definition needs the index: the `GROUP BY` columns
-(`group_by`), or a `JOIN`'s `ON` columns on its from side (`join_from`) or its
-joined side (`join_joined`). In
-`trellis-embed` that is `PlainDefinitionStatus::source_index_gaps`. The warning
-pauses nothing, but `self_check` refuses a definition that did not opt out. See
-[Supported sources and targets](transforms.md#supported-sources-and-targets).
-
-### A reader of a paused column
-
-A `live` definition reading a paused column of an upstream 1-1 target (its fuse
-tripped, or `PAUSE TRANSFORM t.col`) reports `catching_up`, and `status(target)`
-names the column or columns as `paused_upstream_columns`, each `target.column`
-(`PlainDefinitionStatus::paused_upstream_columns` in `trellis-embed`). Nothing is
-paused: resuming the column writes through to the reader and it reads `live` again.
-
-### Partitions under correction
-
-`status(target)` reports, as `correcting`, each partition of a partitioned
-source the definition is being corrected for after the partition was
-attached, detached, dropped or truncated: `node` (`schema.table`), `since`
-(when the staging worker queued the correction) and `keys_remaining` (`None`
-until the correction has counted its keys). The definition reads `backfilling`
-while an entry is listed
-([observability — Transform status lifecycle](observability.md#transform-status-lifecycle)).
-In `trellis-embed`, `PlainDefinitionStatus` carries it as `correcting`, each
-entry with `node`, `since_micros` and `keys_remaining`. The CLI's
-`trellis status` prints each entry on a `correcting` line under its definition.
+* a halted definition, which reports `paused` like an operator pause:
+  `DefinitionSummary::halt` on `definitions()`
+  ([finding halted definitions](status-reference.md#capture_failure));
+* a drain page that keeps failing, which leaves the status word as it was:
+  [`drain_failure`](status-reference.md#drain_failure);
+* a source index a `GROUP BY` or `JOIN` definition needs and lacks:
+  [`source_index_gaps`](status-reference.md#source_index_gaps);
+* a paused upstream column a `live` definition reads, which reports
+  `catching_up`: [`paused_upstream_columns`](status-reference.md#paused_upstream_columns);
+* the partitions a definition is being corrected for while it reads
+  `backfilling`: [`correcting`](status-reference.md#correcting).
 
 ## Migrations and transactions
 
@@ -1095,18 +972,18 @@ Elixir atoms, Ruby symbols), or nothing if no transform writes that table:
 | `catching_up` | Maintained, but reads an upstream transform that isn't `live`, or a paused column of one, so its target may be missing changes. Reported while that holds, never stored. | Keep polling. |
 | `live` | The steady state. | Done. |
 | `quarantined` | Too many source rows failed to apply, so the fuse froze it. | Stop and report it. |
-| `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis because it can't keep the target correct: capture broke, its build kept failing, or the drain hit a failure every key reproduces ([all the causes](observability.md#transform-status-lifecycle)). | Stop and report it. |
+| `paused` | Frozen by a `PAUSE TRANSFORM`, or by Trellis because it can't keep the target correct: capture broke, its build kept failing, or the drain hit a failure every key reproduces ([all the causes](operations.md#paused-definitions)). | Stop and report it. |
 
-The lifecycle behind these words is in
-[transforms — Status](transforms.md#status) and
-[observability — Transform status lifecycle](observability.md#transform-status-lifecycle).
+The [status reference](status-reference.md) defines each word and field.
 Things a poll needs to handle:
 
-* **`waiting_to_backfill` has no deadline of its own.** A long-running
-  transaction holding a table lock the capture install needs, or (for a build
-  over another transform's target) any transaction older than the build's
-  fence, holds a backfill back until it ends
-  ([a build's fence](observability.md#a-builds-fence-on-a-seam-fed-source)),
+* **`waiting_to_backfill` and `backfilling` have no deadline of their own.**
+  A long-running transaction holding a table lock the capture install needs
+  holds a transform in `waiting_to_backfill` until it ends (`capture_wait`
+  names it), and, for a build over another transform's target, any
+  transaction older than the build's fence holds it in `backfilling`
+  (`build_wait`;
+  [a build's fence](observability.md#a-builds-fence-on-a-seam-fed-source)),
   and Trellis reports little but the status meanwhile. Poll with a deadline
   of your own, from somewhere that can wait (a deploy check, a background job),
   not a web request.
@@ -1121,7 +998,7 @@ Things a poll needs to handle:
   charged to no key that pauses nothing, a refused read the catalog can't pin
   on a table say, leaves the transform `live` (or wherever it was) while its
   target stops short of the page. `drain_failure` names it until the page
-  commits ([drain holdups](#drain-holdups)).
+  commits ([`drain_failure`](status-reference.md#drain_failure)).
 * **A schema change pauses, it never fails your writes.** Renaming or dropping a
   source column pauses every transform that reads it, with the table and column
   on `capture_failure`; the others on the table keep running.
@@ -1312,9 +1189,11 @@ let report = loop {
   the drain failures open on the instance. A job that finds its transform no
   longer live, its target no longer caught up, or its capture broken partway
   ends there with what it had found, `truncated`.
-* **A target `self_check` can't compare**
-  ([known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see)),
-  or an unknown name, is refused by the call that would start the job.
+* **A `GROUP BY` or `JOIN` target whose source lacks the index the walk
+  pages by** (listed in `status()`'s `source_index_gaps`), unless it was
+  defined `WITHOUT SOURCE INDEX`
+  ([transforms](transforms.md#a-source-without-the-index-its-self_check-walk-pages-by)),
+  and an unknown name, are refused by the call that would start the job.
 
 In Ruby the job is a `Trellis::SelfCheckJob` (`finished?` says whether to stop
 polling) and its report a `Trellis::SelfCheckReport`; in Elixir a
@@ -1323,10 +1202,12 @@ polling) and its report a `Trellis::SelfCheckReport`; in Elixir a
 
 ## What a transform can do
 
-A transform reads one source table (which needs a primary key) or another
-transform's target, is 1-1 or a `GROUP BY` aggregate, and computes its fields
-from the source row and from other fields; a `JOIN` transform aggregates the
-join of two tables. What the grammar accepts, what `define` refuses, and
+A transform reads one source table (keyed by its primary key, or by the
+columns a `KEY (…)` names) or another transform's target, is 1-1 or a
+`GROUP BY` aggregate, and computes its fields from the source row and from
+other fields; a `JOIN` transform aggregates the join of two tables, and a 1-1
+`JOIN` writes one target row per row of its `FROM` table, joined to up to four
+other tables (a star). What the grammar accepts, what `define` refuses, and
 which column types play which role are in
 [transforms](transforms.md) and the [type-support matrix](type-support.md).
 Whatever the shape, what you can rely on is the status lifecycle and the `live`

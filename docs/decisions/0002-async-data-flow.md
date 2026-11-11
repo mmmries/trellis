@@ -184,35 +184,21 @@ What it does there is one append.
   `DateStyle`, `TimeZone`, `bytea_output`, `IntervalStyle` and
   `extra_float_digits`; an encoding that reads every column costs 3.3 ms and
   323 KB per row on a 100 KB column, 40x the control, where naming only the
-  read columns costs +30 µs. The `WHEN` clause is a filter inside the function (a statement
-  trigger with transition tables can't take a `WHEN`): an update row whose
-  imaged columns are all unchanged (compared over the typed values) stages
-  nothing. The NEW image is the **live row** whenever it can differ from the
-  transition row: the fifth trigger, `<schema>_capture_begin` (`BEFORE … FOR
-  EACH STATEMENT`), marks each statement's span, and capture re-reads its
-  rows by primary key only when another write to the same table ran inside
-  that span (a nested same-key write), or when an update's old rows hold a
-  key twice (an FK action's update merged into the same capture call).
-  Otherwise it images the transition tables and reads no relation. An
-  unconditional re-read took btree predicate locks and failed 50–87% of
-  concurrent `SERIALIZABLE` auto-increment inserts with `40001`; gated, the
-  rate is 0, as with no capture.
+  read columns costs +30 µs. The `WHEN` clause is a filter inside the
+  function, since a statement trigger with transition tables can't take one.
+  The NEW image is the live row, re-read only when another write to the
+  table ran inside the statement's span, which the fifth trigger,
+  `<schema>_capture_begin` (`BEFORE … FOR EACH STATEMENT`), marks: an
+  unconditional re-read failed 50–87% of concurrent `SERIALIZABLE`
+  auto-increment inserts with `40001`; gated, none fail
+  ([stage 01](../staging-and-claiming/01-capture-by-triggers.md#when-capture-re-reads)).
 - **Must (R3, the image chain):** a row's images form a chain, each change's old
   image being the previous change's new image, so a group-basis reader's
-  sides telescope to the row's current contribution. A 1-1 Apply writes the
-  new image and needs no old one; a group-basis Apply takes every change's
-  old side from the ring. The live re-read breaks the chain where it fires:
-  a nested write stages its own change first, and the outer statement then
-  stages its transition old image against the live new image, so the row
-  counts as `2c − a − b` instead of `c − a`; a self-referencing `ON UPDATE
-  CASCADE` merges two updates of one row into one statement, and pairing by
-  key uses one old image twice. So a group-basis reader counts every
-  transition row exactly once, `Σf(NEW TABLE) − Σf(OLD TABLE)` per statement
-  (dropping a no-op pair is still exact, as a cancellation), and a ring row
-  the re-read wrote carries the statement's transition images for it
-  (`transition_images`, old and new); duplicate keys pair one to one, and
-  the sum is identical. The re-read also fires when an update's new rows hold a
-  key twice. *Evidence:* in my group-basis model the live images left
+  sides telescope to the row's current contribution. A 1-1 reader keeps the
+  live row; where the live re-read breaks the chain, a group-basis reader
+  counts every transition row exactly once
+  ([stage 01](../staging-and-claiming/01-capture-by-triggers.md#every-transition-row-counts-once)).
+  *Evidence:* in my group-basis model the live images left
   groups wrong in every soak run with application triggers that rewrite rows
   (about 1,200 wrong groups per version); unpaired transition images were
   exact in every run and in each nested-write shape: a nested update, a
@@ -221,7 +207,7 @@ What it does there is one append.
 - On the privilege model, I checked that the application needs nothing on
   Trellis's schema. The Trellis role must own each source table or be a
   member of its owning role, because `ENABLE ALWAYS` needs ownership, not
-  just `TRIGGER`. It needs no superuser.
+  just `TRIGGER`. It needs no superuser ([ADR-0027](0027-operating-principles.md), rule 1).
 - **Must (I6):** `CREATE TRIGGER` and `DROP TRIGGER` run under a short
   `lock_timeout` in a retry loop, one attempt per interval, until they land.
   *Evidence:* the `lock_timeout` retry measurement under I6.
@@ -231,12 +217,10 @@ What it does there is one append.
   separate fence, marker or generation is needed to make a table's join
   gap-free.
 - **Must (I6):** a schema change to a read column never fails the
-  application's write. The generated function counts, in the
-  empty-statement guard's query, how many of its imaged columns the table
-  still has. On a miss it appends a *schema-changed* marker row naming the
-  missing columns and images the rows over the columns left, by `EXECUTE`
-  (if a key column is gone, it writes the marker only). It has no `EXCEPTION`
-  block, so no subtransaction per statement. The drain that meets the marker
+  application's write. On a missing column the function stages a
+  *schema-changed* marker instead of failing
+  ([stage 01](../staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)).
+  The drain that meets the marker
   pauses every definition reading a missing column with a status error before
   it applies anything later, and the staging worker's reconcile regenerates
   the function over the columns the remaining readers need. Definitions that
@@ -729,16 +713,11 @@ parallelism the group basis relies on. Readers that need consistency use
 - **Must (I8):** a batch folds, re-reads and applies at most a fixed number
   of changes (a per-batch cap on folded records, on the order of 10^5) and
   pages through a larger bucket in key-range pages; per-key `(lsn,
-  change_id)` order holds inside the fold. Pages are keyset ranges on
-  `(route, src_table, key)` with a truncate sentinel first, so a key never
-  splits inside a segment and the fold's whole-window rules (first old
-  image, last new image, an image-less delete ending the key) hold per page
-  unchanged. Cross-key order is arbitrary, which I3 allows, so this order is
-  permanent. Each page is its own transaction behind a claim check,
-  advancing a durable per-bucket cursor; only a bucket's last page marks it
-  drained. The claim and cursor are what make a group-basis page's deltas
-  exactly-once. A segment's pages become visible to the drainers in one
-  step, never page by page.
+  change_id)` order holds inside the fold. A key never splits across pages,
+  so the fold's whole-window rules hold per page. Cross-key order is
+  arbitrary, which I3 allows, so the page order is permanent. A segment's
+  pages become visible to the drainers in one step, never page by page
+  ([stage 04](../staging-and-claiming/04-claiming-and-the-fold.md#paging-a-share-larger-than-the-cap)).
   *Evidence:* the one-pass build's memory measurement under I8.
 - **Must (I7):** every lock statement in Apply runs under `lock_timeout`; a
   timeout releases the claim's transaction and retries the page after a
@@ -977,15 +956,8 @@ partition at 100M.
 
 - **Should:** the watermark token is `pg_current_wal_insert_lsn()` read after
   the caller's commit, and `origin_lsn` is stamped from the trigger's
-  pre-commit `pg_current_wal_insert_lsn()`. A commit the caller could see
-  before taking its token has its ring rows in the same transaction, each
-  with `origin_lsn` at or below the commit's position, so the predicate of
-  [stage 07](../staging-and-claiming/07-convergence-and-await.md) over ring
-  rows alone is sound; a transaction straddling the token over-reports, the
-  safe direction. The token is the insert position because the write
-  position, `pg_current_wal_lsn()`, lags a commit made with
-  `synchronous_commit = off` and can sit below its rows' `origin_lsn`. There
-  is no capture watermark to check.
+  pre-commit `pg_current_wal_insert_lsn()`
+  ([stage 07](../staging-and-claiming/07-convergence-and-await.md#watermark-tokens)).
 - **Must:** three stored statuses: `waiting_to_backfill` (registered, chunk
   plan not yet written; normally momentary), `backfilling` (applying, chunks
   outstanding), `live`. Plus `paused` and
@@ -1000,30 +972,9 @@ partition at 100M.
   `applied_seg`, the newest segment (`seg_seq`) whose changes it reflects,
   and maintenance deletes each tombstone whose `applied_seg` is at or below
   the **contiguous drained prefix**: the highest `seg_seq` at or below which
-  every segment is drained. The
-  prefix, not the segment just drained, because segments drain out of order
-  and a fence is a snapshot, not a position. A same-key predecessor of a
-  delete committed before the delete's trigger ran, so it is in the delete's
-  batch or an earlier one, and at or below the prefix it has been applied or
-  skipped. A Re-derive's read is live, so a page draining an old batch can
-  see a later batch's delete; a Re-derive therefore stamps at least the
-  newest segment its snapshot sees. Every change the snapshot saw is in that
-  segment or an earlier one, so the tombstone outlives every change its
-  `basis` would refuse. Only a tombstone carries the stamp: a write that
-  leaves an entry a tombstone raises `applied_seg` as above, and one that
-  leaves it live leaves it alone, so the GC's partial index can key on it
-  and an Apply to a live entry still changes no indexed column (HOT). A
-  live entry's stale stamp, or none, is never what protects a tombstone: an
-  Apply that deletes the key applies only a change D its `basis` doesn't
-  see, so every change the `basis` does see completed before D and is in D's
-  batch or an earlier one, which D's page's stamp covers; a Re-derive that
-  deletes it stamps its own read's segment. A revival keeps the old stamp,
-  which can only delay the GC. The GC
-  skips the ledger of a definition under a build (`backfilling`, or a
-  frozen Re-derive build), holding the definition's row `for key share`
-  while a batch runs, which a build's start waits on: a build chunk's insert
-  of a new key's entry needs every tombstone written after its snapshot to
-  stay until the insert.
+  every segment is drained, because segments drain out of order. The GC
+  skips the ledger of a definition under a build
+  ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#the-ledger)).
 - **Must (R4, I4 per group):** a group whose partials are all zero and that
   has a basis stays, as a zero group, until the contiguous drained prefix
   passes its stamp, and, for a group with `MIN`/`MAX` extremes, its
@@ -1147,18 +1098,10 @@ combination of values a reader sees
   aggregate's partials, bases and zero groups), clears the target, and
   raises the target's
   truncate floor (`ledger_truncate_floor`) to the truncate's ring `lsn`.
-  I2 then also refuses any change at or below the floor. The floor is
-  exact because `TRUNCATE` takes `ACCESS EXCLUSIVE`: every writer that
-  touched the table before it committed first, so its trigger's position is
-  below the truncate's, and every writer after it is above. That includes a
-  later statement in the truncate's own transaction: the truncate's trigger
-  writes its ring row after reading its position, which moves the insert
-  position on before the next statement's trigger reads it. The drain
-  barrier already applies the truncate's batch after every earlier batch and
-  before every later one, and the fold voids the batch's own earlier rows, so
-  the floor is a second line of defence: any change from before the truncate
-  that still reaches a page is refused, the way Postgres's own lock orders
-  them. A truncate of a leaf or middle of a partitioned source resets
+  I2 then also refuses any change at or below the floor, a second line of
+  defence behind the barrier
+  ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#aggregate-groups-the-group-basis),
+  "Truncate"). A truncate of a leaf or middle of a partitioned source resets
   nothing and sets no floor or barrier: it queues that node's correction
   ([ADR-0017](0017-partitioned-sources.md#a-leaf-or-middle-truncate-queues-that-nodes-correction)).
 - Source `ALTER TABLE` on a read column follows the schema-changed marker

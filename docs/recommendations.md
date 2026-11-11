@@ -76,7 +76,7 @@ for a database that builds large targets.
   before it. `log_checkpoints = on` logs why each one started.
 
 To watch a build's progress, see
-[observability — Transform status lifecycle](observability.md#transform-status-lifecycle).
+[the status reference](status-reference.md#backfilling).
 
 ## Ring sizing
 
@@ -104,16 +104,15 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
   out Trellis's own targets: Trellis stages a target's changes for the
   transforms that read it as it writes them, so those rows add to the ring
   only while Trellis runs.
-* While every Trellis process is down, nothing drains or bounds the ring, and
-  the database's own disk alerts are the only guard. Alert on free disk.
+* Trellis puts no bound on the ring: it grows for as long as capture outruns
+  the drain, and while every Trellis process is down nothing drains it. The
+  database's own disk alerts are the only guard. Alert on free disk.
 * To see the ring's size on disk, read the `ring_bytes` gauge
   ([observability](observability.md#metrics)), or sum
   `pg_total_relation_size` over the ring tables `seg_0` to `seg_3` in
   Trellis's schema. `ring_undrained_bytes` splits what is still to drain by
   source table, and `ring_oldest_undrained_age_seconds` says how far behind
   the drain is.
-* The ring's soft and hard bounds are designed but not built
-  ([ADR-0002 — Consequences](decisions/0002-async-data-flow.md#consequences-and-costs)).
 
 ## `statement_timeout`
 
@@ -298,7 +297,7 @@ number of tables, and there is no step up at the five-table limit.
 warning per joined position past the threshold, naming the position, the key,
 the number of root rows on it and the threshold, which is 250,000 rows per
 key unless `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another
-([observability](observability.md#transform-status-lifecycle)). `trellis
+([status reference](status-reference.md#join)). `trellis
 status` prints each as a warning line. The warning fires on a key that is already
 large; a lookup under the threshold still costs its fan-out on every edit.
 
@@ -438,9 +437,9 @@ row-level security and so no `BYPASSRLS`.
 ### Application roles read targets, and nothing else
 
 Grant application roles `SELECT` on target tables and nothing more: no
-`INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`, and never ownership. Only Trellis
-writes a target, and it doesn't correct a hand edit
-([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned),
+`INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`, and never ownership. Trellis
+doesn't guard a target against hand edits
+([ADR-0027](decisions/0027-operating-principles.md), rule 5;
 [known correctness gaps — Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
 A read-only grant turns a hand edit into a permission error instead of a
 silent divergence.

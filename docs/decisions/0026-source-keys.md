@@ -96,7 +96,7 @@ A `KEY`'s backing index going missing or invalid pauses every reader of the
 table on the staging worker's next pass, with no grace: while no unique index
 enforces the key, the table can take two rows with one key. The check matches
 by shape, in one catalog snapshot, never by an index's oid or name. A
-false-positive study of the key-rule pauses against routine maintenance and
+false-positive study ([ADR-0027](0027-operating-principles.md), rule 3) of the key-rule pauses against routine maintenance and
 migrations found that it fires only when no index enforces the key: every
 operation that keeps an equivalent valid index at every committed instant
 (`REINDEX CONCURRENTLY`, a build-then-drop swap, a rename, pg_repack,
@@ -110,7 +110,7 @@ which nothing enforces the key. Another transform's target gets no such
 check: no supported operation drops the key Trellis gave it.
 
 `RESUME` re-validates everything define validates, against the table as it is
-now, and if that passes, re-records the key and rebuilds. An aggregate or
+now ([ADR-0027](0027-operating-principles.md), rule 4), and if that passes, re-records the key and rebuilds. An aggregate or
 `JOIN` reader of a default-keyed table takes its primary key now; a 1-1
 transform is amended to carry the new key. A `KEY` definition's
 columns never change: its `RESUME` needs an index backing them to exist again.

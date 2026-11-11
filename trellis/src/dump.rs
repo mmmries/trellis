@@ -1051,10 +1051,10 @@ pub(crate) async fn restore_queued(
             ));
         }
         let client = pool.get().await?;
-        let (source_columns, virtual_columns) =
-            crate::defs::catalog::live_source_columns_and_virtual(&**client, unparsed.source_table)
-                .await
-                .map_err(catalog)?;
+        let live = crate::defs::live_table::LiveTable::read(&**client, unparsed.source_table)
+            .await
+            .map_err(|err| catalog(err.into()))?;
+        let (source_columns, virtual_columns) = (live.value_types(), live.virtual_columns);
         drop(client);
         if crate::defs::join::spec(&def).is_none() {
             crate::defs::catalog::reject_virtual_generated_reads(

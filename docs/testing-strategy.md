@@ -9,8 +9,8 @@ promise — and the liveness, safety, and resource behavior around it — falsif
 Each tier is defined by its **trigger** (what makes it run a case), its **judge**
 (what decides pass/fail), and its **reproducibility contract** (can a failure be
 replayed deterministically). Tiers are ordered cheapest-first. The governing rule:
-**push every check to the lowest tier that can hold it** — a race found by chaos
-must be driven down into a deterministic pin; a tier never re-litigates what a
+**push every check to the lowest tier that can hold it** — a race a generative run
+finds must be driven down into a deterministic pin; a tier never re-litigates what a
 lower one already guarantees.
 
 | Tier | Trigger | Judge | Reproducible? | Cadence |
@@ -20,9 +20,6 @@ lower one already guarantees.
 | 3. Unit tests | scripted | assertion | fully | every PR / CI |
 | 4. Integration tests | scripted, real Postgres | assertion | fully | every PR / CI |
 | 5. Generative tests | random valid program, seeded | independent oracle at quiescence | at program level (shrinking) | nightly (`nightly.yml`, the one deep property), and on demand with `-- --ignored` |
-| 6. Chaos tests | wall-clock random workload + faults | invariants over recorded history | **no** | on demand, before a release; never a per-commit gate |
-
-The tier 5↔6 line is the one that most needs stating, so it gets its own section (§6).
 
 ---
 
@@ -60,8 +57,12 @@ or allowlisted actions). Style and lint only; no claim about behavior.
 
 ## 3. Unit tests
 
-**Pure logic in isolation, no Postgres** — fast, deterministic, run on every
-`cargo test`. These own:
+**Logic in isolation, beside the code it tests** (`#[cfg(test)]` modules in
+`trellis/src`) — fast, deterministic, run on every `cargo test`. Most need no
+Postgres. A module whose logic is SQL it renders or a catalog it reads (the
+capture functions, the group-basis and ledger statements, the key and index
+checks) starts a `testkit::TestCluster` of its own and runs the statement there,
+still one fixed case per test. These own:
 
 - The AST and parser — accept/reject, precedence, error messages.
 - The `numeric` exact-decimal type — arithmetic, scale, comparison-by-value.
@@ -70,7 +71,7 @@ or allowlisted actions). Style and lint only; no claim about behavior.
   anything expressible as *value in, expected value out*.
 
 The cheapest place to pin a specific computed answer, and the home of any
-generative/chaos failure that root-causes to a pure function.
+generative failure that root-causes to a pure function.
 
 ## 4. Integration tests
 
@@ -81,16 +82,22 @@ data directory and torn down on `Drop`); CI provisions the server binaries. They
 
 - The capture path end-to-end: source DML → capture trigger → staging ring, with
   each family's images pinned against a golden fixture (`capture_parity.rs`).
-- **Scripted interleavings** — hand-authored concurrency/crash scenarios that must
-  always hold: `testkit::crash::CrashGuard` (SIGKILL a child mid-drain),
-  `crash::OpenTransaction` (a straddling transaction across a batch boundary).
+- **Scripted interleavings** — hand-authored concurrency scenarios that must
+  always hold (`*_interleavings.rs`). A test freezes one drain worker at a named
+  **pause point** inside its page transaction (`staging::interleave`, reached
+  through `trellis::dev`), does something else, then lets it go; the test learns
+  the worker is frozen from a channel, never by polling. The `Driver` in
+  `trellis/tests/support/drain_driver.rs` seals and drains one batch at a time
+  on a worker the test names. `testkit::crash::OpenTransaction` holds a
+  straddling transaction open across a batch boundary.
 - Any behavior that needs a database but is a *fixed* case, not a generated one.
 
 **This tier is the terminal home of every race bug found above it** — a
-generative/chaos finding is not fixed until it exists here (or in tier 3) as a
-deterministic pin that fails before the fix and passes after. Generative and
-integration deliberately **share one action vocabulary**, so a scripted scenario is
-just a generated program with its draws pinned.
+generative finding is not fixed until it exists here (or in tier 3) as a
+deterministic pin that fails before the fix and passes after. A pin that is
+easiest to state as a generated program stays in the `generative` crate with its
+operations written out (`generative/tests/pins`), in the same action vocabulary
+the generators draw from.
 
 **Opt-in third-party tier.** `trellis/tests/pg_partman.rs` drives pg_partman's
 partition maintenance (premake, `run_maintenance`, `partition_data_*`,
@@ -119,7 +126,15 @@ program.** This is the `generative` crate; full architecture lives in
   a bug in the engine's own SQL compiler.
 - **Reproducibility:** at the *program* level via shrinking; seeds replay the
   program, and findings terminate as hand-minimized pins in tiers 3–4.
-- **Properties it lights up as engine stages land:** per-op convergence,
+- **Fault actions:** a worker `SIGKILL`ed mid-drain (`testkit::crash::CrashGuard`
+  over the `engine_subprocess` binary), a server restart, a backup and restore,
+  each an action the oracle still judges at quiescence.
+- **Planted bugs keep it honest:** `trellis::plant` holds known-wrong engine
+  behavior, compiled only for tests and armed one at a time per process by
+  `TRELLIS_TEST_PLANT`. The planted-bug sweep (`generative::plant_sweep`) runs a
+  tier's seeded cases once with no plant, then once per plant, and fails when the
+  tier misses one it should catch.
+- **Properties it checks:** per-op convergence,
   operation-error handling, idempotency (at-least-once treated as exactly-once),
   order-insensitivity over commuting ops, read-your-own-writes via `await`, and — the
   hardest — non-idempotent aggregate delta convergence.
@@ -129,85 +144,10 @@ Its properties are opt-in: each is `#[ignore]`d, so PR-time CI (plain
 runs opt in with `-- --ignored` plus a `PROPTEST_CASES` override (a healthy deep
 run is minutes, not seconds — a "pass" in one second executed nothing). It
 assumes the system *reaches* quiescence and judges *what the answer is* there; it
-structurally cannot judge timing, liveness, or long-horizon resource behavior — tier 6.
-
-## 6. Chaos tests
-
-**Everything that survives *without* quiescence and *without* reproducibility.**
-Chaos is the black-box, wall-clock tier: continuous randomized workload plus
-continuous operational faults against a running system, judged not by an oracle
-snapshot but by **invariants over recorded history.** Non-deterministic by design,
-it can never block a merge.
-
-### The dividing line: quiescence + reproducibility
-
-**If a bug can be caught by "program + deterministic fault placement → quiesce →
-compare to the oracle," and replayed from a seed, it belongs to tier 5 (or a pin in
-tier 4). Chaos owns only what that mold cannot hold.**
-
-**What chaos must NOT cover — generative already owns it:**
-
-- **Converged-state correctness / oracle equality** — generative's entire purpose.
-  Chaos cannot quiesce on demand or shrink, so it cannot reliably assert
-  byte-identical equality and should not try.
-- **Per-op convergence, idempotency, order-insensitivity, read-your-own-writes** —
-  all seeded, reproducible, oracle-judged; re-rolling them under wall-clock
-  randomness adds flake, not coverage.
-- **Fine-grained race exploration at *known* sites** — tier 5 places named failpoints
-  deterministically at those sites and judges at quiescence. Chaos re-rolling them at
-  random adds noise, not signal.
-
-Chaos does not re-verify *what the answer is*; it assumes the lower tiers pin that,
-and borrows the oracle once (below) to keep them honest.
-
-**What chaos MUST cover — generative cannot:**
-
-- **Emergent real-time races** — the interleavings you didn't know to place a
-  failpoint at; only genuine wall-clock concurrency surfaces them.
-- **Liveness and progress** — convergence is still *reached*, and within a bound,
-  under sustained disruption: no deadlock, livelock, permanent stall, or unbounded
-  lag runaway.
-- **Long-horizon degradation and resource safety** — leaks and slow bleed visible
-  only over hours: memory growth, connection/file-handle leaks, ring backlog, WAL
-  retention, disk consumption.
-- **Operational faults not modeled as oracle identities** — Postgres restart/failover
-  under live load, network partition/latency, disk-full, OOM killer, clock skew,
-  pool exhaustion. (SIGKILL is *shared* — `CrashGuard` gives tiers 4–5 a
-  deterministic version — but *sustained, compound, randomly-timed* failure is chaos
-  alone.)
-- **Compound fault overlap too large to enumerate or seed** — several faults in the
-  same window, which no finite seed set covers.
-
-### Architectural requirements
-
-Alongside the generative harness, the chaos tier needs:
-
-- **A continuous workload generator** — a randomized stream of source mutations under
-  real load, *reusing the generative `model`/`generate` vocabulary* so findings
-  translate into seeded programs.
-- **A wall-clock fault scheduler** — coarse operational faults on random real-time
-  timing, at operational rather than code-site granularity.
-- **A history recorder** — since you can't quiesce-and-compare, record observable
-  history (LSN/watermark progression, periodic target snapshots, worker lifecycle,
-  lag/resource metrics) so invariants are checked *post hoc* over the timeline.
-- **Invariant checkers over history:**
-  - *Safety* (every moment): no LSN/watermark regression; no target value that never
-    corresponded to any real source state (no torn/phantom reads); no observable
-    double-apply; monotonic progress.
-  - *Liveness* (eventually): once faults quiesce, convergence within a bounded time;
-    steady-state lag bounded under load; no permanent stall.
-  - *Resource* (bounded over the run): ring backlog, WAL, memory, connections don't grow
-    without bound.
-- **A quiet-window convergence gate** — periodically stop the workload, let it settle,
-  run the generative **oracle once** as ground truth. The single place chaos reaches
-  back to tier 5, bridging "invariants held throughout" to "the answer is correct."
-- **Non-reproducibility as a first-class output contract** — a chaos run *discovers* a
-  bug, it doesn't *terminate* one. Every finding must be mined into a deterministic
-  tier-4 pin or seeded tier-5 program before it counts as fixed; a seed that
-  "reproduces" a race isn't trusted, because it doesn't survive timing changes.
-  Chaos is lead generation for the reproducible tiers.
-- **Isolation and cadence** — its own environment, bounded blast radius, nightly /
-  pre-release schedule, never a per-commit gate.
+structurally cannot judge timing, liveness, or long-horizon resource behavior. No
+test tier judges those: the streaming benchmark and soak runs measure them, by
+hand, before a release (a chaos tier for them is
+[#1884](https://github.com/salesforce-misc/trellis/issues/1884)).
 
 ---
 
@@ -267,7 +207,7 @@ without libxml fails the XML tests.
 
 The tiers form a ratchet; when a bug is found, work flows one direction:
 
-1. Chaos (6) discovers an emergent failure over real time.
+1. A generative run (5), a benchmark or soak run, or a report finds a failure.
 2. It is reproduced as a seeded generative program (5), or — if not combinatorial —
    a scripted scenario (4).
 3. The minimal case is pinned as an integration test (4) or, if it reduces to pure
@@ -276,5 +216,5 @@ The tiers form a ratchet; when a bug is found, work flows one direction:
 
 The higher a fix lands, the cheaper and more permanent it is. Every upper tier's
 design intent is to *shrink its own surface* by feeding durable pins downward — so
-that over time the expensive, non-deterministic tiers exercise genuinely new ground,
-not what the fast tiers already guard.
+that over time the expensive tiers exercise genuinely new ground, not what the fast
+tiers already guard.
