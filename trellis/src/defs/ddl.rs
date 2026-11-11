@@ -1564,45 +1564,12 @@ pub(crate) fn split_pk_key<'a>(
         .collect())
 }
 
-/// Every column of `source_table`, mapped to its *concrete* Postgres type as
-/// rendered by `format_type` (e.g. `integer`, `bigint`, `character
-/// varying(255)`) — the same `pg_catalog` introspection [`source_primary_key`]
-/// does for the primary key, widened to every column. Used by
-/// [`create_target_table`] to give a bare source-column passthrough field its
-/// source column's exact type rather than collapsing it through [`ValueType`]:
-/// a passthrough of an `integer` FK must stay `integer` on the
-/// target so it remains eligible as a `JOIN` key, instead of
-/// widening to `numeric` (which the join-key allowlist excludes). The rendered
-/// type is safe to interpolate into DDL for the same reason
-/// [`PrimaryKeyColumn::data_type`] is — it comes from the catalog, not user
-/// input.
-async fn source_column_pg_types(
-    client: &impl GenericClient,
-    source_table: &str,
-) -> Result<HashMap<String, String>, DdlError> {
-    let rows = client
-        .query(
-            &format!(
-                "select a.attname::text, {}
-                 from pg_attribute a
-                 where a.attrelid = pg_catalog.to_regclass($1)
-                   and a.attnum > 0
-                   and not a.attisdropped",
-                super::copy_type::type_sql("a.atttypid")
-            ),
-            &[&regclass_arg(source_table)],
-        )
-        .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
-        .collect())
-}
-
 /// The Postgres type each of `fields` is created with on a 1-1 target table,
 /// keyed by field name: the one rule `DEFINE TRANSFORM` ([`target_table_ddl`])
 /// and `ALTER TRANSFORM ... ADD` share. A bare source-column passthrough takes
-/// the source column's concrete type, typmod included; every
+/// the source column's concrete type with no modifier (its copy type,
+/// [`super::copy_type::type_sql`]), so a passthrough of an `integer` stays
+/// `integer` and a key column rather than widening to `numeric`; every
 /// other field takes its inferred [`ValueType`]'s keyword ([`pg_type_name`]).
 /// `def` is the definition the fields belong to (its field list decides
 /// whether a reference names a source column or a sibling field), and
@@ -1622,17 +1589,18 @@ pub(crate) async fn field_column_pg_types(
             passthrough_source_column(f, def, source_columns).map(|col| (f.name.as_str(), col))
         })
         .collect();
-    let source_pg_types = if passthroughs.is_empty() {
-        HashMap::new()
+    let source_columns_live = if passthroughs.is_empty() {
+        super::live_table::LiveTable::default()
     } else {
-        source_column_pg_types(client, source_table).await?
+        super::live_table::LiveTable::read(client, source_table).await?
     };
     Ok(fields
         .iter()
         .map(|field| {
             let pg_type = match passthroughs
                 .get(field.name.as_str())
-                .and_then(|col| source_pg_types.get(*col))
+                .and_then(|col| source_columns_live.column(col))
+                .map(|column| &column.info.copy_type)
             {
                 Some(concrete) => concrete.clone(),
                 None => pg_type_name(

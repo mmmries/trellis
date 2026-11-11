@@ -298,3 +298,49 @@ async fn admitted_patterns_count_as_postgres_counts() {
     assert_eq!(row.get::<_, i32>(1), 1);
     assert_eq!(row.get::<_, i32>(2), 2);
 }
+
+/// A resume of a definition with both a pattern Postgres rejects and a
+/// source capture can no longer key (it became an inheritance parent) is
+/// refused for the pattern when the definition is plain, and for the source
+/// when it is a `JOIN`: a plain definition probes its patterns before the
+/// unkeyed-source refusal, a `JOIN` only after every table's key checks.
+#[tokio::test]
+async fn which_refusal_a_resume_gets_over_an_unkeyed_source_depends_on_the_key_space() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(SETUP).await.expect("setup");
+    let trellis = definer(db.dsn()).await;
+    let spaces = definitions("zzz");
+    for (target, space) in [("d3", "aggregate_argument"), ("d5", "join_argument")] {
+        let (_, text) = spaces.iter().find(|(s, _)| *s == space).expect(space);
+        trellis.apply(text).await.expect(target);
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect(target);
+    }
+    raw.batch_execute(
+        "update trellis.transform_definitions \
+         set definition_text = replace(definition_text, '''zzz''', '''('''); \
+         create table public.kid (extra int) inherits (public.s)",
+    )
+    .await
+    .expect("plant");
+    let plain = trellis
+        .apply("RESUME TRANSFORM d3")
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(plain.contains("invalid regular expression"), "{plain}");
+    let join = trellis
+        .apply("RESUME TRANSFORM d5")
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        !join.contains("invalid regular expression") && join.contains("public.s"),
+        "{join}"
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
