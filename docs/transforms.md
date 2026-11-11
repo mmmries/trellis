@@ -2260,11 +2260,9 @@ Treat a target as read-only, and specifically:
   next event that recomputes it, and a row added or re-keyed by hand stays
   until a rebuild. `self_check`
   ([0013](decisions/0013-self-check-production-recompute-audit.md)) reports the
-  divergence; it does not repair it. On a 1-1 target, `PAUSE` then `RESUME`
-  rebuilds the table from source and deletes the rows the source doesn't back,
-  including rows added or re-keyed by hand; on an aggregate target it keeps
-  group rows edited by hand, and `PAUSE`, `DROP TRANSFORM` and define again
-  repairs it ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)).
+  divergence; it does not repair it. `PAUSE` then `RESUME` rebuilds the table
+  from source and deletes the rows the source doesn't back
+  ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)).
 * **Do not add, drop, rename or retype columns.** Trellis addresses its columns
   by name and type. Redefining the transform is how a column changes
   ([Changing a definition](#changing-a-definition)).
@@ -2274,10 +2272,9 @@ Treat a target as read-only, and specifically:
   upserts or deletes it.
 * **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
   the table and its definition together, and refuses while another definition
-  still chains off it. A hand `TRUNCATE` leaves the table empty until a 1-1
-  transform is paused and resumed, or an aggregate dropped and defined again.
-  A resume refuses while the table is missing, and the repair is
-  `DROP TRANSFORM` and defining it again.
+  still chains off it. A hand `TRUNCATE` leaves the table empty until the
+  transform is paused and resumed. A resume refuses while the table is
+  missing, and the repair is `DROP TRANSFORM` and defining it again.
 * **Don't let row-level security apply to the role that writes it.**
   Trellis writes a target as the role each worker connects as, with
   `row_security = off`, so a write that policies applying to that role would
