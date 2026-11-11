@@ -11,7 +11,7 @@
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
 
-use resume_passes::{bring_live, drain_to_quiescence, full_pass, rows, setup, status};
+use resume_passes::{bring_live, reconcile_pass, rows, settle, setup, status};
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
 
@@ -118,8 +118,8 @@ async fn a_key_beside_a_deferrable_primary_key_is_the_key() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     for target in ["p_one", "p_sums"] {
         assert_eq!(status(&trellis, target).await.status, TransformStatus::Live);
     }
@@ -154,7 +154,7 @@ async fn resume_refuses_a_primary_key_made_deferrable() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let refusal = trellis
         .apply("RESUME TRANSFORM s_sums")
         .await
@@ -212,8 +212,8 @@ async fn a_primary_key_made_deferrable_halts_its_readers() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     for target in ["s_one", "s_sums"] {
         let reported = status(&trellis, target).await;
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
@@ -284,8 +284,8 @@ async fn a_one_to_one_join_on_a_deferrable_unique_key_defines() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     for (target, actual, expected) in [
         (
             "by_pk",

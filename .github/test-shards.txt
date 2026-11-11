@@ -185,6 +185,8 @@ test:mixed_case_source 1.7
 test:cross_instance_target_source 1.6
 test:group_basis_alias_columns 1.6
 test:drain_driver_seal_gate 1.5
+test:pipeline_helpers 1.5
+test:waits 1.5
 test:join_one_to_one_lease 1.5
 test:defs_temporal 1.5
 test:define_privileges 1.5

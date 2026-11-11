@@ -13,8 +13,7 @@
 mod resume_passes;
 
 use resume_passes::{
-    RECREATED, SOURCE, assert_staged, bring_live, capture_pass, drain_to_quiescence, rows, setup,
-    status,
+    RECREATED, SOURCE, assert_staged, bring_live, capture_pass, rows, settle, setup, status,
 };
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
@@ -50,7 +49,7 @@ async fn an_aggregate_resumes_onto_a_source_recreated_with_a_wider_key() {
     raw.batch_execute("insert into public.c values (4, 8, 1); delete from public.c where id = 1")
         .await
         .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
 
@@ -192,7 +191,7 @@ async fn a_one_to_one_resume_adds_a_new_key_column_it_does_not_select() {
     )
     .await
     .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, COPY_ACTUAL).await, rows(&raw, COPY_ORACLE).await);
     assert_eq!(
         rows(&raw, "select 'public.c_copy'::regclass::oid::text").await,
@@ -292,7 +291,7 @@ async fn a_one_to_one_resume_drops_a_former_key_column_it_does_not_create() {
         )
         .await
         .unwrap();
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        settle(&db.pool, &mut raw).await;
         let read = |names: &[&str]| names.join("::text, ") + "::text";
         let source: Vec<&str> = columns
             .iter()
@@ -572,7 +571,7 @@ async fn an_aggregate_resumes_onto_its_source_converted_to_a_partitioned_table()
     )
     .await
     .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
 
@@ -741,7 +740,7 @@ async fn transforms_chained_off_a_re_keyed_one_to_one_target_resume_after_it() {
     .await
     .unwrap();
     for _ in 0..3 {
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        settle(&db.pool, &mut raw).await;
     }
     assert_eq!(rows(&raw, COPY_ACTUAL).await, rows(&raw, COPY_ORACLE).await);
     assert_eq!(rows(&raw, tot_actual).await, rows(&raw, tot_oracle).await);
@@ -793,7 +792,7 @@ async fn a_one_to_one_join_resume_adds_a_new_key_column_of_its_from_side() {
     .await
     .unwrap();
     for _ in 0..3 {
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        settle(&db.pool, &mut raw).await;
     }
     assert_eq!(rows(&raw, actual).await, rows(&raw, oracle).await);
 }

@@ -11,7 +11,11 @@
 //! - [`plan`] reads the work an `explain (analyze)` plan says a statement did.
 //! - [`locale`] finds a locale that makes an unpinned `lc_monetary` show.
 //! - [`blocking`] reads from the server's lock table whether one session
-//!   was stuck behind another's lock, and for how long.
+//!   was stuck behind another's lock, and for how long, and waits for one
+//!   to queue behind another.
+//! - [`raw`] opens plain `tokio_postgres` connections outside any pool.
+//! - [`wait`] waits for a condition with a hard deadline and a failure
+//!   that names what was awaited.
 //!
 //! The crate also builds a `trellis-testkit` binary (`src/bin/`) that holds
 //! one [`TestCluster`] for a test suite written in another language (the
@@ -32,7 +36,13 @@ pub mod fixtures;
 pub mod locale;
 pub mod lsn;
 pub mod plan;
+pub mod raw;
+pub mod wait;
 
-pub use blocking::{BlockedWatch, Blocker, watch_blocked};
+pub use blocking::{BlockedWatch, Blocker, wait_blocked_behind, watch_blocked};
 pub use cluster::{ClusterBackup, StopMode, TestCluster, TestDatabase};
 pub use lsn::wal_insert_lsn;
+#[cfg(feature = "engine-access")]
+pub use raw::connect_raw;
+pub use raw::connect_with;
+pub use wait::{wait_for, wait_until};

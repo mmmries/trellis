@@ -92,6 +92,13 @@ data directory and torn down on `Drop`); CI provisions the server binaries. They
   straddling transaction open across a batch boundary.
 - Any behavior that needs a database but is a *fixed* case, not a generated one.
 
+Tests that step the pipeline themselves share one set of helpers rather than
+private copies: `trellis/tests/support/pipeline.rs` (connect, define, a capture
+or reconcile pass, a seal, a settle), which the `Driver` is built on, and
+`testkit`'s `connect_raw`, `wait_until`/`wait_for` and `wait_blocked_behind`
+for raw connections and for the few waits a test can't step to, each with a
+hard deadline and a failure naming what it waited for.
+
 **This tier is the terminal home of every race bug found above it** — a
 generative finding is not fixed until it exists here (or in tier 3) as a
 deterministic pin that fails before the fix and passes after. A pin that is
