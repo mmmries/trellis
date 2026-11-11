@@ -1058,7 +1058,7 @@ fn typed_literal_keyword(value_type: ValueType) -> &'static str {
         })
 }
 
-/// The partial-data predicate slot (`docs/transforms.md#partial-data`).
+/// The partial-data predicate slot (`docs/transforms.md#a-where-other-than-true`, #804).
 ///
 /// This slice accepts only a trivially-true predicate — either `WHERE` is
 /// omitted, or written as the literal `WHERE TRUE`. General predicate

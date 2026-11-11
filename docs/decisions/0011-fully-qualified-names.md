@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-09-10
+date: 2026-11-11
 deciders: Michael Ries
 ---
 
@@ -16,8 +16,9 @@ This ADR settles how table references are spelled and persisted across every
 definition type — transforms and redefinition. It does not relax
 [ADR-0005](0005-source-schema-is-user-owned.md): Trellis still issues no DDL
 against source tables, only resolves, records, and reads their qualified names.
-It introduces no identity concept beyond the `schema.table` string PostgreSQL
-itself uses.
+The `schema.table` string PostgreSQL itself uses is a table's only identity.
+Trellis records oids only to notice that the object at a name was recreated or
+restored, and then pauses rather than follows it.
 
 ## A table reference is resolved once, at definition time, and persisted qualified
 
@@ -56,6 +57,23 @@ relation. OIDs are also **not** stable across restore/`pg_upgrade`/DR-failover,
 so every transform would break after a source-DB restore unless a missing OID
 were tolerated — which reopens the very ambiguity this decision closes. It
 would also impose permanent dual-path complexity.
+
+**An oid is recorded only as a change signal, never as identity.** Trellis
+records the oid (with `xmin` and enabled mode) of each capture trigger it makes
+(`capture_triggers`), the oid of the table each recorded source key was taken
+from (`definition_keys`), and beside its own catalog rows the oid of the
+catalog table that holds them and the cluster's `system_identifier`
+(`capture_triggers`, `partition_sources`). A table recreated at its name, its
+triggers recreated, or the database restored from a logical dump shows up as a
+recorded oid that is gone or differs from the live one. Trellis then pauses
+([ADR-0027](0027-operating-principles.md), rule 2), with a reason, every
+definition that reads the table (every definition, for a
+restore), instead of following the new object or holding on to the old oid
+([capture changed outside Trellis](../staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis),
+[ADR-0017 — a restore pauses for a rebuild](0017-partitioned-sources.md#pg_upgrade-re-baselines-the-recorded-state-a-restore-pauses-for-a-rebuild)).
+`RESUME` re-validates (rule 4) against the table now at the name and rebuilds. A key's
+backing index is matched by shape, never by its oid
+([ADR-0026](0026-source-keys.md#a-key-is-backed-by-a-unique-index-matched-by-shape)).
 
 ## Names are not re-resolved on later operations
 

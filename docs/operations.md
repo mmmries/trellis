@@ -285,9 +285,10 @@ key until it's released or they're resumed.
 
 `self_check` finds a target that differs from its definition, and repairs
 nothing. It's a background job
-([embedding — `self_check` is a background job](embedding.md#self_check-is-a-background-job));
-which targets it compares is in
-[known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see).
+([embedding — `self_check` is a background job](embedding.md#self_check-is-a-background-job)).
+It compares every shape of target, hidden tables included; which wrong rows
+it can find is the "Detected by" column of
+[known correctness gaps](known-correctness-gaps.md#summary).
 
 ## Rewrites that rebuild by themselves
 
@@ -480,7 +481,7 @@ each one costs and what to expect around it
     restore into the same cluster costs the same resumes, though its counters
     only move forward;
   * after a logical restore, start a staging worker. A drain-only client
-    (`staging_worker: false`) that starts before it claims nothing until the
+    (`staging: false`) that starts before it claims nothing until the
     staging worker's first pass has responded. One already running when the
     database is restored under it can apply rows staged before the detection,
     until a staging pass runs; the `RESUME` rebuild overwrites them;

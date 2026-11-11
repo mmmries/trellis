@@ -242,8 +242,9 @@ So:
   function, a drain or build refused a read halts the definitions it reaches,
   and `self_check` reports it.
 * **Tables Trellis can read.** Row-level security that applies to the Trellis
-  role, a logical-replication subscription into a source, a source without a
-  primary key, and a partition or a table in an inheritance hierarchy: each
+  role, a logical-replication subscription into a source, a source with
+  neither a primary key nor a `KEY (…)` naming its key, and a partition or a
+  table in an inheritance hierarchy: each
   is refused at define time, and pauses the transform if it comes about
   later. A partitioned table is a source when its partition key is in the
   group key, read through its root. The full list
@@ -289,7 +290,7 @@ So:
   `waiting_to_backfill` (or `backfilling`, after an `ALTER TRANSFORM` that reads
   a new source column), and `status()` reports what it waits on
   (`capture_wait`), or `capture_failure` when the install fails for another
-  reason, such as a source that lost its primary key. Every process's
+  reason, such as a source that lost the key it is read by. Every process's
   `status()` reports both, wherever the worker runs.
 
 ```rust
@@ -1188,9 +1189,11 @@ let report = loop {
   the drain failures open on the instance. A job that finds its transform no
   longer live, its target no longer caught up, or its capture broken partway
   ends there with what it had found, `truncated`.
-* **A target `self_check` can't compare**
-  ([known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see)),
-  or an unknown name, is refused by the call that would start the job.
+* **A `GROUP BY` or `JOIN` target whose source lacks the index the walk
+  pages by** (listed in `status()`'s `source_index_gaps`), unless it was
+  defined `WITHOUT SOURCE INDEX`
+  ([transforms](transforms.md#a-source-without-the-index-its-self_check-walk-pages-by)),
+  and an unknown name, are refused by the call that would start the job.
 
 In Ruby the job is a `Trellis::SelfCheckJob` (`finished?` says whether to stop
 polling) and its report a `Trellis::SelfCheckReport`; in Elixir a
@@ -1199,10 +1202,12 @@ polling) and its report a `Trellis::SelfCheckReport`; in Elixir a
 
 ## What a transform can do
 
-A transform reads one source table (which needs a primary key) or another
-transform's target, is 1-1 or a `GROUP BY` aggregate, and computes its fields
-from the source row and from other fields; a `JOIN` transform aggregates the
-join of two tables. What the grammar accepts, what `define` refuses, and
+A transform reads one source table (keyed by its primary key, or by the
+columns a `KEY (…)` names) or another transform's target, is 1-1 or a
+`GROUP BY` aggregate, and computes its fields from the source row and from
+other fields; a `JOIN` transform aggregates the join of two tables, and a 1-1
+`JOIN` writes one target row per row of its `FROM` table, joined to up to four
+other tables (a star). What the grammar accepts, what `define` refuses, and
 which column types play which role are in
 [transforms](transforms.md) and the [type-support matrix](type-support.md).
 Whatever the shape, what you can rely on is the status lifecycle and the `live`

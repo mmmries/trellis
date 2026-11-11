@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-09-02
+date: 2026-11-11
 deciders: Michael Ries
 ---
 
@@ -30,14 +30,37 @@ Instead:
    to make — e.g. a source index dropped after define is reported in `status()`
    with the statement that restores it, `create index on public.orders (region)`.
 
-## A missing correctness prerequisite rejects; a missing performance one warns
+## Define refuses a missing prerequisite; after define, a lost key pauses and a lost index is reported
 
-Correctness vs. performance sets the severity:
+Define and a whole-transform `RESUME` refuse a definition that lacks a
+prerequisite ([ADR-0027](0027-operating-principles.md), rule 4):
 
-* A missing correctness prerequisite (a required type, a source's primary key)
-  is a **hard rejection**.
-* A missing performance prerequisite (a source index dropped after define) is
-  a **warning**: the definition stays correct without it.
+* **Correctness prerequisites:** a supported type, and a source key: the
+  table's primary key or a `KEY (…)` the definition names, backed by a unique
+  index ([ADR-0026](0026-source-keys.md)).
+* **The source index a `GROUP BY` or `JOIN` target's `self_check` walk pages
+  by:** an index leading with the `GROUP BY` columns, or on each side of a
+  `JOIN` with that side's `ON` columns. A definition can waive it with
+  `WITHOUT SOURCE INDEX`; its `self_check` then scans the source once per
+  page.
+* **The index a `MIN` or `MAX` field's probe reads:** on the `GROUP BY`
+  columns, then the argument. `WITHOUT SOURCE INDEX` doesn't waive it.
+
+A lost correctness prerequisite pauses the transforms it affects (rule 4), such
+as a change to the key a transform uses, or the index backing a `KEY (…)` going
+missing ([ADR-0026](0026-source-keys.md#keeping-the-key)).
+
+A lost performance prerequisite, an index dropped or invalidated after
+define, leaves the transform running and its target correct, since an index
+affects speed, never results. `status()` reports it (`source_index_gaps`,
+`extreme_index_gaps`) with the `create index` that restores it. Unless the
+definition waived its source index, `self_check` refuses to walk it and a
+whole-transform `RESUME` refuses until the index is back; a `RESUME` always
+refuses while a `MIN`/`MAX` probe index is missing. The exception to "keeps
+running" is that probe index: without it each re-read of a group's extreme
+scans the group, and a page can outrun `statement_timeout` and retry forever,
+so once none has existed for five minutes the staging worker pauses the
+transform, naming the index to create.
 
 ## Consequences
 

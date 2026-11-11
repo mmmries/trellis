@@ -14,7 +14,7 @@ ordered floor to ceiling:
    [Unreferenceable types](#unreferenceable-types) for the exceptions).
 2. **Join / `GROUP BY` key** — matched by equality. A `JOIN`'s `ON` column
    must be on the join-key allowlist (`TEXT_STABLE_JOIN_KEY_TYPES` in
-   `trellis/src/defs/catalog.rs`, by Postgres type name, plus any enum). A
+   `trellis/src/defs/join_key_types.rs`, by Postgres type name, plus any enum). A
    `GROUP BY` key is gated on its `ValueType` instead
    (`validate::reject_unsupported_group_by_key_type`).
 3. **Primary key** — identifies a row. A source's key must be on the same
@@ -483,7 +483,7 @@ never joinable.
 
 - `enumout` is a bijection with no second renderer. Enums are join, `GROUP BY`
   and primary keys; the join/primary-key check is a live `to_regtype` probe
-  (`catalog::is_enum_type_name`) rather than a static list.
+  (`join_key_types::is_enum_type_name`) rather than a static list.
 - There is no typed-literal syntax: a literal's keyword would be a per-schema
   identifier.
 

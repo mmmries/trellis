@@ -50,7 +50,7 @@ Issues labelled `good first contribution`.
 - [x] Tests
   - The test suite, if provided, must be complete and pass
   - Increase code coverage, not versa.
-  - Use any of our testkits that contains a bunch of testing facilities you would need. For example: `import com.salesforce.op.test._` and borrow inspiration from existing tests.
+  - Use the `testkit` crate, which gives each test a throwaway, migrated Postgres database (`testkit::cluster`), and borrow inspiration from existing tests in `trellis/tests`.
 - [x] Dependencies
   - Minimize number of dependencies.
   - Prefer Apache 2.0, BSD3, MIT, ISC and MPL licenses.

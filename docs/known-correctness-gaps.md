@@ -21,8 +21,10 @@ change stays wrong until it's rebuilt: `request_backfill` of the source, or
 ## Summary
 
 Every gap below is silent. "Detected by" says whether `self_check` finds the
-wrong rows, on the targets it compares
-([What `self_check` can't see](#what-self_check-cant-see)).
+wrong rows. It compares every shape of target with a recompute of it in
+Postgres, hidden tables included, detects and never repairs
+([embedding — `self_check` is a background job](embedding.md#self_check-is-a-background-job),
+[ADR-0013](decisions/0013-self-check-production-recompute-audit.md)).
 
 | Gap | Detected by | Ends with |
 |---|---|---|
@@ -517,25 +519,6 @@ ring held.
 TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
-
-## What `self_check` can't see
-
-`self_check(target)` starts a background job that audits the target's
-capture, then compares the target with a recompute of it in Postgres, a page
-of keys at a time
-([embedding — `self_check` is a background job](embedding.md#self_check-is-a-background-job),
-[ADR-0013](decisions/0013-self-check-production-recompute-audit.md)). It
-detects; it never repairs. It's how you find the gaps above, so its own
-limits belong here:
-
-| Target | `self_check` | Until |
-|---|---|---|
-| 1-1, including one over another target | compared | — |
-| Aggregate, `JOIN` | compared, hidden tables included | — |
-| 1-1 `JOIN` | compared, `R` and every position's `M` included, and a join key with more than one live entry in any `M` reported | — |
-
-* Each audit also reports the definition's held keys and the instance's drain
-  holdups. They aren't gaps, but they explain a target that stops short.
 
 ## Repairing a gap
 
