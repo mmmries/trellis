@@ -35,7 +35,8 @@ use trellis::staging::{
 #[path = "pipeline.rs"]
 pub mod pipeline;
 
-pub use pipeline::WAKE;
+#[allow(unused_imports)]
+pub use pipeline::{WAKE, int4};
 
 /// Splits `ddl` into its schema statements and its `insert into …` seed rows.
 /// A group-basis aggregate over a partitioned source is defined while the
@@ -268,6 +269,25 @@ impl Driver {
     /// A new application connection.
     pub async fn user(&self) -> Client {
         connect(self.db.dsn()).await
+    }
+
+    /// Runs `sql` on a new application connection.
+    pub async fn write(&self, sql: &str) {
+        self.user().await.batch_execute(sql).await.expect(sql);
+    }
+
+    /// [`Self::write`]s `sql` and drains it as one sealed batch.
+    pub async fn step(&mut self, sql: &str) {
+        self.write(sql).await;
+        let batch = self.seal().await;
+        self.drain(batch, "step").await;
+    }
+
+    /// [`Self::write`]s `sql` and [`Self::settle`]s it, and everything it
+    /// propagates.
+    pub async fn step_settle(&mut self, sql: &str) {
+        self.write(sql).await;
+        self.settle().await;
     }
 
     /// [`pipeline::seal`]: seals both phases and returns the sealed batch,

@@ -17,11 +17,10 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::{Driver, Running};
+use drain_driver::{Driver, Running, int4};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::integer::IntWidth;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::interleave::PausePoint;
 use trellis::{Trellis, TrellisOptions};
@@ -41,10 +40,6 @@ const OPTIONS: WorkerOptions = WorkerOptions {
     reclaim_ttl: Duration::from_secs(60),
 };
 
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
-
 fn columns() -> Vec<(&'static str, ValueType)> {
     vec![("id", int4()), ("g", int4()), ("v", int4())]
 }
@@ -60,7 +55,8 @@ async fn seeded(rows: &str) -> Driver {
         &[SRC],
     )
     .await;
-    step(&mut d, &format!("insert into public.src values {rows}")).await;
+    d.step(&format!("insert into public.src values {rows}"))
+        .await;
     d
 }
 
@@ -88,17 +84,6 @@ async fn define_as(d: &Driver, definition: &str) {
     trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the build");
-}
-
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-/// Writes `sql` and drains it as one sealed page.
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
 }
 
 async fn assert_oracle(d: &mut Driver) {
@@ -215,13 +200,13 @@ async fn a_build_over_a_seeded_source_writes_every_group() {
 #[tokio::test]
 async fn changes_before_during_and_after_a_build() {
     let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
-    write(&d, "insert into public.src values (3, 1, 1)").await;
+    d.write("insert into public.src values (3, 1, 1)").await;
     let before = d.seal().await;
     define(&d).await;
 
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
     let locked = building.reached(PausePoint::AfterRebuildLock).await;
-    write(&d, "update public.src set v = 100 where id = 2").await;
+    d.write("update public.src set v = 100 where id = 2").await;
     let during = d.seal().await;
     let page = d.drain_frozen(during, "during", &[]).await;
     d.wait_blocked_behind(locked.backend_pid).await;
@@ -243,7 +228,7 @@ async fn changes_before_during_and_after_a_build() {
         "the change from before the build was in its snapshot, and refused"
     );
 
-    step(&mut d, "insert into public.src values (4, 1, 2)").await;
+    d.step("insert into public.src values (4, 1, 2)").await;
     assert_eq!(
         partials(&d, 1).await,
         ["(3,3,13,t)"],
@@ -272,7 +257,8 @@ async fn pages_between_the_enumeration_and_the_lock() {
 
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
     building.reached(PausePoint::AfterRebuildEnumerate).await;
-    step(&mut d, "insert into public.src values (4, 1, 1), (5, 9, 4)").await;
+    d.step("insert into public.src values (4, 1, 1), (5, 9, 4)")
+        .await;
     assert_eq!(
         partials(&d, 1).await,
         ["(1,1,1,f)"],
@@ -281,7 +267,8 @@ async fn pages_between_the_enumeration_and_the_lock() {
     assert_eq!(partials(&d, 9).await, ["(1,1,4,f)"]);
     // Left in the active segment: the build's open transaction holds the
     // seal of a later one, which the ring's four slots then can't spare.
-    write(&d, "update public.src set v = v + 1 where id = 2").await;
+    d.write("update public.src set v = v + 1 where id = 2")
+        .await;
     d.release(&mut building, PausePoint::AfterRebuildEnumerate)
         .await;
     building.finish().await;
@@ -317,11 +304,11 @@ async fn a_page_that_creates_a_group_after_the_locks() {
 
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
     building.reached(PausePoint::AfterRebuildLock).await;
-    step(&mut d, "insert into public.src values (2, 9, 4)").await;
+    d.step("insert into public.src values (2, 9, 4)").await;
     assert_eq!(partials(&d, 9).await, ["(1,1,4,f)"]);
     // Left in the active segment: the build's open transaction holds the
     // seal of a later one, which the ring's four slots then can't spare.
-    write(&d, "insert into public.src values (3, 9, 6)").await;
+    d.write("insert into public.src values (3, 9, 6)").await;
     d.release(&mut building, PausePoint::AfterRebuildLock).await;
     building.finish().await;
     assert_finished(&d).await;
@@ -338,13 +325,13 @@ async fn a_page_that_creates_a_group_after_the_locks() {
 #[tokio::test]
 async fn a_null_key_group_through_the_build() {
     let mut d = seeded("(1, null, 10), (2, null, 5), (3, 1, 7)").await;
-    write(&d, "insert into public.src values (4, null, 1)").await;
+    d.write("insert into public.src values (4, null, 1)").await;
     let before = d.seal().await;
     define(&d).await;
 
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
     let locked = building.reached(PausePoint::AfterRebuildLock).await;
-    write(&d, "update public.src set v = 20 where id = 1").await;
+    d.write("update public.src set v = 20 where id = 1").await;
     let during = d.seal().await;
     let page = d.drain_frozen(during, "during", &[]).await;
     d.wait_blocked_behind(locked.backend_pid).await;
@@ -361,7 +348,7 @@ async fn a_null_key_group_through_the_build() {
         .await,
         ["(3,3,26,t)"]
     );
-    step(&mut d, "insert into public.src values (5, null, 2)").await;
+    d.step("insert into public.src values (5, null, 2)").await;
     assert_oracle(&mut d).await;
 }
 
@@ -371,7 +358,7 @@ async fn a_null_key_group_through_the_build() {
 #[tokio::test]
 async fn a_group_only_an_old_image_names() {
     let mut d = seeded("(1, 5, 3), (2, 1, 1)").await;
-    write(&d, "update public.src set g = 6 where id = 1").await;
+    d.write("update public.src set g = 6 where id = 1").await;
     let undrained = d.seal().await;
     define(&d).await;
     run_build(&d).await;
@@ -455,11 +442,8 @@ async fn a_truncate_during_the_build() {
 #[tokio::test]
 async fn a_truncate_before_the_build_drains_after_it() {
     let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
-    write(
-        &d,
-        "truncate public.src; insert into public.src values (3, 1, 2), (4, 3, 8)",
-    )
-    .await;
+    d.write("truncate public.src; insert into public.src values (3, 1, 2), (4, 3, 8)")
+        .await;
     let page = d.seal().await;
     define(&d).await;
     run_build(&d).await;
@@ -475,11 +459,8 @@ async fn a_truncate_after_the_build() {
     let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
     define(&d).await;
     run_build(&d).await;
-    step(
-        &mut d,
-        "truncate public.src; insert into public.src values (3, 1, 2)",
-    )
-    .await;
+    d.step("truncate public.src; insert into public.src values (3, 1, 2)")
+        .await;
     assert_oracle(&mut d).await;
     assert_eq!(d.rows(ACTUAL).await, ["(1,2,1)"]);
 }
@@ -529,11 +510,8 @@ async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
         &[SRC],
     )
     .await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1, 1.25), (2, 1, 2, null), (3, 2, 5, 2.50)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 1, 1.25), (2, 1, 2, null), (3, 2, 5, 2.50)")
+        .await;
     let columns = [
         ("id", int4()),
         ("g", int4()),
@@ -555,7 +533,7 @@ async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
     trellis::intake::harness::start_registered_builds(d.pool())
         .await
         .expect("start the build");
-    write(&d, "update public.src set m = 3.75 where id = 2").await;
+    d.write("update public.src set m = 3.75 where id = 2").await;
     let undrained = d.seal().await;
     run_build(&d).await;
     const ACTUAL: &str = "select g, a, sm, c from public.agg order by g";
@@ -576,7 +554,7 @@ async fn a_build_writes_averages_numeric_sums_and_composed_fields() {
 #[tokio::test]
 async fn a_group_only_the_hidden_table_names_goes_to_zero() {
     let mut d = seeded("(1, 5, 3), (2, 1, 1)").await;
-    write(&d, "update public.src set g = 6 where id = 1").await;
+    d.write("update public.src set g = 6 where id = 1").await;
     let moved = d.seal().await;
     define(&d).await;
     d.drain(moved, "moved").await;
@@ -594,7 +572,7 @@ async fn a_group_only_the_hidden_table_names_goes_to_zero() {
     assert_eq!(images, ["(0)"], "no old image names group 5");
     run_build(&d).await;
     assert_eq!(partials(&d, 5).await, ["(0,0,0,t)"]);
-    step(&mut d, "insert into public.src values (3, 5, 10)").await;
+    d.step("insert into public.src values (3, 5, 10)").await;
     assert_eq!(partials(&d, 5).await, ["(1,1,10,t)"]);
     assert_oracle(&mut d).await;
 }
@@ -608,7 +586,8 @@ async fn a_build_killed_before_its_commit_runs_again_whole() {
     define(&d).await;
     let mut building = build_frozen(&d, &[PausePoint::BeforeRebuildCommit]).await;
     let reached = building.reached(PausePoint::BeforeRebuildCommit).await;
-    write(&d, "insert into public.src values (4, 1, 1), (5, 7, 2)").await;
+    d.write("insert into public.src values (4, 1, 1), (5, 7, 2)")
+        .await;
     let during = d.seal().await;
     building.kill().await;
     d.ctl
@@ -671,7 +650,8 @@ async fn a_pause_and_resume_wait_for_a_build_in_flight() {
         .get(0);
     let t = trellis(&d).await;
     t.apply("PAUSE TRANSFORM agg").await.expect("pause");
-    write(&d, "insert into public.src values (3, 1, 1), (4, 3, 4)").await;
+    d.write("insert into public.src values (3, 1, 1), (4, 3, 4)")
+        .await;
     trellis::staging::quarantine::resume_transform(d.pool(), "agg")
         .await
         .expect("resume");
@@ -810,7 +790,7 @@ async fn a_partitioned_source_with_rows_is_refused() {
 #[tokio::test]
 async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
     let mut d = seeded("(1, 1, 10), (2, null, 5), (3, 2, null), (4, null, null)").await;
-    write(&d, "create index on public.src (g, v)").await;
+    d.write("create index on public.src (g, v)").await;
     define_as(
         &d,
         "TRANSFORM agg FROM public.src GROUP BY g, v WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
@@ -859,11 +839,8 @@ async fn a_build_that_keeps_failing_on_its_data_pauses_its_definition() {
     for _ in 0..5 {
         assert_eq!(d.rows(STATUS).await, ["(backfilling)"]);
         // Each failure backs the job off; run the next attempt now.
-        write(
-            &d,
-            "update backfill_chunks set next_attempt_at = null where kind = 'plan'",
-        )
-        .await;
+        d.write("update backfill_chunks set next_attempt_at = null where kind = 'plan'")
+            .await;
         build_frozen(&d, &[]).await.finish().await;
     }
     assert_eq!(
@@ -917,21 +894,19 @@ async fn a_qualified_source_and_target_are_read_and_written_not_a_same_named_dec
     // Group 1's partials and row made wrong by hand, then an image-less
     // recompute of one of its keys, which rewrites the group from a read of
     // the source.
-    step(&mut d, "insert into custom.order_items values (3, 1, 3)").await;
+    d.step("insert into custom.order_items values (3, 1, 3)")
+        .await;
     check(&d, "a page").await;
     let id = d
         .rows("select id from transform_definitions where target_table = 'custom.order_summary'")
         .await[0]
         .trim_matches(|c| c == '(' || c == ')')
         .to_string();
-    write(
-        &d,
-        &format!(
-            "update {DEFAULT_SCHEMA}.agg_{id} set __n = 9, __count_1 = 9, __sum_1 = 99 \
+    d.write(&format!(
+        "update {DEFAULT_SCHEMA}.agg_{id} set __n = 9, __count_1 = 9, __sum_1 = 99 \
              where g = 1; \
              update custom.order_summary set total = 99, n = 9 where g = 1"
-        ),
-    )
+    ))
     .await;
     assert_eq!(d.rows(ACTUAL).await, ["(1,99,9)", "(2,7,1)"], "made wrong");
     d.stage_recomputes("custom.order_items", &["3"]).await;
@@ -940,7 +915,7 @@ async fn a_qualified_source_and_target_are_read_and_written_not_a_same_named_dec
     assert_eq!(d.rows(ACTUAL).await, ["(1,8,2)", "(2,7,1)"]);
 
     // A group's extinction deletes the qualified target's row.
-    step(&mut d, "delete from custom.order_items where g = 2").await;
+    d.step("delete from custom.order_items where g = 2").await;
     d.settle().await;
     check(&d, "a group's extinction").await;
     assert_eq!(

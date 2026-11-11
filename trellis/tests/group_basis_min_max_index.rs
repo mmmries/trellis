@@ -17,9 +17,8 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::{Config, DefinitionStatus, TransformStatus, Trellis, TrellisOptions};
 
 const SRC: &str = "public.src";
@@ -34,10 +33,6 @@ const EXPECTED: &str = "select g, min(v), max(v), count(*) from public.src group
 const SEED: &str = "insert into public.src values \
                     (1, 1, 1), (2, 1, 5), (3, 1, 9), (4, null, 2), (5, null, 6), (6, null, 8), \
                     (7, 2, 3), (8, 2, 4)";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 async fn start(definition: &str, source_ddl: &str, g: ValueType) -> Driver {
     Driver::start(
@@ -64,16 +59,10 @@ async fn status(t: &Trellis) -> DefinitionStatus {
     t.status("agg").await.expect("status").expect("defined")
 }
 
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 /// Writes `sql`, drains it as one sealed page and asserts the target equals
 /// `GROUP BY` over the source.
 async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
+    d.step(sql).await;
     assert_eq!(
         d.rows(ACTUAL).await,
         d.rows(EXPECTED).await,
@@ -147,7 +136,7 @@ async fn a_dropped_probe_index_scans_the_group_warns_and_pauses_nothing() {
     assert!(status(&t).await.extreme_index_gaps.is_empty());
     assert_endpoint(&probe_plan(&d).await, "src_g_v_idx");
 
-    write(&d, "drop index public.src_g_v_idx").await;
+    d.write("drop index public.src_g_v_idx").await;
     let dropped = status(&t).await;
     assert_one_gap(&dropped);
     assert!(
@@ -172,7 +161,8 @@ async fn a_dropped_probe_index_scans_the_group_warns_and_pauses_nothing() {
     assert!(after.drain_failure.is_none(), "{after:?}");
     assert_one_gap(&after);
 
-    write(&d, "create index src_g_v_idx on public.src (g, v)").await;
+    d.write("create index src_g_v_idx on public.src (g, v)")
+        .await;
     assert!(status(&t).await.extreme_index_gaps.is_empty());
     assert_endpoint(&probe_plan(&d).await, "src_g_v_idx");
     step(&mut d, "delete from public.src where id in (2, 5, 8)").await;
@@ -188,7 +178,7 @@ async fn an_index_that_does_not_serve_the_probe_counts_as_missing() {
     let mut d = start(AGG, INDEXED, int4()).await;
     let t = handle(&d).await;
     step(&mut d, SEED).await;
-    write(&d, "drop index public.src_g_v_idx").await;
+    d.write("drop index public.src_g_v_idx").await;
     // Only the `GROUP BY` index is left.
     assert_one_gap(&status(&t).await);
     let mut next = 100;
@@ -200,7 +190,7 @@ async fn an_index_that_does_not_serve_the_probe_counts_as_missing() {
         // The columns in different directions.
         "create index x on public.src (g, v desc)",
     ] {
-        write(&d, ddl).await;
+        d.write(ddl).await;
         assert_one_gap(&status(&t).await);
         // A new minimum in group 1 and in the `NULL` group, then its
         // retraction, which probes both groups.
@@ -217,14 +207,14 @@ async fn an_index_that_does_not_serve_the_probe_counts_as_missing() {
             &format!("delete from public.src where id in ({next}, {})", next + 1),
         )
         .await;
-        write(&d, "drop index public.x").await;
+        d.write("drop index public.x").await;
         next += 2;
     }
 
     // An index a `create index concurrently` left invalid: built and ready,
     // never validated. A failed validation phase leaves exactly this; the
     // catalog flag stands in for that race.
-    write(&d, "create index x on public.src (g, v)").await;
+    d.write("create index x on public.src (g, v)").await;
     assert!(status(&t).await.extreme_index_gaps.is_empty());
     d.ctl
         .batch_execute(
@@ -237,11 +227,12 @@ async fn an_index_that_does_not_serve_the_probe_counts_as_missing() {
     assert_group_scan(&probe_plan(&d).await, "using x on");
     // Group 1's minimum.
     step(&mut d, "delete from public.src where id = 1").await;
-    write(&d, "drop index public.x").await;
+    d.write("drop index public.x").await;
 
     // Descending throughout serves the probe (read backward), and a
     // trailing column doesn't stop it counting.
-    write(&d, "create index x on public.src (g desc, v desc, id)").await;
+    d.write("create index x on public.src (g desc, v desc, id)")
+        .await;
     assert!(status(&t).await.extreme_index_gaps.is_empty());
     assert_endpoint(&probe_plan(&d).await, "using x on");
 }
@@ -260,7 +251,7 @@ async fn an_index_under_another_collation_counts_as_missing() {
         ValueType::Text,
     )
     .await;
-    write(&d, "drop index public.src_g_v_idx").await;
+    d.write("drop index public.src_g_v_idx").await;
     let t = handle(&d).await;
     step(
         &mut d,
@@ -268,14 +259,12 @@ async fn an_index_under_another_collation_counts_as_missing() {
     )
     .await;
     assert_one_gap(&status(&t).await);
-    write(&d, r#"create index x on public.src (g collate "C", v)"#).await;
+    d.write(r#"create index x on public.src (g collate "C", v)"#)
+        .await;
     assert_one_gap(&status(&t).await);
     step(&mut d, "delete from public.src where id in (1, 4)").await;
-    write(
-        &d,
-        "drop index public.x; create index x on public.src (g, v)",
-    )
-    .await;
+    d.write("drop index public.x; create index x on public.src (g, v)")
+        .await;
     assert!(status(&t).await.extreme_index_gaps.is_empty());
     assert_endpoint(&probe_plan(&d).await, "using x on");
     step(&mut d, "delete from public.src where id in (2, 3)").await;
@@ -289,11 +278,8 @@ async fn an_index_under_another_collation_counts_as_missing() {
 #[tokio::test]
 async fn a_source_without_any_index_probes_by_scanning_for_the_group() {
     let mut d = start(AGG, INDEXED, int4()).await;
-    write(
-        &d,
-        "drop index public.src_g_v_idx; drop index public.src_g_idx",
-    )
-    .await;
+    d.write("drop index public.src_g_v_idx; drop index public.src_g_idx")
+        .await;
     let t = handle(&d).await;
     step(&mut d, SEED).await;
     let bare = status(&t).await;
@@ -310,7 +296,8 @@ async fn a_source_without_any_index_probes_by_scanning_for_the_group() {
     }
     assert_eq!(status(&t).await.status, TransformStatus::Live);
 
-    write(&d, "create index src_g_v_idx on public.src (g, v)").await;
+    d.write("create index src_g_v_idx on public.src (g, v)")
+        .await;
     let indexed = status(&t).await;
     assert!(indexed.extreme_index_gaps.is_empty(), "{indexed:?}");
     assert!(indexed.source_index_gaps.is_empty(), "{indexed:?}");
@@ -330,7 +317,7 @@ async fn a_definition_without_min_or_max_reports_no_gap() {
     )
     .await;
     let t = handle(&d).await;
-    write(&d, SEED).await;
+    d.write(SEED).await;
     let batch = d.seal().await;
     d.drain(batch, "step").await;
     let s = status(&t).await;
@@ -367,7 +354,7 @@ async fn two_group_columns_read_one_endpoint_per_null_pattern() {
     .await;
     let t = handle(&d).await;
     let step2 = async |d: &mut Driver, sql: &str| {
-        write(d, sql).await;
+        d.write(sql).await;
         let batch = d.seal().await;
         d.drain(batch, "step").await;
         assert_eq!(d.rows(ACTUAL2).await, d.rows(EXPECTED2).await, "{sql}");
@@ -390,7 +377,7 @@ async fn two_group_columns_read_one_endpoint_per_null_pattern() {
     );
     step2(&mut d, "delete from public.src where id in (1, 4, 5, 8)").await;
 
-    write(&d, "drop index public.src_g_h_v_idx").await;
+    d.write("drop index public.src_g_h_v_idx").await;
     let gaps = status(&t).await.extreme_index_gaps;
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert_eq!(gaps[0].columns, ["g", "h", "v"]);
@@ -404,7 +391,7 @@ async fn two_group_columns_read_one_endpoint_per_null_pattern() {
 #[tokio::test]
 async fn which_index_shapes_count_for_the_probe() {
     let d = start(AGG, INDEXED, int4()).await;
-    write(&d, "drop index public.src_g_v_idx").await;
+    d.write("drop index public.src_g_v_idx").await;
     let t = handle(&d).await;
     for ddl in [
         "create index x on public.src (g) include (v)",
@@ -412,10 +399,11 @@ async fn which_index_shapes_count_for_the_probe() {
         "create index x on public.src using hash (g)",
         "create index x on public.src using brin (g, v)",
     ] {
-        write(&d, ddl).await;
+        d.write(ddl).await;
         assert_one_gap(&status(&t).await);
-        write(&d, "drop index public.x").await;
+        d.write("drop index public.x").await;
     }
-    write(&d, "create unique index x on public.src (g, v, id)").await;
+    d.write("create unique index x on public.src (g, v, id)")
+        .await;
     assert!(status(&t).await.extreme_index_gaps.is_empty());
 }

@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 use trellis::capture::reconcile::{self, PassOutcome};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{StoredStatus, TransformStatus};
+use trellis::defs::{StoredStatus, TransformStatus, ValueType};
+use trellis::integer::IntWidth;
 use trellis::staging::{
     ApplyOutcome, StagingError, apply, collect_tombstones, has_pending, retire_drained_segments,
     seal as seal_api,
@@ -372,6 +373,11 @@ async fn undrained_work_holds(client: &Client, ring_slot: i16) -> bool {
         .await
         .expect("read the ring slot's occupant")
         .get(0)
+}
+
+/// The `int4` column type.
+pub fn int4() -> ValueType {
+    ValueType::Integer(IntWidth::Int4)
 }
 
 /// `sql`'s rows, each rendered as a row literal, `(1,25,2)`.

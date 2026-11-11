@@ -18,7 +18,7 @@ mod drain_driver;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::{Driver, Running};
+use drain_driver::{Driver, Running, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
@@ -57,10 +57,6 @@ const OPTIONS: WorkerOptions = WorkerOptions {
     reclaim_ttl: Duration::from_secs(60),
 };
 
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
-
 fn int8() -> ValueType {
     ValueType::Integer(IntWidth::Int8)
 }
@@ -73,7 +69,8 @@ fn src_columns() -> Vec<(&'static str, ValueType)> {
 /// values` tail), with [`AGG`] live over it on the group basis.
 async fn start(rows: &str) -> Driver {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[AGG], &[SRC]).await;
-    step(&mut d, &format!("insert into public.src values {rows}")).await;
+    d.step_settle(&format!("insert into public.src values {rows}"))
+        .await;
     assert_oracle(&mut d).await;
     d
 }
@@ -109,16 +106,6 @@ async fn install(d: &Driver, definition: &str, columns: &[(&str, ValueType)]) {
     trellis::defs::install_definition(d.pool(), definition, &columns, "public")
         .await
         .unwrap_or_else(|e| panic!("install {definition}: {e}"));
-}
-
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-/// Writes `sql` and drains it, and everything it propagates, to quiescence.
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    d.settle().await;
 }
 
 async fn assert_oracle(d: &mut Driver) {
@@ -270,7 +257,8 @@ async fn a_resume_recreates_the_partials_and_keeps_the_target() {
         ))
         .await;
     pause(&d).await;
-    write(&d, "insert into public.src values (4, 3, 1), (5, 1, 100)").await;
+    d.write("insert into public.src values (4, 3, 1), (5, 1, 100)")
+        .await;
     resume(&mut d).await;
     assert_eq!(
         d.rows(&format!("select count(*) from {}", hidden(&d).await))
@@ -317,8 +305,7 @@ async fn a_resume_recreates_the_partials_and_keeps_the_target() {
 async fn changes_written_while_paused_are_built_in() {
     let mut d = start("(1, 1, 10), (2, 1, 5), (3, 2, 7), (4, 3, 2)").await;
     pause(&d).await;
-    write(
-        &d,
+    d.write(
         "insert into public.src values (5, 2, 1); \
          update public.src set v = 50 where id = 1; \
          update public.src set g = 4 where id = 2; \
@@ -344,7 +331,8 @@ async fn a_dropped_partials_table_is_recreated() {
     resume(&mut d).await;
     run_build(&d).await;
     assert_oracle(&mut d).await;
-    step(&mut d, "insert into public.src values (3, 1, 1)").await;
+    d.step_settle("insert into public.src values (3, 1, 1)")
+        .await;
     assert_oracle(&mut d).await;
 }
 
@@ -375,7 +363,7 @@ async fn hand_edited_partials_and_target_rows_are_repaired() {
 async fn target_rows_of_groups_the_source_lost_are_removed() {
     let mut d = start("(1, 1, 10), (2, 2, 7), (3, 3, 4)").await;
     pause(&d).await;
-    write(&d, "delete from public.src where g in (1, 2)").await;
+    d.write("delete from public.src where g in (1, 2)").await;
     d.ctl
         .batch_execute("insert into public.agg (g, total, n) values (50, 5, 5)")
         .await
@@ -394,7 +382,8 @@ async fn target_rows_of_groups_the_source_lost_are_removed() {
 async fn a_retyped_group_column_resumes_over_correctly_typed_partials() {
     let mut d = start("(1, 1, 10), (2, 2, 7)").await;
     pause(&d).await;
-    write(&d, "alter table public.src alter column g type bigint").await;
+    d.write("alter table public.src alter column g type bigint")
+        .await;
     let column = format!(
         "select format_type(atttypid, atttypmod) from pg_attribute \
          where attrelid = '{}'::regclass and attname = 'g'",
@@ -404,7 +393,8 @@ async fn a_retyped_group_column_resumes_over_correctly_typed_partials() {
     resume(&mut d).await;
     assert_eq!(d.rows(&column).await, ["(bigint)"]);
     run_build(&d).await;
-    step(&mut d, "insert into public.src values (3, 5000000000, 4)").await;
+    d.step_settle("insert into public.src values (3, 5000000000, 4)")
+        .await;
     assert_oracle(&mut d).await;
     assert_eq!(
         d.rows(&format!(
@@ -432,11 +422,8 @@ async fn a_group_basis_reader_of_a_resumed_target_is_rebuilt_and_converges() {
     building.reached(PausePoint::AfterRebuildEnumerate).await;
     // A held group (1) and a group the target holds and the build will
     // write too (2): pages before the build's lock statement.
-    write(
-        &d,
-        "insert into public.src values (5, 1, 100); update public.src set v = 70 where id = 3",
-    )
-    .await;
+    d.write("insert into public.src values (5, 1, 100); update public.src set v = 70 where id = 3")
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "page").await;
     d.release(&mut building, PausePoint::AfterRebuildEnumerate)
@@ -461,11 +448,8 @@ async fn the_second_reader_converges_without_being_rebuilt() {
     resume(&mut d).await;
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
     building.reached(PausePoint::AfterRebuildEnumerate).await;
-    write(
-        &d,
-        "insert into public.src values (5, 1, 100); update public.src set v = 70 where id = 3",
-    )
-    .await;
+    d.write("insert into public.src values (5, 1, 100); update public.src set v = 70 where id = 3")
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "page").await;
     d.release(&mut building, PausePoint::AfterRebuildEnumerate)
@@ -500,7 +484,7 @@ async fn a_one_to_one_reader_of_a_resumed_target_is_caught_up() {
     build::settle_builds(d.pool()).await;
     d.settle().await;
     pause(&d).await;
-    write(&d, "update public.src set v = 70 where id = 2").await;
+    d.write("update public.src set v = 70 where id = 2").await;
     resume(&mut d).await;
     run_build(&d).await;
     assert_eq!(
@@ -558,7 +542,8 @@ async fn a_pause_and_resume_wait_for_a_live_rebuild_in_flight() {
         )
         .await;
     let reached = rebuilding.reached(PausePoint::AfterRebuildLock).await;
-    write(&d, "insert into public.src values (4, 1, 100), (5, 3, 1)").await;
+    d.write("insert into public.src values (4, 1, 100), (5, 3, 1)")
+        .await;
     let pool = d.pool().clone();
     let operator = tokio::spawn(async move {
         t.apply("PAUSE TRANSFORM agg").await.expect("pause");
@@ -614,10 +599,11 @@ async fn reader_operations_and_pages_while_the_build_parks() {
         let t = trellis(&d).await;
         pause(&d).await;
         resume(&mut d).await;
-        write(&d, "insert into public.src values (4, 1, 100)").await;
+        d.write("insert into public.src values (4, 1, 100)").await;
         let batch = d.seal().await;
         d.drain(batch, "page").await;
-        write(&d, "insert into public.src values (5, 1, 1), (6, 2, 2)").await;
+        d.write("insert into public.src values (5, 1, 1), (6, 2, 2)")
+            .await;
         let batch = d.seal().await;
         let mut building = build_frozen(&d, &[PausePoint::BeforeRebuildCommit]).await;
         let reached = building.reached(PausePoint::BeforeRebuildCommit).await;

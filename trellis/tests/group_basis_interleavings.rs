@@ -17,20 +17,15 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
 
 const SRC: &str = "public.src";
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 const ACTUAL: &str = "select g, total, n from public.agg order by g";
 const EXPECTED: &str = "select g, sum(v), count(*) from public.src group by g order by g";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 /// `public.src (id, g, v)`, empty, with `definition` live over it on the
 /// group basis, captured by triggers. `app` runs after the source's DDL
@@ -76,17 +71,6 @@ async fn start() -> Driver {
         "",
     )
     .await
-}
-
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-/// Writes `sql` and drains it as one sealed page.
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
 }
 
 /// Settles the pipeline and asserts the target equals the oracle.
@@ -187,7 +171,7 @@ async fn pages_keep_count_and_sum_exact() {
         "delete from public.src where id in (3, 4)",
         "update public.src set g = null where id = 5",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "after {sql}");
     }
     assert_oracle(&mut d).await;
@@ -198,9 +182,9 @@ async fn pages_keep_count_and_sum_exact() {
 #[tokio::test]
 async fn a_page_that_changes_nothing_writes_nothing() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     let before = d.rows("select xmin::text from public.agg").await;
-    step(&mut d, "update public.src set v = v where id = 1").await;
+    d.step("update public.src set v = v where id = 1").await;
     assert_eq!(d.rows("select xmin::text from public.agg").await, before);
     assert_oracle(&mut d).await;
 }
@@ -218,9 +202,9 @@ async fn a_page_that_changes_only_hidden_partials_leaves_the_visible_row() {
         "",
     )
     .await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     let before = d.rows("select xmin::text from public.agg").await;
-    step(&mut d, "insert into public.src values (2, 1, null)").await;
+    d.step("insert into public.src values (2, 1, null)").await;
     assert_eq!(partials(&d, 1).await, ["(2,1,10,f)"]);
     assert_eq!(d.rows("select xmin::text from public.agg").await, before);
     assert_eq!(
@@ -261,7 +245,7 @@ async fn composed_fields_and_expression_arguments_equal_postgres() {
         "update public.src set a = 4, b = 4 where id = 3",
         "delete from public.src where g = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
     }
 }
@@ -288,7 +272,7 @@ async fn numeric_sums_and_averages_keep_the_declared_scale() {
         "update public.src set m = 3 where id = 1",
         "update public.src set g = 2 where id = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
     }
 }
@@ -335,7 +319,7 @@ async fn group_columns_named_like_the_applys_working_columns() {
         "update public.src set n = 2, v = 1 where id = 1",
         "delete from public.src where id = 2",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(
             d.rows(&actual).await,
             d.rows(&expected).await,
@@ -368,7 +352,7 @@ async fn every_pattern_of_null_group_columns_finds_its_group() {
         "delete from public.src where id in (4, 5)",
         "delete from public.src",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(d.rows(actual).await, d.rows(expected).await, "after {sql}");
     }
     assert_oracle(&mut d).await;
@@ -384,8 +368,8 @@ async fn every_pattern_of_null_group_columns_finds_its_group() {
 #[tokio::test]
 async fn r1_a_page_reads_the_basis_after_its_lock() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     let batch = d.seal().await;
     let held = recompute(&d, &[1]).await;
     let page = d.drain_frozen(batch, "a", &[]).await;
@@ -403,8 +387,8 @@ async fn r1_a_page_reads_the_basis_after_its_lock() {
 #[tokio::test]
 async fn r1_a_recompute_queued_behind_a_page_sees_its_change() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     let batch = d.seal().await;
     let mut page = d
         .drain_frozen(batch, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
@@ -429,12 +413,9 @@ async fn r1_a_recompute_queued_behind_a_page_sees_its_change() {
 #[tokio::test]
 async fn r2_a_move_is_checked_against_each_groups_basis() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
-    write(&d, "update public.src set g = 2 where id = 1").await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
+    d.write("update public.src set g = 2 where id = 1").await;
     let batch = d.seal().await;
     recompute(&d, &[2]).await.commit().await;
     d.drain(batch, "a").await;
@@ -449,10 +430,10 @@ async fn r2_a_move_is_checked_against_each_groups_basis() {
 #[tokio::test]
 async fn r2_one_page_applies_only_the_transactions_its_groups_basis_missed() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     recompute(&d, &[1]).await.commit().await;
-    write(&d, "insert into public.src values (3, 1, 1)").await;
+    d.write("insert into public.src values (3, 1, 1)").await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     assert_eq!(partials(&d, 1).await, ["(3,3,16,t)"]);
@@ -468,7 +449,7 @@ async fn r2_one_page_applies_only_the_transactions_its_groups_basis_missed() {
 #[tokio::test]
 async fn r2_a_change_in_flight_at_the_basis_applies() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     let writer = d.user().await;
     writer
         .batch_execute("begin; insert into public.src values (2, 1, 5)")
@@ -476,7 +457,7 @@ async fn r2_a_change_in_flight_at_the_basis_applies() {
         .expect("the in-flight write");
     // A later transaction completes first, so the snapshot's `xmax` is past
     // the writer's and lists it as in flight.
-    write(&d, "insert into public.src values (3, 2, 1)").await;
+    d.write("insert into public.src values (3, 2, 1)").await;
     recompute(&d, &[1]).await.commit().await;
     assert_eq!(partials(&d, 1).await, ["(1,1,10,t)"], "the basis missed it");
     writer.batch_execute("commit").await.expect("commit");
@@ -494,10 +475,10 @@ async fn r2_a_change_in_flight_at_the_basis_applies() {
 #[tokio::test]
 async fn r1_a_page_waits_for_a_page_that_applied_to_its_group() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     let first = d.seal().await;
-    write(&d, "insert into public.src values (3, 1, 1)").await;
+    d.write("insert into public.src values (3, 1, 1)").await;
     let second = d.seal().await;
     let mut held = d
         .drain_frozen(first, "a", &[(PausePoint::AfterGroupUpsert, "public.agg")])
@@ -523,10 +504,10 @@ async fn r1_a_page_waits_for_a_page_that_applied_to_its_group() {
 #[tokio::test]
 async fn f2_a_basis_between_two_changes_of_a_key() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    write(&d, "update public.src set g = 2 where id = 1").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.write("update public.src set g = 2 where id = 1").await;
     recompute(&d, &[2]).await.commit().await;
-    write(&d, "update public.src set g = 3 where id = 1").await;
+    d.write("update public.src set g = 3 where id = 1").await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
@@ -539,17 +520,12 @@ async fn f2_a_basis_between_two_changes_of_a_key() {
 #[tokio::test]
 async fn f2_a_key_through_three_groups_on_one_page() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 1)",
-    )
-    .await;
-    write(
-        &d,
-        "update public.src set g = 2 where id = 1; update public.src set g = 3 where id = 1",
-    )
-    .await;
-    write(&d, "update public.src set g = 4, v = 11 where id = 1").await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 1)")
+        .await;
+    d.write("update public.src set g = 2 where id = 1; update public.src set g = 3 where id = 1")
+        .await;
+    d.write("update public.src set g = 4, v = 11 where id = 1")
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     assert_oracle(&mut d).await;
@@ -591,7 +567,7 @@ async fn r3_nested_writes_sum_once() {
         "update public.src set v = v + 1",
         "insert into public.src values (5, 1, -7); update public.src set g = 2 where id = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "after {sql}");
     }
 }
@@ -605,9 +581,9 @@ async fn r3_nested_writes_sum_once() {
 #[tokio::test]
 async fn a_group_is_visible_only_while_its_count_is_above_zero() {
     let mut d = start().await;
-    write(&d, "insert into public.src values (1, 1, 10)").await;
+    d.write("insert into public.src values (1, 1, 10)").await;
     let insert = d.seal().await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let delete = d.seal().await;
     d.drain(delete, "a").await;
     assert_eq!(partials(&d, 1).await, ["(-1,-1,-10,f)"]);
@@ -634,18 +610,15 @@ async fn hidden_rows(d: &Driver) -> i64 {
 #[tokio::test]
 async fn r4_the_gc_bounds_a_hidden_table_whose_groups_churn() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (0, 0, 1)").await;
+    d.step("insert into public.src values (0, 0, 1)").await;
     for round in 0..5 {
         let first = 1 + round * 1_000;
-        step(
-            &mut d,
-            &format!(
-                "insert into public.src select i, i, i from generate_series({first}, {}) i",
-                first + 999
-            ),
-        )
+        d.step(&format!(
+            "insert into public.src select i, i, i from generate_series({first}, {}) i",
+            first + 999
+        ))
         .await;
-        step(&mut d, "delete from public.src where id > 0").await;
+        d.step("delete from public.src where id > 0").await;
         assert_eq!(hidden_rows(&d).await, 1_001, "round {round}: before the GC");
         assert_eq!(d.collect_tombstones().await, 1_000, "round {round}");
         assert_eq!(hidden_rows(&d).await, 1, "round {round}: after the GC");
@@ -661,10 +634,10 @@ async fn r4_the_gc_bounds_a_hidden_table_whose_groups_churn() {
 #[tokio::test]
 async fn r4_a_group_with_a_nonzero_partial_stays() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 1)").await;
-    write(&d, "update public.src set v = 3 where id = 1").await;
+    d.step("insert into public.src values (1, 1, 1)").await;
+    d.write("update public.src set v = 3 where id = 1").await;
     let update = d.seal().await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let delete = d.seal().await;
     d.drain(delete, "a").await;
     assert_eq!(partials(&d, 1).await, ["(0,0,-2,f)"]);
@@ -686,12 +659,13 @@ async fn r4_a_group_with_a_nonzero_partial_stays() {
 #[tokio::test]
 async fn r4_a_zero_group_with_a_basis_stays_until_the_prefix_passes_its_stamp() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 5, 4), (2, 6, 1)").await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, 5, 4), (2, 6, 1)")
+        .await;
+    d.write("delete from public.src where id = 1").await;
     let c1 = d.seal().await;
     recompute(&d, &[5]).await.commit().await;
     assert_eq!(partials(&d, 5).await, ["(0,0,0,t)"]);
-    write(&d, "update public.src set v = 2 where id = 2").await;
+    d.write("update public.src set v = 2 where id = 2").await;
     let later = d.seal().await;
     d.drain(later, "a").await;
     assert_eq!(d.collect_tombstones().await, 0);
@@ -709,12 +683,12 @@ async fn r4_a_zero_group_with_a_basis_stays_until_the_prefix_passes_its_stamp() 
 #[tokio::test]
 async fn r4_a_basis_without_a_stamp_keeps_its_group() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 1)").await;
+    d.step("insert into public.src values (1, 1, 1)").await;
     recompute(&d, &[2]).await.commit().await;
-    write(
-        &d,
-        &format!("update {} set __stamp = null where g = 2", hidden(&d).await),
-    )
+    d.write(&format!(
+        "update {} set __stamp = null where g = 2",
+        hidden(&d).await
+    ))
     .await;
     d.settle().await;
     assert_eq!(partials(&d, 2).await, ["(0,0,0,t)"]);
@@ -726,10 +700,10 @@ async fn r4_a_basis_without_a_stamp_keeps_its_group() {
 #[tokio::test]
 async fn r4_the_gc_skips_a_group_a_page_holds() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    step(&mut d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.step("delete from public.src where id = 1").await;
     assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     let refill = d.seal().await;
     let mut page = d
         .drain_frozen(refill, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
@@ -750,8 +724,8 @@ async fn r4_the_gc_skips_a_group_a_page_holds() {
 #[tokio::test]
 async fn r4_a_page_meeting_a_group_the_gc_is_deleting_inserts_it_afresh() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    step(&mut d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.step("delete from public.src where id = 1").await;
     assert_eq!(partials(&d, 1).await, ["(0,0,0,f)"]);
     let hidden = hidden(&d).await;
     let gc = d.user().await;
@@ -773,7 +747,7 @@ async fn r4_a_page_meeting_a_group_the_gc_is_deleting_inserts_it_afresh() {
         .await
         .expect("the GC's delete");
     assert_eq!(deleted, 1);
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     let refill = d.seal().await;
     let page = d.drain_frozen(refill, "a", &[]).await;
     d.wait_blocked_behind(gc_pid).await;
@@ -900,14 +874,10 @@ async fn claimable(d: &Driver) -> Vec<i64> {
 #[tokio::test]
 async fn a_truncate_clears_the_groups_and_raises_the_floor() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20), (3, 3, 30)",
-    )
-    .await;
-    step(&mut d, "delete from public.src where id = 3").await;
-    step(
-        &mut d,
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20), (3, 3, 30)")
+        .await;
+    d.step("delete from public.src where id = 3").await;
+    d.step(
         "begin; insert into public.src values (4, 1, 1); truncate public.src; \
          insert into public.src values (5, 2, 5); commit",
     )
@@ -925,7 +895,7 @@ async fn a_truncate_clears_the_groups_and_raises_the_floor() {
         .rows("select floor::text from ledger_truncate_floor where target_table = 'public.agg'")
         .await;
     assert_eq!(floor.len(), 1, "the floor is raised");
-    step(&mut d, "insert into public.src values (6, 1, 6)").await;
+    d.step("insert into public.src values (6, 1, 6)").await;
     assert_oracle(&mut d).await;
 }
 
@@ -935,14 +905,12 @@ async fn a_truncate_clears_the_groups_and_raises_the_floor() {
 #[tokio::test]
 async fn a_change_from_before_a_truncate_is_refused_after_it() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    write(&d, "insert into public.src values (2, 1, 5), (3, 2, 7)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.write("insert into public.src values (2, 1, 5), (3, 2, 7)")
+        .await;
     let before = d.seal().await;
-    write(
-        &d,
-        "truncate public.src; insert into public.src values (4, 2, 1)",
-    )
-    .await;
+    d.write("truncate public.src; insert into public.src values (4, 2, 1)")
+        .await;
     let truncate = d.seal().await;
     d.drain(truncate, "a").await;
     d.drain(before, "b").await;
@@ -958,11 +926,11 @@ async fn a_change_from_before_a_truncate_is_refused_after_it() {
 #[tokio::test]
 async fn the_truncate_page_waits_for_earlier_pages_and_later_ones_for_it() {
     let mut d = start().await;
-    write(&d, "insert into public.src values (1, 9, 10)").await;
+    d.write("insert into public.src values (1, 9, 10)").await;
     let earlier = d.seal().await;
-    write(&d, "truncate public.src").await;
+    d.write("truncate public.src").await;
     let truncate = d.seal().await;
-    write(&d, "insert into public.src values (2, 9, 5)").await;
+    d.write("insert into public.src values (2, 9, 5)").await;
 
     let mut page = d
         .drain_frozen(earlier, "a", &[(PausePoint::AfterEntryLock, "public.agg")])
@@ -997,13 +965,13 @@ async fn the_truncate_page_waits_for_earlier_pages_and_later_ones_for_it() {
 #[tokio::test]
 async fn no_segment_is_sealed_past_an_unfenced_one() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
-    write(&d, "truncate public.src").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    d.write("truncate public.src").await;
     d.retire().await;
     let stuck = trellis::staging::seal::seal_phase1_waiting(&mut d.ctl)
         .await
         .sealed_seg_seq;
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     assert_eq!(
         d.try_seal().await,
         None,
@@ -1030,11 +998,8 @@ async fn no_segment_is_sealed_past_an_unfenced_one() {
 #[tokio::test]
 async fn an_image_less_change_recomputes_the_groups_it_names() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)")
+        .await;
     // Drift both groups behind the pipeline's back.
     d.ctl
         .batch_execute(&format!(
@@ -1049,7 +1014,7 @@ async fn an_image_less_change_recomputes_the_groups_it_names() {
         &[("1", Some(r#"{"id": 1, "g": 2, "v": 10}"#.to_string()))],
     )
     .await;
-    write(&d, "insert into public.src values (4, 1, 1)").await;
+    d.write("insert into public.src values (4, 1, 1)").await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     assert_eq!(partials(&d, 1).await, ["(3,3,16,t)"]);
@@ -1095,15 +1060,13 @@ async fn release(d: &Driver, key: &str) {
 #[tokio::test]
 async fn a_release_recomputes_every_group_the_held_key_moved_through() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
     hold(&d, "1").await;
-    step(&mut d, "update public.src set g = 2 where id = 1").await;
+    d.step("update public.src set g = 2 where id = 1").await;
     recompute(&d, &[2]).await.commit().await;
-    step(&mut d, "update public.src set g = 3, v = 11 where id = 1").await;
+    d.step("update public.src set g = 3, v = 11 where id = 1")
+        .await;
     assert_eq!(held_groups(&d, "1").await, ["(1)", "(2)", "(3)"]);
     assert_eq!(
         partials(&d, 1).await,
@@ -1125,16 +1088,14 @@ async fn a_release_recomputes_every_group_the_held_key_moved_through() {
 #[tokio::test]
 async fn a_release_after_another_keys_release_to_the_same_group() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 1)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 20), (3, 2, 1)")
+        .await;
     hold(&d, "1").await;
     hold(&d, "2").await;
-    step(&mut d, "update public.src set g = 2 where id in (1, 2)").await;
+    d.step("update public.src set g = 2 where id in (1, 2)")
+        .await;
     release(&d, "2").await;
-    step(&mut d, "update public.src set v = 12 where id = 1").await;
+    d.step("update public.src set v = 12 where id = 1").await;
     release(&d, "1").await;
     assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
     assert_oracle(&mut d).await;
@@ -1147,12 +1108,12 @@ async fn a_release_after_another_keys_release_to_the_same_group() {
 #[tokio::test]
 async fn a_change_undrained_at_the_release_is_filtered_by_the_basis() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     hold(&d, "1").await;
-    step(&mut d, "update public.src set g = 2 where id = 1").await;
-    write(&d, "update public.src set g = 3 where id = 1").await;
+    d.step("update public.src set g = 2 where id = 1").await;
+    d.write("update public.src set g = 3 where id = 1").await;
     let pending = d.seal().await;
-    write(&d, "insert into public.src values (2, 4, 1)").await;
+    d.write("insert into public.src values (2, 4, 1)").await;
     release(&d, "1").await;
     assert_eq!(partials(&d, 3).await, ["(1,1,10,t)"]);
     d.drain(pending, "a").await;
@@ -1165,13 +1126,11 @@ async fn a_change_undrained_at_the_release_is_filtered_by_the_basis() {
 #[tokio::test]
 async fn the_automatic_retry_recomputes_the_held_keys_groups() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
     hold(&d, "1").await;
-    step(&mut d, "update public.src set g = 2, v = 3 where id = 1").await;
+    d.step("update public.src set g = 2, v = 3 where id = 1")
+        .await;
     let poisoned_at: std::time::SystemTime = d
         .ctl
         .query_one("select poisoned_at from poison where key = '1'", &[])
@@ -1194,14 +1153,11 @@ async fn the_automatic_retry_recomputes_the_held_keys_groups() {
 #[tokio::test]
 async fn a_release_counts_each_concurrent_change_to_its_group_once() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 20)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 20)")
+        .await;
     hold(&d, "1").await;
-    step(&mut d, "update public.src set v = 11 where id = 1").await;
-    write(&d, "insert into public.src values (3, 1, 5)").await;
+    d.step("update public.src set v = 11 where id = 1").await;
+    d.write("insert into public.src values (3, 1, 5)").await;
     let pending = d.seal().await;
     let open = d.user().await;
     open.batch_execute("begin; update public.src set v = 25 where id = 2")
@@ -1225,13 +1181,10 @@ async fn a_release_counts_each_concurrent_change_to_its_group_once() {
 #[tokio::test]
 async fn a_release_recomputes_a_null_group() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, null, 10), (2, null, 20), (3, 2, 1)",
-    )
-    .await;
+    d.step("insert into public.src values (1, null, 10), (2, null, 20), (3, 2, 1)")
+        .await;
     hold(&d, "1").await;
-    step(&mut d, "update public.src set g = 2 where id = 1").await;
+    d.step("update public.src set g = 2 where id = 1").await;
     assert_eq!(held_groups(&d, "1").await, ["(2)", "(null)"]);
     release(&d, "1").await;
     assert_eq!(
@@ -1256,16 +1209,13 @@ async fn the_evicting_changes_groups_are_held_and_released() {
     use trellis::staging::{BucketFilter, claim, fold};
 
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
     d.ctl
         .batch_execute("alter table public.agg add constraint small check (total < 25)")
         .await
         .expect("constrain the target");
-    write(&d, "update public.src set g = 2 where id = 1").await;
+    d.write("update public.src set g = 2 where id = 1").await;
     let seg = d.seal().await;
     let folded = {
         let mut conn = d.pool().get().await.expect("pool");

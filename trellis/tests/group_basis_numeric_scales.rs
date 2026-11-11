@@ -21,26 +21,11 @@ mod drain_driver;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
-
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
-}
 
 /// The rows of `actual` and `expected` (same columns, each cast to text by
 /// the caller) that the other lacks: equal text, not equal value.
@@ -106,7 +91,7 @@ async fn check(
 async fn run(d: &mut Driver, steps: &[&str], targets: &[(&str, &str, &str)]) {
     let mut failures = Vec::new();
     for sql in steps {
-        step(d, sql).await;
+        d.step(sql).await;
         check(d, sql, targets, &mut failures).await;
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -163,14 +148,11 @@ async fn the_largest_scale_empties_and_refills() {
 #[tokio::test]
 async fn the_largest_scale_empties_and_refills_across_two_concurrent_pages() {
     let mut d = start_agg().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1.5), (2, 1, 2.000)",
-    )
-    .await;
-    write(&d, "delete from public.src where id = 2").await;
+    d.step("insert into public.src values (1, 1, 1.5), (2, 1, 2.000)")
+        .await;
+    d.write("delete from public.src where id = 2").await;
     let first = d.seal().await;
-    write(&d, "insert into public.src values (3, 1, 0.25)").await;
+    d.write("insert into public.src values (3, 1, 0.25)").await;
     let second = d.seal().await;
     let mut held = d
         .drain_frozen(first, "a", &[(PausePoint::AfterGroupUpsert, "public.agg")])
@@ -197,9 +179,10 @@ async fn the_largest_scale_empties_and_refills_across_two_concurrent_pages() {
 
     // The other order: the page bringing the largest scale back waits for
     // the one taking a smaller value away.
-    write(&d, "delete from public.src where id = 3").await;
+    d.write("delete from public.src where id = 3").await;
     let first = d.seal().await;
-    write(&d, "insert into public.src values (4, 1, 0.1250)").await;
+    d.write("insert into public.src values (4, 1, 0.1250)")
+        .await;
     let second = d.seal().await;
     let mut held = d
         .drain_frozen(first, "a", &[(PausePoint::AfterGroupUpsert, "public.agg")])
@@ -335,11 +318,8 @@ async fn a_build_then_pages() {
 #[tokio::test]
 async fn self_check_reports_a_wrong_scale_or_special_count() {
     let mut d = start_agg().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1.5), (2, 1, 2.000), (3, 1, 'Infinity')",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 1.5), (2, 1, 2.000), (3, 1, 'Infinity')")
+        .await;
     let id: i64 = d
         .ctl
         .query_one(
@@ -446,7 +426,7 @@ async fn a_chained_sum_over_a_targets_numeric_column() {
         "update public.src set x = 0.125 where id = 1",
         "delete from public.src where id = 2",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         // The reader's page is the upstream's seam rows: one more drain.
         d.settle().await;
         check(&d, sql, &[("down", rows, expected)], &mut failures).await;
@@ -626,7 +606,7 @@ async fn a_map_of_exceptions_is_multiplied_into_t() {
         &["public.o", "public.c"],
     )
     .await;
-    step(&mut d, "select 1").await;
+    d.step("select 1").await;
     let id: i64 = d
         .ctl
         .query_one(
@@ -649,11 +629,8 @@ async fn a_map_of_exceptions_is_multiplied_into_t() {
     // A second match for keys 1 and 2: `T` gains `P_old ⊗ ΔM`, read from
     // each cell: `{"5": 1}` for `a` (the build's `NULL` plus the cell's map
     // times its new match), still `NULL` for `b`.
-    step(
-        &mut d,
-        "insert into public.c values (2, 1, 'a'), (4, 2, 'b')",
-    )
-    .await;
+    d.step("insert into public.c values (2, 1, 'a'), (4, 2, 'b')")
+        .await;
     assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b=NULL"]);
     // `b`'s sums stay Postgres's: the map only `a` holds never reaches it.
     let b_rows = format!("select * from ({INNER_ROWS}) r where region = 'b'");
@@ -664,28 +641,22 @@ async fn a_map_of_exceptions_is_multiplied_into_t() {
     );
     // Values finite at the reference scale on both keys: no delta holds a
     // map, and `a` keeps the one its cell carried in.
-    step(
-        &mut d,
-        "insert into public.o values (4, 2, 3.5), (5, 1, 4.25)",
-    )
-    .await;
+    d.step("insert into public.o values (4, 2, 3.5), (5, 1, 4.25)")
+        .await;
     assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b=NULL"]);
     assert_eq!(
         difference(&d, &b_rows, &b_expected).await,
         Vec::<String>::new()
     );
     // A `NaN` on key 2, matched twice, beside a finite value on key 1.
-    step(
-        &mut d,
-        "insert into public.o values (6, 2, 'NaN'), (7, 1, 0.5)",
-    )
-    .await;
+    d.step("insert into public.o values (6, 2, 'NaN'), (7, 1, 0.5)")
+        .await;
     assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b={\"NaN\": 2}"]);
     assert_eq!(
         difference(&d, &b_rows, &b_expected).await,
         Vec::<String>::new()
     );
-    step(&mut d, "delete from public.o where id = 6").await;
+    d.step("delete from public.o where id = 6").await;
     assert_eq!(t_maps(&d, &t).await, ["a={\"5\": 1}", "b=NULL"]);
     assert_eq!(
         difference(&d, &b_rows, &b_expected).await,
@@ -803,7 +774,7 @@ async fn random_pages_over_adversarial_values_match_postgres() {
             }
         }
         let sql = sql.join("; ");
-        step(&mut d, &sql).await;
+        d.step(&sql).await;
         check(&d, &sql, &[("agg", rows, expected)], &mut failures).await;
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -879,7 +850,7 @@ async fn random_join_pages_over_adversarial_values_match_postgres() {
             }
         }
         let sql = sql.join("; ");
-        step(&mut d, &sql).await;
+        d.step(&sql).await;
         check(
             &d,
             &sql,
