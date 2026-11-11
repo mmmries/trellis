@@ -1616,8 +1616,8 @@ const MAX_INLINED_DEPTH: usize = 2 * crate::defs::MAX_EXPRESSION_DEPTH;
 /// Renders each calculated field of a 1-1 definition against the source row,
 /// reading another calculated field by name as that field's own expression
 /// (inlined), as `defs::backfill::substitute_all_fields` does for the write
-/// path. Written fresh here on [`render_leaf`]'s grammar, sharing nothing
-/// with the write path (ADR-0013): a name that is not another field is a
+/// path. Rendered by the audit's own walk ([`render_audit`]), sharing
+/// nothing with the write path (ADR-0013): a name that is not another field is a
 /// source column, and a field's own name inside its expression is the source
 /// column of that name.
 struct FieldInliner<'a> {
@@ -1626,6 +1626,9 @@ struct FieldInliner<'a> {
     /// Rendered SQL of the fields already inlined, with its node count.
     memo: HashMap<&'a str, (String, usize)>,
     nodes: usize,
+    /// The field whose expression is being rendered: its own name inside it
+    /// is the source column of that name.
+    owner: &'a str,
 }
 
 impl<'a> FieldInliner<'a> {
@@ -1635,6 +1638,7 @@ impl<'a> FieldInliner<'a> {
             fields: fields.iter().map(|f| (f.name.as_str(), &f.expr)).collect(),
             memo: HashMap::new(),
             nodes: 0,
+            owner: "",
         }
     }
 
@@ -1648,7 +1652,8 @@ impl<'a> FieldInliner<'a> {
     }
 
     fn render(&mut self, field: &'a FieldDef) -> Result<String, SelfCheckError> {
-        self.expr(&field.expr, &field.name, 0)
+        self.owner = &field.name;
+        render_audit(self, &field.expr, 0)
     }
 
     fn charge(&mut self, cost: usize) -> Result<(), SelfCheckError> {
@@ -1658,18 +1663,19 @@ impl<'a> FieldInliner<'a> {
         }
         Ok(())
     }
+}
 
-    fn expr(
-        &mut self,
-        expr: &'a Expr,
-        owner: &str,
-        depth: usize,
-    ) -> Result<String, SelfCheckError> {
+impl<'a> AuditRender<'a> for FieldInliner<'a> {
+    type Error = SelfCheckError;
+
+    /// A read of another field is that field's expression, rendered once
+    /// and charged at its size on every read; any other node costs one.
+    fn special(&mut self, expr: &'a Expr, depth: usize) -> Result<Option<String>, SelfCheckError> {
         if depth > MAX_INLINED_DEPTH {
             return Err(self.too_large());
         }
         if let Expr::Column(name) = expr
-            && name != owner
+            && name != self.owner
             && let Some((key, body)) = self.fields.get_key_value(name.as_str())
         {
             // The read itself is replaced, so it costs nothing: the count is
@@ -1680,77 +1686,114 @@ impl<'a> FieldInliner<'a> {
                 // A memo hit still materializes its text: charge its nodes.
                 let (done, nodes) = (done.clone(), *nodes);
                 self.charge(nodes)?;
-                return Ok(done);
+                return Ok(Some(done));
             }
             let before = self.nodes;
-            let rendered = self.expr(body, key, depth + 1)?;
+            let owner = std::mem::replace(&mut self.owner, key);
+            let rendered = render_audit(self, body, depth + 1);
+            self.owner = owner;
+            let rendered = rendered?;
             // Its own nodes, memo hits inside it included.
             self.memo
                 .insert(key, (rendered.clone(), self.nodes - before));
-            return Ok(rendered);
+            return Ok(Some(rendered));
         }
         self.charge(1)?;
-        Ok(match expr {
-            Expr::BinaryOp { op, lhs, rhs } => {
-                let symbol = registry::operator_spec(*op).symbol;
-                let l = self.expr(lhs, owner, depth + 1)?;
-                let r = self.expr(rhs, owner, depth + 1)?;
-                format!("({l} {symbol} {r})")
-            }
-            Expr::Negate(operand) => {
-                format!("(-({}))", self.expr(operand, owner, depth + 1)?)
-            }
-            Expr::Cast { expr, target } => {
-                format!("cast({} as {target})", self.expr(expr, owner, depth + 1)?)
-            }
-            Expr::Not(operand) => {
-                format!("(not {})", self.expr(operand, owner, depth + 1)?)
-            }
-            Expr::IsNull { expr, negated } => {
-                let test = if *negated { "is not null" } else { "is null" };
-                format!("({} {test})", self.expr(expr, owner, depth + 1)?)
-            }
-            Expr::Case {
-                branches,
-                otherwise,
-            } => {
-                let mut sql = String::from("(case");
-                for (condition, result) in branches {
-                    let c = self.expr(condition, owner, depth + 1)?;
-                    let r = self.expr(result, owner, depth + 1)?;
-                    sql.push_str(&format!(" when {c} then {r}"));
-                }
-                if let Some(otherwise) = otherwise {
-                    let o = self.expr(otherwise, owner, depth + 1)?;
-                    sql.push_str(&format!(" else {o}"));
-                }
-                sql.push_str(" end)");
-                sql
-            }
-            Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-                "count(*)".to_string()
-            }
-            Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
-                let (field, operand) = as_extract(name, args).expect("checked");
-                format!(
-                    "extract({field} from {})",
-                    self.expr(operand, owner, depth + 1)?
-                )
-            }
-            Expr::FunctionCall { name, args } => {
-                let mut rendered = Vec::with_capacity(args.len());
-                for (i, arg) in args.iter().enumerate() {
-                    let text = match arg {
-                        Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
-                        _ => self.expr(arg, owner, depth + 1)?,
-                    };
-                    rendered.push(text);
-                }
-                format!("{}({})", name.to_lowercase(), rendered.join(", "))
-            }
-            leaf => render_leaf(leaf),
-        })
+        Ok(None)
     }
+
+    fn column(&mut self, expr: &'a Expr) -> Result<String, SelfCheckError> {
+        Ok(render_leaf(expr))
+    }
+}
+
+/// One of the audit's renderers of the grammar to SQL text: [`render_leaf`],
+/// [`FieldInliner`], and the `JOIN` audit's (`super::self_check_joins`).
+/// They share [`render_audit`]'s walk, and differ in how each reads a column
+/// and in the nodes each renders itself. Shared within the audit only: none
+/// of this is the write path's (ADR-0013).
+pub(super) trait AuditRender<'e> {
+    type Error;
+
+    /// The text of `expr`, at `depth` in its expression, when this renderer
+    /// renders it itself (an inlined field, an aggregate), or `None` for
+    /// [`render_audit`]'s.
+    fn special(&mut self, _expr: &'e Expr, _depth: usize) -> Result<Option<String>, Self::Error> {
+        Ok(None)
+    }
+
+    /// The text of a column read (`Expr::Column` or `Expr::SourceColumn`)
+    /// that [`Self::special`] left to the walk.
+    fn column(&mut self, expr: &'e Expr) -> Result<String, Self::Error>;
+}
+
+/// `expr` as SQL text, at `depth` in its expression, by `renderer` (see
+/// [`AuditRender`]): each node the renderer leaves to the walk is rendered
+/// here, its children through `renderer` again.
+pub(super) fn render_audit<'e, R: AuditRender<'e>>(
+    renderer: &mut R,
+    expr: &'e Expr,
+    depth: usize,
+) -> Result<String, R::Error> {
+    if let Some(text) = renderer.special(expr, depth)? {
+        return Ok(text);
+    }
+    let mut sub = |e: &'e Expr| render_audit(renderer, e, depth + 1);
+    Ok(match expr {
+        Expr::Column(_) | Expr::SourceColumn { .. } => return renderer.column(expr),
+        Expr::NumberLiteral(text) => number_literal(text),
+        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::BooleanLiteral(value) => value.to_string(),
+        // Bare, so Postgres types it from the same context `validate` did.
+        Expr::Null => "null".to_string(),
+        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let symbol = registry::operator_spec(*op).symbol;
+            let l = sub(lhs)?;
+            let r = sub(rhs)?;
+            format!("({l} {symbol} {r})")
+        }
+        Expr::Negate(operand) => format!("(-({}))", sub(operand)?),
+        Expr::Cast { expr, target } => format!("cast({} as {target})", sub(expr)?),
+        Expr::Not(operand) => format!("(not {})", sub(operand)?),
+        Expr::IsNull { expr, negated } => {
+            let test = if *negated { "is not null" } else { "is null" };
+            format!("({} {test})", sub(expr)?)
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut sql = String::from("(case");
+            for (condition, result) in branches {
+                let c = sub(condition)?;
+                let r = sub(result)?;
+                sql.push_str(&format!(" when {c} then {r}"));
+            }
+            if let Some(otherwise) = otherwise {
+                sql.push_str(&format!(" else {}", sub(otherwise)?));
+            }
+            sql.push_str(" end)");
+            sql
+        }
+        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
+            "count(*)".to_string()
+        }
+        Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
+            let (field, operand) = as_extract(name, args).expect("checked");
+            format!("extract({field} from {})", sub(operand)?)
+        }
+        Expr::FunctionCall { name, args } => {
+            let mut rendered = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                rendered.push(match arg {
+                    Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
+                    _ => sub(arg)?,
+                });
+            }
+            format!("{}({})", name.to_lowercase(), rendered.join(", "))
+        }
+    })
 }
 
 /// Renders a calculated-field expression to Postgres SQL text — the "small"
@@ -1761,60 +1804,23 @@ impl<'a> FieldInliner<'a> {
 /// `generative::oracle`'s own `render_expr` (the same small grammar has only
 /// so many reasonable ways to walk it), but written fresh, here, and
 /// genuinely independent of both: neither of those functions is called from
-/// anywhere in this module, and this function is called from nowhere else.
+/// anywhere in the audit. Its walk, [`render_audit`], is the audit's own,
+/// shared by the audit's other renderers and by nothing on the write path.
 pub(super) fn render_leaf(expr: &Expr) -> String {
-    match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
-        Expr::NumberLiteral(text) => number_literal(text),
-        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::BooleanLiteral(value) => value.to_string(),
-        // Bare, so Postgres types it from the same context `validate` did.
-        Expr::Null => "null".to_string(),
-        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
-        Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = registry::operator_spec(*op).symbol;
-            format!("({} {symbol} {})", render_leaf(lhs), render_leaf(rhs))
+    /// Every column read as its quoted name.
+    struct Leaf;
+    impl AuditRender<'_> for Leaf {
+        type Error = std::convert::Infallible;
+        fn column(&mut self, expr: &Expr) -> Result<String, Self::Error> {
+            Ok(match expr {
+                Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
+                _ => unreachable!("a column read"),
+            })
         }
-        Expr::Negate(operand) => format!("(-({}))", render_leaf(operand)),
-        Expr::Cast { expr, target } => format!("cast({} as {target})", render_leaf(expr)),
-        Expr::Not(operand) => format!("(not {})", render_leaf(operand)),
-        Expr::IsNull { expr, negated } => {
-            let test = if *negated { "is not null" } else { "is null" };
-            format!("({} {test})", render_leaf(expr))
-        }
-        Expr::Case {
-            branches,
-            otherwise,
-        } => {
-            let mut sql = String::from("(case");
-            for (condition, result) in branches {
-                sql.push_str(&format!(
-                    " when {} then {}",
-                    render_leaf(condition),
-                    render_leaf(result)
-                ));
-            }
-            if let Some(otherwise) = otherwise {
-                sql.push_str(&format!(" else {}", render_leaf(otherwise)));
-            }
-            sql.push_str(" end)");
-            sql
-        }
-        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            "count(*)".to_string()
-        }
-        Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
-            let (field, operand) = as_extract(name, args).expect("checked");
-            format!("extract({field} from {})", render_leaf(operand))
-        }
-        Expr::FunctionCall { name, args } => {
-            let rendered: Vec<String> = args
-                .iter()
-                .enumerate()
-                .map(|(i, arg)| render_call_arg(name, i, arg, render_leaf))
-                .collect();
-            format!("{}({})", name.to_lowercase(), rendered.join(", "))
-        }
+    }
+    match render_audit(&mut Leaf, expr, 0) {
+        Ok(text) => text,
+        Err(never) => match never {},
     }
 }
 
@@ -1934,6 +1940,65 @@ mod tests {
             matches!(err, SelfCheckError::UnsupportedExpr { .. }),
             "{err:?}"
         );
+    }
+
+    /// The inliner's accounting, pinned: every node but a field read costs
+    /// one, a memo hit costs the read field's nodes, and a number literal a
+    /// call takes as an argument costs nothing.
+    #[test]
+    fn inlining_charges_one_per_node_but_a_field_read() {
+        let fields = vec![
+            // `+`, `c` and `1`: 3.
+            field("x", sum(col("c"), Expr::NumberLiteral("1".into()))),
+            // `+`, `ROUND`, `x` (its 3), `2` (free) and `NULL`: 6.
+            field(
+                "r",
+                sum(
+                    Expr::FunctionCall {
+                        name: "ROUND".into(),
+                        args: vec![col("x"), Expr::NumberLiteral("2".into())],
+                    },
+                    Expr::Null,
+                ),
+            ),
+        ];
+        let mut inliner = FieldInliner::new("t", &fields);
+        inliner.render(&fields[0]).expect("renders");
+        assert_eq!(inliner.nodes, 3);
+        inliner.render(&fields[1]).expect("renders");
+        assert_eq!(inliner.nodes, 3 + 6);
+    }
+
+    /// The inliner's nesting bound, pinned at its edge: a node is rendered
+    /// at most [`MAX_INLINED_DEPTH`] levels down, and an inlined field's
+    /// body is one level below its read.
+    #[test]
+    fn inlining_bounds_the_nesting_at_max_inlined_depth() {
+        let negated = |levels: usize| {
+            let mut expr = col("c");
+            for _ in 0..levels {
+                expr = Expr::Negate(Box::new(expr));
+            }
+            vec![field("x", expr)]
+        };
+        // Each field reads the previous one: `f<n>`'s `c` is `n` levels down.
+        let chain = |n: usize| {
+            let mut fields = vec![field("f0", col("c"))];
+            for k in 1..=n {
+                fields.push(field(&format!("f{k}"), col(&format!("f{}", k - 1))));
+            }
+            fields
+        };
+        for (fields, fits) in [
+            (negated(MAX_INLINED_DEPTH), true),
+            (negated(MAX_INLINED_DEPTH + 1), false),
+            (chain(MAX_INLINED_DEPTH), true),
+            (chain(MAX_INLINED_DEPTH + 1), false),
+        ] {
+            let last = fields.last().expect("a field");
+            let rendered = FieldInliner::new("t", &fields).render(last);
+            assert_eq!(rendered.is_ok(), fits, "{}: {rendered:?}", last.name);
+        }
     }
 
     /// The largest definition of `shape(n)` define admits (`n` grown until
@@ -2304,5 +2369,53 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(err.code(), ErrorCode::Internal);
+    }
+
+    /// Every construct of the grammar through the audit's 1-1 renderers,
+    /// pinned to its text: [`render_leaf`], and [`FieldInliner`], which also
+    /// inlines a read of another field (`x` in `ix`) and keeps a field's own
+    /// name a source column (`e` in `e`).
+    #[test]
+    fn the_audit_renderers_render_every_construct() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s SELECT CASE WHEN a > 1 AND NOT (b IS NULL) THEN -(a + 2.5) \
+             WHEN b IS NOT NULL THEN CAST(b AS numeric) ELSE COALESCE(a, NULL) END AS x, \
+             EXTRACT(year FROM d) AS y, DATE '2024-01-01' AS z, 'o''clock' AS w, \
+             TRUE AS v, ROUND(m, 2) AS r, s.a AS sa, -2147483648 AS lo, x + 1 AS ix, \
+             e + 1 AS e",
+        )
+        .expect("parses");
+        let x = "(case when ((\"a\" > 1::integer) AND (not (\"b\" is null))) \
+                 then (-((\"a\" + 2.5::numeric))) when (\"b\" is not null) \
+                 then cast(\"b\" as numeric) else coalesce(\"a\", null) end)";
+        let leaves = [
+            x.to_string(),
+            "extract(year from \"d\")".to_string(),
+            "'2024-01-01'::date".to_string(),
+            "'o''clock'::text".to_string(),
+            "true".to_string(),
+            "round(\"m\", (2)::integer)".to_string(),
+            "\"a\"".to_string(),
+            "(-2147483648)::integer".to_string(),
+            "(\"x\" + 1::integer)".to_string(),
+            "(\"e\" + 1::integer)".to_string(),
+        ];
+        let mut inlined = leaves.clone();
+        inlined[8] = format!("({x} + 1::integer)");
+        let mut inliner = FieldInliner::new("t", &def.fields);
+        for ((field, leaf), inlined) in def.fields.iter().zip(&leaves).zip(&inlined) {
+            assert_eq!(&render_leaf(&field.expr), leaf, "{}", field.name);
+            assert_eq!(
+                &inliner.render(field).expect("renders"),
+                inlined,
+                "{}",
+                field.name
+            );
+        }
+        let count = Expr::FunctionCall {
+            name: "COUNT".to_string(),
+            args: Vec::new(),
+        };
+        assert_eq!(render_leaf(&count), "count(*)");
     }
 }
