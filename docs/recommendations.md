@@ -438,9 +438,9 @@ row-level security and so no `BYPASSRLS`.
 ### Application roles read targets, and nothing else
 
 Grant application roles `SELECT` on target tables and nothing more: no
-`INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`, and never ownership. Only Trellis
-writes a target, and it doesn't correct a hand edit
-([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned),
+`INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`, and never ownership. Trellis
+doesn't guard a target against hand edits
+([ADR-0027](decisions/0027-operating-principles.md), rule 5;
 [known correctness gaps — Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
 A read-only grant turns a hand edit into a permission error instead of a
 silent divergence.

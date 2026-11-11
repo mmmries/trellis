@@ -53,7 +53,8 @@ while every rule holds.
 * **Only Trellis writes what it owns:** the target tables, the tables it
   keeps beside them, and its own schema (the catalog and the ring). Grant
   application roles `SELECT` on targets and nothing more
-  ([recommendations](recommendations.md#application-roles-read-targets-and-nothing-else)).
+  ([recommendations](recommendations.md#application-roles-read-targets-and-nothing-else),
+  [ADR-0027](decisions/0027-operating-principles.md), rule 5).
 * **Leave the capture triggers and functions alone.** Trellis pauses the
   readers of a table whose capture was changed, but not when the change is
   undone before the next reconcile pass sees it
@@ -134,9 +135,10 @@ its source row; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 **Repair:** right after the `ALTER`, `request_backfill` the table.
 
 **Ends with:** [#1654](https://github.com/salesforce-misc/trellis/issues/1654),
-a false-positive study of signals that would catch these shapes. Event
-triggers would see every rewrite but need superuser, and logical decoding has
-the same blind spot: `pgoutput` never sends a rewrite's rows.
+a false-positive study ([ADR-0027](decisions/0027-operating-principles.md),
+rule 3) of signals that would catch these shapes. Event triggers would see
+every rewrite but need superuser (rule 1), and logical decoding has the same
+blind spot: `pgoutput` never sends a rewrite's rows.
 
 ### An enum label renamed and added again
 
