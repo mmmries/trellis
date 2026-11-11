@@ -27,7 +27,9 @@ the wait would return before the change is applied.
 The engine's workers do the work; the caller only waits — no client-driven drain loop.
 Capture triggers write a change's ring rows in the writer's own transaction
 ([01](01-capture-by-triggers.md)), so every commit at or below the token is already
-in the ring when the token is read, and the waiter writes nothing.
+in the ring when the token is read, and the waiter writes nothing; there is no
+capture watermark to check. A transaction still open when the token is read can
+have rows at or below it, so the wait over-reports for it, the safe direction.
 
 ## The predicate
 
