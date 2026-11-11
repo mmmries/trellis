@@ -3,7 +3,7 @@
 //! Capture is statement-level triggers, and a statement trigger fires only
 //! for the table a statement names, never for its partitions or children
 //! (`docs/staging-and-claiming/01-capture-by-triggers.md`). So Trellis can't
-//! read a table in a hierarchy:
+//! read a table in a hierarchy, except a partitioned root (below):
 //!
 //! - **a partitioned table** (`relkind = 'p'`): a write aimed at one of its
 //!   partitions directly fires only the partition's triggers;
@@ -35,6 +35,15 @@
 //! A table another definition of this instance targets is exempt in all
 //! three, as it is from every capture check: the target-mutation seam feeds
 //! its readers, not a trigger.
+//!
+//! A partitioned root that is itself no partition and in no inheritance
+//! hierarchy is the one supported shape (ADR-0017): an aggregate or a side of
+//! a `JOIN` reads it, with triggers on every node of its tree. Define admits
+//! it by its own rules (`super::partition_tree`), the capture pass
+//! fingerprints its tree instead of running this check
+//! (`capture::partitions`), and the capture audit skips its
+//! [`Hierarchy::Partitioned`] once the pass has recorded it. Every other use
+//! of a partitioned table, a 1-1 source among them, is refused here as above.
 //!
 //! These are catalog facts that only DDL naming the hierarchy changes.
 //! `VACUUM FULL`, `CLUSTER`, `REINDEX` and Trellis's own capture DDL leave

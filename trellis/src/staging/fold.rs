@@ -118,8 +118,9 @@ pub struct FoldedChange {
     /// Folding to the *shallowest* row instead (MIN, or an arbitrary carry)
     /// would under-report depth and could mask a wave that should have
     /// tripped the bound — MAX is the conservative choice that cannot
-    /// itself cause a missed-detection of infinite propagation. FLAG:
-    /// confirm this against the hop-bound check once it exists.
+    /// itself cause a missed-detection of infinite propagation. The hop
+    /// bound (`super::apply::MAX_HOP_GEN`) is checked on this value's next
+    /// hop, before propagation stages anything.
     pub hop_gen: i32,
     /// `min(appended_at)` per key — the end-to-end latency origin, per-row
     /// rather than the batch's creation timestamp (see doc: an idle active
@@ -179,7 +180,7 @@ pub struct FoldedChange {
     /// change_id)`), which is the change a ledger target applies. `None` when
     /// the record has no such row (only `recompute` rows), or that row has no
     /// `lsn`. A ledger target re-derives such a record instead of applying
-    /// it (`super::ledger`).
+    /// it (`super::one_to_one_ledger`).
     pub last_change: Option<LastChange>,
     /// Every ring row of the key that is a change (`insert`,
     /// `update`, `delete`, `recompute`), unfolded, as one JSON object each
@@ -206,8 +207,8 @@ pub struct LastChange {
 }
 
 /// The fenced window's full column projection the fold needs, with jsonb
-/// images cast to text at the source (this crate has no `serde_json`
-/// dependency — see `append.rs`). `route` rides along so the bucket filter
+/// images cast to text at the source (the driver binds no
+/// `serde_json::Value` — see `append.rs`). `route` rides along so the bucket filter
 /// can be applied to the union of both slots' rows, not to one slot alone.
 /// `op` rides along too — the truncate-void filter and `is_truncate`
 /// both need it, even though the fold otherwise deliberately never filters

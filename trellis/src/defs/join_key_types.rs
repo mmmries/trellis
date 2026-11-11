@@ -98,8 +98,8 @@ pub(crate) fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// numerically equal), `real`/`double precision` (`-0` and `0`
 /// are `=` in Postgres but render as `'-0'` and `'0'`, so text matching
 /// splits one value across two keys; verified on a live server, and the
-/// unlock would be a typed key index comparing decoded values through
-/// `crate::float::compare`, not a new encoding), `character`/`citext`
+/// unlock would be a typed key index comparing decoded values, not a new
+/// encoding), `character`/`citext`
 /// (blank-padding or
 /// case-insensitivity native to the type but not its `::text` form),
 /// `interval` (`timestamp` is admitted alongside `date`/`time`/

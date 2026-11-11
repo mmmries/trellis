@@ -111,8 +111,9 @@ host-language `bucket_of_route` should be a **test oracle** against that SQL, so
 The routing key is `(src_table, key)` — deliberately not the aggregate group key.
 Two obstacles are real:
 
-- **Three of the four producers have no image to derive a group key from.** They
-  append bare recompute triggers, so a group key would need a per-row catalog
+- **Most producers have no image to derive a group key from.** Every producer
+  but capture ([02](02-the-staging-ring.md#the-producers)) appends bare
+  recompute triggers, so a group key would need a per-row catalog
   lookup and live source read on the hot append path — the exact cost the generated
   column exists to avoid.
 - **A per-batch bucket is not stable across batches.** `bucket_count` is per-batch

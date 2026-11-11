@@ -40,7 +40,7 @@ sequenceDiagram
     W->>DB: BEGIN
     W->>DB: 1. version fence (FOR SHARE on each computed source)
     W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: sorted entry lock + I2 test, fields evaluated in the upsert)
-    W->>DB: 3. aggregate groups (sorted group lock, basis test, partial increments)
+    W->>DB: 3. aggregate groups (sorted group lock, basis test, partial increments)<br/>then JOIN targets (lock row, J, P/M cells, T groups)<br/>then 1-1 JOIN targets (lock row, J keys, ledger entries)
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
     W->>DB: 6. pg_notify (the instance's wake channel)
@@ -285,12 +285,47 @@ A 1-1 target's ledger holds only the key and the ordering state, because the
 target row holds the values. It is keyed by `__from_key` and indexes its
 tombstones by `__applied_seg` (the tombstone GC's index, below).
 
-A 1-1 target is built one of two ways. The Re-derive build (`staging::build`)
-serves a 1-1 target on a captured source or on another definition's
-target: it applies from its start and re-derives the source in chunks, each
-inserting the entries its keys don't have yet and locking the others as a page
-does, and stamping them as a Re-derive does (below). Every other 1-1 target
-keeps the one-pass build.
+A plain 1-1 target is built by Re-derive (`staging::build`), on a captured
+source or on another definition's target alike: the build applies from its
+start and re-derives the source in chunks, each inserting the entries its keys
+don't have yet and locking the others as a page does, and stamping them as a
+Re-derive does. An aggregate or a `JOIN` is built by its plan job's one
+absolute write instead ([below](#aggregate-groups-the-group-basis)).
+
+**Tombstone GC (I4).** Maintenance deletes each tombstone whose
+`__applied_seg` is at or below the **contiguous drained prefix**, the highest
+`seg_seq` at or below which every segment is drained, not the highest drained
+segment (`staging::retire::collect_tombstones`). An earlier change to the same
+key committed before the delete's trigger ran, so it is in the delete's batch
+or an earlier one, and at or below the prefix it has been applied or refused.
+A Re-derive stamps at least the newest segment its snapshot sees, so a
+tombstone it wrote outlives every change its `__basis` would refuse. A later
+change to a collected key finds no entry and gets a fresh one, where I2
+reduces to the truncate floor.
+
+The GC skips the ledger of a definition under a build: one that is
+`backfilling`, or whose Re-derive build a pause or quarantine froze.
+A build chunk inserts a new key's entry from a snapshot taken before the
+insert, so a tombstone written after that snapshot must still be there when
+the insert looks for the key. A GC batch checks the definition and holds its
+row `for key share` until it commits, and a build's start takes that row
+`for update`, so a batch either commits before the start or sees the build
+and skips. The tombstones of deletes applied during a build therefore wait
+for it to finish, which bounds them by the write rate times the build's
+length.
+
+Only a tombstone carries `__applied_seg`. A write that leaves an entry
+a tombstone raises it to `greatest(old, its segment)`; one that leaves the
+entry live leaves it alone. The ledger indexes its tombstones by it
+(`(__applied_seg) where __tombstone`), so a GC batch seeks the collectable
+ones under a pinned index-scan plan, however many tombstones wait
+above the drained prefix, and an Apply or Re-derive that leaves an entry live
+changes no indexed column and can be HOT. A live entry's stale
+stamp never has to protect anything: a delete's Apply applies only a change
+its entry's `basis` doesn't see, so every change the `basis` does see
+completed before the delete and is in the delete's batch or an earlier one,
+which the Apply's stamp covers, and a Re-derive that deletes the key stamps
+its own read's segment (`defs::ledger::tombstone_seg_sql`).
 
 ### Aggregate groups: the group basis
 
@@ -304,7 +339,11 @@ partials whenever the visible row is written. The grammar admits `COUNT(*)`,
 `numeric`, because only those can be kept exact from each change alone (a
 `numeric` sum with a count per display scale and of each special value).
 An argument may be an expression (`SUM(v + 1)`), evaluated per change over
-the image as the source's row type.
+the image as the source's row type. A plain aggregate also admits `MIN`/`MAX`
+over a plain source column of an ordered type: the group keeps each extreme
+with a basis of its own, and a retraction that reaches it re-reads the
+group's next one from the source, through an index define requires
+(`staging::group_basis`'s "Extremes").
 
 A page, per aggregate target:
 
@@ -367,40 +406,23 @@ in one sorted statement and rewritten from a `GROUP BY` of the source with
 that statement's snapshot as each group's basis; a page with a `Recompute`
 recomputes the groups it names the same way, under the page's group locks.
 
-**Tombstone GC (I4).** Maintenance deletes each tombstone whose
-`__applied_seg` is at or below the **contiguous drained prefix**, the highest
-`seg_seq` at or below which every segment is drained, not the highest drained
-segment (`staging::retire::collect_tombstones`). An earlier change to the same
-key committed before the delete's trigger ran, so it is in the delete's batch
-or an earlier one, and at or below the prefix it has been applied or refused.
-A Re-derive stamps at least the newest segment its snapshot sees, so a
-tombstone it wrote outlives every change its `__basis` would refuse. A later
-change to a collected key finds no entry and gets a fresh one, where I2
-reduces to the truncate floor.
+### `JOIN` targets
 
-The GC skips the ledger of a definition under a build: one that is
-`backfilling`, or whose Re-derive build a pause or quarantine froze.
-A build chunk inserts a new key's entry from a snapshot taken before the
-insert, so a tombstone written after that snapshot must still be there when
-the insert looks for the key. A GC batch checks the definition and holds its
-row `for key share` until it commits, and a build's start takes that row
-`for update`, so a batch either commits before the start or sees the build
-and skips. The tombstones of deletes applied during a build therefore wait
-for it to finish, which bounds them by the write rate times the build's
-length.
-
-Only a tombstone carries `__applied_seg`. A write that leaves an entry
-a tombstone raises it to `greatest(old, its segment)`; one that leaves the
-entry live leaves it alone. The ledger indexes its tombstones by it
-(`(__applied_seg) where __tombstone`), so a GC batch seeks the collectable
-ones under a pinned index-scan plan, however many tombstones wait
-above the drained prefix, and an Apply or Re-derive that leaves an entry live
-changes no indexed column and can be HOT. A live entry's stale
-stamp never has to protect anything: a delete's Apply applies only a change
-its entry's `basis` doesn't see, so every change the `basis` does see
-completed before the delete and is in the delete's batch or an earlier one,
-which the Apply's stamp covers, and a Re-derive that deletes the key stamps
-its own read's segment (`defs::ledger::tombstone_seg_sql`).
+A `JOIN` target (`staging::join`, ADR-0019) applies after the page's
+aggregate targets: it stages each change's cells before any lock, then takes
+the pair's lock row, the join keys `J`, the partial cells `P` and `M` and the
+visible groups `T`, each in one sorted statement, and moves each cell by the
+changes its basis hasn't counted, as a group does. A 1-1 `JOIN` target
+(`staging::join_one_to_one`, ADR-0021) applies last. Before any 1-1 `JOIN`
+lock row, the page takes, in id order, the definition row of each one that
+may hold a `FROM` row in quarantine or whose joined table it truncates, as a
+rebuild's start does. Then, per target: the pair's lock row, the join keys,
+then the entries of the `FROM` side and of the joined side, each
+on the 1-1 ledger's ordering state and each in one sorted statement; then it
+rewrites the target row of each changed `FROM` row, and of the other rows on a
+joined key the page changed.
+Both are built by their plan job's one absolute write
+([data flow](../data-flow.md#an-aggregates-or-a-joins-build)).
 
 ## The delta model
 
@@ -425,12 +447,14 @@ a running sum and count and writes the ratio when it writes the visible row.
 
 **Not every measure is delta-able**; the gate is explicit: only exact,
 invertible folds are maintained by increments. `count(*)`, `count(col)`, and
-`sum`/`avg` over `smallint`, `integer`, `bigint` and `numeric` are in.
+`sum`/`avg` over `smallint`, `integer`, `bigint` and `numeric` are in. A float
+`sum`/`avg` would drift because IEEE-754 addition is non-associative (and
+`Inf − Inf = NaN`). `min`/`max` are not invertible (removing the current
+maximum tells you nothing about the next one), so a plain aggregate keeps
+them by re-reading the source when a retraction reaches the stored extreme
+([above](#aggregate-groups-the-group-basis)), and a `JOIN` refuses them.
 Everything else is refused at define, named by its family
-([transforms](../transforms.md#supported-sources-and-targets)): `min`/`max` are
-not invertible (removing the current maximum tells you nothing about the next
-one), and a float `sum`/`avg` would drift because IEEE-754 addition is
-non-associative (and `Inf − Inf = NaN`).
+([transforms](../transforms.md#supported-sources-and-targets)).
 
 **The north star for the exact types is byte-identical convergence to a
 from-scratch `GROUP BY` oracle after every op and every drain interleaving** — far
@@ -479,16 +503,19 @@ order every transaction that bumps more than one (a `JOIN` definition's define,
 drop, resume or freeze bumps both its tables') takes them in, so a page and a
 bump never each hold a fence the other wants. The fence set must include
 tables that are *evaluated* but absent from the one-to-one write plan — an
-aggregate-only source, an equi-join parent — or a grain change mid-batch slips
-through.
+aggregate-only source, a `JOIN`'s joined table — or a grain change mid-batch
+slips through.
 
 ## Lock ordering, because parallel workers will overlap
 
 Two workers whose batches touch overlapping keys or groups will contend on the
 same rows. That is fine; deadlocking on them is not. A page takes its locks in
-one consistent order: its 1-1 targets, then its aggregate targets, each in
-target order, and per target **its entries, then its rows, each in one sorted
-statement**. The entry lock is ordered by key
+one consistent order: its 1-1 targets, then its aggregate targets, then its
+`JOIN` targets, then its 1-1 `JOIN` targets, each in target order, and per
+target **its entries, then its rows, each in one sorted
+statement** (a `JOIN` target takes its pair's lock row first, then its
+structures, and the 1-1 `JOIN` targets' definition rows come before any of
+their lock rows, in [the order above](#join-targets)). The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
 [the group basis](#aggregate-groups-the-group-basis)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its
@@ -521,8 +548,9 @@ retried with backoff from outside any transaction.
   (the wait above), an `UPDATE` of a row another transaction holds. A setting
   per transaction would cover only the transactions someone remembered.
 - **The cap is 30 seconds.** The invariant is that the wait is bounded, not
-  that it is short. Aggregate drain pages take no group pre-lock, so pages
-  that touch the same groups don't queue one behind another: in
+  that it is short. An aggregate page stages its sides before it locks a
+  group, so pages that touch the same groups queue on them only for the rest
+  of a page's transaction: in
   `bench fold-in-ratio` at ratio 10 (40k groups, every page touching most of
   them) on disk, the longest page is 6.6 s, and no page waits out a 30 s or a
   10 s cap. The cap is the smallest of the two whose longest page stays under
@@ -675,7 +703,7 @@ under a collapsed warning.
 7. **A non-commutative write commits only if its basis is still current**, checked
    under a lock that serializes every Phase 3 for that key. A new write path must
    either commute (deltas), check its basis, or be serialized some other way
-   (the `prev_lsn` guard, the truncate barrier). A ledger entry or a group records its
+   (the truncate barrier). A ledger entry or a group records its
    basis, and every change to it is checked against it, so a group's
    increments stay exactly-once. See the
    classification table under

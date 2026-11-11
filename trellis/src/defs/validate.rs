@@ -606,8 +606,9 @@ type ReadColumn = (Option<QualifiedColumn>, String);
 /// one's collation. In Postgres an argument's collation comes from the
 /// columns under it: directly, through `COALESCE`, or through another
 /// calculated field it references (whose expression Postgres would inline).
-/// So this follows all three, resolving a bare name the way [`super::eval`]
-/// does: another field of that name first, unless the name is the enclosing
+/// So this follows all three, resolving a bare name the way field-alias
+/// substitution does (`super::backfill::substitute_all_fields`): another
+/// field of that name first, unless the name is the enclosing
 /// field's own (a passthrough of the source column it's named after). Each
 /// read is reported once, in field order.
 pub(crate) fn collation_refusing_function_reads(def: &TransformDef) -> Vec<CollationRefusingRead> {
@@ -3214,8 +3215,8 @@ pub(crate) fn collect_reads(
 /// Assumes `def`'s column references already resolved (this module's own
 /// [`validate`] checks that first) and that `def` is acyclic; a definition
 /// that reaches this function without either guarantee having been checked
-/// gets the same `Cycle`/defense-in-depth treatment [`super::eval`] gives
-/// its own recursion, rather than overflowing the stack.
+/// gets a `Cycle` refusal as defense in depth, rather than overflowing the
+/// stack.
 /// Rejects an [`super::ast::KeySpace::Aggregate`] `GROUP BY` key whose
 /// column is typed [`ValueType::Other`] — see
 /// [`ValidationError::UnsupportedGroupByKeyType`] for why a key role needs
@@ -3302,7 +3303,7 @@ fn group_by_key_rule(value_type: ValueType) -> Option<super::registry::GroupByKe
         // group into two target rows, and the ADR-0013 self-check would
         // (correctly) report a divergence against a server-side `GROUP BY`.
         // Admitting floats here is the typed key index's to grant, by
-        // comparing decoded values through `crate::float::compare`; until
+        // comparing decoded values; until
         // then, rejecting is the honest answer and `numeric` is the
         // steer-to. See `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
         ValueType::Float(_) => None,

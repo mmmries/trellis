@@ -759,9 +759,8 @@ impl Pool {
 /// 04:05:06` under `postgres`, `+1-2 +3 +4:05:06` under `sql_standard`,
 /// `@ 1 year 2 mons 3 days 4 hours 5 mins 6 secs` under `postgres_verbose`
 /// and `P1Y2M3DT4H5M6S` under `iso_8601` (all four read off a live server).
-/// `crate::temporal::Interval::render` reproduces the `postgres` spelling
-/// specifically, which is both Postgres's default and what an interval
-/// `SUM` has to write back.
+/// Trellis pins the `postgres` spelling, Postgres's default, so every
+/// connection renders an interval's text the same way.
 ///
 /// `TimeZone` joined the other four (see the "`TimeZone`"
 /// section above): `timestamptz_out` renders in `'UTC'` everywhere Trellis

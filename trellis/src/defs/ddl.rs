@@ -113,7 +113,7 @@ pub(crate) fn pg_type_name(value_type: ValueType) -> Cow<'static, str> {
 /// narrower than its inferred [`ValueType`], so those keep collapsing through
 /// [`pg_type_name`] exactly as before.
 ///
-/// Mirrors [`super::validate`]/[`super::eval`]'s resolution order: a reference
+/// Mirrors [`super::validate`]'s resolution order: a reference
 /// to a *different* calculated field that happens to share a source column's
 /// name resolves to that field, not the source column, so it isn't treated as
 /// a source-column passthrough here.
