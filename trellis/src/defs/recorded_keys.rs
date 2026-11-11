@@ -63,6 +63,7 @@ use super::ddl::{self, DdlError};
 use super::floor::Floors;
 use super::model::Definition;
 use crate::pool::quote_ident;
+use crate::staging::pause_message::PauseReason;
 
 /// The SQL condition a `definition_keys` row `k` meets when it is a record of
 /// the relation at the name now, given `regclass` (a parameter or literal
@@ -749,10 +750,14 @@ async fn pause_running_readers(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    let error = crate::staging::schema_change::key_changed_error(table, old, new);
+    let reason = PauseReason::KeyRerecorded {
+        table: table.to_string(),
+        old: old.to_vec(),
+        new: new.to_vec(),
+    };
     for id in running {
-        if super::lifecycle::pause_for_capture_failure(txn, id, table, old, &error, None).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        if super::lifecycle::pause(txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
     Ok(())
@@ -947,16 +952,13 @@ pub(crate) async fn backfill_in(
             unkeyed.as_ref().map(|(table, _)| table.as_str()),
         )
         .await?;
-        if let Some((_, reason)) = &unkeyed
-            && super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], reason, None)
-                .await?
+        if let Some((_, reason)) = unkeyed
+            && super::lifecycle::pause(txn, id, &PauseReason::capture(&source, reason)).await?
         {
             paused += 1;
         }
         for reason in deferrable_reasons(txn, &def, &source, &joined, &target).await? {
-            if super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
-                .await?
-            {
+            if super::lifecycle::pause(txn, id, &PauseReason::capture(&source, reason)).await? {
                 paused += 1;
             }
         }
@@ -996,8 +998,7 @@ pub(crate) async fn backfill_in(
             }
         }
         if let Some(reason) = reason
-            && super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
-                .await?
+            && super::lifecycle::pause(txn, id, &PauseReason::capture(&source, reason)).await?
         {
             paused += 1;
         }

@@ -152,6 +152,32 @@ impl TypedCopy {
     }
 }
 
+/// The state of every column `definition` created with a type from the
+/// source ([`typed_copies`], [`inspect`]) that a resume brings to the type
+/// define would give it now: all but the ones it recreates at the live
+/// types ([`CopyKind::recreated_by_resume`]). A resume re-types the drifted
+/// ones before its rebuild (`staging::quarantine::resume_locked`), and a
+/// paused definition's message says so (`staging::pause_message`).
+pub(crate) async fn resume_states(
+    client: &impl GenericClient,
+    schema: &str,
+    definition: &super::model::Definition,
+) -> Result<Vec<CopyState>, tokio_postgres::Error> {
+    let copies = typed_copies(
+        client,
+        schema,
+        &definition.def,
+        &definition.source_table,
+        &definition.target_table,
+    )
+    .await?;
+    Ok(inspect(client, copies)
+        .await?
+        .into_iter()
+        .filter(|s| !s.copy.kind.recreated_by_resume())
+        .collect())
+}
+
 /// Every column definition `def` created with a type that comes from the
 /// source, reading `source` (qualified) into `target` (qualified): its
 /// typed copies, and the columns typed by an expression

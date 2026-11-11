@@ -219,7 +219,11 @@ async fn pause_closure(
     let mut paused = Vec::new();
     for (seed, source_table, error) in &episodes {
         for id in closure(&catalog, seed, &unfrozen) {
-            if crate::defs::lifecycle::pause_for_halt(txn, id, source_table, error).await? {
+            let reason = super::pause_message::PauseReason::Halt {
+                table: source_table.clone(),
+                text: error.clone(),
+            };
+            if crate::defs::lifecycle::pause(txn, id, &reason).await? {
                 let reader = catalog.definitions.iter().find(|r| r.id == id);
                 paused.push(reader.map_or_else(|| id.to_string(), |r| r.def.target.clone()));
             }

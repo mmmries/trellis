@@ -496,8 +496,12 @@ async fn pause_readers(
         return Ok(());
     }
     let txn = fenced_transaction(client).await?;
+    let reason = crate::staging::pause_message::PauseReason::Disruption {
+        table: table.to_string(),
+        text: error.to_string(),
+    };
     for id in readers {
-        if crate::defs::lifecycle::pause_for_disruption(&txn, id, table, error).await? {
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
             crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
     }

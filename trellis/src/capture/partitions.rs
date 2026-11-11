@@ -1126,10 +1126,9 @@ async fn pause_noncompliant(
             "{refusal}; fix the table, then resume the definition to rebuild it, or drop the \
              definition"
         );
-        if crate::defs::lifecycle::pause_for_capture_failure(&txn, *id, table, &[], &error, None)
-            .await?
-        {
-            crate::instance_log::warn!(transform_id = *id, table = %table, "definition paused: {error}");
+        let reason = crate::staging::pause_message::PauseReason::capture(table, error);
+        if crate::defs::lifecycle::pause(&txn, *id, &reason).await? {
+            crate::instance_log::warn!(transform_id = *id, table = %table, "definition paused: {reason}");
         }
     }
     txn.commit().await?;

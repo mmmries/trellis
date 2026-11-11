@@ -68,7 +68,7 @@ use tokio_postgres::Transaction;
 use super::catalog::CatalogError;
 use super::model::{EdgeKind, StoredStatus};
 use crate::pool::{Pool, quote_ident};
-use crate::staging::pause_message::{self, Reason, Recheck};
+use crate::staging::pause_message::{self, PauseReason, Reason};
 
 /// What [`pause_transform`] actually did — returned so a caller (and a test)
 /// can tell a real transition from the idempotent no-op, even though both are
@@ -261,159 +261,6 @@ const WITHDRAWN_CAUSE: &str = " It was paused by the operator, so it stays pause
 const WITHDRAWN_REQUEST: &str = "paused by the operator, which withdrew its resume before the \
      staging worker finished it. Resume it to rebuild it";
 
-/// Pauses definition `id` because a capture function found `columns` of
-/// `source_table` renamed or dropped, or the capture pass found
-/// its primary key redefined, and records why in `capture_failures`:
-/// `error` is the sentence `Trellis::status` reports. The record is what `Trellis::status` reports as
-/// `capture_failure`, and what makes capture stop imaging for the
-/// definition (`capture::columns`). Runs in the caller's transaction, which
-/// the drain commits before it computes anything that could apply to it.
-///
-/// A definition already frozen keeps its status (a quarantined one stays
-/// quarantined) but still gets the record, since its resume is the same
-/// rebuild. An existing record keeps its kind and state, and its reasons
-/// after this one ([`crate::staging::pause_message`]).
-/// Returns whether this call paused it.
-///
-/// `caused_by` is the definition whose resume re-typed the columns of its
-/// target that this pause is about, when that resume is what pauses it
-/// (#828, `staging::schema_change::pause_readers_of_retyped`), and is
-/// recorded with the pause.
-pub(crate) async fn pause_for_capture_failure(
-    txn: &Transaction<'_>,
-    id: i64,
-    source_table: &str,
-    columns: &[String],
-    error: &str,
-    caused_by: Option<i64>,
-) -> Result<bool, CatalogError> {
-    let reason = Reason::standing(source_table, columns, error);
-    pause(txn, id, Pause::rebuild(reason, "capture", caused_by)).await
-}
-
-/// [`pause_for_capture_failure`] for a schema change whose cause the
-/// capture pass can read again while the definition stays paused
-/// (`recheck`): columns renamed or dropped, or a primary key redefined.
-/// The pass drops the reason once its cause is gone, and rewrites it when
-/// it changes ([`crate::staging::pause_message`]).
-pub(crate) async fn pause_for_schema_change(
-    txn: &Transaction<'_>,
-    id: i64,
-    source_table: &str,
-    columns: &[String],
-    error: &str,
-    recheck: Recheck,
-) -> Result<bool, CatalogError> {
-    let reason = Reason {
-        recheck,
-        ..Reason::standing(source_table, columns, error)
-    };
-    pause(txn, id, Pause::rebuild(reason, "capture", None)).await
-}
-
-/// Pauses definition `id` because Trellis's capture of a table it reads was
-/// changed outside Trellis, or the table is gone. The record's
-/// `kind` is `disruption`, which is what a test helper selects to resume
-/// exactly these. Returns whether this call paused it.
-///
-/// A definition already frozen (an operator's `PAUSE`, say) gets the record
-/// with kind `capture` instead, so it stays the operator's pause, which a
-/// helper that resumes disruptions never resumes. It still gets a record:
-/// the record is what makes its resume forget the table's recorded capture
-/// (`staging::quarantine`), so the next pass reinstalls capture instead of
-/// finding the disruption again and pausing it once more. Its row is locked
-/// before its status is read, so a `PAUSE` committing meanwhile is seen and
-/// never recorded as a disruption.
-pub(crate) async fn pause_for_disruption(
-    txn: &Transaction<'_>,
-    id: i64,
-    source_table: &str,
-    error: &str,
-) -> Result<bool, CatalogError> {
-    let Some(kind) = lock_for_kind(txn, id).await? else {
-        return Ok(false);
-    };
-    let reason = Reason::standing(source_table, &[], error);
-    pause(txn, id, Pause::rebuild(reason, kind, None)).await
-}
-
-/// Locks definition `id`'s row and returns the `kind` a disruption's record
-/// takes: `disruption` while it runs, `capture` once frozen (it stays the
-/// operator's pause). `None` when it doesn't exist.
-async fn lock_for_kind(
-    txn: &Transaction<'_>,
-    id: i64,
-) -> Result<Option<&'static str>, CatalogError> {
-    let row = txn
-        .query_opt(
-            "select status = any($2) from transform_definitions where id = $1 for update",
-            &[&id, &StoredStatus::dispatchable()],
-        )
-        .await?;
-    Ok(row.map(|row| {
-        if row.get::<_, bool>(0) {
-            "disruption"
-        } else {
-            "capture"
-        }
-    }))
-}
-
-/// Pauses definition `id` because the database was restored from a logical
-/// dump (`capture::restore`): its ordering state belongs to the
-/// original database, so the record is marked `restored` and its resume resets
-/// that state before the rebuild. Kind `disruption` for a definition that was
-/// running (a test helper resumes those), `capture` for one already frozen,
-/// which stays the operator's pause but resumes with the reset. An existing
-/// record keeps its reason, which the restore's is put before. Returns
-/// whether this call paused it.
-pub(crate) async fn pause_for_restore(
-    txn: &Transaction<'_>,
-    id: i64,
-    source_table: &str,
-    error: &str,
-) -> Result<bool, CatalogError> {
-    let Some(kind) = lock_for_kind(txn, id).await? else {
-        return Ok(false);
-    };
-    let reason = Reason::standing(source_table, &[], error);
-    let restore = Pause {
-        resume_needs: ResumeNeeds::Restore,
-        reason_once: true,
-        ..Pause::rebuild(reason, kind, None)
-    };
-    pause(txn, id, restore).await
-}
-
-/// Pauses definition `id` because the enum values it reads changed identity
-/// (ADR-0020): an enum type it reads was relabelled (`ALTER TYPE ... RENAME
-/// VALUE`), or a column it reads was re-typed from one enum to
-/// another. The label text Trellis staged and keyed by names no
-/// value of the column's type. The record's
-/// `relabel_lsn` is `lsn`, the WAL insert position the capture pass read
-/// after finding it, raised by a later such change; its resume waits until no
-/// change at or below it is pending on the tables the definition reads, and
-/// rebuilds from the source (`staging::quarantine`). Kind `capture`. A
-/// definition already frozen keeps its status but gets the record, so its
-/// resume is the relabel's. An existing record's reason is kept, the
-/// relabel's put before it the first time. Returns whether this call paused
-/// it.
-pub(crate) async fn pause_for_relabel(
-    txn: &Transaction<'_>,
-    id: i64,
-    source_table: &str,
-    error: &str,
-    lsn: crate::PgLsn,
-) -> Result<bool, CatalogError> {
-    let reason = Reason::standing(source_table, &[], error);
-    let relabel = Pause {
-        resume_needs: ResumeNeeds::Relabel(lsn),
-        reason_once: true,
-        ..Pause::rebuild(reason, "capture", None)
-    };
-    pause(txn, id, relabel).await
-}
-
 /// Pauses definition `id`, which this binary can't run (ADR-0024 rules 3
 /// and 6), recording `reason` (an [`super::floor::Unrunnable::reason`]) as its
 /// `capture_failure`, kind `capture`: only an operator's `RESUME` under a
@@ -488,53 +335,8 @@ pub(crate) async fn pause_for_unrunnable(
     Ok(changed)
 }
 
-/// [`pause_for_capture_failure`] for a drain's halt
-/// (`staging::halt`): pauses definition `id` because a page failed with a
-/// halting error on `source_table` that it reads, directly or downstream of
-/// a definition that does. The record's
-/// `kind` is `halt`. Returns whether this call paused it.
-pub(crate) async fn pause_for_halt(
-    txn: &Transaction<'_>,
-    id: i64,
-    source_table: &str,
-    error: &str,
-) -> Result<bool, CatalogError> {
-    let reason = Reason::standing(source_table, &[], error);
-    pause(txn, id, Pause::rebuild(reason, "halt", None)).await
-}
-
-/// One pause of a definition with a `capture_failures` record: what
-/// [`pause`] records and how.
-pub(crate) struct Pause<'a> {
-    /// Why it pauses, added to the record's reasons.
-    pub(crate) reason: Reason,
-    /// The record's `kind` when this pause creates it.
-    pub(crate) kind: &'a str,
-    /// The definition whose resume caused this pause, recorded when this
-    /// pause creates the record.
-    pub(crate) caused_by: Option<i64>,
-    /// What its resume must do besides the rebuild.
-    pub(crate) resume_needs: ResumeNeeds,
-    /// Adds `reason` only when the record didn't already carry
-    /// `resume_needs`: a second restore or relabel keeps the first's reason.
-    pub(crate) reason_once: bool,
-}
-
-impl Pause<'_> {
-    /// A pause whose resume is the plain rebuild, adding its reason each time.
-    fn rebuild(reason: Reason, kind: &str, caused_by: Option<i64>) -> Pause<'_> {
-        Pause {
-            reason,
-            kind,
-            caused_by,
-            resume_needs: ResumeNeeds::Rebuild,
-            reason_once: false,
-        }
-    }
-}
-
 /// What a resume of a paused definition must do before its rebuild, stored
-/// on its `capture_failures` record.
+/// on its `capture_failures` record ([`PauseReason::resume_needs`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeNeeds {
     /// Nothing: the rebuild alone.
@@ -594,22 +396,52 @@ impl ResumeNeeds {
     }
 }
 
-/// Records why `id` pauses in `capture_failures` and what its resume needs,
-/// and pauses it unless it's frozen. A record that already stands keeps its
-/// kind and its state (its cause, a restore's, a relabel's) beyond what
-/// `pause.resume_needs` adds, and gets this reason before its own
-/// ([`crate::staging::pause_message::add_reason`]), unless
-/// `pause.reason_once` and it already carried that need. Takes no lock of
-/// its own: a caller that reads the definition's status first locks its row.
-/// Returns whether it paused it.
+/// Pauses definition `id` for `reason` unless it's frozen, and records why
+/// in its `capture_failures` record: the record is what `Trellis::status`
+/// reports as `capture_failure`, and what makes capture stop imaging for the
+/// definition (`capture::columns`). Runs in the caller's transaction.
+/// Returns whether this call paused it.
+///
+/// A definition already frozen keeps its status (a quarantined one stays
+/// quarantined) but still gets the record, since its resume is the same
+/// rebuild. A record that already stands keeps its kind and its state (its
+/// cause, a restore's, a relabel's) beyond what `reason`'s
+/// [`PauseReason::resume_needs`] adds, and gets this reason before its own
+/// ([`crate::staging::pause_message::add_reason`]), unless the reason needs
+/// more than the rebuild and the record already carried that need: a second
+/// restore or relabel keeps the first's reason.
+///
+/// A reason whose record kind depends on whether the definition still runs
+/// ([`PauseReason::kind_reads_status`]: a disruption, a restore) locks the
+/// definition's row before it reads its status, so a `PAUSE` committing
+/// meanwhile is seen and never recorded as a disruption; it then stays the
+/// operator's pause, which a helper that resumes disruptions never resumes,
+/// but gets the record, which is what makes its resume forget the table's
+/// recorded capture or reset its ordering state. Otherwise it takes no lock
+/// of its own: a caller that reads the definition's status first locks its
+/// row.
 pub(crate) async fn pause(
     txn: &Transaction<'_>,
     id: i64,
-    pause: Pause<'_>,
+    reason: &PauseReason,
 ) -> Result<bool, CatalogError> {
+    let mut dispatchable = true;
+    if reason.kind_reads_status() {
+        let Some(running) = txn
+            .query_opt(
+                "select status = any($2) from transform_definitions where id = $1 for update",
+                &[&id, &StoredStatus::dispatchable()],
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        dispatchable = running.get(0);
+    }
+    let needs = reason.resume_needs();
     let mut add = true;
-    if pause.reason_once {
-        let Some(recorded) = pause.resume_needs.recorded(txn, id).await? else {
+    if needs != ResumeNeeds::Rebuild {
+        let Some(recorded) = needs.recorded(txn, id).await? else {
             return Ok(false);
         };
         add = !recorded;
@@ -617,14 +449,14 @@ pub(crate) async fn pause(
     insert_record(
         txn,
         id,
-        &pause.reason.source_table,
-        pause.kind,
-        pause.caused_by,
+        reason.table(),
+        reason.kind(dispatchable).as_str(),
+        reason.caused_by(),
     )
     .await?;
-    pause.resume_needs.record(txn, id).await?;
+    needs.record(txn, id).await?;
     if add {
-        pause_message::add_reason(txn, id, pause.reason).await?;
+        pause_message::add_reason(txn, id, reason.reason()).await?;
     }
     let paused = txn
         .execute(
@@ -1196,6 +1028,29 @@ mod tests {
         )
     }
 
+    fn caused(text: &str, caused_by: i64) -> PauseReason {
+        PauseReason::Capture {
+            table: "public.s".to_string(),
+            columns: Vec::new(),
+            text: text.to_string(),
+            caused_by: Some(caused_by),
+        }
+    }
+
+    fn restore() -> PauseReason {
+        PauseReason::Restore {
+            table: "public.s".to_string(),
+        }
+    }
+
+    fn relabel(change: &str, lsn: PgLsn) -> PauseReason {
+        PauseReason::Relabel {
+            table: "public.s".to_string(),
+            changes: vec![change.to_string()],
+            lsn,
+        }
+    }
+
     /// A restore marks an existing record `restored`, clears its upstream
     /// cause and keeps its kind, putting its reason first; a second restore
     /// adds no reason. A definition that doesn't exist pauses nothing.
@@ -1208,34 +1063,30 @@ mod tests {
         let txn = client.transaction().await.expect("txn");
 
         assert!(
-            pause_for_capture_failure(&txn, id, "public.s", &[], "first cause", Some(id))
+            pause(&txn, id, &caused("first cause", id))
                 .await
                 .expect("pause")
         );
-        assert!(
-            !pause_for_restore(&txn, id, "public.s", "restored once")
-                .await
-                .expect("restore")
-        );
+        assert!(!pause(&txn, id, &restore()).await.expect("restore"));
         let (error, kind, restored, _, caused_by, status) = record(&txn, id).await;
-        assert!(error.starts_with("restored once"), "{error}");
+        assert!(error.starts_with(&restore().to_string()), "{error}");
         assert!(error.contains("first cause"), "{error}");
         assert_eq!(kind, "capture");
         assert!(restored);
         assert_eq!(caused_by, None);
         assert_eq!(status, "paused");
 
-        pause_for_restore(&txn, id, "public.s", "restored twice")
+        // Its reason gone, a second restore still adds none: the record
+        // already carries the reset.
+        pause_message::replace_reasons(&*txn, id, &[caused("first cause", id).reason()])
             .await
-            .expect("restore again");
+            .expect("replace");
+        let (before, ..) = record(&txn, id).await;
+        pause(&txn, id, &restore()).await.expect("restore again");
         let (again, ..) = record(&txn, id).await;
-        assert_eq!(again, error, "a second restore adds no reason");
+        assert_eq!(again, before, "a second restore adds no reason");
 
-        assert!(
-            !pause_for_restore(&txn, id + 1000, "public.s", "none")
-                .await
-                .expect("absent")
-        );
+        assert!(!pause(&txn, id + 1000, &restore()).await.expect("absent"));
     }
 
     /// A running definition a restore pauses gets a `disruption` record.
@@ -1246,13 +1097,9 @@ mod tests {
         let (pool, id) = live_definition(&db).await;
         let mut client = pool.get().await.expect("client");
         let txn = client.transaction().await.expect("txn");
-        assert!(
-            pause_for_restore(&txn, id, "public.s", "restored")
-                .await
-                .expect("restore")
-        );
+        assert!(pause(&txn, id, &restore()).await.expect("restore"));
         let (error, kind, restored, ..) = record(&txn, id).await;
-        assert!(error.starts_with("restored"), "{error}");
+        assert!(error.starts_with(&restore().to_string()), "{error}");
         assert_eq!(kind, "disruption");
         assert!(restored);
     }
@@ -1269,11 +1116,11 @@ mod tests {
         let txn = client.transaction().await.expect("txn");
 
         assert!(
-            pause_for_capture_failure(&txn, id, "public.s", &[], "first cause", Some(id))
+            pause(&txn, id, &caused("first cause", id))
                 .await
                 .expect("pause")
         );
-        pause_for_relabel(&txn, id, "public.s", "relabelled once", PgLsn::from(200))
+        pause(&txn, id, &relabel("relabelled once", PgLsn::from(200)))
             .await
             .expect("relabel");
         let (error, kind, restored, lsn, caused_by, status) = record(&txn, id).await;
@@ -1285,21 +1132,21 @@ mod tests {
         assert_eq!(caused_by, Some(id), "a relabel keeps the cause");
         assert_eq!(status, "paused");
 
-        pause_for_relabel(&txn, id, "public.s", "relabelled lower", PgLsn::from(100))
+        pause(&txn, id, &relabel("relabelled lower", PgLsn::from(100)))
             .await
             .expect("relabel lower");
         let (lower, _, _, lsn, ..) = record(&txn, id).await;
         assert_eq!(lower, error, "a second relabel adds no reason");
         assert_eq!(lsn, Some(PgLsn::from(200)), "never lowered");
 
-        pause_for_relabel(&txn, id, "public.s", "relabelled higher", PgLsn::from(300))
+        pause(&txn, id, &relabel("relabelled higher", PgLsn::from(300)))
             .await
             .expect("relabel higher");
         let (_, _, _, lsn, ..) = record(&txn, id).await;
         assert_eq!(lsn, Some(PgLsn::from(300)), "raised");
 
         assert!(
-            !pause_for_relabel(&txn, id + 1000, "public.s", "none", PgLsn::from(1))
+            !pause(&txn, id + 1000, &relabel("none", PgLsn::from(1)))
                 .await
                 .expect("absent")
         );
@@ -1314,7 +1161,7 @@ mod tests {
         let mut client = pool.get().await.expect("client");
         let txn = client.transaction().await.expect("txn");
         assert!(
-            pause_for_relabel(&txn, id, "public.s", "relabelled", PgLsn::from(5))
+            pause(&txn, id, &relabel("relabelled", PgLsn::from(5)))
                 .await
                 .expect("relabel")
         );
