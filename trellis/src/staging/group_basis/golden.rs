@@ -93,6 +93,21 @@ fn identity(shape: &GroupShape) -> Vec<PrimaryKeyColumn> {
         .collect()
 }
 
+/// The source's row identity: a key column that can't be `NULL` and one
+/// that can (another aggregate's group column, when the source is its
+/// target), so a key lookup renders both of its match forms.
+fn source_key() -> Vec<PrimaryKeyColumn> {
+    [("id", "integer", false), ("k", "text", true)]
+        .into_iter()
+        .map(|(name, data_type, nullable)| PrimaryKeyColumn {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable,
+            collation: None,
+        })
+        .collect()
+}
+
 /// Every numeric argument's map is free ([`StagedParts::free`]).
 fn all_free(shape: &GroupShape) -> StagedParts {
     StagedParts {
@@ -188,7 +203,7 @@ fn an_aggregate_plan_emits_its_golden_sql() {
                 7,
                 "public.t",
                 "public.s",
-                Vec::new(),
+                source_key(),
                 identity(&shape),
                 shape.clone(),
             );
@@ -213,7 +228,7 @@ fn join_plan(
     collations: Option<[Vec<Option<String>>; 3]>,
 ) -> GroupTargetPlan {
     let source = match writer {
-        Writer::JoinPartials { .. } => Some(("public.s", "trellis_join_rp_7", Vec::new())),
+        Writer::JoinPartials { .. } => Some(("public.s", "trellis_join_rp_7", source_key())),
         _ => None,
     };
     let identity = match writer {

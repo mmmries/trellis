@@ -129,6 +129,11 @@ fn statements(golden: &mut Golden, plan: &JoinTargetPlan) {
     golden.add("product_sql", &plan.product_sql());
     for (side, label) in [(&plan.from, "from"), (&plan.joined, "joined")] {
         group_basis::golden::structure(golden, label, &side.plan);
+        // A build's lock of the cells that take no `J` row.
+        golden.add(
+            &format!("{label} lock_sql_where null_key_filter"),
+            &side.plan.lock_sql_where(&side.null_key_filter()),
+        );
     }
     group_basis::golden::structure(golden, "t", &plan.t);
 }
