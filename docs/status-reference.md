@@ -76,7 +76,7 @@ A `live` transform comes back here for a rebuild after:
   those columns are rebuilt, in the background;
   [Changing a definition](transforms.md#changing-a-definition));
 * a re-read of a table it reads (`Trellis::request_backfill`, the table's
-  capture triggers reinstalled after a restore brought them back disabled, or
+  capture installed on a leaf new to a partitioned source it reads, or
   an automatic rebuild counted in `capture_auto_rebuilds_total`), from the
   call's own transaction (or the capture pass that starts the automatic
   rebuild), returning to `live` when the rebuild is done. Its target keeps its
