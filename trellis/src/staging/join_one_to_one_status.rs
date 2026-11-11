@@ -58,7 +58,7 @@ use crate::pool::quote_ident;
 
 /// The environment variable that sets the fan-out warning threshold: the most
 /// live `a` rows one join key may hold before `status()` warns. Read once,
-/// when nothing has set it.
+/// on first use.
 pub const FAN_OUT_WARNING_ENV: &str = "TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING";
 
 /// The fan-out warning threshold when [`FAN_OUT_WARNING_ENV`] isn't set (or
