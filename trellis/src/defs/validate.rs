@@ -7826,6 +7826,95 @@ mod tests {
         );
     }
 
+    /// Both shapes refuse `GROUP BY` keys one key at a time, in one order: a
+    /// key's refusal comes before any later key's, its type before its
+    /// collation, its collation before a clash with an earlier key, and every
+    /// key's refusal before the index width.
+    #[test]
+    fn group_by_key_refusals_come_key_by_key_in_one_order() {
+        let float = ValueType::Float(crate::float::FloatWidth::Float8);
+        let wide = |last: &str| {
+            let mut keys: Vec<String> = (0..INDEX_MAX_KEYS).map(|i| format!("k{i}")).collect();
+            keys.push(last.to_string());
+            keys
+        };
+        let type_refused = |column: &str| {
+            Err(ValidationError::UnsupportedGroupByKeyType {
+                column: column.into(),
+                value_type: float,
+            })
+        };
+
+        let mut plain: HashMap<String, ValueType> = (0..INDEX_MAX_KEYS)
+            .map(|i| (format!("k{i}"), ValueType::Integer(IntWidth::Int4)))
+            .collect();
+        plain.insert("f".into(), float);
+        let plain_check = |keys: &str| {
+            validate(
+                &parsed(&format!(
+                    "TRANSFORM t FROM s GROUP BY {keys} SELECT COUNT(*) AS n"
+                )),
+                &plain,
+            )
+        };
+        assert_eq!(plain_check("f, missing"), type_refused("f"));
+        assert_eq!(
+            plain_check("missing, f"),
+            Err(ValidationError::UnresolvedGroupByColumn {
+                column: "missing".into()
+            })
+        );
+        assert_eq!(plain_check(&wide("f").join(", ")), type_refused("f"));
+
+        let (mut left, mut right) = tables();
+        for i in 0..INDEX_MAX_KEYS {
+            left.insert(format!("k{i}"), int4());
+        }
+        let mut odd = jcol(float, "double precision", 701, -1);
+        odd.collation = Some("ci".into());
+        odd.collation_deterministic = false;
+        left.insert("odd".into(), odd);
+        left.insert("sku".into(), jcol(ValueType::Text, "text", 25, -1));
+        let sku = right.get_mut("sku").expect("sku");
+        sku.collation = Some("ci".into());
+        sku.collation_deterministic = false;
+        let join_check = |keys: &str| {
+            validate_join(
+                &parse_text(&format!(
+                    "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+                     GROUP BY {keys} SELECT COUNT(*) AS n"
+                ))
+                .unwrap(),
+                &left,
+                &[&right],
+            )
+        };
+        assert_eq!(
+            join_check("items.weight, items.nope"),
+            type_refused("weight")
+        );
+        assert_eq!(
+            join_check("items.nope, items.weight"),
+            Err(ValidationError::JoinUnresolvedColumn {
+                reference: "items.nope".into()
+            })
+        );
+        assert_eq!(join_check("orders.odd"), type_refused("odd"));
+        assert!(matches!(
+            join_check("orders.sku, items.sku"),
+            Err(ValidationError::NondeterministicKeyCollation(refusal))
+                if refusal.table == "items"
+        ));
+        let qualified: Vec<String> = wide("weight")
+            .iter()
+            .map(|key| match key.as_str() {
+                "weight" => "items.weight".to_string(),
+                key => format!("orders.{key}"),
+            })
+            .collect();
+        assert_eq!(join_check(&qualified.join(", ")), type_refused("weight"));
+    }
+
     #[test]
     fn join_refuses_a_self_join_built_by_hand() {
         let (left, right) = tables();
