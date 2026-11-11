@@ -774,7 +774,7 @@ impl JoinTargetPlan {
                 let staged = part.name("__", i);
                 insert_cols.push(staged.clone());
                 if from {
-                    let total = part.total(&part.hidden(i), None, arg.scale);
+                    let total = part.total(&part.hidden(i), None);
                     sums.push(format!("{total} as {staged}"));
                     nonzero.push(part.nonzero(&total));
                     select.push(format!("q.{staged}"));
@@ -841,7 +841,7 @@ impl JoinTargetPlan {
                     let total = if *part == SumPart::Scales && side.delta_map_free(i) {
                         NO_SCALES.to_string()
                     } else {
-                        part.total(&delta, None, arg.scale)
+                        part.total(&delta, None)
                     };
                     columns.push(format!("{total} as {delta}"));
                 }
@@ -909,14 +909,6 @@ impl JoinTargetPlan {
         // `P_old` of cell `p`, given its delta row `d` (left joined).
         let p_old_n = "(p.__n - coalesce(d.__dn, 0))".to_string();
         let p_old_c = |i: usize| format!("(p.__count_{i} - coalesce(d.__dc{i}, 0))");
-        // The reference scale of `T`'s argument `i` (1-based).
-        let scale_of = |i: usize| {
-            if i <= fa {
-                p_args[i - 1].scale
-            } else {
-                m_args[i - 1 - fa].scale
-            }
-        };
         let held = |_: usize, _: SumPart, column: String| column;
         // A cell's delta of partial `part` of the side's argument `i`
         // (1-based), through `alias`: a map no delta holds
@@ -936,8 +928,8 @@ impl JoinTargetPlan {
         let d_delta = |i: usize, part: SumPart| delta(&from_free, "d", i, part);
         let e_delta = |j: usize, part: SumPart| delta(&joined_free, "e", j, part);
         let zero = |_: usize, part: SumPart| part.zero().to_string();
-        let times = |i: usize, part: SumPart, a: &str, n: &str| part.times(a, n, scale_of(i));
-        let sub = |i: usize, part: SumPart, a: &str, b: &str| part.sub(a, b, scale_of(i));
+        let times = |_: usize, part: SumPart, a: &str, n: &str| part.times(a, n);
+        let sub = |_: usize, part: SumPart, a: &str, b: &str| part.sub(a, b);
         let p_old = |i: usize, part: SumPart| {
             sub(
                 i,
@@ -1135,7 +1127,7 @@ impl JoinTargetPlan {
             nonzero.push(format!("sum(__c{i}) <> 0"));
             for part in arg.parts() {
                 let staged = part.name("__", i);
-                let total = part.total(&staged, None, arg.scale);
+                let total = part.total(&staged, None);
                 insert_cols.push(staged.clone());
                 if *part == SumPart::Scales {
                     maps.push(format!("{total} as {staged}"));
@@ -1290,7 +1282,7 @@ impl JoinTargetPlan {
                 .iter()
                 .map(|c| {
                     if c.starts_with("__scales_") {
-                        format!("{} as {c}", SumPart::Scales.total(c, None, None))
+                        format!("{} as {c}", SumPart::Scales.total(c, None))
                     } else {
                         format!("sum({c}) as {c}")
                     }
