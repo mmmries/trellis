@@ -222,8 +222,9 @@
 //! The knobs a test sets to give one scenario its shape, and the counter it
 //! reads back, are kept per database: the count of `JoinKeyMoved` retries
 //! ([`join_key_moves`]), the forced ones ([`force_join_key_moves`]), and the
-//! 1-1 `JOIN` fan-out chunk and warning threshold
+//! 1-1 `JOIN` fan-out chunk, chunk lock timeout and warning threshold
 //! (`super::join_one_to_one::fan_out::set_chunk_rows_in`,
+//! `super::join_one_to_one::fan_out::set_chunk_lock_timeout_in`,
 //! `super::join_one_to_one_status::set_fan_out_warning_rows_in`). Each test
 //! has a database of its own, so tests that set them run in parallel in one
 //! binary. The engine reads them where it reads the process-wide value, on
@@ -543,6 +544,9 @@ struct DatabaseKnobs {
     fan_out_chunk_rows: usize,
     /// The 1-1 `JOIN` fan-out warning threshold; 0 for the process-wide one.
     fan_out_warning_rows: i64,
+    /// How long a 1-1 `JOIN` fan-out chunk waits for a lock; `None` for
+    /// `super::build::CHUNK_LOCK_TIMEOUT`.
+    fan_out_chunk_lock_timeout: Option<Duration>,
 }
 
 /// By database name.
@@ -656,6 +660,25 @@ pub(crate) async fn fan_out_warning_rows<C: GenericClient>(
         .await?
         .map(|knobs| knobs.fan_out_warning_rows)
         .filter(|rows| *rows > 0))
+}
+
+/// Sets how long a 1-1 `JOIN` fan-out chunk on `database` waits for a lock
+/// (`super::build::CHUNK_LOCK_TIMEOUT` unless set), or restores it with
+/// `None`. For a test that freezes the lock's holder and then releases it:
+/// on a loaded machine the release can come more than a second after the
+/// chunk queued, and the chunk would give up, as it should in production.
+pub(crate) fn set_fan_out_chunk_lock_timeout(database: &str, timeout: Option<Duration>) {
+    set_on_database(database, |knobs| knobs.fan_out_chunk_lock_timeout = timeout);
+}
+
+/// The fan-out chunk lock timeout set on the database `client`'s session is
+/// on, if any.
+pub(crate) async fn fan_out_chunk_lock_timeout<C: GenericClient>(
+    client: &C,
+) -> Result<Option<Duration>, tokio_postgres::Error> {
+    Ok(set_knobs(client)
+        .await?
+        .and_then(|knobs| knobs.fan_out_chunk_lock_timeout))
 }
 
 /// The longest stall, in microseconds; 0 for none. See the module doc's

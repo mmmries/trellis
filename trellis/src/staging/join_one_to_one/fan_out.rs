@@ -105,6 +105,15 @@ pub fn set_chunk_rows_in(database: &str, rows: usize) {
     super::super::interleave::set_fan_out_chunk_rows(database, rows);
 }
 
+/// Sets how long a chunk on `database` waits for a lock, over
+/// `super::super::build::CHUNK_LOCK_TIMEOUT`, for a test that freezes the
+/// holder; `None` restores it. See `super::super::interleave`'s "Knobs by
+/// database".
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_chunk_lock_timeout_in(database: &str, timeout: Option<std::time::Duration>) {
+    super::super::interleave::set_fan_out_chunk_lock_timeout(database, timeout);
+}
+
 /// The chunk for a transaction on `txn`'s database: one a test set on it
 /// (`set_chunk_rows_in`), else [`chunk_rows`].
 async fn chunk_rows_on(txn: &Transaction<'_>) -> Result<usize, ApplyError> {
@@ -557,7 +566,13 @@ async fn run_chunk(
             .isolation_level(IsolationLevel::ReadCommitted)
             .start()
             .await?;
-        crate::locks::set_local_lock_timeout(&txn, super::super::build::CHUNK_LOCK_TIMEOUT).await?;
+        #[cfg(any(test, feature = "test-util"))]
+        let lock_timeout = super::super::interleave::fan_out_chunk_lock_timeout(&txn)
+            .await?
+            .unwrap_or(super::super::build::CHUNK_LOCK_TIMEOUT);
+        #[cfg(not(any(test, feature = "test-util")))]
+        let lock_timeout = super::super::build::CHUNK_LOCK_TIMEOUT;
+        crate::locks::set_local_lock_timeout(&txn, lock_timeout).await?;
         match chunk_in(&txn, loaded, at, key, &held).await {
             Ok(Chunk::Ran) => txn.commit().await?,
             Ok(other) => {

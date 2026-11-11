@@ -259,6 +259,18 @@ impl Driver {
         trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows_in(self.db.name(), rows);
     }
 
+    /// Has a 1-1 `JOIN` fan-out chunk on this database wait up to `timeout`
+    /// for a lock instead of the engine's one second
+    /// (`trellis::dev::build::CHUNK_LOCK_TIMEOUT`): for a test that queues
+    /// a chunk behind a worker it froze, so a release that comes late on a
+    /// loaded machine doesn't make the chunk give up.
+    pub fn set_fan_out_chunk_lock_timeout(&self, timeout: Duration) {
+        trellis::dev::defs::set_one_to_one_join_fan_out_chunk_lock_timeout_in(
+            self.db.name(),
+            Some(timeout),
+        );
+    }
+
     /// Sets the 1-1 `JOIN` fan-out warning threshold on this database; `0`
     /// restores the default.
     pub fn set_fan_out_warning_rows(&self, rows: i64) {

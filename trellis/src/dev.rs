@@ -77,6 +77,7 @@ pub mod defs {
     pub use crate::staging::join_one_to_one::fan_out::{
         DEFAULT_CHUNK_ROWS as ONE_TO_ONE_JOIN_DEFAULT_FAN_OUT_CHUNK_ROWS,
         chunk_rows as one_to_one_join_fan_out_chunk_rows,
+        set_chunk_lock_timeout_in as set_one_to_one_join_fan_out_chunk_lock_timeout_in,
         set_chunk_rows as set_one_to_one_join_fan_out_chunk_rows,
         set_chunk_rows_in as set_one_to_one_join_fan_out_chunk_rows_in,
     };

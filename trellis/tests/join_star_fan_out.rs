@@ -99,6 +99,9 @@ async fn cx_f10a_a_chunk_queues_on_the_r_entry_of_a_page_at_the_other_position()
             let name = format!("{} {orientation:?}", star.name());
             let mut d = star::start_seeded(&[star], &orientation.sql(SEED)).await;
             d.set_fan_out_chunk_rows(1);
+            // The chunk queues behind a worker this test froze: it waits as a page
+            // would, not one second, which a release can outlast on a loaded box.
+            d.set_fan_out_chunk_lock_timeout(std::time::Duration::from_secs(30));
             step(
                 &mut d,
                 &orientation.sql("update public.b1 set w = 11 where id = 1"),
@@ -196,6 +199,9 @@ async fn cx_f10c_chunks_at_two_positions_on_one_row_queue_on_its_r_entry() {
         let name = star.name();
         let mut d = star::start_seeded(&[star], SHARED_SEED).await;
         d.set_fan_out_chunk_rows(1);
+        // The chunk queues behind a worker this test froze: it waits as a page
+        // would, not one second, which a release can outlast on a loaded box.
+        d.set_fan_out_chunk_lock_timeout(std::time::Duration::from_secs(30));
         step(&mut d, "update public.b1 set w = 11 where id = 1").await;
         step(&mut d, "update public.b2 set w = 101 where id = 1").await;
         assert_eq!(
@@ -250,6 +256,9 @@ async fn cx_f10a_a_chunk_leaves_out_a_row_a_page_at_the_other_position_held_afte
                     insert into public.b2 values (1, 1, 100, 'e1'), (5, 5, 500, 'e5')";
         let mut d = star::start_seeded(&[star], seed).await;
         d.set_fan_out_chunk_rows(1);
+        // The chunk queues behind a worker this test froze: it waits as a page
+        // would, not one second, which a release can outlast on a loaded box.
+        d.set_fan_out_chunk_lock_timeout(std::time::Duration::from_secs(30));
         step(&mut d, "update public.b1 set w = 11 where id = 1").await;
         assert_eq!(markers(&d, star).await, ["(1,{1},)"], "{name}");
         star::write(&d, "update public.b2 set w = 2000 where id = 1").await;
