@@ -26,9 +26,6 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
                    create unique index on public.b (k); \
                    create index on public.a (k)";
 
-/// The test hooks are process-wide, so these tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
 }
@@ -249,7 +246,6 @@ async fn release(d: &mut Driver, kind: Kind, table: &str, key: &str) {
 /// held is parked too, and its release re-derives it.
 #[tokio::test]
 async fn a_field_failing_on_a_fan_out_row_holds_that_row_and_the_b_change_applies() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[23]).await;
@@ -294,7 +290,6 @@ async fn a_field_failing_on_a_fan_out_row_holds_that_row_and_the_b_change_applie
 /// Pins the `join1_fan_out_held_row` plant.
 #[tokio::test]
 async fn a_fan_out_leaves_a_held_row_as_it_was() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[23]).await;
@@ -328,7 +323,6 @@ async fn a_fan_out_leaves_a_held_row_as_it_was() {
 /// same row. Nothing deadlocks.
 #[tokio::test]
 async fn a_change_of_the_row_planned_before_its_hold_applies_after_the_fan_out() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[23]).await;
@@ -365,7 +359,6 @@ async fn a_change_of_the_row_planned_before_its_hold_applies_after_the_fan_out()
 /// Pins the `join1_release_no_rederive` plant.
 #[tokio::test]
 async fn a_release_before_a_pending_fan_out_of_its_key_stays_released() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[23]).await;
@@ -391,7 +384,6 @@ async fn a_release_before_a_pending_fan_out_of_its_key_stays_released() {
 /// `M` that page committed. Nothing deadlocks.
 #[tokio::test]
 async fn a_release_queues_behind_a_page_on_its_key() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[23]).await;
@@ -426,7 +418,6 @@ async fn a_release_queues_behind_a_page_on_its_key() {
 /// naming the rows it found; nothing is held.
 #[tokio::test]
 async fn a_fan_out_failing_on_more_rows_than_its_bisection_names_halts() {
-    let _serial = SERIAL.lock().await;
     let kind = Kind::Left;
     let mut d = start(kind, A_ROWS, B_ROWS).await;
     let big: Vec<i32> = (5..=40).collect();
@@ -476,7 +467,6 @@ async fn a_fan_out_failing_on_more_rows_than_its_bisection_names_halts() {
 /// its first failure, as a build chunk holds a key).
 #[tokio::test]
 async fn held_fan_out_rows_count_toward_the_fuses() {
-    let _serial = SERIAL.lock().await;
     let kind = Kind::Left;
     let mut d = start(kind, A_ROWS, B_ROWS).await;
     seed_key_10(&mut d, &[11, 12, 13, 14, 15]).await;
@@ -589,7 +579,6 @@ async fn self_check_walk(
 /// counts toward `total`'s fuse.
 #[tokio::test]
 async fn an_a_change_failing_against_the_pages_b_change_is_held_in_the_page() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[]).await;
@@ -647,7 +636,6 @@ async fn an_a_change_failing_against_the_pages_b_change_is_held_in_the_page() {
 /// first attempt, and the row's target row stays as it was.
 #[tokio::test]
 async fn an_a_change_failing_alone_is_held_on_its_first_failure() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         write(
@@ -690,7 +678,6 @@ async fn an_a_change_failing_alone_is_held_on_its_first_failure() {
 /// rows it found; nothing is held or written.
 #[tokio::test]
 async fn a_changes_failing_on_more_rows_than_the_bisection_names_halt() {
-    let _serial = SERIAL.lock().await;
     let kind = Kind::Left;
     let mut d = start(kind, A_ROWS, B_ROWS).await;
     step(&mut d, "update public.b set w = 1000 where id = 1").await;
@@ -740,7 +727,6 @@ async fn a_changes_failing_on_more_rows_than_the_bisection_names_halt() {
 /// trip nothing, and a fifth pauses the column.
 #[tokio::test]
 async fn a_changes_failing_on_one_column_trip_its_fuse() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         step(&mut d, "update public.b set w = 1000 where id = 1").await;
@@ -808,7 +794,6 @@ async fn row_of(d: &Driver, kind: Kind, id: i32) -> Vec<String> {
 /// release re-derives `R`'s entry and the target row from the live row.
 #[tokio::test]
 async fn a_row_held_in_its_a_page_stays_until_its_release_re_derives_it() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[]).await;
@@ -869,7 +854,6 @@ async fn a_row_held_in_its_a_page_stays_until_its_release_re_derives_it() {
 /// queues behind the page instead of closing a cycle with the hold.
 #[tokio::test]
 async fn an_a_page_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
-    let _serial = SERIAL.lock().await;
     let kind = Kind::Left;
     let mut d = start(kind, A_ROWS, B_ROWS).await;
     let id = definition_id(&d, &kind.target()).await;
@@ -918,7 +902,6 @@ async fn an_a_page_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
 /// and the column is frozen from the pause's return.
 #[tokio::test]
 async fn a_column_pause_waits_for_a_page_of_the_joined_table() {
-    let _serial = SERIAL.lock().await;
     let kind = Kind::Left;
     let mut d = start(kind, A_ROWS, B_ROWS).await;
     write(&d, "update public.b set w = 500 where id = 1").await;
@@ -975,7 +958,6 @@ async fn a_column_pause_waits_for_a_page_of_the_joined_table() {
 /// on its keys.
 #[tokio::test]
 async fn a_held_key_of_b_is_released_by_a_rederive_and_its_fan_out() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         d.ctl
@@ -1025,7 +1007,6 @@ async fn a_held_key_of_b_is_released_by_a_rederive_and_its_fan_out() {
 /// text, a later fan-out leaves it out, and its release re-derives it.
 #[tokio::test]
 async fn a_held_row_of_a_keyed_by_null_is_released() {
-    let _serial = SERIAL.lock().await;
     for (word, sql) in [("LEFT", "left"), ("INNER", "inner")] {
         let mut d = Driver::start(
             "create table public.src (id integer primary key, g integer, h integer); \
@@ -1114,7 +1095,6 @@ async fn a_held_row_of_a_keyed_by_null_is_released() {
 /// target, and its release stages the Re-derive there.
 #[tokio::test]
 async fn a_held_row_of_a_chained_a_side_is_released() {
-    let _serial = SERIAL.lock().await;
     let mut d = Driver::start(
         "create table public.asrc (id integer primary key, k integer, x integer); \
          create table public.b (id integer primary key, k integer, w integer); \
@@ -1206,7 +1186,6 @@ async fn capture(d: &mut Driver, table: &str) {
 /// the page.
 #[tokio::test]
 async fn a_fan_out_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
-    let _serial = SERIAL.lock().await;
     let kind = Kind::Left;
     let mut d = start(kind, A_ROWS, B_ROWS).await;
     seed_key_10(&mut d, &[23]).await;
@@ -1259,7 +1238,6 @@ async fn a_fan_out_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
 /// the row from the rebuilt `M`.
 #[tokio::test]
 async fn a_held_row_stays_through_a_rebuild_and_its_release_re_derives_it() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[23]).await;
@@ -1299,7 +1277,6 @@ async fn a_held_row_stays_through_a_rebuild_and_its_release_re_derives_it() {
 /// held row does, and its release deletes it.
 #[tokio::test]
 async fn an_inner_held_row_whose_b_row_goes_is_deleted_by_its_release() {
-    let _serial = SERIAL.lock().await;
     let kind = Kind::Inner;
     let mut d = start(kind, A_ROWS, B_ROWS).await;
     seed_key_10(&mut d, &[23]).await;
@@ -1318,7 +1295,6 @@ async fn an_inner_held_row_whose_b_row_goes_is_deleted_by_its_release() {
 /// column back. A 1-1 `JOIN` has no field build of its own.
 #[tokio::test]
 async fn a_column_resume_rebuilds_the_rows_written_while_it_was_paused() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         quarantine::pause_column(d.pool(), kind.name(), "total")
@@ -1351,7 +1327,6 @@ async fn a_column_resume_rebuilds_the_rows_written_while_it_was_paused() {
 /// is left held. LEFT and INNER.
 #[tokio::test]
 async fn a_column_the_fuse_paused_resumes_through_the_in_place_rebuild() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[11, 12, 13, 14, 15]).await;

@@ -7,10 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # CI never attaches a debugger, and line tables keep file:line in panic
-  # backtraces. Full debug info made the ~115 statically linked test
-  # binaries ~13GB and a fifth of the build was linking them.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   # How many `test` job shards there are; the matrix `shard` list below must be
   # 1..TEST_SHARDS (the `lint` job checks it).
   TEST_SHARDS: 4
@@ -39,7 +35,8 @@ jobs:
       - name: Restore Cargo dependency cache
         # Compiled third-party dependencies (see prune-cargo-target.sh), keyed
         # on everything that decides them: the compiler, the debug-info
-        # setting above and Cargo.lock. A lockfile change still restores the
+        # setting (`[profile.dev] debug` in Cargo.toml; the `line-tables` in the
+        # key below) and Cargo.lock. A lockfile change still restores the
         # nearest older entry, so only the changed dependencies rebuild. PRs
         # restore the entry main saved. This job is the only one that saves it
         # (the `test` shards, the `elixir` job and the `ruby` job restore only).

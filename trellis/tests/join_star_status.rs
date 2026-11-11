@@ -17,18 +17,7 @@ mod star;
 use drain_driver::Driver;
 use star::{Shape, Star};
 use trellis::config::Config;
-use trellis::dev::defs::set_one_to_one_join_fan_out_warning_rows;
 use trellis::{JoinStatus, Trellis, TrellisOptions};
-
-/// Puts the process-wide warning threshold back when a test ends, even on
-/// a panic.
-struct Threshold;
-
-impl Drop for Threshold {
-    fn drop(&mut self) {
-        set_one_to_one_join_fan_out_warning_rows(0);
-    }
-}
 
 async fn join_status(d: &Driver, star: Star) -> JoinStatus {
     Trellis::connect(
@@ -66,15 +55,13 @@ const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty')";
 /// threshold of 2, naming that position and the key, and not at 3.
 #[tokio::test]
 async fn a_per_position_warning_names_its_position_and_key() {
-    let _serial = star::serial().await;
-    let _threshold = Threshold;
     for shape in shapes() {
         let star = shape.stars()[0];
         let name = format!("{shape:?}");
         let d = star::start(&[star], A_ROWS, B_ROWS).await;
-        set_one_to_one_join_fan_out_warning_rows(3);
+        d.set_fan_out_warning_rows(3);
         assert_eq!(warned(&d, star).await, [], "{name}: 3 is not past 3");
-        set_one_to_one_join_fan_out_warning_rows(2);
+        d.set_fan_out_warning_rows(2);
         assert_eq!(
             warned(&d, star).await,
             [(shape.at, "10".to_string(), 3, 2)],
@@ -98,21 +85,19 @@ async fn warned(d: &Driver, star: Star) -> Vec<(usize, String, i64, i64)> {
 /// whichever holds the larger group: ADR-0021's warning is per position.
 #[tokio::test]
 async fn every_position_past_the_threshold_warns() {
-    let _serial = star::serial().await;
-    let _threshold = Threshold;
     let shape = Shape::new(2, 2);
     let star = shape.stars()[0];
     let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
     // Every `a` row onto `b1`'s key 1001: a group of 4 at position 1, past
     // position 2's group of 3 on key 10.
     star::step(&mut d, "update public.a set k1 = 1001").await;
-    set_one_to_one_join_fan_out_warning_rows(2);
+    d.set_fan_out_warning_rows(2);
     assert_eq!(
         warned(&d, star).await,
         [(1, "1001".to_string(), 4, 2), (2, "10".to_string(), 3, 2)]
     );
     // Past 3, only position 1's group of 4 warns.
-    set_one_to_one_join_fan_out_warning_rows(3);
+    d.set_fan_out_warning_rows(3);
     assert_eq!(warned(&d, star).await, [(1, "1001".to_string(), 4, 3)]);
 }
 
@@ -120,7 +105,6 @@ async fn every_position_past_the_threshold_warns() {
 /// then `J`.
 #[tokio::test]
 async fn status_lists_every_positions_m() {
-    let _serial = star::serial().await;
     for shape in shapes() {
         let star = shape.stars()[0];
         let d = star::start(&[star], A_ROWS, B_ROWS).await;

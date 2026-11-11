@@ -51,7 +51,6 @@ const ASYM: &[Orientation] = &Orientation::BOTH;
 /// one change.
 #[tokio::test]
 async fn cx_f1a_value_changes_at_two_positions_meet_at_one_root_row() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -69,7 +68,6 @@ async fn cx_f1a_value_changes_at_two_positions_meet_at_one_root_row() {
 /// `star_own_j_only` or `star_r_after_m`.
 #[tokio::test]
 async fn cx_f1b_an_insert_at_one_position_meets_a_change_at_the_other() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -85,7 +83,6 @@ async fn cx_f1b_an_insert_at_one_position_meets_a_change_at_the_other() {
 /// (`star_last_no_r` fails it with the change at the last position).
 #[tokio::test]
 async fn cx_f1c_a_delete_at_one_position_meets_a_change_at_the_other() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -101,7 +98,6 @@ async fn cx_f1c_a_delete_at_one_position_meets_a_change_at_the_other() {
 /// Planted `star_own_j_only`.
 #[tokio::test]
 async fn cx_f1d_moves_off_at_two_positions_meet_at_one_root_row() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -117,7 +113,6 @@ async fn cx_f1d_moves_off_at_two_positions_meet_at_one_root_row() {
 /// mirror. Planted `star_own_j_only` or `star_r_after_m`.
 #[tokio::test]
 async fn cx_f1e_a_change_at_one_position_meets_an_insert_at_the_other() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -133,7 +128,6 @@ async fn cx_f1e_a_change_at_one_position_meets_an_insert_at_the_other() {
 /// on the same row; both orientations. Planted `star_own_j_only`.
 #[tokio::test]
 async fn cx_f1f_a_move_onto_a_key_meets_a_change_at_the_other_position() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -163,7 +157,6 @@ const A5: &str = "insert into public.a (id, k1, k2, x, y) values (5, 1, 1, 5, 'a
 /// lock now orders the pages without `J`, so `join1_m_before_j` passes it).
 #[tokio::test]
 async fn cx_f4a_a_hand_off_out_of_order_races_a_change_and_a_root_insert() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[LEAVE],
@@ -182,7 +175,6 @@ async fn cx_f4a_a_hand_off_out_of_order_races_a_change_and_a_root_insert() {
 /// `a` insert on `(1, 1)` after them.
 #[tokio::test]
 async fn cx_f4b_a_hand_off_out_of_order_races_its_first_half_and_a_change() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -201,7 +193,6 @@ async fn cx_f4b_a_hand_off_out_of_order_races_its_first_half_and_a_change() {
 /// undrained batches, so not three in flight), then the leave.
 #[tokio::test]
 async fn cx_f4c_a_hand_off_out_of_order_races_a_change_then_a_root_insert() {
-    let _serial = star::serial().await;
     for orientation in ASYM {
         for star in N3.stars() {
             for flip in [false, true] {
@@ -237,7 +228,6 @@ async fn cx_f4c_a_hand_off_out_of_order_races_a_change_then_a_root_insert() {
 /// that page commits.
 #[tokio::test]
 async fn cx_f6e_a_joined_rederive_whose_row_moved_races_a_change_at_the_other_position() {
-    let _serial = star::serial().await;
     for orientation in ASYM {
         for star in N3.stars() {
             let mut d = star::start_seeded(&[star], &orientation.sql(SEED)).await;
@@ -250,7 +240,7 @@ async fn cx_f6e_a_joined_rederive_whose_row_moved_races_a_change_at_the_other_po
             )
             .await;
             let joined = d.seal().await;
-            let moves = trellis::dev::interleave::join_key_moves();
+            let moves = d.join_key_moves();
             let target = star.target();
             let mut page = d
                 .drain_frozen(
@@ -279,7 +269,7 @@ async fn cx_f6e_a_joined_rederive_whose_row_moved_races_a_change_at_the_other_po
             if let Err(err) = &result {
                 panic!("{name} {orientation:?}: the Re-derive page failed: {err}");
             }
-            let retried = trellis::dev::interleave::join_key_moves() - moves;
+            let retried = d.join_key_moves() - moves;
             star::assert_oracle(&mut d, &[star]).await;
             assert!(
                 blocked,
@@ -302,7 +292,6 @@ async fn cx_f6e_a_joined_rederive_whose_row_moved_races_a_change_at_the_other_po
 /// neither `star_own_j_only` nor `join1_no_entry_lock` fails it.
 #[tokio::test]
 async fn cx_f9c_a_root_row_moving_to_null_races_a_page_of_both_joined_tables() {
-    let _serial = star::serial().await;
     star_cx::family(
         SEED,
         &[],
@@ -362,7 +351,7 @@ async fn late_m_key(third: bool) {
             d.drain(p1, "move").await;
             star::write(&d, &o("update public.b2 set w = 301 where id = 3")).await;
             let p3 = d.seal().await;
-            let moves = trellis::dev::interleave::join_key_moves();
+            let moves = d.join_key_moves();
             let (blocked, result) = if third {
                 let mut held = d
                     .drain_frozen(p3, "third", &[(PausePoint::BeforeCommit, &target)])
@@ -380,7 +369,7 @@ async fn late_m_key(third: bool) {
             if let Err(err) = &result {
                 panic!("{name}: the mixed page failed: {err}");
             }
-            let retried = trellis::dev::interleave::join_key_moves() - moves;
+            let retried = d.join_key_moves() - moves;
             if !third {
                 d.drain(p3, "third").await;
             }
@@ -401,7 +390,6 @@ async fn late_m_key(third: bool) {
 /// `star_recheck_skip_last`).
 #[tokio::test]
 async fn cx_f11a_a_joined_entry_whose_key_moved_onto_a_root_key_retries_under_a_third_page() {
-    let _serial = star::serial().await;
     late_m_key(true).await;
 }
 
@@ -411,7 +399,6 @@ async fn cx_f11a_a_joined_entry_whose_key_moved_onto_a_root_key_retries_under_a_
 /// `star_recheck_skip_last`).
 #[tokio::test]
 async fn ps7_a_joined_entry_whose_key_moved_onto_a_root_key_retries() {
-    let _serial = star::serial().await;
     late_m_key(false).await;
 }
 
@@ -420,7 +407,6 @@ async fn ps7_a_joined_entry_whose_key_moved_onto_a_root_key_retries() {
 /// fixture the crossing pins share).
 #[tokio::test]
 async fn a_page_of_both_joined_tables_fans_out_at_both_positions() {
-    let _serial = star::serial().await;
     let stars = N3.stars();
     let mut d = star::start_seeded(&stars, CROSS_SEED).await;
     star::step(

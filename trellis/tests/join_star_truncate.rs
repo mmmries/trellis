@@ -134,7 +134,6 @@ const TRUNCATE_RACES: [(&str, &str, &str); 8] = [
 /// rebuild's start too, `cx_f5a_…`).
 #[tokio::test]
 async fn pp_t1_to_t7_a_truncate_races_a_page_of_either_table() {
-    let _serial = star::serial().await;
     for (name, x, y) in TRUNCATE_RACES {
         for star in AT2.stars() {
             for x_first in [true, false] {
@@ -160,7 +159,6 @@ async fn pp_t1_to_t7_a_truncate_races_a_page_of_either_table() {
 /// `M` at position 2. Planted `join1_truncate_no_floor`, it applies.
 #[tokio::test]
 async fn pp_t8_a_stale_page_after_the_truncate_is_refused() {
-    let _serial = star::serial().await;
     for star in AT2.stars() {
         for table in ["public.a", "{b}"] {
             let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
@@ -212,7 +210,6 @@ async fn pp_t8_a_stale_page_after_the_truncate_is_refused() {
 /// `join1_truncate_keeps_r`, it writes their rows back.
 #[tokio::test]
 async fn px4_a_truncate_of_a_empties_r_and_a_later_change_at_position_2_writes_nothing() {
-    let _serial = star::serial().await;
     for star in AT2.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::step(&mut d, "truncate public.a").await;
@@ -233,7 +230,6 @@ async fn px4_a_truncate_of_a_empties_r_and_a_later_change_at_position_2_writes_n
 /// that is gone.
 #[tokio::test]
 async fn px5_a_truncate_at_position_2_empties_its_m_before_the_rebuild_runs() {
-    let _serial = star::serial().await;
     for star in AT2.stars() {
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
         star::step(&mut d, &AT2.sql("truncate {b}")).await;
@@ -267,7 +263,6 @@ async fn px5_a_truncate_at_position_2_empties_its_m_before_the_rebuild_runs() {
 /// `join1_truncate_no_rebuild`, nothing rewrites them.
 #[tokio::test]
 async fn px6_a_truncate_at_position_2_rebuilds_the_target() {
-    let _serial = star::serial().await;
     for star in AT2.stars() {
         let name = star.name();
         let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
@@ -377,7 +372,6 @@ async fn def_row_first(d: &mut Driver, star: Star, batch: i64) {
 /// ([`def_row_first`]).
 #[tokio::test]
 async fn px7_a_truncate_at_position_2_and_a_rebuild_start_take_the_definition_row_first() {
-    let _serial = star::serial().await;
     let star = AT2.stars()[0];
     let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
     star::write(&d, &AT2.sql("truncate {b}")).await;
@@ -399,7 +393,6 @@ const TRUNCATE_BOTH: &str = "truncate public.b1, public.b2";
 /// definition row, rests on the page's own `FOR UPDATE` (PP-T's T1).
 #[tokio::test]
 async fn xt1_a_page_truncating_both_joined_tables_races_an_a_page() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         for truncate_first in [true, false] {
             let mut d = star::start_seeded(&[star], SEED).await;
@@ -428,7 +421,6 @@ async fn xt1_a_page_truncating_both_joined_tables_races_an_a_page() {
 /// `join1_truncate_no_rebuild`, it starts none.
 #[tokio::test]
 async fn xt1_a_page_truncating_both_joined_tables_empties_both_ms_and_starts_one_rebuild() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         let name = star.name();
         let mut d = star::start_seeded(&[star], SEED).await;
@@ -466,7 +458,6 @@ async fn xt1_a_page_truncating_both_joined_tables_empties_both_ms_and_starts_one
 /// once, before the lock row ([`def_row_first`]).
 #[tokio::test]
 async fn xt1_a_page_truncating_both_joined_tables_takes_the_definition_row_first() {
-    let _serial = star::serial().await;
     let star = N3.stars()[0];
     let mut d = star::start_seeded(&[star], SEED).await;
     star::write(&d, TRUNCATE_BOTH).await;
@@ -480,7 +471,6 @@ async fn xt1_a_page_truncating_both_joined_tables_takes_the_definition_row_first
 /// starts rewrites the chunk's rows.
 #[tokio::test]
 async fn a_truncate_of_a_joined_table_queues_behind_a_build_chunk_in_flight() {
-    let _serial = star::serial().await;
     for truncate in ["truncate public.b2", TRUNCATE_BOTH] {
         for star in AT2.stars() {
             let mut d = star::start_unbuilt(&[star], A_ROWS, B_ROWS).await;
@@ -521,7 +511,6 @@ async fn a_truncate_of_a_joined_table_queues_behind_a_build_chunk_in_flight() {
 /// doesn't fail this pin, though #1464 names it.
 #[tokio::test]
 async fn cx_f5a_a_truncate_at_one_position_races_a_change_at_the_other() {
-    let _serial = star::serial().await;
     for star in N3.stars() {
         for truncate_first in [true, false] {
             let mut d = star::start_seeded(&[star], SEED).await;
@@ -583,7 +572,6 @@ async fn after_a_truncate(orientation: Orientation, rebuilt: bool) {
 /// unlocked and one of them misses the other.
 #[tokio::test]
 async fn ps3_a_root_insert_races_a_change_of_its_key_after_a_truncate_at_the_other_position() {
-    let _serial = star::serial().await;
     after_a_truncate(Orientation::AsWritten, true).await;
 }
 
@@ -592,7 +580,6 @@ async fn ps3_a_root_insert_races_a_change_of_its_key_after_a_truncate_at_the_oth
 /// orientation as written fails; `star_root_skip_j_first`, the swapped one.
 #[tokio::test]
 async fn cx_f5d_a_root_insert_races_a_change_of_its_key_while_the_truncates_rebuild_is_pending() {
-    let _serial = star::serial().await;
     for orientation in Orientation::BOTH {
         after_a_truncate(orientation, false).await;
     }
@@ -606,7 +593,6 @@ async fn cx_f5d_a_root_insert_races_a_change_of_its_key_while_the_truncates_rebu
 /// sweep job); refilled, every star matches the live join.
 #[tokio::test]
 async fn a_truncate_of_every_table_of_several_stars_empties_each_and_starts_one_rebuild_each() {
-    let _serial = star::serial().await;
     let stars = N3.stars();
     let mut d = star::start_seeded(&stars, SEED).await;
     star::step(&mut d, "truncate public.a, public.b1, public.b2").await;
@@ -652,7 +638,6 @@ async fn a_truncate_of_every_table_of_several_stars_empties_each_and_starts_one_
 /// cleared and refilled, and the star rebuilds to the live join.
 #[tokio::test]
 async fn a_truncate_of_a_joined_table_another_transform_reads_settles_both() {
-    let _serial = star::serial().await;
     let star = N3.stars()[0];
     let ddl = format!("{}; {SEED}", N3.ddl());
     let def = star.definition();

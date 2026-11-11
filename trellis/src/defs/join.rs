@@ -783,11 +783,7 @@ fn argument_type(
         Side::From => from,
         Side::Joined(_) => joined,
     };
-    let types: HashMap<String, ValueType> = columns
-        .iter()
-        .map(|(name, info)| (name.clone(), info.value_type))
-        .collect();
-    super::validate::infer_expr_type(arg, &types)
+    super::validate::infer_expr_type_in("", arg, &super::validate::ColumnTypes::Live(columns))
 }
 
 /// The Postgres type of a `JOIN` field that isn't a `GROUP BY` key: an

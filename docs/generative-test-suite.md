@@ -223,7 +223,7 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    construct. The near misses are the wrong-typed operand of each operator and
    function (a call no overload of the name accepts), prefix `-` over a
    non-numeric operand, a `CAST` the registry does not admit and a target it has
-   no spelling for, a constant zero divisor, a chained comparison, a simple
+   no spelling for, a literal zero divisor, a chained comparison, a simple
    `CASE`, an `IS TRUE`-style test, each word Postgres reserves used as a
    column (the live server also refuses each as an unquoted column name), a
    `NULL` define can't type (both operands of an arithmetic operator, the
@@ -235,31 +235,21 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    does not admit (including the `STABLE` and `VOLATILE` ones). The date
    constructs add their own: a field or unit the type lacks, the `STABLE`
    overloads Postgres picks silently (`DATE_TRUNC` of a `date`, `EXTRACT` of a
-   `timestamptz`, `CAST(tz AS timestamp)`), a zone that is not `'UTC'`, an
-   interval-producing `-`, and a constant date past `date`'s range.
+   `timestamptz`, `CAST(tz AS timestamp)`), a zone that is not `'UTC'`, and an
+   interval-producing `-`.
 
-Postgres folds constants while it plans, so an expression it rejects for every
-row (`2147483647 + 1`, `1.5 / 0`) is refused at define by design. A constant
-zero divisor is refused whatever the dividend, so for a column dividend (which
-Postgres plans without error) the checker accepts the refusal when no row of
-the table computes a value, or when a `COALESCE`, `CASE`, `AND` or `OR` may
-keep the division from running. Inside those, define follows the planner: it
-refuses a constant in a `CASE` result whatever the condition, and nothing
-after a constant that ends the `CASE`, `AND`, `OR` or `COALESCE` (the
-constants-only property reaches those folds, including `NULL` ones from
-`NULLIF`). The Value property
-treats "refused at define, and Postgres raises class 22 on a `WHERE false`
-probe" as agreement, and flags both a refusal where Postgres plans the
+Postgres folds constants while it plans, and define evaluates none of them
+([ADR-0022](decisions/0022-grammar-mirrors-postgres.md)): an expression
+Postgres rejects for every row while planning (`2147483647 + 1`) defines, and
+its rows fail at run time like any per-row error. The Value property treats
+"admitted, and Postgres raises class 22 on a `WHERE false` probe" as agreement
+(failing while planning), and flags a refusal where Postgres plans the
 expression without error (a false refusal) and an acceptance where Postgres
-raises while planning it (a missed refusal).
-
-A gap that is open (define admits what Postgres rejects) is tolerated in one
-named place in `generative::expr_conformance`, reported as a known gap, and
-pinned by a test that fails the day define refuses it, which is when the
-tolerance goes. The tolerance covers the gap and nothing beside it: the
-checker rewrites the gap away (a pattern Postgres rejects becomes `'a'`, a
-function call over constants, innermost first, becomes the literal Postgres
-computes for it) and the rewritten expression must pass every property.
+fails to plan it for another reason, such as an operator it can't resolve (a
+missed refusal). The one constant rule define has is textual: a `/` or `%`
+whose divisor is written as a literal zero is refused wherever it sits, and
+the checker restates that rule on its own and flags define on either side of
+it, whatever Postgres would do with the division.
 
 Deterministic tests in the same file pin each precedence tier (every pair of
 registry operators, generically) and each refusal by name, and check every
@@ -273,8 +263,9 @@ The randomized properties are `#[ignore]`d and draw fresh cases each run:
 `PROPTEST_CASES=2000 cargo test -p generative --test expr_conformance --
 --ignored`. A failure prints the expression's text; add it to
 `hard_cases_agree_with_postgres` to replay it. A property over constants only
-(`property_constant_expressions_conform_to_postgres`) is where the plan-time
-range refusals are reached.
+(`property_constant_expressions_conform_to_postgres`) is where Postgres's
+plan-time folding is reached, so most of its failing draws agree as failing
+while planning.
 
 #### Adding an operator or function
 
@@ -296,9 +287,7 @@ range refusals are reached.
 3. If define refuses a combination Postgres accepts on purpose (the float/exact
    comparison is one), teach the generator the admitted spelling next to
    `Rule::FloatVsLiteral` and the near-miss list the refused one.
-4. If the operator makes a new constant fold fail at plan time, make define
-   refuse it and let the Value property confirm Postgres raises on the probe.
-5. Teach the end-to-end oracle (`oracle::render_expr`, `field_value_type`) the
+4. Teach the end-to-end oracle (`oracle::render_expr`, `field_value_type`) the
    operator's rendering and typing, and add a literal pool for any new
    typed-literal keyword.
 
@@ -555,10 +544,23 @@ beside them run on every `cargo test`.
   keys equal its `k` half the time, so it is hot at two or more positions at
   once; the stream cut into shuffled pages of 1 to 15 draws, half of them
   mixed (one root key written at the root and at every position, the
-  drawn "late" position's write last); drains capped at a drawn 1 to 15
-  rows; 8 workers and a commit stall of up to 3 ms. The case also carries
-  the shares of lock steps to stall (30%) and pages to re-derive (12%),
-  which wait for engine hooks that stall or re-derive a share of them. One
+  drawn "late" position's write last); root rows that move at one
+  position alone; updates concentrated on a few rows; and bursts that end in
+  a race (a root row and a row of each joined table put on a hot key, then
+  value changes of the joined rows at every position, with nothing after
+  them to repair what they leave). Its cases drain with 8 workers, drains
+  capped at a drawn 1 to 15 rows, a commit stall of up to 20 ms, and the
+  engine's test-only knobs (`trellis::dev::interleave`,
+  `trellis::dev::staging`, `trellis::dev::defs`), each process-wide for the
+  case: 30% of a page's lock steps stalled up to a drawn 1 to 12 ms; 12% of
+  pages re-derived, each holding its unlocked read open before its key
+  lock; in three cases in four a split threshold of 2 to 16 rows, so one
+  batch's pages drain on several workers side by side, and lanes paced at
+  2 to 20 ms an op, so rows move while pages drain; and in half the cases a
+  fan-out chunk of 1 to 4 rows, below a hot key's rows, so fan-outs go
+  through pending markers and chunks. None of the knobs exists in a normal
+  build, and each changes when things happen or how a page reads, never
+  what a correct engine converges to. One
   case in four runs its metamorphic twin too: the same program with every
   definition's `JOIN` clauses in a drawn order, which renumbers the
   positions and so changes the engine's `(position, key)` lock order but no
@@ -584,15 +586,18 @@ beside them run on every `cargo test`.
   plants whose only failure is a deadlock the engine retries). It gates the
   plants it catches in about one case in five or more:
   `join1_no_placeholder`, `join1_old_key_unlocked`, `join1_no_orphan_pass`,
-  `star_root_skip_j_last`, `star_root_skip_j_first`,
-  `star_root_skip_j_middle`, `star_chunk_skip_j_last` and
-  `star_chunk_skip_j_first`. The rest run as known misses, with their
-  measured rates in the tier's `STAR_KNOWN_MISSES`: among them the R-entry
-  rule's ablations, which fire in about 35 cases of 48 and are caught in
-  none, and the plants that need a Re-derive whose row moved after its read
-  or a fan-out chunk, which the tier doesn't fire. Their deterministic pins
-  gate all of them. The two-table tier leaves every plant that fires only
-  on a star to this one.
+  `join1_truncate_keeps_r`, `join1_m_before_j`, `star_root_skip_j_last`,
+  `star_root_skip_j_first`, `star_root_skip_j_middle`,
+  `star_chunk_skip_j_last` and `star_chunk_skip_j_first`. The rest run as
+  known misses, with their measured rates in the tier's
+  `STAR_KNOWN_MISSES`. Every `star_*` plant it runs fires, but the R-entry
+  rule's ablations, the late-key and re-check plants and the fan-out
+  chunk's are caught in a few cases of 48 at most: each needs two pages,
+  or a page and a source write, to meet inside a window of a few
+  milliseconds, which a deterministic pin holds open with a pause point and
+  the tier's timing only hits now and then. Their pins gate all of them.
+  The two-table tier leaves every plant that fires only on a star to this
+  one.
 - **Chained-reader convergence** (`tests/join_chained_convergence.rs`,
   ADR-0002 "Multi-hop"). A `JOIN`, aggregate or 1-1, one of whose sides is
   another definition's target in the same instance, so the target-mutation

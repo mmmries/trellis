@@ -239,7 +239,6 @@ async fn run_cell(cell: &Cell, kind: &str) {
 }
 
 async fn run(cell: Cell) {
-    let _serial = star::serial().await;
     for kind in ["", "LEFT"] {
         run_cell(&cell, kind).await;
     }

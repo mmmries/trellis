@@ -249,7 +249,8 @@ async fn another_version_taking_over_after_the_pre_check_refuses_the_write() {
     assert!(
         handover_pass_as(&pool, &config(&db).with_binary_version(OTHER), "other")
             .await
-            .expect("pass"),
+            .expect("pass")
+            .took_over,
         "the other version takes over: no process of this one is live"
     );
     refused_with(parked.release().await, ErrorCode::VersionHandover);
@@ -289,7 +290,7 @@ async fn a_takeover_pass_waits_for_a_call_holding_its_fence() {
     };
     parked.release().await.expect("the call commits first");
     assert!(
-        pass.await.expect("pass task").expect("pass"),
+        pass.await.expect("pass task").expect("pass").took_over,
         "then the other version takes over"
     );
     assert_eq!(status_of(&raw, "m_copy").await, "paused");

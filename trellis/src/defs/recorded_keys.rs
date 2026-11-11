@@ -948,12 +948,15 @@ pub(crate) async fn backfill_in(
         )
         .await?;
         if let Some((_, reason)) = &unkeyed
-            && super::lifecycle::pause_for_included_key(txn, id, &source, reason).await?
+            && super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], reason, None)
+                .await?
         {
             paused += 1;
         }
         for reason in deferrable_reasons(txn, &def, &source, &joined, &target).await? {
-            if super::lifecycle::pause_for_included_key(txn, id, &source, &reason).await? {
+            if super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
+                .await?
+            {
                 paused += 1;
             }
         }
@@ -993,7 +996,8 @@ pub(crate) async fn backfill_in(
             }
         }
         if let Some(reason) = reason
-            && super::lifecycle::pause_for_included_key(txn, id, &source, &reason).await?
+            && super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
+                .await?
         {
             paused += 1;
         }

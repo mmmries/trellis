@@ -450,33 +450,6 @@ fn an_aggregate_over_an_identity_cast_defines() {
     }
 }
 
-/// An identity cast of a constant is transparent to the constant checks:
-/// the overflow under it is refused, and a `CASE` condition over it decides
-/// the branch the planner keeps.
-#[test]
-fn an_identity_cast_is_transparent_to_constant_folding() {
-    assert!(matches!(
-        type_of("CAST(2147483647 AS integer) + 1"),
-        Err(ValidationError::ConstantOutOfRange { .. })
-    ));
-    assert!(matches!(
-        type_of("CASE WHEN CAST(1 AS integer) = 2 THEN 1 ELSE 2147483647 + 1 END"),
-        Err(ValidationError::ConstantOutOfRange { .. })
-    ));
-    assert_type(
-        "CASE WHEN CAST(1 AS integer) = 1 THEN 1 ELSE 2147483647 + 1 END",
-        I4,
-    );
-    assert_refused(
-        "CASE WHEN CAST(1.5 AS numeric) = 2 THEN 1.5 ELSE 1.0 / 0 END",
-        "zero",
-    );
-    assert_type(
-        "CASE WHEN CAST(1.5 AS numeric) = 1.5 THEN 1.5 ELSE 1.0 / 0 END",
-        N,
-    );
-}
-
 #[test]
 fn what_postgres_would_do_differently_is_refused_with_the_remedy() {
     assert_refused("i4 / i4", "CAST(<dividend> AS numeric)");
@@ -513,7 +486,7 @@ fn what_postgres_would_do_differently_is_refused_with_the_remedy() {
 }
 
 #[test]
-fn a_constant_zero_divisor_is_refused_however_it_is_spelled() {
+fn a_literal_zero_divisor_is_refused_however_it_is_spelled() {
     for text in [
         "n / 0",
         "n / 0.0",
@@ -524,19 +497,18 @@ fn a_constant_zero_divisor_is_refused_however_it_is_spelled() {
         "f8 / 0.0",
         "f4 / REAL '0'",
         "f8 / DOUBLE PRECISION '-0'",
-        "n / (1 - 1)",
-        "i8 % (2 - 2)",
-        "n / (0 * 5)",
-        "n / (4 % 2)",
         "n / -(0)",
         "i4 % CAST(0 AS bigint)",
         "1 % 0",
-        "n / COALESCE(0, 1)",
-        "-n / (3 - 3.0)",
+        // Written as a literal zero, the divisor is refused however the
+        // dividend reads.
+        "DOUBLE PRECISION 'NaN' / 0",
+        "(REAL 'NaN' + REAL '0') / -(REAL '0')",
     ] {
         assert_refused(text, "zero");
     }
-    // A nonzero or non-constant divisor is fine.
+    // A nonzero divisor, or one that is not written as a literal zero, is
+    // fine: a divisor that computes to zero fails its rows at run time.
     for text in [
         "n / 1",
         "n / -1",
@@ -545,79 +517,29 @@ fn a_constant_zero_divisor_is_refused_however_it_is_spelled() {
         "n / n",
         "n / (1 + 1)",
         "i4 % (i4 - i4)",
-        // Postgres divides a NaN by zero to NaN.
-        "DOUBLE PRECISION 'NaN' / 0",
-        "(REAL 'NaN' + REAL '0') / -(REAL '0')",
+        "n / (1 - 1)",
+        "i8 % (2 - 2)",
+        "n / (0 * 5)",
+        "n / (4 % 2)",
+        "n / COALESCE(0, 1)",
+        "-n / (3 - 3.0)",
     ] {
         assert!(type_of(text).is_ok(), "`{text}`: {:?}", type_of(text));
     }
 }
 
 #[test]
-fn a_constant_that_overflows_is_refused_like_the_sum() {
-    for text in [
-        "2147483647 + 1",
-        "2147483647 * 2",
-        "-2147483648 - 1",
-        "-(-2147483647 - 1)",
-        "ABS(-2147483648)",
-        "-2147483647 * 2",
-        "CAST(2147483647 AS bigint) * 4294967296 * 4294967296",
-        "9223372036854775807 + 1",
-        "-9223372036854775808 - 1",
-        "-(-9223372036854775807 - 1)",
-        "ABS(-9223372036854775807 - 1)",
-        "9223372036854775807 * 2",
-        "DOUBLE PRECISION '1e+308' * 10",
-        "DOUBLE PRECISION '1e+308' * DOUBLE PRECISION '10'",
-        "DOUBLE PRECISION '1e-200' * DOUBLE PRECISION '1e-200'",
-        "DOUBLE PRECISION '1e-300' / DOUBLE PRECISION '1e+300'",
-        "REAL '3e+38' * REAL '3'",
-        "-DOUBLE PRECISION '1.7976931348623157e+308' - DOUBLE PRECISION '1e+308'",
-        "f8 + (DOUBLE PRECISION '1e+308' * 10)",
-    ] {
-        assert_refused(text, "out of range");
-    }
-    // The same operations on data are not refused: they fail per row.
-    for text in [
-        "i4 + 2147483647",
-        "i4 * 2",
-        "-i4",
-        "ABS(i4)",
-        "i8 * i8",
-        "i2 * i2",
-    ] {
-        assert!(type_of(text).is_ok(), "`{text}`");
-    }
-    // Values that fit.
-    for text in [
-        "2147483647 - 1",
-        "-2147483648 + 1",
-        "-(-2147483647)",
-        "ABS(-2147483647)",
-        "46340 * 46340",
-        "DOUBLE PRECISION '1e+308' - DOUBLE PRECISION '1e+308'",
-        "DOUBLE PRECISION '0' * DOUBLE PRECISION '1e-300'",
-        "DOUBLE PRECISION '1' / DOUBLE PRECISION 'Infinity'",
-        "DOUBLE PRECISION 'Infinity' * DOUBLE PRECISION '0'",
-        "REAL '1e-30' * REAL '1'",
-    ] {
-        assert!(type_of(text).is_ok(), "`{text}`: {:?}", type_of(text));
-    }
-}
-
-#[test]
-fn constants_under_a_dropped_coalesce_branch_are_not_refused() {
-    // Postgres drops the arguments after a constant one unevaluated.
+fn constants_in_a_coalesce_are_not_evaluated() {
+    // Define evaluates no constant, wherever it sits.
     for text in [
         "COALESCE(5, 2147483647 * 2)",
-        "COALESCE(5, n / 0)",
         "COALESCE(1, -(-2147483647 - 1))",
+        "COALESCE(i4, 2147483647 * 2)",
     ] {
         assert!(type_of(text).is_ok(), "`{text}`: {:?}", type_of(text));
     }
-    // ... but one before the constant is planned.
-    assert_refused("COALESCE(i4, 2147483647 * 2)", "out of range");
+    // A literal zero divisor is refused wherever it is written.
+    assert_refused("COALESCE(5, n / 0)", "zero");
     assert_refused("COALESCE(i4, n / 0)", "zero");
 }
 

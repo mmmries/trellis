@@ -409,10 +409,10 @@ fn run_case_with(case: &JoinCase, drain_batch_cap: Option<usize>) -> Result<(), 
 /// and then, when it draws one, its metamorphic twin: the same program with
 /// every definition's `JOIN` clauses permuted, which must converge to its
 /// own oracle (the same rows: `join_star_tier.rs` checks the two oracles
-/// agree). The knobs' shares of stalled lock steps and re-derived pages
-/// await engine hooks that stall or re-derive a share of them; the case's
-/// commit stall bounds every page's.
+/// agree). The knobs' stalled lock steps, re-derived pages and fan-out
+/// chunk hold for both runs ([`StarKnobsGuard`]).
 fn run_star_case(case: &StarCase) -> Result<(), String> {
+    let _knobs = StarKnobsGuard::set(&case.knobs);
     let cap = Some(case.knobs.drain_batch_cap);
     run_case_with(&case.case, cap)?;
     if case.knobs.metamorphic {
@@ -428,6 +428,41 @@ fn run_star_case(case: &StarCase) -> Result<(), String> {
         })?;
     }
     Ok(())
+}
+
+/// Sets a star case's engine knobs (`trellis::dev::interleave`'s lock-step
+/// stall and re-derived share, the fan-out chunk and the split threshold)
+/// for as long as it lives. They are process-wide, like the commit stall:
+/// any other test running in this binary's threads meanwhile (another
+/// ignored property run in the same `--ignored` invocation) drains under
+/// them too. That changes its timing, not its verdict: each knob changes
+/// when things happen, or how a page reads, never what a correct engine
+/// writes. The planted-bug sweep runs each plant's cases in a process of
+/// its own, one test at a time, so its counts see only the star case's.
+struct StarKnobsGuard;
+
+impl StarKnobsGuard {
+    fn set(knobs: &generative::generate::join_one_to_one::StarKnobs) -> Self {
+        trellis::dev::interleave::set_lock_step_stall(
+            Some(knobs.lock_step_stall),
+            knobs.stalled_lock_steps_per_mille,
+        );
+        trellis::dev::interleave::set_rederived_pages(knobs.rederived_pages_per_mille);
+        trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows(
+            knobs.fan_out_chunk_rows.unwrap_or(0),
+        );
+        trellis::dev::staging::set_min_rows_to_split(knobs.split_rows.unwrap_or(0));
+        StarKnobsGuard
+    }
+}
+
+impl Drop for StarKnobsGuard {
+    fn drop(&mut self) {
+        trellis::dev::interleave::set_lock_step_stall(None, 0);
+        trellis::dev::interleave::set_rederived_pages(0);
+        trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows(0);
+        trellis::dev::staging::set_min_rows_to_split(0);
+    }
 }
 
 proptest! {
@@ -741,41 +776,51 @@ fn star_sweep_tier() -> SweepTier {
     )
 }
 
-/// The star tier's known misses, measured by its reach sweep (#1781: seeds 1
-/// to 4, twelve cases each, with the in-run invariant on; caught and fired
-/// in, of 48). Its deterministic pin, named in `trellis/src/plant.rs`, gates
-/// each. #1817 tracks raising the tier's reach on them.
+/// The star tier's known misses, measured by its reach sweep (seeds 1 to 4,
+/// twelve cases each, with the in-run invariant on; caught and fired in, of
+/// 48): every rate here on #1817's generator but the two-table plants' in
+/// the last item, which are #1781's, before #1817's knobs. Its
+/// deterministic pin, named in `trellis/src/plant.rs`, gates each. What the
+/// star plants among them need is one interleaving of two pages, or of a
+/// page and a source write, inside a window of a few milliseconds, which a
+/// pin's pause point holds open and the tier's timing only hits now and
+/// then.
 ///
 /// It gates the plants it catches in about one case in five or more (a
 /// 48-case sweep then misses each with probability below about 1e-4):
-/// `join1_no_placeholder` 48, `join1_old_key_unlocked` 40,
-/// `join1_no_orphan_pass` 20, `star_chunk_skip_j_last` 37,
-/// `star_chunk_skip_j_first` 37, `star_root_skip_j_last` 27,
-/// `star_root_skip_j_first` 27 and `star_root_skip_j_middle` 17.
+/// `join1_no_placeholder` 48, `join1_old_key_unlocked` 45,
+/// `join1_no_orphan_pass` 18, `join1_truncate_keeps_r` 17,
+/// `join1_m_before_j` 11, `star_chunk_skip_j_last` 40,
+/// `star_chunk_skip_j_first` 40, `star_root_skip_j_last` 38,
+/// `star_root_skip_j_first` 36 and `star_root_skip_j_middle` 30.
 ///
-/// - `join1_truncate_keeps_r`: caught 7, fired 22 (gated on the two-table
-///   tier; at this rate a 48-case sweep misses it about one time in 2,000).
-/// - `join1_truncate_no_rebuild`: caught 5, fired 36.
-/// - `join1_m_before_j`: caught 0, fired 48 (gated on the two-table tier,
-///   which catches it in 9, in its wide and racing key shapes with bursts of
-///   several hundred ops; the star tier draws only its narrow star key
-///   shape, in bursts of 30 to 150 ops).
-/// - `star_own_j_only`: caught 0, fired 36; `star_r_after_m`: caught 0,
-///   fired 34; `star_last_no_r`: caught 0, fired 34. The R-entry rule's
-///   ablations need a root key move and a joined write on its new key to
-///   race inside one page's locks, which the hot keys and mixed pages draw
-///   but don't yet catch.
-/// - `star_truncate_keeps_other_markers`: caught 0, fired 27 (a marker to
-///   keep needs a pending fan-out, and the tier's keys never hold that
-///   many rows).
-/// - `star_fence_first_only`: caught 0, fired 36 (a resume fires it; no
-///   page of a later position is in flight across it).
-/// - Never fired (0 of 48): `star_late_skip_last`, `star_late_skip_first`,
-///   `star_recheck_j` and `star_recheck_skip_last` need a Re-derive whose
-///   row moved after its read, or a joined page holding a key for a root
-///   item only, which wait for the re-derived-pages share
-///   (`StarKnobs::rederived_pages_per_mille`, which no engine hook applies yet); `star_chunk_no_r`
-///   needs a fan-out chunk, which no key of the tier is large enough for.
+/// - `join1_truncate_no_rebuild`: caught 4, fired 36.
+/// - `star_own_j_only`: caught 4, fired 40; `star_r_after_m`: caught 1,
+///   fired 40; `star_last_no_r`: caught 2, fired 40. The R-entry rule's
+///   ablations fail only when a joined page at one position starts its
+///   read-and-write of a root row's target inside another position's page's
+///   window between its `M` write and its commit. Split batches drain the
+///   two pages side by side and the stalls widen the window, but the two
+///   workers' pages meet in it only now and then; the in-run invariant
+///   catches the stale row when they do.
+/// - `star_truncate_keeps_other_markers`: caught 0, fired 37 (its pins
+///   keep a marker of another position pending across the truncate and
+///   then let its chunk run; in the tier the kept marker's chunk never
+///   left a wrong row by the check).
+/// - `star_chunk_no_r`: caught 0, fired 12 (a writer at another position
+///   on one of a chunk's batch rows must commit between the chunk's read of
+///   `M` and its write of the row).
+/// - `star_fence_first_only`: caught 0, fired 38 (a resume fires it; a page
+///   of a later position must hold its plan across the resume's fence
+///   bump).
+/// - `star_late_skip_last`: caught 2, fired 2; `star_late_skip_first`:
+///   caught 1, fired 3; `star_recheck_j`: caught 1, fired 2;
+///   `star_recheck_skip_last`: caught 0, fired 1. Caught almost whenever
+///   they fire, but they fire rarely: a re-derived row must move at the one
+///   position between the page's unlocked read and its lock (for the
+///   re-check plants, a joined row onto a key the page holds only for a
+///   root item), which the paced writes do within the re-derived page's
+///   stall only now and then.
 /// - The two-table tier's other known misses, each caught 0:
 ///   `join1_no_j_lock` (fired 48), `join1_brd_no_key` (48),
 ///   `join1_no_recheck` (48), `join1_vis_only` (48), `join1_chunk_no_key`
@@ -784,9 +829,7 @@ fn star_sweep_tier() -> SweepTier {
 ///   `join1_snapshot_after_read` (48), `join1_truncate_def_after_lock` (36),
 ///   `join1_truncate_keeps_m` (35) and `join1_truncate_share_lock` (35).
 const STAR_KNOWN_MISSES: &[&str] = &[
-    "join1_truncate_keeps_r",
     "join1_truncate_no_rebuild",
-    "join1_m_before_j",
     "star_own_j_only",
     "star_r_after_m",
     "star_last_no_r",
@@ -1037,6 +1080,7 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
             columns: i % 16,
             own_keys: [0; 3],
             on_key: false,
+            key_scope: None,
         });
     }
     let action = |kind, target| JoinActionDraw {

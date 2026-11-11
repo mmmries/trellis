@@ -268,14 +268,12 @@ pub(crate) const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearm
 /// The claim a drain worker holds on one chunk, which fences every target
 /// write the chunk makes.
 ///
-/// A chunk's write bypasses the target-mutation seam
-/// (`staging::target_mutations`), which is only safe while nothing reads the
-/// target: while its definition is still being built. A chunk a worker holds
-/// across a pause and a resume ([`STALE`]) would break that if its write
-/// could land once the resumed definition's rebuild has finished, since
-/// readers can attach from then on. A definition reading the target would
-/// never hear of that write: when the source change it carries drains, apply
-/// finds the target already current, and changes and stages nothing.
+/// A chunk a worker holds across a pause and a resume ([`STALE`]) belongs to
+/// the build the resume superseded: the resumed definition's rebuild
+/// enqueues fresh chunks and owns the target's way back to `live`. A write
+/// of the old chunk that landed after the rebuild finished would be one no
+/// build accounts for, made from a plan (the fields, the paused columns) the
+/// resume may have replaced.
 ///
 /// So every target write runs in a transaction that first [`hold`]s the
 /// claim: it takes a `for key share` lock on the chunk's row and checks that

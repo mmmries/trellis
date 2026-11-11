@@ -998,12 +998,17 @@ pub(crate) async fn apply_page(
 ) -> Result<(usize, usize), ApplyError> {
     let shape = &*plan.shape;
     // 1. Fold.
+    // Test-only: a share of pages re-derives. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    let forced = super::interleave::take_rederived_page();
+    #[cfg(not(any(test, feature = "test-util")))]
+    let forced = false;
     let predates = plan
         .a
         .iter()
         .chain(plan.b.iter().flatten())
         .any(|r| r.apply.is_some())
-        && super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?;
+        && (forced || super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?);
     let rederived: (Vec<Record>, Vec<Vec<Record>>) = if predates {
         (
             plan.a.iter().map(Record::rederive).collect(),
@@ -1128,6 +1133,12 @@ pub(crate) async fn apply_page(
         &shape.target,
     )
     .await?;
+    // Test-only: a re-derived page holds its unlocked read open. See
+    // `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    if forced {
+        super::interleave::rederive_stall().await;
+    }
 
     // 3. `J`, one sorted statement over every position's keys.
     let locked = root_skip_j(shape, &k, &root_k, &joined_k);
@@ -2098,8 +2109,8 @@ async fn check_held_keys(
     };
     // Test-only: a key that moves on every attempt. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
-    if side == Side::From && super::interleave::take_forced_join_key_move() {
-        super::interleave::note_join_key_moved();
+    if side == Side::From && super::interleave::take_forced_join_key_move(txn).await? {
+        super::interleave::note_join_key_moved(txn).await;
         return Err(ApplyError::JoinKeyMoved {
             target: shape.target.clone(),
         });
@@ -2115,7 +2126,7 @@ async fn check_held_keys(
             .any(|key| key_moved(shape, side, key, k, fan_k))
     {
         #[cfg(any(test, feature = "test-util"))]
-        super::interleave::note_join_key_moved();
+        super::interleave::note_join_key_moved(txn).await;
         return Err(ApplyError::JoinKeyMoved {
             target: shape.target.clone(),
         });
@@ -2180,7 +2191,7 @@ async fn rederive_read(
     #[cfg(not(any(test, feature = "test-util")))]
     let unchecked = false;
     if !unchecked {
-        check_read_keys(shape, side, &read.rows, k)?;
+        check_read_keys(txn, shape, side, &read.rows, k).await?;
     }
     // Planted bug: the basis is a snapshot taken one statement after the
     // read. See `crate::plant`.
@@ -2214,12 +2225,16 @@ async fn rederive_read(
 /// Checks that the join key of each live row of `side` a Re-derive read is
 /// in `k`. Define gives each `ON` pair one type and collation, so a `b`
 /// column's text is the text its `J` key has.
-fn check_read_keys(
+async fn check_read_keys(
+    txn: &Transaction<'_>,
     shape: &JoinShape,
     side: Side,
     rows: &HashMap<String, String>,
     (k, fan_k): (&PageKeys, &PageKeys),
 ) -> Result<(), ApplyError> {
+    // Read only to count a move, under test (`super::interleave`).
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = txn;
     let names = shape.side_key(side);
     for doc in rows.values() {
         let value: serde_json::Value =
@@ -2232,7 +2247,7 @@ fn check_read_keys(
             .collect();
         if key_moved(shape, side, &key, k, fan_k) {
             #[cfg(any(test, feature = "test-util"))]
-            super::interleave::note_join_key_moved();
+            super::interleave::note_join_key_moved(txn).await;
             return Err(ApplyError::JoinKeyMoved {
                 target: shape.target.clone(),
             });

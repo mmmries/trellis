@@ -51,13 +51,27 @@ stage, drain or change state side by side.
    ([ADR-0024](0024-compatibility-floors-and-rollback.md)),
    and succeeds, or refuses when the attach would write (a
    grammar-version pause, [ADR-0018](0018-grammar-versioning.md), or a changed
-   marker). A background process never migrates; `trellis run` migrates before
-   it starts its pipeline, and waits on the refusal.
+   marker). With migrations pending and nothing live, a background process
+   migrates: its pass runs `migrate`, the ordinary one (the identity and
+   attach checks, the catalog floor, the refusal of a changed migration or a
+   gap, the takeover work), and takes over in the same pass. `migrate` takes
+   the handover lock exclusive and decides again under it, so it never runs
+   beside a process that went live since the pass decided, and two processes
+   that find the migrations pending at once run them one after the other: the
+   second finds nothing left. When `migrate` refuses (the process's role
+   can't alter Trellis's tables, the history doesn't fit, the floor), the
+   process stands by, says why, and tries again a minute later (at the next
+   standby poll when the refusal was a fault, such as a lost connection). An
+   explicit `migrate` still works, before or instead of that (`trellis run`
+   migrates before it starts its pipeline, a deploy step, a release task): it
+   is idempotent, and leaves a background process nothing pending. A
+   define-only handle runs no background process, so nothing migrates for it
+   but its own `migrate`.
 4. **Standby.** While another version is live, or this binary's migrations are
-   pending, a background process stages nothing, drains nothing, dispatches no
-   builds and runs no `self_check` job. A leader releases the staging-worker
-   lock first. It checks again every standby poll and takes over as soon as
-   nothing holds it back. It waits rather than exiting, so an orchestrator
+   pending and it can't run them, a background process stages nothing, drains
+   nothing, dispatches no builds and runs no `self_check` job. A leader
+   releases the staging-worker lock first. It checks again every standby poll
+   and takes over as soon as nothing holds it back. It waits rather than exiting, so an orchestrator
    doesn't crash-loop it. Its pass runs under a per-instance advisory lock, so
    two processes starting at once decide in turn: the second sees the first,
    and a process that stands by holds no other version back, so two versions
@@ -85,8 +99,12 @@ stage, drain or change state side by side.
    the call.
 7. **Visible.** `status()` carries `version_handover` while another version is
    live, naming this binary's version and the other processes by worker id and
-   version. A background process logs when it starts standing by, why, and when
-   it takes over. A process killed without a clean shutdown leaves its row
+   version, and `migrations_pending` while this binary's migrations haven't
+   run, naming them and, when this handle's background process tried and was
+   refused, why; a read that can't read the catalog until they run refuses
+   with them (`version_handover`). A background process logs when it starts
+   standing by, why, and when it takes over, naming the migrations it ran
+   first. A process killed without a clean shutdown leaves its row
    live for up to the reclaim TTL, which delays the takeover by as much; the
    message says so.
 8. **Symmetric.** The rules hold for a rollback between two releases that both
@@ -106,8 +124,9 @@ Start the new version: its processes stand by, its state-changing calls refuse,
 and capture never stops (the triggers keep staging changes in the
 application's own transactions). Stop the old version: within one standby poll
 of its clean shutdown (or the reclaim TTL, for a process killed without one),
-the new version takes over, migrating first where its migrations are pending
-(`trellis run`, or an embedder's `migrate`).
+the new version takes over. Where its migrations are pending, one of its
+background processes runs them first, in the same pass; no deploy step has
+to.
 
 ## Rejected
 
@@ -134,7 +153,9 @@ the new version takes over, migrating first where its migrations are pending
 * During a cross-version deploy the new version does nothing until the old one
   is gone, and its `apply` changes refuse until then. A release that carries a
   migration can't have it run until every process of the old version has
-  stopped.
+  stopped; then the new version's background processes run it themselves.
+* A background process's role needs the rights `migrate` needs, or the
+  migrations wait for a role that has them to run `migrate`.
 * A stale row left by a killed process delays the takeover by up to the
   reclaim TTL.
 * Every state-changing call reads the registry and `pg_locks` before it

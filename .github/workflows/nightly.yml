@@ -75,10 +75,6 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
-    env:
-      # As in ci.yml: line tables keep file:line in backtraces without the
-      # multi-gigabyte cost of full debug info.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:

@@ -2,8 +2,9 @@
 //! rows pass one chunk leaves its key to chunks under a durable pending
 //! marker (`join1_fan_out`), each one transaction under the key's `J` lock.
 //!
-//! The chunk is shrunk to two rows (`set_one_to_one_join_fan_out_chunk_rows`)
-//! over a key of seven `a` rows, and the pages and chunks are driven by hand
+//! The chunk is shrunk to two rows, on each test's own database
+//! (`Driver::set_fan_out_chunk_rows`), over a key of seven `a` rows, and the
+//! pages and chunks are driven by hand
 //! (`support/drain_driver.rs`): a chunk frozen at a [`PausePoint`] while a page
 //! queues behind it (asserted with `pg_blocking_pids`) or while its session
 //! is ended. Nothing sleeps or polls for convergence. Each scenario runs on
@@ -33,7 +34,6 @@ mod drain_driver;
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
-use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::interleave::PausePoint;
@@ -55,26 +55,6 @@ const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty')";
 
 /// The chunk these tests run with.
 const CHUNK: usize = 2;
-
-/// The chunk is process-wide, so these tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Holds the serial lock with the chunk at [`CHUNK`], and puts it back.
-struct Chunked {
-    _serial: tokio::sync::MutexGuard<'static, ()>,
-}
-
-impl Drop for Chunked {
-    fn drop(&mut self) {
-        set_one_to_one_join_fan_out_chunk_rows(0);
-    }
-}
-
-async fn chunked() -> Chunked {
-    let serial = SERIAL.lock().await;
-    set_one_to_one_join_fan_out_chunk_rows(CHUNK);
-    Chunked { _serial: serial }
-}
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -110,7 +90,7 @@ impl Kind {
 
 /// `kind` over `a_rows` and `b_rows`, built and live, `a` and `b` captured.
 async fn start_with(kind: Kind, a_rows: &str, b_rows: &str) -> Driver {
-    Driver::start(
+    let d = Driver::start(
         &format!(
             "{DDL}; insert into public.a values {a_rows}; insert into public.b values {b_rows}"
         ),
@@ -128,7 +108,9 @@ async fn start_with(kind: Kind, a_rows: &str, b_rows: &str) -> Driver {
         )],
         &["public.a", "public.b"],
     )
-    .await
+    .await;
+    d.set_fan_out_chunk_rows(CHUNK);
+    d
 }
 
 async fn start(kind: Kind) -> Driver {
@@ -262,7 +244,6 @@ async fn frozen_chunk(
 /// marker and the token converges.
 #[tokio::test]
 async fn a_b_change_past_one_chunk_commits_its_page_and_finishes_in_chunks() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(
@@ -319,7 +300,6 @@ async fn a_b_change_past_one_chunk_commits_its_page_and_finishes_in_chunks() {
 /// that recomputes a pending key whole drops its marker.
 #[tokio::test]
 async fn a_page_recomputes_the_keys_that_fit_one_chunk_itself() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         // Key 20 (one row) fits; key 10 (seven) doesn't.
@@ -361,7 +341,6 @@ async fn a_page_recomputes_the_keys_that_fit_one_chunk_itself() {
 /// were. The next chunk recomputes those rows again, from the cursor.
 #[tokio::test]
 async fn a_chunk_killed_mid_way_changes_nothing_and_the_next_resumes_from_its_cursor() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -394,7 +373,6 @@ async fn a_chunk_killed_mid_way_changes_nothing_and_the_next_resumes_from_its_cu
 /// target row, so the writer queues on `J`, not on a row the chunk wrote.
 #[tokio::test]
 async fn an_a_writer_on_a_pending_key_waits_for_one_chunk_at_most() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -437,7 +415,6 @@ async fn an_a_writer_on_a_pending_key_waits_for_one_chunk_at_most() {
 /// writes its own rows from `M` as it is, and the chunks the rest.
 #[tokio::test]
 async fn a_changes_on_a_half_done_key_are_exact() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -460,7 +437,6 @@ async fn a_changes_on_a_half_done_key_are_exact() {
 /// cursor joined the first change, and every row must join the second.
 #[tokio::test]
 async fn a_second_b_change_on_a_pending_key_resets_its_cursor() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -490,7 +466,6 @@ async fn a_second_b_change_on_a_pending_key_resets_its_cursor() {
 /// `J` row, then resets the cursor that chunk advanced.
 #[tokio::test]
 async fn a_b_page_queued_behind_a_chunk_resets_the_cursor_it_advanced() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -517,7 +492,6 @@ async fn a_b_page_queued_behind_a_chunk_resets_the_cursor_it_advanced() {
 /// which recomputes every row; one of `a` drops them and empties the target.
 #[tokio::test]
 async fn a_truncate_of_either_side_drops_the_pending_fan_outs() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -556,7 +530,6 @@ async fn trellis(d: &Driver) -> Trellis {
 /// follows recomputes every row.
 #[tokio::test]
 async fn a_resume_drops_the_pending_fan_outs_and_rebuilds() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -593,7 +566,6 @@ async fn a_resume_drops_the_pending_fan_outs_and_rebuilds() {
 /// advances: the row's target row stays as it was.
 #[tokio::test]
 async fn a_row_a_chunk_fails_on_is_held_with_the_markers_origin() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         // Row 3's `x + w` overflows `integer` once `w` is 1000.
         let a_rows = A_ROWS.replace("(3, 10, 3, 'three')", "(3, 10, 2147483000, 'three')");
@@ -631,7 +603,6 @@ async fn a_row_a_chunk_fails_on_is_held_with_the_markers_origin() {
 #[tokio::test]
 async fn self_check_does_not_vouch_for_a_target_with_a_pending_fan_out() {
     use trellis::staging::self_check::{SelfCheckScope, compare_page};
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -677,7 +648,6 @@ async fn self_check_does_not_vouch_for_a_target_with_a_pending_fan_out() {
 #[tokio::test]
 async fn self_check_reads_a_pending_fan_out_as_not_caught_up() {
     use trellis::staging::self_check::{SelfCheckOutcome, SelfCheckScope, check_page};
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -716,7 +686,6 @@ async fn self_check_reads_a_pending_fan_out_as_not_caught_up() {
 #[tokio::test]
 async fn the_hidden_snapshot_under_a_pending_fan_out_is_exact_up_to_its_cursor() {
     use trellis::staging::one_to_one_join_snapshot::hidden_snapshot;
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(

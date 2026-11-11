@@ -14,7 +14,6 @@ mod drain_driver;
 use drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
-use trellis::dev::defs::set_one_to_one_join_fan_out_warning_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::{JoinBuildStep, JoinStatus, OneToOneBuildStep, Trellis, TrellisOptions};
@@ -38,9 +37,6 @@ const SEED: &str = "insert into public.a \
 
 const DEFINITION: &str = "TRANSFORM jl FROM public.a LEFT JOIN public.b ON a.k = b.k \
                           SELECT a.r + COALESCE(b.img, 0) AS total, b.k0 AS k0";
-
-/// The warning threshold is process-wide.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn columns() -> Vec<(&'static str, ValueType)> {
     vec![
@@ -123,7 +119,6 @@ fn rows(status: &JoinStatus) -> Vec<(&'static str, i64)> {
 
 #[tokio::test]
 async fn status_reports_the_sizes_of_r_m_and_j() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(true).await;
     analyze(&d).await;
     let status = join_status(&d).await;
@@ -192,7 +187,6 @@ async fn warned(d: &Driver) -> Option<(String, i64, i64)> {
 
 #[tokio::test]
 async fn a_default_threshold_warns_of_nothing_in_a_small_table() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     let status = trellis(&d)
         .await
@@ -205,12 +199,11 @@ async fn a_default_threshold_warns_of_nothing_in_a_small_table() {
 
 #[tokio::test]
 async fn status_warns_of_a_join_key_with_more_a_rows_than_the_threshold() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(true).await;
     // The largest group holds 3 rows (keys 20 and 40).
-    set_one_to_one_join_fan_out_warning_rows(3);
+    d.set_fan_out_warning_rows(3);
     assert_eq!(warned(&d).await, None, "3 is not past 3");
-    set_one_to_one_join_fan_out_warning_rows(2);
+    d.set_fan_out_warning_rows(2);
     let warning = warning(&d).await.expect("keys 20 and 40 hold 3 rows");
     assert_eq!((warning.rows, warning.threshold), (3, 2));
     assert!(warning.key == "20" || warning.key == "40", "{warning:?}");
@@ -222,14 +215,14 @@ async fn status_warns_of_a_join_key_with_more_a_rows_than_the_threshold() {
     )
     .await;
     assert_eq!(warned(&d).await, Some(("30".to_string(), 6, 2)));
-    set_one_to_one_join_fan_out_warning_rows(5);
+    d.set_fan_out_warning_rows(5);
     assert_eq!(warned(&d).await, Some(("30".to_string(), 6, 5)));
-    set_one_to_one_join_fan_out_warning_rows(6);
+    d.set_fan_out_warning_rows(6);
     assert_eq!(warned(&d).await, None, "6 is not past 6");
 
     // Rows deleted are tombstones in `R`, and a tombstone is not a row on the
     // key; a row with a `NULL` key is on none.
-    set_one_to_one_join_fan_out_warning_rows(3);
+    d.set_fan_out_warning_rows(3);
     step(&mut d, "delete from public.a where id like 'x%'").await;
     assert_eq!(warned(&d).await, None);
     step(
@@ -238,13 +231,11 @@ async fn status_warns_of_a_join_key_with_more_a_rows_than_the_threshold() {
     )
     .await;
     assert_eq!(warned(&d).await, None);
-    set_one_to_one_join_fan_out_warning_rows(0);
 }
 
 /// The join key of a composite `ON` is named by all its columns.
 #[tokio::test]
 async fn a_composite_join_key_is_named_by_all_its_columns() {
-    let _serial = SERIAL.lock().await;
     let d = Driver::start(
         "create table public.a (id integer primary key, k integer, m text); \
          create table public.b (id integer primary key, k integer, m text, w integer); \
@@ -262,13 +253,12 @@ async fn a_composite_join_key_is_named_by_all_its_columns() {
         &["public.a", "public.b"],
     )
     .await;
-    set_one_to_one_join_fan_out_warning_rows(2);
+    d.set_fan_out_warning_rows(2);
     let warning = warning(&d).await.expect("3 rows on (1, x)");
     assert_eq!(
         (warning.key.as_str(), warning.rows, warning.threshold),
         ("1,x", 3, 2)
     );
-    set_one_to_one_join_fan_out_warning_rows(0);
 }
 
 // ----------------------------------------------------------- the build's step
@@ -300,7 +290,6 @@ async fn building(d: &Driver) -> Option<OneToOneBuildStep> {
 /// nothing once it is `live`.
 #[tokio::test]
 async fn status_names_each_step_of_a_fresh_build() {
-    let _serial = SERIAL.lock().await;
     let d = start(false).await;
     assert_eq!(
         building(&d).await,
@@ -328,7 +317,6 @@ async fn status_names_each_step_of_a_fresh_build() {
 /// The stages of the plan job's `M` pass, by the cursor it stores.
 #[tokio::test]
 async fn status_names_the_stage_of_a_plan_job_by_its_cursor() {
-    let _serial = SERIAL.lock().await;
     let d = start(false).await;
     for (cursor, step) in [
         (None, OneToOneBuildStep::JoinedRows { position: 1 }),
@@ -367,7 +355,6 @@ async fn status_names_the_stage_of_a_plan_job_by_its_cursor() {
 /// paused reports no step.
 #[tokio::test]
 async fn status_names_the_steps_of_a_rebuild_and_its_sweep() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(true).await;
     d.retire().await;
     trellis(&d)
@@ -436,7 +423,6 @@ async fn status_names_the_steps_of_a_rebuild_and_its_sweep() {
 /// the test doesn't build 300k rows.)
 #[tokio::test]
 async fn a_sampled_r_still_finds_the_large_group_and_counts_it_exactly() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     let id: i64 = d
         .ctl
@@ -471,10 +457,9 @@ async fn a_sampled_r_still_finds_the_large_group_and_counts_it_exactly() {
         pages > 2000,
         "R has {pages} pages: the sample is a share of it"
     );
-    set_one_to_one_join_fan_out_warning_rows(50_000);
+    d.set_fan_out_warning_rows(50_000);
     assert_eq!(warned(&d).await, Some(("55".to_string(), 200_000, 50_000)));
     // A threshold above the group's size warns of nothing.
-    set_one_to_one_join_fan_out_warning_rows(200_000);
+    d.set_fan_out_warning_rows(200_000);
     assert_eq!(warned(&d).await, None);
-    set_one_to_one_join_fan_out_warning_rows(0);
 }

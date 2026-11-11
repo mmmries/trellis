@@ -52,10 +52,6 @@ const SEED: &str = "insert into public.a \
                     insert into public.b select i, i * 10, i * 100, 'k' || i \
                         from generate_series(1, 6) i";
 
-/// The forced key moves and the retry counters are process-wide, so these
-/// tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
     Left,
@@ -339,7 +335,6 @@ async fn trellis(d: &Driver) -> Trellis {
 /// the live join. A fresh build over an empty target gets no sweep.
 #[tokio::test]
 async fn a_build_of_several_chunks_fills_the_target_r_and_m() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(&KINDS, false).await;
     assert_eq!(
         pending(&d, &["sweep"]).await,
@@ -388,7 +383,6 @@ async fn a_build_of_several_chunks_fills_the_target_r_and_m() {
 /// once the chunk commits (#1375's C families: a chunk first).
 #[tokio::test]
 async fn c_a_page_on_a_chunks_key_queues_behind_the_chunk() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         assert_eq!(build_step(d.pool(), "planner", 100).await, Step::Planned);
@@ -416,7 +410,6 @@ async fn c_a_page_on_a_chunks_key_queues_behind_the_chunk() {
 /// never holds up the drain behind it (#1375's C families: a page first).
 #[tokio::test]
 async fn c_a_chunk_on_a_pages_key_gives_up_and_retries() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         assert_eq!(build_step(d.pool(), "planner", 100).await, Step::Planned);
@@ -461,7 +454,6 @@ async fn c_a_chunk_on_a_pages_key_gives_up_and_retries() {
 /// failure recorded: a chunk, an `M` pass batch and a sweep batch.
 #[tokio::test]
 async fn a_jobs_update_of_its_own_row_waits_out_its_heartbeat() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let target = kind.target();
 
@@ -580,7 +572,6 @@ async fn assert_no_failure(d: &Driver, kind: &str, step: &str) {
 /// whichever chunks had run.
 #[tokio::test]
 async fn a_truncate_of_b_in_the_middle_of_a_build_is_rebuilt() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
@@ -606,7 +597,6 @@ async fn a_truncate_of_b_in_the_middle_of_a_build_is_rebuilt() {
 /// chunk's rows are rebuilt after.
 #[tokio::test]
 async fn a_truncate_of_b_queues_behind_a_chunk_in_flight() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         assert_eq!(build_step(d.pool(), "planner", 100).await, Step::Planned);
@@ -640,7 +630,6 @@ async fn a_truncate_of_b_queues_behind_a_chunk_in_flight() {
 /// its fan-out doesn't see it, and the chunk's row keeps no match.
 #[tokio::test]
 async fn c10_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_retries() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         // No `b` row on 70 yet: the build's `M` pass reads none.
@@ -651,7 +640,7 @@ async fn c10_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_retries() {
         write(&d, "insert into public.b values (7, 70, 700, 'k7')").await;
         let insert = d.seal().await;
         let target = kind.target();
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut chunk = d
             .run_frozen(
                 &[
@@ -673,7 +662,7 @@ async fn c10_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_retries() {
         chunk.finish_result().await.expect("the chunk's build step");
         if frozen.is_none() {
             assert!(
-                trellis::dev::interleave::join_key_moves() > moves,
+                d.join_key_moves() > moves,
                 "the chunk rolled back on the moved key"
             );
         }
@@ -736,7 +725,6 @@ async fn rebuild_planned(d: &mut Driver) {
 /// row keeps no match.
 #[tokio::test]
 async fn c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retries() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         rebuild_planned(&mut d).await;
@@ -745,7 +733,7 @@ async fn c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retrie
         write(&d, "insert into public.b values (7, 70, 700, 'k7')").await;
         let insert = d.seal().await;
         let target = kind.target();
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut chunk = d
             .run_frozen(
                 &[
@@ -766,7 +754,7 @@ async fn c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retrie
         chunk.finish_result().await.expect("the chunk's build step");
         if frozen.is_none() {
             assert!(
-                trellis::dev::interleave::join_key_moves() > moves,
+                d.join_key_moves() > moves,
                 "the chunk rolled back on the moved key"
             );
         }
@@ -788,7 +776,6 @@ async fn c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retrie
 /// retry's outcome, not the plant.
 #[tokio::test]
 async fn c10_a_chunk_whose_entry_moved_off_its_key_set_retries() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         rebuild_planned(&mut d).await;
@@ -804,7 +791,7 @@ async fn c10_a_chunk_whose_entry_moved_off_its_key_set_retries() {
         let insert = d.seal().await;
         write(&d, "update public.a set k = 10 where id = 'a01'").await;
         let target = kind.target();
-        let moves = trellis::dev::interleave::join_key_moves();
+        let moves = d.join_key_moves();
         let mut chunk = d
             .run_frozen(
                 &[
@@ -850,7 +837,7 @@ async fn c10_a_chunk_whose_entry_moved_off_its_key_set_retries() {
         page.finish().await;
         if frozen.is_none() {
             assert!(
-                trellis::dev::interleave::join_key_moves() > moves,
+                d.join_key_moves() > moves,
                 "the chunk rolled back on the moved entry"
             );
         }
@@ -866,7 +853,6 @@ async fn c10_a_chunk_whose_entry_moved_off_its_key_set_retries() {
 /// other row is built.
 #[tokio::test]
 async fn a_row_whose_field_fails_is_quarantined_and_the_build_goes_on() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let d = start(&[kind], false).await;
         // `a02` is on key 20, whose `b` row adds 200: past `integer`.
@@ -939,7 +925,6 @@ async fn change_while_paused(d: &mut Driver, kinds: &[Kind], sql: &str) {
 /// all). Planted `join1_no_orphan_pass` leaves them in the target.
 #[tokio::test]
 async fn h1_a_resume_removes_the_rows_of_a_rows_deleted_while_paused() {
-    let _serial = SERIAL.lock().await;
     for (case, sql) in [
         (
             "mixed",
@@ -966,7 +951,6 @@ async fn h1_a_resume_removes_the_rows_of_a_rows_deleted_while_paused() {
 /// deletes the orphans' rows by statement, and the re-inserted row is lost.
 #[tokio::test]
 async fn h3_a_row_reinserted_after_the_orphan_read_is_kept() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         change_while_paused(&mut d, &[kind], "delete from public.a where id = 'a03'").await;
@@ -1002,7 +986,6 @@ async fn h3_a_row_reinserted_after_the_orphan_read_is_kept() {
 /// waits for the lock row: a deadlock.
 #[tokio::test]
 async fn a_truncate_of_a_runs_past_the_sweeps_orphan_read() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         change_while_paused(&mut d, &[kind], "delete from public.a where id = 'a03'").await;
@@ -1041,7 +1024,6 @@ async fn a_truncate_of_a_runs_past_the_sweeps_orphan_read() {
 /// `M`, and row 2's entry stays live.
 #[tokio::test]
 async fn the_m_pass_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         write_uncaptured(
@@ -1093,7 +1075,6 @@ async fn the_m_pass_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild() {
 /// version, and the build ends as the live join.
 #[tokio::test]
 async fn a_plan_job_that_fails_in_its_m_pass_resumes_from_its_cursor() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         write(&d, "update public.a set r = 55 where id = 'a03'").await;
@@ -1211,7 +1192,6 @@ async fn m_versions(d: &Driver, kind: Kind) -> Vec<String> {
 /// join.
 #[tokio::test]
 async fn a_plan_job_that_fails_in_its_walk_of_m_resumes_from_its_cursor() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         write_uncaptured(&d, "public.b", "delete from public.b where bid = 3").await;
@@ -1279,7 +1259,6 @@ async fn a_plan_job_that_fails_in_its_walk_of_m_resumes_from_its_cursor() {
 /// every `M` entry keeps its version, and the build ends as the live join.
 #[tokio::test]
 async fn a_plan_job_killed_after_its_m_pass_resumes_at_the_walk_of_a() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         let target = kind.target();
@@ -1336,7 +1315,6 @@ async fn a_plan_job_killed_after_its_m_pass_resumes_at_the_walk_of_a() {
 /// re-read, loses row 1.
 #[tokio::test]
 async fn a_b_row_reinserted_after_the_walk_of_ms_probe_stays_live() {
-    let _serial = SERIAL.lock().await;
     for (case, row, rolled_back) in [
         ("same key", "(1, 10, 100, 'k1')", false),
         ("moved key", "(2, 70, 200, 'k2')", true),
@@ -1405,7 +1383,6 @@ async fn a_b_row_reinserted_after_the_walk_of_ms_probe_stays_live() {
 /// in the #1375 model; this pins that the start queues.)
 #[tokio::test]
 async fn a_rebuild_start_waits_for_the_page_in_flight_on_its_lock_row() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         write(&d, "update public.a set r = 77 where id = 'a04'").await;
@@ -1438,7 +1415,6 @@ async fn a_rebuild_start_waits_for_the_page_in_flight_on_its_lock_row() {
 /// breaks the deadlock by failing one of them.
 #[tokio::test]
 async fn a_rebuild_of_two_joins_takes_their_lock_rows_in_a_pages_order() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(&KINDS, true).await;
     write(&d, "update public.a set r = 77 where id = 'a04'").await;
     let batch = d.seal().await;
@@ -1468,7 +1444,6 @@ async fn a_rebuild_of_two_joins_takes_their_lock_rows_in_a_pages_order() {
 /// orphan pass removes the deleted row's.
 #[tokio::test]
 async fn a_resume_after_changes_of_both_sides_while_paused_rebuilds_the_join() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(&KINDS, true).await;
     change_while_paused(
         &mut d,
@@ -1491,7 +1466,6 @@ async fn a_resume_after_changes_of_both_sides_while_paused_rebuilds_the_join() {
 /// other row does.
 #[tokio::test]
 async fn a_sweep_killed_in_its_orphan_pass_resumes_from_its_cursor() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind], true).await;
         change_while_paused(

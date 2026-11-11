@@ -16,9 +16,11 @@
 //! - [`liveness`] is stage 04's claim-liveness half: the
 //!   out-of-band heartbeat daemon, release-on-error, reclaim-on-TTL, and
 //!   the consecutive-fence-miss backoff.
-//! - [`apply`] is stage 05's apply ∪ mark-drained, 1-1/scalar
-//!   subset only: the three-phase drain (claim, then fold, compute, apply ∪
-//!   mark-drained per page), the version fence, and downstream propagation.
+//! - [`apply`] is stage 05's apply ∪ mark-drained: the three-phase drain
+//!   (claim, then fold, compute, apply ∪ mark-drained per page), the version
+//!   fence, and downstream propagation. A page's 1-1 targets settle on
+//!   `one_to_one_ledger`, its aggregates on `group_basis`, and its `JOIN`
+//!   and 1-1 `JOIN` targets in `join` and `join_one_to_one`.
 //! - [`page`] is where an oversized share's pages come from:
 //!   the page-source interface and the `drain_cursor` read-back.
 //! - [`schema_change`] is the drain's barrier for a capture function's
@@ -45,9 +47,8 @@
 //!   functions and privileges it runs first.
 //! - [`error`] is this module's error type.
 //!
-//! What this module does *not* do: delta arithmetic for aggregate
-//! transforms (blocked on aggregate transform-defs), or capture (stage 01,
-//! [`crate::capture`]) — see
+//! What this module does *not* do: capture (stage 01, [`crate::capture`]) —
+//! see
 //! docs/staging-and-claiming/02-the-staging-ring.md,
 //! docs/staging-and-claiming/03-sealing-and-the-fence.md,
 //! docs/staging-and-claiming/04-claiming-and-the-fold.md, and

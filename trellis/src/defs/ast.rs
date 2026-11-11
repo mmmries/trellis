@@ -535,22 +535,6 @@ impl Expr {
         }
     }
 
-    /// [`Expr::logic_children`], mutably.
-    pub fn logic_children_mut(&mut self) -> Vec<&mut Expr> {
-        match self {
-            Expr::Not(operand) | Expr::IsNull { expr: operand, .. } => vec![operand],
-            Expr::Case {
-                branches,
-                otherwise,
-            } => branches
-                .iter_mut()
-                .flat_map(|(condition, result)| [condition, result])
-                .chain(otherwise.as_deref_mut())
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
     /// Rebuilds a [`Expr::Not`], [`Expr::IsNull`] or [`Expr::Case`] node with
     /// `f` applied to each direct subexpression (the same order as
     /// [`Expr::logic_children`]); `None` for any other node.

@@ -11,9 +11,9 @@ guarantee. Each item links to the document that argues for it.
 |---|---|
 | A change is staged in the transaction that makes it | `AFTER … FOR EACH STATEMENT` triggers with transition tables |
 | The staging area is append-only on the hot path | a *ring* of N tables, `TRUNCATE` as the retirement primitive |
-| Batches are cut in visibility space, with a published, write-once fence | `txid_current()` defaults and `txid_snapshot` columns |
-| A batch is immutable once sealed; every producer writes to the active batch | four producers, two of them SQL-side |
-| Claim exclusivity comes from a unique constraint, not a lock | bucket count, share formula, `hashtext` routing |
+| Batches are cut in visibility space, with a published, write-once fence | `pg_current_xact_id()` defaults and `pg_snapshot` columns |
+| A batch is immutable once sealed; every producer writes to the active batch | [producers](02-the-staging-ring.md#the-producers) in two languages: capture triggers in SQL, the rest through one Rust append |
+| Claim exclusivity comes from a unique constraint, not a lock | bucket count, share formula, `hashtextextended` routing |
 | Apply ∪ mark-complete are one transaction | the bit-mask coverage of buckets |
 | Merging happens at read time, under four fixed rules | ordered `array_agg` arg-extremes |
 | Pending work is measured by asking storage, never a boundary aggregate | index + hand-written `ANALYZE` on statistics-free tables |
@@ -29,7 +29,7 @@ guarantee. Each item links to the document that argues for it.
 - **The staging tables and the *target* tables share a transaction** — same
       database — what makes exactly-once for non-idempotent effects possible.
       → [05](05-apply-and-exactly-once-deltas.md)
-- **The fence is a store-assigned per-row writer identity (`txid_current()`)
+- **The fence is a store-assigned per-row writer identity (`pg_current_xact_id()`)
       plus an inspectable transaction snapshot.**
       → [03](03-sealing-and-the-fence.md)
 - **Enumerate which measures are invertible.** Everything else goes on a

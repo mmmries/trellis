@@ -65,9 +65,11 @@ Two downstream effects:
 ### 4. Transform status storage: no new field
 
 **Decision:** transform lifecycle status stays in the one status field of the
-transform's definition — the `TransformStatus` enum
-(`WaitingToBackfill | Backfilling | CatchingUp | Live | Quarantined | Paused`),
-persisted as text and check-constrained.
+transform's definition, persisted as text and check-constrained to the
+`StoredStatus` words (`waiting_to_backfill | backfilling | live | quarantined |
+paused`). The reported `TransformStatus` adds `CatchingUp`, which is derived
+when status is read (a `live` definition reading an upstream that isn't `live`)
+and never stored.
 
 Quarantine and the backfill lifecycle are two arcs of one state machine on that one
 field: `Quarantined` is the value [ADR-0003](0003-quarantine-storage-and-api.md)'s

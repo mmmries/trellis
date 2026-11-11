@@ -23,12 +23,14 @@ the ways a target can go wrong without a stop, and names the repair for each.
 | `paused`, with a `capture_failure` reading "resuming: …" | A `RESUME` is re-typing copies, waiting for an upstream to go `live`, or waiting for the changes staged before an enum relabel, or a re-type to another enum, to drain | Wait. A `PAUSE` withdraws the resume |
 | `paused`, with a `capture_failure` reading "the cause it was paused for is gone" | Every reason it was paused for was fixed while it stayed paused (a column renamed back, a primary key put back); the staging worker never resumes it on its own ([transform status](observability.md#transform-status-lifecycle)) | `RESUME`, which does what the message's "RESUME would …" says, as the schema stands when it runs |
 | `quarantined` | Too many of its keys failed to apply, so the whole-definition fuse tripped | Fix the cause `sample_quarantined` shows, then `RESUME` |
+| A column `paused`, with a `last_error`, in `Trellis::quarantined()` (`quarantine_status("<target>.<column>")`, the `trellis.column_status` table) on a `live` definition | One field failed for too many rows (Postgres couldn't compute it: an overflow, a division by zero, a constant Postgres fails while planning), so its column fuse tripped. Rows already written keep their last value of it, new rows get `NULL` for it, and its other fields keep updating | Fix the cause `sample_quarantined("<target>.<column>")` shows, then `RESUME TRANSFORM <target>.<column>`, which rebuilds that column |
 | `held_keys` | Keys that keep failing to apply are held, with their target rows frozen | Fix the cause, then [release them](#releasing-held-keys) |
 | `drain_failure` | A page that fails in a way no key can be charged for is held back, and every watermark taken since waits on it | Fix what the error names; the next pass commits the page ([A page that fails only for several definitions together](#a-page-that-fails-only-for-several-definitions-together)) |
 | `backfill_failure` | A build or correction chunk keeps failing | Fix what the error names; it retries |
 | `capture_wait` | Installing or widening capture is waiting for a table lock | Wait for the lock holder it names |
 | A `self_check` report with divergences | The target differs from a recompute of it | Find the gap in [known correctness gaps](known-correctness-gaps.md) and use its repair |
 | `version_handover`, and state-changing calls refused with the `version_handover` code | A Trellis process of another version is live on the instance: this version's background processes stand by and its changes refuse ([version handover](decisions/0023-version-handover.md)) | Stop the other version's processes; this version takes over within a standby poll (5 seconds), or the reclaim TTL (30 seconds) after a process killed without a clean shutdown ([rolling deploys](embedding.md#rolling-deploys)) |
+| `migrations_pending` with `cannot_run`, or `status()` refused with the `version_handover` code naming pending migrations | This version's migrations haven't run: a process of another version is still live, or this process's `migrate` was refused (`cannot_run` says why, often a role that can't alter Trellis's tables). Its background processes stand by, checking every 5 seconds, and try a refused `migrate` again a minute later | Stop the other version's processes; for a refusal, fix its cause or run `migrate` with a role that can ([upgrading](upgrading.md#upgrading)) |
 | `below_catalog_floor`, and `migrate` and state-changing calls refused with the `version_floor` code | The catalog floor, the oldest Trellis version that can read the catalog, is above this version: a later release migrated the database ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). This version's background processes stand by meanwhile | Run the version the message names, or a later one ([the catalog floor](upgrading.md#the-catalog-floor)) |
 
 ## Repair tools
@@ -364,9 +366,10 @@ each one costs and what to expect around it
 
 * **Upgrading or rolling back Trellis:** follow
   [upgrading and rolling back](upgrading.md). In short, start the new version
-  beside the old (it stands by, and `status()` shows `version_handover`), stop
-  the old, and migrate (`trellis run` does it by itself; an embedder runs
-  `migrate` after the old version has stopped). Before rolling back, drop,
+  beside the old (it stands by, and `status()` shows `version_handover`), and
+  stop the old: the new version runs its migrations itself and takes over (a
+  worker whose role can't alter Trellis's tables stands by until another role
+  runs `migrate`, and `status()` shows why in `migrations_pending`). Before rolling back, drop,
   under the newer release, each definition whose `floor` is above the release
   you roll back to; the older release pauses any you leave, and only a
   release that meets the floor resumes or drops them

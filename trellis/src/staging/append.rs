@@ -94,8 +94,8 @@ pub const NODE_TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-node-truncate";
 /// One raw change to append into the active ring segment.
 ///
 /// `old_image`/`new_image` are raw JSON text (serialized by the caller):
-/// the trellis crate has no JSON dependency, and tokio-postgres's
-/// `serde_json::Value` feature isn't enabled here. The text is bound with an
+/// tokio-postgres's `with-serde_json-1` feature isn't enabled, so the driver
+/// has no `ToSql` for a `serde_json::Value`. The text is bound with an
 /// explicit `::text::jsonb` cast so a malformed payload fails on the insert
 /// rather than being mis-typed. The intermediate `::text` matters: Postgres
 /// infers a placeholder's type from its immediate cast, so `$n::jsonb` alone

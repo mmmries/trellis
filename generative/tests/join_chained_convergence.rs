@@ -576,6 +576,7 @@ fn hand_built_one_to_one_case() -> JoinCase {
             columns: i % 16,
             own_keys: [0; 3],
             on_key: false,
+            key_scope: None,
         });
     }
     one_to_one_chained_case(

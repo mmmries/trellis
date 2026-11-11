@@ -71,17 +71,20 @@ pub mod defs {
     pub use crate::defs::typed_literal;
 
     /// The 1-1 JOIN's fan-out chunk and fan-out warning threshold
-    /// (ADR-0021): tests and `benchmark` set them, once, before a client
-    /// starts.
+    /// (ADR-0021). A test sets them on its own database (the `_in`
+    /// setters), so tests that set them run in parallel; a whole-engine run
+    /// sets the chunk for its process.
     pub use crate::staging::join_one_to_one::fan_out::{
         DEFAULT_CHUNK_ROWS as ONE_TO_ONE_JOIN_DEFAULT_FAN_OUT_CHUNK_ROWS,
         chunk_rows as one_to_one_join_fan_out_chunk_rows,
+        set_chunk_lock_timeout_in as set_one_to_one_join_fan_out_chunk_lock_timeout_in,
         set_chunk_rows as set_one_to_one_join_fan_out_chunk_rows,
+        set_chunk_rows_in as set_one_to_one_join_fan_out_chunk_rows_in,
     };
     pub use crate::staging::join_one_to_one_status::{
         FAN_OUT_WARNING_ENV as ONE_TO_ONE_JOIN_FAN_OUT_WARNING_ENV,
         fan_out_warning_rows as one_to_one_join_fan_out_warning_rows,
-        set_fan_out_warning_rows as set_one_to_one_join_fan_out_warning_rows,
+        set_fan_out_warning_rows_in as set_one_to_one_join_fan_out_warning_rows_in,
     };
 
     pub use crate::float::FloatWidth;
@@ -123,6 +126,17 @@ pub mod staging {
     /// counts bursts large enough to seal into a split batch, and must follow
     /// the threshold if it moves.
     pub use crate::staging::claim::MIN_ROWS_TO_SPLIT;
+    /// Lowers the split threshold for this process, so the star tier's
+    /// small batches split across workers and a root row's pages at two
+    /// positions drain side by side (#1817).
+    pub use crate::staging::claim::set_min_rows_to_split;
+
+    /// The split threshold batches seal with in this process:
+    /// `MIN_ROWS_TO_SPLIT`, or what [`set_min_rows_to_split`] lowered it
+    /// to. The concurrent tier's coverage report reads it.
+    pub fn min_rows_to_split() -> i64 {
+        crate::staging::claim::min_rows_to_split()
+    }
     /// `seal_phase1`/`seal_phase2` force a seal boundary at a deterministic
     /// point so two changes land in distinct segments instead of depending on
     /// a maintenance tick's timing. There is no facade equivalent — "seal
@@ -193,7 +207,7 @@ pub mod capture {
 pub mod interleave {
     pub use crate::staging::interleave::{
         PausePoint, PauseScope, Reached, force_join_key_moves, join_key_moves, set_commit_stall,
-        set_group_lock_stall, set_stall, with_scope,
+        set_group_lock_stall, set_lock_step_stall, set_rederived_pages, set_stall, with_scope,
     };
 }
 
@@ -286,6 +300,7 @@ pub mod fixtures {
             paused_upstream_columns: Vec::new(),
             build_wait: None,
             version_handover: None,
+            migrations_pending: None,
             below_catalog_floor: None,
             floor: "0.2.0".to_string(),
         }

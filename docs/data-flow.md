@@ -229,8 +229,10 @@ Staged changes are **collapsed** before touching any target:
 
 * An **aggregate** target's N staged changes to a group reduce to one
   recompute/delta write for that group's row.
-* **1-1** and **cross-join** targets reduce to the distinct set of target rows
-  (or key pairs) affected.
+* A **`JOIN`** target's changes reduce to one delta per partial cell and per
+  visible group.
+* **1-1** and **1-1 `JOIN`** targets reduce to the distinct set of target rows
+  affected.
 
 Collapsing turns a burst of source writes into the minimal set of target
 writes.
@@ -257,7 +259,7 @@ statement that writes the target and computes no value itself (see
 and [0002-async-data-flow](decisions/0002-async-data-flow.md)). Each statement
 is the **minimal write** for the collapsed batch — for an aggregate, a small
 atomic delta against the group's existing value rather than a full recompute;
-for 1-1 and cross-join, only the target rows the batch touched. This keeps
+for a 1-1 or 1-1 `JOIN` target, only the target rows the batch touched. This keeps
 incremental maintenance cheaper than re-running the definition while landing on
 the same result.
 

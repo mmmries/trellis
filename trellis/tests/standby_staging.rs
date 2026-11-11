@@ -156,6 +156,19 @@ async fn a_killed_leader_session_hands_over() {
     b.shutdown().await.expect("shutdown b");
 }
 
+/// The call pool's `(total, idle)` once every connection is back: a call's
+/// connection goes back once its session reset lands, after the call returns.
+async fn settled_counts(handle: &Trellis) -> (usize, usize) {
+    let deadline = tokio::time::Instant::now() + TAKEOVER_WAIT;
+    loop {
+        let (total, idle) = handle.pool().counts();
+        if total == idle || tokio::time::Instant::now() > deadline {
+            return (total, idle);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Both pools close connections left idle: the sweep's `close_idle` leaves
 /// an unused call pool empty.
 #[tokio::test]
@@ -164,10 +177,17 @@ async fn an_idle_call_pool_closes_its_connections() {
     let db = cluster.create_isolated_database().await;
     let handle = connect(db.dsn(), TrellisOptions::default()).await;
     handle.status("nothing").await.expect("a call");
-    // A call's connection goes back once its session reset lands.
-    while handle.pool().counts() != (1, 1) {
-        tokio::task::yield_now().await;
-    }
+    assert_eq!(
+        settled_counts(&handle).await,
+        (1, 1),
+        "a call uses one connection"
+    );
+    handle.definitions().await.expect("a call");
+    assert_eq!(
+        settled_counts(&handle).await,
+        (1, 1),
+        "a call uses one connection"
+    );
 
     handle.pool().close_idle(Duration::from_secs(3600));
     assert_eq!(handle.pool().counts(), (1, 1), "a recent connection stays");

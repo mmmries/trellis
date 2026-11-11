@@ -49,7 +49,6 @@ use std::time::Duration;
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
-use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::interleave::PausePoint;
@@ -71,26 +70,6 @@ const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty')";
 
 /// The chunk these tests run with.
 const CHUNK: usize = 2;
-
-/// The chunk is process-wide, so these tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Holds the serial lock with the chunk at [`CHUNK`], and puts it back.
-struct Chunked {
-    _serial: tokio::sync::MutexGuard<'static, ()>,
-}
-
-impl Drop for Chunked {
-    fn drop(&mut self) {
-        set_one_to_one_join_fan_out_chunk_rows(0);
-    }
-}
-
-async fn chunked() -> Chunked {
-    let serial = SERIAL.lock().await;
-    set_one_to_one_join_fan_out_chunk_rows(CHUNK);
-    Chunked { _serial: serial }
-}
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -182,6 +161,7 @@ async fn start(kind: Kind) -> Driver {
         &["public.a", "public.b"],
     )
     .await;
+    d.set_fan_out_chunk_rows(CHUNK);
     // A reader is defined over a live target; the aggregate's `GROUP BY`
     // column needs an index on it.
     d.ctl
@@ -487,7 +467,6 @@ async fn marker_origin(d: &Driver) -> Vec<String> {
 /// chunk's staged rows carry the marker's origin.
 #[tokio::test]
 async fn a_readers_page_races_a_chunk() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(
@@ -557,7 +536,6 @@ async fn a_readers_page_races_a_chunk() {
 /// next chunk writes and stages the same rows again.
 #[tokio::test]
 async fn a_chunk_killed_after_the_seam_staged_nothing() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.b set w = 900 where id = 1").await;
@@ -595,7 +573,6 @@ async fn a_chunk_killed_after_the_seam_staged_nothing() {
 /// origin too: a token taken between the two commits waits for the readers.
 #[tokio::test]
 async fn an_a_rows_staged_change_carries_the_pages_b_origin() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         write(&d, "update public.b set w = 250, tag = 'late' where id = 2").await;
@@ -621,7 +598,6 @@ async fn an_a_rows_staged_change_carries_the_pages_b_origin() {
 /// chunk, and the readers apply each delete and insert from its images.
 #[tokio::test]
 async fn b_rows_going_and_coming_reach_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "delete from public.b where id = 1").await;
@@ -652,7 +628,6 @@ async fn b_rows_going_and_coming_reach_the_readers() {
 /// the readers.
 #[tokio::test]
 async fn a_chunk_holding_a_row_stages_the_rest() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.a set x = 2147483000 where id = 3").await;
@@ -704,7 +679,6 @@ async fn a_chunk_holding_a_row_stages_the_rest() {
 /// reader's deltas telescope to the second change.
 #[tokio::test]
 async fn a_second_b_change_resets_the_cursor_with_the_readers_rows_half_staged() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(
@@ -792,7 +766,6 @@ async fn status(d: &Driver, kind: Kind) -> String {
 /// stages its rows for the readers in its own transaction.
 #[tokio::test]
 async fn a_rebuild_reaches_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         past_capture(&d, "public.a", "update public.a set x = 50 where id = 1").await;
@@ -829,7 +802,6 @@ async fn a_rebuild_reaches_the_readers() {
 /// get every row's delete; rows inserted after it reach them as before.
 #[tokio::test]
 async fn a_truncate_of_a_reaches_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "truncate public.a").await;
@@ -856,7 +828,6 @@ async fn a_truncate_of_a_reaches_the_readers() {
 /// them for the readers.
 #[tokio::test]
 async fn a_truncate_of_b_rebuild_reaches_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(
@@ -880,7 +851,6 @@ async fn a_truncate_of_b_rebuild_reaches_the_readers() {
 /// key's row; both reach the readers.
 #[tokio::test]
 async fn a_rederive_reaches_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         past_capture(&d, "public.a", "update public.a set x = 70 where id = 9").await;
@@ -905,7 +875,6 @@ async fn a_rederive_reaches_the_readers() {
 /// pause.
 #[tokio::test]
 async fn a_resume_rebuild_reaches_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let trellis = trellis(&d).await;
@@ -937,7 +906,6 @@ async fn a_resume_rebuild_reaches_the_readers() {
 /// for the readers, before the `Recompute` it stages finds the row written.
 #[tokio::test]
 async fn a_quarantine_release_reaches_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         step(&mut d, "update public.a set x = 2147483600 where id = 8").await;
@@ -968,7 +936,6 @@ async fn a_quarantine_release_reaches_the_readers() {
 /// source.
 #[tokio::test]
 async fn a_readers_failing_field_holds_the_key_for_that_reader_alone() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let double = format!("{}_double", kind.name());
@@ -1091,7 +1058,6 @@ async fn capture_passes(d: &mut Driver) {
 /// reaches every reader.
 #[tokio::test]
 async fn a_widening_resumes_down_the_readers() {
-    let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         d.ctl

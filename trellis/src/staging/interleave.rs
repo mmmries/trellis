@@ -196,15 +196,53 @@
 //! the first wrote but hasn't committed (the `JOIN` tier's `join_no_j_lock`
 //! and `join_t_skip_lock` plants).
 //!
+//! A lock-step stall ([`set_lock_step_stall`]) holds a share of a 1-1
+//! `JOIN` page's lock steps, each on its own draw: from
+//! `BeforeJoin1Lock` to `AfterJoin1PositionFanOut` above, and a fan-out
+//! chunk's `AfterJoin1FanOutLock` and `AfterJoin1FanOutRLock`. It sleeps a
+//! uniform time up to its maximum, so a held step is often long: the
+//! window in which a star's writer at another position, or a writer moving
+//! the page's row, commits between two of the page's steps (the star
+//! tier's R-entry and late-key plants). A re-derived share
+//! ([`set_rederived_pages`]) has a share of the 1-1 `JOIN` pages that hold
+//! changes re-derive them instead, as a page that may predate a build does:
+//! each reads its rows live, unlocked, before its key lock, and sleeps up
+//! to the lock-step stall between the two, so a row that moves meanwhile
+//! takes the late-key retry. A Re-derive is exact whenever it runs, so
+//! neither changes what a correct engine converges to.
+//!
 //! A stall is process-wide, like a plant, and an armed [`PauseScope`] point
 //! ignores it. Every page of every engine in the process takes it, so a
 //! harness that sets one runs nothing else in that process meanwhile (the
 //! generative tier runs its steady-load cases only in its planted-bug
 //! sweep's own processes) and clears it when the run ends, however it ends.
+//!
+//! # Knobs by database
+//!
+//! The knobs a test sets to give one scenario its shape, and the counter it
+//! reads back, are kept per database: the count of `JoinKeyMoved` retries
+//! ([`join_key_moves`]), the forced ones ([`force_join_key_moves`]), and the
+//! 1-1 `JOIN` fan-out chunk, chunk lock timeout and warning threshold
+//! (`super::join_one_to_one::fan_out::set_chunk_rows_in`,
+//! `super::join_one_to_one::fan_out::set_chunk_lock_timeout_in`,
+//! `super::join_one_to_one_status::set_fan_out_warning_rows_in`). Each test
+//! has a database of its own, so tests that set them run in parallel in one
+//! binary. The engine reads them where it reads the process-wide value, on
+//! the session it is running (`current_database()`), so they hold on
+//! whatever task runs the page: a drain the test awaits, one it spawned, or
+//! a worker the engine spawned itself. A task-local like [`PauseScope`]
+//! would not cross a `tokio::spawn`. Until a test sets one, a reader asks
+//! its session nothing, so a process that never sets one (a benchmark, a
+//! generative run) pays no round trip; the counter asks only when a page
+//! has raised `JoinKeyMoved` and is rolling back.
+//!
+//! The stalls stay process-wide: they model a busy worker for every engine
+//! in a run, and their only callers set them for the whole process.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -493,39 +531,154 @@ impl PauseScope {
     }
 }
 
-/// How many [`crate::staging::apply::ApplyError::JoinKeyMoved`] a 1-1 `JOIN`
-/// page has raised in this process.
-static JOIN_KEY_MOVES: AtomicU64 = AtomicU64::new(0);
-
-/// How many of the next 1-1 `JOIN` page's held-key checks raise
-/// `JoinKeyMoved` whatever the keys are ([`force_join_key_moves`]).
-static FORCED_JOIN_KEY_MOVES: AtomicU64 = AtomicU64::new(0);
-
-/// How many times a 1-1 `JOIN` page has found a join key moved under it and
-/// rolled back, in this process: a test reads it before and after a drain to
-/// see that a retry happened, or that none did.
-pub fn join_key_moves() -> u64 {
-    JOIN_KEY_MOVES.load(Ordering::Relaxed)
+/// The knobs and counters of one database (see the module doc's "Knobs by
+/// database").
+#[derive(Debug, Default, Clone, Copy)]
+struct DatabaseKnobs {
+    /// How many `JoinKeyMoved` the database's 1-1 `JOIN` pages have raised.
+    join_key_moves: u64,
+    /// How many of the next held-key checks raise `JoinKeyMoved` whatever
+    /// the keys are ([`force_join_key_moves`]).
+    forced_join_key_moves: u64,
+    /// The 1-1 `JOIN` fan-out chunk; 0 for the process-wide one.
+    fan_out_chunk_rows: usize,
+    /// The 1-1 `JOIN` fan-out warning threshold; 0 for the process-wide one.
+    fan_out_warning_rows: i64,
+    /// How long a 1-1 `JOIN` fan-out chunk waits for a lock; `None` for
+    /// `super::build::CHUNK_LOCK_TIMEOUT`.
+    fan_out_chunk_lock_timeout: Option<Duration>,
 }
 
-/// Makes the next `n` held-key checks of 1-1 `JOIN` pages raise
-/// `JoinKeyMoved`, whether or not a key moved: a key that moves on every
-/// attempt, for the test of the retry budget.
-pub fn force_join_key_moves(n: u64) {
-    FORCED_JOIN_KEY_MOVES.store(n, Ordering::Relaxed);
+/// By database name.
+static DATABASE_KNOBS: Mutex<BTreeMap<String, DatabaseKnobs>> = Mutex::new(BTreeMap::new());
+
+/// Whether a test has set a knob on any database. Until one has, a reader
+/// of a set knob doesn't ask its session which database it is on.
+static ANY_DATABASE_KNOB: AtomicBool = AtomicBool::new(false);
+
+fn with_database<T>(database: &str, f: impl FnOnce(&mut DatabaseKnobs) -> T) -> T {
+    let mut knobs = DATABASE_KNOBS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    f(knobs.entry(database.to_string()).or_default())
 }
 
-/// Counts a raised `JoinKeyMoved`.
-pub(crate) fn note_join_key_moved() {
-    JOIN_KEY_MOVES.fetch_add(1, Ordering::Relaxed);
+/// Sets a knob on `database`.
+fn set_on_database(database: &str, f: impl FnOnce(&mut DatabaseKnobs)) {
+    ANY_DATABASE_KNOB.store(true, Ordering::Relaxed);
+    with_database(database, f);
+}
+
+/// The database `client`'s session is on.
+async fn database_of<C: GenericClient>(client: &C) -> Result<String, tokio_postgres::Error> {
+    Ok(client
+        .query_one("select current_database()::text", &[])
+        .await?
+        .get(0))
+}
+
+/// The knobs set on the database `client`'s session is on, or `None` when
+/// no test has set a knob on any database.
+async fn set_knobs<C: GenericClient>(
+    client: &C,
+) -> Result<Option<DatabaseKnobs>, tokio_postgres::Error> {
+    if !ANY_DATABASE_KNOB.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let database = database_of(client).await?;
+    Ok(Some(with_database(&database, |knobs| *knobs)))
+}
+
+/// How many times a 1-1 `JOIN` page on `database` has found a join key moved
+/// under it and rolled back: a test reads it before and after a drain to see
+/// that a retry happened, or that none did.
+pub fn join_key_moves(database: &str) -> u64 {
+    with_database(database, |knobs| knobs.join_key_moves)
+}
+
+/// Makes the next `n` held-key checks of 1-1 `JOIN` pages on `database`
+/// raise `JoinKeyMoved`, whether or not a key moved: a key that moves on
+/// every attempt, for the test of the retry budget.
+pub fn force_join_key_moves(database: &str, n: u64) {
+    set_on_database(database, |knobs| knobs.forced_join_key_moves = n);
+}
+
+/// Counts a raised `JoinKeyMoved` on the database `client`'s session is on.
+/// The page is rolling back either way, so a failure to read the database
+/// leaves the move uncounted rather than changing the page's error: a test
+/// that counts it then fails on the count.
+pub(crate) async fn note_join_key_moved<C: GenericClient>(client: &C) {
+    if let Ok(database) = database_of(client).await {
+        with_database(&database, |knobs| knobs.join_key_moves += 1);
+    }
 }
 
 /// Whether this held-key check is forced to raise `JoinKeyMoved`
 /// ([`force_join_key_moves`]); consumes one.
-pub(crate) fn take_forced_join_key_move() -> bool {
-    FORCED_JOIN_KEY_MOVES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-        .is_ok()
+pub(crate) async fn take_forced_join_key_move<C: GenericClient>(
+    client: &C,
+) -> Result<bool, tokio_postgres::Error> {
+    if !ANY_DATABASE_KNOB.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let database = database_of(client).await?;
+    Ok(with_database(&database, |knobs| {
+        let forced = knobs.forced_join_key_moves > 0;
+        knobs.forced_join_key_moves = knobs.forced_join_key_moves.saturating_sub(1);
+        forced
+    }))
+}
+
+/// Sets the 1-1 `JOIN` fan-out chunk on `database`, over the process-wide
+/// one; `0` restores the process-wide one.
+pub(crate) fn set_fan_out_chunk_rows(database: &str, rows: usize) {
+    set_on_database(database, |knobs| knobs.fan_out_chunk_rows = rows);
+}
+
+/// The fan-out chunk set on the database `client`'s session is on, if any.
+pub(crate) async fn fan_out_chunk_rows<C: GenericClient>(
+    client: &C,
+) -> Result<Option<usize>, tokio_postgres::Error> {
+    Ok(set_knobs(client)
+        .await?
+        .map(|knobs| knobs.fan_out_chunk_rows)
+        .filter(|rows| *rows > 0))
+}
+
+/// Sets the 1-1 `JOIN` fan-out warning threshold on `database`, over the
+/// process-wide one; `0` restores the process-wide one.
+pub(crate) fn set_fan_out_warning_rows(database: &str, rows: i64) {
+    set_on_database(database, |knobs| knobs.fan_out_warning_rows = rows);
+}
+
+/// The fan-out warning threshold set on the database `client`'s session is
+/// on, if any.
+pub(crate) async fn fan_out_warning_rows<C: GenericClient>(
+    client: &C,
+) -> Result<Option<i64>, tokio_postgres::Error> {
+    Ok(set_knobs(client)
+        .await?
+        .map(|knobs| knobs.fan_out_warning_rows)
+        .filter(|rows| *rows > 0))
+}
+
+/// Sets how long a 1-1 `JOIN` fan-out chunk on `database` waits for a lock
+/// (`super::build::CHUNK_LOCK_TIMEOUT` unless set), or restores it with
+/// `None`. For a test that freezes the lock's holder and then releases it:
+/// on a loaded machine the release can come more than a second after the
+/// chunk queued, and the chunk would give up, as it should in production.
+pub(crate) fn set_fan_out_chunk_lock_timeout(database: &str, timeout: Option<Duration>) {
+    set_on_database(database, |knobs| knobs.fan_out_chunk_lock_timeout = timeout);
+}
+
+/// The fan-out chunk lock timeout set on the database `client`'s session is
+/// on, if any.
+pub(crate) async fn fan_out_chunk_lock_timeout<C: GenericClient>(
+    client: &C,
+) -> Result<Option<Duration>, tokio_postgres::Error> {
+    Ok(set_knobs(client)
+        .await?
+        .and_then(|knobs| knobs.fan_out_chunk_lock_timeout))
 }
 
 /// The longest stall, in microseconds; 0 for none. See the module doc's
@@ -563,8 +716,88 @@ pub fn set_commit_stall(max: Option<Duration>) {
     COMMIT_STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
 }
 
+/// The longest lock-step stall, in microseconds; 0 for none. See the module
+/// doc's "Stalls".
+static LOCK_STEP_STALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// The share of lock steps that stall, in thousandths.
+static LOCK_STEP_STALL_PER_MILLE: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the longest stall a 1-1 `JOIN` page or fan-out chunk takes at a
+/// lock step, and the share of its lock steps, in thousandths, that take
+/// one; `None` clears it. See the module doc's "Stalls".
+pub fn set_lock_step_stall(max: Option<Duration>, per_mille: u16) {
+    let micros = max.map_or(0, |max| u64::try_from(max.as_micros()).unwrap_or(u64::MAX));
+    LOCK_STEP_STALL_PER_MILLE.store(u64::from(per_mille.min(1000)), Ordering::Relaxed);
+    LOCK_STEP_STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
+}
+
+/// The share of 1-1 `JOIN` pages re-derived, in thousandths
+/// ([`set_rederived_pages`]).
+static REDERIVED_PAGES_PER_MILLE: AtomicU64 = AtomicU64::new(0);
+
+/// Has the share `per_mille` (in thousandths) of the 1-1 `JOIN` pages that
+/// hold changes re-derive them, as a page that may predate a build does; 0
+/// stops it. See the module doc's "Stalls".
+pub fn set_rederived_pages(per_mille: u16) {
+    REDERIVED_PAGES_PER_MILLE.store(u64::from(per_mille.min(1000)), Ordering::Relaxed);
+}
+
+/// Whether this 1-1 `JOIN` page re-derives its changes
+/// ([`set_rederived_pages`]).
+pub(crate) fn take_rederived_page() -> bool {
+    let share = REDERIVED_PAGES_PER_MILLE.load(Ordering::Relaxed);
+    share > 0 && unit() * 1000.0 < share as f64
+}
+
+/// A page [`take_rederived_page`] re-derived sleeps a uniform time up to
+/// the lock-step stall ([`set_lock_step_stall`]) between its unlocked read
+/// of its rows' keys and its key lock, so a row that moves meanwhile takes
+/// the late-key retry.
+pub(crate) async fn rederive_stall() {
+    let max = LOCK_STEP_STALL_MAX_MICROS.load(Ordering::Relaxed);
+    if max > 0 {
+        tokio::time::sleep(Duration::from_micros((unit() * max as f64) as u64)).await;
+    }
+}
+
+/// A uniform draw in `[0, 1)`: a splitmix64 step over a shared counter, no
+/// RNG dependency for a test-only jitter that needs no quality beyond
+/// "spread out".
+fn unit() -> f64 {
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE
+        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// Sleeps a random time up to the set stall, at the points it applies to.
 async fn stall(point: PausePoint) {
+    if matches!(
+        point,
+        PausePoint::BeforeJoin1Lock
+            | PausePoint::AfterJoin1KeyInsert
+            | PausePoint::AfterJoin1RLock
+            | PausePoint::AfterJoin1REntryLock
+            | PausePoint::AfterJoin1MEntryLock
+            | PausePoint::AfterJoin1Read
+            | PausePoint::BeforeJoin1Recompute
+            | PausePoint::AfterJoin1PositionFanOut
+            | PausePoint::AfterJoin1FanOutLock
+            | PausePoint::AfterJoin1FanOutRLock
+    ) {
+        let max = LOCK_STEP_STALL_MAX_MICROS.load(Ordering::Relaxed);
+        let share = LOCK_STEP_STALL_PER_MILLE.load(Ordering::Relaxed);
+        if max > 0 && share > 0 && unit() * 1000.0 < share as f64 {
+            let micros = (unit() * max as f64) as u64;
+            tokio::time::sleep(Duration::from_micros(micros)).await;
+        }
+        return;
+    }
     let max = match point {
         PausePoint::AfterPlaceholders
         | PausePoint::AfterEntryLock
@@ -578,16 +811,7 @@ async fn stall(point: PausePoint) {
     if max == 0 {
         return;
     }
-    // A splitmix64 step over a shared counter: no RNG dependency for a
-    // test-only jitter that needs no quality beyond "spread out".
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut x = STATE
-        .fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
-        .wrapping_add(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^= x >> 31;
-    let unit = (x >> 11) as f64 / (1u64 << 53) as f64;
+    let unit = unit();
     let micros = (unit * unit * unit * max as f64) as u64;
     tokio::time::sleep(Duration::from_micros(micros)).await;
 }

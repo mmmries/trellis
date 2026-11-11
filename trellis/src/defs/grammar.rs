@@ -215,7 +215,7 @@ pub(crate) async fn pause_unloadable_in(
                 oldest,
             }
             .to_string();
-            super::lifecycle::pause_for_grammar_version(txn, id, &source, &reason)
+            super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
                 .await
                 .map_err(incompatible)?;
             paused += 1;
@@ -227,7 +227,7 @@ pub(crate) async fn pause_unloadable_in(
         // catalog.
         if let Err(e) = load_in(text, grammar_version, oldest, current) {
             let reason = unparsable_stored_text_reason(&target, &e);
-            if super::lifecycle::pause_for_grammar_version(txn, id, &source, &reason)
+            if super::lifecycle::pause_for_capture_failure(txn, id, &source, &[], &reason, None)
                 .await
                 .map_err(incompatible)?
             {

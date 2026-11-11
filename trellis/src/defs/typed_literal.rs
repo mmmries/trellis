@@ -185,8 +185,8 @@ pub struct TypedLiteralSpec {
 ///   server must stay correct when read on another — is therefore
 ///   unreachable for `interval` without also pinning an input GUC, which
 ///   Trellis does not do. (`interval`'s *output* side is fine: Trellis pins
-///   `IntervalStyle` and `crate::temporal::Interval::render` reproduces the
-///   `postgres` spelling exactly, which is what `SUM(interval)` needs.)
+///   `IntervalStyle`, so every connection renders an interval in the
+///   `postgres` spelling.)
 /// * **`bit`** (fixed-length) — permanently excluded,
 ///   not merely waiting: Postgres's *default* typmod for a `bit` literal
 ///   cast with no explicit length is `bit(1)`, and [`render_sql`] always

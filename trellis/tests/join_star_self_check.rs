@@ -166,7 +166,6 @@ async fn planted(d: &Driver, star: Star, plant: &str, undo: &str, expected: Vec<
 
 #[tokio::test]
 async fn a_star_s_self_check_is_clean_after_mixed_traffic() {
-    let _serial = star::serial().await;
     for shape in [N3, N4] {
         let stars = shape.stars();
         let mut d = star::start_seeded(&stars, &seed(shape)).await;
@@ -186,7 +185,6 @@ async fn a_star_s_self_check_is_clean_after_mixed_traffic() {
 
 #[tokio::test]
 async fn hand_edits_at_position_2_are_each_reported_until_undone() {
-    let _serial = star::serial().await;
     let stars = N3.stars();
     let d = star::start_seeded(&stars, &seed(N3)).await;
     for star in stars {
@@ -397,13 +395,11 @@ async fn o1(shape: Shape, stars: &[Star]) {
 
 #[tokio::test]
 async fn o1_a_star_and_its_join_clauses_permuted_reach_the_same_target_at_n_3() {
-    let _serial = star::serial().await;
     o1(N3, &N3.stars()).await;
 }
 
 #[tokio::test]
 async fn o1_a_star_and_its_join_clauses_permuted_reach_the_same_target_at_n_4() {
-    let _serial = star::serial().await;
     // Every order of the three positions, over two of the strength-2 cover's
     // kind tuples (an `INNER` at the first position, and in the middle).
     let stars: Vec<Star> = N4.stars().into_iter().skip(1).take(2).collect();
@@ -412,7 +408,6 @@ async fn o1_a_star_and_its_join_clauses_permuted_reach_the_same_target_at_n_4() 
 
 #[tokio::test]
 async fn a_star_s_snapshot_reads_every_position() {
-    let _serial = star::serial().await;
     let star = N3.stars()[0];
     let d = star::start_seeded(&[star], &seed(N3)).await;
     let s = star_snapshot(d.pool(), &star.target())
@@ -519,7 +514,6 @@ async fn compare_walk(d: &Driver, star: Star) -> (Vec<Divergence>, bool) {
 /// every position of the star.
 #[tokio::test]
 async fn an_uncertain_key_at_any_position_leaves_every_key_uncertain() {
-    let _serial = star::serial().await;
     let star = N4.stars()[0];
     for p in N4.all() {
         let d = star::start_seeded(&[star], &seed(N4)).await;

@@ -14,8 +14,8 @@ redefining it and cutting over.
 
 ## What is editable, and what is not
 
-The **key-space is fixed at creation**. A change of granularity — 1-1, aggregate, or
-cross-join, and the columns that key it — is a different table, not an edit, and stays
+The **key-space is fixed at creation**. A change of granularity — 1-1, aggregate, `JOIN`
+or 1-1 `JOIN`, and the columns that key it — is a different table, not an edit, and stays
 a new transform plus cutover. The grammar enforces this by construction: the edit
 statement has no key-space clause to write, so a granularity change is not expressible
 as an edit rather than rejected by a validator branch.

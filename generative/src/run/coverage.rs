@@ -447,7 +447,8 @@ pub enum ConcurrentShape {
     /// or more rows, in the burst: rows the engine may hash to different
     /// buckets of a split batch, and so drain on different workers.
     HotGroup,
-    /// The burst carries at least `SPLIT_THRESHOLD_ROWS` source changes and
+    /// The burst carries at least the split threshold's source changes
+    /// (`SPLIT_THRESHOLD_ROWS`, or what a star case lowered it to) and
     /// no whole-table op (a `TRUNCATE` batch always seals unsplit), so it
     /// can seal into a split batch if the harness outruns the seal cadence.
     SplitSized,
@@ -714,7 +715,10 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
         {
             out.insert(ConcurrentShape::HotGroup);
         }
-        if changes >= SPLIT_THRESHOLD_ROWS && !whole_table {
+        // The threshold a star case lowered, if it did (`StarKnobs`).
+        let split = usize::try_from(trellis::dev::staging::min_rows_to_split())
+            .unwrap_or(SPLIT_THRESHOLD_ROWS);
+        if changes >= split && !whole_table {
             out.insert(ConcurrentShape::SplitSized);
         }
     }

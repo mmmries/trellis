@@ -382,6 +382,15 @@ pause are arcs of one lifecycle:
   part, which no chunk's range reaches, may still be draining when it flips,
   but they gate every token, so the await covers them
   ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
+
+  A paused column of the definition's own 1-1 target (its fuse tripped, or
+  `PAUSE TRANSFORM t.col`) leaves the status `live`: the column stops updating
+  and the rest of the target keeps applying. It shows in
+  `Trellis::quarantined()` and `quarantine_status("t.col")` as `paused`, with
+  `last_error` when the column failed itself (none for a pause by an operator,
+  or one cascaded from an upstream column it reads). The CLI's `trellis status`
+  prints one `column` line under the definition for each, with the error and
+  the remedy, `RESUME TRANSFORM t.col` once the cause is fixed.
 * **`quarantined`** — the whole-transform fuse tripped
   ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)). Resuming drops the
   transform back to `waiting_to_backfill`, deletes the keys it holds in
@@ -740,6 +749,17 @@ line when it takes over ([version handover](decisions/0023-version-handover.md))
 A process killed without a clean shutdown keeps counting until its registry row
 ages out, up to the reclaim TTL of 30 seconds. The Elixir and Ruby bindings
 report it as `version_handover`.
+
+While this binary's migrations haven't run on the instance,
+`status().migrations_pending` is set: it names them, and `cannot_run` says why
+this handle's background process couldn't run them, when it tried and was
+refused (its role can't alter Trellis's tables, say), with the remedy. A
+background process runs them itself once no process of another version is
+live, then logs an info line naming the migrations that ran as it takes over.
+Where the catalog can't be read until they run, `status()` and
+`definitions()` refuse with the `version_handover` code, naming them, and
+`trellis status` prints them on a `Migrations pending:` line. The Elixir and
+Ruby bindings report the refusal; they don't carry `migrations_pending` yet.
 
 Every definition's status also carries its `floor`, the oldest Trellis release
 that can run it ([defining transforms — Floors](transforms.md#floors)), which
