@@ -174,7 +174,7 @@ to its commit, so the basis it tests is one no other page is about to change.
 
 So a group's partials are the contributions of the source rows its basis saw
 plus the changes that came after, each counted once, whichever batch or page
-it came from ([below](#aggregate-groups-the-group-basis)). A batch draining
+it came from ([the group basis](group-basis.md#a-page)). A batch draining
 after a newer one for the same key adds nothing twice.
 
 ## Absolute writes do not commute: the 1-1 ledger
@@ -290,7 +290,7 @@ source or on another definition's target alike: the build applies from its
 start and re-derives the source in chunks, each inserting the entries its keys
 don't have yet and locking the others as a page does, and stamping them as a
 Re-derive does. An aggregate or a `JOIN` is built by its plan job's one
-absolute write instead ([below](#aggregate-groups-the-group-basis)).
+absolute write instead ([the group basis](group-basis.md#absolute-writes)).
 
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
@@ -331,57 +331,9 @@ its own read's segment (`defs::ledger::tombstone_seg_sql`).
 
 ### Aggregate groups: the group basis
 
-An aggregate (`staging::group_basis`, ADR-0002 "Aggregates: a basis per
-group") keeps each group's partials (its row count `__n`, and per distinct
-argument its non-null count and, for a `SUM` or `AVG`, its sum) in a hidden
-table in the catalog schema, `agg_<id>`, beside the group's basis and stamp.
-The visible target holds only the declared columns, computed from the
-partials whenever the visible row is written. The grammar admits `COUNT(*)`,
-`COUNT(x)`, and `SUM`/`AVG` over `smallint`, `integer`, `bigint` and
-`numeric`, because only those can be kept exact from each change alone (a
-`numeric` sum with a count per display scale and of each special value).
-An argument may be an expression (`SUM(v + 1)`), evaluated per change over
-the image as the source's row type. A plain aggregate also admits `MIN`/`MAX`
-over a plain source column of an ordered type: the group keeps each extreme
-with a basis of its own, and a retraction that reaches it re-reads the
-group's next one from the source, through an index define requires
-(`staging::group_basis`'s "Extremes").
-
-A page, per aggregate target:
-
-1. **Stage.** One statement splits each ring row into sides (its old image
-   negated, and its new image), evaluates the group and each argument on
-   each, and sums them per group, transaction and statement into a session
-   temporary table. It reads no basis, so this work, most of a page's,
-   happens before any group is locked.
-2. **Lock (I1, I5).** One statement inserts every group the staged sides name,
-   sorted, and locks the ones that exist.
-3. **Apply.** One later statement, so under `READ COMMITTED` its snapshot
-   sees every committed basis, keeps a staged sum only when its transaction
-   isn't visible in the group's basis and its `lsn` is above the target's
-   truncate floor, adds what is kept to the hidden row, and writes the
-   visible row when a visible value changed: an upsert while `__n > 0`, a
-   delete when it falls to 0.
-
-Each changed visible row reaches the seam with its prior image, computed from
-the partials before the page's change. A `Recompute` (a release of a key, or
-a rebuild's) names groups instead of carrying images: the page
-rewrites each of them from a `GROUP BY` of the source in the statement's
-snapshot, which becomes the group's basis.
-
-**Builds.** A build or rebuild is one absolute write per structure: it locks
-the groups of the enumeration (the target's, the source's, and those the
-ring's old images name) in key order, then one statement runs the source's
-`GROUP BY` from its snapshot and replaces each group's partials, basis, stamp
-and visible row. Pages keep applying, against the new bases once it commits.
-It is the plan job's whole build
-([data flow](../data-flow.md#an-aggregates-or-a-joins-build)).
-
-**Zero groups.** A group whose partials are all zero has no visible row, but
-its hidden row can still matter: a change its basis saw but a page hasn't
-drained yet must still be refused. The maintenance loop's GC collects a zero
-group only once the contiguous drained prefix reaches its stamp
-(`staging::retire::collect_tombstones`), without waiting on a page.
+A page moves each locked group by the sums of its changes' sides the group's
+basis hasn't counted; an absolute write rewrites groups from the source:
+[the group basis](group-basis.md).
 
 **Truncate.** A source `TRUNCATE` empties a 1-1 target's ledger, or an
 aggregate's hidden table, clears the target's rows, and raises the target's
@@ -401,12 +353,8 @@ is decided.
 **Release.** Releasing a quarantined key
 (`staging::release_key`) stages one `Recompute` of it and discards the parked
 rows. A replayed row would carry the releaser's `row_txid`, not the source
-transaction's. On an aggregate the release also recomputes, in
-its own transaction, every group the held row's `agg_groups` names (the
-groups of every parked change's images) and the key's current row's, locked
-in one sorted statement and rewritten from a `GROUP BY` of the source with
-that statement's snapshot as each group's basis; a page with a `Recompute`
-recomputes the groups it names the same way, under the page's group locks.
+transaction's. On an aggregate the release also recomputes every group the
+key could owe ([the group basis](group-basis.md#absolute-writes)).
 
 ### `JOIN` targets
 
@@ -454,7 +402,7 @@ invertible folds are maintained by increments. `count(*)`, `count(col)`, and
 `Inf − Inf = NaN`). `min`/`max` are not invertible (removing the current
 maximum tells you nothing about the next one), so a plain aggregate keeps
 them by re-reading the source when a retraction reaches the stored extreme
-([above](#aggregate-groups-the-group-basis)), and a `JOIN` refuses them.
+([the group basis](group-basis.md#a-page)), and a `JOIN` refuses them.
 Everything else is refused at define, named by its family
 ([transforms](../transforms.md#supported-sources-and-targets)).
 
@@ -519,7 +467,7 @@ statement** (a `JOIN` target takes its pair's lock row first, then its
 structures, and the 1-1 `JOIN` targets' definition rows come before any of
 their lock rows, in [the order above](#join-targets)). The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
-[the group basis](#aggregate-groups-the-group-basis)); a 1-1 target's rows are
+[the group basis](group-basis.md#a-page)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its
 groups in group order.
 
