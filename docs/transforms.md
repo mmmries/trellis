@@ -51,16 +51,20 @@ condition can't arise later. An `ALTER TRANSFORM` is checked as define is.
 
 The rule reads a column's type. When the staging worker's capture pass finds
 a column a definition reads retyped, or dropped and added again, it runs
-define's validation again. A definition that still validates keeps running.
-Its [floor](#floors) is recorded again over the new types, and its target is
+define's validation again
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+A definition that still validates keeps running. Its [floor](#floors) is recorded again over the new types, and its target is
 rebuilt in place unless the change was a pure widening. A definition pauses
 when define would now refuse it, when it would evaluate the column as another
 type (`integer` to `double precision`), or when the new type outgrew a column
 Trellis copied ([the widening entry](#a-column-trellis-copies-widened)). A key
 column (a source key, `GROUP BY` key or `ON` column) whose new type or
 collation define refuses, or whose stored keys now render differently, pauses
-its readers too. So does a read column renamed or dropped
-([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+its readers too. A source key's collation changed to another deterministic
+one pauses nothing, though the rest of any build then scans the source, and
+`self_check` reads the source by scan rather than by index (it pages under the
+target key's collation). A read column renamed or dropped pauses its readers
+([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)).
 
 #### Shape
 
@@ -68,11 +72,11 @@ The rule reads the table's shape: its place in a partition or inheritance
 hierarchy, its partition tree, its row-level security, a subscription into it,
 or whether a column it reads is virtual. The staging worker's next reconcile
 pass (every 5 seconds by default) pauses every definition reading the table
-that the new shape breaks. The resume's rebuild repairs any writes that
-capture missed before that pass. Row-level security on a target pauses the
-definition that writes it. On a role a drain logs in as, the refused read or
-write halts the definitions it reaches on the next drain (`capture_failure`
-kind `halt`). Only a
+that the new shape breaks, and `self_check` reports a `capture` divergence.
+The resume's rebuild repairs any writes that capture missed before that pass.
+Row-level security on a target also pauses the definition that writes it. On
+a role a drain logs in as, the refused read or write halts the definitions it
+reaches on the next drain (`capture_failure` kind `halt`). Only a
 subscription's apply worker escapes capture: a session with
 `session_replication_role = replica` fires the capture triggers, which are
 `ENABLE ALWAYS` ([stage 1](staging-and-claiming/01-capture-by-triggers.md)).
@@ -91,8 +95,8 @@ grace period, whether or not a write arrived:
 
 A primary key made deferrable halts its readers on the next drain of a change.
 A dropped primary key leaves the table uncapturable (a capture holdup in
-`status()`), and its readers pause when its next change is applied. A target
-that lost the index over its key has no detector: `RESUME` and a rebuild
+`status()`), and halts its readers on the next drain of a change to it. A
+target that lost the index over its key has no detector: `RESUME` and a rebuild
 refuse until the index is back. These pause nothing: an equivalent index
 built before the old one is dropped, `REINDEX CONCURRENTLY`, a rename and
 pg_repack.
@@ -138,17 +142,17 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A partitioned root ([0017](decisions/0017-partitioned-sources.md)) whose partition key, at any level, the group key omits: an aggregate's `GROUP BY`, or a `JOIN` table's `GROUP BY` and `ON` columns from that table | `PartitionedSource`, naming the column | [Shape](#shape): a sub-level added later | Add the column to the `GROUP BY` or join on it; after a change, detach the sub-level, then `RESUME` |
 | A partitioned root whose key level is an expression, or whose partition-key column has a type other than `smallint`, `integer`, `bigint`, `numeric`, `text`, `varchar`, `uuid`, `date`, `timestamp`, `timestamptz` or `boolean`, a non-default operator class or a nondeterministic collation | `PartitionedSource` | [Shape](#shape): a sub-level added later | Partition by a plain listed column; after a change, detach the sub-level, then `RESUME` |
 | A partitioned root with more than 1,000 leaves, or on PostgreSQL before 15: every build statement opens every leaf | `PartitionedSource` | [Shape](#shape) | Merge partitions to 1,000 or fewer leaves, or upgrade the server |
-| A partitioned root as a 1-1 transform's `FROM` (partitioned targets are not supported) | `PartitionedSource` | [Shape](#shape): the source dropped and created again partitioned | Aggregate over it, or use a plain table |
+| A partitioned root as a 1-1 transform's `FROM` (partitioned targets are not supported) | `PartitionedSource` | [Disruption](#disruption): the source dropped and created again partitioned; `RESUME` then refuses | Aggregate over it, or use a plain table |
 | **Source keys** | | | |
-| An aggregate target, or a 1-1 target over one, as another Trellis instance's source: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint, not a primary key. Inside the owning instance it can be chained off | `NoPrimaryKey` | [Key](#key) | Chain within the instance ([instance-identity](instance-identity.md)), group over a 1-1 transform, or name the group key with `KEY (…)` |
+| An aggregate target, or a 1-1 target over one, as another Trellis instance's source: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint, not a primary key. Inside the owning instance it can be chained off | `NoPrimaryKey` | [Disruption](#disruption): only by the table being replaced by such a target; `RESUME` then refuses | Chain within the instance ([instance-identity](instance-identity.md)), group over a 1-1 transform, or name the group key with `KEY (…)` |
 | [The key a transform keys each table by](#the-key-a-transform-keys-each-table-by) | `NoPrimaryKey`, `DeferrablePrimaryKey`, `KeyNotBacked`, `KeyOnTrellisTarget`, `KeyDiffersFromReaders` | [Key](#key) | Name a `KEY (…)` or add a primary key; [details](#the-key-a-transform-keys-each-table-by) |
 | **Row-level security and replication** | | | |
 | [Row-level security on a role Trellis runs as](#row-level-security-on-a-role-trellis-runs-as) | `RowSecurityApplies`, `ExtremeSourceNotReadable` | [Shape](#shape) | `BYPASSRLS`, or the owner without `FORCE ROW LEVEL SECURITY`; then `RESUME` |
 | A table a logical-replication subscription in the same database replicates into, in any sync state or disabled: its apply worker fires only row-level triggers. Publishing a table is fine | `Subscribed` | [Shape](#shape) | Remove the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then `RESUME` |
 | **Generated columns, collations and patterns** | | | |
 | [A virtual generated column a definition reads](#a-virtual-generated-column-a-definition-reads) | `VirtualGeneratedColumn` | [Shape](#shape) | Make it `STORED`, or write its expression in the definition |
-| A nondeterministic collation on a key column (a source key, `GROUP BY` key or `ON` column), on a column passed to `STRPOS` or `REGEXP_COUNT`, or on one compared as text (`=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM`, `NULLIF`), directly or through `COALESCE`, a `CASE` result or a field | `NondeterministicKeyCollation`, `NondeterministicCollationTextFunction`, `JoinNondeterministicCollation` | On a key, [Retype](#retype); on a column only a text function reads, [Per row](#per-row) | Keep the collation deterministic ([type-support](type-support.md#collation)) |
-| A `REGEXP_COUNT` pattern that isn't a string literal, or that Postgres rejects (`(?P<n>a)`, `a++`, `\pL`); define, `ALTER TRANSFORM` and `RESUME` probe it with `regexp_count('', pattern)` | `NonLiteralRegexPattern`, `InvalidRegexPattern` (with the server's message) | [Text](#text); a Postgres upgrade that changes the verdict is [Per row](#per-row) | Write a pattern Postgres's `regexp_count` accepts |
+| A nondeterministic collation on a key column (a source key, `GROUP BY` key or `ON` column), on a column passed to `STRPOS` or `REGEXP_COUNT`, or on one compared as text (`=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM`, `NULLIF`), directly or through `COALESCE`, a `CASE` result or a field | `NondeterministicKeyCollation`, `NondeterministicCollationTextFunction`, `JoinNondeterministicCollation` | On a key, [Retype](#retype); on a column only a text function reads, [Per row](#per-row); on a column only compared, nothing detects it ([known correctness gaps](known-correctness-gaps.md#a-read-column-given-a-nondeterministic-collation)) | Keep the collation deterministic ([type-support](type-support.md#collation)) |
+| A `REGEXP_COUNT` pattern that isn't a string literal, or that Postgres rejects (`(?P<n>a)`, `a++`, `\pL`); define, `ALTER TRANSFORM` and `RESUME` probe it with `regexp_count('', pattern)`. Back-references, lookahead and `\m`/`\M` are admitted | `NonLiteralRegexPattern`, `InvalidRegexPattern` (with the server's message) | [Text](#text); a Postgres upgrade that changes the verdict is [Per row](#per-row) | Write a pattern Postgres's `regexp_count` accepts |
 | **Constants** | | | |
 | [A literal zero divisor](#a-literal-zero-divisor) | `ConstantDivisorZero` | [Text](#text) | A nonzero divisor or a column; `x / NULLIF(col, 0)` |
 | [A typed literal not in its type's canonical spelling](#a-typed-literal-not-in-its-types-canonical-spelling) | `InvalidTypedLiteral` | [Text](#text) | The spelling Postgres prints: `DATE '2024-01-05'` |
@@ -187,7 +191,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | **Field, column and table names** | | | |
 | A field named after a 1-1 source key column or a 1-1 `JOIN`'s `a` key column (`id AS id`; `id AS order_id` is fine), or a field or `GROUP BY` column whose name starts with `__` | `FieldNamedAfterPrimaryKey`, `ReservedFieldName`, `ReservedGroupByColumnName` | [Text](#text) | Rename the field |
 | An aggregate whose argument names another aggregate field no source column is named after (`SUM(val) AS total, SUM(total)`) | `AggregateOfAggregateField` | [Text](#text) | Aggregate the source column |
-| A bare name that is both a source column and a field whose expression isn't just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`; see [Calculated Fields](#calculated-fields)) | `AmbiguousColumnReference` | [Resume only](#resume-only): a source column added under a field's name | Write `src.val` for the column, or rename the field |
+| A bare name that is both a source column and a field whose expression isn't just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`; see [Calculated Fields](#calculated-fields)). A 1-1 transform refuses such a field whether or not anything reads it | `AmbiguousColumnReference`; in a 1-1 transform, `CalculatedFieldShadowsSourceColumn` | [Resume only](#resume-only): a source column added under a field's name | Write `src.val` for the column, or rename the field |
 | [An unquoted reserved word as a name](#an-unquoted-reserved-word-as-a-name) | `ReservedWord` | [Retype](#retype): renaming a read column is a rename | Quote it (`"order"`), or qualify it (`orders.order`) |
 | An unquoted target, `FROM` or `JOIN` table name that Postgres reserves (`FROM user`, `FROM order`); `public.order` is fine | `ReservedTableName` | [Text](#text) | Quote it as the catalog spells it (`FROM "order"`) |
 | A name over 63 bytes after folding and unescaping, in any position: Postgres would truncate it | `NameTooLong` | [Text](#text); a definition 0.1.x stored with a longer `AS` label keeps running, its `ALTER TRANSFORM` refuses, and the upgrade that writes a `KEY (…)` into it pauses it | 63 bytes or fewer; drop and define such a stored definition again |
@@ -211,7 +215,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | Chaining off a transform that is not `live` | `TransformNotLive` | n/a | Wait for the upstream to go `live` |
 | **Target names** | | | |
 | [A target whose name is taken](#a-target-whose-name-is-taken) | `TargetTableExists`, `TargetNotAdoptable` | n/a | Another name, or `ADOPT EXISTING TABLE` |
-| A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | `TargetNameHasReaders`, naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it (`DependentsBlockDrop`) | `DROP TRANSFORM` each reader named, or another name |
+| A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | `TargetNameHasReaders`, naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it (`DependentsBlockDrop`) | `DROP TRANSFORM` each reader named (paused first), or another name |
 | A target in this instance's catalog schema, or in a schema holding another instance's `trellis_instance` table, whose uninstall would drop it ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)) | `TargetInCatalogSchema` | [Resume only](#resume-only) | An ordinary schema; after define, `DROP TRANSFORM` and define it there |
 
 ### Details
