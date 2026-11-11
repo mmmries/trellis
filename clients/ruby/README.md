@@ -465,10 +465,11 @@ end
   app uses `structure.sql`.
 
 `rails trellis:migrate` creates or upgrades Trellis's own tables the same
-way. The helpers run it whenever a migration defines something; run it in
-the deploy step as well (`bin/rails trellis:migrate db:migrate`), so a
-deploy that upgrades the gem without a new define still upgrades the
-tables before the worker restarts.
+way. The helpers run it whenever a migration defines something, and a worker
+of a new gem version runs it by itself once the old version's processes have
+stopped. Run it in the deploy step as well (`bin/rails trellis:migrate
+db:migrate`) to create the tables on a fresh database, to upgrade them before
+the worker restarts, or when the worker's database role can't alter them.
 
 `Trellis::Railtie.with_handle { ... }` is what `trellis:migrate` and the
 helpers use, for a script or rake task of your own that needs Trellis the
