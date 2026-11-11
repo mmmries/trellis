@@ -2016,10 +2016,6 @@ pub(crate) fn validate_aggregate_admitted(
     let KeySpace::Aggregate { .. } = &def.key_space else {
         return Ok(());
     };
-    let value_types: HashMap<String, ValueType> = columns
-        .iter()
-        .map(|(name, info)| (name.clone(), info.value_type))
-        .collect();
     // Each field with the calculated fields it reads by name substituted, as
     // the group basis routes it: an argument that names a grouped calculated
     // field (`(qty + 1) AS q, SUM(q)`) is typed as that field's expression,
@@ -2030,7 +2026,7 @@ pub(crate) fn validate_aggregate_admitted(
     };
     for field in &def.fields {
         let expr = substituted.get(&field.name).unwrap_or(&field.expr);
-        check_aggregate_calls(expr, columns, &value_types)?;
+        check_aggregate_calls(expr, columns)?;
     }
     Ok(())
 }
@@ -2039,19 +2035,18 @@ pub(crate) fn validate_aggregate_admitted(
 fn check_aggregate_calls(
     expr: &Expr,
     columns: &HashMap<String, JoinColumnInfo>,
-    value_types: &HashMap<String, ValueType>,
 ) -> Result<(), ValidationError> {
     match expr {
         Expr::BinaryOp { lhs, rhs, .. } => {
-            check_aggregate_calls(lhs, columns, value_types)?;
-            check_aggregate_calls(rhs, columns, value_types)
+            check_aggregate_calls(lhs, columns)?;
+            check_aggregate_calls(rhs, columns)
         }
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            check_aggregate_calls(operand, columns, value_types)
+            check_aggregate_calls(operand, columns)
         }
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
             for child in expr.logic_children() {
-                check_aggregate_calls(child, columns, value_types)?;
+                check_aggregate_calls(child, columns)?;
             }
             Ok(())
         }
@@ -2061,7 +2056,7 @@ fn check_aggregate_calls(
                 || super::registry::AGGREGATE_FUNCTIONS.contains(&upper.as_str()))
             {
                 for arg in args {
-                    check_aggregate_calls(arg, columns, value_types)?;
+                    check_aggregate_calls(arg, columns)?;
                 }
                 return Ok(());
             }
@@ -2071,7 +2066,7 @@ fn check_aggregate_calls(
             };
             // `validate` has typed the definition already; an argument it
             // can't type here is left to it.
-            let Ok(value_type) = infer_expr_type(arg, value_types) else {
+            let Ok(value_type) = infer_expr_type_in("", arg, &ColumnTypes::Live(columns)) else {
                 return Ok(());
             };
             let column = match arg {
@@ -2435,7 +2430,7 @@ pub fn validate_join(
             ));
         }
         // The composed field's type, over both tables' columns: each column
-        // is renamed apart by side, since the two tables may share names.
+        // is typed by its own side, since the two tables may share names.
         join_field_value_type(def, field, left, joined)?;
     }
     check_join_collation_reads(def, join, left, joined)?;
@@ -2593,11 +2588,7 @@ fn check_join_field_expr<'a>(
             // The argument's type over its one side, and for a lone column
             // its declared modifier (an expression's `numeric` result has no
             // declared scale).
-            let value_types: HashMap<String, ValueType> = columns
-                .iter()
-                .map(|(name, info)| (name.clone(), info.value_type))
-                .collect();
-            let value_type = infer_expr_type(arg, &value_types)?;
+            let value_type = infer_expr_type_in(field, arg, &ColumnTypes::Live(columns))?;
             let (pg_type, typmod, trellis_target) = match arg {
                 Expr::SourceColumn { column, .. } => columns
                     .get(column)
@@ -2621,62 +2612,10 @@ fn check_join_field_expr<'a>(
     }
 }
 
-/// Rewrites every side-qualified column in `expr` to a bare name unique to
-/// its side, recording its type in `types`, so a composed field can be typed
-/// by the single-table inference.
-pub(crate) fn rename_join_columns(
-    expr: &mut Expr,
-    def: &TransformDef,
-    root: &HashMap<String, JoinColumnInfo>,
-    joined: &[&HashMap<String, JoinColumnInfo>],
-    types: &mut HashMap<String, ValueType>,
-) {
-    match expr {
-        Expr::SourceColumn { table, column, .. } => {
-            // Matched on the bare name as written. A table that is no
-            // joined one is the validator's to refuse; it is typed as the
-            // first joined table's here.
-            let side = super::join::spec(def)
-                .and_then(|join| super::join::side_of_written(def, join, table))
-                .unwrap_or(super::join::JOINED);
-            let prefix = match side {
-                Side::From => "l".to_string(),
-                Side::Joined(position) if position == super::join::Position::FIRST => {
-                    "r".to_string()
-                }
-                Side::Joined(position) => format!("r{}", position.index() + 1),
-            };
-            let columns = side_columns(side, root, joined);
-            let renamed = format!("{prefix}\u{1}{column}");
-            if let Some(info) = columns.get(column.as_str()) {
-                types.insert(renamed.clone(), info.value_type);
-            }
-            *expr = Expr::Column(renamed);
-        }
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            rename_join_columns(lhs, def, root, joined, types);
-            rename_join_columns(rhs, def, root, joined, types);
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            rename_join_columns(operand, def, root, joined, types);
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                rename_join_columns(arg, def, root, joined, types);
-            }
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children_mut() {
-                rename_join_columns(child, def, root, joined, types);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// The type of a `JOIN` definition's field that isn't a `GROUP BY` key, as
-/// [`validate_join`] infers it: each column typed by its own side, the
-/// single-table inference over the rest. Only meaningful for a definition
+/// [`validate_join`] infers it: each column typed by its own side
+/// ([`ColumnTypes::Join`]). The field is typed on its own: a `JOIN`'s field
+/// reads no other field by name. Only meaningful for a definition
 /// [`validate_join`] accepts.
 pub(crate) fn join_field_value_type(
     def: &TransformDef,
@@ -2684,22 +2623,8 @@ pub(crate) fn join_field_value_type(
     root: &HashMap<String, JoinColumnInfo>,
     joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<ValueType, ValidationError> {
-    let mut renamed = field.expr.clone();
-    let mut types = HashMap::new();
-    rename_join_columns(&mut renamed, def, root, joined, &mut types);
-    let types_by_field = infer_field_types(
-        &TransformDef {
-            fields: vec![super::ast::FieldDef {
-                name: field.name.clone(),
-                expr: renamed,
-            }],
-            key_space: KeySpace::Aggregate {
-                group_by: Vec::new(),
-            },
-            ..def.clone()
-        },
-        &types,
-    )?;
+    let columns = ColumnTypes::Join { def, root, joined };
+    let types_by_field = infer_fields(std::slice::from_ref(field), &columns)?;
     Ok(types_by_field
         .get(&field.name)
         .copied()
@@ -3520,20 +3445,79 @@ const GROUP_BY_KEY_TYPE_NAMES: &[&str] = &[
     "enum types",
 ];
 
+/// The columns type inference reads: what a column reference is typed as.
+/// Inference never refuses an unknown column (the validators resolve every
+/// read first), so a read neither variant knows is typed `numeric`, matching
+/// `eval`'s same fallback.
+#[derive(Clone, Copy)]
+pub(crate) enum ColumnTypes<'a> {
+    /// One table's columns by name, for a bare or a qualified read alike.
+    Source(&'a HashMap<String, ValueType>),
+    /// One table's live columns, read the same way.
+    Live(&'a HashMap<String, JoinColumnInfo>),
+    /// A `JOIN`'s tables (`root` the `FROM` table's live columns, `joined`
+    /// each joined table's, by position). A qualified read is typed by the
+    /// side its table names, so two tables may share a column name. A bare
+    /// read names no column: a `JOIN` qualifies every one.
+    Join {
+        def: &'a TransformDef,
+        root: &'a HashMap<String, JoinColumnInfo>,
+        joined: &'a [&'a HashMap<String, JoinColumnInfo>],
+    },
+}
+
+impl ColumnTypes<'_> {
+    /// The type of the bare column `name`, if it is one.
+    fn bare(&self, name: &str) -> Option<ValueType> {
+        match self {
+            ColumnTypes::Source(columns) => columns.get(name).copied(),
+            ColumnTypes::Live(columns) => columns.get(name).map(|info| info.value_type),
+            ColumnTypes::Join { .. } => None,
+        }
+    }
+
+    /// The type of `column` read through the table `table` (its bare name,
+    /// as written).
+    fn qualified(&self, table: &str, column: &str) -> Option<ValueType> {
+        match self {
+            ColumnTypes::Source(_) | ColumnTypes::Live(_) => self.bare(column),
+            ColumnTypes::Join { def, root, joined } => {
+                // A table that is no joined one is the validator's to
+                // refuse; it is typed as the first joined table's here.
+                let side = super::join::spec(def)
+                    .and_then(|join| super::join::side_of_written(def, join, table))
+                    .unwrap_or(super::join::JOINED);
+                side_columns(side, root, joined)
+                    .get(column)
+                    .map(|info| info.value_type)
+            }
+        }
+    }
+}
+
 pub(crate) fn infer_field_types(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<HashMap<String, ValueType>, ValidationError> {
-    let fields_by_name: HashMap<&str, &super::ast::FieldDef> =
-        def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    infer_fields(&def.fields, &ColumnTypes::Source(source_columns))
+}
 
-    let mut types: HashMap<String, ValueType> = HashMap::with_capacity(def.fields.len());
+/// The type of each of `fields`, each read of another of them by name typed
+/// as that field.
+fn infer_fields(
+    fields: &[super::ast::FieldDef],
+    columns: &ColumnTypes<'_>,
+) -> Result<HashMap<String, ValueType>, ValidationError> {
+    let fields_by_name: HashMap<&str, &super::ast::FieldDef> =
+        fields.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let mut types: HashMap<String, ValueType> = HashMap::with_capacity(fields.len());
     let mut in_progress: HashSet<String> = HashSet::new();
-    for field in &def.fields {
+    for field in fields {
         if !types.contains_key(&field.name) {
             let t = infer_field(
                 field,
-                source_columns,
+                columns,
                 &fields_by_name,
                 &mut types,
                 &mut in_progress,
@@ -3552,10 +3536,19 @@ pub(crate) fn infer_expr_type(
     expr: &Expr,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<ValueType, ValidationError> {
+    infer_expr_type_in("", expr, &ColumnTypes::Source(source_columns))
+}
+
+/// [`infer_expr_type`] over any [`ColumnTypes`], a refusal naming `field`.
+pub(crate) fn infer_expr_type_in(
+    field: &str,
+    expr: &Expr,
+    columns: &ColumnTypes<'_>,
+) -> Result<ValueType, ValidationError> {
     infer_expr(
         expr,
-        "",
-        source_columns,
+        field,
+        columns,
         &HashMap::new(),
         &mut HashMap::new(),
         &mut HashSet::new(),
@@ -3564,7 +3557,7 @@ pub(crate) fn infer_expr_type(
 
 fn infer_field(
     field: &super::ast::FieldDef,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -3580,13 +3573,13 @@ fn infer_field(
     // A field is its own target column, so Postgres plans it whatever reads
     // it. One that is only `NULL` is `text`, the type `CREATE TABLE AS`
     // gives an `unknown` column.
-    let t = if is_null_literal(&field.expr, &field.name, source_columns, fields_by_name) {
+    let t = if is_null_literal(&field.expr, &field.name, columns, fields_by_name) {
         Ok(ValueType::Text)
     } else {
         infer_expr(
             &field.expr,
             &field.name,
-            source_columns,
+            columns,
             fields_by_name,
             types,
             in_progress,
@@ -3606,7 +3599,7 @@ fn infer_field(
 fn is_null_literal(
     expr: &Expr,
     field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
 ) -> bool {
     let (mut expr, mut field_name) = (expr, field_name);
@@ -3616,7 +3609,7 @@ fn is_null_literal(
         match expr {
             Expr::Null => return true,
             Expr::Column(name) => {
-                let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+                let is_self_passthrough = name == field_name && columns.bare(name).is_some();
                 let Some(field) = fields_by_name
                     .get(name.as_str())
                     .filter(|_| !is_self_passthrough)
@@ -3639,18 +3632,18 @@ fn is_null_literal(
 fn infer_operand(
     expr: &Expr,
     field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
 ) -> Result<Option<ValueType>, ValidationError> {
-    if is_null_literal(expr, field_name, source_columns, fields_by_name) {
+    if is_null_literal(expr, field_name, columns, fields_by_name) {
         return Ok(None);
     }
     infer_expr(
         expr,
         field_name,
-        source_columns,
+        columns,
         fields_by_name,
         types,
         in_progress,
@@ -3726,14 +3719,14 @@ fn null_argument_refusal(
     name: &str,
     args: &[Expr],
     field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
 ) -> Option<ValidationError> {
     (name != "COALESCE"
         && name != "NULLIF"
         && args
             .iter()
-            .any(|arg| is_null_literal(arg, field_name, source_columns, fields_by_name)))
+            .any(|arg| is_null_literal(arg, field_name, columns, fields_by_name)))
     .then(|| {
         untyped_null(
             field_name,
@@ -3760,7 +3753,7 @@ fn infer_case(
     branches: &[(Expr, Expr)],
     otherwise: Option<&Expr>,
     field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -3787,7 +3780,7 @@ fn infer_case(
         let condition_t = infer_operand(
             condition,
             field_name,
-            source_columns,
+            columns,
             fields_by_name,
             types,
             in_progress,
@@ -3803,7 +3796,7 @@ fn infer_case(
         if let Some(result_t) = infer_operand(
             result,
             field_name,
-            source_columns,
+            columns,
             fields_by_name,
             types,
             in_progress,
@@ -3815,7 +3808,7 @@ fn infer_case(
         && let Some(otherwise_t) = infer_operand(
             otherwise,
             field_name,
-            source_columns,
+            columns,
             fields_by_name,
             types,
             in_progress,
@@ -3897,7 +3890,7 @@ fn comparison_type(
 fn infer_expr(
     expr: &Expr,
     field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -3906,31 +3899,21 @@ fn infer_expr(
         Expr::Column(name) => {
             // See the matching comment in `validate`: a field referencing a
             // source column of its own name is a passthrough, not a
-            // self-dependency, so it's resolved via `source_columns` below
+            // self-dependency, so it's resolved via `columns` below
             // rather than recursing into its own (in-progress) inference.
-            let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+            let is_self_passthrough = name == field_name && columns.bare(name).is_some();
             if !is_self_passthrough && let Some(calc_field) = fields_by_name.get(name.as_str()) {
-                return infer_field(
-                    calc_field,
-                    source_columns,
-                    fields_by_name,
-                    types,
-                    in_progress,
-                );
+                return infer_field(calc_field, columns, fields_by_name, types, in_progress);
             }
-            // Column resolution against `source_columns` already happened
+            // Column resolution against `columns` already happened
             // in `validate`; a name absent here (standalone use, e.g. tests
             // calling `infer_field_types` directly) defaults to Numeric,
             // matching `eval`'s same fallback.
-            Ok(source_columns
-                .get(name)
-                .copied()
-                .unwrap_or(ValueType::Numeric))
+            Ok(columns.bare(name).unwrap_or(ValueType::Numeric))
         }
-        // A qualified name is always the source column.
-        Expr::SourceColumn { column, .. } => Ok(source_columns
-            .get(column)
-            .copied()
+        // A qualified name is always a column of the table it names.
+        Expr::SourceColumn { table, column, .. } => Ok(columns
+            .qualified(table, column)
             .unwrap_or(ValueType::Numeric)),
         // An unadorned literal is typed exactly as Postgres's
         // own lexer types it — `integer` if it fits, else `bigint`, else
@@ -3943,7 +3926,7 @@ fn infer_expr(
         Expr::Null => Err(untyped_null(field_name, "this position")),
         Expr::FunctionCall { name, args }
             if let Some(refusal) =
-                null_argument_refusal(name, args, field_name, source_columns, fields_by_name) =>
+                null_argument_refusal(name, args, field_name, columns, fields_by_name) =>
         {
             Err(refusal)
         }
@@ -3983,7 +3966,7 @@ fn infer_expr(
                 let operand_t = infer_operand(
                     operand,
                     field_name,
-                    source_columns,
+                    columns,
                     fields_by_name,
                     types,
                     in_progress,
@@ -4004,7 +3987,7 @@ fn infer_expr(
             let operand_t = infer_operand(
                 operand,
                 field_name,
-                source_columns,
+                columns,
                 fields_by_name,
                 types,
                 in_progress,
@@ -4025,7 +4008,7 @@ fn infer_expr(
             infer_operand(
                 operand,
                 field_name,
-                source_columns,
+                columns,
                 fields_by_name,
                 types,
                 in_progress,
@@ -4039,7 +4022,7 @@ fn infer_expr(
             branches,
             otherwise.as_deref(),
             field_name,
-            source_columns,
+            columns,
             fields_by_name,
             types,
             in_progress,
@@ -4047,14 +4030,8 @@ fn infer_expr(
         Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
             let mut arg_types = [None; 2];
             for (slot, arg) in arg_types.iter_mut().zip(args) {
-                *slot = infer_operand(
-                    arg,
-                    field_name,
-                    source_columns,
-                    fields_by_name,
-                    types,
-                    in_progress,
-                )?;
+                *slot =
+                    infer_operand(arg, field_name, columns, fields_by_name, types, in_progress)?;
             }
             // Postgres resolves `NULLIF` as the `=` over its arguments: a
             // `NULL` one takes the other's type, and two are `text`.
@@ -4096,29 +4073,17 @@ fn infer_expr(
                 name,
                 args,
                 field_name,
-                source_columns,
+                columns,
                 fields_by_name,
                 types,
                 in_progress,
             )
         }
         Expr::BinaryOp { op, lhs, rhs } => {
-            let lhs_t = infer_operand(
-                lhs,
-                field_name,
-                source_columns,
-                fields_by_name,
-                types,
-                in_progress,
-            )?;
-            let rhs_t = infer_operand(
-                rhs,
-                field_name,
-                source_columns,
-                fields_by_name,
-                types,
-                in_progress,
-            )?;
+            let lhs_t =
+                infer_operand(lhs, field_name, columns, fields_by_name, types, in_progress)?;
+            let rhs_t =
+                infer_operand(rhs, field_name, columns, fields_by_name, types, in_progress)?;
             infer_binary_op(expr, *op, lhs, rhs, lhs_t, rhs_t, field_name)
         }
         Expr::Negate(operand) => {
@@ -4126,7 +4091,7 @@ fn infer_expr(
             let operand_t = infer_operand(
                 operand,
                 field_name,
-                source_columns,
+                columns,
                 fields_by_name,
                 types,
                 in_progress,
@@ -4148,13 +4113,13 @@ fn infer_expr(
         } => {
             // `CAST(NULL AS <type>)` is a `NULL` of that type, whatever the
             // type: no value is converted.
-            if is_null_literal(operand, field_name, source_columns, fields_by_name) {
+            if is_null_literal(operand, field_name, columns, fields_by_name) {
                 return Ok(*target);
             }
             let operand_t = infer_expr(
                 operand,
                 field_name,
-                source_columns,
+                columns,
                 fields_by_name,
                 types,
                 in_progress,
@@ -4185,14 +4150,8 @@ fn infer_expr(
             let mut common_type = None;
             for (i, arg) in args.iter().enumerate() {
                 // A `NULL` argument takes the type of the others.
-                let Some(arg_t) = infer_operand(
-                    arg,
-                    field_name,
-                    source_columns,
-                    fields_by_name,
-                    types,
-                    in_progress,
-                )?
+                let Some(arg_t) =
+                    infer_operand(arg, field_name, columns, fields_by_name, types, in_progress)?
                 else {
                     continue;
                 };
@@ -4240,7 +4199,7 @@ fn infer_expr(
                 return infer_overloaded_call(
                     expr,
                     field_name,
-                    source_columns,
+                    columns,
                     fields_by_name,
                     types,
                     in_progress,
@@ -4266,14 +4225,7 @@ fn infer_expr(
             };
             let Some(spec) = spec else {
                 for arg in args {
-                    infer_expr(
-                        arg,
-                        field_name,
-                        source_columns,
-                        fields_by_name,
-                        types,
-                        in_progress,
-                    )?;
+                    infer_expr(arg, field_name, columns, fields_by_name, types, in_progress)?;
                 }
                 return Ok(ValueType::Numeric);
             };
@@ -4295,27 +4247,14 @@ fn infer_expr(
             // through `registry::aggregate_result_type` below.
             if name == "COUNT" {
                 for arg in args {
-                    infer_expr(
-                        arg,
-                        field_name,
-                        source_columns,
-                        fields_by_name,
-                        types,
-                        in_progress,
-                    )?;
+                    infer_expr(arg, field_name, columns, fields_by_name, types, in_progress)?;
                 }
                 return Ok(spec.return_type);
             }
             let mut arg_types: Vec<ValueType> = Vec::with_capacity(args.len());
             for (i, (arg, expected)) in args.iter().zip(spec.arg_types).enumerate() {
-                let arg_t = infer_expr(
-                    arg,
-                    field_name,
-                    source_columns,
-                    fields_by_name,
-                    types,
-                    in_progress,
-                )?;
+                let arg_t =
+                    infer_expr(arg, field_name, columns, fields_by_name, types, in_progress)?;
                 // A `Numeric`-declared *aggregate* argument now
                 // means "any exact-numeric type" — `SUM`/`AVG`/`MIN`/`MAX`
                 // accept every exact-integer width as well as `numeric`, and
@@ -4664,7 +4603,7 @@ fn infer_date_part_call(
     name: &str,
     args: &[Expr],
     field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -4698,7 +4637,7 @@ fn infer_date_part_call(
     let operand_t = infer_expr(
         operand,
         field_name,
-        source_columns,
+        columns,
         fields_by_name,
         types,
         in_progress,
@@ -4789,7 +4728,7 @@ fn infer_date_part_call(
 fn infer_overloaded_call(
     expr: &Expr,
     field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
+    columns: &ColumnTypes<'_>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     types: &mut HashMap<String, ValueType>,
     in_progress: &mut HashSet<String>,
@@ -4813,7 +4752,7 @@ fn infer_overloaded_call(
         arg_types.push(infer_expr(
             arg,
             field_name,
-            source_columns,
+            columns,
             fields_by_name,
             types,
             in_progress,
@@ -7162,11 +7101,29 @@ mod tests {
         ] {
             check(select).unwrap();
         }
-        // A literal zero divisor is refused there as anywhere.
-        assert!(matches!(
-            check("orders.region AS region, SUM(CAST(items.qty AS numeric) / 0) AS s"),
-            Err(ValidationError::ConstantDivisorZero { .. })
-        ));
+        // A literal zero divisor is refused there as anywhere, naming the
+        // field and quoting the expression as written, qualified columns and
+        // all: inside an aggregate's argument and in a composed field alike.
+        for (select, quoted) in [
+            (
+                "orders.region AS region, SUM(CAST(items.qty AS numeric) / 0) AS s",
+                "(CAST(items.qty AS numeric) / 0)",
+            ),
+            (
+                "orders.region AS region, AVG(items.qty) / 0 AS s",
+                "(AVG(items.qty) / 0)",
+            ),
+        ] {
+            let err = check(select).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ValidationError::ConstantDivisorZero { ref field, ref text }
+                        if field == "s" && text == quoted
+                ),
+                "{select}: {err:?}"
+            );
+        }
     }
 
     #[test]
