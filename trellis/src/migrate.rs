@@ -150,32 +150,49 @@ pub(crate) async fn below_catalog_floor(
 }
 
 /// Whether some migration this binary carries hasn't run on `schema`'s
-/// instance: refinery's history lacks its version. A schema with no history
-/// has never been migrated, so no process of any version can be running on
-/// it, and reads as nothing pending: `migrate` creates it, and a background
-/// process started before that fails as it reads the catalog. A version the
-/// history has and this binary lacks doesn't count either: it is a newer
-/// release's, or a gap the attach refuses ([`catalog_floor::decide`]).
+/// instance ([`pending_migrations`] finds one).
 pub(crate) async fn migrations_pending(
     client: &impl tokio_postgres::GenericClient,
     schema: &str,
 ) -> Result<bool, tokio_postgres::Error> {
-    let history = format!("{}.refinery_schema_history", quote_ident(schema));
-    let carried: Vec<i32> = embedded::migrations::runner()
-        .get_migrations()
-        .iter()
-        .map(|migration| migration.version())
-        .collect();
+    Ok(!pending_migrations(client, schema).await?.is_empty())
+}
+
+/// The migrations this binary carries that haven't run on `schema`'s
+/// instance, by name (`V9__worker_versions`), oldest first: refinery's history
+/// lacks their versions. A schema with no history has never been migrated, so
+/// no process of any version can be running on it, and reads as nothing
+/// pending: `migrate` creates it, and a background process started before
+/// that fails as it reads the catalog. A version the history has and this
+/// binary lacks doesn't count either: it is a newer release's, or a gap the
+/// attach refuses ([`catalog_floor::decide`]).
+pub(crate) async fn pending_migrations(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
     if !has_history(client, schema).await? {
-        return Ok(false);
+        return Ok(Vec::new());
     }
+    let history = format!("{}.refinery_schema_history", quote_ident(schema));
     let applied: std::collections::HashSet<i32> = client
         .query(&format!("select version from {history}"), &[])
         .await?
         .iter()
         .map(|row| row.get(0))
         .collect();
-    Ok(carried.iter().any(|version| !applied.contains(version)))
+    let runner = embedded::migrations::runner();
+    let mut carried: Vec<&refinery::Migration> = runner
+        .get_migrations()
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version()))
+        .collect();
+    carried.sort_by_key(|migration| migration.version());
+    Ok(carried.into_iter().map(migration_name).collect())
+}
+
+/// A migration as the log and `status()` name it: `V9__worker_versions`.
+fn migration_name(migration: &refinery::Migration) -> String {
+    format!("V{}__{}", migration.version(), migration.name())
 }
 
 /// Whether `schema` has refinery's history table: it has been migrated.
@@ -212,6 +229,16 @@ pub async fn migrate(config: &Config) -> Result<(), Error> {
 /// [`migrate`] on `pool`'s connection settings rather than a pool of its own
 /// built from `config`.
 pub async fn migrate_with_pool(pool: &Pool, config: &Config) -> Result<(), Error> {
+    migrate_carrying(pool, config, &Migrations::embedded())
+        .await
+        .map(|_| ())
+}
+
+/// [`migrate_with_pool`], returning the migrations it ran, by name
+/// (`V9__worker_versions`), oldest first: none when another `migrate` ran
+/// them first. What a background process runs when it takes over with this
+/// binary's migrations pending (ADR-0023, rule 3).
+pub(crate) async fn migrate_reporting(pool: &Pool, config: &Config) -> Result<Vec<String>, Error> {
     migrate_carrying(pool, config, &Migrations::embedded()).await
 }
 
@@ -221,7 +248,7 @@ async fn migrate_carrying(
     pool: &Pool,
     config: &Config,
     migrations: &Migrations,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     // One attach at a time per database: the instance-conflict check reads
     // the markers other attaches write. The attach runs on the lock's own
     // session, so the lock can't end before it. See `identity::AttachLock`.
@@ -236,7 +263,7 @@ async fn attach(
     pool: &Pool,
     config: &Config,
     migrations: &Migrations,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     identity::prepare_attach(pg_client, config).await?;
 
     // ADR-0024: refuse a catalog this binary can't read before anything
@@ -276,7 +303,7 @@ async fn attach_under_handover(
     pool: &Pool,
     config: &Config,
     migrations: &Migrations,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     let observed = handover::observe(&*pg_client, config.schema(), true).await?;
     let other_version =
         match handover::decide(config.binary_version(), &observed, handover::Asker::Migrate) {
@@ -297,10 +324,10 @@ async fn attach_under_handover(
         {
             return Err(Error::OtherVersionLive(seen));
         }
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    run_migrations(pg_client, migrations).await?;
+    let ran = run_migrations(pg_client, migrations).await?;
 
     // ADR-0018, ADR-0024 rule 3: before anything reads a stored definition,
     // pause each one this binary can't run (its floor or its grammar is
@@ -319,7 +346,7 @@ async fn attach_under_handover(
     // defined (`crate::dump`): restore them now, with the catalog current.
     crate::dump::restore_queued(pool, config).await?;
 
-    Ok(())
+    Ok(ran)
 }
 
 /// Whether a schema dump's restore queue is waiting in `config`'s schema
@@ -343,14 +370,15 @@ async fn restore_queued(client: &tokio_postgres::Client, config: &Config) -> Res
 /// when the connection was opened: a migration that doesn't fit is stopped by
 /// the server and rolled back, and the ones before it stay applied, which is
 /// refinery's migration-at-a-time model anyway. Outside a call it is one
-/// `run_async`, as before.
+/// `run_async`, as before. Returns the migrations it ran, by name, oldest
+/// first.
 async fn run_migrations(
     pg_client: &mut tokio_postgres::Client,
     migrations: &Migrations,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     if crate::deadline::current().is_none() {
-        migrations.runner().run_async(pg_client).await?;
-        return Ok(());
+        let report = migrations.runner().run_async(pg_client).await?;
+        return Ok(applied_names(&report));
     }
     let mut versions: Vec<i32> = migrations
         .list
@@ -359,11 +387,11 @@ async fn run_migrations(
         .collect();
     versions.sort_unstable();
     let Some(&first) = versions.first() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     // The first pass creates refinery's history table, which the query for
     // what is applied needs.
-    run_up_to(pg_client, migrations, first).await?;
+    let mut ran = run_up_to(pg_client, migrations, first).await?;
     let applied: std::collections::HashSet<i32> = migrations
         .runner()
         .get_applied_migrations_async(pg_client)
@@ -372,11 +400,19 @@ async fn run_migrations(
         .map(|migration| migration.version())
         .collect();
     for version in versions.into_iter().filter(|v| !applied.contains(v)) {
-        run_up_to(pg_client, migrations, version).await?;
+        ran.extend(run_up_to(pg_client, migrations, version).await?);
     }
     // Nothing is pending now; this last pass is refinery's divergence check
     // over the whole set, as an unbounded run does.
-    run_up_to_latest(pg_client, migrations).await
+    run_up_to_latest(pg_client, migrations).await?;
+    Ok(ran)
+}
+
+/// The migrations a runner's `report` says it ran, by name, oldest first.
+fn applied_names(report: &refinery::Report) -> Vec<String> {
+    let mut applied: Vec<&refinery::Migration> = report.applied_migrations().iter().collect();
+    applied.sort_by_key(|migration| migration.version());
+    applied.into_iter().map(migration_name).collect()
 }
 
 /// The budget the running call has left, as this session's
@@ -394,14 +430,14 @@ async fn run_up_to(
     pg_client: &mut tokio_postgres::Client,
     migrations: &Migrations,
     version: i32,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     refresh_call_budget(pg_client).await?;
-    migrations
+    let report = migrations
         .runner()
         .set_target(refinery::Target::Version(version))
         .run_async(pg_client)
         .await?;
-    Ok(())
+    Ok(applied_names(&report))
 }
 
 async fn run_up_to_latest(

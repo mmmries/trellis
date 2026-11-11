@@ -30,6 +30,7 @@ the ways a target can go wrong without a stop, and names the repair for each.
 | `capture_wait` | Installing or widening capture is waiting for a table lock | Wait for the lock holder it names |
 | A `self_check` report with divergences | The target differs from a recompute of it | Find the gap in [known correctness gaps](known-correctness-gaps.md) and use its repair |
 | `version_handover`, and state-changing calls refused with the `version_handover` code | A Trellis process of another version is live on the instance: this version's background processes stand by and its changes refuse ([version handover](decisions/0023-version-handover.md)) | Stop the other version's processes; this version takes over within a standby poll (5 seconds), or the reclaim TTL (30 seconds) after a process killed without a clean shutdown ([rolling deploys](embedding.md#rolling-deploys)) |
+| `migrations_pending` with `cannot_run`, or `status()` refused with the `version_handover` code naming pending migrations | This version's migrations haven't run: a process of another version is still live, or this process's `migrate` was refused (`cannot_run` says why, often a role that can't alter Trellis's tables). Its background processes stand by, checking every 5 seconds, and try a refused `migrate` again a minute later | Stop the other version's processes; for a refusal, fix its cause or run `migrate` with a role that can ([upgrading](upgrading.md#upgrading)) |
 | `below_catalog_floor`, and `migrate` and state-changing calls refused with the `version_floor` code | The catalog floor, the oldest Trellis version that can read the catalog, is above this version: a later release migrated the database ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). This version's background processes stand by meanwhile | Run the version the message names, or a later one ([the catalog floor](upgrading.md#the-catalog-floor)) |
 
 ## Repair tools
@@ -365,9 +366,10 @@ each one costs and what to expect around it
 
 * **Upgrading or rolling back Trellis:** follow
   [upgrading and rolling back](upgrading.md). In short, start the new version
-  beside the old (it stands by, and `status()` shows `version_handover`), stop
-  the old, and migrate (`trellis run` does it by itself; an embedder runs
-  `migrate` after the old version has stopped). Before rolling back, drop,
+  beside the old (it stands by, and `status()` shows `version_handover`), and
+  stop the old: the new version runs its migrations itself and takes over (a
+  worker whose role can't alter Trellis's tables stands by until another role
+  runs `migrate`, and `status()` shows why in `migrations_pending`). Before rolling back, drop,
   under the newer release, each definition whose `floor` is above the release
   you roll back to; the older release pauses any you leave, and only a
   release that meets the floor resumes or drops them

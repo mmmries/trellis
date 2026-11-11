@@ -169,7 +169,8 @@ async fn a_second_version_stands_by_then_takes_over_once_the_first_deregisters()
     assert!(
         handover_pass_as(&pool, &config(&db).with_binary_version(OTHER), "next-pass")
             .await
-            .expect("pass"),
+            .expect("pass")
+            .took_over,
         "nothing of another version is live any more"
     );
     new_definer
@@ -216,7 +217,8 @@ async fn the_pre_0_2_0_shapes_hold_this_version_back() {
     assert!(
         !handover_pass_as(&pool, &config(&db), "probe")
             .await
-            .expect("pass"),
+            .expect("pass")
+            .took_over,
         "a background process stands by"
     );
     raw.execute("delete from worker_registry", &[])
@@ -232,27 +234,23 @@ async fn the_pre_0_2_0_shapes_hold_this_version_back() {
         !handover_pass_as(&pool, &config(&db), "probe")
             .await
             .expect("pass")
+            .took_over
     );
     leader.release().await.expect("the old leader stops");
 
     assert!(
         handover_pass_as(&pool, &config(&db), "probe")
             .await
-            .expect("pass"),
+            .expect("pass")
+            .took_over,
         "nothing else is live"
     );
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Rule 3: a migration this binary carries is never run while a Trellis
-/// process is live; `migrate` refuses instead and runs it once nothing is.
-/// The database is put back to before migration V9 (every migration after
-/// it undone too), with a live row of the release that wrote it.
-#[tokio::test]
-async fn a_pending_migration_is_not_run_while_a_process_is_live() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = raw(&db).await;
+/// Puts the database back to before migration V9 (every migration after it
+/// undone too): the catalog a release before 0.2.0 left.
+async fn rewind_to_v8(raw: &Client) {
     raw.batch_execute(
         "alter table worker_registry drop column version, drop column staging, \
            drop column drain, drop column standby, drop column staging_pid; \
@@ -263,50 +261,75 @@ async fn a_pending_migration_is_not_run_while_a_process_is_live() {
          alter table partition_corrections drop constraint partition_corrections_cause_check; \
          drop table definition_keys; \
          update trellis_instance set instance_format_version = 1; \
-         delete from refinery_schema_history where version > 8; \
-         insert into worker_registry (worker_id) values ('trellis-old-1-00')",
+         delete from refinery_schema_history where version > 8",
     )
     .await
-    .expect("a database at V8 with a live v0.1.0 drain worker");
-    let history = async || -> i64 {
-        raw.query_one(
-            "select count(*) from refinery_schema_history where version = 9",
-            &[],
-        )
-        .await
-        .expect("history")
-        .get(0)
-    };
+    .expect("a database at V8");
+}
+
+/// A live registry row of a release before 0.2.0 (it records no version).
+async fn old_worker_live(raw: &Client) {
+    raw.execute(
+        "insert into worker_registry (worker_id) values ('trellis-old-1-00')",
+        &[],
+    )
+    .await
+    .expect("a live v0.1.0 drain worker");
+}
+
+/// Whether migration V9 has run.
+async fn v9_ran(raw: &Client) -> bool {
+    raw.query_one(
+        "select exists (select 1 from refinery_schema_history where version = 9)",
+        &[],
+    )
+    .await
+    .expect("history")
+    .get(0)
+}
+
+/// Rules 3 and 4: a migration this binary carries is never run while a
+/// Trellis process is live; `migrate` refuses instead, and a background
+/// process stands by and migrates nothing. An explicit `migrate` still runs
+/// it once nothing is live, and the next pass then finds nothing pending and
+/// takes over without migrating.
+#[tokio::test]
+async fn a_pending_migration_is_not_run_while_a_process_is_live() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    old_worker_live(&raw).await;
 
     let trellis = Trellis::connect(config(&db), TrellisOptions::default())
         .await
         .expect("connect");
     let err = refused(trellis.migrate().await);
     assert!(err.to_string().contains("migrations are pending"), "{err}");
-    assert_eq!(history().await, 0, "V9 did not run");
-    // A background process waits too, and registers nothing meanwhile.
+    assert!(!v9_ran(&raw).await, "V9 did not run");
+    // A background process waits too, migrates nothing, and registers
+    // nothing meanwhile.
     let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
-    assert!(
-        !handover_pass_as(&pool, &config(&db), "probe")
-            .await
-            .expect("pass")
-    );
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    assert!(!v9_ran(&raw).await, "V9 did not run");
+    let rows: i64 = raw
+        .query_one("select count(*) from worker_registry", &[])
+        .await
+        .expect("registry")
+        .get(0);
+    assert_eq!(rows, 1, "only the old worker's row");
 
     raw.execute("delete from worker_registry", &[])
         .await
         .expect("the old worker stops");
-    // Nothing is live, but the migration hasn't run: a background process
-    // still waits for it.
-    assert!(
-        !handover_pass_as(&pool, &config(&db), "probe")
-            .await
-            .expect("pass")
-    );
     trellis
         .migrate()
         .await
         .expect("migrates once nothing is live");
-    assert_eq!(history().await, 1, "V9 ran");
+    assert!(v9_ran(&raw).await, "V9 ran");
     // V11 recorded the floor and set the marker's retired format version to
     // 2 on a catalog it upgraded, which releases before 0.2.0 refuse.
     let marker = raw
@@ -319,12 +342,353 @@ async fn a_pending_migration_is_not_run_while_a_process_is_live() {
         .expect("marker");
     assert_eq!(marker.get::<_, String>(0), "0.2.0");
     assert_eq!(marker.get::<_, i32>(1), 2);
-    assert!(
-        handover_pass_as(&pool, &config(&db), "probe")
-            .await
-            .expect("pass")
-    );
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over && pass.migrated.is_empty(), "{pass:?}");
     trellis.shutdown().await.expect("shutdown");
+}
+
+/// Rules 1, 3 and 7 across a deploy with no `migrate` step: while the old
+/// release is live, a background process of this one stands by and runs
+/// nothing, and its reads say which migrations are pending; once the old
+/// release is gone, its next pass runs them, takes over and logs which ran.
+#[tokio::test]
+async fn a_background_process_migrates_itself_once_the_old_version_is_gone() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    old_worker_live(&raw).await;
+
+    // Its first pass, in `connect`, stands it by.
+    let worker = Trellis::connect(
+        config(&db),
+        TrellisOptions {
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a standby connects without error");
+    assert!(
+        !v9_ran(&raw).await,
+        "nothing migrates beside the old worker"
+    );
+    // The V8 catalog lacks what the migrations add, so a read refuses with
+    // the pending migrations rather than a bare SQL error.
+    let err = refused(worker.status("anything").await);
+    let TrellisError::MigrationsPending { pending, .. } = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(
+        pending.migrations.first().map(String::as_str),
+        Some("V9__worker_versions")
+    );
+    assert_eq!(pending.cannot_run, None, "{pending:?}");
+
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    // The worker stops before the old one does, so its own handover task
+    // can't run the migrations before the pass this test steps.
+    worker.shutdown().await.expect("shutdown");
+
+    raw.execute("delete from worker_registry", &[])
+        .await
+        .expect("the old worker stops");
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over, "{pass:?}");
+    assert_eq!(
+        pass.migrated.first().map(String::as_str),
+        Some("V9__worker_versions")
+    );
+    assert!(
+        pass.migrated.len() > 1,
+        "every pending migration ran: {pass:?}"
+    );
+    let log = pass.log.expect("the takeover is logged");
+    assert!(
+        log.contains("ran this binary's pending migrations (V9__worker_versions, "),
+        "{log}"
+    );
+    assert!(v9_ran(&raw).await);
+    // The ordinary `migrate` ran: V11 recorded the floor and the marker.
+    let marker = raw
+        .query_one(
+            "select (select version from catalog_floor), instance_format_version \
+             from trellis_instance",
+            &[],
+        )
+        .await
+        .expect("marker");
+    assert_eq!(marker.get::<_, String>(0), "0.2.0");
+    assert_eq!(marker.get::<_, i32>(1), 2);
+    let rows = registry(&raw).await;
+    assert!(
+        rows.iter().any(|(id, version, standby)| id == "probe"
+            && version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+            && !standby),
+        "the process registered as taken over: {rows:?}"
+    );
+    // Nothing is pending now, so reads work and report nothing pending.
+    let reader = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    assert!(reader.definitions().await.expect("listing").is_empty());
+    assert_eq!(reader.status("anything").await.expect("status"), None);
+    reader.shutdown().await.expect("shutdown");
+}
+
+/// Rule 1: two background processes of this version that find the
+/// migrations pending at once migrate one after the other under the locks:
+/// one runs them, the other finds nothing left, and both take over.
+#[tokio::test]
+async fn two_processes_racing_to_migrate_run_the_migrations_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    let cfg = config(&db);
+    let (first, second) = tokio::join!(
+        handover_pass_as(&pool, &cfg, "first"),
+        handover_pass_as(&pool, &cfg, "second"),
+    );
+    let (first, second) = (first.expect("pass"), second.expect("pass"));
+    assert!(first.took_over && second.took_over, "{first:?} {second:?}");
+    assert_eq!(
+        [&first, &second]
+            .iter()
+            .filter(|pass| !pass.migrated.is_empty())
+            .count(),
+        1,
+        "exactly one ran the migrations: {first:?} {second:?}"
+    );
+    let ran: i64 = raw
+        .query_one(
+            "select count(*) from refinery_schema_history where version = 9",
+            &[],
+        )
+        .await
+        .expect("history")
+        .get(0);
+    assert_eq!(ran, 1);
+    assert_eq!(registry(&raw).await.len(), 2, "both registered");
+}
+
+/// Rule 2: a process of the old release that goes live after a pass decided
+/// to migrate, but before the migration took the handover lock, holds it
+/// back: `migrate` decides again under the lock, runs nothing, and the
+/// process stands by. The pass is held between its decision and `migrate` by
+/// holding the attach lock `migrate` takes first; it is seen waiting on that
+/// lock in `pg_locks`.
+#[tokio::test]
+async fn a_process_that_goes_live_before_the_migration_holds_it_back() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    let holder = self::raw(&db).await;
+    holder
+        .execute(
+            "select pg_advisory_lock($1)",
+            &[&trellis::identity::ATTACH_LOCK_KEY],
+        )
+        .await
+        .expect("hold the attach lock");
+
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    let cfg = config(&db);
+    let pass = tokio::spawn(async move { handover_pass_as(&pool, &cfg, "probe").await });
+    // The pass decided (nothing live) and waits in `migrate` for the lock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let waiting: bool = raw
+            .query_one(
+                "select exists (select 1 from pg_locks \
+                 where locktype = 'advisory' and not granted \
+                 and database = (select oid from pg_database \
+                                 where datname = current_database()))",
+                &[],
+            )
+            .await
+            .expect("pg_locks")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pass never reached migrate"
+        );
+        tokio::task::yield_now().await;
+    }
+    old_worker_live(&raw).await;
+    holder
+        .execute(
+            "select pg_advisory_unlock($1)",
+            &[&trellis::identity::ATTACH_LOCK_KEY],
+        )
+        .await
+        .expect("release it");
+
+    let pass = pass.await.expect("pass task").expect("pass");
+    assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    // A version that went live meanwhile is no refusal to back off from: the
+    // next pass checks again.
+    assert_eq!(pass.retry_in, None, "{pass:?}");
+    assert!(
+        !v9_ran(&raw).await,
+        "nothing migrated beside the old worker"
+    );
+    let log = pass.log.expect("the standby is logged");
+    assert!(log.contains("trellis-old-1-00"), "{log}");
+}
+
+/// Rule 3's refusals: a role that can read and write Trellis's tables but
+/// not alter them can't run the migrations, so its background process
+/// stands by and says why, in its log and in `status()`, and tries again
+/// every pass; once another role runs `migrate`, it takes over.
+#[tokio::test]
+async fn a_role_that_cannot_migrate_stands_by_and_says_so() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    let role = format!("handover_dml_{}", std::process::id());
+    let grants = format!(
+        "grant usage on schema {schema} to {role}; \
+         grant select, insert, update, delete on all tables in schema {schema} to {role}; \
+         grant usage, select on all sequences in schema {schema} to {role}",
+        schema = trellis::config::DEFAULT_SCHEMA
+    );
+    raw.batch_execute(&format!("create role {role} login; {grants}"))
+        .await
+        .expect("a role with DML rights only");
+    assert!(db.dsn().contains("user=postgres"), "{}", db.dsn());
+    let as_role = Config::from_dsn(db.dsn().replace("user=postgres", &format!("user={role}")))
+        .expect("config");
+
+    let worker = Trellis::connect(
+        as_role.clone(),
+        TrellisOptions {
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a standby connects without error");
+    assert!(!v9_ran(&raw).await);
+    let err = refused(worker.status("anything").await);
+    let TrellisError::MigrationsPending { pending, .. } = &err else {
+        panic!("{err:?}");
+    };
+    let reason = pending
+        .cannot_run
+        .as_deref()
+        .expect("its pass tried and says why");
+    assert!(reason.contains("this role cannot run them"), "{reason}");
+
+    let pool = trellis::pool::Pool::new(&as_role).expect("pool");
+    let pass = handover_pass_as(&pool, &as_role, "probe")
+        .await
+        .expect("a refused migrate is a standby, not an error");
+    assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    // It waits on an operator, so the process tries again after a minute,
+    // not every standby poll.
+    assert!(
+        pass.retry_in
+            .is_some_and(|wait| wait > std::time::Duration::from_secs(30)),
+        "{pass:?}"
+    );
+    let log = pass.log.expect("the standby is logged");
+    assert!(log.contains("this role cannot run them"), "{log}");
+    assert!(log.contains("V9__worker_versions"), "{log}");
+
+    Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect as the owner")
+        .migrate()
+        .await
+        .expect("the owner migrates");
+    raw.batch_execute(&grants)
+        .await
+        .expect("grants on the new tables");
+    let pass = handover_pass_as(&pool, &as_role, "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    worker.shutdown().await.expect("shutdown");
+}
+
+/// Rule 3: the automatic migration is the ordinary `migrate`, so it refuses
+/// a history that doesn't fit this binary's migrations (a changed
+/// migration), and the process stands by and says why until it fits.
+#[tokio::test]
+async fn a_changed_migration_stands_the_process_by() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    let checksum: String = raw
+        .query_one(
+            "select checksum from refinery_schema_history where version = 1",
+            &[],
+        )
+        .await
+        .expect("history")
+        .get(0);
+    raw.execute(
+        "update refinery_schema_history set checksum = '1' where version = 1",
+        &[],
+    )
+    .await
+    .expect("a changed migration");
+
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(!pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    let log = pass.log.expect("the standby is logged");
+    assert!(log.contains("migrate refused"), "{log}");
+    assert!(pass.retry_in.is_some(), "a changed migration backs off");
+    assert!(!v9_ran(&raw).await);
+
+    raw.execute(
+        "update refinery_schema_history set checksum = $1 where version = 1",
+        &[&checksum],
+    )
+    .await
+    .expect("the history fits again");
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over && !pass.migrated.is_empty(), "{pass:?}");
+}
+
+/// Rule 5: a define-only handle runs no background work, so nothing
+/// migrates on its behalf: connecting leaves the migrations pending.
+#[tokio::test]
+async fn a_define_only_handle_never_migrates() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    let definer = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    refused(definer.status("anything").await);
+    assert!(!v9_ran(&raw).await);
+    definer.migrate().await.expect("an explicit migrate");
+    assert!(v9_ran(&raw).await);
+    definer.shutdown().await.expect("shutdown");
 }
 
 /// While another version is live and nothing is pending, `migrate` changes
@@ -431,7 +795,8 @@ async fn processes_of_one_version_never_stand_by() {
     assert!(
         handover_pass_as(&pool, &config(&db), "probe")
             .await
-            .expect("pass"),
+            .expect("pass")
+            .took_over,
         "the leader's lock is matched to its row of this version"
     );
     let err = second
@@ -516,6 +881,7 @@ async fn the_pass_and_migrate_wait_for_the_handover_lock() {
         handover_pass_as(&pool, &config(&db), "probe")
             .await
             .expect("pass")
+            .took_over
     );
     trellis.migrate().await.expect("migrate");
     trellis.shutdown().await.expect("shutdown");
@@ -627,7 +993,8 @@ async fn a_handle_below_the_catalog_floor_stands_by_and_refuses_until_it_meets_i
     assert!(
         !handover_pass_as(&pool, &config(&db), "probe")
             .await
-            .expect("pass"),
+            .expect("pass")
+            .took_over,
         "every standby poll checks the floor again"
     );
 
@@ -694,7 +1061,8 @@ async fn a_handle_below_the_catalog_floor_stands_by_and_refuses_until_it_meets_i
     assert!(
         handover_pass_as(&pool, &config(&db), "next-pass")
             .await
-            .expect("pass"),
+            .expect("pass")
+            .took_over,
         "this version's next pass takes over"
     );
     worker

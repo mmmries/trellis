@@ -750,6 +750,17 @@ A process killed without a clean shutdown keeps counting until its registry row
 ages out, up to the reclaim TTL of 30 seconds. The Elixir and Ruby bindings
 report it as `version_handover`.
 
+While this binary's migrations haven't run on the instance,
+`status().migrations_pending` is set: it names them, and `cannot_run` says why
+this handle's background process couldn't run them, when it tried and was
+refused (its role can't alter Trellis's tables, say), with the remedy. A
+background process runs them itself once no process of another version is
+live, then logs an info line naming the migrations that ran as it takes over.
+Where the catalog can't be read until they run, `status()` and
+`definitions()` refuse with the `version_handover` code, naming them, and
+`trellis status` prints them on a `Migrations pending:` line. The Elixir and
+Ruby bindings report the refusal; they don't carry `migrations_pending` yet.
+
 Every definition's status also carries its `floor`, the oldest Trellis release
 that can run it ([defining transforms — Floors](transforms.md#floors)), which
 `trellis status` prints as `floor=` and the bindings report as `floor`.

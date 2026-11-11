@@ -14,4 +14,4 @@ publish = false
 [dependencies]
 # Named `engine` so publish-packages.sh's rename of `trellis = { path = ... }` never matches it.
 engine = { package = "trellis", path = "TRELLIS_PATH" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }

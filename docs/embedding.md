@@ -49,11 +49,12 @@ Four rules sit behind that table, and they hold for each instance separately:
 * **At least one process runs drain threads for each instance.** Drain threads
   take their work from a queue in the database, so any number of processes can
   run them; the dedicated worker's own are usually enough.
-* **`migrate` runs before the worker connects.** The staging worker reads
-  Trellis's own tables as it starts, so a `staging: true` connect to a
-  schema `migrate` hasn't created yet fails with a `not_found` error. One
-  connected to a schema an older release migrated stands by until `migrate`
-  has run this release's migrations ([rolling deploys](#rolling-deploys)).
+* **`migrate` creates the schema before the first worker connects.** The
+  staging worker reads Trellis's own tables as it starts, so a
+  `staging: true` connect to a schema `migrate` hasn't created yet fails with
+  a `not_found` error. A worker connected to a schema an older release
+  migrated runs this release's migrations itself, once no process of the
+  older release is live ([rolling deploys](#rolling-deploys)).
 * **Nothing errors when a rule is broken.** The transforms just never go
   `live` ([the silent-stall hazard](#the-silent-stall-hazard), and
   the health checks that catch it).
@@ -112,10 +113,12 @@ harmless; each one polls every 5 seconds.
 **Across a version boundary** the same deploy works, and the two versions never
 run side by side ([version handover](decisions/0023-version-handover.md)).
 Every process with `staging` or `drain_threads` registers its Trellis version,
-and versions match exactly: any change of release is a handover.
-[Upgrading and rolling back](upgrading.md) gives the steps, including where
-`migrate` goes in the deploy, and what rolling the application back does to
-its definitions. While the new version stands by, the refusal of
+and versions match exactly: any change of release is a handover. When the old
+version's last process has gone, a process of the new one runs the new
+release's migrations, if it carries any, and takes over, with no deploy step.
+[Upgrading and rolling back](upgrading.md) gives the steps, including when a
+deploy step that runs `migrate` still helps, and what rolling the application
+back does to its definitions. While the new version stands by, the refusal of
 state-changing calls covers a web process's handle as much as the worker's;
 `status()`, the listings and the health checks keep working. A killed
 process's registry row stays live for up to the 30-second reclaim TTL. An old
@@ -781,7 +784,10 @@ So keep Trellis out of the host's transaction, in this order:
 
 1. The host migrations that create or change source tables run and commit.
 2. `migrate` creates or upgrades Trellis's own tables. It's idempotent, so
-   running it on every deploy is fine.
+   running it on every deploy is fine. A worker of a new release runs it by
+   itself as it takes over, so a deploy only needs this step to create the
+   schema, to define in step 3 before the worker has taken over, or when
+   the worker's role can't alter Trellis's tables.
 3. The transforms are defined, once each, outside any host transaction.
 4. The dedicated worker starts or restarts. It doesn't need the definitions
    to exist first; it picks each one up on its next pass.
@@ -790,7 +796,8 @@ In a deploy that changes the Trellis release, steps 2 and 3 refuse with the
 `version_handover` code while a process of the old release is live: `migrate`
 when the new release carries a migration, and every define, `ALTER`, `PAUSE`,
 `RESUME` and `DROP` ([rolling deploys](#rolling-deploys)). Run them once the
-old release's processes have stopped.
+old release's processes have stopped, or leave step 2 to the new release's
+worker, which migrates as it takes over.
 
 Step 3 can be a deploy step of its own, run after migrations, or a migration
 of its own with the host's transaction turned off (`@disable_ddl_transaction
@@ -844,8 +851,9 @@ Ecto doesn't start the application to migrate, so each helper connects a
 handle of its own from the repo's `:trellis` configuration
 (`config :my_app, MyApp.Repo, trellis: [url: database_url]`), with the
 defaults, and runs `migrate` on it first. That covers step 2 whenever a
-migration defines something. To upgrade Trellis's tables on a deploy that
-doesn't, run `migrate` in the release's migration task too:
+migration defines something. The worker upgrades Trellis's tables on a deploy
+that doesn't; to have them upgraded before the application starts (or by a
+role the worker's isn't), run `migrate` in the release's migration task too:
 
 ```elixir
 defmodule MyApp.Release do

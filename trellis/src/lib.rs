@@ -233,7 +233,7 @@ pub use config::Config;
 pub use dump::SchemaDump;
 pub use error::Error;
 pub use error_code::ErrorCode;
-pub use handover::{OtherProcess, OtherVersionLive};
+pub use handover::{MigrationsPending, OtherProcess, OtherVersionLive};
 pub use metrics::Metrics;
 pub use migrate::migrate;
 #[cfg(feature = "otlp")]

@@ -23,15 +23,23 @@ Trellis:
    application's own transactions.
 2. **Stop the old release.** The new one takes over at its next poll, or up to
    the 30-second reclaim TTL after a process killed without a clean shutdown.
-3. **Run `migrate`** when the new release carries a migration. `trellis run`
-   migrates by itself once the old release has stopped. An embedded fleet runs
-   `migrate` (`bin/rails trellis:migrate`, or an Elixir release task that
-   calls `Trellis.migrate!`) in a deploy step after the old processes are
-   gone: while one is live and a migration is pending, `migrate` refuses with
-   the `version_handover` code and the new release's background processes
-   wait for it. With no migration pending, `migrate` beside the old release
-   changes nothing: it succeeds, or refuses with the same code when it would
-   have to pause a definition.
+   When the new release carries a migration, it migrates first, by itself:
+   one of its background processes (a `trellis run`, or an embedded handle
+   with `staging` or `drain_threads`) runs `migrate`, logs which migrations
+   ran, and takes over in the same pass. While a process of the old release
+   is live, nothing migrates.
+
+A deploy step that runs `migrate` (`bin/rails trellis:migrate`, an Elixir
+release task that calls `Trellis.migrate!`) still works, and is still how a
+release's migrations run without starting a worker. Run it after the old
+processes are gone: while one is live and a migration is pending, `migrate`
+refuses with the `version_handover` code. With no migration pending, `migrate`
+beside the old release changes nothing: it succeeds, or refuses with the same
+code when it would have to pause a definition. Keep the step when your
+workers' database role can read and write Trellis's tables but not alter them:
+their `migrate` is refused, and they stand by until a role that can runs it.
+A process that can't migrate logs why, `status()` carries it in
+`migrations_pending.cannot_run`, and the process tries again every minute.
 
 A state-changing call an old-release process is in the middle of when the new
 release takes over, or when `migrate` raises the [catalog
@@ -44,7 +52,11 @@ this binary's version and each live process of the old release by worker id
 ([observability](observability.md#another-version-is-live)); `trellis status`
 prints it as a `Standing by:` line above the definitions, and `trellis run`
 prints `trellis standing by: …`. The definitions keep the statuses the old
-release gives them.
+release gives them. While the new release's migrations are pending,
+`status()` carries `migrations_pending`, naming them; where the catalog can't
+be read until they run, `status()` and `definitions()` refuse with the
+`version_handover` code and the same names instead, and `trellis status`
+prints them on a `Migrations pending:` line.
 
 After the takeover, a definition whose stored text the new grammar can't parse
 pauses, with a `capture_failure` naming the refusal and the remedy: `DROP
@@ -265,11 +277,14 @@ the catalog with an instance format version the older release doesn't know
 (instance format version 2)`). `trellis run`, `trellis apply`,
 `bin/rails trellis:migrate`, the `Trellis::Migration` and `Trellis.Migration`
 helpers and a release task that calls `Trellis.migrate!` all migrate first, so
-each one stops with that error. A handle that connects without migrating, such
-as a worker the application starts at boot, checks nothing and runs on the
-newer database.
+each one stops with that error. A handle of such a release that connects
+without migrating, such as a worker the application starts at boot, checks
+nothing and runs on the newer database.
 A rollback deploy's `bin/rails db:migrate` or `mix ecto.migrate` doesn't stop
 it: every migration of the rolled-back application has already run, so no
-helper runs. Keep an explicit Trellis `migrate` step in your deploy, as in
+helper runs. When a rollback to a release before 0.2.0 is possible, keep an
+explicit Trellis `migrate` step in your deploy, as in
 [Upgrading](#upgrading), so that a rollback deploy stops at it, and restore the
-backup before starting the older release.
+backup before starting the older release. From 0.2.0 on, the
+[catalog floor](#the-catalog-floor) guards every handle, a worker that never
+migrates included.

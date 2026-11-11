@@ -41,7 +41,7 @@ use trellis::{
     CaptureFailure, CaptureFailureKind, Config, CorrectingNode, DefinitionSummary, DrainFailure,
     ExtremeIndexGap, IndexRole, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus,
     OneToOneBuildStep, QuarantineEntry, QuarantineState, QuarantineTarget, SourceIndexGap, Trellis,
-    TrellisOptions,
+    TrellisError, TrellisOptions,
 };
 
 use super::release::shell_quote;
@@ -111,7 +111,18 @@ pub async fn run(_args: Args, database_url: Option<String>) -> Result<String, St
 /// Builds the full human-readable status report: definitions, poisoned keys,
 /// then the quarantined source rows.
 async fn report(trellis: &Trellis) -> Result<String, String> {
-    let definitions = trellis.definitions().await.map_err(|err| err.to_string())?;
+    let definitions = match trellis.definitions().await {
+        Ok(definitions) => definitions,
+        // ADR-0023: this binary's migrations haven't run, and the catalog
+        // can't be read until they do.
+        Err(TrellisError::MigrationsPending { pending, error }) => {
+            return Ok(format!(
+                "Migrations pending: {pending}\n\nThe definitions can't be read until they \
+                 run: {error}\n"
+            ));
+        }
+        Err(err) => return Err(err.to_string()),
+    };
     // `definitions()` doesn't carry a drain failure, the source index gaps
     // or the nodes under correction, so each definition's own status
     // is read for them, by the qualified target name `definitions()` lists.
@@ -124,6 +135,8 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     let mut handover = None;
     // ADR-0024: set while this binary is below the catalog floor.
     let mut below_floor = None;
+    // ADR-0023: set while this binary's migrations haven't run.
+    let mut pending = None;
     for def in definitions {
         let status = trellis
             .status(&def.target_table)
@@ -134,6 +147,9 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
         }
         if below_floor.is_none() {
             below_floor = status.as_ref().and_then(|s| s.below_catalog_floor.clone());
+        }
+        if pending.is_none() {
+            pending = status.as_ref().and_then(|s| s.migrations_pending.clone());
         }
         let paused_columns = paused_columns_of(&quarantined, &def.target_table);
         let mut warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
@@ -166,6 +182,9 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     }
     if let Some(seen) = handover {
         out.push_str(&format!("Standing by: {seen}\n\n"));
+    }
+    if let Some(pending) = pending {
+        out.push_str(&format!("Migrations pending: {pending}\n\n"));
     }
     out.push_str("Transform definitions:\n");
     out.push_str(&format_definitions(&listed));

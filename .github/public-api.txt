@@ -171,6 +171,7 @@ struct HeldKeys
 struct HiddenTableSize
 struct JoinStatus
 struct Metrics
+struct MigrationsPending
 struct OtherProcess
 struct OtherVersionLive
 struct PartialsWarning
