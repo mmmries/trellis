@@ -4547,7 +4547,7 @@ async fn complete_resume(
     .await?;
     // A definition paused by a logical restore starts over on this
     // database's own positions. The rebuild below keeps the ledger's
-    // `__applied_lsn` (B4), which is right for an ordinary one and would skip
+    // `__applied_lsn`, which is right for an ordinary one and would skip
     // every later change to a key the dump held.
     if restored {
         reset_ordering_state(txn, schema, id, &definition.target_table).await?;
@@ -4635,7 +4635,7 @@ async fn complete_resume(
 
     // The staging worker's next pass starts the rebuild from
     // `waiting_to_backfill` (`super::build::start_ready_builds`): a 1-1 build
-    // runs over the ledger the freeze left (B4), and its sweep drops the keys
+    // runs over the ledger the freeze left, and its sweep drops the keys
     // deleted meanwhile; a group-basis aggregate's or a `JOIN`'s plan job
     // rewrites its groups.
     // Release every key this definition holds. The fresh build below

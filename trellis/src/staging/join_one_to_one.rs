@@ -51,7 +51,7 @@
 //!    before it [`star_own_j_only`, `star_r_after_m`, `star_last_no_r`].
 //!    After each lock, every held key is checked: a root entry's at every
 //!    position against K, a joined entry's against the page's fan-out keys
-//!    at its position, not K (F11): a key K holds only for a root item
+//!    at its position, not K: a key K holds only for a root item
 //!    would let the page recompute rows on it without their `R` entries
 //!    [`star_recheck_j`, `star_recheck_skip_last`]. One outside its set
 //!    moved after K was read, so the page rolls back with
@@ -946,7 +946,7 @@ fn moved_key(shape: &JoinShape, side: Side, parts: &[Option<String>], k: &PageKe
 
 /// Whether a key of `side`'s row is outside the set the page holds it
 /// under, so the page rolls back and retries: a `FROM` row's against K
-/// (`k`, [`moved_key`]); a joined table's (F11, #1459) against the page's
+/// (`k`, [`moved_key`]); a joined table's against the page's
 /// fan-out keys at its position (`fan_k`), the keys whose `R` entries the
 /// page locked, not K. A key K holds only for a root item of the page
 /// would let the page recompute rows on it without their `R` entries.

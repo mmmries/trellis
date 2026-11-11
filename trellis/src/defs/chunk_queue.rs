@@ -72,8 +72,7 @@ pub enum ChunkQueueError {
     /// (`super::floor::unknown_value_sql`), so this is a defensive refusal
     /// to read it as some other position.
     UnknownCursor { tag: String },
-    /// A partition correction failed (ADR-0017 P4a,
-    /// `staging::partition_correction`).
+    /// A partition correction failed (`staging::partition_correction`).
     Correction(Box<crate::staging::partition_correction::CorrectionError>),
 }
 
@@ -214,8 +213,8 @@ pub enum ChunkWork {
     /// build's chunks didn't. It is claimed only once its build's plan job
     /// and every chunk are done ([`claim_chunks_of`]).
     Sweep { cursor: Option<String> },
-    /// A partition correction for one aggregate definition (ADR-0017 P4a,
-    /// `staging::partition_correction`): re-derives the key set of
+    /// A partition correction for one aggregate definition
+    /// (`staging::partition_correction`): re-derives the key set of
     /// `partition_corrections` row `correction_id`, resuming from its
     /// `partition_correction_progress`.
     Correction { correction_id: i64 },
@@ -240,7 +239,8 @@ pub const KIND_PLAN: &str = "plan";
 pub const KIND_REDERIVE: &str = "rederive";
 /// `backfill_chunks.kind` of a rebuild's sweep job.
 pub const KIND_SWEEP: &str = "sweep";
-/// `backfill_chunks.kind` of a partition correction (ADR-0017 P4a).
+/// `backfill_chunks.kind` of a partition correction
+/// (`staging::partition_correction`).
 pub const KIND_CORRECTION: &str = "correction";
 /// Every `backfill_chunks.kind` this release writes and reads. A kind not
 /// listed was written by a newer release, and its definition pauses

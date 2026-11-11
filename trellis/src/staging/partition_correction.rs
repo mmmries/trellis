@@ -3,7 +3,7 @@
 //! Partition maintenance (`ATTACH`, `DETACH`, `DROP`, a new leaf written
 //! directly) changes a partitioned root's rows without a write any capture
 //! trigger sees. The reconcile pass records each such change as a durable
-//! correction request ([`crate::capture::partitions`], P3). This module
+//! correction request ([`crate::capture::partitions`]). This module
 //! consumes the requests of an **aggregate** that reads the source, or of a
 //! `JOIN` that reads it as either side.
 //!
@@ -43,8 +43,8 @@
 //! nothing.
 //!
 //! A `complement` correction, which the every-pass sweep queues when it finds
-//! groups that route to no current leaf ([`crate::capture::complement`],
-//! P7), routes by the complement text it was queued with, as a gone node
+//! groups that route to no current leaf ([`crate::capture::complement`]),
+//! routes by the complement text it was queued with, as a gone node
 //! does by its recorded one, and has no node phase.
 //!
 //! A `HASH` text embeds its parent's oid, so a dropped middle's leaves are
