@@ -64,62 +64,9 @@ TRANSFORM`, then define it again in the current grammar. A definition that
 parses but fails one of the new release's define-time checks is left as the old
 release left it at the takeover, which does not run those checks again; rows
 that arrive afterwards follow the new release's rules. Each release's notes list
-both kinds of case. Every other definition carries
-on.
-
-A definition an earlier release built over a source key with `INCLUDE`
-columns (`primary key (id) include (x)`), which that release read as key
-columns, pauses too, naming the table and the columns, and so does a 1-1
-transform reading its 1-1 target, which that release keyed by them as well.
-`RESUME` re-keys each and rebuilds it ([when a definition needs
-you](operations.md#when-a-definition-needs-you)). Those releases kept such a
-target's rows right, but failed to apply a change that left an `INCLUDE`
-column of a 1-1 transform's source `NULL`.
-
-A definition an earlier release kept over a table with no primary key (its
-primary key dropped after define) was keyed by a unique index that release
-chose. This release keys a table only by its primary key or a `KEY (…)` the
-definition names ([Supported sources and targets](transforms.md#supported-sources-and-targets)).
-At the takeover, when that index backs a key now (valid, not deferrable, not
-partial, over plain columns that are `NOT NULL` or `NULLS NOT DISTINCT`), its
-key columns are written into the stored definition as an explicit `KEY (…)`,
-and the definition keeps running; `status()` and a schema dump show the new
-text. A 1-1 transform's target is keyed by the primary key its source had at
-define, so for a 1-1 transform (plain or `JOIN`, its `FROM` table) the index
-must also be over that key's columns. Otherwise it pauses, with a
-`capture_failure` naming the table and its unique indexes, or the key its
-target is keyed by: add a primary key (for a 1-1 transform, that key back) and
-`RESUME`, or `DROP TRANSFORM` and define it again with a valid `KEY (…)`.
-
-A definition an earlier release kept over a source or joined table whose
-primary key is deferrable (`DEFERRABLE`, initially immediate or deferred) was
-keyed by that key. This release doesn't key a table by a deferrable key, which
-can hold duplicate keys inside a transaction, and no other unique index stands
-in for it. At the takeover the definition pauses, with a `capture_failure`
-naming the table, its key and the remedy: recreate the key not deferrable, in
-one statement (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`;
-Postgres can't change a primary key's deferrability in place), then `RESUME`;
-or `DROP TRANSFORM` and define it again with a `KEY (…)` over a unique index
-that isn't deferrable.
-
-A `SUM` or `AVG` an earlier release kept over a `numeric(p,s)` column held its
-sum alone. This release keeps, per group, the sum of the finite values and a
-map counting every value that isn't finite at the column's declared scale:
-values at other scales, `NaN`, `Infinity` and `-Infinity`
-([type support](type-support.md#numeric-and-floating-point)). At the takeover
-each such definition's hidden tables gain the map in place, empty in every
-row: every value of the column has scale `s`. The definition then carries
-the new layout's floor (0.2.0), so a release before it refuses to run it
-([Rolling back](#rolling-back)). Those releases counted a `NaN` in the sum
-itself: 0.1.0 left a group's sum at `NaN` for good once a `NaN` had been
-summed into it, even after the `NaN` left, and 0.1.1 added a fixed weight
-(`10^2100`) per `NaN` it held. A definition with a group stored either way,
-plain or `JOIN`, is rebuilt at the takeover as a `RESUME` rebuilds it: its
-hidden tables are created afresh and every group is written from its source.
-Its `status()` reads `waiting_to_backfill`, then `backfilling`, until the
-rebuild is done; meanwhile a group that changes can show a partial value, as
-during any build. The transforms reading its target rebuild their own copies
-of it when it finishes.
+both kinds of case, and every other change the takeover makes to a definition
+(one it pauses because it keys a table differently, or rebuilds because it
+stores it differently), with the remedy. Every other definition carries on.
 
 For an embedded fleet, [Rolling deploys](embedding.md#rolling-deploys) covers
 the handover in detail, and
