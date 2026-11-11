@@ -959,7 +959,10 @@ fn recheck_against(
 ///
 /// Changes nothing that outlives `txn`, which the caller rolls back: the
 /// keys a resume would re-record are written in it ([`rekeying`]), so the
-/// re-validation reads the keys a resume's would.
+/// re-validation reads the keys a resume's would. It doesn't re-key as a
+/// resume does (`staging::quarantine::rekey_and_revalidate`), which alters a
+/// 1-1 target and waits on key record locks, and it says nothing of an
+/// upstream a resume would wait for.
 async fn resume_outcome(
     txn: &Transaction<'_>,
     schema: &str,
@@ -1013,18 +1016,10 @@ async fn resume_outcome(
         return Ok(Some(outcome));
     }
     // Typed copies whose type define would give differently now.
-    let copies = crate::defs::copies::typed_copies(
-        txn,
-        schema,
-        &definition.def,
-        &definition.source_table,
-        &definition.target_table,
-    )
-    .await?;
-    let drifted: Vec<String> = crate::defs::copies::inspect(txn, copies)
+    let drifted: Vec<String> = crate::defs::copies::resume_states(txn, schema, &definition)
         .await?
         .into_iter()
-        .filter(|s| s.drifted() && !s.copy.kind.recreated_by_resume())
+        .filter(|s| s.drifted())
         .map(|s| {
             format!(
                 "{} from {} to {}",
