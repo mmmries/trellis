@@ -464,7 +464,7 @@ extremes matched a fresh `GROUP BY` in all 680 soak runs.
   large target Trellis owns.
 - **Must:** the probe reads one endpoint of a valid, non-partial btree whose
   leading columns are the `GROUP BY` columns in order, then the argument, in
-  the argument's collation, which define requires. Without it a probe scans
+  the argument's collation; define requires it. Without it a probe scans
   the group, exact but able to outrun `statement_timeout` on a large group,
   so an index dropped after define pauses the definition after a grace that
   lets a rebuild dropping the old index first finish. The
@@ -547,9 +547,9 @@ reason.
 - **Must:** a retype of an argument column after define goes through the
   capture pass's re-validation like any other. A `numeric(p,s)` column
   re-typed to an unconstrained `numeric` keeps every value's text, and its
-  stored maps keep their reference scale, so nothing pauses or rebuilds. A
-  change between two declared scales re-renders values, so its readers
-  rebuild.
+  stored maps keep their reference scale, so nothing pauses or rebuilds:
+  values at other scales are counted from then on. A change between two
+  declared scales re-renders values, so its readers rebuild.
 
 ### Apply sums sides per group and transaction
 

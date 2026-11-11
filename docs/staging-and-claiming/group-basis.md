@@ -15,9 +15,10 @@ catalog schema, `agg_<id>`, holds per group the row count `__n`, per distinct
 argument its non-null count and its sum (`numeric` whatever the argument type),
 the basis and stamp, and with `MIN`/`MAX` each extreme at the argument's type
 under its own `__xbasis` and `__xstamp`. Readers get no grant on it and its
-shape is internal; a drop removes it by definition id, and a resume recreates
-it. A write updates the hidden row, then the visible row (computed from the
-partials and extremes), and skips the visible write when no value changed.
+shape is internal; a drop removes it by definition id, and a resume drops and
+recreates it. A write updates the hidden row, then the visible row (computed
+from the partials and extremes), and skips the visible write when no value
+changed.
 
 ## A page
 
@@ -71,10 +72,12 @@ reference scale, per display scale (0 to 16383; none is negative), and each
 The reference scale is the column's declared `s` (a negative `s` as 0) when the
 hidden table is created, stored as the map column's comment, so a later retype
 never changes a stored map's meaning; with no declared scale the map counts
-every value. A `JOIN` product multiplies the counts by the match count
+every value. The count at the reference scale is the non-null count less the
+map's counts. A `JOIN` product multiplies the counts by the match count
 (`max(n, 1)` for `LEFT`). The visible `SUM` is `NULL` with no non-null value,
 `NaN` or the infinity as Postgres's would be, else the finite sum at the largest
-counted scale; `AVG` divides it by the count, as `numeric_div` does. While a
+scale with a non-zero count; `AVG` divides it by the non-null count, as
+`numeric_div` does. While a
 `numeric(p,s)` argument's values are finite, no statement writes its map; a
 build's shortcut for that case falls back under a savepoint on an off-scale
 value, so it never changes a result.

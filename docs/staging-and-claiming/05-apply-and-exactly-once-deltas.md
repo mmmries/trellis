@@ -174,7 +174,7 @@ to its commit, so the basis it tests is one no other page is about to change.
 
 So a group's partials are the contributions of the source rows its basis saw
 plus the changes that came after, each counted once, whichever batch or page
-it came from ([below](#aggregate-groups-the-group-basis)). A batch draining
+it came from ([the group basis](group-basis.md#a-page)). A batch draining
 after a newer one for the same key adds nothing twice.
 
 ## Absolute writes do not commute: the 1-1 ledger
@@ -290,7 +290,7 @@ source or on another definition's target alike: the build applies from its
 start and re-derives the source in chunks, each inserting the entries its keys
 don't have yet and locking the others as a page does, and stamping them as a
 Re-derive does. An aggregate or a `JOIN` is built by its plan job's one
-absolute write instead ([below](#aggregate-groups-the-group-basis)).
+absolute write instead ([the group basis](group-basis.md#absolute-writes)).
 
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
@@ -402,7 +402,7 @@ invertible folds are maintained by increments. `count(*)`, `count(col)`, and
 `Inf − Inf = NaN`). `min`/`max` are not invertible (removing the current
 maximum tells you nothing about the next one), so a plain aggregate keeps
 them by re-reading the source when a retraction reaches the stored extreme
-([above](#aggregate-groups-the-group-basis)), and a `JOIN` refuses them.
+([the group basis](group-basis.md#a-page)), and a `JOIN` refuses them.
 Everything else is refused at define, named by its family
 ([transforms](../transforms.md#supported-sources-and-targets)).
 
@@ -467,7 +467,7 @@ statement** (a `JOIN` target takes its pair's lock row first, then its
 structures, and the 1-1 `JOIN` targets' definition rows come before any of
 their lock rows, in [the order above](#join-targets)). The entry lock is ordered by key
 ([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
-[the group basis](#aggregate-groups-the-group-basis)); a 1-1 target's rows are
+[the group basis](group-basis.md#a-page)); a 1-1 target's rows are
 then pre-locked in key order, and an aggregate's group upsert writes its
 groups in group order.
 
