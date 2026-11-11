@@ -2625,14 +2625,17 @@ impl GroupTargetPlan {
     }
 
     /// Whether `T`'s JOIN build write takes the bulk path
-    /// ([`Self::match_hidden_build_sql`]): no extremes, so `T` holds no
-    /// basis and every staged change applies.
+    /// ([`Self::match_hidden_build_sql`]) in place of
+    /// [`Self::apply_hidden_sql`]: no extremes and no truncate floor, so
+    /// every staged change applies (a `JOIN`'s `T` holds no basis) and none
+    /// needs [`Self::apply_extremes_sql`]'s probes.
     fn hidden_build_is_bulk(&self) -> bool {
         self.shape.extremes().is_empty() && self.floor_key.is_none()
     }
 
-    /// The first statement of [`Self::apply_hidden_sql`] with no extremes
-    /// (#1844): sums the staged rows once per group and matches each sum to
+    /// The first statement of the bulk path that replaces
+    /// [`Self::apply_hidden_sql`] in a build ([`Self::hidden_build_is_bulk`],
+    /// #1844): sums the staged rows once per group and matches each sum to
     /// its hidden row with one join instead of a lookup per group, into
     /// [`HIDDEN_MATCH`] in the hidden rows' `ctid` order. A staged group with
     /// no hidden row has a null `__hc`, and is lost as [`Self::lost_cte_sql`]
@@ -2662,7 +2665,8 @@ impl GroupTargetPlan {
         )
     }
 
-    /// The second statement of [`Self::apply_hidden_sql`] with no extremes:
+    /// The second statement of the bulk path that replaces
+    /// [`Self::apply_hidden_sql`] in a build ([`Self::hidden_build_is_bulk`]):
     /// adds each matched sum in [`HIDDEN_MATCH`] to its hidden row by
     /// `ctid`. Run under [`HIDDEN_UPDATE_SETTINGS`], it reads the match in
     /// order and fetches each row by a TID scan, so it rewrites `T`'s pages
@@ -6044,6 +6048,110 @@ mod tests {
             .and_then(|rows| rows.parse().ok())
             .expect("estimated rows");
         assert!(rows <= 40_000.0, "planned for 20000 cells: {write_plan}");
+    }
+
+    /// A `JOIN` build's bulk write of `T`'s partials ([`apply_hidden_build`])
+    /// rewrites `T` in disk order: the match joins the staged sums to `T` by
+    /// a hash join and writes them sorted by `T`'s `ctid`, and the update,
+    /// under [`HIDDEN_UPDATE_SETTINGS`], reads the match in that order and
+    /// fetches each row by a TID scan. In hash order, every row dirties a
+    /// random page of `T`, and at millions of groups each checkpoint writes
+    /// the pages again as full-page images; the update's results are the
+    /// same either way, so only the plan shows it.
+    #[tokio::test]
+    async fn a_join_build_t_write_rewrites_t_in_disk_order() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let def =
+            crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
+        let shape = route(&def, &columns()).expect("admitted");
+        let hidden = hidden_table_ident("trellis", 7);
+        let plan = GroupTargetPlan::for_join(
+            "public.t",
+            hidden.clone(),
+            "trellis_test_t_staged",
+            None,
+            Vec::new(),
+            shape.clone(),
+            Writer::JoinTarget,
+            None,
+            String::new(),
+        );
+        assert!(plan.hidden_build_is_bulk());
+        // `T` holds its groups out of group order, so neither the staged
+        // groups' order nor a hash of them is `T`'s disk order.
+        client
+            .batch_execute(&format!(
+                "create schema if not exists trellis; {}; \
+                 insert into {hidden} (g) \
+                     select g from generate_series(1, 20000) g order by random()",
+                hidden_table_ddl("trellis", 7, &shape)
+            ))
+            .await
+            .expect("hidden table");
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&plan.staged_ddl()).await.expect("staged");
+        // Every held group, and a `NULL` group the lock inserts.
+        txn.batch_execute(&format!(
+            "insert into {} (g, __txid, __lsn, __n, __c1, __s1) \
+                 select g, pg_current_xact_id(), '0/10', 1, 1, coalesce(g, 7) \
+                 from (select generate_series(1, 20000) union all select null) as v(g)",
+            plan.staged
+        ))
+        .await
+        .expect("stage");
+        txn.batch_execute(&plan.lock_sql()).await.expect("lock");
+        analyze(&txn, &[&plan.staged, &hidden])
+            .await
+            .expect("analyze");
+        txn.batch_execute(BULK_PLAN_SETTINGS)
+            .await
+            .expect("settings");
+        let matched = plan.match_hidden_build_sql();
+        let match_plan = explain(&txn, &matched).await;
+        assert!(
+            match_plan.contains("Hash Right Join") || match_plan.contains("Hash Left Join"),
+            "{match_plan}"
+        );
+        assert!(match_plan.contains("Sort Key: x.ctid"), "{match_plan}");
+        txn.batch_execute(&matched).await.expect("match");
+        txn.batch_execute(HIDDEN_UPDATE_SETTINGS)
+            .await
+            .expect("settings");
+        let update = plan.update_hidden_build_sql();
+        let update_plan = explain(&txn, &update).await;
+        assert!(!update_plan.contains("Hash"), "{update_plan}");
+        assert!(!update_plan.contains("Sort"), "{update_plan}");
+        let tid_scan = update_plan
+            .lines()
+            .position(|line| line.contains("Tid Scan on"))
+            .unwrap_or_else(|| panic!("no TID scan of T: {update_plan}"));
+        let nested_loop = update_plan
+            .lines()
+            .position(|line| line.contains("Nested Loop"))
+            .unwrap_or_else(|| panic!("no nested loop: {update_plan}"));
+        assert!(nested_loop < tid_scan, "{update_plan}");
+        let updated = txn.execute(&update, &[]).await.expect("update");
+        assert_eq!(updated, 20_001);
+        let wrong: i64 = txn
+            .query_one(
+                &format!(
+                    "select count(*) from {hidden} \
+                     where __n <> 1 or __count_1 <> 1 or __sum_1 <> coalesce(g, 7)"
+                ),
+                &[],
+            )
+            .await
+            .expect("hidden rows")
+            .get(0);
+        assert_eq!(wrong, 0);
+        txn.rollback().await.expect("rollback");
     }
 
     /// ADR-0019's strict `T` write: a `JOIN`'s `T` page or build step whose
