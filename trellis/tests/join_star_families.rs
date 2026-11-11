@@ -54,6 +54,18 @@ fn leak(sql: String) -> &'static str {
     Box::leak(sql.into_boxed_str())
 }
 
+/// [`Writer::Each`] of `statements` at `shape`: one page whose statements
+/// commit in a transaction each.
+fn each(shape: Shape, statements: &[&str]) -> Writer {
+    Writer::Each(Box::leak(
+        statements
+            .iter()
+            .map(|sql| leak(shape.sql(sql)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    ))
+}
+
 // ----------------------------------------------------------------------- M
 
 /// M: a mixed page with an `a` move `10 → 20` and the change of key 20 at
@@ -103,14 +115,14 @@ async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
                 shape,
                 A_ROWS,
                 B_ROWS,
-                Writer::Change(leak(shape.sql(
-                    "update public.a set {k} = 20 where id = 1; update {b} set w = 250 where id = 2",
-                ))),
-                Writer::Change(leak(format!(
-                    "{}; {}",
-                    shape.sql(other_a),
-                    shape.sql("update {b} set w = 150 where id = 1")
-                ))),
+                each(
+                    shape,
+                    &[
+                        "update public.a set {k} = 20 where id = 1",
+                        "update {b} set w = 250 where id = 2",
+                    ],
+                ),
+                each(shape, &[other_a, "update {b} set w = 150 where id = 1"]),
             )
             .await;
         }
@@ -122,9 +134,13 @@ async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
 #[tokio::test]
 async fn m_a_mixed_page_races_pages_of_either_side() {
     for shape in SHAPES {
-        let mixed = Writer::Change(leak(shape.sql(
-            "update public.a set {k} = 20 where id = 1; update {b} set w = 111 where id = 1",
-        )));
+        let mixed = each(
+            shape,
+            &[
+                "update public.a set {k} = 20 where id = 1",
+                "update {b} set w = 111 where id = 1",
+            ],
+        );
         for other in [
             "update {b} set w = 222 where id = 2",
             "insert into {a_ins} values (5, 10, 5, 'five')",
@@ -602,12 +618,10 @@ async fn f7_a_hand_off_applied_out_of_order_with_a_root_insert() {
             let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
             star::write(&d, &shape.sql("update {b} set k = 60 where id = 1")).await;
             let leave = d.seal().await;
+            star::write(&d, &shape.sql("update {b} set k = 10 where id = 2")).await;
             star::write(
                 &d,
-                &shape.sql(
-                    "update {b} set k = 10 where id = 2; \
-                     insert into {a_ins} values (5, 10, 5, 'five')",
-                ),
+                &shape.sql("insert into {a_ins} values (5, 10, 5, 'five')"),
             )
             .await;
             let take = d.seal().await;
