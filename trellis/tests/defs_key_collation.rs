@@ -7,15 +7,20 @@
 //!
 //! The `JOIN` key twin of this rule is pinned in `defs_join_define.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::definer;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
+use trellis::TransformStatus;
 use trellis::defs::{
     CatalogError, KeyColumnRole, NondeterministicCollationTextFunction,
     NondeterministicKeyCollation, Statement, ValidationError, ValueType, alter_transform,
     install_definition, parse_statement,
 };
-use trellis::{Config, TransformStatus, Trellis, TrellisOptions};
 
 /// Only ICU provides nondeterministic collations. Every test cluster's
 /// default collation is ICU `en-US`, so a server without ICU can't run
@@ -549,15 +554,6 @@ async fn join_text_reads_of_a_column_only_the_joined_table_has_are_refused() {
     }
 }
 
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
-
 /// A resume re-validates a JOIN against the live columns: re-collating a
 /// read column to a nondeterministic collation while the transform is paused
 /// refuses the resume, naming that side's table and column, and re-collating
@@ -575,7 +571,7 @@ async fn resuming_a_join_whose_read_column_became_nondeterministic_is_refused() 
          create index on post_tags (post);",
     )
     .await;
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     let mut n = 0;
     for (space, build) in KEY_SPACES {
         for (table, column) in [("posts", "author"), ("post_tags", "note")] {

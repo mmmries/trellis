@@ -18,26 +18,15 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::integer::IntWidth;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::self_check::{
     SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
 use trellis::{Trellis, TrellisOptions};
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
-
-async fn step(d: &mut Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
-}
 
 /// The rows of `actual` and `expected` (same columns) that the other lacks,
 /// compared by value (`numeric`'s `=`: `NaN = NaN`, `1.5 = 1.50`).
@@ -93,7 +82,7 @@ async fn definition_id(d: &Driver, target: &str) -> String {
 async fn run(d: &mut Driver, steps: &[&str], targets: &[(&str, &str, &str)]) {
     let mut failures = Vec::new();
     for sql in steps {
-        step(d, sql).await;
+        d.step(sql).await;
         for (target, actual, expected) in targets {
             let diff = difference(d, actual, expected).await;
             if !diff.is_empty() {
@@ -305,8 +294,7 @@ async fn a_nan_not_applied_yet_is_subtracted_from_the_sources() {
         &["public.src", "public.o", "public.c"],
     )
     .await;
-    step(
-        &mut d,
+    d.step(
         "insert into public.src values (1, 1, 1.50), (2, 1, 'NaN'), (3, 2, 2); \
          insert into public.c values (1, 1, 'a'), (2, 2, 'b'); \
          insert into public.o values (1, 1, 1.50), (2, 1, 'NaN'), (3, 2, 2), (4, 9, 'NaN')",
@@ -415,11 +403,8 @@ async fn a_nan_matched_twice_in_one_join_group() {
 #[tokio::test]
 async fn a_sum_stored_as_nan_is_reported_and_a_rebuild_repairs_it() {
     let mut d = start_agg().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1.50), (2, 1, 2.25), (3, 1, 'NaN'), (4, 2, 1)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 1.50), (2, 1, 2.25), (3, 1, 'NaN'), (4, 2, 1)")
+        .await;
     let id = definition_id(&d, "agg").await;
     let hidden = format!("{DEFAULT_SCHEMA}.agg_{id}");
     d.ctl
@@ -455,7 +440,7 @@ async fn a_sum_stored_as_nan_is_reported_and_a_rebuild_repairs_it() {
         .batch_execute(&format!("update {hidden} set __sum_1 = 'NaN' where g = 1"))
         .await
         .expect("a sum stored as NaN");
-    step(&mut d, "delete from public.src where id = 3").await;
+    d.step("delete from public.src where id = 3").await;
     assert_eq!(
         d.rows("select total from public.agg where g = 1").await,
         ["(NaN)"],

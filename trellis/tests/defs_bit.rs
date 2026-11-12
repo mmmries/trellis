@@ -43,10 +43,15 @@
 //! the engine's own renderer. Harness conventions follow
 //! `defs_boolean.rs`/`defs_bytea.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, drain, seal};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
@@ -55,7 +60,6 @@ use trellis::defs::{
     source_primary_key, validate,
 };
 use trellis::integer::IntWidth;
-use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -69,18 +73,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ("vb".to_string(), ValueType::Other(PgType::VarBit)),
         ("n".to_string(), ValueType::Numeric),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("session bootstrap");
-    client
 }
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
@@ -114,7 +106,7 @@ async fn define_join_on(
 async fn bit_and_varbit_have_no_dedicated_text_cast_function() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     for pg_type in [
         "bit", "varbit", "smallint", "integer", "oid", "uuid", "bytea",
@@ -158,7 +150,7 @@ async fn bit_and_varbit_have_no_dedicated_text_cast_function() {
 async fn to_jsonb_and_text_agree_for_bit_and_varbit() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -208,7 +200,7 @@ async fn bit_and_varbit_join_keys_and_primary_keys_are_admitted() {
     for (pg_decl, expected_pk_type) in [("bit(4)", "\"bit\""), ("bit varying", "bit varying")] {
         let cluster = TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let client = connect_raw(db.dsn()).await;
+        let client = connect(db.dsn()).await;
 
         client
             .batch_execute(&format!(
@@ -271,7 +263,7 @@ fn fixed_length_bit_group_by_key_is_refused() {
 async fn fixed_length_bit_truncates_under_a_bare_cast_but_bit_varying_does_not() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let row = client
         .query_one("select ('101'::bit)::text, length('101'::bit)", &[])
@@ -313,7 +305,7 @@ async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two(
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -381,23 +373,6 @@ async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two(
             .unwrap_or_else(|e| panic!("stage bare recompute {key}: {e}"));
     }
 
-    async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool) {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "bit_worker",
-            1,
-            "trellis_defs_bit_issue_118_regression",
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
     // Row 1: an ordinary image-bearing insert, the shape real CDC produces.
     stage_image(&client, "seg_0", "1", r#"{"grp":"101","amount":"10"}"#).await;
     // Row 2: a bare recompute trigger — no image at all — forcing
@@ -405,7 +380,10 @@ async fn a_varbit_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two(
     // `row_as_text_jsonb_sql`'s `<col>::text` cast.
     stage_bare_recompute(&client, "seg_0", "2").await;
 
-    drain_sealed(&mut client, &db.pool).await;
+    let batch = seal(&mut client).await;
+    drain(&db.pool, batch, "bit_worker")
+        .await
+        .expect("drain must claim and drain something");
 
     let rows = client
         .query("select grp::text, total::text from totals", &[])

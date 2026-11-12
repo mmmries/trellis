@@ -36,31 +36,23 @@
 //!
 //! Harness conventions follow `defs_enum.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, drain, seal};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse, validate};
 use trellis::integer::IntWidth;
-use trellis::staging::{apply, retire_drained_segments, seal};
 
 // ---------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("session bootstrap");
-    client
-}
 
 /// The physical ring table this test should stage into *right now* —
 /// `seal::seal_phase1` rotates which ring slot is active every time it's
@@ -169,26 +161,10 @@ async fn stage_bare_recompute(client: &Client, key: &str, src_table: &str) {
 }
 
 async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool, worker: &str) {
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+    let batch = seal(client).await;
+    drain(pool, batch, worker)
         .await
-        .expect("seal phase 2");
-    apply::drain_once(
-        pool,
-        outcome.sealed_seg_seq,
-        worker,
-        1,
-        "trellis_defs_count_column",
-    )
-    .await
-    .expect("drain_once")
-    .expect("drain_once must claim and drain something");
-    // Frees this round's now-fully-drained ring slot so a test with more
-    // rounds than `RING_SIZE` doesn't hit `StagingError::RingFull` once the
-    // ring wraps back around.
-    retire_drained_segments(client)
-        .await
-        .expect("retire drained segments");
+        .expect("drain must claim and drain something");
 }
 
 async fn read_totals(client: &Client) -> Vec<(i32, i64, i64)> {
@@ -268,7 +244,7 @@ fn count_of_a_column_parses_and_validates() {
 async fn count_column_target_type_is_bigint_live() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
     create_schema_and_definition(&db.pool, &client).await;
 
     let row = client
@@ -291,7 +267,7 @@ async fn count_column_target_type_is_bigint_live() {
 async fn count_column_matches_a_server_side_recompute_excluding_nulls() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     create_schema_and_definition(&db.pool, &client).await;
 
     // grp 1: three rows, one NULL amount => total_rows=3, non_null_amounts=2.
@@ -346,7 +322,7 @@ async fn count_column_matches_a_server_side_recompute_excluding_nulls() {
 async fn count_column_delta_path_tracks_null_transitions_and_deletes() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     create_schema_and_definition(&db.pool, &client).await;
 
     client
@@ -435,7 +411,7 @@ async fn count_column_delta_path_tracks_null_transitions_and_deletes() {
 async fn count_column_forced_full_recompute_still_excludes_nulls() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     create_schema_and_definition(&db.pool, &client).await;
 
     client
@@ -472,7 +448,7 @@ async fn count_column_forced_full_recompute_still_excludes_nulls() {
 async fn count_column_bulk_forced_full_recompute_still_excludes_nulls() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     create_schema_and_definition(&db.pool, &client).await;
 
     client

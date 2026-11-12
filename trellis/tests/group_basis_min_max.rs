@@ -29,7 +29,7 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{PgType, ValueType};
 use trellis::float::FloatWidth;
@@ -46,10 +46,6 @@ const SOURCE_DDL: &str = "create table public.src (id integer primary key, g int
                           create index on public.src (g, v)";
 const ACTUAL: &str = "select g, lo, hi, n from public.agg order by g";
 const EXPECTED: &str = "select g, min(v), max(v), count(*) from public.src group by g order by g";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 /// `public.src (id, g, v)`, empty, with `definition` live over it on the
 /// group basis, captured by triggers, its hidden table keeping extremes.
@@ -86,17 +82,6 @@ async fn scalar(d: &Driver, sql: &str) -> String {
     let rows = d.rows(sql).await;
     assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
     rows[0].trim_matches(|c| c == '(' || c == ')').to_string()
-}
-
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-/// Writes `sql` and drains it as one sealed page.
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
 }
 
 /// The target equals the oracle now, before anything else drains.
@@ -155,7 +140,7 @@ async fn pages_keep_min_and_max_exact() {
         "update public.src set g = null where id = 5",
         "delete from public.src",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_now(&d, ACTUAL, EXPECTED, sql).await;
     }
     assert_oracle(&mut d).await;
@@ -167,14 +152,11 @@ async fn pages_keep_min_and_max_exact() {
 #[tokio::test]
 async fn only_a_retraction_reaching_an_extreme_probes() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9)",
-    )
-    .await;
-    step(&mut d, "delete from public.src where id = 2").await;
+    d.step("insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9)")
+        .await;
+    d.step("delete from public.src where id = 2").await;
     assert_eq!(extremes(&d, 1).await, ["(1,9,f)"]);
-    step(&mut d, "delete from public.src where id = 1").await;
+    d.step("delete from public.src where id = 1").await;
     assert_eq!(extremes(&d, 1).await, ["(9,9,t)"]);
     assert_oracle(&mut d).await;
 }
@@ -203,7 +185,7 @@ async fn a_build_writes_the_extremes_and_their_basis() {
         "delete from public.src where id = 5",
         "update public.src set v = 1 where id = 3",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_now(&d, ACTUAL, EXPECTED, sql).await;
     }
     assert_oracle(&mut d).await;
@@ -342,10 +324,10 @@ async fn f2_run_checked(script: &str, checked: bool) {
             seed.push(format!("({}, {g}, {v})", g * 10 + id));
         }
     }
-    step(
-        &mut d,
-        &format!("insert into public.src values {}", seed.join(", ")),
-    )
+    d.step(&format!(
+        "insert into public.src values {}",
+        seed.join(", ")
+    ))
     .await;
     let mut batches = Vec::new();
     for action in script.split_whitespace() {
@@ -355,7 +337,7 @@ async fn f2_run_checked(script: &str, checked: bool) {
                 let t: usize = n.parse().expect("a transaction");
                 for (k, sequence) in SEQUENCES.iter().enumerate() {
                     if !sequence.txns[t].is_empty() {
-                        write(&d, &bind(sequence.txns[t], k as i32 + 1)).await;
+                        d.write(&bind(sequence.txns[t], k as i32 + 1)).await;
                     }
                 }
             }
@@ -456,16 +438,13 @@ async fn self_check_agrees_at_every_step_of_f2() {
 /// the racer's count.
 async fn f4_racer(point: PausePoint, racer: &str, want: &str) {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9), (4, 2, 2)",
-    )
-    .await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9), (4, 2, 2)")
+        .await;
+    d.write("delete from public.src where id = 1").await;
     let batch = d.seal().await;
     let mut page = d.drain_frozen(batch, "a", &[(point, "public.agg")]).await;
     page.reached(point).await;
-    write(&d, racer).await;
+    d.write(racer).await;
     d.release(&mut page, point).await;
     page.finish().await;
     let probed = extremes(&d, 1).await;
@@ -509,12 +488,9 @@ async fn f4_a_delete_of_the_next_value_racing_the_probe() {
 #[tokio::test]
 async fn f4_a_page_on_the_group_queues_behind_the_probing_page() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9)",
-    )
-    .await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9)")
+        .await;
+    d.write("delete from public.src where id = 1").await;
     let first = d.seal().await;
     let mut page = d
         .drain_frozen(
@@ -524,7 +500,7 @@ async fn f4_a_page_on_the_group_queues_behind_the_probing_page() {
         )
         .await;
     let frozen = page.reached(PausePoint::BeforeExtremeProbe).await;
-    write(&d, "insert into public.src values (4, 1, 3)").await;
+    d.write("insert into public.src values (4, 1, 3)").await;
     let second = d.seal().await;
     let racer = d.drain_frozen(second, "b", &[]).await;
     d.wait_blocked_behind(frozen.backend_pid).await;
@@ -547,18 +523,15 @@ async fn f4_a_page_on_the_group_queues_behind_the_probing_page() {
 #[tokio::test]
 async fn f4p_the_next_value_deleted_and_drained_before_the_lock() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9)",
-    )
-    .await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, 1, 1), (2, 1, 5), (3, 1, 9)")
+        .await;
+    d.write("delete from public.src where id = 1").await;
     let first = d.seal().await;
     let mut page = d
         .drain_frozen(first, "a", &[(PausePoint::BeforeGroupLock, "public.agg")])
         .await;
     page.reached(PausePoint::BeforeGroupLock).await;
-    write(&d, "delete from public.src where id = 2").await;
+    d.write("delete from public.src where id = 2").await;
     let second = d.seal().await;
     d.drain(second, "b").await;
     assert_eq!(extremes(&d, 1).await, ["(1,9,f)"], "the racer didn't probe");
@@ -579,15 +552,12 @@ async fn f4p_the_next_value_deleted_and_drained_before_the_lock() {
 #[tokio::test]
 async fn f5_an_all_null_group_gains_and_loses_a_value_in_reverse() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, null), (2, 1, null)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, null), (2, 1, null)")
+        .await;
     assert_eq!(extremes(&d, 1).await, ["(,,f)"]);
-    write(&d, "update public.src set v = 5 where id = 1").await;
+    d.write("update public.src set v = 5 where id = 1").await;
     let t1 = d.seal().await;
-    write(&d, "update public.src set v = null where id = 1").await;
+    d.write("update public.src set v = null where id = 1").await;
     let t2 = d.seal().await;
     d.drain(t2, "a").await;
     d.drain(t1, "b").await;
@@ -602,16 +572,13 @@ async fn f5_an_all_null_group_gains_and_loses_a_value_in_reverse() {
 #[tokio::test]
 async fn f5_the_only_value_set_to_null_then_deleted() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 4), (2, 1, null)",
-    )
-    .await;
-    step(&mut d, "update public.src set v = null where id = 1").await;
+    d.step("insert into public.src values (1, 1, 4), (2, 1, null)")
+        .await;
+    d.step("update public.src set v = null where id = 1").await;
     assert_now(&d, ACTUAL, EXPECTED, "set to null").await;
-    step(&mut d, "delete from public.src where id = 1").await;
+    d.step("delete from public.src where id = 1").await;
     assert_now(&d, ACTUAL, EXPECTED, "deleted").await;
-    step(&mut d, "insert into public.src values (3, 1, 6)").await;
+    d.step("insert into public.src values (3, 1, 6)").await;
     assert_oracle(&mut d).await;
 }
 
@@ -623,21 +590,18 @@ async fn f5_the_only_value_set_to_null_then_deleted() {
 #[tokio::test]
 async fn f5_the_null_group_probes_its_own_rows() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, null, 1), (2, null, 4), (3, null, 8), (4, 1, 0)",
-    )
-    .await;
-    step(&mut d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, null, 1), (2, null, 4), (3, null, 8), (4, 1, 0)")
+        .await;
+    d.step("delete from public.src where id = 1").await;
     assert_now(&d, ACTUAL, EXPECTED, "the NULL group's minimum deleted").await;
-    write(&d, "insert into public.src values (5, null, 2)").await;
+    d.write("insert into public.src values (5, null, 2)").await;
     let insert = d.seal().await;
-    write(&d, "delete from public.src where id = 5").await;
+    d.write("delete from public.src where id = 5").await;
     let delete = d.seal().await;
     d.drain(delete, "a").await;
     d.drain(insert, "b").await;
     assert_now(&d, ACTUAL, EXPECTED, "insert-low-delete, reversed").await;
-    step(&mut d, "delete from public.src where id = 3").await;
+    d.step("delete from public.src where id = 3").await;
     assert_oracle(&mut d).await;
 }
 
@@ -666,17 +630,17 @@ async fn f5_every_pattern_of_null_group_columns_probes_its_own_rows() {
             rows.push(format!("({}, {g}, {h}, {v})", k * 10 + v));
         }
     }
-    step(
-        &mut d,
-        &format!("insert into public.src values {}", rows.join(", ")),
-    )
+    d.step(&format!(
+        "insert into public.src values {}",
+        rows.join(", ")
+    ))
     .await;
     for sql in [
         "delete from public.src where id % 10 = 1",
         "delete from public.src where id % 10 = 3",
         "delete from public.src where id % 10 = 2",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_now(&d, actual, expected, sql).await;
     }
     d.settle().await;
@@ -695,14 +659,11 @@ async fn f5_every_pattern_of_null_group_columns_probes_its_own_rows() {
 #[tokio::test]
 async fn f6_a_zero_group_a_probe_stamped_stays_until_the_prefix_passes_it() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (100, 2, 0)").await;
-    write(&d, "insert into public.src values (1, 1, 1)").await;
+    d.step("insert into public.src values (100, 2, 0)").await;
+    d.write("insert into public.src values (1, 1, 1)").await;
     let t1 = d.seal().await;
-    write(
-        &d,
-        "delete from public.src where id = 1; insert into public.src values (2, 1, 7)",
-    )
-    .await;
+    d.write("delete from public.src where id = 1; insert into public.src values (2, 1, 7)")
+        .await;
     let t2 = d.seal().await;
     d.drain(t2, "a").await;
     let probed = extremes(&d, 1).await;
@@ -825,8 +786,7 @@ async fn assert_walk(d: &Driver, want: &[Divergence], what: &str) {
 #[tokio::test]
 async fn self_check_compares_each_extreme_with_the_sources() {
     let mut d = start().await;
-    step(
-        &mut d,
+    d.step(
         "insert into public.src values \
          (1, 1, 3), (2, 1, 3), (3, 1, 5), (4, 1, 9), \
          (5, 2, null), (6, 2, null), \
@@ -836,7 +796,7 @@ async fn self_check_compares_each_extreme_with_the_sources() {
     .await;
     // A tie at the minimum: one of the two deleted probes and finds the
     // other. Group 3 empties to a zero group.
-    step(&mut d, "delete from public.src where id in (1, 9)").await;
+    d.step("delete from public.src where id in (1, 9)").await;
     assert_oracle(&mut d).await;
     assert_walk(&d, &[], "converged").await;
 
@@ -846,7 +806,7 @@ async fn self_check_compares_each_extreme_with_the_sources() {
     let max = format!("{name}.__max_1");
     let plant = |sql: String| {
         let d = &d;
-        async move { write(d, &sql).await }
+        async move { d.write(&sql).await }
     };
 
     // The hidden and visible minimum planted alike: only the source shows it.
@@ -966,14 +926,11 @@ async fn self_check_compares_each_extreme_with_the_sources() {
 #[tokio::test]
 async fn self_check_reads_the_extremes_under_their_own_basis() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (100, 2, 0)").await;
-    write(&d, "insert into public.src values (1, 1, 1)").await;
+    d.step("insert into public.src values (100, 2, 0)").await;
+    d.write("insert into public.src values (1, 1, 1)").await;
     let t1 = d.seal().await;
-    write(
-        &d,
-        "delete from public.src where id = 1; insert into public.src values (2, 1, 7)",
-    )
-    .await;
+    d.write("delete from public.src where id = 1; insert into public.src values (2, 1, 7)")
+        .await;
     let t2 = d.seal().await;
     d.drain(t2, "a").await;
     assert_eq!(extremes(&d, 1).await, ["(7,7,t)"]);
@@ -982,7 +939,8 @@ async fn self_check_reads_the_extremes_under_their_own_basis() {
     }
     // A plant on the probed extreme is still reported.
     let hidden = hidden(&d).await;
-    write(&d, &format!("update {hidden} set __max_1 = 8 where g = 1")).await;
+    d.write(&format!("update {hidden} set __max_1 = 8 where g = 1"))
+        .await;
     assert_eq!(
         compare(&d, 100).await,
         (
@@ -995,14 +953,12 @@ async fn self_check_reads_the_extremes_under_their_own_basis() {
             false
         )
     );
-    write(&d, &format!("update {hidden} set __max_1 = 7 where g = 1")).await;
+    d.write(&format!("update {hidden} set __max_1 = 7 where g = 1"))
+        .await;
     // Changes no basis saw, not applied yet: an insertion below the
     // minimum and a delete of the maximum are subtracted from the source.
-    write(
-        &d,
-        "insert into public.src values (3, 1, 0); delete from public.src where id = 2",
-    )
-    .await;
+    d.write("insert into public.src values (3, 1, 0); delete from public.src where id = 2")
+        .await;
     assert_eq!(compare(&d, 100).await, (vec![], false));
     d.drain(t1, "b").await;
     assert_eq!(compare(&d, 100).await, (vec![], false));
@@ -1011,14 +967,11 @@ async fn self_check_reads_the_extremes_under_their_own_basis() {
 
     // A group with rows: T3 inserts 4, and T4's delete of the minimum 1
     // drains first. Its probe sees T3, which its partials don't count yet.
-    step(
-        &mut d,
-        "insert into public.src values (10, 5, 1), (11, 5, 7)",
-    )
-    .await;
-    write(&d, "insert into public.src values (12, 5, 4)").await;
+    d.step("insert into public.src values (10, 5, 1), (11, 5, 7)")
+        .await;
+    d.write("insert into public.src values (12, 5, 4)").await;
     let t3 = d.seal().await;
-    write(&d, "delete from public.src where id = 10").await;
+    d.write("delete from public.src where id = 10").await;
     let t4 = d.seal().await;
     d.drain(t4, "a").await;
     assert_eq!(extremes(&d, 5).await, ["(4,7,t)"]);
@@ -1040,18 +993,12 @@ async fn self_check_reads_the_extremes_under_their_own_basis() {
 #[tokio::test]
 async fn self_check_compares_the_groups_only_the_extremes_have() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (100, 2, 0), (300, 3, 5)",
-    )
-    .await;
-    write(&d, "insert into public.src values (1, 1, 1)").await;
+    d.step("insert into public.src values (100, 2, 0), (300, 3, 5)")
+        .await;
+    d.write("insert into public.src values (1, 1, 1)").await;
     let t1 = d.seal().await;
-    write(
-        &d,
-        "delete from public.src where id = 1; insert into public.src values (2, 1, 7)",
-    )
-    .await;
+    d.write("delete from public.src where id = 1; insert into public.src values (2, 1, 7)")
+        .await;
     let t2 = d.seal().await;
     d.drain(t2, "a").await;
     assert_eq!(extremes(&d, 1).await, ["(7,7,t)"]);
@@ -1082,7 +1029,7 @@ async fn self_check_compares_the_groups_only_the_extremes_have() {
          drop table public.saved"
     );
 
-    write(&d, &save(1)).await;
+    d.write(&save(1)).await;
     for limit in [1, 2, 100] {
         assert_eq!(
             compare(&d, limit).await,
@@ -1096,9 +1043,9 @@ async fn self_check_compares_the_groups_only_the_extremes_have() {
             "limit {limit}"
         );
     }
-    write(&d, &restore).await;
+    d.write(&restore).await;
 
-    write(&d, &save(2)).await;
+    d.write(&save(2)).await;
     for limit in [1, 2, 100] {
         let (found, _) = compare(&d, limit).await;
         assert!(
@@ -1108,7 +1055,7 @@ async fn self_check_compares_the_groups_only_the_extremes_have() {
             "limit {limit}: {found:?}"
         );
     }
-    write(&d, &restore).await;
+    d.write(&restore).await;
 
     d.drain(t1, "b").await;
     assert_oracle(&mut d).await;
@@ -1129,15 +1076,13 @@ async fn self_check_takes_each_extreme_over_its_own_arguments() {
         &[("id", int4()), ("g", int4()), ("v", int4()), ("w", int4())],
     )
     .await;
-    step(
-        &mut d,
+    d.step(
         "insert into public.src values (1, 1, 5, null), (2, 1, null, 9), (3, 1, 6, 2), \
          (4, 2, null, 3), (5, 3, 4, null)",
     )
     .await;
     assert_walk(&d, &[], "settled").await;
-    write(
-        &d,
+    d.write(
         "insert into public.src values (6, 1, 1, null); update public.src set w = 10 where id = 4",
     )
     .await;
@@ -1168,7 +1113,8 @@ async fn start_typed(ty: &str, value_type: ValueType, rows: &str) -> Driver {
         &[("id", int4()), ("g", int4()), ("v", value_type)],
     )
     .await;
-    step(&mut d, &format!("insert into public.src values {rows}")).await;
+    d.step(&format!("insert into public.src values {rows}"))
+        .await;
     d.settle().await;
     assert_walk(&d, &[], "settled").await;
     d
@@ -1182,13 +1128,10 @@ async fn assert_planted(d: &Driver, plants: &[(&str, &str, &str, bool)]) {
     let name = hidden_name(d).await;
     for (value, stem, source, diverged) in plants {
         let field = if *stem == "min" { "lo" } else { "hi" };
-        write(
-            d,
-            &format!(
-                "update {hidden} set __{stem}_1 = '{value}' where g = 1; \
+        d.write(&format!(
+            "update {hidden} set __{stem}_1 = '{value}' where g = 1; \
                  update public.agg set {field} = '{value}' where g = 1"
-            ),
-        )
+        ))
         .await;
         let want = if *diverged {
             vec![cell(
@@ -1201,13 +1144,10 @@ async fn assert_planted(d: &Driver, plants: &[(&str, &str, &str, bool)]) {
             vec![]
         };
         assert_walk(d, &want, &format!("{stem} planted as {value}")).await;
-        write(
-            d,
-            &format!(
-                "update {hidden} set __{stem}_1 = '{source}' where g = 1; \
+        d.write(&format!(
+            "update {hidden} set __{stem}_1 = '{source}' where g = 1; \
                  update public.agg set {field} = '{source}' where g = 1"
-            ),
-        )
+        ))
         .await;
     }
 }
@@ -1343,12 +1283,9 @@ async fn a_probe_behind_a_source_lock_retries_the_page() {
         &[SRC],
     )
     .await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1), (2, 1, 5), (3, 2, 4)",
-    )
-    .await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.step("insert into public.src values (1, 1, 1), (2, 1, 5), (3, 2, 4)")
+        .await;
+    d.write("delete from public.src where id = 1").await;
     let batch = d.seal().await;
     let holder = d.user().await;
     let pid: i32 = holder

@@ -16,11 +16,10 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::{Driver, Running};
+use drain_driver::{Driver, Running, int4};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::integer::IntWidth;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::interleave::PausePoint;
 use trellis::{Trellis, TrellisOptions};
@@ -39,10 +38,6 @@ const OPTIONS: WorkerOptions = WorkerOptions {
     reclaim_ttl: Duration::from_secs(60),
 };
 
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
-
 /// `public.src (id, g, v)`, empty, with [`AGG`] live over it on the group
 /// basis, captured by triggers.
 async fn start() -> Driver {
@@ -54,17 +49,6 @@ async fn start() -> Driver {
         &[SRC],
     )
     .await
-}
-
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-/// Writes `sql` and drains it as one sealed page.
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
 }
 
 async fn assert_oracle(d: &mut Driver) {
@@ -164,11 +148,8 @@ async fn assert_finished(d: &Driver) {
 #[tokio::test]
 async fn a_rebuild_replaces_every_group_in_place() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, 5, 1)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, 5, 1)")
+        .await;
     let hidden = hidden(&d).await;
     d.ctl
         .batch_execute(&format!(
@@ -203,18 +184,15 @@ async fn a_rebuild_replaces_every_group_in_place() {
 #[tokio::test]
 async fn changes_before_during_and_after_a_rebuild() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 5)",
-    )
-    .await;
-    write(&d, "insert into public.src values (3, 1, 1)").await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 5)")
+        .await;
+    d.write("insert into public.src values (3, 1, 1)").await;
     let before = d.seal().await;
     request_rebuild(&d).await;
 
     let mut rebuilding = rebuild_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
     let locked = rebuilding.reached(PausePoint::AfterRebuildLock).await;
-    write(&d, "update public.src set v = 100 where id = 2").await;
+    d.write("update public.src set v = 100 where id = 2").await;
     let during = d.seal().await;
     let page = d.drain_frozen(during, "during", &[]).await;
     d.wait_blocked_behind(locked.backend_pid).await;
@@ -237,7 +215,7 @@ async fn changes_before_during_and_after_a_rebuild() {
         "the change from before the rebuild was in its snapshot, and refused"
     );
 
-    step(&mut d, "insert into public.src values (4, 1, 2)").await;
+    d.step("insert into public.src values (4, 1, 2)").await;
     assert_eq!(
         partials(&d, 1).await,
         ["(3,3,13,t)"],
@@ -255,15 +233,12 @@ async fn changes_before_during_and_after_a_rebuild() {
 #[tokio::test]
 async fn a_page_that_commits_between_the_enumeration_and_the_locks() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 5)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 5)")
+        .await;
     request_rebuild(&d).await;
     let mut rebuilding = rebuild_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
     rebuilding.reached(PausePoint::AfterRebuildEnumerate).await;
-    step(&mut d, "update public.src set v = 100 where id = 2").await;
+    d.step("update public.src set v = 100 where id = 2").await;
     d.release(&mut rebuilding, PausePoint::AfterRebuildEnumerate)
         .await;
     rebuilding.finish().await;
@@ -279,16 +254,16 @@ async fn a_page_that_commits_between_the_enumeration_and_the_locks() {
 #[tokio::test]
 async fn a_page_that_creates_a_group_while_a_rebuild_runs() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     request_rebuild(&d).await;
 
     let mut rebuilding = rebuild_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
     rebuilding.reached(PausePoint::AfterRebuildLock).await;
-    step(&mut d, "insert into public.src values (2, 9, 4)").await;
+    d.step("insert into public.src values (2, 9, 4)").await;
     assert_eq!(partials(&d, 9).await, ["(1,1,4,f)"]);
     // Left in the active segment: the rebuild's open transaction holds the
     // seal of a later one, which the ring's four slots then can't spare.
-    write(&d, "insert into public.src values (3, 9, 6)").await;
+    d.write("insert into public.src values (3, 9, 6)").await;
     d.release(&mut rebuilding, PausePoint::AfterRebuildLock)
         .await;
     rebuilding.finish().await;
@@ -312,10 +287,11 @@ async fn a_page_that_creates_a_group_while_a_rebuild_runs() {
 #[tokio::test]
 async fn a_group_that_disappears_and_one_only_an_old_image_names() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 5, 3), (2, 1, 1)").await;
-    write(&d, "delete from public.src where id = 1").await;
-    write(&d, "insert into public.src values (3, 7, 2)").await;
-    write(&d, "update public.src set g = 8 where id = 3").await;
+    d.step("insert into public.src values (1, 5, 3), (2, 1, 1)")
+        .await;
+    d.write("delete from public.src where id = 1").await;
+    d.write("insert into public.src values (3, 7, 2)").await;
+    d.write("update public.src set g = 8 where id = 3").await;
     let undrained = d.seal().await;
     assert!(partials(&d, 7).await.is_empty(), "no group 7 anywhere yet");
     request_rebuild(&d).await;
@@ -342,11 +318,8 @@ async fn a_group_that_disappears_and_one_only_an_old_image_names() {
 #[tokio::test]
 async fn a_reader_sees_old_values_until_the_rebuild_commits() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 5), (3, 3, 1)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 5), (3, 3, 1)")
+        .await;
     let hidden = hidden(&d).await;
     d.ctl
         .batch_execute(&format!(
@@ -355,7 +328,7 @@ async fn a_reader_sees_old_values_until_the_rebuild_commits() {
         ))
         .await
         .expect("damage group 1");
-    write(&d, "delete from public.src where id = 3").await;
+    d.write("delete from public.src where id = 3").await;
     let old = ["(1,999,1)", "(2,5,1)", "(3,1,1)"];
     assert_eq!(d.rows(ACTUAL).await, old);
     request_rebuild(&d).await;
@@ -393,11 +366,8 @@ async fn a_reader_sees_old_values_until_the_rebuild_commits() {
 #[tokio::test]
 async fn a_rebuild_replaces_a_group_with_a_null_part() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, null, 10), (2, null, 5), (3, 1, 7)",
-    )
-    .await;
+    d.step("insert into public.src values (1, null, 10), (2, null, 5), (3, 1, 7)")
+        .await;
     let hidden = hidden(&d).await;
     d.ctl
         .batch_execute(&format!(
@@ -406,7 +376,7 @@ async fn a_rebuild_replaces_a_group_with_a_null_part() {
         ))
         .await
         .expect("damage the NULL group");
-    write(&d, "insert into public.src values (4, null, 1)").await;
+    d.write("insert into public.src values (4, null, 1)").await;
     let undrained = d.seal().await;
     request_rebuild(&d).await;
     rebuild(&d).await;
@@ -443,11 +413,8 @@ async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
     const ACTUAL: &str = "select g, a, sm, c from public.agg order by g";
     const EXPECTED: &str = "select g, avg(v), sum(m), sum(v) + count(m) from public.src \
                             group by g order by g";
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 1, 1.25), (2, 1, 2, null), (3, 2, 5, 2.50)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 1, 1.25), (2, 1, 2, null), (3, 2, 5, 2.50)")
+        .await;
     let hidden = hidden(&d).await;
     d.ctl
         .batch_execute(&format!(
@@ -456,7 +423,7 @@ async fn a_rebuild_writes_averages_numeric_sums_and_composed_fields() {
         ))
         .await
         .expect("damage the target");
-    write(&d, "update public.src set m = 3.75 where id = 2").await;
+    d.write("update public.src set m = 3.75 where id = 2").await;
     let undrained = d.seal().await;
     request_rebuild(&d).await;
     rebuild(&d).await;

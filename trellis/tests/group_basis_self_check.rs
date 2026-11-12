@@ -15,11 +15,10 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::integer::IntWidth;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
@@ -28,10 +27,6 @@ use trellis::{Trellis, TrellisOptions};
 
 const SRC: &str = "public.src";
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 async fn start_with(definition: &str, source_ddl: &str, columns: &[(&str, ValueType)]) -> Driver {
     Driver::start(source_ddl, columns, &[definition], &[SRC]).await
@@ -45,12 +40,6 @@ async fn start() -> Driver {
         &[("id", int4()), ("g", int4()), ("v", int4())],
     )
     .await
-}
-
-async fn step(d: &mut Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
 }
 
 async fn exec(d: &Driver, sql: &str) {
@@ -117,7 +106,7 @@ async fn a_converged_group_target_reports_no_divergence_page_by_page() {
         "delete from public.src where id in (5, 6)",
         "update public.src set v = null where id = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
     }
     for limit in [1, 2, 100] {
         let (found, compared, pages) = walk(&d, limit).await;
@@ -155,7 +144,7 @@ async fn composed_fields_and_numerics_converge_without_divergence() {
         "delete from public.src where id = 2",
         "update public.src set m = 3, g = 2 where id = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(walk(&d, 2).await.0, [], "after {sql}");
     }
 }
@@ -178,7 +167,7 @@ async fn an_aggregate_field_reading_another_field_by_name_converges() {
         "update public.src set m = 3 where id = 1",
         "delete from public.src where id = 3",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
         assert_eq!(walk(&d, 2).await.0, [], "after {sql}");
     }
 }
@@ -188,7 +177,7 @@ async fn an_aggregate_field_reading_another_field_by_name_converges() {
 #[tokio::test]
 async fn a_page_still_to_apply_is_not_caught_up_rather_than_diverged() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     exec(&d, "insert into public.src values (2, 1, 5), (3, 2, 1)").await;
     let batch = d.seal().await;
     let page = check_page(
@@ -214,11 +203,8 @@ async fn a_page_still_to_apply_is_not_caught_up_rather_than_diverged() {
 #[tokio::test]
 async fn a_hand_edited_partial_is_reported_until_it_is_restored() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)")
+        .await;
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();
 
@@ -260,11 +246,8 @@ async fn a_hand_edited_partial_is_reported_until_it_is_restored() {
 #[tokio::test]
 async fn missing_extra_and_stale_groups_are_reported() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 5), (3, null, 1)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 5), (3, null, 1)")
+        .await;
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();
 
@@ -330,11 +313,8 @@ async fn missing_extra_and_stale_groups_are_reported() {
 #[tokio::test]
 async fn a_write_made_while_capture_was_off_is_reported() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 5)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 5)")
+        .await;
     exec(
         &d,
         "alter table public.src disable trigger trellis_capture_insert",
@@ -420,7 +400,7 @@ async fn composite_keys_with_null_parts_and_expression_arguments() {
         "delete from public.src where id = 6",
         "update public.src set b = null where id = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step(sql).await;
     }
     for limit in [1, 2, 100] {
         let (found, compared, _) = walk(&d, limit).await;
@@ -448,11 +428,8 @@ async fn composite_keys_with_null_parts_and_expression_arguments() {
 #[tokio::test]
 async fn a_key_on_one_side_only_is_reported_alike_at_every_page_size() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 5), (3, 3, 1), (4, 4, 2)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 5), (3, 3, 1), (4, 4, 2)")
+        .await;
     let same_at_every_limit = |found: Vec<Vec<Divergence>>| {
         let first = &found[0];
         for (i, other) in found.iter().enumerate() {
@@ -538,9 +515,7 @@ async fn compare(d: &Driver, limit: i64) -> (Vec<Divergence>, Vec<String>, bool)
 #[tokio::test]
 async fn ring_rows_not_applied_yet_are_subtracted_from_the_source() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, null, 1),                                        (5, 3, 2)",
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, null, 1),                                        (5, 3, 2)",
     )
     .await;
     exec(
@@ -577,7 +552,7 @@ async fn ring_rows_not_applied_yet_are_subtracted_from_the_source() {
 #[tokio::test]
 async fn a_group_of_negative_count_has_no_row_to_miss() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     exec(&d, "insert into public.src values (2, 2, 5)").await;
     let insertion = d.seal().await;
     exec(&d, "delete from public.src where id = 2").await;
@@ -608,11 +583,8 @@ async fn a_group_of_negative_count_has_no_row_to_miss() {
 #[tokio::test]
 async fn a_planted_error_on_a_group_with_pending_changes_is_reported_exactly() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)")
+        .await;
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();
     exec(
@@ -643,11 +615,8 @@ async fn a_planted_error_on_a_group_with_pending_changes_is_reported_exactly() {
 #[tokio::test]
 async fn an_image_less_pending_change_leaves_only_its_groups_uncertain() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 5), (3, 3, 7)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 5), (3, 3, 7)")
+        .await;
     d.stage_recomputes(SRC, &["1"]).await;
     assert_eq!(
         compare(&d, 10).await,
@@ -671,11 +640,8 @@ async fn an_image_less_pending_change_leaves_only_its_groups_uncertain() {
 #[tokio::test]
 async fn a_held_keys_parked_and_pending_changes_are_subtracted() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
     d.ctl
         .execute(
             "insert into poison (transform_id, src_table, key, last_error) \
@@ -685,7 +651,8 @@ async fn a_held_keys_parked_and_pending_changes_are_subtracted() {
         )
         .await
         .expect("hold the key");
-    step(&mut d, "update public.src set g = 2, v = 11 where id = 1").await;
+    d.step("update public.src set g = 2, v = 11 where id = 1")
+        .await;
     assert_eq!(
         d.rows("select count(*) from poison_held").await,
         ["(1)"],
@@ -744,12 +711,9 @@ async fn segment_tables(d: &Driver) -> Vec<String> {
 #[tokio::test]
 async fn a_drained_ring_slot_is_never_scanned_by_a_page() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
-    step(&mut d, "insert into public.src values (3, 1, 5)").await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
+    d.step("insert into public.src values (3, 1, 5)").await;
     assert_eq!(
         d.rows("select state from segments order by seg_seq").await,
         ["(drained)", "(drained)", "(active)"],
@@ -795,7 +759,7 @@ async fn fence_scans(d: &mut Driver, fence: &str) -> (Vec<String>, Vec<String>) 
 async fn a_drained_slot_with_a_writer_in_flight_at_its_fence_is_read_until_no_late_row_is_counted()
 {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     let tables = segment_tables(&d).await;
     let before_active = tables[tables.len() - 2].clone();
     let real_fence = d
@@ -837,7 +801,7 @@ async fn a_drained_slot_with_a_writer_in_flight_at_its_fence_is_read_until_no_la
     // The successor drains: it took the late rows, so the slot is skipped.
     // (Under the fence the segment really had.)
     fence_scans(&mut d, &real_fence).await;
-    step(&mut d, "insert into public.src values (2, 1, 1)").await;
+    d.step("insert into public.src values (2, 1, 1)").await;
     let (read, skipped) = ring_scans(&d).await;
     assert!(skipped.contains(&before_active), "{read:?} {skipped:?}");
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
@@ -868,7 +832,7 @@ async fn slot_and_late_rows(d: &Driver, seg_seq: i64) -> (String, String) {
 #[tokio::test]
 async fn a_late_writers_row_in_a_drained_slot_is_read_until_its_successor_drains() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     let writer = d.user().await;
     writer
         .batch_execute("begin; insert into public.src values (2, 1, 5)")
@@ -924,12 +888,9 @@ async fn a_late_writers_row_in_a_drained_slot_is_read_until_its_successor_drains
 #[tokio::test]
 async fn a_drained_ring_slot_is_read_for_a_definition_with_a_held_key() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
-    step(&mut d, "insert into public.src values (3, 1, 5)").await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
+    d.step("insert into public.src values (3, 1, 5)").await;
     let oldest = segment_tables(&d).await[0].clone();
     assert!(ring_scans(&d).await.1.contains(&oldest));
     d.ctl
@@ -941,8 +902,9 @@ async fn a_drained_ring_slot_is_read_for_a_definition_with_a_held_key() {
         )
         .await
         .expect("hold the key");
-    step(&mut d, "update public.src set g = 2, v = 11 where id = 1").await;
-    step(&mut d, "update public.src set v = 12 where id = 1").await;
+    d.step("update public.src set g = 2, v = 11 where id = 1")
+        .await;
+    d.step("update public.src set v = 12 where id = 1").await;
     assert_eq!(d.rows("select count(*) from poison_held").await, ["(1)"]);
     let oldest = segment_tables(&d).await[0].clone();
     let (read, skipped) = ring_scans(&d).await;
@@ -959,11 +921,8 @@ async fn a_drained_ring_slot_is_read_for_a_definition_with_a_held_key() {
 #[tokio::test]
 async fn a_pending_truncate_leaves_every_group_uncertain() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 2, 20)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
+        .await;
     exec(&d, "truncate public.src").await;
     let (_, _, all) = compare(&d, 10).await;
     assert!(all);
@@ -978,11 +937,8 @@ async fn a_pending_truncate_leaves_every_group_uncertain() {
 #[tokio::test]
 async fn a_pending_change_a_groups_basis_saw_is_not_subtracted() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)")
+        .await;
     exec(&d, "insert into public.src values (4, 1, 100)").await;
     let batch = d.seal().await;
     let hidden = hidden(&d).await;
@@ -1012,7 +968,7 @@ async fn a_pending_change_a_groups_basis_saw_is_not_subtracted() {
 #[tokio::test]
 async fn a_pending_change_at_or_below_the_truncate_floor_is_not_subtracted() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    d.step("insert into public.src values (1, 1, 10)").await;
     exec(&d, "insert into public.src values (2, 1, 5), (3, 2, 7)").await;
     let before = d.seal().await;
     exec(
@@ -1045,10 +1001,10 @@ async fn groups_page_in_their_key_order_with_the_null_group_last() {
         values.push(format!("({g}, {g}, {g})"));
     }
     values.push("(200, null, 5)".to_string());
-    step(
-        &mut d,
-        &format!("insert into public.src values {}", values.join(", ")),
-    )
+    d.step(&format!(
+        "insert into public.src values {}",
+        values.join(", ")
+    ))
     .await;
     for limit in [1, 2, 3, 4, 100] {
         let (found, compared, pages) = walk(&d, limit).await;
@@ -1190,10 +1146,10 @@ async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_witho
             rows.push(format!("({id}, {g}, {h}, {id})"));
         }
     }
-    step(
-        &mut d,
-        &format!("insert into public.src values {}", rows.join(", ")),
-    )
+    d.step(&format!(
+        "insert into public.src values {}",
+        rows.join(", ")
+    ))
     .await;
     // Pending: a group emptied (only the ring still holds its rows), a new
     // group (only in the source and the ring), and a row moved into the
@@ -1293,11 +1249,8 @@ async fn request_backfill_and_rebuild(d: &Driver) {
 #[tokio::test]
 async fn a_planted_divergence_is_reported_until_request_backfill_repairs_it() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, 3, 1), (5, 4, 2)",
-    )
-    .await;
+    d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, 3, 1), (5, 4, 2)")
+        .await;
     assert_eq!(walk(&d, 100).await.0, [], "converged before the plant");
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();

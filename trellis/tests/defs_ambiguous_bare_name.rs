@@ -3,18 +3,20 @@
 //! and both qualified spellings. A qualified `<table>.<column>` reads the
 //! source column.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, settle, start_and_settle_builds};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
+use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::intake::harness;
 use trellis::integer::IntWidth;
-use trellis::staging::{CdcOp, StagedChange, has_pending, retire_drained_segments};
-
-const TEST_NAME: &str = "defs_ambiguous_bare_name_test";
+use trellis::staging::{CdcOp, StagedChange};
 
 fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([
@@ -22,53 +24,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ("grp".to_string(), ValueType::Integer(IntWidth::Int4)),
         ("val".to_string(), ValueType::Integer(IntWidth::Int4)),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            TEST_NAME,
-            1,
-            "trellis_defs_ambiguous_bare_name_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 /// The issue's example: `val` is a source column and a field, and `SUM(val)`
@@ -138,9 +93,9 @@ async fn a_qualified_name_aggregates_the_source_column() {
     )
     .await
     .expect("the qualified names are not ambiguous");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     let row = |grp: i32, val: &str, total: &str, biggest: &str| {
         (grp, val.to_string(), total.to_string(), biggest.to_string())
@@ -180,7 +135,7 @@ async fn a_qualified_name_aggregates_the_source_column() {
         },
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
     assert_eq!(
         read_totals(&client).await,
         vec![row(1, "2", "112", "112"), row(2, "3", "1", "1")]

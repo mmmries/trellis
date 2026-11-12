@@ -44,10 +44,15 @@
 //! `min`/`max` — never against the engine's own renderer. Harness conventions follow
 //! `defs_boolean.rs`/`defs_bytea.rs`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, drain, seal};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::pg_type::PgType;
@@ -57,7 +62,6 @@ use trellis::defs::{
 };
 use trellis::integer::IntWidth;
 use trellis::netaddr;
-use trellis::staging::{apply, seal};
 
 // ---------------------------------------------------------------------
 // Harness
@@ -72,18 +76,6 @@ fn source_columns() -> HashMap<String, ValueType> {
         ("m8".to_string(), ValueType::Other(PgType::MacAddr8)),
         ("n".to_string(), ValueType::Numeric),
     ])
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("session bootstrap");
-    client
 }
 
 /// Defines a `JOIN` whose one `ON` term pairs `left.lcol` with
@@ -115,7 +107,7 @@ async fn define_join_on(
 async fn inet_and_cidr_share_a_text_cast_row_macaddr_and_macaddr8_have_none() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     for pg_type in ["inet", "cidr"] {
         let row = client
@@ -161,7 +153,7 @@ async fn inet_and_cidr_share_a_text_cast_row_macaddr_and_macaddr8_have_none() {
 async fn inet_out_and_the_text_cast_disagree_on_bare_host_addresses() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -212,7 +204,7 @@ async fn inet_out_and_the_text_cast_disagree_on_bare_host_addresses() {
 async fn cidr_out_and_the_text_cast_always_agree() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -245,7 +237,7 @@ async fn cidr_out_and_the_text_cast_always_agree() {
 async fn cidr_macaddr_macaddr8_join_keys_and_primary_keys_are_admitted() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     for (idx, pg_type) in ["cidr", "macaddr", "macaddr8"].into_iter().enumerate() {
         let parent = format!("parent_{idx}");
@@ -279,7 +271,7 @@ async fn cidr_macaddr_macaddr8_join_keys_and_primary_keys_are_admitted() {
 async fn inet_is_refused_as_a_join_key_and_primary_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -332,7 +324,7 @@ fn all_four_families_are_admitted_as_group_by_keys() {
 async fn postgres_has_no_min_max_aggregate_for_macaddr_or_macaddr8() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     for (pg_type, sample, value_type) in [
         (
@@ -392,7 +384,7 @@ async fn postgres_has_no_min_max_aggregate_for_macaddr_or_macaddr8() {
 async fn to_jsonb_agrees_with_text_except_for_inet() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -445,7 +437,7 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -513,23 +505,6 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
             .unwrap_or_else(|e| panic!("stage bare recompute {key}: {e}"));
     }
 
-    async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool) {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "inet_worker",
-            1,
-            "trellis_defs_netaddr_issue_116_regression",
-        )
-        .await
-        .expect("drain_once")
-        .expect("drain_once must claim and drain something");
-    }
-
     // Row 1: an ordinary image-bearing insert, staged with `inet_out`'s
     // host-elided spelling — exactly what a capture trigger images for a
     // bare host address.
@@ -546,7 +521,10 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     // same value `192.168.1.5/32`.
     stage_bare_recompute(&client, "seg_0", "2").await;
 
-    drain_sealed(&mut client, &db.pool).await;
+    let batch = seal(&mut client).await;
+    drain(&db.pool, batch, "inet_worker")
+        .await
+        .expect("drain must claim and drain something");
 
     let rows = client
         .query("select grp::text, total::text from totals", &[])
@@ -592,7 +570,7 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
 async fn typed_literals_round_trip_through_a_real_cast() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     let cases: &[(&str, &str)] = &[
         ("inet", "192.168.1.5/32"),

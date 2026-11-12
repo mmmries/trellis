@@ -25,8 +25,12 @@
 //!
 //! Harness conventions (hand-built source table, `create_definition` +
 //! `create_target_table`, CDC rows staged straight into the ring, seal, then
-//! `drain_once`) are copied from `apply.rs`; the backfill leg's
-//! chunk-draining helper is copied from `defs_install_definition.rs`.
+//! drain) are copied from `apply.rs`.
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, drain, seal, start_and_settle_builds};
 
 #[path = "support/sql_recompute.rs"]
 mod sql_recompute;
@@ -43,7 +47,6 @@ use trellis::defs::{
     source_primary_key, validate,
 };
 use trellis::pool::Pool;
-use trellis::staging::apply;
 
 // ---------------------------------------------------------------------
 // The families that exercise this shared mechanism, each with a canonical
@@ -108,30 +111,6 @@ fn source_columns() -> HashMap<String, ValueType> {
     HashMap::from([("id".to_string(), ValueType::Numeric)])
 }
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; \
-             set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"
-        ))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
 async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
     let lsn = testkit::wal_insert_lsn(client).await;
     client
@@ -147,19 +126,6 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
         )
         .await
         .expect("stage cdc row");
-}
-
-/// Starts every registered definition's Re-derive build and runs it to
-/// `live`, standing in for the staging worker and a running
-/// `application_threads` drain worker (copied from
-/// `defs_install_definition.rs`).
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// The declared Postgres type of `table`.`column`, straight from
@@ -414,7 +380,7 @@ async fn install_and_backfill_produce_real_typed_columns() {
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
 
     // The columns are genuinely their own Postgres types — this is the
     // "computed 1-1 target" claim. Without typed literals the only way to get
@@ -488,17 +454,10 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_source_text() {
     insert_cdc_row(&client, "1", r#"{"id":"1"}"#).await;
     insert_cdc_row(&client, "2", r#"{"id":"2"}"#).await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
-    apply::drain_once(
-        &db.pool,
-        seg_seq,
-        "typed_literal_worker",
-        1,
-        "trellis_typed_literal_test",
-    )
-    .await
-    .expect("drain_once")
-    .expect("drain_once must claim and drain something");
+    let batch = seal(&mut client).await;
+    drain(&db.pool, batch, "typed_literal_worker")
+        .await
+        .expect("drain must claim and drain something");
 
     // Both columns' declared types survive the apply path, and the persisted
     // values match what a `SELECT` over the same rows computes.
@@ -679,7 +638,7 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
     )
     .await
     .expect("install_definition under a hostile DateStyle");
-    drain_backfill_chunks(&pool).await;
+    start_and_settle_builds(&pool).await;
 
     for (name, _, text, _) in CASES {
         let persisted: Option<String> = client

@@ -8,20 +8,15 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::Config;
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::integer::IntWidth;
 use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::self_check::{
     SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
 use trellis::{Trellis, TrellisOptions};
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 /// Every name the generated SQL uses as a table alias, a CTE or a CTE column,
 /// each a source column here.
@@ -191,12 +186,6 @@ const ORACLE: &str = "select g, count(*), sum(r), sum(s + e), count(p), sum(v) f
 const TARGET: &str =
     "select g, n, sum_r, sum_se, cnt_p, total from public.agg order by g nulls last";
 
-async fn step(d: &mut Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
-}
-
 /// `sql`'s rows as text. (`Driver::rows` aliases its subquery `r`, a field name
 /// here.)
 async fn rows(d: &Driver, sql: &str) -> Vec<String> {
@@ -300,25 +289,19 @@ async fn an_aggregate_over_columns_named_like_generated_aliases_builds_applies_c
     let mut d = start().await;
     assert_matches_source(&d, "after the build").await;
 
-    step(
-        &mut d,
-        &format!(
-            "insert into public.src values {}, {}, {}",
-            row(4, Some(2), 40),
-            row(5, Some(3), 50),
-            row(6, None, 60)
-        ),
-    )
+    d.step(&format!(
+        "insert into public.src values {}, {}, {}",
+        row(4, Some(2), 40),
+        row(5, Some(3), 50),
+        row(6, None, 60)
+    ))
     .await;
     assert_matches_source(&d, "after inserts").await;
 
-    step(&mut d, "update public.src set g = 3 where id = 2").await;
-    step(
-        &mut d,
-        "update public.src set r = r + 100, v = v + 1 where id = 3",
-    )
-    .await;
-    step(&mut d, "delete from public.src where id in (5, 6)").await;
+    d.step("update public.src set g = 3 where id = 2").await;
+    d.step("update public.src set r = r + 100, v = v + 1 where id = 3")
+        .await;
+    d.step("delete from public.src where id in (5, 6)").await;
     assert_matches_source(&d, "after updates and deletes").await;
     assert_self_check_clean(&d).await;
 
@@ -491,20 +474,16 @@ async fn a_join_over_columns_named_like_generated_aliases_builds_applies_checks_
     .await;
     assert_joins_match_source(&d, "after the build").await;
 
-    step(
-        &mut d,
-        &format!(
-            "insert into public.ja values {}, {}; insert into public.jb values {}, {}",
-            row_a(4, 3, 3, 3, 1),
-            row_a(5, 4, 9, 9, 2),
-            row_b(4, 3, 3, 30, 6),
-            row_b(5, 3, 3, 31, 7)
-        ),
-    )
+    d.step(&format!(
+        "insert into public.ja values {}, {}; insert into public.jb values {}, {}",
+        row_a(4, 3, 3, 3, 1),
+        row_a(5, 4, 9, 9, 2),
+        row_b(4, 3, 3, 30, 6),
+        row_b(5, 3, 3, 31, 7)
+    ))
     .await;
     assert_joins_match_source(&d, "after inserts on both sides").await;
-    step(
-        &mut d,
+    d.step(
         "update public.ja set ga = 5, r = r + 100 where id = 1; \
          update public.jb set gb = 11, k = 3 where id = 2; \
          delete from public.jb where id = 3; delete from public.ja where id = 5",

@@ -24,7 +24,7 @@ mod drain_driver;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::{Driver, Running};
+use drain_driver::{Driver, Running, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
@@ -35,10 +35,6 @@ const SRC: &str = "public.src";
 const SRC_DDL: &str = "create table public.src (id integer primary key, g integer, h integer, \
                        v integer); \
                        create index on public.src (g, h)";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 fn int8() -> ValueType {
     ValueType::Integer(IntWidth::Int8)
@@ -90,16 +86,6 @@ async fn hidden_tables(d: &Driver) -> usize {
     .len()
 }
 
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-/// Writes `sql` and drains it, and everything it propagates, to quiescence.
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    d.settle().await;
-}
-
 /// Asserts `actual` equals the oracle `expected`, both over the settled
 /// pipeline.
 async fn assert_equal(d: &mut Driver, actual: &str, expected: &str) {
@@ -133,19 +119,18 @@ async fn an_extinct_upstream_group_removes_its_rollup_group() {
     .await;
     const ROLL: &str = "select g, total2 from public.roll order by g";
     const ORACLE: &str = "select g, sum(v) from public.src group by g order by g";
-    step(
-        &mut d,
+    d.step_settle(
         "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2), (4, 3, 0, 11)",
     )
     .await;
     assert_equal(&mut d, ROLL, ORACLE).await;
-    step(&mut d, "delete from public.src where id = 4").await;
+    d.step_settle("delete from public.src where id = 4").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
     assert_eq!(
         d.rows("select g from public.roll where g = 3").await.len(),
         0
     );
-    step(&mut d, "delete from public.src where id = 1").await;
+    d.step_settle("delete from public.src where id = 1").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
 }
 
@@ -169,19 +154,18 @@ async fn an_extinct_composite_upstream_group_reduces_its_coarser_rollup() {
     const ROLL: &str = "select g, total2, groups from public.roll order by g";
     const ORACLE: &str = "select g, sum(v), count(distinct array[h]) from public.src \
                           group by g order by g";
-    step(
-        &mut d,
+    d.step_settle(
         "insert into public.src values \
          (1, 1, 1, 5), (2, 1, 1, 7), (3, 1, 2, 2), (4, 2, 1, 11), (5, 2, null, 3)",
     )
     .await;
     assert_equal(&mut d, ROLL, ORACLE).await;
-    step(&mut d, "delete from public.src where id = 3").await;
+    d.step_settle("delete from public.src where id = 3").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
     // A NULL grouping part: the upstream group `(2, NULL)` goes extinct.
-    step(&mut d, "delete from public.src where id = 5").await;
+    d.step_settle("delete from public.src where id = 5").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
-    step(&mut d, "delete from public.src where g = 2").await;
+    d.step_settle("delete from public.src where g = 2").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
 }
 
@@ -200,15 +184,12 @@ fn one_columns() -> Vec<(&'static str, ValueType)> {
 #[tokio::test]
 async fn a_deleted_one_to_one_row_reduces_the_aggregate_over_it() {
     let mut d = start(ONE, OVER_ONE, &one_columns(), 1).await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)",
-    )
-    .await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)")
+        .await;
     assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
-    step(&mut d, "delete from public.src where id = 2").await;
+    d.step_settle("delete from public.src where id = 2").await;
     assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
-    step(&mut d, "delete from public.src where id = 3").await;
+    d.step_settle("delete from public.src where id = 3").await;
     assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
 }
 
@@ -220,21 +201,21 @@ async fn a_deleted_one_to_one_row_reduces_the_aggregate_over_it() {
 #[tokio::test]
 async fn an_upstream_row_that_moves_group_leaves_its_old_group() {
     let mut d = start(ONE, OVER_ONE, &one_columns(), 1).await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)",
-    )
-    .await;
-    step(&mut d, "update public.src set g = 2, v = 9 where id = 1").await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)")
+        .await;
+    d.step_settle("update public.src set g = 2, v = 9 where id = 1")
+        .await;
     assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
     // Two moves of one key in one page: the images chain through both.
-    write(&d, "update public.src set g = 3 where id = 2").await;
-    write(&d, "update public.src set g = 1, v = 1 where id = 2").await;
+    d.write("update public.src set g = 3 where id = 2").await;
+    d.write("update public.src set g = 1, v = 1 where id = 2")
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
     // The upstream group-key change moves group 2's only member away.
-    step(&mut d, "update public.src set g = 1 where id = 3").await;
+    d.step_settle("update public.src set g = 1 where id = 3")
+        .await;
     assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
 }
 
@@ -256,14 +237,12 @@ async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
     const ORACLE: &str = "select n, sum(total), count(*) from \
                           (select g, sum(v) as total, count(*) as n from public.src group by g) s \
                           group by n order by n";
-    step(
-        &mut d,
+    d.step_settle(
         "insert into public.src values (1, 1, 0, 10), (3, 1, 0, 7), (5, 2, 0, 1), (6, 3, 0, 4)",
     )
     .await;
     assert_equal(&mut d, ROLL, ORACLE).await;
-    write(
-        &d,
+    d.write(
         "update public.src set g = 2 where id in (1, 3, 6); \
          insert into public.src values (2, 1, 0, 5), (4, 1, 0, 6)",
     )
@@ -273,8 +252,8 @@ async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
     assert_equal(&mut d, ROLL, ORACLE).await;
     // Emptied by one transaction and refilled by another, drained as one
     // page: the upstream group's row count passes through 0.
-    write(&d, "delete from public.src where g = 1").await;
-    write(&d, "insert into public.src values (7, 1, 0, 3)").await;
+    d.write("delete from public.src where g = 1").await;
+    d.write("insert into public.src values (7, 1, 0, 3)").await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
@@ -289,7 +268,7 @@ async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
 #[tokio::test]
 async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_write() {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
-    write(&d, "insert into public.src values (1, 1, 0, 5)").await;
+    d.write("insert into public.src values (1, 1, 0, 5)").await;
     let batch = d.seal().await;
     let mut page = d
         .drain_frozen(batch, "writer", &[(PausePoint::BeforeCommit, "public.m")])
@@ -337,11 +316,8 @@ async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_it
 #[tokio::test]
 async fn a_reader_defined_over_a_seeded_upstream_builds_from_its_rows() {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 6), (3, 2, 0, 7)",
-    )
-    .await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 6), (3, 2, 0, 7)")
+        .await;
     install(&d, OVER_ONE, &one_columns()).await;
     trellis::intake::harness::start_registered_builds(d.pool())
         .await
@@ -403,17 +379,13 @@ async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
     const ORACLE: &str = "select n, count(*), sum(total) from ( \
                               select count(*) as n, sum(v) as total from public.src group by g \
                           ) s group by n order by n";
-    step(
-        &mut d,
+    d.step_settle(
         "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2), (4, 3, 0, 11)",
     )
     .await;
     assert_equal(&mut d, ROLL, ORACLE).await;
-    write(
-        &d,
-        "insert into public.src values (5, 2, 0, 1); delete from public.src where id = 4",
-    )
-    .await;
+    d.write("insert into public.src values (5, 2, 0, 1); delete from public.src where id = 4")
+        .await;
     let undrained = d.seal().await;
     let trellis = trellis::Trellis::connect(
         trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
@@ -433,7 +405,8 @@ async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
     );
     d.drain(undrained, "undrained").await;
     assert_equal(&mut d, ROLL, ORACLE).await;
-    step(&mut d, "insert into public.src values (6, 3, 0, 4)").await;
+    d.step_settle("insert into public.src values (6, 3, 0, 4)")
+        .await;
     assert_equal(&mut d, ROLL, ORACLE).await;
 }
 
@@ -481,14 +454,12 @@ async fn an_upstream_release_reaches_its_reader_through_the_seam() {
     const ORACLE: &str = "select n, count(*), sum(total) from ( \
                               select count(*) as n, sum(v) as total from public.src group by g \
                           ) s group by n order by n";
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)",
-    )
-    .await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)")
+        .await;
     assert_equal(&mut d, ROLL, ORACLE).await;
     hold(&d, "public.agg", SRC, "1").await;
-    write(&d, "update public.src set g = 2, v = 9 where id = 1").await;
+    d.write("update public.src set g = 2, v = 9 where id = 1")
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "held").await;
     assert_ne!(
@@ -534,12 +505,10 @@ async fn join_with_reader() -> Driver {
     .await;
     trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
-    step(&mut d, "insert into public.b values (1, 1, 10), (2, 2, 20)").await;
-    step(
-        &mut d,
-        "insert into public.a values (1, 1, 1, 0), (2, 2, 2, 0)",
-    )
-    .await;
+    d.step_settle("insert into public.b values (1, 1, 10), (2, 2, 20)")
+        .await;
+    d.step_settle("insert into public.a values (1, 1, 1, 0), (2, 2, 2, 0)")
+        .await;
     assert_equal(&mut d, JR, JR_ORACLE).await;
     d
 }
@@ -550,7 +519,7 @@ async fn join_with_reader() -> Driver {
 async fn an_upstream_join_release_reaches_its_reader_through_the_seam() {
     let mut d = join_with_reader().await;
     hold(&d, "public.j", "public.a", "1").await;
-    write(&d, "update public.a set ga = 2 where id = 1").await;
+    d.write("update public.a set ga = 2 where id = 1").await;
     let batch = d.seal().await;
     d.drain(batch, "held").await;
     assert_ne!(
@@ -574,11 +543,8 @@ async fn an_upstream_join_release_reaches_its_reader_through_the_seam() {
 #[tokio::test]
 async fn an_upstream_join_rebuild_reaches_its_reader_through_the_seam() {
     let mut d = join_with_reader().await;
-    write(
-        &d,
-        "update public.a set ga = 2 where id = 1; insert into public.a values (3, 3, 2, 0)",
-    )
-    .await;
+    d.write("update public.a set ga = 2 where id = 1; insert into public.a values (3, 3, 2, 0)")
+        .await;
     let undrained = d.seal().await;
     let trellis = trellis::Trellis::connect(
         trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
@@ -631,10 +597,11 @@ async fn a_one_to_one_reader_holds_the_null_keyed_groups() {
         "update public.src set h = 5 where id = 3",
         "delete from public.src where h is null",
     ] {
-        step(&mut d, sql).await;
+        d.step_settle(sql).await;
         assert_equal(&mut d, A2, ORACLE).await;
     }
-    step(&mut d, "insert into public.src values (5, null, null, 5)").await;
+    d.step_settle("insert into public.src values (5, null, null, 5)")
+        .await;
     assert_equal(&mut d, A2, ORACLE).await;
     assert_eq!(
         d.rows("select n from public.a2 where g is null and h is null")
@@ -683,10 +650,11 @@ async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
         "delete from public.b where id = 1",
         "delete from public.a where ga is null",
     ] {
-        step(&mut d, sql).await;
+        d.step_settle(sql).await;
         assert_equal(&mut d, JR, ORACLE).await;
     }
-    step(&mut d, "insert into public.a values (4, null, 2, 0)").await;
+    d.step_settle("insert into public.a values (4, null, 2, 0)")
+        .await;
     assert_equal(&mut d, JR, ORACLE).await;
     assert_eq!(
         d.rows("select n from public.jr where ga is null").await,
@@ -732,7 +700,7 @@ async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
         "delete from public.src where g is null and h is null",
         "update public.src set h = 2 where id = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step_settle(sql).await;
         assert_equal(&mut d, ROLL, ORACLE).await;
     }
 }
@@ -752,17 +720,14 @@ async fn a_pause_and_drop_of_a_reader_wait_for_a_page_that_planned_it() {
     .await;
     const AGG: &str = "select g, total, n from public.agg order by g";
     const ORACLE: &str = "select g, sum(v), count(*) from public.src group by g order by g";
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)",
-    )
-    .await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)")
+        .await;
     // Group 1's change reaches `roll` through the seam: its rows are pending
     // when the next page is planned, with group 2's change beside them.
-    write(&d, "insert into public.src values (3, 1, 0, 1)").await;
+    d.write("insert into public.src values (3, 1, 0, 1)").await;
     let seam = d.seal().await;
     d.drain(seam, "seam").await;
-    write(&d, "insert into public.src values (4, 2, 0, 1)").await;
+    d.write("insert into public.src values (4, 2, 0, 1)").await;
     let batch = d.seal().await;
     let agg_id: i64 = d
         .ctl
@@ -837,12 +802,9 @@ async fn a_pause_and_drop_of_a_one_to_one_wait_for_a_page_that_planned_it() {
     .await;
     const A1: &str = "select id, g, w from public.a1 order by id";
     const ORACLE: &str = "select id, g, v from public.src order by id";
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)",
-    )
-    .await;
-    write(&d, "update public.src set v = 9 where id = 2").await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)")
+        .await;
+    d.write("update public.src set v = 9 where id = 2").await;
     let batch = d.seal().await;
     // Another transaction holds `a1`'s row 2, so the page queues on it with
     // its plan already loaded and `m` not yet written.
@@ -915,8 +877,7 @@ fn up_columns() -> Vec<(&'static str, ValueType)> {
 /// and `roll` not yet defined over it.
 async fn seeded_upstream() -> Driver {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[UP_HG], &[SRC]).await;
-    step(
-        &mut d,
+    d.step_settle(
         "insert into public.src values (1, 1, null, 10), (2, null, null, 5), (3, 2, 5, 7), \
          (4, null, 5, 3), (5, 3, null, 1)",
     )
@@ -926,7 +887,7 @@ async fn seeded_upstream() -> Driver {
 
 /// Defines `roll` over `up`: it applies from here, with its plan job claimable.
 async fn define_roll(d: &Driver) {
-    write(d, "create index on public.up (h)").await;
+    d.write("create index on public.up (h)").await;
     install(d, ROLL_H, &up_columns()).await;
     trellis::intake::harness::start_registered_builds(d.pool())
         .await
@@ -990,12 +951,12 @@ async fn assert_roll_finished(d: &Driver) {
 #[tokio::test]
 async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
     let mut d = seeded_upstream().await;
-    step(&mut d, "update public.src set v = 11 where id = 2").await;
+    d.step_settle("update public.src set v = 11 where id = 2")
+        .await;
     define_roll(&d).await;
     // The reader is defined and its build not started: this write's upstream
     // page runs, and its seam page is sealed, ahead of the build's snapshot.
-    write(
-        &d,
+    d.write(
         "update public.src set v = 20 where id = 1; \
                insert into public.src values (6, null, null, 4)",
     )
@@ -1014,7 +975,7 @@ async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
     );
     // A write to a `NULL`-part row left in the active segment: the build's
     // open transaction holds the seal of a later one.
-    write(&d, "update public.src set v = 6 where id = 4").await;
+    d.write("update public.src set v = 6 where id = 4").await;
     d.release(&mut building, PausePoint::AfterRebuildLock).await;
     building.finish().await;
     page.finish().await;
@@ -1026,11 +987,8 @@ async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
     );
     assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
 
-    step(
-        &mut d,
-        "update public.src set v = 30 where id = 4; delete from public.src where id = 5",
-    )
-    .await;
+    d.step_settle("update public.src set v = 30 where id = 4; delete from public.src where id = 5")
+        .await;
     assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
     assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,37,2)", "(,35,3)"]);
 }
@@ -1042,7 +1000,7 @@ async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
 #[tokio::test]
 async fn an_undrained_seam_page_from_before_a_null_part_build_is_refused() {
     let mut d = seeded_upstream().await;
-    write(&d, "update public.src set v = 11 where id = 2").await;
+    d.write("update public.src set v = 11 where id = 2").await;
     let batch = d.seal().await;
     d.drain(batch, "before").await;
     let seam = d.seal().await;
@@ -1071,11 +1029,8 @@ async fn an_undrained_seam_page_from_before_a_null_part_build_is_refused() {
 async fn upstream_truncates_across_a_reader_build_over_null_part_keys() {
     let mut d = seeded_upstream().await;
     define_roll(&d).await;
-    write(
-        &d,
-        "truncate public.src; insert into public.src values (6, 1, null, 9), (7, null, 5, 2)",
-    )
-    .await;
+    d.write("truncate public.src; insert into public.src values (6, 1, null, 9), (7, null, 5, 2)")
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "truncate").await;
     let seam = d.seal().await;
@@ -1089,11 +1044,8 @@ async fn upstream_truncates_across_a_reader_build_over_null_part_keys() {
         "the seam page waits for the build's lock"
     );
     // Left in the active segment, drained after the build.
-    write(
-        &d,
-        "truncate public.src; insert into public.src values (8, null, null, 4), (9, 2, 5, 1)",
-    )
-    .await;
+    d.write("truncate public.src; insert into public.src values (8, null, null, 4), (9, 2, 5, 1)")
+        .await;
     d.release(&mut building, PausePoint::AfterRebuildLock).await;
     building.finish().await;
     page.finish().await;
@@ -1106,11 +1058,8 @@ async fn upstream_truncates_across_a_reader_build_over_null_part_keys() {
     assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
     assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,1,1)", "(,4,1)"]);
 
-    step(
-        &mut d,
-        "truncate public.src; insert into public.src values (10, null, null, 6)",
-    )
-    .await;
+    d.step_settle("truncate public.src; insert into public.src values (10, null, null, 6)")
+        .await;
     assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
     assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,6,1)"]);
 }
@@ -1123,13 +1072,11 @@ async fn upstream_truncates_across_a_reader_build_over_null_part_keys() {
 #[tokio::test]
 async fn a_change_from_before_an_upstream_truncate_is_refused_after_the_build() {
     let mut d = seeded_upstream().await;
-    write(&d, "insert into public.src values (7, null, 5, 30)").await;
+    d.write("insert into public.src values (7, null, 5, 30)")
+        .await;
     let before = d.seal().await;
-    write(
-        &d,
-        "truncate public.src; insert into public.src values (6, null, null, 9)",
-    )
-    .await;
+    d.write("truncate public.src; insert into public.src values (6, null, null, 9)")
+        .await;
     let truncate = d.seal().await;
     d.drain(truncate, "truncate").await;
     define_roll(&d).await;

@@ -12,14 +12,19 @@
 //! Every test is stepped by hand: no staging worker runs, and nothing polls
 //! for convergence.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer};
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::install::{Installed, installed};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{CatalogError, ValidationError, ValueType, install_definition};
-use trellis::{Applied, Config, TransformStatus, Trellis, TrellisOptions};
+use trellis::{Applied, TransformStatus, Trellis};
 
 async fn batch(pool: &trellis::pool::Pool, sql: &str) {
     pool.get()
@@ -317,27 +322,6 @@ async fn define_refuses_a_join_key_with_a_nondeterministic_collation() {
     assert_nothing_registered(&db.pool, "visits_by_region").await;
 }
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
-
 const ORDERS_ITEMS: &str = "set search_path to public;
      create table orders (id integer primary key, region text, total numeric(10,2));
      create table items (id integer primary key, order_id integer, sku text, qty integer);
@@ -399,9 +383,9 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 async fn a_join_registers_both_tables_and_a_pass_starts_its_build() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(ORDERS_ITEMS).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     let applied = trellis.apply(BY_REGION).await.expect("define the JOIN");
     let target_table = applied.into_transform().expect("a transform is defined");
@@ -566,9 +550,9 @@ async fn a_join_registers_both_tables_and_a_pass_starts_its_build() {
 async fn a_join_pauses_resumes_and_drops_with_its_hidden_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(ORDERS_ITEMS).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(BY_REGION).await.expect("define the JOIN");
     let id = definition_id(&raw, "by_region").await;
 
@@ -648,9 +632,9 @@ async fn a_join_pauses_resumes_and_drops_with_its_hidden_tables() {
 async fn a_join_resume_revalidates_both_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(ORDERS_ITEMS).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(BY_REGION).await.expect("define the JOIN");
     trellis
         .apply("PAUSE TRANSFORM by_region")
@@ -717,9 +701,9 @@ async fn a_join_resume_revalidates_both_tables() {
 async fn a_column_lost_or_retyped_on_either_table_pauses_the_whole_join() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(ORDERS_ITEMS).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(BY_REGION).await.expect("define the JOIN");
     pass(&mut raw, &db.pool).await;
 
@@ -784,9 +768,9 @@ async fn a_column_lost_or_retyped_on_either_table_pauses_the_whole_join() {
 async fn a_target_a_join_reads_cannot_be_dropped_under_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(ORDERS_ITEMS).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply(
             "TRANSFORM line_totals FROM items GROUP BY order_id \
@@ -876,7 +860,7 @@ async fn assert_unpaused(trellis: &Trellis, target: &str) {
 async fn a_widened_string_changes_no_copy_and_an_outgrown_column_pauses_the_join() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(
         "set search_path to public;
          create table orders (id integer primary key, code varchar(10) collate \"C\", \
@@ -888,7 +872,7 @@ async fn a_widened_string_changes_no_copy_and_an_outgrown_column_pauses_the_join
     )
     .await
     .expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply(
             "TRANSFORM by_code FROM orders LEFT JOIN items \
@@ -985,7 +969,7 @@ async fn a_widened_string_changes_no_copy_and_an_outgrown_column_pauses_the_join
 async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(
         "set search_path to public;
          create table orders (id integer primary key, region text, placed timestamp);
@@ -998,7 +982,7 @@ async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
     )
     .await
     .expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply(
             "TRANSFORM shipped FROM orders LEFT JOIN items \
@@ -1057,7 +1041,7 @@ async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
 async fn a_join_resume_recreates_its_hidden_tables_without_re_typing_them() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(
         "set search_path to public;
          create table orders (id integer primary key, code bigint, region text);
@@ -1067,7 +1051,7 @@ async fn a_join_resume_recreates_its_hidden_tables_without_re_typing_them() {
     )
     .await
     .expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply(
             "TRANSFORM by_code FROM orders LEFT JOIN items \

@@ -15,12 +15,17 @@
 //!
 //! Every test is stepped by hand: no staging worker runs.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::definer;
+
 use std::collections::HashMap;
 
 use testkit::TestCluster;
 use trellis::defs::{CatalogError, ValidationError, ValueType, install_definition};
 use trellis::integer::IntWidth;
-use trellis::{Config, Trellis, TrellisError, TrellisOptions};
+use trellis::{Trellis, TrellisError};
 
 async fn batch(pool: &trellis::pool::Pool, sql: &str) {
     pool.get()
@@ -481,15 +486,6 @@ async fn a_one_to_one_joins_tables_are_refused_past_the_column_cap() {
     );
 }
 
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
-
 /// Defines `TRANSFORM al FROM public.a` with `fields` fields over a source
 /// `a (id, v)`, and runs its build, so `ALTER TRANSFORM` finds it live.
 async fn live_wide_target(db: &testkit::TestDatabase, fields: usize) -> Trellis {
@@ -498,7 +494,7 @@ async fn live_wide_target(db: &testkit::TestDatabase, fields: usize) -> Trellis 
         "create table public.a (id integer primary key, v integer);",
     )
     .await;
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply(&format!(
             "TRANSFORM al FROM public.a SELECT {}",
