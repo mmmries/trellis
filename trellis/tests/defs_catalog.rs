@@ -5,7 +5,7 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::start_and_settle_builds;
+use pipeline::{numeric_columns, start_and_settle_builds};
 
 use std::collections::HashMap;
 
@@ -15,13 +15,6 @@ use trellis::defs::{
     CatalogError, ValidationError, ValueType, all_source_tables, create_definition,
     install_definition, transforms_for_source,
 };
-
-fn columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|s| (s.to_string(), ValueType::Numeric))
-        .collect()
-}
 
 /// Bare `name` qualified under [`DEFAULT_SCHEMA`] — where
 /// `create_bare_source_table`/`create_authors_and_posts` actually land a
@@ -57,7 +50,7 @@ async fn valid_definition_is_stored_and_retrievable() {
     let def = create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM orders SELECT price + tax AS total",
-        &columns(&["price", "tax"]),
+        &numeric_columns(&["price", "tax"]),
     )
     .await
     .expect("valid definition should be stored");
@@ -287,7 +280,7 @@ async fn an_explicitly_qualified_source_resolves_to_that_exact_relation_not_sear
     let def = create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("explicitly-qualified source should resolve to custom.orders");
@@ -335,7 +328,7 @@ async fn an_explicitly_qualified_source_naming_a_schema_without_that_table_is_re
     let err = create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .unwrap_err();
@@ -380,7 +373,7 @@ async fn an_explicitly_qualified_target_still_triggers_the_suffix_collision_guar
     create_definition(
         &db.pool,
         "TRANSFORM foo FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("first definition (public.foo) should be stored");
@@ -407,7 +400,7 @@ async fn an_explicitly_qualified_target_still_triggers_the_suffix_collision_guar
         &custom_foo_def,
         "custom",
         &pk,
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
         &custom_foo_def.source,
     )
     .await
@@ -416,7 +409,7 @@ async fn an_explicitly_qualified_target_still_triggers_the_suffix_collision_guar
     let err = create_definition(
         &db.pool,
         "TRANSFORM custom.foo FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .unwrap_err();
@@ -576,7 +569,7 @@ async fn creating_a_new_definition_bumps_the_source_tables_version() {
     let first = create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("first definition");
@@ -585,7 +578,7 @@ async fn creating_a_new_definition_bumps_the_source_tables_version() {
     let second = create_definition(
         &db.pool,
         "TRANSFORM order_discounts FROM orders SELECT price AS discount",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("second definition against the same source table");
@@ -596,7 +589,7 @@ async fn creating_a_new_definition_bumps_the_source_tables_version() {
     let unrelated = create_definition(
         &db.pool,
         "TRANSFORM customer_names FROM customers SELECT name AS full_name",
-        &columns(&["name"]),
+        &numeric_columns(&["name"]),
     )
     .await
     .expect("definition against a different source table");
@@ -684,7 +677,7 @@ async fn an_unresolved_column_reference_is_rejected() {
     let err = create_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT mystery_column AS x",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .unwrap_err();
@@ -720,7 +713,7 @@ async fn unresolvable_join_and_partial_data_definitions_are_rejected_cleanly() {
     let partial_data = create_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a AS x WHERE a = b",
-        &columns(&["a"]),
+        &numeric_columns(&["a"]),
     )
     .await
     .unwrap_err();
@@ -779,7 +772,7 @@ async fn source_to_transform_mapping_reflects_a_newly_created_definition() {
     create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("create definition");
@@ -810,7 +803,7 @@ async fn a_duplicate_target_table_surfaces_the_underlying_postgres_detail() {
     create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("first definition should be stored");
@@ -818,7 +811,7 @@ async fn a_duplicate_target_table_surfaces_the_underlying_postgres_detail() {
     let err = create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM customers SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .unwrap_err();
@@ -858,7 +851,7 @@ async fn a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rej
     create_definition(
         &db.pool,
         "TRANSFORM foo FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("first definition (public.foo) should be stored");
@@ -881,7 +874,7 @@ async fn a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rej
     let err = create_definition(
         &custom_pool,
         "TRANSFORM foo FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .unwrap_err();
@@ -953,7 +946,7 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
     let seed_def = create_definition(
         &db.pool,
         "TRANSFORM bar FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("seed definition should be stored");
@@ -1022,7 +1015,7 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
         create_definition(
             &custom_pool,
             "TRANSFORM foo FROM orders SELECT price AS total",
-            &columns(&["price"]),
+            &numeric_columns(&["price"]),
         )
         .await
     });
@@ -1117,7 +1110,7 @@ async fn all_source_tables_returns_each_transforms_anchor_table() {
     create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("valid definition should be stored");
@@ -1167,7 +1160,7 @@ async fn all_source_tables_returns_the_actual_schema_not_a_target_schema_guess()
     create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
-        &columns(&["price"]),
+        &numeric_columns(&["price"]),
     )
     .await
     .expect("explicitly-qualified source should resolve to custom.orders");
@@ -1310,7 +1303,7 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     install_definition(
         &db.pool,
         "TRANSFORM custom.t FROM s SELECT a AS x",
-        &columns(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -1324,7 +1317,7 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     create_definition(
         &db.pool,
         "TRANSFORM totals FROM t GROUP BY x WITHOUT SOURCE INDEX SELECT x AS x, COUNT(*) AS n",
-        &columns(&["x"]),
+        &numeric_columns(&["x"]),
     )
     .await
     .expect(
@@ -1364,7 +1357,7 @@ async fn a_one_to_one_transform_against_a_composite_primary_key_source_is_accept
     install_definition(
         &db.pool,
         "TRANSFORM line_totals FROM order_lines SELECT price AS total",
-        &columns(&["order_id", "line_no", "price"]),
+        &numeric_columns(&["order_id", "line_no", "price"]),
         "public",
     )
     .await

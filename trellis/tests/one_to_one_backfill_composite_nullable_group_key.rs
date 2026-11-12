@@ -40,18 +40,11 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::connect;
+use pipeline::{columns, connect};
 use std::collections::HashMap;
 
 use testkit::TestCluster;
 use trellis::defs::{ValueType, install_definition};
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, ty)| (name.to_string(), *ty))
-        .collect()
-}
 
 /// A plain [`KeySpace::OneToOne`] chained onto a composite aggregate `GROUP
 /// BY` key must not panic when it backfills from scratch over a source that

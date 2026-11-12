@@ -4,21 +4,12 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::connect;
-
-use std::collections::HashMap;
+use pipeline::{connect, numeric_columns};
 
 use testkit::TestCluster;
 use trellis::config::Config;
 use trellis::defs::grammar::CURRENT_GRAMMAR_VERSION;
-use trellis::defs::{CatalogError, ParseError, ValueType, install_definition};
-
-fn cols(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
-}
+use trellis::defs::{CatalogError, ParseError, install_definition};
 
 /// Define stamps the oldest grammar version that reads the text as the
 /// current one does (ADR-0018): grammar 1 for text with no quoted name and
@@ -40,7 +31,7 @@ async fn definitions_are_stamped_with_the_oldest_grammar_that_reads_them_the_sam
         ),
         ("TRANSFORM T3 FROM S SELECT A AS X", "public.t3", 2),
     ] {
-        install_definition(&db.pool, text, &cols(&["a", "B"]), "public")
+        install_definition(&db.pool, text, &numeric_columns(&["a", "B"]), "public")
             .await
             .unwrap_or_else(|e| panic!("define {text}: {e}"));
         let v: i32 = raw
@@ -69,7 +60,7 @@ async fn a_definition_with_a_newer_grammar_is_skipped_unread_and_left_untouched(
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
-        &cols(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -123,7 +114,7 @@ async fn attaching_pauses_a_definition_with_a_newer_grammar_naming_the_remedy() 
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
-        &cols(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -180,7 +171,7 @@ async fn attaching_pauses_a_definition_older_than_the_window_and_names_the_fix()
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
-        &cols(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -353,7 +344,7 @@ async fn attaching_pauses_a_definition_whose_text_the_grammar_now_refuses() {
         "TRANSFORM t FROM s SELECT a + 1 AS x",
         "TRANSFORM healthy FROM s SELECT a AS a",
     ] {
-        install_definition(&db.pool, text, &cols(&["a"]), "public")
+        install_definition(&db.pool, text, &numeric_columns(&["a"]), "public")
             .await
             .expect("define");
     }

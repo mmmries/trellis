@@ -28,24 +28,16 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::{connect_raw, start_and_settle_builds};
-use std::collections::HashMap;
+use pipeline::{connect_raw, numeric_columns, start_and_settle_builds};
 
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
 use tokio_postgres::Client;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::defs::{TransformStatus, ValueType, create_definition, install_definition};
+use trellis::defs::{TransformStatus, create_definition, install_definition};
 use trellis::staging::apply;
 use trellis::staging::quarantine;
 use trellis::staging::retire_drained_segments;
-
-fn numeric(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
-}
 
 /// Bare `name` qualified under [`DEFAULT_SCHEMA`] — matches
 /// `tests/quarantine.rs`'s own `qualify_fixture_table`: a CDC-staged
@@ -284,7 +276,7 @@ async fn a_plain_one_to_one_is_not_held_by_the_xmin_fence() {
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
-        &numeric(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -348,7 +340,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     .await
     .expect("seed source table");
 
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     install_definition(
         &db.pool,
         "TRANSFORM t2 FROM s2 SELECT a + a AS x",
@@ -448,7 +440,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     .await
     .expect("seed source table");
 
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     install_definition(
         &db.pool,
         "TRANSFORM t4 FROM s4 SELECT a + a AS x",
@@ -583,7 +575,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     .await
     .expect("seed source table");
 
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     install_definition(
         &db.pool,
         "TRANSFORM t6 FROM s6 SELECT a + a AS x",
@@ -696,7 +688,7 @@ async fn resume_transform_refuses_a_target_that_is_not_paused() {
     .await
     .expect("seed source table");
 
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     create_definition(&db.pool, "TRANSFORM t3 FROM s3 SELECT a + a AS x", &cols)
         .await
         .expect("create_definition (ring path, live immediately)");
@@ -749,7 +741,7 @@ async fn every_build_reaches_live_through_three_stored_states() {
     .expect("seed source tables");
 
     // Chunked path: a plain 1-1 definition.
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     let plain = install_definition(
         &db.pool,
         "TRANSFORM plain_t FROM plain_s SELECT a + a AS x",
@@ -762,7 +754,7 @@ async fn every_build_reaches_live_through_three_stored_states() {
     start_and_settle_builds(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 
-    let agg_cols = numeric(&["grp", "a"]);
+    let agg_cols = numeric_columns(&["grp", "a"]);
 
     // The Re-derive build: a plain `SUM`.
     let summed = install_definition(
