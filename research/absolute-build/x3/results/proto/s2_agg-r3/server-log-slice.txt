@@ -1,0 +1,148 @@
+2026-11-12 12:35:13.279 PST [3104716] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:13.296 PST [3104739] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:13.567 PST [3104762] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:13.839 PST [3104787] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:14.111 PST [3104817] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:14.382 PST [3104840] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:35:14.382 PST [3104840] FATAL:  connection to client lost
+2026-11-12 12:35:14.653 PST [3104863] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:14.924 PST [3104886] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:15.468 PST [3104933] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:15.739 PST [3104956] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:16.010 PST [3104979] LOG:  could not send data to client: Broken pipe
+2026-11-12 12:35:16.010 PST [3104979] FATAL:  connection to client lost
+2026-11-12 12:35:16.281 PST [3105010] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:16.553 PST [3105033] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:16.825 PST [3105058] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:17.096 PST [3105081] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:35:17.096 PST [3105081] FATAL:  connection to client lost
+2026-11-12 12:35:17.367 PST [3105104] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:17.638 PST [3105127] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:35:17.638 PST [3105127] FATAL:  connection to client lost
+2026-11-12 12:35:17.909 PST [3105150] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:18.180 PST [3105173] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:35:18.180 PST [3105173] FATAL:  connection to client lost
+2026-11-12 12:35:18.450 PST [3105196] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:18.719 PST [3105219] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:18.988 PST [3105242] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:35:18.988 PST [3105242] FATAL:  connection to client lost
+2026-11-12 12:35:19.254 PST [3105265] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:35:19.424 PST [3104685] LOG:  duration: 1096.171 ms  plan:
+	Query Text: with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), 0) as __seg), a as (select s."author_id"::integer as "author_id", count(*)::bigint as __rn, (count(*) filter (where (s."score") is not null))::bigint as __rc1, coalesce(sum((s."score")) filter (where scale((s."score")) is not null), 0) as __rs1, (select case when __v.__ka is null then null::jsonb else ( select jsonb_object_agg(__z.__sk, __z.__sc) from ( select __u.__sk::text as __sk, sum(1)::bigint as __sc from unnest(__v.__ka, __v.__wa) as __u(__sk, __sw) where __u.__sk is not null group by __u.__sk having sum(1) <> 0) as __z) end from (select array_agg(coalesce(scale((s."score"))::text, (s."score")::text)) filter (where (s."score") is not null and scale((s."score")) is distinct from 2) as __ka, null::bigint[] as __wa) as __v) as __rk1, (count(*) filter (where (s."likes") is not null))::bigint as __rc2, coalesce(sum((s."likes")::numeric), 0) as __rs2 from "public"."posts" s group by 1), e as (select distinct "author_id" from (select "author_id" from "trellis"."agg_1" h union all select "author_id" as "author_id" from "public"."author_totals" t union all select s."author_id"::integer as "author_id" from (select old_image as __i from "trellis".seg_0 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_0 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object' union all select old_image as __i from "trellis".seg_1 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_1 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object' union all select old_image as __i from "trellis".seg_2 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_2 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object' union all select old_image as __i from "trellis".seg_3 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_3 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object') as r cross join lateral jsonb_populate_record(null::"public"."posts", r.__i) as s) as e0), c as (select case when a.__rn is null then e."author_id" else a."author_id" end as "author_id", coalesce(a.__rn, 0) as __rn, coalesce(a.__rc1, 0) as __rc1, coalesce(a.__rs1, 0::numeric) as __rs1, coalesce(a.__rk1, null::jsonb) as __rk1, coalesce(a.__rc2, 0) as __rc2, coalesce(a.__rs2, 0::numeric) as __rs2 from a full join e on array[a."author_id"] = array[e."author_id"]), up as ( insert into "trellis"."agg_1" as u ("author_id", __n, __count_1, __sum_1, __scales_1, __count_2, __sum_2, __basis, __stamp) select c."author_id", c.__rn, c.__rc1, c.__rs1, c.__rk1, c.__rc2, c.__rs2, snap.__snap, snap.__seg from c, snap order by c."author_id" on conflict ("author_id") do update set __n = excluded.__n where false returning u."author_id", u.__n as __nn, u.__count_1 as __nc1, u.__sum_1 as __ns1, u.__scales_1 as __nk1, u.__count_2 as __nc2, u.__sum_2 as __ns2 ), strag as ( insert into pg_temp."trellis_group_recompute_1_f01a0db369afd2ce" ("author_id") select c."author_id" from c where not exists (select from up where array[up."author_id"] = array[c."author_id"]) ), nv as (select up.*, __nf.__nf0, __nf.__nf1, __nf.__nf2 from up cross join lateral (select ("__trellis_a0")::bigint as __nf0, ("__trellis_a1")::numeric as __nf1, ("__trellis_a2")::bigint as __nf2 from (select up.__nn as "__trellis_a0", case when up.__nc1 = 0 then null else ((case when up.__nk1 is null then round(up.__ns1, 2) when coalesce(((up.__nk1) ->> 'NaN')::bigint, 0) > 0 or (coalesce(((up.__nk1) ->> 'Infinity')::bigint, 0) > 0 and coalesce(((up.__nk1) ->> '-Infinity')::bigint, 0) > 0) then 'NaN'::numeric when coalesce(((up.__nk1) ->> 'Infinity')::bigint, 0) > 0 then 'Infinity'::numeric when coalesce(((up.__nk1) ->> '-Infinity')::bigint, 0) > 0 then '-Infinity'::numeric else round(up.__ns1, coalesce(greatest(case when (up.__nc1) > (select coalesce(sum(value::bigint), 0) from jsonb_each_text(up.__nk1)) then 2 end, (select max(key::int) from jsonb_each_text(up.__nk1) where key not in ('NaN', 'Infinity', '-Infinity') and value::bigint > 0)), 2)) end))::numeric end as "__trellis_a1", case when up.__nc2 = 0 then null else (up.__ns2)::bigint end as "__trellis_a2") as a) as __nf), cur as ( select nv.*, t.* , (nv.__nn > 0) is distinct from (t.__tc is not null) or (nv.__nn > 0 and not ((nv.__nf0, nv.__nf1, scale(nv.__nf1), nv.__nf2) is not distinct from (t.__vf0, t.__vf1, scale(t.__vf1), t.__vf2))) as __changed from nv left join lateral (select x.ctid, x."n", x."total_score", x."total_likes" from "public"."author_totals" x where x."author_id" = nv."author_id" union all select x.ctid, x."n", x."total_score", x."total_likes" from "public"."author_totals" x where (nv."author_id" is null) and x."author_id" is null limit 1) as t(__tc, __vf0, __vf1, __vf2) on true ), written as ( insert into "public"."author_totals" ("author_id", "n", "total_score", "total_likes") select "author_id", __nf0, __nf1, __nf2 from cur where __changed and __nn > 0 order by "author_id" on conflict ("author_id") do update set "n" = excluded."n", "total_score" = excluded."total_score", "total_likes" = excluded."total_likes" ), deleted as ( delete from "public"."author_totals" where ctid = any(array( select __tc from cur where __changed and __nn <= 0 and __tc is not null)) ) select coalesce(replace(cur."author_id"::text, chr(1), chr(1) || chr(1)), chr(1)), cur.__changed, cur.__nn > 0, cur.__tc is not null, null::text, cur.__nn, cur.__nc1, cur.__ns1::text, cur.__nc2, cur.__ns2::text from cur
+	Query Parameters: $1 = 'public.posts'
+	CTE Scan on cur  (cost=1666812.75..1670467.83 rows=91377 width=155)
+	  CTE snap
+	    ->  Result  (cost=0.31..0.32 rows=1 width=40)
+	          InitPlan 2
+	            ->  Result  (cost=0.30..0.31 rows=1 width=8)
+	                  InitPlan 1
+	                    ->  Limit  (cost=0.15..0.30 rows=1 width=8)
+	                          ->  Index Only Scan Backward using segments_pkey on segments  (cost=0.15..53.40 rows=350 width=8)
+	  CTE c
+	    ->  Hash Full Join  (cost=173.90..148919.34 rows=91377 width=124)
+	          Hash Cond: (ARRAY[s.author_id] = ARRAY[h.author_id])
+	          ->  GroupAggregate  (cost=0.42..144405.46 rows=91377 width=124)
+	                Group Key: s.author_id
+	                ->  Index Scan using posts_author_idx on posts s  (cost=0.42..72880.39 rows=1000000 width=14)
+	                SubPlan 5
+	                  ->  Result  (cost=0.32..0.33 rows=1 width=32)
+	                        InitPlan 4
+	                          ->  Aggregate  (cost=0.31..0.32 rows=1 width=32)
+	                                ->  HashAggregate  (cost=0.15..0.28 rows=10 width=40)
+	                                      Group Key: __u.__sk
+	                                      Filter: (sum(1) <> 0)
+	                                      ->  Function Scan on __u  (cost=0.01..0.11 rows=10 width=32)
+	                                            Filter: (__sk IS NOT NULL)
+	          ->  Hash  (cost=170.97..170.97 rows=200 width=4)
+	                ->  HashAggregate  (cost=168.97..170.97 rows=200 width=4)
+	                      Group Key: h.author_id
+	                      ->  Append  (cost=0.00..165.35 rows=1448 width=4)
+	                            ->  Seq Scan on agg_1 h  (cost=0.00..14.20 rows=420 width=4)
+	                            ->  Seq Scan on author_totals t  (cost=0.00..20.20 rows=1020 width=4)
+	                            ->  Nested Loop  (cost=0.00..123.71 rows=8 width=4)
+	                                  ->  Append  (cost=0.00..123.55 rows=8 width=32)
+	                                        ->  Seq Scan on seg_0  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_0 seg_0_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                        ->  Seq Scan on seg_1  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_1 seg_1_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                        ->  Seq Scan on seg_2  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_2 seg_2_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                        ->  Seq Scan on seg_3  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_3 seg_3_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                  ->  Function Scan on jsonb_populate_record s_1  (cost=0.00..0.01 rows=1 width=4)
+	  CTE up
+	    ->  Insert on agg_1 u  (cost=17767.59..17996.03 rows=91377 width=165)
+	          Conflict Resolution: UPDATE
+	          Conflict Arbiter Indexes: agg_1_author_id_key
+	          Conflict Filter: false
+	          ->  Subquery Scan on "*SELECT*"  (cost=17767.59..17996.03 rows=91377 width=165)
+	                ->  Sort  (cost=17767.59..17996.03 rows=91377 width=164)
+	                      Sort Key: c.author_id
+	                      ->  Nested Loop  (cost=0.00..2741.33 rows=91377 width=164)
+	                            ->  CTE Scan on snap  (cost=0.00..0.02 rows=1 width=40)
+	                            ->  CTE Scan on c  (cost=0.00..1827.54 rows=91377 width=124)
+	  CTE strag
+	    ->  Insert on trellis_group_recompute_1_f01a0db369afd2ce  (cost=2969.75..6630.54 rows=0 width=0)
+	          ->  Hash Anti Join  (cost=2969.75..6630.54 rows=45688 width=4)
+	                Hash Cond: (ARRAY[c_1.author_id] = ARRAY[up.author_id])
+	                ->  CTE Scan on c c_1  (cost=0.00..1827.54 rows=91377 width=4)
+	                ->  Hash  (cost=1827.54..1827.54 rows=91377 width=4)
+	                      ->  CTE Scan on up  (cost=0.00..1827.54 rows=91377 width=4)
+	  CTE cur
+	    ->  Nested Loop Left Join  (cost=0.15..1488025.46 rows=91377 width=227)
+	          ->  CTE Scan on up up_1  (cost=0.00..1827.54 rows=91377 width=124)
+	          ->  Limit  (cost=0.15..3.60 rows=1 width=54)
+	                ->  Append  (cost=0.15..20.85 rows=6 width=54)
+	                      ->  Index Scan using author_totals_author_id_key on author_totals x  (cost=0.15..8.17 rows=1 width=54)
+	                            Index Cond: (author_id = up_1.author_id)
+	                      ->  Result  (cost=4.19..12.65 rows=5 width=54)
+	                            One-Time Filter: (up_1.author_id IS NULL)
+	                            ->  Bitmap Heap Scan on author_totals x_1  (cost=4.19..12.65 rows=5 width=54)
+	                                  Recheck Cond: (author_id IS NULL)
+	                                  ->  Bitmap Index Scan on author_totals_author_id_key  (cost=0.00..4.19 rows=5 width=0)
+	                                        Index Cond: (author_id IS NULL)
+	          SubPlan 9
+	            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32)
+	                  ->  Function Scan on jsonb_each_text  (cost=0.00..1.00 rows=100 width=32)
+	          SubPlan 10
+	            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_1  (cost=0.00..2.13 rows=32 width=32)
+	                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+	          SubPlan 11
+	            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_2  (cost=0.00..1.00 rows=100 width=32)
+	          SubPlan 12
+	            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_3  (cost=0.00..2.13 rows=32 width=32)
+	                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+	          SubPlan 13
+	            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_4  (cost=0.00..1.00 rows=100 width=32)
+	          SubPlan 14
+	            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_5  (cost=0.00..2.13 rows=32 width=32)
+	                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+	  CTE written
+	    ->  Insert on author_totals  (cost=3114.06..3152.13 rows=0 width=0)
+	          Conflict Resolution: UPDATE
+	          Conflict Arbiter Indexes: author_totals_author_id_key
+	          ->  Sort  (cost=3114.06..3152.13 rows=15230 width=52)
+	                Sort Key: cur_1.author_id
+	                ->  CTE Scan on cur cur_1  (cost=0.00..2055.98 rows=15230 width=52)
+	                      Filter: (__changed AND (__nn > 0))
+	  CTE deleted
+	    ->  Delete on author_totals author_totals_1  (cost=2055.98..2088.93 rows=0 width=0)
+	          InitPlan 17
+	            ->  CTE Scan on cur cur_2  (cost=0.00..2055.98 rows=15153 width=6)
+	                  Filter: (__changed AND (__tc IS NOT NULL) AND (__nn <= 0))
+	          ->  Seq Scan on author_totals author_totals_1  (cost=0.00..32.95 rows=10 width=6)
+	                Filter: (ctid = ANY ((InitPlan 17).col1))
+2026-11-12 12:35:19.789 PST [3105311] LOG:  could not receive data from client: Connection reset by peer

@@ -1,0 +1,423 @@
+2026-11-12 12:37:50.670 PST [3123107] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:50.689 PST [3123138] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:51.495 PST [3123629] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:51.765 PST [3123691] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:52.035 PST [3123924] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:52.304 PST [3124004] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:52.578 PST [3124174] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:52.847 PST [3124386] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:53.119 PST [3124485] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:53.659 PST [3124779] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:53.928 PST [3124878] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:54.201 PST [3125058] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:54.470 PST [3125182] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:54.739 PST [3125314] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:55.010 PST [3125520] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:37:55.011 PST [3125520] FATAL:  connection to client lost
+2026-11-12 12:37:55.280 PST [3125651] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:37:55.280 PST [3125651] FATAL:  connection to client lost
+2026-11-12 12:37:55.548 PST [3125897] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:55.818 PST [3126046] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:56.090 PST [3126233] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:56.361 PST [3126321] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:56.633 PST [3126459] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:56.904 PST [3126653] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:57.173 PST [3126811] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:57.445 PST [3127033] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:57.986 PST [3127326] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:58.254 PST [3127605] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:58.521 PST [3127892] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:58.787 PST [3128171] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:59.054 PST [3128458] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:59.320 PST [3128744] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:37:59.587 PST [3129030] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:00.121 PST [3129604] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:00.396 PST [3129823] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:00.668 PST [3129910] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:00.938 PST [3129968] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:01.213 PST [3130238] LOG:  could not send data to client: Broken pipe
+2026-11-12 12:38:01.213 PST [3130238] FATAL:  connection to client lost
+2026-11-12 12:38:01.484 PST [3130344] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:01.758 PST [3130616] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:02.027 PST [3130698] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:02.298 PST [3130790] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:02.572 PST [3130923] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:02.842 PST [3131180] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:02.842 PST [3131180] FATAL:  connection to client lost
+2026-11-12 12:38:03.112 PST [3131402] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:03.386 PST [3131441] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:03.931 PST [3131768] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:04.202 PST [3132000] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:04.475 PST [3132040] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:04.746 PST [3132270] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:05.018 PST [3132358] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:05.286 PST [3132440] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:05.558 PST [3132624] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:05.828 PST [3132717] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:06.097 PST [3132850] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:06.365 PST [3132882] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:06.634 PST [3132969] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:06.634 PST [3132969] FATAL:  connection to client lost
+2026-11-12 12:38:06.902 PST [3133052] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:07.438 PST [3133250] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:07.438 PST [3133250] FATAL:  connection to client lost
+2026-11-12 12:38:07.705 PST [3133292] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:07.972 PST [3133419] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:08.239 PST [3133452] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:08.506 PST [3133580] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:08.506 PST [3133580] FATAL:  connection to client lost
+2026-11-12 12:38:08.774 PST [3133610] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:09.042 PST [3133690] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:09.575 PST [3133792] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:10.109 PST [3133896] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:10.377 PST [3133974] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:10.643 PST [3134049] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:11.712 PST [3134265] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:11.980 PST [3134292] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:12.248 PST [3134368] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:12.514 PST [3134444] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:12.783 PST [3134475] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:13.316 PST [3134578] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:13.600 PST [3082557] LOG:  checkpoints are occurring too frequently (24 seconds apart)
+2026-11-12 12:38:13.600 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:13.602 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:13.848 PST [3134684] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:14.648 PST [3134866] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:14.915 PST [3134889] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:15.181 PST [3134912] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:15.717 PST [3134958] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:16.781 PST [3135123] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:17.047 PST [3135199] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:17.314 PST [3135226] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:17.579 PST [3135319] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:18.113 PST [3135373] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:18.380 PST [3135447] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:18.646 PST [3135473] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:18.912 PST [3135550] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:19.178 PST [3135577] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:19.444 PST [3135653] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:19.711 PST [3135678] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:19.977 PST [3135701] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:20.041 PST [3082557] LOG:  checkpoint complete: wrote 105 buffers (0.6%), wrote 3 SLRU buffers; 0 WAL file(s) added, 1 removed, 32 recycled; write=5.816 s, sync=0.592 s, total=6.442 s; sync files=298, longest=0.517 s, average=0.002 s; distance=537531 kB, estimate=547056 kB; lsn=6/2F890070, redo lsn=6/1025C098
+2026-11-12 12:38:20.218 PST [3082557] LOG:  checkpoints are occurring too frequently (7 seconds apart)
+2026-11-12 12:38:20.218 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:20.218 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:20.244 PST [3135724] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:20.510 PST [3135747] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:21.043 PST [3135848] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:21.314 PST [3135871] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:21.849 PST [3135973] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:22.114 PST [3135996] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:22.382 PST [3136020] LOG:  could not send data to client: Broken pipe
+2026-11-12 12:38:22.382 PST [3136020] FATAL:  connection to client lost
+2026-11-12 12:38:22.916 PST [3136066] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:23.183 PST [3136146] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:23.451 PST [3136171] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:23.717 PST [3136194] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:23.983 PST [3136273] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:24.249 PST [3136304] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:24.516 PST [3136327] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:24.782 PST [3136350] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:25.048 PST [3136424] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:25.313 PST [3136449] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:25.581 PST [3136480] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:25.850 PST [3136503] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:26.040 PST [3082557] LOG:  checkpoint complete: wrote 18 buffers (0.1%), wrote 3 SLRU buffers; 0 WAL file(s) added, 1 removed, 32 recycled; write=4.713 s, sync=0.231 s, total=5.822 s; sync files=12, longest=0.200 s, average=0.020 s; distance=539253 kB, estimate=546276 kB; lsn=6/50043960, redo lsn=6/310F9548
+2026-11-12 12:38:26.095 PST [3082557] LOG:  checkpoints are occurring too frequently (6 seconds apart)
+2026-11-12 12:38:26.095 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:26.097 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:26.117 PST [3136531] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:26.384 PST [3136554] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:26.919 PST [3136654] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:27.186 PST [3136679] LOG:  could not send data to client: Broken pipe
+2026-11-12 12:38:27.186 PST [3136679] FATAL:  connection to client lost
+2026-11-12 12:38:27.452 PST [3136702] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:27.718 PST [3136778] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:27.984 PST [3136811] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:28.253 PST [3136834] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:28.787 PST [3136930] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:29.053 PST [3136966] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:29.320 PST [3136991] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:29.854 PST [3137110] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:30.119 PST [3137183] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:30.647 PST [3082557] LOG:  checkpoint complete: wrote 17 buffers (0.1%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=4.411 s, sync=0.109 s, total=4.552 s; sync files=11, longest=0.063 s, average=0.010 s; distance=540338 kB, estimate=545682 kB; lsn=6/703C6990, redo lsn=6/520A60F8
+2026-11-12 12:38:31.027 PST [3082557] LOG:  checkpoints are occurring too frequently (5 seconds apart)
+2026-11-12 12:38:31.027 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:31.027 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:31.187 PST [3137345] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:31.718 PST [3137473] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:31.985 PST [3137527] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:32.517 PST [3137627] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:32.784 PST [3137653] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:33.049 PST [3137729] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:33.315 PST [3137755] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:33.582 PST [3137831] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:34.117 PST [3137880] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:34.383 PST [3137961] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:34.649 PST [3137990] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:35.183 PST [3138036] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:35.718 PST [3138139] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:35.804 PST [3082557] LOG:  checkpoint complete: wrote 12 buffers (0.1%), wrote 3 SLRU buffers; 0 WAL file(s) added, 1 removed, 32 recycled; write=4.612 s, sync=0.086 s, total=4.777 s; sync files=16, longest=0.029 s, average=0.006 s; distance=542975 kB, estimate=545411 kB; lsn=6/920000F8, redo lsn=6/732E5F80
+2026-11-12 12:38:36.014 PST [3082557] LOG:  checkpoints are occurring too frequently (5 seconds apart)
+2026-11-12 12:38:36.014 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:36.016 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:36.251 PST [3138186] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:36.519 PST [3138261] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:36.519 PST [3138261] FATAL:  connection to client lost
+2026-11-12 12:38:37.319 PST [3138383] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:37.586 PST [3138410] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:37.852 PST [3138433] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:38.119 PST [3138459] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:38.386 PST [3138482] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:38.651 PST [3138533] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:38.918 PST [3138590] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:39.185 PST [3138613] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:39.452 PST [3138636] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:39.717 PST [3138714] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:40.254 PST [3138762] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:40.254 PST [3138762] FATAL:  connection to client lost
+2026-11-12 12:38:40.627 PST [3082557] LOG:  checkpoint complete: wrote 32 buffers (0.2%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=4.513 s, sync=0.060 s, total=4.614 s; sync files=12, longest=0.026 s, average=0.005 s; distance=538648 kB, estimate=544735 kB; lsn=6/B232A1C0, redo lsn=6/940EC048
+2026-11-12 12:38:40.786 PST [3138869] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:41.016 PST [3082557] LOG:  checkpoints are occurring too frequently (5 seconds apart)
+2026-11-12 12:38:41.016 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:41.016 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:41.052 PST [3138892] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:41.318 PST [3138973] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:41.585 PST [3139001] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:41.852 PST [3139026] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:42.117 PST [3139111] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:42.916 PST [3139240] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:42.916 PST [3139240] FATAL:  connection to client lost
+2026-11-12 12:38:43.717 PST [3139364] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:43.990 PST [3139390] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:44.258 PST [3139416] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:44.525 PST [3139492] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:45.059 PST [3139597] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:45.325 PST [3139623] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:45.592 PST [3139698] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:45.860 PST [3139773] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:45.906 PST [3082557] LOG:  checkpoint complete: wrote 5 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=4.812 s, sync=0.052 s, total=4.890 s; sync files=15, longest=0.018 s, average=0.004 s; distance=543837 kB, estimate=544645 kB; lsn=6/D3FDC3A0, redo lsn=6/B5403840
+2026-11-12 12:38:46.087 PST [3082557] LOG:  checkpoints are occurring too frequently (5 seconds apart)
+2026-11-12 12:38:46.087 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:46.087 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:46.126 PST [3139812] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:46.393 PST [3139886] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:46.661 PST [3139917] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:47.461 PST [3139987] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:47.729 PST [3140066] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:47.997 PST [3140094] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:48.530 PST [3140141] LOG:  could not send data to client: Broken pipe
+2026-11-12 12:38:48.530 PST [3140141] FATAL:  connection to client lost
+2026-11-12 12:38:48.798 PST [3140217] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:49.065 PST [3140242] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:49.331 PST [3140265] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:49.598 PST [3140306] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:49.866 PST [3140505] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:50.151 PST [3082557] LOG:  checkpoint complete: wrote 8663 buffers (52.9%), wrote 3 SLRU buffers; 0 WAL file(s) added, 1 removed, 32 recycled; write=3.310 s, sync=0.574 s, total=4.064 s; sync files=13, longest=0.299 s, average=0.045 s; distance=537474 kB, estimate=543928 kB; lsn=6/F55E0200, redo lsn=6/D60E4180
+2026-11-12 12:38:50.184 PST [3082557] LOG:  checkpoints are occurring too frequently (4 seconds apart)
+2026-11-12 12:38:50.184 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:50.194 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:50.401 PST [3140590] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:50.669 PST [3140614] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:50.669 PST [3140614] FATAL:  connection to client lost
+2026-11-12 12:38:50.935 PST [3140637] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:51.202 PST [3140710] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:51.469 PST [3140739] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:51.734 PST [3140762] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:38:51.734 PST [3140762] FATAL:  connection to client lost
+2026-11-12 12:38:52.002 PST [3140787] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:52.267 PST [3140864] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:52.535 PST [3140889] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:52.802 PST [3140912] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:53.069 PST [3140988] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:53.342 PST [3082557] LOG:  checkpoint complete: wrote 6789 buffers (41.4%), wrote 0 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=3.062 s, sync=0.049 s, total=3.159 s; sync files=6, longest=0.022 s, average=0.009 s; distance=541983 kB, estimate=543734 kB; lsn=7/15C2F3F8, redo lsn=6/F722C068
+2026-11-12 12:38:53.556 PST [3082557] LOG:  checkpoints are occurring too frequently (3 seconds apart)
+2026-11-12 12:38:53.556 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:53.556 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:53.602 PST [3141038] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:53.867 PST [3141095] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:54.134 PST [3141141] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:54.401 PST [3141164] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:54.668 PST [3141187] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:54.936 PST [3141265] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:55.204 PST [3141290] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:55.470 PST [3141320] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:55.737 PST [3141343] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:56.004 PST [3141428] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:56.538 PST [3141477] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:56.806 PST [3141501] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:57.072 PST [3141524] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:57.337 PST [3141574] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:57.581 PST [3082557] LOG:  checkpoint complete: wrote 858 buffers (5.2%), wrote 3 SLRU buffers; 0 WAL file(s) added, 1 removed, 32 recycled; write=3.653 s, sync=0.277 s, total=4.026 s; sync files=24, longest=0.072 s, average=0.012 s; distance=542624 kB, estimate=543623 kB; lsn=7/37429C30, redo lsn=7/18414188
+2026-11-12 12:38:57.604 PST [3141691] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:57.773 PST [3082557] LOG:  checkpoints are occurring too frequently (4 seconds apart)
+2026-11-12 12:38:57.773 PST [3082557] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-11-12 12:38:57.773 PST [3082557] LOG:  checkpoint starting: wal
+2026-11-12 12:38:57.869 PST [3141719] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:58.137 PST [3141750] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:58.404 PST [3141773] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:58.936 PST [3141820] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:59.203 PST [3141952] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:59.471 PST [3141979] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:38:59.737 PST [3142002] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:00.002 PST [3142025] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:00.270 PST [3142048] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:39:00.270 PST [3142048] FATAL:  connection to client lost
+2026-11-12 12:39:00.536 PST [3142072] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:00.803 PST [3142095] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:01.071 PST [3142172] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:01.340 PST [3142198] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:01.606 PST [3142221] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:01.872 PST [3142294] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:02.139 PST [3142323] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:02.672 PST [3142370] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:02.939 PST [3142447] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:03.206 PST [3142472] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:03.740 PST [3142571] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:03.843 PST [3122977] LOG:  duration: 68115.412 ms  plan:
+	Query Text: with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), 0) as __seg), a as (select s."grp_hi"::integer as "grp_hi", count(*)::bigint as __rn, (count(*) filter (where (s."score") is not null))::bigint as __rc1, coalesce(sum((s."score")) filter (where scale((s."score")) is not null), 0) as __rs1, (select case when __v.__ka is null then null::jsonb else ( select jsonb_object_agg(__z.__sk, __z.__sc) from ( select __u.__sk::text as __sk, sum(1)::bigint as __sc from unnest(__v.__ka, __v.__wa) as __u(__sk, __sw) where __u.__sk is not null group by __u.__sk having sum(1) <> 0) as __z) end from (select array_agg(coalesce(scale((s."score"))::text, (s."score")::text)) filter (where (s."score") is not null and scale((s."score")) is distinct from 2) as __ka, null::bigint[] as __wa) as __v) as __rk1, (count(*) filter (where (s."likes") is not null))::bigint as __rc2, coalesce(sum((s."likes")::numeric), 0) as __rs2 from "public"."posts" s group by 1), e as (select distinct "grp_hi" from (select "grp_hi" from "trellis"."agg_1" h union all select "grp_hi" as "grp_hi" from "public"."hi_totals" t union all select s."grp_hi"::integer as "grp_hi" from (select old_image as __i from "trellis".seg_0 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_0 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object' union all select old_image as __i from "trellis".seg_1 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_1 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object' union all select old_image as __i from "trellis".seg_2 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_2 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object' union all select old_image as __i from "trellis".seg_3 where src_table = $1 and jsonb_typeof(old_image) = 'object' union all select transition_images -> 'old' from "trellis".seg_3 where src_table = $1 and jsonb_typeof(transition_images -> 'old') = 'object') as r cross join lateral jsonb_populate_record(null::"public"."posts", r.__i) as s) as e0), c as (select case when a.__rn is null then e."grp_hi" else a."grp_hi" end as "grp_hi", coalesce(a.__rn, 0) as __rn, coalesce(a.__rc1, 0) as __rc1, coalesce(a.__rs1, 0::numeric) as __rs1, coalesce(a.__rk1, null::jsonb) as __rk1, coalesce(a.__rc2, 0) as __rc2, coalesce(a.__rs2, 0::numeric) as __rs2 from a full join e on array[a."grp_hi"] = array[e."grp_hi"]), up as ( insert into "trellis"."agg_1" as u ("grp_hi", __n, __count_1, __sum_1, __scales_1, __count_2, __sum_2, __basis, __stamp) select c."grp_hi", c.__rn, c.__rc1, c.__rs1, c.__rk1, c.__rc2, c.__rs2, snap.__snap, snap.__seg from c, snap order by c."grp_hi" on conflict ("grp_hi") do update set __n = excluded.__n where false returning u."grp_hi", u.__n as __nn, u.__count_1 as __nc1, u.__sum_1 as __ns1, u.__scales_1 as __nk1, u.__count_2 as __nc2, u.__sum_2 as __ns2 ), strag as ( insert into pg_temp."trellis_group_recompute_1_f8ecc87fa7762b2e" ("grp_hi") select c."grp_hi" from c where not exists (select from up where array[up."grp_hi"] = array[c."grp_hi"]) ), nv as (select up.*, __nf.__nf0, __nf.__nf1, __nf.__nf2 from up cross join lateral (select ("__trellis_a0")::bigint as __nf0, ("__trellis_a1")::numeric as __nf1, ("__trellis_a2")::bigint as __nf2 from (select up.__nn as "__trellis_a0", case when up.__nc1 = 0 then null else ((case when up.__nk1 is null then round(up.__ns1, 2) when coalesce(((up.__nk1) ->> 'NaN')::bigint, 0) > 0 or (coalesce(((up.__nk1) ->> 'Infinity')::bigint, 0) > 0 and coalesce(((up.__nk1) ->> '-Infinity')::bigint, 0) > 0) then 'NaN'::numeric when coalesce(((up.__nk1) ->> 'Infinity')::bigint, 0) > 0 then 'Infinity'::numeric when coalesce(((up.__nk1) ->> '-Infinity')::bigint, 0) > 0 then '-Infinity'::numeric else round(up.__ns1, coalesce(greatest(case when (up.__nc1) > (select coalesce(sum(value::bigint), 0) from jsonb_each_text(up.__nk1)) then 2 end, (select max(key::int) from jsonb_each_text(up.__nk1) where key not in ('NaN', 'Infinity', '-Infinity') and value::bigint > 0)), 2)) end))::numeric end as "__trellis_a1", case when up.__nc2 = 0 then null else (up.__ns2)::bigint end as "__trellis_a2") as a) as __nf), cur as ( select nv.*, t.* , (nv.__nn > 0) is distinct from (t.__tc is not null) or (nv.__nn > 0 and not ((nv.__nf0, nv.__nf1, scale(nv.__nf1), nv.__nf2) is not distinct from (t.__vf0, t.__vf1, scale(t.__vf1), t.__vf2))) as __changed from nv left join lateral (select x.ctid, x."n", x."total_score", x."total_likes" from "public"."hi_totals" x where x."grp_hi" = nv."grp_hi" union all select x.ctid, x."n", x."total_score", x."total_likes" from "public"."hi_totals" x where (nv."grp_hi" is null) and x."grp_hi" is null limit 1) as t(__tc, __vf0, __vf1, __vf2) on true ), written as ( insert into "public"."hi_totals" ("grp_hi", "n", "total_score", "total_likes") select "grp_hi", __nf0, __nf1, __nf2 from cur where __changed and __nn > 0 order by "grp_hi" on conflict ("grp_hi") do update set "n" = excluded."n", "total_score" = excluded."total_score", "total_likes" = excluded."total_likes" ), deleted as ( delete from "public"."hi_totals" where ctid = any(array( select __tc from cur where __changed and __nn <= 0 and __tc is not null)) ) select coalesce(replace(cur."grp_hi"::text, chr(1), chr(1) || chr(1)), chr(1)), cur.__changed, cur.__nn > 0, cur.__tc is not null, null::text, cur.__nn, cur.__nc1, cur.__ns1::text, cur.__nc2, cur.__ns2::text from cur
+	Query Parameters: $1 = 'public.posts'
+	CTE Scan on cur  (cost=173534518.14..173934520.14 rows=10000050 width=155)
+	  CTE snap
+	    ->  Result  (cost=0.31..0.32 rows=1 width=40)
+	          InitPlan 2
+	            ->  Result  (cost=0.30..0.31 rows=1 width=8)
+	                  InitPlan 1
+	                    ->  Limit  (cost=0.15..0.30 rows=1 width=8)
+	                          ->  Index Only Scan Backward using segments_pkey on segments  (cost=0.15..53.40 rows=350 width=8)
+	  CTE c
+	    ->  Hash Full Join  (cost=173.91..5118162.86 rows=10000050 width=124)
+	          Hash Cond: (ARRAY[s.grp_hi] = ARRAY[h.grp_hi])
+	          ->  GroupAggregate  (cost=0.43..4642987.01 rows=10000050 width=124)
+	                Group Key: s.grp_hi
+	                ->  Index Scan using posts_grp_hi_idx on posts s  (cost=0.43..792967.76 rows=10000050 width=14)
+	                SubPlan 5
+	                  ->  Result  (cost=0.32..0.33 rows=1 width=32)
+	                        InitPlan 4
+	                          ->  Aggregate  (cost=0.31..0.32 rows=1 width=32)
+	                                ->  HashAggregate  (cost=0.15..0.28 rows=10 width=40)
+	                                      Group Key: __u.__sk
+	                                      Filter: (sum(1) <> 0)
+	                                      ->  Function Scan on __u  (cost=0.01..0.11 rows=10 width=32)
+	                                            Filter: (__sk IS NOT NULL)
+	          ->  Hash  (cost=170.97..170.97 rows=200 width=4)
+	                ->  HashAggregate  (cost=168.97..170.97 rows=200 width=4)
+	                      Group Key: h.grp_hi
+	                      ->  Append  (cost=0.00..165.35 rows=1448 width=4)
+	                            ->  Seq Scan on agg_1 h  (cost=0.00..14.20 rows=420 width=4)
+	                            ->  Seq Scan on hi_totals t  (cost=0.00..20.20 rows=1020 width=4)
+	                            ->  Nested Loop  (cost=0.00..123.71 rows=8 width=4)
+	                                  ->  Append  (cost=0.00..123.55 rows=8 width=32)
+	                                        ->  Seq Scan on seg_0  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_0 seg_0_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                        ->  Seq Scan on seg_1  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_1 seg_1_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                        ->  Seq Scan on seg_2  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_2 seg_2_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                        ->  Seq Scan on seg_3  (cost=0.00..15.07 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof(old_image) = 'object'::text))
+	                                        ->  Seq Scan on seg_3 seg_3_1  (cost=0.00..15.80 rows=1 width=32)
+	                                              Filter: ((src_table = 'public.posts'::text) AND (jsonb_typeof((transition_images -> 'old'::text)) = 'object'::text))
+	                                  ->  Function Scan on jsonb_populate_record s_1  (cost=0.00..0.01 rows=1 width=4)
+	  CTE up
+	    ->  Insert on agg_1 u  (cost=3923641.03..3948641.15 rows=10000050 width=165)
+	          Conflict Resolution: UPDATE
+	          Conflict Arbiter Indexes: agg_1_grp_hi_key
+	          Conflict Filter: false
+	          ->  Subquery Scan on "*SELECT*"  (cost=3923641.03..3948641.15 rows=10000050 width=165)
+	                ->  Sort  (cost=3923641.03..3948641.15 rows=10000050 width=164)
+	                      Sort Key: c.grp_hi
+	                      ->  Nested Loop  (cost=0.00..300001.52 rows=10000050 width=164)
+	                            ->  CTE Scan on snap  (cost=0.00..0.02 rows=1 width=40)
+	                            ->  CTE Scan on c  (cost=0.00..200001.00 rows=10000050 width=124)
+	  CTE strag
+	    ->  Insert on trellis_group_recompute_1_f8ecc87fa7762b2e  (cost=364064.62..881880.63 rows=0 width=0)
+	          ->  Hash Anti Join  (cost=364064.62..881880.63 rows=5000025 width=4)
+	                Hash Cond: (ARRAY[c_1.grp_hi] = ARRAY[up.grp_hi])
+	                ->  CTE Scan on c c_1  (cost=0.00..200001.00 rows=10000050 width=4)
+	                ->  Hash  (cost=200001.00..200001.00 rows=10000050 width=4)
+	                      ->  CTE Scan on up  (cost=0.00..200001.00 rows=10000050 width=4)
+	  CTE cur
+	    ->  Nested Loop Left Join  (cost=0.15..162845453.58 rows=10000050 width=227)
+	          ->  CTE Scan on up up_1  (cost=0.00..200001.00 rows=10000050 width=124)
+	          ->  Limit  (cost=0.15..3.60 rows=1 width=54)
+	                ->  Append  (cost=0.15..20.85 rows=6 width=54)
+	                      ->  Index Scan using hi_totals_grp_hi_key on hi_totals x  (cost=0.15..8.17 rows=1 width=54)
+	                            Index Cond: (grp_hi = up_1.grp_hi)
+	                      ->  Result  (cost=4.19..12.65 rows=5 width=54)
+	                            One-Time Filter: (up_1.grp_hi IS NULL)
+	                            ->  Bitmap Heap Scan on hi_totals x_1  (cost=4.19..12.65 rows=5 width=54)
+	                                  Recheck Cond: (grp_hi IS NULL)
+	                                  ->  Bitmap Index Scan on hi_totals_grp_hi_key  (cost=0.00..4.19 rows=5 width=0)
+	                                        Index Cond: (grp_hi IS NULL)
+	          SubPlan 9
+	            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32)
+	                  ->  Function Scan on jsonb_each_text  (cost=0.00..1.00 rows=100 width=32)
+	          SubPlan 10
+	            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_1  (cost=0.00..2.13 rows=32 width=32)
+	                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+	          SubPlan 11
+	            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_2  (cost=0.00..1.00 rows=100 width=32)
+	          SubPlan 12
+	            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_3  (cost=0.00..2.13 rows=32 width=32)
+	                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+	          SubPlan 13
+	            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_4  (cost=0.00..1.00 rows=100 width=32)
+	          SubPlan 14
+	            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4)
+	                  ->  Function Scan on jsonb_each_text jsonb_each_text_5  (cost=0.00..2.13 rows=32 width=32)
+	                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+	  CTE written
+	    ->  Insert on hi_totals  (cost=511178.83..515345.52 rows=0 width=0)
+	          Conflict Resolution: UPDATE
+	          Conflict Arbiter Indexes: hi_totals_grp_hi_key
+	          ->  Sort  (cost=511178.83..515345.52 rows=1666675 width=52)
+	                Sort Key: cur_1.grp_hi
+	                ->  CTE Scan on cur cur_1  (cost=0.00..225001.12 rows=1666675 width=52)
+	                      Filter: (__changed AND (__nn > 0))
+	  CTE deleted
+	    ->  Delete on hi_totals hi_totals_1  (cost=225001.12..225034.08 rows=0 width=0)
+	          InitPlan 17
+	            ->  CTE Scan on cur cur_2  (cost=0.00..225001.12 rows=1658342 width=6)
+	                  Filter: (__changed AND (__tc IS NOT NULL) AND (__nn <= 0))
+	          ->  Seq Scan on hi_totals hi_totals_1  (cost=0.00..32.95 rows=10 width=6)
+	                Filter: (ctid = ANY ((InitPlan 17).col1))
+2026-11-12 12:39:04.008 PST [3142597] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:04.541 PST [3142643] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:04.807 PST [3142666] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:05.073 PST [3142689] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:05.339 PST [3142712] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:05.606 PST [3142735] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:06.138 PST [3142793] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:06.674 PST [3142839] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:06.940 PST [3142863] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:07.207 PST [3142886] LOG:  could not send data to client: Connection reset by peer
+2026-11-12 12:39:07.207 PST [3142886] FATAL:  connection to client lost
+2026-11-12 12:39:07.475 PST [3142909] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:07.743 PST [3142933] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:08.010 PST [3142956] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:08.547 PST [3143003] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:08.813 PST [3143026] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:09.081 PST [3143049] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:09.348 PST [3143072] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:09.614 PST [3143095] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:09.880 PST [3143118] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:10.147 PST [3143141] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:10.415 PST [3143164] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:10.682 PST [3143187] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:10.949 PST [3143210] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:11.217 PST [3143240] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:11.483 PST [3143265] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:11.750 PST [3143288] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:12.018 PST [3143311] LOG:  could not receive data from client: Connection reset by peer
+2026-11-12 12:39:12.286 PST [3143334] LOG:  could not receive data from client: Connection reset by peer

@@ -1,0 +1,103 @@
+Running as unit: run-p2910562-i23879967.scope; invocation ID: c40916da6e924c5f9839471d648a6da4
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook: the box is reserved:
+20261112T115609-b-sweep  lane b  #1858  sweep  since 2026-11-12T11:56:09-08:00  expect 7200s
+  sweep.sh: 3 truncate binaries x {none(timing), 7 truncate plants, 4 truncate-path mutations} on main 9bf521ac vs step-2 branch (separate target dirs)
+logbook id: 20261112T123222-r-bench
+[12:32:22] ./setup_cluster.sh
+cluster up at /home/mike/code/trellis-lane-r/target/research-pg-x3 port 54873
+[12:32:23] psql -X -q -h /home/mike/code/trellis-lane-r/target/research-pg-x3 -p 54873 -U app -v N=1000000 -f gen.sql src1m
+ setseed 
+---------
+ 
+(1 row)
+
+  posts  |  tags   | tags_per_post | authors_used 
+---------+---------+---------------+--------------
+ 1000000 | 1900031 |      1.900031 |        99995
+(1 row)
+
+[12:32:27] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-base ./run.sh src1m base 1 s2_agg
+NOTICE:  database "x3_base_s2_agg_r1" does not exist, skipping
+base	s2_agg	1	.602441541	16279400	.455446334	9758480	6.783830725	81339920	29908992	9125888	9125888
+[12:32:40] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-proto ./run.sh src1m proto 1 s2_agg
+NOTICE:  database "x3_proto_s2_agg_r1" does not exist, skipping
+proto	s2_agg	1	.720505200	16279400	1.179762502	9767104	6.215114302	48006368	16957440	9125888	9125888
+[12:32:53] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-base ./run.sh src1m base 1 s2_agg_hi
+NOTICE:  database "x3_base_s2_agg_hi_r1" does not exist, skipping
+base	s2_agg_hi	1	1.471970966	154580512	.858227571	88409328	21.060434327	916700112	279265280	82763776	82763776
+[12:33:22] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-proto ./run.sh src1m proto 1 s2_agg_hi
+NOTICE:  database "x3_proto_s2_agg_hi_r1" does not exist, skipping
+proto	s2_agg_hi	1	1.336411578	154580552	.824929896	88407832	11.781377305	558899632	149856256	82763776	82771968
+[12:33:42] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-base ./run.sh src1m base 2 s2_agg
+NOTICE:  database "x3_base_s2_agg_r2" does not exist, skipping
+base	s2_agg	2	.527942486	16279400	.466803714	9766304	6.835879345	81448328	29908992	9125888	9125888
+[12:33:54] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-proto ./run.sh src1m proto 2 s2_agg
+NOTICE:  database "x3_proto_s2_agg_r2" does not exist, skipping
+proto	s2_agg	2	.605194901	16279400	.516750617	9766008	6.580308609	48015944	16957440	9125888	9125888
+[12:34:07] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-base ./run.sh src1m base 2 s2_agg_hi
+NOTICE:  database "x3_base_s2_agg_hi_r2" does not exist, skipping
+base	s2_agg_hi	2	1.288570379	154580552	.822168550	88407832	19.359796171	1036708136	279265280	82763776	82771968
+[12:34:33] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-proto ./run.sh src1m proto 2 s2_agg_hi
+NOTICE:  database "x3_proto_s2_agg_hi_r2" does not exist, skipping
+proto	s2_agg_hi	2	1.311520581	193950072	.795585676	88407928	11.896282333	461831352	149856256	82763776	82763776
+[12:34:53] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-base ./run.sh src1m base 3 s2_agg
+NOTICE:  database "x3_base_s2_agg_r3" does not exist, skipping
+base	s2_agg	3	.647262406	16279400	.577881274	9763376	6.834346536	81339872	29908992	9125888	9125888
+[12:35:07] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-proto ./run.sh src1m proto 3 s2_agg
+NOTICE:  database "x3_proto_s2_agg_r3" does not exist, skipping
+proto	s2_agg	3	.617731425	16279400	.483178988	9762640	6.575476894	48015264	16957440	9125888	9125888
+[12:35:19] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-base ./run.sh src1m base 3 s2_agg_hi
+NOTICE:  database "x3_base_s2_agg_hi_r3" does not exist, skipping
+base	s2_agg_hi	3	1.295008510	154580536	.813957228	88510160	19.121219250	916469528	279265280	82763776	82763776
+[12:35:47] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-proto ./run.sh src1m proto 3 s2_agg_hi
+NOTICE:  database "x3_proto_s2_agg_hi_r3" does not exist, skipping
+proto	s2_agg_hi	3	1.278661720	154580512	.815467324	88405120	11.887923073	560334664	149856256	82763776	82771968
+gen 10m
+ 12:36:06 up 1 day, 21:04,  1 user,  load average: 1.25, 3.01, 5.10
+rustc=0 cargo=0
+[12:36:06] psql -X -q -h /home/mike/code/trellis-lane-r/target/research-pg-x3 -p 54873 -U app -v N=10000000 -f gen.sql src10m
+ setseed 
+---------
+ 
+(1 row)
+
+  posts   |   tags   | tags_per_post | authors_used 
+----------+----------+---------------+--------------
+ 10000000 | 19000479 |     1.9000479 |       999956
+(1 row)
+
+[12:36:56] env TR=/home/mike/code/trellis-lane-r/target/x3-bin/trellis-proto ./run.sh src10m proto10m 1 s2_agg_hi
+NOTICE:  database "x3_proto10m_s2_agg_hi_r1" does not exist, skipping
+proto10m	s2_agg_hi	1	13.529471797	1545558208	12.471645148	882724720	81.673833500	5892874688	1486544896	827170816	827195392
+20261112T123222-r-bench	done	bench	r	1917	research/absolute-build/x3/run_x3.sh: X3 end-to-end plain-aggregate build, base 54cfddb2 vs write-once prototype, E5 method, s2_agg+s2_agg_hi 1M x3, s2_agg_hi 10M x1 (proto only)	2026-11-12T12:32:22-08:00	2026-11-12T12:39:22-08:00	420	31900000	ok	7200	X3 end-to-end plain-aggregate fresh build (define to live), base 54cfddb2 vs candidate A prototype, E5 method: s2_agg/s2_agg_hi at 1M rows x3 each, s2_agg_hi 10M rows x1 proto only; see research/absolute-build/x3/X3-results.md. rows = generated posts+post_tags (1M: 2.9M, 10M: 29M), estimate
+finished 20261112T123222-r-bench outcome=ok

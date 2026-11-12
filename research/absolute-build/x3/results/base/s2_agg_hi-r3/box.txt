@@ -1,0 +1,3 @@
+shape=s2_agg_hi rep=3 label=base
+ 12:35:20 up 1 day, 21:04,  1 user,  load average: 1.54, 3.33, 5.31
+rustc=0

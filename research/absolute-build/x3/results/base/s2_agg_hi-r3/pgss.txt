@@ -1,0 +1,15 @@
+1|10205|1000000|613263688|15781|665|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), rg as (select distinc
+1|2319|1000000|287190172|0|49|insert into "trellis"."agg_1" ("grp_hi") select distinct "grp_hi" from ( select "grp_hi" from pg_temp."trellis_group_sides_1_44d1af5ecae2d619" union all select 
+1|342|1|0|0|0|select count(*) from (select * from plain_ctas except all select * from hi_totals) x
+1|217|1|0|0|80|select count(*) from (select * from hi_totals except all select * from plain_ctas) x
+1|198|1000000|0|0|0|insert into pg_temp."trellis_group_recompute_1_f8ecc87fa7762b2e" ("grp_hi") select "grp_hi" from "trellis"."agg_1" h union all select "grp_hi" as "grp_hi" from 
+3|159|0|0|0|0|delete from trellis.agg_1 where ctid = any(array( select ctid from trellis.agg_1 where __zero and (__basis is null or __stamp <= $2) order by grp_hi limit $1 fo
+149|59|596|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exists (select from pg_ca
+1|52|1|60536769|7353|0|select count(*) from plain_ctas
+1|14|1|0|0|0|select count(*) from hi_totals
+149|10|0|0|0|0|set timezone_abbreviations to $1
+79|7|79|0|0|0|select pid from pg_locks where locktype = $2 and granted and objsubid = $3 and database = (select oid from pg_database where datname = current_database()) and (
+149|7|0|0|0|0|set timezone to $1
+74|6|222|0|0|0|with cols as ( select array_agg(a.attname::text) as names, array_agg(a.attnum) as attnums, array_agg(a.attcollation::oid) as collations from pg_catalog.pg_attri
+73|4|73|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next
+73|3|73|0|0|0|select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, d.join_table, array(select j.table_name from (select $4 as position, d.join_table a

@@ -1,0 +1,3 @@
+shape=s2_agg rep=1 label=proto
+ 12:32:40 up 1 day, 21:01,  1 user,  load average: 1.73, 4.27, 5.91
+rustc=0

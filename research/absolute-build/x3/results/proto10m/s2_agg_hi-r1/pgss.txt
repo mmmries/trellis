@@ -1,0 +1,15 @@
+1|68115|10000000|4592321086|78|6650|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), a as (select s."grp_h
+1|2220|1|0|0|804|select count(*) from (select * from hi_totals except all select * from plain_ctas) x
+1|2203|1|0|0|804|select count(*) from (select * from plain_ctas except all select * from hi_totals) x
+1|495|1|605367690|73530|0|select count(*) from hi_totals
+16|254|16|16641|9|0|update backfill_chunks set claimed_at = now() where id = $1 and claimed_by = $2 and not done
+619|243|2476|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exists (select from pg_ca
+1|147|1|0|0|0|select count(*) from plain_ctas
+352|81|352|0|0|0|select not exists ( select $4 from backfill_chunks bc where bc.definition_id = d.id and not bc.done and not (bc.fuse_rearmed_at is distinct from d.fuse_rearmed_
+8|42|16|7447|5|0|insert into drainers (drainer_id, last_seen) select distinct d, now() from unnest($1::text[]) as d on conflict (drainer_id) do update set last_seen = excluded.l
+619|39|0|0|0|0|set timezone_abbreviations to $1
+619|29|0|0|0|0|set timezone to $1
+326|29|326|0|0|0|select pid from pg_locks where locktype = $2 and granted and objsubid = $3 and database = (select oid from pg_database where datname = current_database()) and (
+308|22|924|0|0|0|with cols as ( select array_agg(a.attname::text) as names, array_agg(a.attnum) as attnums, array_agg(a.attcollation::oid) as collations from pg_catalog.pg_attri
+307|18|307|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next
+16|16|16|12394|9|0|insert into worker_registry (worker_id, registered_at, last_seen, version, staging, drain, standby, staging_pid) values ($1, now(), now(), $2, $3, $4, $5, $6) o

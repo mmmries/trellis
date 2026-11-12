@@ -1,0 +1,15 @@
+1|1226|99995|50829976|2|54|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), rg as (select distinc
+1|313|99995|28713877|0|0|insert into "trellis"."agg_1" ("author_id") select distinct "author_id" from ( select "author_id" from pg_temp."trellis_group_sides_1_34563cf2bd068379" union al
+1|49|99995|0|0|0|insert into pg_temp."trellis_group_recompute_1_f01a0db369afd2ce" ("author_id") select "author_id" from "trellis"."agg_1" h union all select "author_id" as "auth
+57|25|228|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exists (select from pg_ca
+1|25|1|0|0|0|select count(*) from (select * from author_totals except all select * from plain_ctas) x
+1|25|1|0|0|0|select count(*) from (select * from plain_ctas except all select * from author_totals) x
+1|4|1|6849798|834|0|select count(*) from plain_ctas
+57|4|0|0|0|0|set timezone_abbreviations to $1
+1|3|1|0|0|0|select count(*) from author_totals
+57|3|0|0|0|0|set timezone to $1
+31|3|31|0|0|0|select pid from pg_locks where locktype = $2 and granted and objsubid = $3 and database = (select oid from pg_database where datname = current_database()) and (
+28|2|84|0|0|0|with cols as ( select array_agg(a.attname::text) as names, array_agg(a.attnum) as attnums, array_agg(a.attcollation::oid) as collations from pg_catalog.pg_attri
+2|2|0|8313|1|0|insert into definition_types (transform_id, type_oid, type_name) select $1, k.type_oid, k.type_name from definition_key_types k where k.transform_id = $1 and k.
+27|1|27|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next
+27|1|27|0|0|0|select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, d.join_table, array(select j.table_name from (select $4 as position, d.join_table a

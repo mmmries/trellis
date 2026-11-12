@@ -1,0 +1,15 @@
+1|5785|1000000|459219176|4|566|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), a as (select s."grp_h
+1|207|1|0|0|80|select count(*) from (select * from plain_ctas except all select * from hi_totals) x
+1|205|1|0|0|80|select count(*) from (select * from hi_totals except all select * from plain_ctas) x
+95|40|380|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exists (select from pg_ca
+1|14|1|0|0|0|select count(*) from hi_totals
+1|7|1|0|0|0|select count(*) from plain_ctas
+95|7|0|0|0|0|set timezone_abbreviations to $1
+51|5|51|0|0|0|select pid from pg_locks where locktype = $2 and granted and objsubid = $3 and database = (select oid from pg_database where datname = current_database()) and (
+95|5|0|0|0|0|set timezone to $1
+47|4|141|0|0|0|with cols as ( select array_agg(a.attname::text) as names, array_agg(a.attnum) as attnums, array_agg(a.attcollation::oid) as collations from pg_catalog.pg_attri
+46|3|46|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next
+46|2|46|0|0|0|select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, d.join_table, array(select j.table_name from (select $4 as position, d.join_table a
+2|2|0|0|0|0|select v.transform_id, d.source_table, n.nspname::text || $1 || t.typname::text, v.label, e.enumlabel::text from definition_enum_values v join (select d.id as t
+293|2|293|0|0|0|select set_config($1, case when kept between $2 and $3 then kept::text else $4 end, $5) from (select (extract($6 from current_setting($7)::interval) * $8)::bigi
+205|1|205|0|0|0|select to_regclass($1) is not null
