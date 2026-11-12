@@ -453,6 +453,43 @@ async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
     let _ = &it.db;
 }
 
+/// A `KEY (...)` on a partitioned root that leaves out the partition key can
+/// have no unique index behind it, so define refuses it and says why.
+#[tokio::test]
+async fn a_partitioned_roots_unbacked_key_names_the_partition_key_rule() {
+    let cluster = TestCluster::start();
+    let it = instance(
+        &cluster,
+        "create table public.lines (id bigint not null, order_id bigint not null, \
+            amount int) partition by hash (order_id); \
+         create table public.lines_0 partition of public.lines \
+            for values with (modulus 1, remainder 0);",
+    )
+    .await;
+    let err = refusal(
+        &it,
+        "TRANSFORM totals FROM public.lines KEY (id) GROUP BY order_id WITHOUT SOURCE INDEX \
+         SELECT COUNT(*) AS n",
+    )
+    .await;
+    assert!(
+        matches!(
+            err,
+            CatalogError::Ddl(trellis::defs::ddl::DdlError::KeyNotBacked {
+                partitioned: true,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .ends_with("so the KEY must name the partition key's columns too"),
+        "{err}"
+    );
+    let _ = &it.db;
+}
+
 /// A `JOIN` side's partial key is its own `GROUP BY` columns plus its join
 /// key (ADR-0019), and the group-key rule applies to it on either side: a
 /// fact table partitioned on the column it joins by needs nothing in its
