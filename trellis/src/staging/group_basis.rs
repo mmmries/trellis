@@ -6199,12 +6199,14 @@ mod tests {
         assert_eq!(rows, expected, "every staged group, in group order");
         txn.commit().await.expect("commit");
 
-        // Over those rows: group 1 and the `NULL` group add, group 2's zero
-        // delta leaves its row as it was.
+        // Over those rows: group 1 and the `NULL` group add, as does group
+        // 41 to its zero row, and group 2's zero delta leaves its row as it
+        // was.
         let txn = client.transaction().await.expect("begin");
         txn.batch_execute(&plan.staged_ddl()).await.expect("staged");
         txn.batch_execute(&stage(
-            "(1, 1, 1, 5), (1, 1, 1, 6), (2, 0, 0, 0), (null::integer, 1, 1, 3)",
+            "(1, 1, 1, 5), (1, 1, 1, 6), (2, 0, 0, 0), (41, 1, 1, 9), \
+             (null::integer, 1, 1, 3)",
         ))
         .await
         .expect("stage");
@@ -6215,12 +6217,17 @@ mod tests {
         assert_eq!(before, after, "a zero delta does not rewrite its row");
         let mut changed: Vec<Row> = read(txn.query(&rows_sql, &[]).await.expect("rows"))
             .into_iter()
-            .filter(|(g, ..)| matches!(g, None | Some(1) | Some(2)))
+            .filter(|(g, ..)| matches!(g, None | Some(1) | Some(2) | Some(41)))
             .collect();
         changed.sort();
         assert_eq!(
             changed,
-            vec![(None, 3, 3, 10), (Some(1), 3, 3, 12), (Some(2), 1, 1, 2)],
+            vec![
+                (None, 3, 3, 10),
+                (Some(1), 3, 3, 12),
+                (Some(2), 1, 1, 2),
+                (Some(41), 1, 1, 9)
+            ],
             "deltas add to the rows there; no second row for any group"
         );
         // Group 2's row is locked all the same: another writer waits on it.
