@@ -3306,8 +3306,6 @@ impl GroupTargetPlan {
     /// each partial's value with a change of zero, and each extreme's prior
     /// and new value, for [`Self::visible_tail_sql`].
     fn probe_sql(&self, image_columns: Option<&[String]>) -> String {
-        let cols = quoted(&self.shape.group_cols);
-        let col_list = cols.join(", ");
         let extremes = self.shape.extremes();
         let mut held = vec!["x.ctid".to_string()];
         let mut held_names = vec!["__hc".to_string()];
@@ -3338,7 +3336,7 @@ impl GroupTargetPlan {
                 x.named("__n")
             ));
         }
-        let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        returning.push("false as __probe".to_string());
         let stamp = "__xbasis = snap.__snap, __xstamp = snap.__seg";
         // Planted bugs: the probe writes no extremes' basis, or stamps the
         // partials' basis instead. See `crate::plant`.
@@ -3350,35 +3348,20 @@ impl GroupTargetPlan {
         } else {
             stamp
         };
-        format!(
-            "with snap as materialized ({SNAPSHOT_AND_STAMP}), \
-             rg as (select distinct {col_list} from {probed}), \
-             r as ( \
-                 select h.*, p.* from rg \
-                 cross join lateral {lookup_hidden} as h({held_names}) \
-                 cross join lateral (select {probes}) as p \
-             ), \
-             up as ( \
-                 update {hidden} u set {sets}, {stamp} \
-                 from r, snap \
-                 where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc \
-                 returning {up_groups}, {returning}, false as __probe \
-             ), \
-             {tail}",
-            probed = self.probed,
-            lookup_hidden = self.group_lookup(
-                &self.hidden_ident,
-                Population::Hidden,
-                "rg",
-                &held.join(", ")
+        let probes = format!("cross join lateral (select {}) as p", probes.join(", "));
+        self.absolute_write_sql(
+            SNAPSHOT_AND_STAMP,
+            &self.probed,
+            &self.hidden_read_sql(
+                "h.*, p.*",
+                &held.join(", "),
+                &held_names.join(", "),
+                &probes,
             ),
-            held_names = held_names.join(", "),
-            probes = probes.join(", "),
-            hidden = self.hidden_ident,
-            sets = sets.join(", "),
-            up_groups = up_groups.join(", "),
-            returning = returning.join(", "),
-            tail = self.visible_tail_sql(image_columns),
+            &format!("{}, {stamp}", sets.join(", ")),
+            BY_CTID_ARRAY,
+            &returning.join(", "),
+            &self.visible_tail_sql(image_columns),
         )
     }
 
@@ -3398,15 +3381,10 @@ impl GroupTargetPlan {
     /// established that the node holds every row of every group in the set
     /// and no row of a group outside it.
     fn recompute_sql(&self, image_columns: Option<&[String]>, node: Option<&str>) -> String {
-        let cols = quoted(&self.shape.group_cols);
-        let col_list = cols.join(", ");
         let mut old = self.shape.each_partial(|p| format!("x.{}", p.hidden()));
         let mut old_names = self.shape.each_partial(|p| p.name("__o"));
         // The scan form's partials, `NULL` for a group the node has no row of.
         let mut zeroed = self.shape.each_partial(|p| p.or_zero("n", "__r"));
-        let mut sets = self
-            .shape
-            .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")));
         let mut returning = self.shape.each_partial(|p| {
             let (h, d, n) = (p.hidden(), p.name("__d"), p.name("__n"));
             format!(
@@ -3417,7 +3395,118 @@ impl GroupTargetPlan {
         // Rx6: the extremes from the same snapshot, which becomes their
         // basis too.
         let extremes = self.shape.extremes();
-        let mut xsets = String::new();
+        for x in &extremes {
+            let (column, fresh_name) = (x.column(), x.named("__r"));
+            old.push(format!("x.{column}"));
+            old_names.push(x.named("__o"));
+            zeroed.push(format!("n.{fresh_name} as {fresh_name}"));
+            returning.push(format!(
+                "r.{o} as {o}, u.{column} as {}",
+                x.named("__n"),
+                o = x.named("__o")
+            ));
+        }
+        if !extremes.is_empty() {
+            returning.push("false as __probe".to_string());
+        }
+        let (held, names) = (
+            format!("x.ctid, {}", old.join(", ")),
+            format!("__hc, {}", old_names.join(", ")),
+        );
+        let r = match node {
+            None => self.hidden_read_sql("h.*, a.*", &held, &names, &self.probe_join_sql()),
+            Some(node) => {
+                // The node's group columns at the hidden table's types, as
+                // `rg`'s: array equality needs both sides' element types
+                // the same (a `varchar` source column against a `text`
+                // group column has no `=`).
+                let matched = format!("left join n on {}", self.group_match("n", "rg"));
+                format!(
+                    "n as materialized ({fresh}), {r}",
+                    fresh = self.fresh_select(&self.group_values(), node, false),
+                    r = self.hidden_read_sql(
+                        &format!("h.*, {}", zeroed.join(", ")),
+                        &held,
+                        &names,
+                        &matched
+                    ),
+                )
+            }
+        };
+        self.absolute_write_sql(
+            // Spaced as written before the constant, so the text is unchanged.
+            &format!(" {SNAPSHOT_AND_STAMP} "),
+            &self.recomputed,
+            &r,
+            &self.absolute_sets(),
+            BY_CTID_ARRAY,
+            &returning.join(", "),
+            &match &self.writer {
+                Writer::JoinPartials { deltas } => self.deltas_tail_sql(deltas),
+                Writer::Aggregate | Writer::JoinTarget => self.visible_tail_sql(image_columns),
+            },
+        )
+    }
+
+    /// An absolute write (R1, R5): over the groups of `groups`, already
+    /// locked, takes the snapshot and reads the newest segment's `seg_seq`
+    /// (`snap`, [`SNAPSHOT_AND_STAMP`]) in this one statement; reads each
+    /// group's hidden row and new values into `r` (a CTE over `rg`, the
+    /// groups); writes `sets` to each hidden row `by` finds (`r`'s `__hc`);
+    /// and hands `tail` the group columns, then `returning`, as `up`.
+    #[allow(clippy::too_many_arguments)]
+    fn absolute_write_sql(
+        &self,
+        snap: &str,
+        groups: &str,
+        r: &str,
+        sets: &str,
+        by: &str,
+        returning: &str,
+        tail: &str,
+    ) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        format!(
+            "with snap as materialized ({snap}), \
+             rg as (select distinct {cols} from {groups}), \
+             {r}, \
+             up as ( \
+                 update {hidden} u set {sets} \
+                 from r, snap where {by} \
+                 returning {up_groups}, {returning} \
+             ), \
+             {tail}",
+            cols = cols.join(", "),
+            hidden = self.hidden_ident,
+            up_groups = up_groups.join(", "),
+        )
+    }
+
+    /// An absolute write's `r`: per group of `rg`, `select` over its hidden
+    /// row's `held` columns (its `ctid` first), read as `h(<names>)`, and
+    /// `join`.
+    fn hidden_read_sql(&self, select: &str, held: &str, names: &str, join: &str) -> String {
+        format!(
+            "r as ( select {select} from rg cross join lateral {lookup} as h({names}) {join} )",
+            lookup = self.group_lookup(&self.hidden_ident, Population::Hidden, "rg", held),
+        )
+    }
+
+    /// The new values of `rg`'s group as `a`, by one index probe of the
+    /// source's root ([`Self::probe_rows_sql`]).
+    fn probe_join_sql(&self) -> String {
+        format!(
+            "cross join lateral ({}) as a",
+            self.fresh_select(&[], &format!("({})", self.probe_rows_sql()), false)
+        )
+    }
+
+    /// The `set` list of a write of every partial and extreme (Rx6): each
+    /// from `r`'s new value (`__r…`), with the snapshot as their basis and
+    /// the segment as their stamp.
+    fn absolute_sets(&self) -> String {
+        let extremes = self.shape.extremes();
         let keep = false;
         // Planted bug: the absolute write leaves the extremes, their basis
         // and their stamp as they were. See `crate::plant`.
@@ -3427,86 +3516,19 @@ impl GroupTargetPlan {
                 crate::plant::Plant::GbxAbsoluteWriteKeepsExtremes,
                 !extremes.is_empty(),
             );
-        for x in &extremes {
-            let (column, fresh_name) = (x.column(), x.named("__r"));
-            old.push(format!("x.{column}"));
-            old_names.push(x.named("__o"));
-            zeroed.push(format!("n.{fresh_name} as {fresh_name}"));
-            if !keep {
-                sets.push(format!("{column} = r.{fresh_name}"));
-            }
-            returning.push(format!(
-                "r.{o} as {o}, u.{column} as {}",
-                x.named("__n"),
-                o = x.named("__o")
-            ));
+        let mut sets = self
+            .shape
+            .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")));
+        if !keep {
+            sets.extend(
+                (extremes.iter()).map(|x| format!("{} = r.{}", x.column(), x.named("__r"))),
+            );
         }
-        if !extremes.is_empty() {
-            returning.push("false as __probe".to_string());
-            if !keep {
-                xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
-            }
+        sets.push("__basis = snap.__snap, __stamp = snap.__seg".to_string());
+        if !keep && !extremes.is_empty() {
+            sets.push("__xbasis = snap.__snap, __xstamp = snap.__seg".to_string());
         }
-        let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
-        let lookup_hidden = self.group_lookup(
-            &self.hidden_ident,
-            Population::Hidden,
-            "rg",
-            &format!("x.ctid, {}", old.join(", ")),
-        );
-        let r = match node {
-            None => format!(
-                "r as ( \
-                     select h.*, a.* from rg \
-                     cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
-                     cross join lateral ({fresh}) as a \
-                 )",
-                old_names = old_names.join(", "),
-                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql()), false),
-            ),
-            Some(node) => {
-                // The node's group columns at the hidden table's types, as
-                // `rg`'s: array equality needs both sides' element types
-                // the same (a `varchar` source column against a `text`
-                // group column has no `=`).
-                let matched = self.group_match("n", "rg");
-                format!(
-                    "n as materialized ({fresh}), \
-                     r as ( \
-                         select h.*, {zeroed} from rg \
-                         cross join lateral {lookup_hidden} as h(__hc, {old_names}) \
-                         left join n on {matched} \
-                     )",
-                    fresh = self.fresh_select(&self.group_values(), node, false),
-                    zeroed = zeroed.join(", "),
-                    old_names = old_names.join(", "),
-                )
-            }
-        };
-        format!(
-            "with snap as materialized ( \
-                 select pg_catalog.pg_current_snapshot() as __snap, \
-                        coalesce((select max(seg_seq) from segments), 0) as __seg \
-             ), \
-             rg as (select distinct {col_list} from {recomputed}), \
-             {r}, \
-             up as ( \
-                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg{xsets} \
-                 from r, snap \
-                 where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc \
-                 returning {up_groups}, {returning} \
-             ), \
-             {tail}",
-            recomputed = self.recomputed,
-            hidden = self.hidden_ident,
-            sets = sets.join(", "),
-            up_groups = up_groups.join(", "),
-            returning = returning.join(", "),
-            tail = match &self.writer {
-                Writer::JoinPartials { deltas } => self.deltas_tail_sql(deltas),
-                Writer::Aggregate | Writer::JoinTarget => self.visible_tail_sql(image_columns),
-            },
-        )
+        sets.join(", ")
     }
 
     /// A `JOIN` build's snapshot statement for one side ([`write_join_build_cells`]):
@@ -3585,9 +3607,6 @@ impl GroupTargetPlan {
         let cell: Vec<String> = (self.shape.partials().into_iter())
             .flat_map(|p| [p.or_zero("h", "__o"), p.or_zero("n", "__r")])
             .collect();
-        let sets = self
-            .shape
-            .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")));
         let r_cols: Vec<String> = cols.iter().map(|c| format!("r.{c}")).collect();
         let mut insert_cols = cols.clone();
         insert_cols.extend(self.shape.each_partial(|p| p.hidden()));
@@ -3627,7 +3646,7 @@ impl GroupTargetPlan {
             "with snap as materialized (select __snap, __seg from {grouped} where __meta), \
              up as ( \
                  update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
-                 from {cells} r, snap where u.ctid = r.__hc \
+                 from {cells} r, snap where {BY_CTID} \
                  returning r.__hc \
              ), \
              ins as ( \
@@ -3638,7 +3657,9 @@ impl GroupTargetPlan {
              d as (insert into {deltas} ({delta_cols}) select {delta_values} from {cells} r) \
              select count(*) from {cells}",
             hidden = self.hidden_ident,
-            sets = sets.join(", "),
+            sets = (self.shape)
+                .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")))
+                .join(", "),
             insert_cols = insert_cols.join(", "),
             insert_values = insert_values.join(", "),
             delta_cols = delta_cols.join(", "),
@@ -3765,84 +3786,45 @@ impl GroupTargetPlan {
     /// [`Self::visible_tail_sql`]'s layout, with each partial's new value in
     /// place of its change.
     fn rebuild_sql(&self, image_columns: Option<&[String]>, read: &RebuildRead) -> String {
-        let cols = quoted(&self.shape.group_cols);
-        let col_list = cols.join(", ");
         let mut kept = self.shape.each_partial(|p| p.or_zero("a", "__r"));
-        let mut sets = self
-            .shape
-            .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")));
         let mut returning = self
             .shape
             .each_partial(|p| format!("u.{} as {}", p.hidden(), p.name("__n")));
         // Rx6: the extremes from the same `GROUP BY` and snapshot, which
         // becomes their basis too.
-        let extremes = self.shape.extremes();
-        let mut xsets = String::new();
-        let keep = false;
-        // Planted bug: the absolute write leaves the extremes, their basis
-        // and their stamp as they were. See `crate::plant`.
-        #[cfg(any(test, feature = "test-util"))]
-        let keep = keep
-            || crate::plant::fires(
-                crate::plant::Plant::GbxAbsoluteWriteKeepsExtremes,
-                !extremes.is_empty(),
-            );
-        for x in &extremes {
-            let (column, fresh_name) = (x.column(), x.named("__r"));
+        for x in &self.shape.extremes() {
+            let fresh_name = x.named("__r");
             kept.push(format!("a.{fresh_name} as {fresh_name}"));
-            if !keep {
-                sets.push(format!("{column} = r.{fresh_name}"));
-            }
-            returning.push(format!("u.{column} as {}", x.named("__n")));
+            returning.push(format!("u.{} as {}", x.column(), x.named("__n")));
         }
-        if !extremes.is_empty() && !keep {
-            xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
-        }
-        let matched = self.group_match("a", "rg");
-        let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
-        let lookup_hidden =
-            self.group_lookup(&self.hidden_ident, Population::Hidden, "rg", "x.ctid");
-        let r = match read {
+        let kept = format!("h.__hc, {}", kept.join(", "));
+        let a = match read {
             #[cfg(any(test, feature = "test-util"))]
-            RebuildRead::Early(early) => format!(
-                "a as (select * from {early} where __rn is not null), \
-                 r as ( \
-                     select h.__hc, {kept} from rg \
-                     cross join lateral {lookup_hidden} as h(__hc) \
-                     left join a on {matched} \
-                 )",
-                kept = kept.join(", "),
-            ),
+            RebuildRead::Early(early) => {
+                Some(format!("select * from {early} where __rn is not null"))
+            }
             // One `GROUP BY` of the source or of a leaf, matched to the
             // locked groups.
-            RebuildRead::Source | RebuildRead::Node(_) => {
-                let from = match read {
-                    RebuildRead::Node(node) => node.as_str(),
-                    _ => self.source_row.as_str(),
-                };
-                format!(
-                    "a as ({fresh}), \
-                     r as ( \
-                         select h.__hc, {kept} from rg \
-                         cross join lateral {lookup_hidden} as h(__hc) \
-                         left join a on {matched} \
-                     )",
-                    fresh = self.fresh_select(&self.group_values(), from, false),
-                    kept = kept.join(", "),
-                )
+            RebuildRead::Source => {
+                Some(self.fresh_select(&self.group_values(), &self.source_row, false))
             }
+            RebuildRead::Node(node) => Some(self.fresh_select(&self.group_values(), node, false)),
             // One index probe of the root per group, for a set that is not
             // a leaf's (the remainder's) or a leaf of a tree that is not as
             // recorded.
-            RebuildRead::Probe => format!(
-                "r as ( \
-                     select h.__hc, {kept} from rg \
-                     cross join lateral {lookup_hidden} as h(__hc) \
-                     cross join lateral ({fresh}) as a \
-                 )",
-                kept = kept.join(", "),
-                fresh = self.fresh_select(&[], &format!("({})", self.probe_rows_sql()), false),
+            RebuildRead::Probe => None,
+        };
+        let r = match a {
+            Some(a) => format!(
+                "a as ({a}), {}",
+                self.hidden_read_sql(
+                    &kept,
+                    "x.ctid",
+                    "__hc",
+                    &format!("left join a on {}", self.group_match("a", "rg"))
+                )
             ),
+            None => self.hidden_read_sql(&kept, "x.ctid", "__hc", &self.probe_join_sql()),
         };
         #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
         let mut snap = SNAPSHOT_AND_STAMP.to_string();
@@ -3850,23 +3832,14 @@ impl GroupTargetPlan {
         if let RebuildRead::Early(early) = read {
             snap = format!("select __snap, __seg from {early} limit 1");
         }
-        format!(
-            "with snap as materialized ({snap}), \
-             rg as (select distinct {col_list} from {recomputed}), \
-             {r}, \
-             up as ( \
-                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg{xsets} \
-                 from r, snap where u.ctid = r.__hc \
-                 returning {up_groups}, {returning} \
-             ), \
-             {tail}",
-            recomputed = self.recomputed,
-            r = r,
-            hidden = self.hidden_ident,
-            sets = sets.join(", "),
-            up_groups = up_groups.join(", "),
-            returning = returning.join(", "),
-            tail = self.held_tail_sql(image_columns),
+        self.absolute_write_sql(
+            &snap,
+            &self.recomputed,
+            &r,
+            &self.absolute_sets(),
+            BY_CTID,
+            &returning.join(", "),
+            &self.held_tail_sql(image_columns),
         )
     }
 
@@ -4997,6 +4970,12 @@ pub(crate) struct RebuildScope {
 /// its stamp (R5), read in one statement.
 const SNAPSHOT_AND_STAMP: &str = "select pg_catalog.pg_current_snapshot() as __snap, \
      coalesce((select max(seg_seq) from segments), 0) as __seg";
+
+/// How an absolute write's `up` finds each group's hidden row: by `r`'s
+/// `__hc`, which the recompute and the probe also give as an array of
+/// `ctid`s. Each statement keeps the form it was measured with.
+const BY_CTID: &str = "u.ctid = r.__hc";
+const BY_CTID_ARRAY: &str = "u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc";
 
 /// Where a rebuild's replace reads the groups' rows from.
 #[derive(Debug, Clone, PartialEq, Eq)]
