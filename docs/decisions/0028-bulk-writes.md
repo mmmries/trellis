@@ -18,7 +18,7 @@ at 10 to 17 times the cost of the plain `INSERT … SELECT` of its query. A
 0.8 GB target, 82 times its plain query. That was one run on a busy machine,
 but the WAL figure doesn't depend on load.
 
-This ADR settles three rules for a **bulk write**: a statement expected to
+This ADR settles three rules and a cost goal for a **bulk write**: a statement expected to
 write a large share of a hidden table, a ledger or a target. It extends the
 lock order of [ADR-0002](0002-async-data-flow.md) (I5) and of
 [ADR-0019](0019-join-transforms.md) (JR1), which already sort every lock
@@ -91,14 +91,21 @@ check that turns a delta for an unlocked row into an error
 ([ADR-0019](0019-join-transforms.md)) can't fire in the build. It stays for
 pages, whose lock set is computed separately from what they write.
 
-`[OPEN: How does an absolute write meet rule 1? An aggregate's build and a 1-1
-build chunk write values they read after taking their locks (ADR-0002, R1): a
-snapshot taken before the locks lets a page that applies in between be lost or
-counted twice. Today the lock statement inserts placeholder rows and the write
-updates them, which is the 10M-group case above. One upsert would read before
-it locks. Recommendation: settle this with the redesign of the aggregate
-build's write; until then those builds keep two statements and follow rule 2
-in both.]`
+Rules 1 and 3 are settled for writes that add a delta. A build that writes
+absolute values it read after taking its locks (an aggregate's build, a 1-1
+build chunk; [ADR-0002](0002-async-data-flow.md), R1) keeps its two statements,
+both in rule 2's order; how such a write can write each row once is an open
+research question.
+
+### The goal for a build is twice the cost of its plain query
+
+A build's cost is measured against the plain `INSERT … SELECT` of its query.
+The goal is a build within twice that time. It is a goal and not a release
+gate: builds are at 10 to 17 times today, and I don't know that every shape can
+reach it. In the model, filling a join's state with plain inserts alone cost
+2.2 to 2.5 times the plain query, and the upsert of rule 3 costs more than
+that. The goal also says when to stop: a build at twice its plain query isn't
+worth optimizing further.
 
 ### Pages keep their forms
 
@@ -136,13 +143,8 @@ still gets its row, and holds its lock, until the build commits.
   catch.
 - Zero rows written by a build stay until the collection that removes them
   runs, as lock rows do today.
-- A build's cost is judged against the plain `INSERT … SELECT` of its query,
-  and by WAL bytes and full-page images as well as time, at a size where the
-  hidden tables are larger than shared buffers. None of the costs above shows
-  on small data.
+- A build is measured against its plain query, and by WAL bytes and full-page
+  images as well as time, at a size where the hidden tables are larger than
+  shared buffers. None of the costs above shows on small data.
 - Builds that don't meet the rules yet are being changed to, one structure at
   a time; rule 2 can be applied to a statement without rule 1 or 3.
-
-`[OPEN: Should a build's ratio to its plain query be a recurring benchmark
-that gates a release? Recommendation: yes, one transform per shape at 1M rows
-and the high-cardinality aggregate at 10M.]`
