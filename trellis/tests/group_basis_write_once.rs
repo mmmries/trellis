@@ -244,13 +244,16 @@ async fn a_page_blocked_on_an_inserted_row_applies_only_what_s1_missed() {
 /// `pages_between_the_enumeration_and_the_lock`, which pins that).
 #[tokio::test]
 async fn pages_before_step_one_make_stragglers() {
-    let mut d = seeded("(1, 1, 10), (2, 2, 5), (3, 3, 1)", true).await;
+    let mut d = seeded("(1, 1, 10), (2, 2, 5), (3, 3, 1), (7, null, 5)", true).await;
     define(&d).await;
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
     building.reached(PausePoint::AfterRebuildEnumerate).await;
-    d.step("insert into public.src values (4, 1, 1), (5, 9, 4)")
+    // The `NULL` group too: in S1 it is both a source group and a hidden
+    // row, which step 1 must match as one group (`NULL` matching `NULL`).
+    d.step("insert into public.src values (4, 1, 1), (5, 9, 4), (6, null, 2)")
         .await;
     assert_eq!(partials(&d, Some(1)).await, ["(1,1,1,f)"]);
+    assert_eq!(partials(&d, None).await, ["(1,1,2,f)"]);
     assert_eq!(partials(&d, Some(9)).await, ["(1,1,4,f)"]);
     d.write("update public.src set v = v + 1 where id = 2")
         .await;
@@ -264,6 +267,7 @@ async fn pages_before_step_one_make_stragglers() {
         ["(1,1,4,t)"],
         "enumerated through the hidden table, rewritten by step 2"
     );
+    assert_eq!(partials(&d, None).await, ["(2,2,7,t)"]);
     let undrained = d.seal().await;
     d.drain(undrained, "undrained").await;
     assert_eq!(partials(&d, Some(2)).await, ["(1,1,6,t)"]);
