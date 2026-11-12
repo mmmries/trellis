@@ -39,9 +39,9 @@ DROP   TRANSFORM <transform>
 ```
 
 - The clauses between `FROM` and `SELECT` choose the
-  [granularity](#granularity): none is 1-1, `GROUP BY` an aggregate,
-  `JOIN ... GROUP BY` a join aggregate, `JOIN` alone a 1-1 `JOIN` (more than
-  one `JOIN`: a star).
+  [granularity](#granularity): none is 1-1, `GROUP BY` an aggregate, one
+  `JOIN` with `GROUP BY` a join aggregate, `JOIN` alone a 1-1 `JOIN` (more
+  than one `JOIN`: a star).
 - `ADOPT EXISTING TABLE` builds into an existing empty table instead of
   creating one, and `KEY (...)` keys a table by those columns instead of its
   primary key ([details](#changing-a-definition)).
@@ -60,7 +60,9 @@ DROP   TRANSFORM <transform>
 
 What a definition may read is the [refusal table](#refusals); why the
 statement has this shape is
-[0004-transform-definition-grammar](decisions/0004-transform-definition-grammar.md).
+[0004-transform-definition-grammar](decisions/0004-transform-definition-grammar.md),
+with aliases from [0019](decisions/0019-join-transforms.md) and the 1-1 `JOIN`
+and star from [0021](decisions/0021-one-to-one-join-transforms.md).
 
 ## Supported sources and targets
 
