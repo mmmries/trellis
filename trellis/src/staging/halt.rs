@@ -368,6 +368,30 @@ async fn missing_privileges(
     })
 }
 
+/// Whether the session's role holds `USAGE` on the schema of each of
+/// `tables` (unquoted `schema.table` identities) that exists. Without it any
+/// lookup of the table by name raises `42501`, `to_regclass` included, so a
+/// read that would only report on the table (`Trellis::status`'s index gaps)
+/// checks this first, and the drain halts the table's readers instead.
+pub(crate) async fn schemas_usable(
+    client: &impl GenericClient,
+    tables: &[String],
+) -> Result<bool, tokio_postgres::Error> {
+    let schemas: Vec<&str> = tables
+        .iter()
+        .filter_map(|table| table.split_once('.').map(|(schema, _)| schema))
+        .collect();
+    let row = client
+        .query_one(
+            "select coalesce(pg_catalog.bool_and( \
+                 pg_catalog.has_schema_privilege(n.oid, 'USAGE')), true) \
+             from pg_catalog.pg_namespace n where n.nspname = any($1)",
+            &[&schemas],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 /// The ids of the definitions in `unfrozen` that `seed` reaches: its
 /// readers (or writer), then every reader of each one's target, to a
 /// fixpoint. A frozen definition is left out and not followed, since it

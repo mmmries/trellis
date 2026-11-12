@@ -1272,8 +1272,13 @@ impl Trellis {
                 }
                 // A stored definition always parses, unless this release
                 // can't run it (ADR-0024 rule 3): then it isn't parsed, and
-                // its `capture_failure` and floor say why.
-                if let Ok(Some(def)) = crate::defs::grammar::load_stored(
+                // its `capture_failure` and floor say why. Its sources are
+                // read below only where the role may still use their schema:
+                // the drain halts it otherwise, and the halt is the report.
+                let mut sources = row.get::<_, Vec<String>>("joined_tables");
+                sources.push(row.get("source_table"));
+                if crate::staging::halt::schemas_usable(&*txn, &sources).await?
+                    && let Ok(Some(def)) = crate::defs::grammar::load_stored(
                     self.pool.floors(),
                     row.get("definition_text"),
                     row.get("grammar_version"),
