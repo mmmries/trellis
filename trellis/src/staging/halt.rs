@@ -99,6 +99,19 @@ fn seed(err: &ApplyError) -> Option<Seed> {
     }
 }
 
+/// The message of the first Postgres error on `err`'s source chain, if it
+/// has one.
+fn refused_message(err: &ApplyError) -> Option<String> {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return pg.as_db_error().map(|db| db.message().to_string());
+        }
+        link = err.source();
+    }
+    None
+}
+
 /// Pauses every definition that isn't frozen and that the halting failure
 /// `err` reaches (see the module doc), and, if that paused any, records the
 /// halting stop, all in one transaction. Returns the bare targets of the
@@ -119,6 +132,13 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
         None => return Ok(Vec::new()),
     };
 
+    // A refused read or write reads as Postgres's own message, without the
+    // wrappers of whichever step met it, since the refusal names the step's
+    // role and table.
+    let text = match &seed {
+        None => refused_message(err).unwrap_or_else(|| err.to_string()),
+        Some(_) => err.to_string(),
+    };
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     let paused = pause_closure(
@@ -127,7 +147,7 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
         pool.floors(),
         seed,
         "the drain halted",
-        &err.to_string(),
+        &text,
     )
     .await?;
     txn.commit().await?;
@@ -366,6 +386,30 @@ async fn missing_privileges(
     } else {
         None
     })
+}
+
+/// Whether the session's role holds `USAGE` on the schema of each of
+/// `tables` (unquoted `schema.table` identities) that exists. Without it any
+/// lookup of the table by name raises `42501`, `to_regclass` included, so a
+/// read that would only report on the table (`Trellis::status`'s index gaps)
+/// checks this first, and the drain halts the table's readers instead.
+pub(crate) async fn schemas_usable(
+    client: &impl GenericClient,
+    tables: &[String],
+) -> Result<bool, tokio_postgres::Error> {
+    let schemas: Vec<&str> = tables
+        .iter()
+        .filter_map(|table| table.split_once('.').map(|(schema, _)| schema))
+        .collect();
+    let row = client
+        .query_one(
+            "select coalesce(pg_catalog.bool_and( \
+                 pg_catalog.has_schema_privilege(n.oid, 'USAGE')), true) \
+             from pg_catalog.pg_namespace n where n.nspname = any($1)",
+            &[&schemas],
+        )
+        .await?;
+    Ok(row.get(0))
 }
 
 /// The ids of the definitions in `unfrozen` that `seed` reaches: its

@@ -1,5 +1,6 @@
 //! A `TRUNCATE` of any table of a star 1-1 `JOIN` (#1776, #1460 sub-step
-//! 3.10; #1464's PP-T, PX4 to PX7, CX F5a/F5e and F5d, PS3 and XT1).
+//! 3.10; #1375's T families, #1464's PP-T, PX4 to PX7, CX F5a/F5e and F5d,
+//! PS3 and XT1).
 //!
 //! A truncate's page takes the transform's lock row `FOR UPDATE`, so every
 //! other page of the star, at any position, queues on it; it empties the
@@ -9,10 +10,10 @@
 //! that truncates several joined tables takes the definition row once,
 //! before the lock row, and starts one rebuild (ADR-0021, "Truncate").
 //!
-//! The star is #1464's fixture (`support/star.rs`): `a(id, k1, k2, x, y)`
-//! joined to `b1` (position 1, the model's `b`) and `b2` (position 2, the
-//! model's `e`). The per-position pins (PP-T, PX) run at position 2 of
-//! n = 3 under every kind tuple; the cross-position pins (CX, PS3, XT1) use
+//! The star is #1464's fixture (`support/star.rs`): `a(id, k1, .., x, y)`
+//! joined to `b1`, `b2`, ... The per-position pins (T, PP-T, PX) run over
+//! [`SHAPES`], the two-table `JOIN` and position 2 of a three-table star,
+//! under every kind tuple; the cross-position pins (CX, PS3, XT1) use
 //! #1459's n = 3 base state (`support/star_cx.rs`).
 //!
 //! The model (#1459) has no segment barrier, rebuild or floor (#1464 Q7), so
@@ -26,29 +27,36 @@ mod star;
 mod star_cx;
 
 use drain_driver::Driver;
-use star::{Kind, Shape, Star};
+use star::{Kind, SHAPES, Shape, Star};
 use star_cx::{N3, Orientation, SEED};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::build::{self, Step};
 use trellis::staging::interleave::PausePoint;
 
-/// The position under test: the last of three tables.
+/// Position 2 of three tables, for the pins that name `b2`.
 const AT2: Shape = Shape {
     positions: 2,
     at: 2,
 };
 
-/// `a` rows `(id, k2, x, y)` and `b2` rows `(id, k, w, tag)`; position 1 is
-/// matched and idle.
+/// `a` rows `(id, k, x, y)` and rows `(id, k, w, tag)` of the table under
+/// test; the idle positions are matched.
 const A_ROWS: &str =
     "(1, 10, 1, 'one'), (2, 20, 2, 'two'), (3, 30, 3, 'three'), (4, null, 4, 'four')";
 const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty'), (3, 40, 400, 'forty')";
 
-/// The quoted, qualified `ledger_truncate_floor` key of `table` (`R` or an
-/// `M`, as [`star::r_table`] and [`star::m_table`] name it).
-fn floor_key(table: &str) -> String {
+/// How many floors `table` (`R` or an `M`, qualified, as [`star::r_table`]
+/// and [`star::m_table`] name it) has: 1 once a truncate raised it.
+async fn floors(d: &Driver, table: &str) -> String {
     let (schema, name) = table.split_once('.').expect("a qualified table");
-    format!("\"{schema}\".\"{name}\"")
+    count(
+        d,
+        &format!(
+            "select count(*) from ledger_truncate_floor \
+             where target_table = '\"{schema}\".\"{name}\"'"
+        ),
+    )
+    .await
 }
 
 /// `star`'s status and how many of its build jobs are queued.
@@ -71,11 +79,22 @@ async fn count(d: &Driver, sql: &str) -> String {
     d.rows(sql).await.concat()
 }
 
+/// Each `M`'s row count, by position.
+async fn m_counts(d: &Driver, star: Star) -> Vec<String> {
+    let mut counts = Vec::new();
+    for p in star.shape.all() {
+        let m = star::m_table(d, star, p).await;
+        counts.push(count(d, &format!("select count(*) from {m}")).await);
+    }
+    counts
+}
+
 // ------------------------------------------------------------------ PP-T
 
-/// PP-T (#1375 T1 to T7) at position 2: a `TRUNCATE` of `a` or of the table
-/// at position 2 against a page of the other, alone or with the inserts
-/// after it in one transaction, and both truncated and refilled. T8 is
+/// PP-T (#1375 T1 to T7): a `TRUNCATE` of `a` or of the table under test
+/// against a page of the other (T1, T2) and of its own (T3, T4), a
+/// `TRUNCATE` and the inserts after it in one transaction against a page of
+/// the other (T5, T6), and both truncated and refilled (T7). T8 is
 /// [`pp_t8_a_stale_page_after_the_truncate_is_refused`].
 const TRUNCATE_RACES: [(&str, &str, &str); 8] = [
     (
@@ -84,6 +103,8 @@ const TRUNCATE_RACES: [(&str, &str, &str); 8] = [
         "update {b} set w = 999 where id = 2",
     ),
     (
+        // A page of `b` that holds a `NULL` key reads no `R` entry, so it
+        // meets the truncate's page on the lock row alone.
         "t1 truncate a vs a NULL-keyed b change",
         "truncate public.a",
         "insert into {b} values (4, null, 1, 'none')",
@@ -125,29 +146,31 @@ const TRUNCATE_RACES: [(&str, &str, &str); 8] = [
     ),
 ];
 
-/// PP-T T1 to T7: each pair is two batches, drained in both orders, the
-/// first frozen at its commit: the second queues on the star's lock row,
-/// which the truncate's page holds `FOR UPDATE` and every other page `FOR
-/// SHARE`, and after the rebuilds the target is the live join. Planted
-/// `join1_truncate_share_lock`, the second page runs beside a `TRUNCATE a`
-/// (a joined table's truncate is ordered by its definition row and its
-/// rebuild's start too, `cx_f5a_…`).
+/// PP-T T1 to T7: each pair is two batches, sealed in order, drained in both
+/// orders, the first frozen at its commit: the second queues on the star's
+/// lock row, which the truncate's page holds `FOR UPDATE` and every other
+/// page `FOR SHARE`, and after the rebuilds the target is the live join.
+/// Planted `join1_truncate_share_lock`, the second page runs beside a
+/// `TRUNCATE a` (a joined table's truncate is ordered by its definition row
+/// and its rebuild's start too, `cx_f5a_…`).
 #[tokio::test]
 async fn pp_t1_to_t7_a_truncate_races_a_page_of_either_table() {
-    for (name, x, y) in TRUNCATE_RACES {
-        for star in AT2.stars() {
-            for x_first in [true, false] {
-                let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-                star::write(&d, &AT2.sql(x)).await;
-                let sealed_x = d.seal().await;
-                star::write(&d, &AT2.sql(y)).await;
-                let sealed_y = d.seal().await;
-                let (first, second) = if x_first {
-                    (sealed_x, sealed_y)
-                } else {
-                    (sealed_y, sealed_x)
-                };
-                star::race_rebuilt(&mut d, star, name, first, second).await;
+    for shape in SHAPES {
+        for (name, x, y) in TRUNCATE_RACES {
+            for star in shape.stars() {
+                for x_first in [true, false] {
+                    let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+                    star::write(&d, &shape.sql(x)).await;
+                    let sealed_x = d.seal().await;
+                    star::write(&d, &shape.sql(y)).await;
+                    let sealed_y = d.seal().await;
+                    let (first, second) = if x_first {
+                        (sealed_x, sealed_y)
+                    } else {
+                        (sealed_y, sealed_x)
+                    };
+                    star::race_rebuilt(&mut d, star, name, first, second).await;
+                }
             }
         }
     }
@@ -156,174 +179,275 @@ async fn pp_t1_to_t7_a_truncate_races_a_page_of_either_table() {
 /// PP-T T8: a page of the truncated table from before the truncate, drained
 /// after the truncate's page (the barrier never lets it; the driver claims
 /// it out of order on purpose), is refused by that table's floor: `R`, or
-/// `M` at position 2. Planted `join1_truncate_no_floor`, it applies.
+/// the `M` of the table under test. Planted `join1_truncate_no_floor`, it
+/// applies.
 #[tokio::test]
 async fn pp_t8_a_stale_page_after_the_truncate_is_refused() {
-    for star in AT2.stars() {
-        for table in ["public.a", "{b}"] {
-            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-            let stale = if table == "public.a" {
-                "insert into {a_ins} values (9, 20, 9, 'nine'); \
-                 update public.a set x = 99 where id = 1"
-            } else {
-                "insert into {b} values (9, 30, 900, 'thirty'); \
-                 update {b} set w = 99 where id = 1"
-            };
-            star::write(&d, &AT2.sql(stale)).await;
-            let earlier = d.seal().await;
-            star::write(&d, &AT2.sql(&format!("truncate {table}"))).await;
-            let truncate = d.seal().await;
-            d.drain(truncate, "truncate").await;
-            d.drain(earlier, "stale").await;
-            let ledger = if table == "public.a" {
-                star::r_table(&d, star).await
-            } else {
-                star::m_table(&d, star, 2).await
-            };
-            assert_eq!(
-                count(
-                    &d,
-                    &format!("select count(*) from {ledger} where not __tombstone")
-                )
-                .await,
-                "(0)",
-                "{} {table}: the stale page wrote an entry",
-                star.name()
-            );
-            if table == "public.a" {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            for table in ["public.a", "{b}"] {
+                let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+                let stale = if table == "public.a" {
+                    "insert into {a_ins} values (9, 20, 9, 'nine'); \
+                     update public.a set x = 99 where id = 1"
+                } else {
+                    "insert into {b} values (9, 30, 900, 'thirty'); \
+                     update {b} set w = 99 where id = 1"
+                };
+                star::write(&d, &shape.sql(stale)).await;
+                let earlier = d.seal().await;
+                star::write(&d, &shape.sql(&format!("truncate {table}"))).await;
+                let truncate = d.seal().await;
+                d.drain(truncate, "truncate").await;
+                d.drain(earlier, "stale").await;
+                let ledger = if table == "public.a" {
+                    star::r_table(&d, star).await
+                } else {
+                    star::m_table(&d, star, shape.at).await
+                };
                 assert_eq!(
-                    count(&d, &format!("select count(*) from {}", star.target())).await,
+                    count(
+                        &d,
+                        &format!("select count(*) from {ledger} where not __tombstone")
+                    )
+                    .await,
                     "(0)",
-                    "{}: the stale page wrote a target row",
+                    "{} {table}: the stale page wrote an entry",
                     star.name()
                 );
+                if table == "public.a" {
+                    assert_eq!(
+                        count(&d, &format!("select count(*) from {}", star.target())).await,
+                        "(0)",
+                        "{}: the stale page wrote a target row",
+                        star.name()
+                    );
+                }
+                star::assert_rebuilt(&mut d, &[star]).await;
             }
-            star::assert_rebuilt(&mut d, &[star]).await;
         }
+    }
+}
+
+/// The barrier: a `TRUNCATE` of the table under test, then a later batch
+/// with an insert into `a` and a change of that table (a mixed page).
+/// Nothing past the truncate's batch is claimable until it drains, so the
+/// mixed page can't apply its insert first and have the rebuild the
+/// truncate starts treat it as older than it is.
+#[tokio::test]
+async fn a_batch_after_a_truncate_waits_for_it() {
+    for shape in SHAPES {
+        let star = shape.stars()[0];
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        star::write(&d, &shape.sql("truncate {b}")).await;
+        let truncate = d.seal().await;
+        star::write(
+            &d,
+            &shape.sql(
+                "insert into {a_ins} values (5, 20, 5, 'five'); \
+                 insert into {b} values (4, 20, 1, 'again')",
+            ),
+        )
+        .await;
+        let mixed = d.seal().await;
+        let claimable = || async {
+            trellis::staging::apply::next_claimable_segments(&d.ctl, 1_000_000)
+                .await
+                .expect("next claimable segments")
+        };
+        assert_eq!(claimable().await, [truncate], "the mixed page waits");
+        d.drain(truncate, "truncate").await;
+        assert_eq!(claimable().await, [mixed]);
+        d.drain(mixed, "mixed").await;
+        star::assert_rebuilt(&mut d, &[star]).await;
+        assert_eq!(
+            count(&d, &shape.sql("select count(*) from {b}")).await,
+            "(1)",
+            "the insert survived"
+        );
     }
 }
 
 // -------------------------------------------------------------------- PX
 
-/// PX4: after a `TRUNCATE a`, a change of the table at position 2 fans out
-/// to no row: `R` holds none of the `a` rows that are gone. Planted
-/// `join1_truncate_keeps_r`, it writes their rows back.
+/// PX4: a `TRUNCATE a` empties `R` and the target in its page, raises `R`'s
+/// floor and leaves every `M` and `J` as they were, and starts no rebuild.
+/// A later change of the joined table fans out to no row, since `R` holds
+/// none of the `a` rows that are gone, and later inserts into `a` apply.
+/// Planted `join1_truncate_keeps_r`, `R` keeps its entries, and the change
+/// writes their rows back.
 #[tokio::test]
-async fn px4_a_truncate_of_a_empties_r_and_a_later_change_at_position_2_writes_nothing() {
-    for star in AT2.stars() {
-        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-        star::step(&mut d, "truncate public.a").await;
-        star::step(&mut d, &AT2.sql("update {b} set w = 999 where id = 1")).await;
-        assert_eq!(
-            count(&d, &format!("select count(*) from {}", star.target())).await,
-            "(0)",
-            "{}: a change at position 2 resurrected the rows of a rows that are gone",
-            star.name()
-        );
-        star::assert_oracle(&mut d, &[star]).await;
+async fn px4_a_truncate_of_a_empties_r_and_the_target_and_later_changes_apply() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let name = star.name();
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            let id = star::definition_id(&d, star).await;
+            let j = format!("select j::text from {DEFAULT_SCHEMA}.join1_{id}_j j order by 1");
+            let (j_before, m_before) = (d.rows(&j).await, m_counts(&d, star).await);
+            star::step(&mut d, "truncate public.a").await;
+            let r = star::r_table(&d, star).await;
+            let target = format!("select count(*) from {}", star.target());
+            assert_eq!(
+                count(&d, &target).await,
+                "(0)",
+                "{name}: the target is empty"
+            );
+            assert_eq!(
+                count(&d, &format!("select count(*) from {r}")).await,
+                "(0)",
+                "{name}: R is empty"
+            );
+            assert_eq!(m_counts(&d, star).await, m_before, "{name}: M is untouched");
+            assert_eq!(d.rows(&j).await, j_before, "{name}: J keeps its rows");
+            assert_eq!(floors(&d, &r).await, "(1)", "{name}: R's floor rose");
+            assert_eq!(
+                build_state(&d, star).await,
+                ("live".to_string(), 0),
+                "{name}: a TRUNCATE of a starts no rebuild"
+            );
+            star::step(&mut d, &shape.sql("update {b} set w = 999 where id = 1")).await;
+            assert_eq!(
+                count(&d, &target).await,
+                "(0)",
+                "{name}: a change of the joined table resurrected the rows of a rows that \
+                 are gone"
+            );
+            star::step(
+                &mut d,
+                &shape.sql("insert into {a_ins} values (7, 10, 7, 'seven')"),
+            )
+            .await;
+            star::assert_oracle(&mut d, &[star]).await;
+        }
     }
 }
 
-/// PX5: after a `TRUNCATE` of the table at position 2 and before the rebuild
+/// PX5: after a `TRUNCATE` of the table under test and before the rebuild
 /// reaches any row, an `a` change reads the `M` the truncate left there,
 /// which is empty. Planted `join1_truncate_keeps_m`, the new row joins a row
 /// that is gone.
 #[tokio::test]
-async fn px5_a_truncate_at_position_2_empties_its_m_before_the_rebuild_runs() {
-    for star in AT2.stars() {
-        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-        star::step(&mut d, &AT2.sql("truncate {b}")).await;
-        star::step(
-            &mut d,
-            &AT2.sql("insert into {a_ins} values (5, 10, 5, 'five')"),
-        )
-        .await;
-        assert_eq!(
-            count(
-                &d,
-                &format!(
-                    "select count(*) from {} where id = 5 and tag2 is not null",
-                    star.target()
-                )
+async fn px5_a_truncate_of_a_joined_table_empties_its_m_before_the_rebuild_runs() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            star::step(&mut d, &shape.sql("truncate {b}")).await;
+            star::step(
+                &mut d,
+                &shape.sql("insert into {a_ins} values (5, 10, 5, 'five')"),
             )
-            .await,
-            "(0)",
-            "{}: the new row joined a row of b2 that is gone",
-            star.name()
-        );
-        star::assert_rebuilt(&mut d, &[star]).await;
+            .await;
+            assert_eq!(
+                count(
+                    &d,
+                    &format!(
+                        "select count(*) from {} where id = 5 and tag{} is not null",
+                        star.target(),
+                        shape.at
+                    )
+                )
+                .await,
+                "(0)",
+                "{}: the new row joined a row that is gone",
+                star.name()
+            );
+            star::assert_rebuilt(&mut d, &[star]).await;
+        }
     }
 }
 
-/// PX6: a `TRUNCATE` of the table at position 2 empties its `M` and raises
-/// its floor in its page, leaves position 1's `M` as it was, and starts a
-/// rebuild: the definition reads `backfilling` with the plan and sweep jobs
-/// queued. Its rows keep the `b2` side they held until the rebuild reaches
-/// them; then a `LEFT` row's is `NULL` and an `INNER` row is gone. Planted
-/// `join1_truncate_no_rebuild`, nothing rewrites them.
+/// PX6: a `TRUNCATE` of the table under test empties its `M` and raises its
+/// floor in its page, leaves the other positions' `M`s as they were, and
+/// starts a rebuild: the definition reads `backfilling` with the plan and
+/// sweep jobs queued and the segment it starts in recorded. Its rows keep the side they
+/// held until the rebuild reaches them; then a `LEFT` row's is `NULL` and
+/// an `INNER` row is gone. Planted `join1_truncate_no_rebuild`, nothing
+/// rewrites them.
 #[tokio::test]
-async fn px6_a_truncate_at_position_2_rebuilds_the_target() {
-    for star in AT2.stars() {
-        let name = star.name();
-        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-        let m1 = star::m_table(&d, star, 1).await;
-        let m2 = star::m_table(&d, star, 2).await;
-        let m1_before = count(&d, &format!("select count(*) from {m1}")).await;
-        star::step(&mut d, &AT2.sql("truncate {b}")).await;
-        assert_eq!(
-            count(&d, &format!("select count(*) from {m2}")).await,
-            "(0)",
-            "{name}: M at position 2 is empty"
-        );
-        assert_eq!(
-            count(&d, &format!("select count(*) from {m1}")).await,
-            m1_before,
-            "{name}: M at position 1 is untouched"
-        );
-        assert_eq!(
-            count(
-                &d,
-                &format!(
-                    "select count(*) from ledger_truncate_floor where target_table = '{}'",
-                    floor_key(&m2)
-                )
+async fn px6_a_truncate_of_a_joined_table_rebuilds_the_target() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let name = star.name();
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            let id = star::definition_id(&d, star).await;
+            let seg = format!("select build_seg from transform_definitions where id = {id}");
+            let built: i64 = d.ctl.query_one(&seg, &[]).await.expect("build_seg").get(0);
+            let mut m_expected = m_counts(&d, star).await;
+            m_expected[shape.at - 1] = "(0)".to_string();
+            star::step(&mut d, &shape.sql("truncate {b}")).await;
+            assert_eq!(
+                m_counts(&d, star).await,
+                m_expected,
+                "{name}: only the M under test is empty"
+            );
+            let m = star::m_table(&d, star, shape.at).await;
+            assert_eq!(floors(&d, &m).await, "(1)", "{name}: its M's floor rose");
+            assert_eq!(
+                build_state(&d, star).await,
+                ("backfilling".to_string(), 2),
+                "{name}: a plan job and a sweep job are queued"
+            );
+            let rebuilt: i64 = d.ctl.query_one(&seg, &[]).await.expect("build_seg").get(0);
+            assert!(rebuilt > built, "{name}: the rebuild recorded its segment");
+            let tagged = format!(
+                "select count(*) from {} where tag{} is not null",
+                star.target(),
+                shape.at
+            );
+            assert_eq!(
+                count(&d, &tagged).await,
+                "(2)",
+                "{name}: the rows wait for the rebuild"
+            );
+            star::assert_rebuilt(&mut d, &[star]).await;
+            assert_eq!(
+                build_state(&d, star).await,
+                ("live".to_string(), 0),
+                "{name}: the rebuild finished"
+            );
+            let expected = match star.kind(shape.at) {
+                Kind::Left => "(4)",
+                Kind::Inner => "(0)",
+            };
+            assert_eq!(
+                count(&d, &format!("select count(*) from {}", star.target())).await,
+                expected,
+                "{name}"
+            );
+        }
+    }
+}
+
+/// A row of the table under test inserted after its `TRUNCATE` in the same
+/// transaction is in its `M` once the truncate's page has applied it, and
+/// the rebuild keeps it.
+#[tokio::test]
+async fn a_truncate_of_a_joined_table_and_a_later_insert_in_one_transaction() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            star::step(
+                &mut d,
+                &shape.sql(
+                    "begin; truncate {b}; \
+                     insert into {b} values (4, 10, 401, 'ten2'), (5, null, 1, 'none'); commit",
+                ),
             )
-            .await,
-            "(1)",
-            "{name}: M's floor at position 2 rose"
-        );
-        assert_eq!(
-            build_state(&d, star).await,
-            ("backfilling".to_string(), 2),
-            "{name}: a plan job and a sweep job are queued"
-        );
-        assert_eq!(
-            count(
-                &d,
-                &format!(
-                    "select count(*) from {} where tag2 is not null",
-                    star.target()
+            .await;
+            let m = star::m_table(&d, star, shape.at).await;
+            assert_eq!(
+                count(
+                    &d,
+                    &format!("select count(*) from {m} where not __tombstone")
                 )
-            )
-            .await,
-            "(2)",
-            "{name}: the rows wait for the rebuild"
-        );
-        star::assert_rebuilt(&mut d, &[star]).await;
-        assert_eq!(
-            build_state(&d, star).await,
-            ("live".to_string(), 0),
-            "{name}: the rebuild finished"
-        );
-        let expected = match star.kind(2) {
-            Kind::Left => "(4)",
-            Kind::Inner => "(0)",
-        };
-        assert_eq!(
-            count(&d, &format!("select count(*) from {}", star.target())).await,
-            expected,
-            "{name}"
-        );
+                .await,
+                "(2)",
+                "{}: the later inserts are in M",
+                star.name()
+            );
+            star::assert_rebuilt(&mut d, &[star]).await;
+        }
     }
 }
 
@@ -367,16 +491,17 @@ async fn def_row_first(d: &mut Driver, star: Star, batch: i64) {
     star::assert_rebuilt(d, &[star]).await;
 }
 
-/// PX7: a `TRUNCATE` page of the table at position 2 takes the definition
-/// row before the lock row, as a rebuild's start does
-/// ([`def_row_first`]).
+/// PX7: a `TRUNCATE` page of the table under test takes the definition row
+/// before the lock row, as a rebuild's start does ([`def_row_first`]).
 #[tokio::test]
-async fn px7_a_truncate_at_position_2_and_a_rebuild_start_take_the_definition_row_first() {
-    let star = AT2.stars()[0];
-    let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-    star::write(&d, &AT2.sql("truncate {b}")).await;
-    let truncate = d.seal().await;
-    def_row_first(&mut d, star, truncate).await;
+async fn px7_a_truncate_of_a_joined_table_and_a_rebuild_start_take_the_definition_row_first() {
+    for shape in SHAPES {
+        let star = shape.stars()[0];
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        star::write(&d, &shape.sql("truncate {b}")).await;
+        let truncate = d.seal().await;
+        def_row_first(&mut d, star, truncate).await;
+    }
 }
 
 // -------------------------------------------------------------------- XT1
@@ -433,14 +558,7 @@ async fn xt1_a_page_truncating_both_joined_tables_empties_both_ms_and_starts_one
                 "{name}: M at position {p} is empty"
             );
             assert_eq!(
-                count(
-                    &d,
-                    &format!(
-                        "select count(*) from ledger_truncate_floor where target_table = '{}'",
-                        floor_key(&m)
-                    )
-                )
-                .await,
+                floors(&d, &m).await,
                 "(1)",
                 "{name}: M's floor at position {p} rose"
             );

@@ -10,14 +10,13 @@
 //!   shape of [`SHAPES`]: the two-table JOIN and a star of three tables at
 //!   its last position.
 //!   - the build, then changes of `a` and of the table at `at`;
-//!   - T1 and T2 (#1375): a truncate of either side racing a page of the
-//!     other, races whose truncate may start a rebuild;
 //!   - C (#1375): a page on a build chunk's key queues behind the chunk;
 //!   - the chunked fan-out (#1405): a change past one chunk finishes in
 //!     chunks.
 //!
 //! The #1371 and #1375 families (F, M, N, R) run over [`SHAPES`] in
-//! `join_star_families.rs` and `join_star_joined_families.rs`.
+//! `join_star_families.rs` and `join_star_joined_families.rs`, and #1375's
+//! truncates (T) in `join_star_truncate.rs`.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -223,45 +222,6 @@ async fn the_build_and_changes_of_either_side_apply() {
         ] {
             star::step(&mut d, &shape.sql(sql)).await;
             star::assert_oracle(&mut d, &stars).await;
-        }
-    }
-}
-
-/// T1 and T2 (#1375): a `TRUNCATE` of `a` ‖ an update of the table at `at`,
-/// and a `TRUNCATE` of that table ‖ an `a` insert on a key it held, each in
-/// either order. The second page queues on the pair's lock row, which the
-/// truncate's page holds `FOR UPDATE` and every other page `FOR SHARE`, and
-/// the rebuild a truncate of the joined table starts is exact.
-#[tokio::test]
-async fn t1_t2_a_truncate_races_a_page_of_the_other_side() {
-    for shape in shapes() {
-        for (name, x, y) in [
-            (
-                "t1 truncate a vs b",
-                "truncate public.a",
-                "update {b} set w = 999 where id = 2",
-            ),
-            (
-                "t2 truncate b vs a",
-                "truncate {b}",
-                "insert into {a_ins} values (5, 20, 5, 'five')",
-            ),
-        ] {
-            for star in shape.stars() {
-                for x_first in [true, false] {
-                    let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-                    star::write(&d, &shape.sql(x)).await;
-                    let sealed_x = d.seal().await;
-                    star::write(&d, &shape.sql(y)).await;
-                    let sealed_y = d.seal().await;
-                    let (first, second) = if x_first {
-                        (sealed_x, sealed_y)
-                    } else {
-                        (sealed_y, sealed_x)
-                    };
-                    star::race_rebuilt(&mut d, star, name, first, second).await;
-                }
-            }
         }
     }
 }
