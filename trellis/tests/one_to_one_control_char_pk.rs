@@ -12,26 +12,15 @@
 //! agree on that raw text.
 
 use std::collections::HashMap;
+use testkit::connect_raw;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{create_definition, create_target_table};
 use trellis::pool::Pool;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// Stages one CDC change for `orders` into the active ring segment, shaped
 /// the way capture stages it: the raw key text, and text-valued JSON images.

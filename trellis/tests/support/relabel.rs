@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::reconcile;
 use trellis::defs::TransformStatus;
 use trellis::staging::self_check::CheckPageExt;
@@ -24,15 +24,7 @@ pub const REASON: &str = "enum value 'brisk' of type public.tone was renamed to 
      from the source";
 
 async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
+    testkit::connect_with(dsn, &format!("set search_path to {SCHEMA}, public")).await
 }
 
 /// Fields drop in order: clients, facade, database, cluster.

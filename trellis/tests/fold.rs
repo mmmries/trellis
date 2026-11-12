@@ -10,26 +10,12 @@
 //! filter on `op`, an own-slot-only window, or ignoring `change_id`.
 
 use std::time::SystemTime;
+use testkit::connect_raw;
 
 use testkit::TestCluster;
+use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{BucketFilter, FoldedChange, TRUNCATE_SENTINEL_KEY, fold, seal};
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
-/// `sealing.rs`/`staging_ring.rs`'s convention.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// One raw row to insert into a ring table, with every fold-relevant column
 /// exposed (unlike `StagedChange`, which enforces the image-bearing/

@@ -31,25 +31,14 @@
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
 use std::collections::HashMap;
+use testkit::connect_raw;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn seal_active_segment(client: &mut Client) -> i64 {
     use trellis::staging::seal;

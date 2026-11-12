@@ -4,26 +4,17 @@
 //! are `source_index.rs`'s.) Nothing here waits for anything: each report is a
 //! catalog read, and the sizes are made current by an explicit `ANALYZE`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::{Config, JoinStatus, Trellis, TrellisOptions};
 
 const BY_REGION: &str = "TRANSFORM by_region FROM orders LEFT JOIN items \
      ON orders.id = items.order_id GROUP BY orders.region \
     WITHOUT SOURCE INDEX SELECT orders.region AS region, COUNT(*) AS n, SUM(items.qty) AS qty";
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn join_status(trellis: &Trellis) -> JoinStatus {
     trellis
@@ -39,7 +30,7 @@ async fn join_status(trellis: &Trellis) -> JoinStatus {
 async fn status_reports_hidden_tables_and_a_large_p() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, region text); \
          create table public.items (id integer primary key, order_id integer, qty integer); \
@@ -100,7 +91,7 @@ async fn status_reports_hidden_tables_and_a_large_p() {
 async fn a_plain_transform_has_no_join_status() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table public.orders (id integer primary key, region text)")
         .await
         .expect("create table");

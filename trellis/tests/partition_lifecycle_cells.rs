@@ -13,12 +13,10 @@ mod drain_driver;
 
 use std::time::{Duration, Instant};
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::capture::partitions::{self, PendingCorrection};
 use trellis::capture::reconcile::PassOutcome;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::partition_correction::{self, Options, Outcome};
 
 const SOURCE: &str = "public.items";
@@ -72,10 +70,6 @@ fn tree(kind: &str) -> String {
 
 /// 160 rows through the parent: ten per group 0-15, `v` the id.
 const SEED: &str = "insert into public.items select i, i % 16, i from generate_series(1, 160) i";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 struct Fx {
     d: Driver,

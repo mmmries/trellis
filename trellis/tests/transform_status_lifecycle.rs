@@ -25,28 +25,20 @@
 //! pre-resume `poison` rows are (deliberately) still there, while a full
 //! fresh threshold's worth of new evictions must.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, start_and_settle_builds};
 use std::collections::HashMap;
 
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{TransformStatus, ValueType, create_definition, install_definition};
 use trellis::staging::apply;
 use trellis::staging::quarantine;
 use trellis::staging::{has_pending, retire_drained_segments};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 fn numeric(names: &[&str]) -> HashMap<String, ValueType> {
     names
@@ -119,7 +111,7 @@ async fn insert_cdc_row(
 /// itself rather than staging it into the ring (ADR-0002), so the
 /// builds run first.
 async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    drain_backfill_chunks(pool).await;
+    start_and_settle_builds(pool).await;
     // A throwaway, always-caught-up watermark — this helper
     // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
@@ -153,7 +145,7 @@ async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
 /// again — already happened.
 async fn drain_until_live(pool: &trellis::pool::Pool, client: &mut Client, target: &str) {
     // A chunked rebuild goes live from its last chunk (ADR-0002).
-    drain_backfill_chunks(pool).await;
+    start_and_settle_builds(pool).await;
     if status_of(client, target).await == TransformStatus::Live {
         return;
     }
@@ -175,18 +167,6 @@ async fn drain_until_live(pool: &trellis::pool::Pool, client: &mut Client, targe
         }
     }
     panic!("{target} did not reach live within 16 seal/drain rounds");
-}
-
-/// Starts every registered definition's build and runs it to completion —
-/// the harness stand-in for the staging worker and a running drain worker,
-/// matching `defs_install_definition.rs`'s `drain_backfill_chunks`.
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// One staging-worker reconcile pass (capture, then the start of ready
@@ -418,8 +398,8 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     .expect("install_definition");
     // The plain 1-1 build runs in the background as chunk work; drive it
     // to completion.
-    drain_backfill_chunks(&db.pool).await;
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     assert_eq!(status_of(&raw, "t2").await, TransformStatus::Live);
 
     // Break it: mutate a source row so the target visibly diverges, then
@@ -449,7 +429,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     );
 
     // Start the resumed definition's rebuild and run it to completion.
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
 
     assert_eq!(
@@ -515,8 +495,8 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     // Drained to quiescence so the CDC rows this test stages next are
     // isolated in a fresh segment of their own.
     drain_to_quiescence(&db.pool, &mut raw).await;
@@ -577,7 +557,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
         "resume must drop straight to waiting_to_backfill, never directly to backfilling/live"
     );
 
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     // The resume deleted the five bad keys' `poison`/`poison_held` rows,
     // which no release could ever have cleared: their key can never
     // cast to `s4.id`'s `bigint`.
@@ -649,8 +629,8 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     )
     .await
     .expect("install_definition");
-    drain_backfill_chunks(&db.pool).await;
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(status_of(&raw, "t6").await, TransformStatus::Live);
 
@@ -677,7 +657,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     quarantine::resume_transform(&db.pool, "t6")
         .await
         .expect("resume_transform");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     drain_until_live(&db.pool, &mut raw, "t6").await;
     // Flush whatever the re-backfill left staged, so the
     // eviction rounds below start from a segment holding only their own
@@ -815,7 +795,7 @@ async fn every_build_reaches_live_through_three_stored_states() {
     .await
     .expect("install_definition (chunked path)");
     assert_eq!(plain.status, trellis::defs::StoredStatus::WaitingToBackfill);
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 
     let agg_cols = numeric(&["grp", "a"]);

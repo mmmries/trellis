@@ -25,28 +25,18 @@
 //! single-column-only, so this file asserts against the target table's
 //! contents directly instead.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef};
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) and pins
-/// `search_path`, matching `client_e2e.rs`'s helper of the same name.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// Stages one CDC change for `order_lines` into the active ring segment,
 /// shaped the way capture stages it: `key` is the composite key joined with
@@ -111,13 +101,6 @@ async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
         }
     }
     panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
-}
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
 }
 
 /// The transform this file exercises: a 1-1 passthrough-plus-arithmetic

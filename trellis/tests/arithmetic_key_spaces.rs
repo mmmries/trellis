@@ -11,25 +11,16 @@
 #[path = "support/wait_live.rs"]
 mod wait_live;
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use tokio_postgres::Client;
 use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
 use trellis::{Config, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisOptions};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn define(dsn: &str, statements: &[&str]) {
     let definer = Trellis::connect(
@@ -135,7 +126,7 @@ const WORKLOAD: &[&str] = &[
 async fn a_one_to_one_field_computes_every_arithmetic_form() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(SOURCE).await.expect("source");
     // Existing rows go through the build, the rest through apply.
     raw.batch_execute(WORKLOAD[0]).await.expect("seed");
@@ -181,7 +172,7 @@ async fn a_one_to_one_field_computes_every_arithmetic_form() {
 async fn an_aggregate_argument_and_composed_field_compute_arithmetic() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(SOURCE).await.expect("source");
     define(
         db.dsn(),
@@ -219,7 +210,7 @@ async fn an_aggregate_argument_and_composed_field_compute_arithmetic() {
 async fn a_join_computes_arithmetic_in_arguments_and_composed_fields() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.fa (id integer primary key, g integer, k integer, v integer); \
          create table public.db (id integer primary key, k integer, y integer, w integer); \
@@ -274,7 +265,7 @@ async fn a_join_computes_arithmetic_in_arguments_and_composed_fields() {
 async fn alter_transform_adds_an_arithmetic_field() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(SOURCE).await.expect("source");
     raw.batch_execute(WORKLOAD[0]).await.expect("seed");
     define(db.dsn(), &["TRANSFORM t FROM s SELECT a4 AS a4"]).await;

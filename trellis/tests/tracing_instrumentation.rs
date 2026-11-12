@@ -19,21 +19,25 @@
 //! across every `.await` point in these tests only because nothing here
 //! ever hops to a different OS thread mid-poll.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use testkit::TestCluster;
 use testkit::crash::OpenTransaction;
+use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef};
 use trellis::defs::{create_definition, create_target_table, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{FoldedChange, IsolationOutcome, LastChange, isolate_and_evict};
@@ -179,18 +183,6 @@ fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
 // Shared scaffolding (mirrors apply.rs/end_to_end_latency.rs/quarantine.rs)
 // ---------------------------------------------------------------------
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
-
 async fn seal_active_segment(client: &mut Client) -> i64 {
     use trellis::staging::seal;
     let outcome = seal::seal_phase1_waiting(client).await;
@@ -198,13 +190,6 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
         .await
         .expect("seal phase 2");
     outcome.sealed_seg_seq
-}
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
 }
 
 async fn insert_cdc_row(

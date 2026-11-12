@@ -16,37 +16,18 @@
 //! test holds its build at a fixed point with an advisory lock, so the
 //! interleaving that matters is set up, not raced.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer};
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use tokio_postgres::Client;
 use trellis::{Config, TransformStatus, Trellis, TrellisOptions};
 
 /// Budget for each wait on the running engine.
 const TIMEOUT: Duration = Duration::from_secs(60);
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-/// A define-only facade connection: no staging worker, no drain threads.
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
 
 /// The whole engine: capture, the maintenance loop (the only starter of
 /// builds) and drain threads.
@@ -147,14 +128,14 @@ async fn a_one_to_one_rederive_build_applies_while_backfilling_and_is_steady_at_
     const HOLD: i64 = 6254;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.orders (id integer primary key, a integer); \
          insert into public.orders values (1, 1), (2, 2)",
     )
     .await
     .expect("create and seed orders");
-    define_only(db.dsn())
+    definer(db.dsn())
         .await
         .apply("TRANSFORM order_view FROM orders SELECT a + a AS a2")
         .await
@@ -267,10 +248,10 @@ async fn a_one_to_one_rederive_build_applies_while_backfilling_and_is_steady_at_
 async fn a_build_on_another_definitions_target_follows_a_change_upstream() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_sales(&raw).await;
 
-    define_only(db.dsn())
+    definer(db.dsn())
         .await
         .apply("TRANSFORM sku_totals FROM sales GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(amount) AS total")
         .await

@@ -4,31 +4,13 @@
 //! and its quoted spelling; an addressing statement acts only on the exact
 //! name, never on a twin in another case.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer};
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
-use trellis::{Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
+use tokio_postgres::Client;
+use trellis::{ErrorCode, TrellisError};
 
 async fn status(raw: &Client, target: &str) -> Option<String> {
     raw.query_opt(
@@ -57,11 +39,11 @@ fn assert_case_hint(err: &TrellisError, found: &str) {
 async fn an_address_in_another_case_is_refused_with_the_quoted_spelling() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table orders (id bigint primary key, amt numeric)")
         .await
         .expect("seed the source");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM \"OrderTotals\" FROM orders SELECT amt AS amt")
         .await
@@ -111,11 +93,11 @@ async fn an_address_in_another_case_is_refused_with_the_quoted_spelling() {
 async fn an_unquoted_address_acts_only_on_its_lower_case_twin() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute("create table orders (id bigint primary key, amt numeric)")
         .await
         .expect("seed the source");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     for text in [
         "TRANSFORM \"OrderTotals\" FROM orders SELECT amt AS amt",
         "TRANSFORM OrderTotals FROM orders SELECT amt AS amt",
@@ -144,7 +126,7 @@ async fn an_unquoted_address_acts_only_on_its_lower_case_twin() {
 async fn a_define_naming_a_table_schema_or_column_in_another_case_gets_the_hint() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table \"Orders\" (id bigint primary key, \"Amount\" numeric(20, 0)); \
          create schema \"Shop\"; \
@@ -152,7 +134,7 @@ async fn a_define_naming_a_table_schema_or_column_in_another_case_gets_the_hint(
     )
     .await
     .expect("seed the sources");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     for (text, found) in [
         (

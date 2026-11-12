@@ -7,7 +7,9 @@
 //! run Trellis as a non-superuser login role (a superuser bypasses RLS, and a
 //! test cluster connects as one): defining refuses a table whose policies
 //! apply, and the staging worker's capture pass pauses the readers of one
-//! whose policies apply after define, which `self_check` reports too.
+//! whose policies apply after define, which `self_check` reports too. A
+//! drain refused a read (a privilege, or `USAGE` on a source's schema)
+//! halts the table's readers.
 //!
 //! Nothing polls for convergence: every pass is stepped by hand.
 
@@ -1510,5 +1512,172 @@ async fn a_delete_staged_for_a_row_the_policy_hides_halts_a_drain_the_policy_app
     assert_eq!(copy, copy_before, "the 1-1 target applied nothing");
     assert_eq!(aggregate, aggregate_before, "the aggregate applied nothing");
     assert_eq!(poison_rows(&it.admin).await, 0);
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A refused read of a schema: the role loses `USAGE` on a source's schema
+/// after define. Postgres refuses every lookup of the table by name, so the
+/// drain halts its readers, as for a revoked table privilege, naming the
+/// missing `USAGE`, while a reader of another schema applies the same page.
+/// `status` answers for the aggregate rather than failing on the source's
+/// index lookup, and after the grant a `RESUME` rebuilds both.
+#[tokio::test]
+async fn a_revoked_schema_usage_halts_the_readers_of_its_tables() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create schema app; grant usage on schema app to rls_trellis; \
+             create table app.o (id int primary key, cid int, amount int); \
+             insert into app.o select i, 1 + i % 3, i from generate_series(1, 6) i; \
+             alter table app.o owner to rls_trellis;",
+        )
+        .await
+        .expect("a source in a schema of its own");
+    for ddl in [
+        "TRANSFORM o_copy FROM app.o SELECT amount AS amount",
+        "TRANSFORM o_totals FROM app.o GROUP BY cid WITHOUT SOURCE INDEX \
+         SELECT cid AS cid, COUNT(*) AS n",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+
+    it.admin
+        .batch_execute(
+            "revoke usage on schema app from rls_trellis; \
+             insert into app.o values (10, 1, 100); \
+             update public.c set amount = 77 where id = 1",
+        )
+        .await
+        .expect("revoke, then write both schemas");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the drain halts the readers of app.o and commits the rest of the page");
+    for target in ["o_copy", "o_totals"] {
+        let failure = halted(&it.trellis, target).await;
+        assert_eq!(failure.source_table, "app.o", "{target}");
+        assert!(
+            failure
+                .error
+                .contains("role rls_trellis lacks USAGE on schema app"),
+            "{target}: {}",
+            failure.error
+        );
+        assert!(
+            failure.error.contains("permission denied for schema app"),
+            "{target} carries Postgres's own message: {}",
+            failure.error
+        );
+    }
+    assert_eq!(
+        status(&it.trellis, "c_copy").await.status,
+        TransformStatus::Live
+    );
+    assert_eq!(
+        amount_of(&it.admin, "public.c_copy", 1).await,
+        Some("77".to_string()),
+        "the other schema's reader applied its share of the page"
+    );
+    assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
+
+    it.admin
+        .batch_execute("grant usage on schema app to rls_trellis")
+        .await
+        .expect("grant USAGE back");
+    for target in ["o_copy", "o_totals"] {
+        it.trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .expect("resume");
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+    for target in ["o_copy", "o_totals"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        amount_of(&it.admin, "public.o_copy", 10).await,
+        Some("100".to_string())
+    );
+    let totals: String = it
+        .admin
+        .query_one(
+            "select string_agg(cid || ':' || n, ',' order by cid) from public.o_totals",
+            &[],
+        )
+        .await
+        .expect("read the aggregate")
+        .get(0);
+    assert_eq!(totals, "1:3,2:2,3:2");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A page that carries a table the role lost `USAGE` on and a table whose
+/// primary key was redefined: the redefined key still pauses its readers
+/// before the page computes anything for them, as on a page without the
+/// unreachable table, and only the unreachable table's readers halt.
+#[tokio::test]
+async fn a_revoked_schema_usage_leaves_another_tables_redefined_key_checked() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create schema app; grant usage on schema app to rls_trellis; \
+             create table app.o (id int primary key, cid int, amount int); \
+             insert into app.o select i, 1 + i % 3, i from generate_series(1, 6) i; \
+             alter table app.o owner to rls_trellis;",
+        )
+        .await
+        .expect("a source in a schema of its own");
+    for ddl in [
+        "TRANSFORM o_copy FROM app.o SELECT amount AS amount",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+
+    it.admin
+        .batch_execute(
+            "alter table public.c drop constraint c_pkey, add primary key (amount); \
+             revoke usage on schema app from rls_trellis; \
+             insert into app.o values (10, 1, 100); \
+             update public.c set amount = 77 where id = 1",
+        )
+        .await
+        .expect("redefine c's key, revoke, then write both schemas");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the drain pauses c's reader and halts app.o's");
+    let failure = halted(&it.trellis, "o_copy").await;
+    assert!(
+        failure
+            .error
+            .starts_with("the drain halted: permission denied for schema app; role rls_trellis lacks USAGE on schema app"),
+        "{}",
+        failure.error
+    );
+    let c = status(&it.trellis, "c_copy").await;
+    assert_eq!(c.status, TransformStatus::Paused);
+    let failure = c.capture_failure.expect("the reason is reported");
+    assert_ne!(
+        failure.kind,
+        trellis::CaptureFailureKind::Halt,
+        "{failure:?}"
+    );
+    assert_eq!(failure.source_table, "public.c");
+    assert!(
+        failure.error.contains("primary key") && failure.error.contains("\"amount\""),
+        "{failure:?}"
+    );
+    assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
     it.trellis.shutdown().await.expect("shutdown");
 }

@@ -25,7 +25,7 @@ mod wait_live;
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
 use trellis::{Config, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisOptions};
 
@@ -47,11 +47,7 @@ const SHADOWS: &str = "\
 /// `search_path` (`"$user", public`): the shadows are visible on it, as on
 /// any application connection.
 async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
+    testkit::connect_with(dsn, "").await
 }
 
 /// A connection with `pg_catalog` alone on its path, for the oracle: it

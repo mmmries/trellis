@@ -41,26 +41,18 @@
 //! - readers of a 1-1 `JOIN` target are queued after it and restore and
 //!   build like any chain (`readers_of_a_one_to_one_join_restore_after_it`)
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use std::process::Command;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn facade_with(config: Config) -> Trellis {
     Trellis::connect(config, TrellisOptions::default())
@@ -229,7 +221,7 @@ fn load(dsn: &str, sql: &str) {
 async fn a_restored_dump_builds_its_definitions() {
     let cluster = TestCluster::start();
     let source = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(source.dsn()).await;
+    let mut raw = connect(source.dsn()).await;
     raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
     raw.batch_execute(SOURCE_ROWS).await.expect("source rows");
     let t = facade(source.dsn()).await;
@@ -299,7 +291,7 @@ async fn a_restored_dump_builds_its_definitions() {
 
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &structure);
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     let t2 = facade(loaded.dsn()).await;
     t2.migrate().await.expect("migrate restores the queue");
     assert_eq!(
@@ -349,7 +341,7 @@ async fn a_restored_dump_builds_its_definitions() {
     // A second migrate finds no queue and changes nothing.
     t2.migrate().await.expect("migrate again");
 
-    let mut worker = connect_raw(loaded.dsn()).await;
+    let mut worker = connect(loaded.dsn()).await;
     trellis::client::reconcile_pass(&mut worker, t2.pool(), SCHEMA)
         .await
         .expect("reconcile pass on the restored database");
@@ -406,8 +398,8 @@ async fn the_appendix_is_the_same_for_the_same_definitions() {
     let cluster = TestCluster::start();
     let first = cluster.create_isolated_database().await;
     let second = cluster.create_isolated_database().await;
-    let mut raw_first = connect_raw(first.dsn()).await;
-    let mut raw_second = connect_raw(second.dsn()).await;
+    let mut raw_first = connect(first.dsn()).await;
+    let mut raw_second = connect(second.dsn()).await;
     raw_first.batch_execute(SOURCE_DDL).await.expect("ddl");
     raw_second.batch_execute(SOURCE_DDL).await.expect("ddl");
     let t_first = facade(first.dsn()).await;
@@ -455,7 +447,7 @@ async fn load_edited_keeping_the_appendix(
     edit: impl Fn(&str) -> String,
 ) -> (testkit::TestDatabase, String) {
     let source = cluster.create_isolated_database().await;
-    let raw = connect_raw(source.dsn()).await;
+    let raw = connect(source.dsn()).await;
     raw.batch_execute(SOURCE_DDL).await.expect("ddl");
     let t = facade(source.dsn()).await;
     t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b, m AS m")
@@ -485,7 +477,7 @@ async fn load_edited_keeping_the_appendix(
 async fn a_changed_target_schema_refuses_and_keeps_the_queue() {
     let cluster = TestCluster::start();
     let loaded = load_edited(&cluster, str::to_string).await;
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     after
         .batch_execute("create schema elsewhere")
         .await
@@ -549,7 +541,7 @@ async fn a_row_this_release_cannot_run_is_stored_paused() {
             + "\n"
     })
     .await;
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     let config = Config::from_dsn(loaded.dsn().to_string())
         .expect("dsn")
         .with_binary_version("0.2.0");
@@ -632,7 +624,7 @@ async fn a_queue_with_later_joined_tables_round_trips_them() {
             + "\n"
     })
     .await;
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     let config = Config::from_dsn(loaded.dsn().to_string())
         .expect("dsn")
         .with_binary_version("0.2.0");
@@ -694,7 +686,7 @@ async fn a_queue_with_later_joined_tables_round_trips_them() {
 async fn rows_restored_paused_resume_on_a_release_that_meets_their_floor() {
     let cluster = TestCluster::start();
     let source = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(source.dsn()).await;
+    let mut raw = connect(source.dsn()).await;
     raw.batch_execute(SOURCE_DDL).await.expect("ddl");
     let t = facade(source.dsn()).await;
     define_everything(&t, &mut raw).await;
@@ -707,7 +699,7 @@ async fn rows_restored_paused_resume_on_a_release_that_meets_their_floor() {
         + "\n";
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &structure);
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     let at = |version: &str| {
         Config::from_dsn(loaded.dsn().to_string())
             .expect("dsn")
@@ -805,7 +797,7 @@ async fn a_refusal_part_way_restores_the_rows_before_it_and_the_next_migrate_goe
         sql.replace("'public.tot',", "'public.not_tot',")
     })
     .await;
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     let refused = facade(loaded.dsn())
         .await
         .migrate()
@@ -874,7 +866,7 @@ const QUEUED: &str = "select to_jsonb(target_table) from trellis.restore_queue o
 async fn an_appendix_over_identical_definitions_is_dequeued_and_changes_nothing() {
     let cluster = TestCluster::start();
     let (loaded, appendix) = load_edited_keeping_the_appendix(&cluster, str::to_string).await;
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     facade(loaded.dsn()).await.migrate().await.expect("migrate");
     let defined = rows_json(&after, DEFINITIONS).await;
     assert_eq!(defined.len(), 3, "{defined:?}");
@@ -912,7 +904,7 @@ async fn an_appendix_over_identical_definitions_is_dequeued_and_changes_nothing(
 async fn an_appendix_over_a_different_definition_refuses_and_names_the_cause() {
     let cluster = TestCluster::start();
     let (loaded, appendix) = load_edited_keeping_the_appendix(&cluster, str::to_string).await;
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     facade(loaded.dsn()).await.migrate().await.expect("migrate");
     let defined = rows_json(&after, DEFINITIONS).await;
     // oc's queued text differs from the one the database runs.
@@ -984,7 +976,7 @@ async fn a_chain_whose_upstream_already_exists_restores_the_rest() {
     for built in [false, true] {
         let cluster = TestCluster::start();
         let loaded = load_edited(&cluster, str::to_string).await;
-        let after = connect_raw(loaded.dsn()).await;
+        let after = connect(loaded.dsn()).await;
         // Restore only o1 (queue order: o1, tot, oc), keeping the rest of
         // the rows aside to queue again.
         after
@@ -1050,7 +1042,7 @@ async fn a_chain_whose_upstream_already_exists_restores_the_rest() {
 async fn the_refusal_names_a_way_out_that_works_and_every_recorded_field_counts() {
     let cluster = TestCluster::start();
     let (loaded, appendix) = load_edited_keeping_the_appendix(&cluster, str::to_string).await;
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     after.batch_execute(SOURCE_ROWS).await.expect("rows");
     let t = facade(loaded.dsn()).await;
     t.migrate().await.expect("migrate");
@@ -1229,7 +1221,7 @@ async fn drain_until_committed(pool: &trellis::pool::Pool, client: &mut Client) 
 async fn a_restored_target_keeps_the_objects_a_user_added_and_builds() {
     let cluster = TestCluster::start();
     let source = cluster.create_isolated_database().await;
-    let raw = connect_raw(source.dsn()).await;
+    let raw = connect(source.dsn()).await;
     raw.batch_execute("create table public.orders (id bigint primary key, g bigint, a bigint)")
         .await
         .expect("source ddl");
@@ -1259,7 +1251,7 @@ async fn a_restored_target_keeps_the_objects_a_user_added_and_builds() {
     let structure = structure_file(&t, source.dsn()).await;
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &structure);
-    let mut after = connect_raw(loaded.dsn()).await;
+    let mut after = connect(loaded.dsn()).await;
     let t2 = facade(loaded.dsn()).await;
     t2.migrate()
         .await
@@ -1351,7 +1343,7 @@ async fn a_restored_target_keeps_the_objects_a_user_added_and_builds() {
 async fn a_restored_aggregate_keeps_its_group_key_beside_a_constraint_named_before_it() {
     let cluster = TestCluster::start();
     let source = cluster.create_isolated_database().await;
-    let raw = connect_raw(source.dsn()).await;
+    let raw = connect(source.dsn()).await;
     raw.batch_execute("create table public.orders (id bigint primary key, g bigint, a bigint)")
         .await
         .expect("source ddl");
@@ -1372,7 +1364,7 @@ async fn a_restored_aggregate_keeps_its_group_key_beside_a_constraint_named_befo
     let structure = structure_file(&t, source.dsn()).await;
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &structure);
-    let mut after = connect_raw(loaded.dsn()).await;
+    let mut after = connect(loaded.dsn()).await;
     assert_eq!(
         rows_json(
             &after,
@@ -1434,7 +1426,7 @@ async fn settle(t: &Trellis, raw: &mut Client) {
 async fn readers_of_a_one_to_one_join_restore_after_it() {
     let cluster = TestCluster::start();
     let source = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(source.dsn()).await;
+    let mut raw = connect(source.dsn()).await;
     raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
     raw.batch_execute(SOURCE_ROWS).await.expect("source rows");
     let t = facade(source.dsn()).await;
@@ -1474,7 +1466,7 @@ async fn readers_of_a_one_to_one_join_restore_after_it() {
 
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &structure);
-    let mut after = connect_raw(loaded.dsn()).await;
+    let mut after = connect(loaded.dsn()).await;
     let t2 = facade(loaded.dsn()).await;
     t2.migrate().await.expect("migrate restores the queue");
     after

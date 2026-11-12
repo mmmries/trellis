@@ -16,10 +16,9 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
@@ -45,10 +44,6 @@ const LEFT_PAIR: &str = "TRANSFORM l FROM public.a LEFT JOIN public.b \
 /// key is `ga`'s text.
 const INNER: &str = "TRANSFORM i FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
     WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(a.x) AS sx, SUM(b.y) AS sy";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 async fn start(definitions: &[&str]) -> Driver {
     Driver::start_with_database_defaults(
