@@ -4,6 +4,10 @@
 //! creates anything, and a `RESUME` of a definition whose target schema has
 //! since become one refuses it the same way. Direct, with no polling.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::definer;
 use testkit::{TestCluster, TestDatabase};
 use trellis::pool::Pool;
 use trellis::{
@@ -34,15 +38,6 @@ async fn relation_exists(db: &TestDatabase, qualified: &str) -> bool {
         .get(0)
 }
 
-async fn connect(db: &TestDatabase) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
-
 /// The refusal define made, as `(target, schema, own, message)`.
 fn refusal(result: Result<impl std::fmt::Debug, TrellisError>) -> (String, String, bool, String) {
     match result {
@@ -65,7 +60,7 @@ async fn a_target_qualified_into_this_instances_catalog_schema_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     raw(&db, SOURCE).await;
-    let trellis = connect(&db).await;
+    let trellis = definer(db.dsn()).await;
 
     let (target, schema, own, message) = refusal(
         trellis
@@ -101,7 +96,7 @@ async fn a_target_qualified_into_another_instances_catalog_schema_is_refused() {
     migrate_with_pool(&Pool::new(&other).expect("pool"), &other)
         .await
         .expect("attach the other instance");
-    let trellis = connect(&db).await;
+    let trellis = definer(db.dsn()).await;
 
     // A 1-1 target creates a ledger beside the target; an aggregate creates
     // only the target there.
@@ -157,7 +152,7 @@ async fn a_target_qualified_into_an_ordinary_schema_is_accepted() {
          create view reporting.trellis_instance as select 1 as one",
     )
     .await;
-    let trellis = connect(&db).await;
+    let trellis = definer(db.dsn()).await;
 
     trellis
         .apply("TRANSFORM reporting.cat_out FROM cat_src SELECT v AS v")
@@ -174,7 +169,7 @@ async fn a_resume_refuses_a_target_schema_that_became_another_instances_catalog(
     let db = cluster.create_isolated_database().await;
     raw(&db, SOURCE).await;
     raw(&db, "create schema late").await;
-    let trellis = connect(&db).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM late.cat_out FROM cat_src SELECT v AS v")
         .await
@@ -355,7 +350,7 @@ async fn a_refused_define_beside_an_existing_transform_changes_nothing() {
     let db = cluster.create_isolated_database().await;
     raw(&db, SOURCE).await;
     raw(&db, "create schema late").await;
-    let trellis = connect(&db).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM late.cat_out FROM cat_src SELECT v AS v")
         .await

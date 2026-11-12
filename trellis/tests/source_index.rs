@@ -5,11 +5,14 @@
 //! and nothing pauses. Every test is stepped by hand: no staging worker runs
 //! and nothing polls.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use tokio_postgres::Client;
 use trellis::{Config, IndexRole, SelfCheckMode, TransformStatus, Trellis, TrellisOptions};
 
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g SELECT SUM(v) AS total";
@@ -19,23 +22,11 @@ const JOIN: &str = "TRANSFORM j FROM public.orders LEFT JOIN public.items \
      ON orders.id = items.order_id GROUP BY orders.region \
      SELECT orders.region AS region, COUNT(*) AS n";
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
 /// A database with `src (id, g, h, v)` and a define-only `Trellis`.
 async fn setup(extra: &str) -> (TestCluster, testkit::TestDatabase, Client, Trellis) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(&format!(
         "create table public.src (id integer primary key, g integer, h integer, v integer); \
          create table public.orders (id integer primary key, region text); \

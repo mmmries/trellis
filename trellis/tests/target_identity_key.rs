@@ -16,7 +16,7 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
@@ -51,10 +51,6 @@ const MIRROR_ACTUAL: &str = "select ga, n, sx from public.mirror order by ga";
 const SEED: &str = "insert into public.a values (1, 1, 1, 10), (2, 1, 2, 5), (3, 2, 1, 7), \
                         (4, null, 2, 3); \
                     insert into public.b values (1, 1, 100, 1), (2, 2, 200, 2)";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 fn int8() -> ValueType {
     ValueType::Integer(IntWidth::Int8)

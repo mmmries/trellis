@@ -36,25 +36,13 @@
 //! and the resumed column is restored there too.
 
 use std::collections::HashMap;
+use testkit::connect_raw;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use tokio_postgres::Client;
 use trellis::defs::{ValueType, install_definition};
 use trellis::staging::quarantine;
 use trellis::staging::{has_pending, retire_drained_segments};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring
 /// — needed after installing `sku_totals_echo` so its own downstream

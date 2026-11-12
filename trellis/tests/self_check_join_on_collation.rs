@@ -19,7 +19,7 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::self_check::{
@@ -77,10 +77,6 @@ async fn assert_compares_clean(d: &Driver, target: &str, target_part_only: bool,
             }
         }
     }
-}
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
 }
 
 const COLUMNS: &[(&str, ValueType)] = &[

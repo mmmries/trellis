@@ -23,29 +23,16 @@
 //! writes through a real capture trigger and never drains.
 
 use std::time::{Duration, Instant};
+use testkit::connect_raw;
 
 use testkit::TestCluster;
+use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
 use trellis::capture::install;
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{StagingError, apply, has_pending, retire_drained_segments, seal};
 use trellis::{BlockingTrellis, Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
-/// `trellis/tests/converge.rs`/`client_e2e.rs`'s own helper of the same name.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// Inserts a bare recompute row directly into `seg_0` (the fresh, always-
 /// active slot on an untouched ring) with an explicit `origin_lsn` —

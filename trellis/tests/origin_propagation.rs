@@ -7,36 +7,17 @@
 //! Driven by hand through the engine's own seal, fold and apply path, with no
 //! live capture: `orders -> hop_a -> hop_b -> hop_c`, all 1-1.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
 
 use testkit::TestCluster;
+use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::ValueType;
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
 use trellis::staging::{apply, seal};
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'"
-        ))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn seal_active_segment(client: &mut Client) -> i64 {
     let outcome = seal::seal_phase1_waiting(client).await;

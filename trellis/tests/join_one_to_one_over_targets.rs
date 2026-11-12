@@ -50,18 +50,13 @@ mod drain_driver;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::integer::IntWidth;
 use trellis::staging::converge;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine;
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 const SOURCES: &str = "create table public.asrc (id integer primary key, k integer, x integer); \
                        create table public.bsrc (id integer primary key, w integer, tag text)";

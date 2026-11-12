@@ -15,7 +15,7 @@ mod drain_driver;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::Config;
 use trellis::defs::{ValueType, install_definition};
 use trellis::integer::IntWidth;
@@ -97,10 +97,6 @@ async fn assert_aggregate_self_check_clean(d: &Driver, target: &str) {
         "self_check: {:?}",
         page.outcome
     );
-}
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
 }
 
 fn cols() -> Vec<String> {

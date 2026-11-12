@@ -27,7 +27,7 @@ mod drain_driver;
 
 use std::time::{Duration, Instant};
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::capture::partitions::{self, PendingCorrection};
 use trellis::capture::reconcile::PassOutcome;
 use trellis::config::DEFAULT_SCHEMA;
@@ -167,10 +167,6 @@ fn tree(part: Part, kind: &str) -> String {
 /// nothing), `gb` 0-2. The facts: ten for each key 0-15, `ga` 0-3.
 const SEED: &str = "insert into public.b select i, i % 14, i % 3, i from generate_series(1, 28) i; \
                     insert into public.a select i, i % 4, i % 16, i from generate_series(1, 160) i";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 struct Fx {
     d: Driver,

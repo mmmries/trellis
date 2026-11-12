@@ -19,9 +19,10 @@
 //! target is ever captured.
 
 use std::collections::{BTreeSet, HashMap};
+use testkit::connect_raw;
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{apply, has_pending, retire_drained_segments};
 
@@ -43,20 +44,6 @@ pub async fn database() -> (TestCluster, TestDatabase, Client) {
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     (cluster, db, raw)
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'"
-        ))
-        .await
-        .expect("set search_path");
-    client
 }
 
 /// Renders every non-retired segment plus its ring rows, so a ring that

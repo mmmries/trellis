@@ -6,9 +6,10 @@
 //! these tests hold the implementation to.
 
 use std::time::Duration;
+use testkit::connect_raw;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{CdcOp, StagedChange, StagingError, append};
 
@@ -21,21 +22,6 @@ fn recompute(src_table: &str, key: &str) -> StagedChange {
         prior_image: None,
         origin_lsn: None,
     }
-}
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool` and its
-/// `search_path`-pinning hook), spawns its connection driver, and pins
-/// `search_path` itself so the client sees the migrated tables unqualified.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
 }
 
 /// Appends `changes` into `seg_0` on a brand-new connection (bypassing the

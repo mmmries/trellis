@@ -32,9 +32,8 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::interleave::PausePoint;
 use trellis::{Config, Trellis, TrellisOptions};
@@ -55,10 +54,6 @@ const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty')";
 
 /// The chunk these tests run with.
 const CHUNK: usize = 2;
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {

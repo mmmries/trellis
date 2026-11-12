@@ -10,22 +10,14 @@
 #[path = "support/wait_live.rs"]
 mod wait_live;
 
-use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::{Config, Trellis, TrellisOptions};
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
+use pipeline::connect;
+use testkit::TestCluster;
+use tokio_postgres::Client;
+use trellis::config::DEFAULT_TARGET_SCHEMA;
+use trellis::{Config, Trellis, TrellisOptions};
 
 async fn running(dsn: &str) -> Trellis {
     Trellis::connect(
@@ -55,7 +47,7 @@ async fn definition_text(raw: &Client) -> String {
 async fn cast_aliases_are_typed_canonically_stored_canonically_and_leave_columns_alone() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     // Columns named like the aliases: they stay columns everywhere else,
     // including as the operand of a cast to the same word.
     raw.batch_execute(

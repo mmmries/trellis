@@ -34,11 +34,10 @@ mod star;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use star::{Shape, Star};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::{ApplyError, liveness, quarantine};
 
@@ -55,10 +54,6 @@ const B_ROWS: &str = "(1, 10, 100, 'ten'), (2, 20, 200, 'twenty')";
 /// An `x` whose total fits with `b2.w = 100` and overflows with `1000`: the
 /// idle positions add 4000.
 const BIG_X: i32 = 2_147_479_000;
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 /// The all-`LEFT` star of [`SHAPE`].
 fn left() -> Star {
