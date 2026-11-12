@@ -454,27 +454,24 @@ impl Driver {
     /// backend holds. Like [`Self::wait_blocked_behind`], for when the test
     /// has forced `n` waiters but not which holder each queues behind.
     pub async fn wait_blocked(&self, n: i64) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let blocked: i64 = self
-                .ctl
-                .query_one(
-                    "select count(*) from pg_stat_activity \
-                     where cardinality(pg_blocking_pids(pid)) > 0",
-                    &[],
-                )
-                .await
-                .expect("read pg_stat_activity")
-                .get(0);
-            if blocked >= n {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{blocked} of {n} backends queued on a lock within 60 s"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        testkit::wait_for(
+            format!("{n} backends are queued on a lock"),
+            Duration::from_secs(60),
+            async || {
+                let blocked: i64 = self
+                    .ctl
+                    .query_one(
+                        "select count(*) from pg_stat_activity \
+                         where cardinality(pg_blocking_pids(pid)) > 0",
+                        &[],
+                    )
+                    .await
+                    .expect("read pg_stat_activity")
+                    .get(0);
+                if blocked >= n { Ok(()) } else { Err(blocked) }
+            },
+        )
+        .await;
     }
 
     /// [`pipeline::settle`]: seals and drains until nothing is pending

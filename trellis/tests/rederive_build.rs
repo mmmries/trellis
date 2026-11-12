@@ -1508,8 +1508,7 @@ const PLAN_PAUSE_LOCK: i64 = 0x7a1a;
 /// wait for convergence: it returns once Postgres reports the queue the test
 /// built on purpose, as the other lock-order tests do with `pg_blocking_pids`.
 async fn wait_for_queue(raw: &Client, behind: Option<i32>, queued: i64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
+    testkit::wait_for("the queue forms", Duration::from_secs(60), async || {
         let waiting: i64 = raw
             .query_one(
                 "select count(*) from pg_stat_activity \
@@ -1522,14 +1521,12 @@ async fn wait_for_queue(raw: &Client, behind: Option<i32>, queued: i64) {
             .expect("count the queue")
             .get(0);
         if waiting >= queued {
-            return;
+            Ok(())
+        } else {
+            Err(waiting)
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the queue never formed"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await;
 }
 
 /// Claims the Re-derive plan job as `held` and pauses the building transform,
