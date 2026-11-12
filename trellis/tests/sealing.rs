@@ -10,29 +10,13 @@
 //! gate.
 
 use std::time::Duration;
+use testkit::connect_raw;
 
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
 use tokio_postgres::{Client, IsolationLevel, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{StagedChange, StagingError, TRUNCATE_SENTINEL_KEY, seal};
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), for tests that
-/// need a plain `tokio_postgres::Client`/`Transaction` — the type
-/// `trellis::staging::seal`'s functions take, which the pooled
-/// `deadpool_postgres::Client` doesn't satisfy (it has its own, unrelated
-/// `GenericClient` trait).
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn insert_recompute(client: &Client, table: &str, key: &str) {
     client

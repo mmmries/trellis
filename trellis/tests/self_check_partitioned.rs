@@ -8,11 +8,9 @@ mod drain_driver;
 
 use std::time::{Duration, Instant};
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::capture::sql::{CaptureEvent, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::capture_audit::CaptureFault;
 use trellis::staging::self_check::{
     Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
@@ -25,10 +23,6 @@ const TREE: &str = "create table public.items (id integer not null, g integer no
         v integer not null, primary key (g, id)) partition by list (g); \
      create table public.items_a partition of public.items for values in (1, 2); \
      create table public.items_b partition of public.items for values in (3, 4)";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 async fn check(d: &Driver, target: &str) -> Vec<Divergence> {
     let page = check_page(

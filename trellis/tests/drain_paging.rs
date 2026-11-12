@@ -9,11 +9,15 @@
 //! COUNT over the live source for the aggregate, the source's own rows for the
 //! 1-1 copy.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{
@@ -29,18 +33,6 @@ const GROUP_TOTALS: &str = "TRANSFORM grp_totals FROM items GROUP BY grp \
     WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total, COUNT(*) AS n";
 
 const ITEM_COPY: &str = "TRANSFORM item_copy FROM items SELECT amount AS amount";
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 fn source_columns() -> HashMap<String, ValueType> {
     ["id", "grp", "amount"]
@@ -292,7 +284,7 @@ async fn insert_items(client: &Client, ids: &[i32]) {
 async fn a_share_over_the_cap_drains_in_at_most_ceil_share_over_cap_pages() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();
@@ -346,7 +338,7 @@ async fn a_share_over_the_cap_drains_in_at_most_ceil_share_over_cap_pages() {
 async fn a_share_under_the_cap_drains_in_one_page_without_a_cursor() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();
@@ -368,7 +360,7 @@ async fn a_share_under_the_cap_drains_in_one_page_without_a_cursor() {
 async fn a_reclaim_after_page_k_resumes_at_page_k_plus_one_and_matches_the_oracle() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     // Seed groups through an ordinary drain, then a mixed batch: inserts,
@@ -498,7 +490,7 @@ async fn a_reclaim_after_page_k_resumes_at_page_k_plus_one_and_matches_the_oracl
 async fn a_stale_claimants_page_rolls_back_as_claim_lost() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();
@@ -562,7 +554,7 @@ async fn a_stale_claimants_page_rolls_back_as_claim_lost() {
 async fn a_boundary_key_lands_whole_in_one_page() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_copy(&db, &client).await;
 
     let ids: Vec<i32> = (1..=60).collect();
@@ -603,7 +595,7 @@ async fn a_boundary_key_lands_whole_in_one_page() {
 async fn a_key_straddling_two_paged_segments_matches_the_oracle() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=280).collect();
@@ -698,7 +690,7 @@ async fn stage_truncate_segment(client: &mut Client, pool: &trellis::pool::Pool)
 async fn a_paged_truncate_segment_clears_once_and_matches_the_oracle() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let seg = stage_truncate_segment(&mut client, &db.pool).await;
@@ -721,7 +713,7 @@ async fn a_paged_truncate_segment_clears_once_and_matches_the_oracle() {
 async fn later_pages_of_a_truncate_segment_still_void_pre_truncate_rows_after_a_reclaim() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let seg = stage_truncate_segment(&mut client, &db.pool).await;
@@ -761,7 +753,7 @@ async fn later_pages_of_a_truncate_segment_still_void_pre_truncate_rows_after_a_
 async fn an_oversized_segment_drains_alone_and_small_ones_coalesce_after_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     insert_items(&client, &(1..=300).collect::<Vec<_>>()).await;
@@ -842,7 +834,7 @@ async fn a_drain_never_claims_a_segment_before_its_fence_is_published() {
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     insert_items(&client, &(1..=20).collect::<Vec<_>>()).await;
@@ -973,7 +965,7 @@ async fn finish_with_worker_c(
 async fn a_direct_drain_that_lost_one_of_its_buckets_commits_nothing() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();
@@ -998,7 +990,7 @@ async fn a_direct_drain_that_lost_one_of_its_buckets_commits_nothing() {
 async fn a_page_whose_worker_lost_one_held_bucket_rolls_back() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();
@@ -1022,7 +1014,7 @@ async fn a_page_whose_worker_lost_one_held_bucket_rolls_back() {
 async fn a_claimant_resuming_buckets_at_two_cursors_finishes_each_to_the_oracle() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();
@@ -1077,7 +1069,7 @@ async fn a_claimant_resuming_buckets_at_two_cursors_finishes_each_to_the_oracle(
 async fn isolation_surfaces_a_lost_claim_without_charging_any_key() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     insert_items(&client, &(1..=20).collect::<Vec<_>>()).await;
@@ -1262,7 +1254,7 @@ async fn drain_within(
 async fn a_worker_paging_two_skewed_buckets_as_one_union_finishes_in_bounded_pages() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let (heavy, light, rest) = skewed_ids(&client, 60).await;
@@ -1322,7 +1314,7 @@ async fn a_worker_paging_two_skewed_buckets_as_one_union_finishes_in_bounded_pag
 async fn a_worker_resuming_skewed_buckets_at_different_cursors_finishes_in_bounded_pages() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let (heavy, light, rest) = skewed_ids(&client, 60).await;
@@ -1488,7 +1480,7 @@ async fn stage_copy_keys(client: &Client, ids: &[i32]) {
 async fn a_reclaim_mid_materialized_drain_resumes_from_the_cursor_in_a_new_session() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_copy(&db, &client).await;
 
     let ids: Vec<i32> = (1..=60).collect();
@@ -1544,7 +1536,7 @@ async fn a_reclaim_mid_materialized_drain_resumes_from_the_cursor_in_a_new_sessi
 async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_copy(&db, &client).await;
     let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
     let pool = trellis::pool::Pool::with_limits(&config, 1, Duration::from_secs(30))
@@ -1630,7 +1622,7 @@ async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
 async fn isolation_can_check_out_the_connection_its_failed_page_held() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_copy(&db, &client).await;
     // Key 13 fails in Phase 3, alone and in any run holding it.
     client
@@ -1703,7 +1695,7 @@ async fn lock_waiters(client: &Client, except: i32) -> Vec<(i32, String, f64)> {
 async fn a_drain_waits_out_a_held_lock_outside_its_transaction() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
     let impatient = trellis::pool::Pool::new(
         &trellis::config::Config::from_dsn(format!(
@@ -1718,7 +1710,7 @@ async fn a_drain_waits_out_a_held_lock_outside_its_transaction() {
     insert_items(&client, &ids).await;
     let seg = seal(&mut client).await;
 
-    let holder = connect_raw(db.dsn()).await;
+    let holder = connect(db.dsn()).await;
     let holder_pid: i32 = holder
         .query_one("select pg_backend_pid()", &[])
         .await
@@ -1824,7 +1816,7 @@ async fn charges_and_holdups(client: &Client) -> (i64, i64) {
 async fn a_non_final_page_retried_after_its_commit_landed_applies_nothing_twice() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();
@@ -1857,7 +1849,7 @@ async fn a_non_final_page_retried_after_its_commit_landed_applies_nothing_twice(
 async fn a_final_page_retried_after_its_commit_landed_rolls_back_as_claim_lost() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     setup_aggregate(&db, &client).await;
 
     let ids: Vec<i32> = (1..=300).collect();

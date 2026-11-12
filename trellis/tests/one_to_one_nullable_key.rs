@@ -19,7 +19,7 @@ mod sql_recompute;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use sql_recompute::recompute;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
@@ -43,10 +43,6 @@ const A2_ORACLE: &str =
 const AGG_ACTUAL: &str = "select g, h, n, t from public.agg order by g, h";
 const AGG_ORACLE: &str =
     "select g, h, count(*), sum(v) from public.src group by g, h order by g, h";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 fn int8() -> ValueType {
     ValueType::Integer(IntWidth::Int8)

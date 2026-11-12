@@ -7,34 +7,17 @@
 //!
 //! No staging worker runs: these pins are of define, not of apply.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer};
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
+use trellis::Applied;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{CatalogError, ValidationError, install_definition};
-use trellis::{Applied, Config, Trellis, TrellisOptions};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
 
 async fn define_err(pool: &trellis::pool::Pool, text: &str) -> CatalogError {
     install_definition(pool, text, &HashMap::new(), "public")
@@ -157,9 +140,9 @@ fn star(target: &str, joined: usize) -> String {
 async fn u2_a_star_of_five_defines_and_drops_every_hidden_table_and_six_are_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     let err = define_err(&db.pool, &star("six", 5)).await;
     assert!(
@@ -226,7 +209,7 @@ async fn u2_a_star_of_five_defines_and_drops_every_hidden_table_and_six_are_refu
 async fn a_stars_shape_refusals_are_named() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
     raw.batch_execute(
         "create table public.facts (id integer, day date, primary key (id, day))
@@ -391,9 +374,9 @@ async fn a_stars_shape_refusals_are_named() {
 async fn a_star_defines_and_resumes_with_nothing_set() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     trellis.apply(&star("v", 2)).await.expect("define the star");
     trellis.apply("PAUSE TRANSFORM v").await.expect("pause");

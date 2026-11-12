@@ -16,27 +16,19 @@
 //! - a schema name with `%` or `'` in it dumps
 //!   (`a_schema_name_with_percent_and_quote_dumps`)
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use std::process::Command;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::dump::{CLASSIFICATION, Class, ID_PLACEHOLDER, names_table};
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn facade(dsn: &str) -> Trellis {
     Trellis::connect(
@@ -274,7 +266,7 @@ const STATUSES: &str =
 async fn a_dump_loads_as_defined_not_built() {
     let cluster = TestCluster::start();
     let source = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(source.dsn()).await;
+    let mut raw = connect(source.dsn()).await;
     let t = facade(source.dsn()).await;
     define_and_build(&t, &mut raw).await;
     assert!(
@@ -326,7 +318,7 @@ async fn a_dump_loads_as_defined_not_built() {
 
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &schema_sql, &appendix);
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
 
     // The catalog rows match, apart from the build progress a define resets.
     for sql in [
@@ -464,7 +456,7 @@ async fn a_dump_loads_as_defined_not_built() {
         );
     }
     let fresh = cluster.create_isolated_database().await;
-    let fresh = connect_raw(fresh.dsn()).await;
+    let fresh = connect(fresh.dsn()).await;
     for (table, class) in CLASSIFICATION {
         if matches!(class, Class::Seed { .. }) && !table.contains(ID_PLACEHOLDER) {
             let sql = format!("select to_jsonb(t) - 'created_at' from {SCHEMA}.{table} t");
@@ -506,7 +498,7 @@ async fn a_dump_loads_as_defined_not_built() {
 async fn a_loaded_database_builds_its_definitions() {
     let cluster = TestCluster::start();
     let source = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(source.dsn()).await;
+    let mut raw = connect(source.dsn()).await;
     let t = facade(source.dsn()).await;
     define_and_build(&t, &mut raw).await;
 
@@ -526,7 +518,7 @@ async fn a_loaded_database_builds_its_definitions() {
     let appendix = t.dump_definitions_sql().await.expect("dump definitions");
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &schema_sql, &appendix);
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     after
         .batch_execute(
             "insert into public.cats values (1, 'tom'), (2, 'kit'); \
@@ -536,7 +528,7 @@ async fn a_loaded_database_builds_its_definitions() {
         .expect("load source rows");
 
     let t2 = facade(loaded.dsn()).await;
-    let mut worker = connect_raw(loaded.dsn()).await;
+    let mut worker = connect(loaded.dsn()).await;
     // The staging worker's own reconcile pass, not the test harness, finds
     // the loaded definitions and starts their builds: the loaded catalog
     // has no capture gates, and the dump's capture triggers
@@ -602,7 +594,7 @@ async fn a_loaded_database_builds_its_definitions() {
 async fn a_runtime_update_leaves_the_dump_unchanged() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let t = facade(db.dsn()).await;
     raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
     t.apply("TRANSFORM o1 FROM orders SELECT g AS g")
@@ -664,7 +656,7 @@ async fn a_schema_name_with_placeholder_text_loads() {
     .await
     .expect("connect");
     t.migrate().await.expect("migrate");
-    let raw = connect_raw(source.dsn()).await;
+    let raw = connect(source.dsn()).await;
     raw.batch_execute(
         "create table public.cats (id bigint primary key, name text); \
          create table public.orders (id bigint primary key, cat_id bigint)",
@@ -688,7 +680,7 @@ async fn a_schema_name_with_placeholder_text_loads() {
     let appendix = t.dump_definitions_sql().await.expect("dump definitions");
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &schema_sql, &appendix);
-    let after = connect_raw(loaded.dsn()).await;
+    let after = connect(loaded.dsn()).await;
     let quoted = format!("\"{}\"", schema.replace('"', "\"\""));
     for (table, want) in [
         ("halting_stops", 1),
@@ -727,7 +719,7 @@ async fn a_schema_name_with_placeholder_text_loads() {
 async fn every_trellis_table_is_classified() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     let t = facade(db.dsn()).await;
     define_and_build(&t, &mut raw).await;
     // A star of five tables owns every position's `M`. Defined last, and

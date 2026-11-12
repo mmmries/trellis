@@ -14,12 +14,16 @@
 //! CDC staged for it (the lost change the rebuild is there to repair), asks
 //! for the rebuild, and drives the build and the drain directly.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
+use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::intake::harness;
@@ -29,18 +33,6 @@ use trellis::{Config, Trellis, TrellisOptions};
 
 const TEST_NAME: &str = "table_catch_ups_test";
 const WAKE: &str = "table_catch_ups_wake";
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn connect_trellis(dsn: &str) -> Trellis {
     Trellis::connect(
@@ -266,7 +258,7 @@ async fn active_seq(client: &Client) -> i64 {
 async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     seed_sales(&client).await;
     install_definition(
         &db.pool,
@@ -331,7 +323,7 @@ async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {
 async fn request_backfill_names_a_source_outside_the_search_path() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
     client
         .batch_execute(
             "create schema shop; create schema blog; \
@@ -388,7 +380,7 @@ async fn request_backfill_names_a_source_outside_the_search_path() {
 async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     seed_sales(&client).await;
     install_definition(
         &db.pool,
@@ -441,7 +433,7 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
 async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     seed_sales(&client).await;
     install_definition(
         &db.pool,
@@ -498,7 +490,7 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
 async fn a_table_whose_capture_is_reinstalled_rebuilds_its_readers() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
+    let mut client = connect(db.dsn()).await;
     seed_sales(&client).await;
     install_definition(
         &db.pool,

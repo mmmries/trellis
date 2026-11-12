@@ -9,14 +9,18 @@
 //! Every test is stepped by hand: no staging worker runs, and nothing polls
 //! for convergence.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer};
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::install::{Installed, installed};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{CatalogError, ValidationError, ValueType, install_definition};
-use trellis::{Applied, Config, TransformStatus, Trellis, TrellisOptions};
+use trellis::{Applied, TransformStatus, Trellis};
 
 async fn batch(pool: &trellis::pool::Pool, sql: &str) {
     pool.get()
@@ -54,27 +58,6 @@ async fn assert_nothing_registered(pool: &trellis::pool::Pool, target: &str) {
         .expect("count definitions")
         .get(0);
     assert_eq!(definitions, 0, "a refused definition must not be stored");
-}
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
 }
 
 async fn status(trellis: &Trellis, target: &str) -> Option<TransformStatus> {
@@ -150,7 +133,7 @@ async fn a_one_to_one_join_defines_with_no_setting() {
     install_definition(&db.pool, LEFT_JOIN, &HashMap::new(), "public")
         .await
         .expect("a 1-1 JOIN defines");
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let exists: bool = raw
         .query_one(
             "select pg_catalog.to_regclass('public.order_view') is not null",
@@ -437,7 +420,7 @@ async fn a_one_to_one_target_side_needs_its_primary_key_and_any_transform_reads_
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
 
     // A plain 1-1 target of `customers`, with a unique key that is not its
@@ -525,7 +508,7 @@ async fn a_one_to_one_target_is_an_a_side_on_any_columns_and_a_b_side_on_columns
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
     raw.batch_execute(
         "set search_path to public;
@@ -628,9 +611,9 @@ async fn a_one_to_one_target_is_an_a_side_on_any_columns_and_a_b_side_on_columns
 async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     let applied = trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
     assert!(
@@ -846,9 +829,9 @@ async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
 async fn a_build_start_runs_the_minimal_build_of_a_one_to_one_join() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
 
     // The first pass installs both captures; the second finds the build ready
@@ -930,9 +913,9 @@ async fn a_build_start_runs_the_minimal_build_of_a_one_to_one_join() {
 async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply(
             "TRANSFORM order_view FROM orders LEFT JOIN customers ON orders.cust = customers.ext \
@@ -1105,9 +1088,9 @@ async fn drain(raw: &mut Client, pool: &trellis::pool::Pool) {
 async fn a_change_of_either_side_applies_and_a_truncate_clears_or_rebuilds_a_one_to_one_join() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
 
     // The passes install both captures and start the build, which fills the
@@ -1225,9 +1208,9 @@ async fn a_change_of_either_side_applies_and_a_truncate_clears_or_rebuilds_a_one
 async fn a_restored_one_to_one_joins_resume_recreates_its_ledgers_and_keeps_the_target() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
     let id = definition_id(&raw, "order_view").await;
     trellis
@@ -1310,9 +1293,9 @@ async fn a_restored_one_to_one_joins_resume_recreates_its_ledgers_and_keeps_the_
 async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tables() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
     let id = definition_id(&raw, "order_view").await;
     trellis
@@ -1331,7 +1314,7 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
         .expect("a claimed chunk")
         .get(0);
     // The chunk's session, mid-write: its claim row held `for key share`.
-    let mut chunk_session = connect_raw(db.dsn()).await;
+    let mut chunk_session = connect(db.dsn()).await;
     let pid: i32 = chunk_session
         .query_one("select pg_backend_pid()", &[])
         .await
@@ -1402,7 +1385,7 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
 async fn a_target_may_not_take_the_name_of_a_table_another_transform_reads() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
     raw.batch_execute(
         "create table public.shadow (id integer primary key, who text); \
@@ -1410,7 +1393,7 @@ async fn a_target_may_not_take_the_name_of_a_table_another_transform_reads() {
     )
     .await
     .expect("the readers' table");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     for reader in [
         "TRANSFORM shadow_copy FROM shadow SELECT who AS who",
         "TRANSFORM shadow_join FROM orders LEFT JOIN shadow \
@@ -1542,9 +1525,9 @@ async fn a_target_may_not_take_the_name_of_a_table_another_transform_reads() {
 async fn a_rebuild_in_place_drops_the_entries_whose_rows_are_gone() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
     pass(&mut raw, &db.pool).await;
     pass(&mut raw, &db.pool).await;
@@ -1663,9 +1646,9 @@ async fn a_qualified_read_of_a_reserved_word_column_is_copied_under_its_name() {
 async fn a_reader_of_a_one_to_one_join_alters_and_blocks_its_drop() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
     pass(&mut raw, &db.pool).await;
     pass(&mut raw, &db.pool).await;

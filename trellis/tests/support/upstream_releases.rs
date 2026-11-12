@@ -4,11 +4,10 @@
 
 #![allow(dead_code)]
 
-use crate::drain_driver::{self, Driver};
+use crate::drain_driver::{self, Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::apply;
+pub use trellis::staging::build::settle_builds;
 use trellis::{Config, Trellis, TrellisOptions};
 
 pub async fn pass(d: &mut Driver) {
@@ -64,19 +63,8 @@ pub async fn settle_tolerant(d: &mut Driver) -> usize {
     failures
 }
 
-/// Claims, runs and finishes every pending backfill chunk, then settles the
-/// builds.
-pub async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    const CLAIMED_BY: &str = "upstream_release_backfill";
-    trellis::staging::build::settle_builds(pool).await;
-}
-
 pub async fn write(d: &Driver, sql: &str) {
     d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-pub fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
 }
 
 /// `up` (a 1-1 copy of `t`) and `r`, a 1-1 copy of `up` whose target
@@ -97,7 +85,7 @@ pub async fn persistently_held() -> (Driver, Trellis) {
         .expect("define r");
     for _ in 0..3 {
         pass(&mut d).await;
-        run_backfill_chunks(d.pool()).await;
+        settle_builds(d.pool()).await;
         settle_tolerant(&mut d).await;
     }
     d.ctl
@@ -125,7 +113,7 @@ pub async fn r_retry_attempts(d: &Driver) -> Vec<String> {
 pub async fn rounds(d: &mut Driver, n: usize) {
     for _ in 0..n {
         pass(d).await;
-        run_backfill_chunks(d.pool()).await;
+        settle_builds(d.pool()).await;
         settle_tolerant(d).await;
     }
 }
