@@ -329,7 +329,7 @@ For each release, the notes carry:
   them.
 - **Definitions that pause because the new version keys a table
   differently,** each with its remedy
-  ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
+  ([the key entry](transforms.md#the-key-a-transform-keys-each-table-by)).
 - **Changes an upgrade makes that users don't see,** so a question about them
   has an answer: a build restarted, hidden tables re-laid out, a definition
   rebuilt at the takeover.
