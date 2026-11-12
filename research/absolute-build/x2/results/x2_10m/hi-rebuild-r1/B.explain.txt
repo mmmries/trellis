@@ -1,0 +1,124 @@
+STMT gate
+LSN|2B/A2E0D180
+
+Time: 0.588 ms
+STMT B
+LSN|2B/A2E0D180
+CTE Scan on cur  (cost=135148125.09..135552054.97 rows=10098247 width=155) (actual rows=10100000.00 loops=1)
+  Storage: Disk  Maximum Storage: 1210061kB
+  Buffers: shared hit=119876460 read=1563754 dirtied=364167 written=374460, temp read=147458 written=366523
+  WAL: records=40318628 fpi=208588 bytes=4849245013 buffers full=495162
+  CTE snap
+    ->  Result  (cost=38.26..38.27 rows=1 width=40) (actual rows=1.00 loops=1)
+          InitPlan 1
+            ->  Aggregate  (cost=38.25..38.26 rows=1 width=8) (actual rows=1.00 loops=1)
+                  ->  Seq Scan on segments  (cost=0.00..32.60 rows=2260 width=8) (actual rows=0.00 loops=1)
+  CTE ins
+    ->  Insert on agg_1  (cost=0.43..4941913.35 rows=10098247 width=165) (actual rows=10100000.00 loops=1)
+          Conflict Resolution: UPDATE
+          Conflict Arbiter Indexes: agg_1_author_id_key
+          Tuples Inserted: 100000
+          Conflicting Tuples: 10000000
+          Buffers: shared hit=119876460 read=1490224 dirtied=364167 written=374460
+          WAL: records=40318628 fpi=208588 bytes=4849245013 buffers full=495162
+          ->  Subquery Scan on "*SELECT*"  (cost=0.43..4941913.35 rows=10098247 width=165) (actual rows=10100000.00 loops=1)
+                Buffers: shared hit=8860487 read=1178354 written=245332
+                ->  Nested Loop  (cost=0.43..4941913.35 rows=10098247 width=164) (actual rows=10100000.00 loops=1)
+                      Buffers: shared hit=8860487 read=1178354 written=245332
+                      ->  GroupAggregate  (cost=0.43..4739948.40 rows=10098247 width=124) (actual rows=10100000.00 loops=1)
+                            Group Key: s.grp_hi
+                            Buffers: shared hit=8860487 read=1178354 written=245332
+                            ->  Index Scan using posts_grp_hi_idx on posts s  (cost=0.43..852123.30 rows=10098247 width=14) (actual rows=10100000.00 loops=1)
+                                  Index Searches: 1
+                                  Buffers: shared hit=8860487 read=1178354 written=245332
+                            SubPlan 4
+                              ->  Result  (cost=0.32..0.33 rows=1 width=32) (actual rows=1.00 loops=10100000)
+                                    InitPlan 3
+                                      ->  Aggregate  (cost=0.31..0.32 rows=1 width=32) (never executed)
+                                            ->  HashAggregate  (cost=0.15..0.28 rows=10 width=40) (never executed)
+                                                  Group Key: __u.__sk
+                                                  Filter: (sum(1) <> 0)
+                                                  ->  Function Scan on __u  (cost=0.01..0.11 rows=10 width=32) (never executed)
+                                                        Filter: (__sk IS NOT NULL)
+                      ->  CTE Scan on snap  (cost=0.00..0.02 rows=1 width=40) (actual rows=1.00 loops=10100000)
+                            Storage: Memory  Maximum Storage: 17kB
+  CTE cur
+    ->  Hash Left Join  (cost=366886.39..128831774.02 rows=10098247 width=201) (actual rows=10100000.00 loops=1)
+          Hash Cond: (ins.grp_hi = x.grp_hi)
+          Buffers: shared hit=119876460 read=1563754 dirtied=364167 written=374460, temp read=147458 written=215266
+          WAL: records=40318628 fpi=208588 bytes=4849245013 buffers full=495162
+          ->  CTE Scan on ins  (cost=0.00..201964.94 rows=10098247 width=124) (actual rows=10100000.00 loops=1)
+                Storage: Disk  Maximum Storage: 542464kB
+                Buffers: shared hit=119876460 read=1490224 dirtied=364167 written=374460, temp written=67808
+                WAL: records=40318628 fpi=208588 bytes=4849245013 buffers full=495162
+          ->  Hash  (cost=173528.84..173528.84 rows=9999884 width=32) (actual rows=10000000.00 loops=1)
+                Buckets: 131072  Batches: 128  Memory Usage: 6231kB
+                Buffers: shared read=73530, temp written=67757
+                ->  Seq Scan on hi_totals x  (cost=0.00..173528.84 rows=9999884 width=32) (actual rows=10000000.00 loops=1)
+                      Buffers: shared read=73530
+          SubPlan 6
+            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32) (never executed)
+                  ->  Function Scan on jsonb_each_text  (cost=0.00..1.00 rows=100 width=32) (never executed)
+          SubPlan 7
+            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4) (never executed)
+                  ->  Function Scan on jsonb_each_text jsonb_each_text_1  (cost=0.00..2.13 rows=32 width=32) (never executed)
+                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+          SubPlan 8
+            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32) (never executed)
+                  ->  Function Scan on jsonb_each_text jsonb_each_text_2  (cost=0.00..1.00 rows=100 width=32) (never executed)
+          SubPlan 9
+            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4) (never executed)
+                  ->  Function Scan on jsonb_each_text jsonb_each_text_3  (cost=0.00..2.13 rows=32 width=32) (never executed)
+                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+          SubPlan 10
+            ->  Aggregate  (cost=1.75..1.76 rows=1 width=32) (never executed)
+                  ->  Function Scan on jsonb_each_text jsonb_each_text_4  (cost=0.00..1.00 rows=100 width=32) (never executed)
+          SubPlan 11
+            ->  Aggregate  (cost=2.37..2.38 rows=1 width=4) (never executed)
+                  ->  Function Scan on jsonb_each_text jsonb_each_text_5  (cost=0.00..2.13 rows=32 width=32) (never executed)
+                        Filter: ((key <> ALL ('{NaN,Infinity,-Infinity}'::text[])) AND ((value)::bigint > 0))
+  CTE written
+    ->  Insert on hi_totals  (cost=1134525.97..1147148.78 rows=0 width=0) (actual rows=0.00 loops=1)
+          Conflict Resolution: UPDATE
+          Conflict Arbiter Indexes: author_totals_author_id_key
+          Tuples Inserted: 100000
+          Conflicting Tuples: 1000000
+          Buffers: shared hit=11663896 read=100961 dirtied=109227 written=100195, temp read=162573 written=11334
+          WAL: records=4300277 fpi=100871 bytes=1102849525 buffers full=126781
+          ->  Sort  (cost=1134525.97..1147148.78 rows=5049124 width=52) (actual rows=1100000.00 loops=1)
+                Sort Key: cur_1.grp_hi
+                Sort Method: external merge  Disk: 45304kB
+                Buffers: shared read=3, temp read=162573 written=11334
+                ->  CTE Scan on cur cur_1  (cost=0.00..227210.56 rows=5049124 width=52) (actual rows=1100000.00 loops=1)
+                      Filter: (__changed AND (__nn > 0))
+                      Rows Removed by Filter: 9000000
+                      Storage: Disk  Maximum Storage: 1210061kB
+                      Buffers: temp read=151258
+  CTE deleted
+    ->  Delete on hi_totals hi_totals_1  (cost=227210.57..227250.67 rows=0 width=0) (actual rows=0.00 loops=1)
+          Buffers: temp read=151258 written=1
+          InitPlan 14
+            ->  CTE Scan on cur cur_2  (cost=0.00..227210.56 rows=1 width=6) (actual rows=0.00 loops=1)
+                  Filter: (__changed AND (__tc IS NOT NULL) AND (__nn <= 0))
+                  Rows Removed by Filter: 10100000
+                  Storage: Disk  Maximum Storage: 1210061kB
+                  Buffers: temp read=151258 written=1
+          ->  Tid Scan on hi_totals hi_totals_1  (cost=0.01..40.11 rows=10 width=6) (actual rows=0.00 loops=1)
+                TID Cond: (ctid = ANY ((InitPlan 14).col1))
+                Buffers: temp read=151258 written=1
+Planning:
+  Buffers: shared hit=274 read=37 dirtied=7
+Planning Time: 3.068 ms
+Execution Time: 102296.308 ms
+Time: 102304.744 ms (01:42.305)
+STMT end
+LSN|2D/CB282F8
+
+rc=0 wall_s=102.329092152
+wal_total_bytes=6070473816
+pg_stat_wal=44619145 309496 5952296359
+temp=258 3047937376
+stats=100000 10000000 4468 10000000
+sizes hidden=3209543680 hidden_heap=2532638720 target=895713280
+hidden_md5=0a6aa4fbebfcb8450b072af7e158a1cd rows=10100000
+target_md5=71ed85a7c12d60e87ec6c02a938da868 rows=10100000

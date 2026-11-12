@@ -1,0 +1,6 @@
+label=x2_10m shape=hi mode=rebuild rep=1
+ 11:15:37 up 1 day, 19:44,  1 user,  load average: 5.13, 3.46, 4.31
+rustc=0 cargo=1
+label=x2_10m shape=hi mode=rebuild rep=1
+ 11:32:58 up 1 day, 20:01,  1 user,  load average: 16.40, 10.80, 6.97
+rustc=1 cargo=3

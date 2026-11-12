@@ -1,0 +1,28 @@
+STMT plain
+LSN|2/49FCC5B8
+Insert on plain_ins  (cost=0.42..84022.57 rows=0 width=0) (actual rows=0.00 loops=1)
+  Buffers: shared hit=1287835 read=14467 dirtied=1112 written=1112
+  WAL: records=200266 fpi=2 bytes=16104567 buffers full=1029
+  ->  GroupAggregate  (cost=0.42..84022.57 rows=91450 width=52) (actual rows=99995.00 loops=1)
+        Group Key: posts.author_id
+        Buffers: shared hit=986305 read=14466
+        ->  Index Scan using posts_author_idx on posts  (cost=0.42..72879.44 rows=1000000 width=14) (actual rows=1000000.00 loops=1)
+              Index Searches: 1
+              Buffers: shared hit=986305 read=14466
+Planning:
+  Buffers: shared hit=77 read=18 dirtied=2
+Planning Time: 0.254 ms
+Execution Time: 767.290 ms
+Time: 767.965 ms
+STMT end
+LSN|2/4AF53278
+
+rc=0 wall_s=.780816112
+wal_total_bytes=16444600
+pg_stat_wal=200447 34 16296071
+temp=0 0
+stats=0 0 0 0
+sizes hidden=24576 hidden_heap=0 target=16384
+hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0
+target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0
+plain_md5=372d185e6cb9631e85199a3923a50d9d

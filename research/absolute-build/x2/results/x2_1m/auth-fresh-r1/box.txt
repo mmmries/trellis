@@ -1,0 +1,3 @@
+label=x2_1m shape=auth mode=fresh rep=1
+ 10:43:20 up 1 day, 19:12,  1 user,  load average: 7.99, 16.53, 17.84
+rustc=0 cargo=2

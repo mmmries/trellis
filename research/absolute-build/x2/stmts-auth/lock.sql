@@ -1,0 +1,1 @@
+insert into "trellis"."agg_1" ("author_id") select distinct "author_id" from ( select "author_id" from pg_temp."trellis_group_sides_1_34563cf2bd068379" union all select "author_id" from pg_temp."trellis_group_recompute_1_f01a0db369afd2ce" ) as g order by "author_id" on conflict ("author_id") do update set __n = excluded.__n where false;

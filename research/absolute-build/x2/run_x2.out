@@ -1,0 +1,289 @@
+logbook id: 20261112T104320-r-bench
+[10:43:20] env KEEP_C=1 ./x2.sh src1m x2_1m auth fresh 1 plain a c1 c2 A0 A0.1 A1 A10 B0 B0.1 B1 B10
+[10:43:23] variant plain on x2fb_x2_1m_auth_ff100_p0
+[10:43:25] variant plain rc=0 rc=0 wall_s=.780816112 stats=0 0 0 0 hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 plain_md5=372d185e6cb9631e85199a3923a50d9d 
+[10:43:27] variant a on x2fb_x2_1m_auth_ff100_p0
+[10:43:31] variant a rc=0 rc=0 wall_s=2.722163709 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:43:32] variant c1 on x2fb_x2_1m_auth_ff100_p0
+[10:43:35] variant c1 rc=0 rc=0 wall_s=1.621150167 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:43:37] variant c2 on x2fb_x2_1m_auth_ff50_p0
+[10:43:39] variant c2 rc=0 rc=0 wall_s=1.625275679 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:43:41] variant A0 on x2fb_x2_1m_auth_ff100_p0
+[10:43:43] variant A0 rc=0 rc=0 wall_s=1.047364736 stats=99995 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:43:45] variant A0.1 on x2fb_x2_1m_auth_ff100_p0_1
+[10:43:47] variant A0.1 rc=0 rc=0 wall_s=1.069357279 stats=99895 100 0 100 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:43:49] variant A1 on x2fb_x2_1m_auth_ff100_p1
+[10:43:52] variant A1 rc=0 rc=0 wall_s=1.073464908 stats=98995 1000 0 1000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:43:54] variant A10 on x2fb_x2_1m_auth_ff100_p10
+[10:43:56] variant A10 rc=0 rc=0 wall_s=1.269521808 stats=89995 10000 0 10000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:43:58] variant B0 on x2fb_x2_1m_auth_ff100_p0
+[10:44:00] variant B0 rc=0 rc=0 wall_s=1.009524273 stats=99995 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:44:01] variant B0.1 on x2fb_x2_1m_auth_ff100_p0_1
+[10:44:03] variant B0.1 rc=0 rc=0 wall_s=1.049999256 stats=99895 100 0 100 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:44:05] variant B1 on x2fb_x2_1m_auth_ff100_p1
+[10:44:07] variant B1 rc=0 rc=0 wall_s=1.201446155 stats=98995 1000 0 1000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:44:09] variant B10 on x2fb_x2_1m_auth_ff100_p10
+[10:44:11] variant B10 rc=0 rc=0 wall_s=1.224806037 stats=89995 10000 0 10000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:44:12] ./x2.sh src1m x2_1m auth rebuild 1 plain a c1 c2 Au B
+[10:44:12] rebuild base x2keep_x2_1m_auth_c1_rb from x2keep_x2_1m_auth_c1
+[10:44:18] variant plain on x2keep_x2_1m_auth_c1_rb
+[10:44:19] variant plain rc=0 rc=0 wall_s=.691676338 stats=0 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 plain_md5=11e63185e210c4979708cfd5b4f56d41 
+[10:44:21] variant a on x2keep_x2_1m_auth_c1_rb
+[10:44:24] variant a rc=0 rc=0 wall_s=1.684305476 stats=1000 100995 593 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:44:25] variant c1 on x2keep_x2_1m_auth_c1_rb
+[10:44:28] variant c1 rc=0 rc=0 wall_s=1.627613742 stats=1000 100995 580 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:44:28] rebuild base x2keep_x2_1m_auth_c2_rb from x2keep_x2_1m_auth_c2
+[10:44:33] variant c2 on x2keep_x2_1m_auth_c2_rb
+[10:44:38] variant c2 rc=0 rc=0 wall_s=3.805346946 stats=1000 100995 97905 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:44:39] variant Au on x2keep_x2_1m_auth_c1_rb
+[10:44:42] variant Au rc=0 rc=0 wall_s=2.189168112 stats=1000 99995 580 99995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:44:44] variant B on x2keep_x2_1m_auth_c1_rb
+[10:44:47] variant B rc=0 rc=0 wall_s=1.296437793 stats=1000 99995 580 99995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:44:47] env KEEP_C=1 ./x2.sh src1m x2_1m hi fresh 1 plain a c1 c2 A0 A0.1 A1 A10 B0 B0.1 B1 B10
+[10:44:48] variant plain on x2fb_x2_1m_hi_ff100_p0
+[10:44:51] variant plain rc=0 rc=0 wall_s=1.376610818 stats=0 0 0 0 hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 plain_md5=a197d5d1818af42fac968ae1f5e1d109 
+[10:44:52] variant a on x2fb_x2_1m_hi_ff100_p0
+[10:45:07] variant a rc=0 rc=0 wall_s=12.485162780 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:45:08] variant c1 on x2fb_x2_1m_hi_ff100_p0
+[10:45:25] variant c1 rc=0 rc=0 wall_s=14.912554369 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:45:27] variant c2 on x2fb_x2_1m_hi_ff50_p0
+[10:45:41] variant c2 rc=0 rc=0 wall_s=12.198566368 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:45:42] variant A0 on x2fb_x2_1m_hi_ff100_p0
+[10:45:52] variant A0 rc=0 rc=0 wall_s=8.265816823 stats=1000000 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:45:55] variant A0.1 on x2fb_x2_1m_hi_ff100_p0_1
+[10:46:04] variant A0.1 rc=0 rc=0 wall_s=7.756531911 stats=999000 1000 0 1000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:46:06] variant A1 on x2fb_x2_1m_hi_ff100_p1
+[10:46:15] variant A1 rc=0 rc=0 wall_s=7.393116601 stats=990000 10000 0 10000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:46:18] variant A10 on x2fb_x2_1m_hi_ff100_p10
+[10:46:26] variant A10 rc=0 rc=0 wall_s=6.946663259 stats=900000 100000 0 100000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:46:28] variant B0 on x2fb_x2_1m_hi_ff100_p0
+[10:46:34] variant B0 rc=0 rc=0 wall_s=5.113122548 stats=1000000 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:46:36] variant B0.1 on x2fb_x2_1m_hi_ff100_p0_1
+[10:46:43] variant B0.1 rc=0 rc=0 wall_s=5.751246630 stats=999000 1000 0 1000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:46:44] variant B1 on x2fb_x2_1m_hi_ff100_p1
+[10:46:52] variant B1 rc=0 rc=0 wall_s=5.621521776 stats=990000 10000 0 10000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:46:53] variant B10 on x2fb_x2_1m_hi_ff100_p10
+[10:47:01] variant B10 rc=0 rc=0 wall_s=6.167251898 stats=900000 100000 0 100000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:47:01] ./x2.sh src1m x2_1m hi rebuild 1 plain a c1 c2 Au B
+[10:47:01] rebuild base x2keep_x2_1m_hi_c1_rb from x2keep_x2_1m_hi_c1
+[10:47:05] variant plain on x2keep_x2_1m_hi_c1_rb
+[10:47:08] variant plain rc=0 rc=0 wall_s=1.394758536 stats=0 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 plain_md5=52192c9ddc3a266f8989d5206e9a90a0 
+[10:47:10] variant a on x2keep_x2_1m_hi_c1_rb
+[10:47:26] variant a rc=0 rc=0 wall_s=13.829184004 stats=10000 1010000 463 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:47:27] variant c1 on x2keep_x2_1m_hi_c1_rb
+[10:47:41] variant c1 rc=0 rc=0 wall_s=11.102221115 stats=10000 1010000 443 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:47:41] rebuild base x2keep_x2_1m_hi_c2_rb from x2keep_x2_1m_hi_c2
+[10:47:44] variant c2 on x2keep_x2_1m_hi_c2_rb
+[10:47:57] variant c2 rc=0 rc=0 wall_s=10.955396378 stats=10000 1010000 979156 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:47:59] variant Au on x2keep_x2_1m_hi_c1_rb
+[10:48:13] variant Au rc=0 rc=0 wall_s=12.267584774 stats=10000 1000000 443 1000000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:48:15] variant B on x2keep_x2_1m_hi_c1_rb
+[10:48:22] variant B rc=0 rc=0 wall_s=5.527284533 stats=10000 1000000 443 1000000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:48:22] env KEEP_C=1 ./x2.sh src1m x2_1m auth fresh 2 plain a c1 c2 A0 A0.1 A1 A10 B0 B0.1 B1 B10
+[10:48:24] variant plain on x2fb_x2_1m_auth_ff100_p0
+[10:48:26] variant plain rc=0 rc=0 wall_s=.544444637 stats=0 0 0 0 hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 plain_md5=372d185e6cb9631e85199a3923a50d9d 
+[10:48:27] variant a on x2fb_x2_1m_auth_ff100_p0
+[10:48:30] variant a rc=0 rc=0 wall_s=1.613231728 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:31] variant c1 on x2fb_x2_1m_auth_ff100_p0
+[10:48:34] variant c1 rc=0 rc=0 wall_s=1.557274364 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:36] variant c2 on x2fb_x2_1m_auth_ff50_p0
+[10:48:38] variant c2 rc=0 rc=0 wall_s=1.574966658 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:40] variant A0 on x2fb_x2_1m_auth_ff100_p0
+[10:48:42] variant A0 rc=0 rc=0 wall_s=.977377923 stats=99995 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:44] variant A0.1 on x2fb_x2_1m_auth_ff100_p0_1
+[10:48:46] variant A0.1 rc=0 rc=0 wall_s=1.046311400 stats=99895 100 0 100 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:48] variant A1 on x2fb_x2_1m_auth_ff100_p1
+[10:48:50] variant A1 rc=0 rc=0 wall_s=1.078088789 stats=98995 1000 0 1000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:52] variant A10 on x2fb_x2_1m_auth_ff100_p10
+[10:48:54] variant A10 rc=0 rc=0 wall_s=1.234861657 stats=89995 10000 0 10000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:56] variant B0 on x2fb_x2_1m_auth_ff100_p0
+[10:48:58] variant B0 rc=0 rc=0 wall_s=1.046280171 stats=99995 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:48:59] variant B0.1 on x2fb_x2_1m_auth_ff100_p0_1
+[10:49:01] variant B0.1 rc=0 rc=0 wall_s=1.059898799 stats=99895 100 0 100 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:49:03] variant B1 on x2fb_x2_1m_auth_ff100_p1
+[10:49:05] variant B1 rc=0 rc=0 wall_s=1.069810284 stats=98995 1000 0 1000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:49:06] variant B10 on x2fb_x2_1m_auth_ff100_p10
+[10:49:08] variant B10 rc=0 rc=0 wall_s=1.111012814 stats=89995 10000 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:49:09] ./x2.sh src1m x2_1m auth rebuild 2 plain a c1 c2 Au B
+[10:49:10] variant plain on x2keep_x2_1m_auth_c1_rb
+[10:49:12] variant plain rc=0 rc=0 wall_s=.631480238 stats=0 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 plain_md5=11e63185e210c4979708cfd5b4f56d41 
+[10:49:13] variant a on x2keep_x2_1m_auth_c1_rb
+[10:49:16] variant a rc=0 rc=0 wall_s=1.648952579 stats=1000 100995 593 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:49:17] variant c1 on x2keep_x2_1m_auth_c1_rb
+[10:49:20] variant c1 rc=0 rc=0 wall_s=1.629017510 stats=1000 100995 580 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:49:22] variant c2 on x2keep_x2_1m_auth_c2_rb
+[10:49:24] variant c2 rc=0 rc=0 wall_s=1.562444409 stats=1000 100995 97905 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:49:26] variant Au on x2keep_x2_1m_auth_c1_rb
+[10:49:29] variant Au rc=0 rc=0 wall_s=2.295034583 stats=1000 99995 580 99995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:49:31] variant B on x2keep_x2_1m_auth_c1_rb
+[10:49:33] variant B rc=0 rc=0 wall_s=1.254918415 stats=1000 99995 580 99995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:49:33] env KEEP_C=1 ./x2.sh src1m x2_1m hi fresh 2 plain a c1 c2 A0 A0.1 A1 A10 B0 B0.1 B1 B10
+[10:49:35] variant plain on x2fb_x2_1m_hi_ff100_p0
+[10:49:37] variant plain rc=0 rc=0 wall_s=1.350475025 stats=0 0 0 0 hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 plain_md5=a197d5d1818af42fac968ae1f5e1d109 
+[10:49:39] variant a on x2fb_x2_1m_hi_ff100_p0
+[10:49:53] variant a rc=0 rc=0 wall_s=12.474666784 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:49:54] variant c1 on x2fb_x2_1m_hi_ff100_p0
+[10:50:07] variant c1 rc=0 rc=0 wall_s=10.935042463 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:50:09] variant c2 on x2fb_x2_1m_hi_ff50_p0
+[10:50:22] variant c2 rc=0 rc=0 wall_s=11.264041787 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:50:24] variant A0 on x2fb_x2_1m_hi_ff100_p0
+[10:50:30] variant A0 rc=0 rc=0 wall_s=5.149856151 stats=1000000 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:50:32] variant A0.1 on x2fb_x2_1m_hi_ff100_p0_1
+[10:50:39] variant A0.1 rc=0 rc=0 wall_s=5.788545614 stats=999000 1000 0 1000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:50:41] variant A1 on x2fb_x2_1m_hi_ff100_p1
+[10:50:49] variant A1 rc=0 rc=0 wall_s=6.472817078 stats=990000 10000 0 10000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:50:51] variant A10 on x2fb_x2_1m_hi_ff100_p10
+[10:51:00] variant A10 rc=0 rc=0 wall_s=6.839389191 stats=900000 100000 0 100000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:51:01] variant B0 on x2fb_x2_1m_hi_ff100_p0
+[10:51:08] variant B0 rc=0 rc=0 wall_s=5.128754711 stats=1000000 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:51:09] variant B0.1 on x2fb_x2_1m_hi_ff100_p0_1
+[10:51:16] variant B0.1 rc=0 rc=0 wall_s=5.506533732 stats=999000 1000 0 1000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:51:18] variant B1 on x2fb_x2_1m_hi_ff100_p1
+[10:51:25] variant B1 rc=0 rc=0 wall_s=5.579129991 stats=990000 10000 0 10000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:51:26] variant B10 on x2fb_x2_1m_hi_ff100_p10
+[10:51:34] variant B10 rc=0 rc=0 wall_s=5.876640145 stats=900000 100000 0 100000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:51:34] ./x2.sh src1m x2_1m hi rebuild 2 plain a c1 c2 Au B
+[10:51:36] variant plain on x2keep_x2_1m_hi_c1_rb
+[10:51:39] variant plain rc=0 rc=0 wall_s=1.382033345 stats=0 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 plain_md5=52192c9ddc3a266f8989d5206e9a90a0 
+[10:51:40] variant a on x2keep_x2_1m_hi_c1_rb
+[10:51:57] variant a rc=0 rc=0 wall_s=14.302187523 stats=10000 1010000 463 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:51:59] variant c1 on x2keep_x2_1m_hi_c1_rb
+[10:52:11] variant c1 rc=0 rc=0 wall_s=10.846013938 stats=10000 1010000 443 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:52:13] variant c2 on x2keep_x2_1m_hi_c2_rb
+[10:52:25] variant c2 rc=0 rc=0 wall_s=10.666270088 stats=10000 1010000 979156 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:52:27] variant Au on x2keep_x2_1m_hi_c1_rb
+[10:52:41] variant Au rc=0 rc=0 wall_s=12.061560102 stats=10000 1000000 443 1000000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:52:43] variant B on x2keep_x2_1m_hi_c1_rb
+[10:52:50] variant B rc=0 rc=0 wall_s=5.491676014 stats=10000 1000000 443 1000000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:52:50] env KEEP_C=1 ./x2.sh src1m x2_1m auth fresh 3 plain a c1 c2 A0 A0.1 A1 A10 B0 B0.1 B1 B10
+[10:52:52] variant plain on x2fb_x2_1m_auth_ff100_p0
+[10:52:53] variant plain rc=0 rc=0 wall_s=.558528339 stats=0 0 0 0 hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 plain_md5=372d185e6cb9631e85199a3923a50d9d 
+[10:52:55] variant a on x2fb_x2_1m_auth_ff100_p0
+[10:52:58] variant a rc=0 rc=0 wall_s=1.601305398 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:52:59] variant c1 on x2fb_x2_1m_auth_ff100_p0
+[10:53:02] variant c1 rc=0 rc=0 wall_s=1.588766788 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:04] variant c2 on x2fb_x2_1m_auth_ff50_p0
+[10:53:06] variant c2 rc=0 rc=0 wall_s=1.551842758 stats=99995 99995 0 99995 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:08] variant A0 on x2fb_x2_1m_auth_ff100_p0
+[10:53:10] variant A0 rc=0 rc=0 wall_s=1.035860382 stats=99995 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:12] variant A0.1 on x2fb_x2_1m_auth_ff100_p0_1
+[10:53:14] variant A0.1 rc=0 rc=0 wall_s=1.064701424 stats=99895 100 0 100 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:16] variant A1 on x2fb_x2_1m_auth_ff100_p1
+[10:53:18] variant A1 rc=0 rc=0 wall_s=1.111354466 stats=98995 1000 0 1000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:20] variant A10 on x2fb_x2_1m_auth_ff100_p10
+[10:53:22] variant A10 rc=0 rc=0 wall_s=1.190377772 stats=89995 10000 0 10000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:23] variant B0 on x2fb_x2_1m_auth_ff100_p0
+[10:53:25] variant B0 rc=0 rc=0 wall_s=1.022544722 stats=99995 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:27] variant B0.1 on x2fb_x2_1m_auth_ff100_p0_1
+[10:53:29] variant B0.1 rc=0 rc=0 wall_s=1.060228700 stats=99895 100 0 100 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:30] variant B1 on x2fb_x2_1m_auth_ff100_p1
+[10:53:33] variant B1 rc=0 rc=0 wall_s=1.084076892 stats=98995 1000 0 1000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:34] variant B10 on x2fb_x2_1m_auth_ff100_p10
+[10:53:36] variant B10 rc=0 rc=0 wall_s=1.118372704 stats=89995 10000 0 10000 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 
+[10:53:36] ./x2.sh src1m x2_1m auth rebuild 3 plain a c1 c2 Au B
+[10:53:38] variant plain on x2keep_x2_1m_auth_c1_rb
+[10:53:39] variant plain rc=0 rc=0 wall_s=.636402246 stats=0 0 0 0 hidden_md5=14de1427093655605e319210c2959007 rows=99995 target_md5=372d185e6cb9631e85199a3923a50d9d rows=99995 plain_md5=11e63185e210c4979708cfd5b4f56d41 
+[10:53:41] variant a on x2keep_x2_1m_auth_c1_rb
+[10:53:44] variant a rc=0 rc=0 wall_s=1.691096757 stats=1000 100995 593 0 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:53:45] variant c1 on x2keep_x2_1m_auth_c1_rb
+[10:53:48] variant c1 rc=0 rc=0 wall_s=1.622931915 stats=1000 100995 580 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:53:49] variant c2 on x2keep_x2_1m_auth_c2_rb
+[10:53:52] variant c2 rc=0 rc=0 wall_s=1.694620399 stats=1000 100995 97905 100995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:53:54] variant Au on x2keep_x2_1m_auth_c1_rb
+[10:53:57] variant Au rc=0 rc=0 wall_s=2.098540447 stats=1000 99995 580 99995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:53:58] variant B on x2keep_x2_1m_auth_c1_rb
+[10:54:01] variant B rc=0 rc=0 wall_s=1.221836073 stats=1000 99995 580 99995 hidden_md5=3ac81345be10b3cbcf112501e9dadaf3 rows=100995 target_md5=11e63185e210c4979708cfd5b4f56d41 rows=100995 
+[10:54:01] env KEEP_C=1 ./x2.sh src1m x2_1m hi fresh 3 plain a c1 c2 A0 A0.1 A1 A10 B0 B0.1 B1 B10
+[10:54:02] variant plain on x2fb_x2_1m_hi_ff100_p0
+[10:54:05] variant plain rc=0 rc=0 wall_s=1.335742664 stats=0 0 0 0 hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 plain_md5=a197d5d1818af42fac968ae1f5e1d109 
+[10:54:06] variant a on x2fb_x2_1m_hi_ff100_p0
+[10:54:20] variant a rc=0 rc=0 wall_s=12.406088635 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:54:22] variant c1 on x2fb_x2_1m_hi_ff100_p0
+[10:54:35] variant c1 rc=0 rc=0 wall_s=10.971213520 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:54:37] variant c2 on x2fb_x2_1m_hi_ff50_p0
+[10:54:50] variant c2 rc=0 rc=0 wall_s=11.259579422 stats=1000000 1000000 0 1000000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:54:52] variant A0 on x2fb_x2_1m_hi_ff100_p0
+[10:54:58] variant A0 rc=0 rc=0 wall_s=5.183760437 stats=1000000 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:55:00] variant A0.1 on x2fb_x2_1m_hi_ff100_p0_1
+[10:55:07] variant A0.1 rc=0 rc=0 wall_s=5.785311056 stats=999000 1000 0 1000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:55:09] variant A1 on x2fb_x2_1m_hi_ff100_p1
+[10:55:17] variant A1 rc=0 rc=0 wall_s=5.951733687 stats=990000 10000 0 10000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:55:19] variant A10 on x2fb_x2_1m_hi_ff100_p10
+[10:55:27] variant A10 rc=0 rc=0 wall_s=6.948958913 stats=900000 100000 0 100000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:55:29] variant B0 on x2fb_x2_1m_hi_ff100_p0
+[10:55:35] variant B0 rc=0 rc=0 wall_s=4.930440206 stats=1000000 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:55:36] variant B0.1 on x2fb_x2_1m_hi_ff100_p0_1
+[10:55:44] variant B0.1 rc=0 rc=0 wall_s=5.699068507 stats=999000 1000 0 1000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:55:45] variant B1 on x2fb_x2_1m_hi_ff100_p1
+[10:55:52] variant B1 rc=0 rc=0 wall_s=5.623663129 stats=990000 10000 0 10000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:55:54] variant B10 on x2fb_x2_1m_hi_ff100_p10
+[10:56:01] variant B10 rc=0 rc=0 wall_s=5.716345179 stats=900000 100000 0 100000 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 
+[10:56:01] ./x2.sh src1m x2_1m hi rebuild 3 plain a c1 c2 Au B
+[10:56:03] variant plain on x2keep_x2_1m_hi_c1_rb
+[10:56:06] variant plain rc=0 rc=0 wall_s=1.383634774 stats=0 0 0 0 hidden_md5=3297e943f2fe15866b9e11fce9ea0817 rows=1000000 target_md5=a197d5d1818af42fac968ae1f5e1d109 rows=1000000 plain_md5=52192c9ddc3a266f8989d5206e9a90a0 
+[10:56:07] variant a on x2keep_x2_1m_hi_c1_rb
+[10:56:24] variant a rc=0 rc=0 wall_s=14.237530963 stats=10000 1010000 463 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:56:25] variant c1 on x2keep_x2_1m_hi_c1_rb
+[10:56:38] variant c1 rc=0 rc=0 wall_s=10.802797665 stats=10000 1010000 443 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:56:40] variant c2 on x2keep_x2_1m_hi_c2_rb
+[10:56:52] variant c2 rc=0 rc=0 wall_s=10.606257614 stats=10000 1010000 979156 1010000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:56:54] variant Au on x2keep_x2_1m_hi_c1_rb
+[10:57:08] variant Au rc=0 rc=0 wall_s=12.031923564 stats=10000 1000000 443 1000000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+[10:57:09] variant B on x2keep_x2_1m_hi_c1_rb
+[10:57:17] variant B rc=0 rc=0 wall_s=5.414778813 stats=10000 1000000 443 1000000 hidden_md5=99acbb8b3a5e9bb7a9c8fbd06ec46af5 rows=1010000 target_md5=52192c9ddc3a266f8989d5206e9a90a0 rows=1010000 
+gen 10m
+ 10:57:17 up 1 day, 19:25,  1 user,  load average: 1.17, 2.10, 8.09
+rustc=0 cargo=0
+NOTICE:  database "src10m" does not exist, skipping
+[10:57:17] psql -X -q -h /home/mike/code/trellis-lane-r/target/research-pg-x2 -p 54872 -U app -v N=10000000 -f gen_x2.sql src10m
+ setseed 
+---------
+ 
+(1 row)
+
+  posts   | authors_used 
+----------+--------------
+ 10000000 |       999956
+(1 row)
+
+[10:57:43] env KEEP_C=1 ./x2.sh src10m x2_10m hi fresh 1 plain c1 c2 A0 A0.1 A1 A10 B0 B0.1 B1 B10
+[10:57:49] variant plain on x2fb_x2_10m_hi_ff100_p0
+[10:58:07] variant plain rc=0 rc=0 wall_s=15.332095741 stats=0 0 0 0 hidden_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 target_md5=d41d8cd98f00b204e9800998ecf8427e rows=0 plain_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc 
+[10:58:12] variant c1 on x2fb_x2_10m_hi_ff100_p0
+[11:00:53] variant c1 rc=0 rc=0 wall_s=146.353720324 stats=10000000 10000000 0 10000000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:01:00] variant c2 on x2fb_x2_10m_hi_ff50_p0
+[11:03:46] variant c2 rc=0 rc=0 wall_s=154.003872067 stats=10000000 10000000 0 10000000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:03:51] variant A0 on x2fb_x2_10m_hi_ff100_p0
+[11:04:57] variant A0 rc=0 rc=0 wall_s=59.044529065 stats=10000000 0 0 0 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:05:06] variant A0.1 on x2fb_x2_10m_hi_ff100_p0_1
+[11:06:27] variant A0.1 rc=0 rc=0 wall_s=71.997065537 stats=9990000 10000 0 10000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:06:37] variant A1 on x2fb_x2_10m_hi_ff100_p1
+[11:08:01] variant A1 rc=0 rc=0 wall_s=76.416207021 stats=9900000 100000 0 100000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:08:13] variant A10 on x2fb_x2_10m_hi_ff100_p10
+[11:09:42] variant A10 rc=0 rc=0 wall_s=81.815099703 stats=9000000 1000000 0 1000000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:09:49] variant B0 on x2fb_x2_10m_hi_ff100_p0
+[11:10:55] variant B0 rc=0 rc=0 wall_s=59.659074401 stats=10000000 0 0 0 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:11:01] variant B0.1 on x2fb_x2_10m_hi_ff100_p0_1
+[11:12:18] variant B0.1 rc=0 rc=0 wall_s=68.665411168 stats=9990000 10000 0 10000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:12:22] variant B1 on x2fb_x2_10m_hi_ff100_p1
+[11:13:52] variant B1 rc=0 rc=0 wall_s=81.393745272 stats=9900000 100000 0 100000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:13:59] variant B10 on x2fb_x2_10m_hi_ff100_p10
+[11:15:33] variant B10 rc=0 rc=0 wall_s=85.628338971 stats=9000000 1000000 0 1000000 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 
+[11:15:37] ./x2.sh src10m x2_10m hi rebuild 1 plain c1 c2 Au B
+[11:15:37] rebuild base x2keep_x2_10m_hi_c1_rb from x2keep_x2_10m_hi_c1
+[11:17:35] variant plain on x2keep_x2_10m_hi_c1_rb
+[11:18:11] variant plain rc=0 rc=0 wall_s=28.598458055 stats=0 0 0 0 hidden_md5=559bf7786cf1c3a9e227e6c36b3a70b4 rows=10000000 target_md5=4ff1cdab71b4b6764fc9ef6267aaf0bc rows=10000000 plain_md5=71ed85a7c12d60e87ec6c02a938da868 
+[11:18:18] variant c1 on x2keep_x2_10m_hi_c1_rb
+[11:21:26] variant c1 rc=0 rc=0 wall_s=173.588464916 stats=100000 10100000 4468 10100000 hidden_md5=0a6aa4fbebfcb8450b072af7e158a1cd rows=10100000 target_md5=71ed85a7c12d60e87ec6c02a938da868 rows=10100000 
+[11:21:27] rebuild base x2keep_x2_10m_hi_c2_rb from x2keep_x2_10m_hi_c2
+[11:22:51] variant c2 on x2keep_x2_10m_hi_c2_rb
+[11:26:52] variant c2 rc=0 rc=0 wall_s=227.396819187 stats=100000 10100000 9791656 10100000 hidden_md5=0a6aa4fbebfcb8450b072af7e158a1cd rows=10100000 target_md5=71ed85a7c12d60e87ec6c02a938da868 rows=10100000 
+[11:27:02] variant Au on x2keep_x2_10m_hi_c1_rb
+[11:30:49] variant Au rc=0 rc=0 wall_s=211.640528838 stats=100000 10000000 4468 10000000 hidden_md5=0a6aa4fbebfcb8450b072af7e158a1cd rows=10100000 target_md5=71ed85a7c12d60e87ec6c02a938da868 rows=10100000 
+[11:30:57] variant B on x2keep_x2_10m_hi_c1_rb
+[11:32:58] variant B rc=0 rc=0 wall_s=102.329092152 stats=100000 10000000 4468 10000000 hidden_md5=0a6aa4fbebfcb8450b072af7e158a1cd rows=10100000 target_md5=71ed85a7c12d60e87ec6c02a938da868 rows=10100000 
+[11:32:58] env TIMEOUT=30min ./x2.sh src10m x2_10m hi rebuild 1 a
+[11:33:06] variant a on x2keep_x2_10m_hi_c1_rb
+[11:55:56] variant a rc=0 rc=0 wall_s=1349.657953956 stats=100000 10100000 4482 10100000 hidden_md5=0a6aa4fbebfcb8450b072af7e158a1cd rows=10100000 target_md5=71ed85a7c12d60e87ec6c02a938da868 rows=10100000 
+20261112T104320-r-bench	done	bench	r	1917	research/absolute-build/x2/run_x2.sh: X2 statement micro, fresh+rebuild, 1M rows (100k/1M groups, 3 reps) and 10M rows/10M groups (1 rep)	2026-11-12T10:43:20-08:00	2026-11-12T11:55:57-08:00	4357	13640000	ok	10800	X2 plain-aggregate build statements (today a, c1 key-ordered, c2 ff50, A write-once+stragglers, B gate+upsert, plain): fresh and rebuild at 1M rows/100k+1M groups x3 and 10M/10M x1; see research/absolute-build/x2/X2-results.md. rows = generated 11M posts + rebuild source changes (estimate)
+finished 20261112T104320-r-bench outcome=ok

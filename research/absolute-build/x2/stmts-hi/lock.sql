@@ -1,0 +1,1 @@
+insert into "trellis"."agg_1" ("grp_hi") select distinct "grp_hi" from ( select "grp_hi" from pg_temp."trellis_group_sides_1_44d1af5ecae2d619" union all select "grp_hi" from pg_temp."trellis_group_recompute_1_f8ecc87fa7762b2e" ) as g order by "grp_hi" on conflict ("grp_hi") do update set __n = excluded.__n where false;

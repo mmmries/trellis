@@ -1,0 +1,3 @@
+label=x2_1m shape=auth mode=rebuild rep=2
+ 10:49:09 up 1 day, 19:17,  1 user,  load average: 0.97, 6.56, 12.98
+rustc=0 cargo=0
