@@ -1159,10 +1159,17 @@ async fn plan_job(d: &Driver) -> (Option<String>, Option<String>, bool) {
 /// rolled back, its fenced transaction still holds the job's claim row `FOR
 /// KEY SHARE` (`ClaimFence::hold`): a claim's `FOR UPDATE SKIP LOCKED` then
 /// skips the row the test freed, and finds nothing to run.
+/// A backend that has already exited is not one `pg_terminate_backend` can
+/// signal, and it returns false at once (#1898); one gone from
+/// `pg_stat_activity` has rolled back, so that counts as exited.
 async fn end_session(d: &Driver, pid: i32) {
     let ended: bool = d
         .ctl
-        .query_one("select pg_terminate_backend($1, 60000)", &[&pid])
+        .query_one(
+            "select pg_terminate_backend($1, 60000) \
+             or not exists (select 1 from pg_stat_activity where pid = $1)",
+            &[&pid],
+        )
         .await
         .expect("end the job's session")
         .get(0);

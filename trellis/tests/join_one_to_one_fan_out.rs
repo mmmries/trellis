@@ -214,10 +214,17 @@ async fn converged(d: &Driver, token: tokio_postgres::types::PgLsn) -> bool {
 
 /// Ends a frozen chunk's session and waits until it has exited, so its
 /// transaction has rolled back and released its locks.
+/// A backend that has already exited is not one `pg_terminate_backend` can
+/// signal, and it returns false at once (#1898); one gone from
+/// `pg_stat_activity` has rolled back, so that counts as exited.
 async fn end_session(d: &Driver, pid: i32) {
     let ended: bool = d
         .ctl
-        .query_one("select pg_terminate_backend($1, 60000)", &[&pid])
+        .query_one(
+            "select pg_terminate_backend($1, 60000) \
+             or not exists (select 1 from pg_stat_activity where pid = $1)",
+            &[&pid],
+        )
         .await
         .expect("end the chunk's session")
         .get(0);
