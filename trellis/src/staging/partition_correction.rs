@@ -1661,4 +1661,77 @@ mod tests {
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
+
+    /// A correction is enqueued only for a definition that applies; one that
+    /// is `live` moves to `backfilling` under a Re-derive build with it.
+    #[tokio::test]
+    async fn a_correction_is_enqueued_only_for_an_applying_definition() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = Pool::new(&config).expect("pool");
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute("create table public.s (id bigint primary key, x numeric)")
+            .await
+            .expect("source");
+        let columns: std::collections::HashMap<String, crate::defs::ast::ValueType> = ["id", "x"]
+            .iter()
+            .map(|name| (name.to_string(), crate::defs::ast::ValueType::Numeric))
+            .collect();
+        let id =
+            catalog::create_definition(&pool, "TRANSFORM t FROM public.s SELECT x AS v", &columns)
+                .await
+                .expect("define")
+                .id;
+        let correction: i64 = client
+            .query_one(
+                "insert into partition_corrections (table_name, kind, node_oid, node_name, cause) \
+                 values ('public.s', 'new_leaf', 1, 'public.s_1', 'created') returning id",
+                &[],
+            )
+            .await
+            .expect("correction")
+            .get(0);
+        let set = |status: &'static str, build: Option<&'static str>| {
+            let client = &client;
+            async move {
+                client
+                    .execute(
+                        "update transform_definitions set status = $2, build = $3 where id = $1",
+                        &[&id, &status, &build],
+                    )
+                    .await
+                    .expect("set state");
+            }
+        };
+        for (status, build) in [
+            ("backfilling", None),
+            ("waiting_to_backfill", None),
+            ("paused", None),
+            ("quarantined", None),
+        ] {
+            set(status, build).await;
+            assert!(
+                !enqueue(&pool, id, correction).await.expect("enqueue"),
+                "{status}"
+            );
+        }
+        set("live", None).await;
+        assert!(enqueue(&pool, id, correction).await.expect("enqueue"));
+        let row = client
+            .query_one(
+                &format!(
+                    "select status, {APPLYING_SQL}, \
+                            (select count(*) from backfill_chunks where correction_id = $2) \
+                     from transform_definitions where id = $1"
+                ),
+                &[&id, &correction],
+            )
+            .await
+            .expect("state");
+        assert_eq!(row.get::<_, String>(0), "backfilling");
+        assert!(row.get::<_, bool>(1), "applies under the Re-derive build");
+        assert_eq!(row.get::<_, i64>(2), 1);
+    }
 }
