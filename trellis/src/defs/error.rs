@@ -207,7 +207,7 @@ impl fmt::Display for ParseError {
             ),
             ParseError::NonImmutableConstruct { name } => write!(
                 f,
-                "'{name}' is not immutable and cannot be used in a calculated field (docs/transforms.md#calculated-fields requires immutable functions/operators only)"
+                "'{name}' is not immutable and cannot be used in a calculated field (docs/expressions.md#immutability requires immutable functions/operators only)"
             ),
             ParseError::UnsupportedPredicate { detail } => {
                 write!(f, "unsupported partial-data predicate: {detail}")

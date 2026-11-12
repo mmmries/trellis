@@ -1209,7 +1209,8 @@ other fields; a `JOIN` transform aggregates the join of two tables, and a 1-1
 `JOIN` writes one target row per row of its `FROM` table, joined to up to four
 other tables (a star). What the grammar accepts, what `define` refuses, and
 which column types play which role are in
-[transforms](transforms.md) and the [type-support matrix](type-support.md).
+[transforms](transforms.md), [expressions](expressions.md) and the
+[type-support matrix](type-support.md).
 Whatever the shape, what you can rely on is the status lifecycle and the `live`
 plus `await_converged` contract above. `self_check` audits a target against a
 recompute from its source, as a [background job](#self_check-is-a-background-job)

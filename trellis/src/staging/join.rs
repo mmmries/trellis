@@ -120,7 +120,7 @@
 //! 5. `T`: its groups are locked **after** the product, so the set is exactly
 //!    the groups the product reads under `J`, with every group of the visible
 //!    target and of `T`'s hidden table added (R8 one level up). One sorted
-//!    upsert locks and writes them: each group's delta, zero or not, is
+//!    upsert locks and writes them (ADR-0028, W3): each group's delta, zero or not, is
 //!    inserted as a new row or added to the row there, so the groups it
 //!    locks are the groups it writes, and a page's strict two-step form and
 //!    its lock-gap check have nothing to catch here. `T` changes only as the

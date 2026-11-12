@@ -7,7 +7,7 @@
 //! room to grow (aggregate/cross-join variants, general predicates) without
 //! changing the shape callers already match on.
 //!
-//! The value model is [`ValueType`]; see `docs/transforms.md` and ADR-0004's
+//! The value model is [`ValueType`]; see `docs/expressions.md` and ADR-0004's
 //! growth policy.
 
 use std::fmt;

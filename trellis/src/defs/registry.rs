@@ -1436,7 +1436,7 @@ pub fn extreme_type_admitted(value_type: ValueType) -> bool {
 
 /// Identifiers known to be non-immutable (depend on database/session state
 /// rather than solely their inputs), called out per
-/// `docs/transforms.md#calculated-fields` so a rejection can name the
+/// `docs/expressions.md#immutability` so a rejection can name the
 /// immutability rule rather than reporting a generic unknown-function error.
 pub const NON_IMMUTABLE_NAMES: &[&str] = &[
     "NOW",

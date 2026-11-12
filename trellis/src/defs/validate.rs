@@ -1215,15 +1215,14 @@ impl fmt::Display for ValidationError {
             ValidationError::UntypedNull { field, context } => write!(
                 f,
                 "calculated field '{field}' has a NULL in {context}, where nothing gives it a \
-                 type; write CAST(NULL AS <type>) with the type you mean (see \"Supported \
-                 sources and targets\" in docs/transforms.md)"
+                 type; write CAST(NULL AS <type>) with the type you mean (see \"Refusals\" in \
+                 docs/expressions.md)"
             ),
             ValidationError::ConstantDivisorZero { field, text } => write!(
                 f,
                 "calculated field '{field}' divides by a literal zero in {text}; Postgres \
                  raises a division-by-zero error for every row that has a dividend. Use a \
-                 nonzero divisor, or a column (see \"Supported sources and targets\" in \
-                 docs/transforms.md)"
+                 nonzero divisor, or a column (see \"Refusals\" in docs/expressions.md)"
             ),
             ValidationError::IntegerDivision { field, lhs, rhs } => write!(
                 f,
@@ -1241,7 +1240,7 @@ impl fmt::Display for ValidationError {
                 "calculated field '{field}' casts a {from} value to {to}; the only casts \
                  admitted are an integer to the same or a wider integer, any integer to \
                  numeric, numeric to numeric, and a date or timestamp to timestamp, because \
-                 only those are exact and read no session setting (see \"Supported sources and targets\" in docs/transforms.md)"
+                 only those are exact and read no session setting (see \"Refusals\" in docs/expressions.md)"
             ),
             ValidationError::TemporalOperand {
                 field,
@@ -1251,7 +1250,7 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "calculated field '{field}': {construct} does not take a {found} value: \
-                 {reason} (see \"Supported sources and targets\" in docs/transforms.md)"
+                 {reason} (see \"Refusals\" in docs/expressions.md)"
             ),
             ValidationError::TemporalLiteral {
                 field,

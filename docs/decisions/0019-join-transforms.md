@@ -192,19 +192,17 @@ values, I measured 51 MB in all, against 15 GB for one materialized row per fact
 
 ### A writer locks `J[k]` `FOR UPDATE`, reads the other side after the lock, and writes `T` in its own transaction
 
+How every writer locks and writes is defined in
+[ADR-0028](0028-locking-and-writing.md). A JOIN transform's writers follow it
+with `J` as the lock that stands for a join key:
+
 - **JR1, lock order.** Every writer of `P` or `M` (a page, a build step, a cell
   recompute, a leaf correction) locks `J[k]` `FOR UPDATE` for every non-null
   key it touches; a key with a `NULL` in any column joins nothing and takes
-  no `J` row and no lock. A writer creates the `J` rows its keys lack with
-  one sorted `insert … on conflict do nothing`, then locks all of them with
-  one sorted `select … for update`. Every writer takes its locks in one
-  order: build-chunk rows, the pair's truncate lock row, `J` rows sorted by
-  key (by the tuple of join columns), `P` and `M` cells sorted, then `T`
-  groups sorted, each class in one sorted statement.
+  no `J` row and no lock. It creates the `J` rows its keys lack and takes its
+  locks in ADR-0028's order (I5), each class in one sorted statement.
 - **JR2, read after the lock.** A writer reads the other side's partials and
-  `J.matches` only in statements after its `J` lock statement. Pages and builds
-  run under `READ COMMITTED`, so each of those statements sees every writer the
-  lock waited for.
+  `J.matches` only in statements after its `J` lock statement (ADR-0028, I1).
 - **JR3, one transaction.** An `a`-side writer adds `ΔP ⊗ M`, plus `ΔP ⊗ U`
   where `matches = 0`, to `T` in the same transaction as its change to `P`. A
   `b`-side writer adds `P ⊗ ΔM`, and when `matches` crosses zero moves the key's
@@ -249,8 +247,9 @@ The strict form of the `T` write is kept for pages: a nonzero delta for a `T`
 group the page didn't lock is an error, not a silent insert, so a gap in the
 computed lock set fails loudly instead of losing a delta. A build locks and
 writes `T`'s groups in one sorted upsert, every staged group inserted or added
-to (a zero delta locks its row without rewriting it), so its lock set and write
-set are the same by construction.
+to (a zero delta locks its row without rewriting it), so its lock set and its
+write set are the same by construction
+([ADR-0028](0028-locking-and-writing.md#w3-where-a-page-can-write-the-same-rows-the-one-write-is-a-sorted-upsert-and-it-is-the-lock)).
 
 ### `TRUNCATE` of either side excludes writers of both, behind a two-sided barrier
 
@@ -345,9 +344,10 @@ can take it. The enumeration is a `create table as` too, for the same reason as
 the snapshot statement. A cell first seen after the enumeration belongs to its
 pages. It then carries both sides' changes into `T` as the product, as a page
 does. `T`'s groups are locked and written after the product, in one sorted
-upsert, together with every group of the visible target and of `T`'s hidden
-table; `T` changes only as a delta, and each locked group's visible row is compared with
-the row the target holds. Pages apply from the build's first moment, and a page
+upsert (ADR-0028, W3), together with every group of the visible target and of
+`T`'s hidden table; `T` changes only as a delta, and each locked group's
+visible row is compared with the row the target holds. Pages apply from the
+build's first moment, and a page
 that names a key the build holds waits for its commit. Readers see the old `T`
 and the old visible rows until then. One `GROUP BY` per structure was 2–12x
 cheaper than chunks in the model (84 s against 412–509 s on a 100M-row fact
