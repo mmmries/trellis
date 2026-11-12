@@ -264,15 +264,10 @@ takes it anyway, so one code path serves every `n`, at about 8% of its
 fan-out's time.
 
 **Lock order.** A page carrying changes and Re-derives of several tables
-takes the lock classes in one global order, over the union of its key sets:
-the truncate lock row; `J`, in one statement sorted by `(position, key)`;
-the `R` entries, in one statement sorted by entry key; the `M` entries,
-sorted by `(position, id)`, in statements that follow that order; then
-the target rows. Placeholder inserts follow the same order, so no two
-transactions take two rows of `J`, `R` or `M` in opposite orders. The target
-rows need no such order: every writer of a target row holds its `R` entry
-first (C), so two writers of one row queue on that entry before either
-reaches the row.
+takes the lock classes in one global order, over the union of its key sets.
+[ADR-0028](0028-locking-and-writing.md#i5-every-writer-takes-its-locks-in-one-order-each-class-in-one-sorted-statement)
+defines that order, for `J`, the `R` entries, the `M` entries and the target
+rows.
 
 A truncate page holds the lock row `FOR UPDATE`, empties its table's hidden
 table and raises its floor. It empties the table with a `DELETE`: a build
