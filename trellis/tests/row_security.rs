@@ -1661,7 +1661,7 @@ async fn a_revoked_schema_usage_leaves_another_tables_redefined_key_checked() {
     assert!(
         failure
             .error
-            .contains("role rls_trellis lacks USAGE on schema app"),
+            .starts_with("the drain halted: permission denied for schema app; role rls_trellis lacks USAGE on schema app"),
         "{}",
         failure.error
     );

@@ -99,6 +99,19 @@ fn seed(err: &ApplyError) -> Option<Seed> {
     }
 }
 
+/// The message of the first Postgres error on `err`'s source chain, if it
+/// has one.
+fn refused_message(err: &ApplyError) -> Option<String> {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return pg.as_db_error().map(|db| db.message().to_string());
+        }
+        link = err.source();
+    }
+    None
+}
+
 /// Pauses every definition that isn't frozen and that the halting failure
 /// `err` reaches (see the module doc), and, if that paused any, records the
 /// halting stop, all in one transaction. Returns the bare targets of the
@@ -119,6 +132,13 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
         None => return Ok(Vec::new()),
     };
 
+    // A refused read or write reads as Postgres's own message, without the
+    // wrappers of whichever step met it, since the refusal names the step's
+    // role and table.
+    let text = match &seed {
+        None => refused_message(err).unwrap_or_else(|| err.to_string()),
+        Some(_) => err.to_string(),
+    };
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     let paused = pause_closure(
@@ -127,7 +147,7 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
         pool.floors(),
         seed,
         "the drain halted",
-        &err.to_string(),
+        &text,
     )
     .await?;
     txn.commit().await?;
