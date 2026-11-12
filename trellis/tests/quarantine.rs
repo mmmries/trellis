@@ -15,7 +15,7 @@ mod drain_driver;
 #[path = "support/sql_recompute.rs"]
 mod sql_recompute;
 
-use drain_driver::pipeline::{connect_raw, numeric_columns};
+use drain_driver::pipeline::{self, connect_raw, numeric_columns};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -41,15 +41,6 @@ fn is_data_exception(err: &ApplyError) -> bool {
         ApplyError::Db(err) => err.code().is_some_and(|code| code.code().starts_with("22")),
         _ => false,
     }
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
 }
 
 async fn segment_state_is_drained(client: &Client, seg_seq: i64) -> bool {
@@ -298,7 +289,7 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
         "the released row is now an ordinary pending ring row; the predicate must still block"
     );
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
     assert!(
         converge::converged_through(&client, token)
@@ -354,7 +345,7 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
     match result {
         Err(err) if is_data_exception(&err) => {}
@@ -426,7 +417,7 @@ async fn a_clean_drain_clears_death_counters() {
         Some(r#"{"price":"10.00","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
 
     assert_eq!(
@@ -481,7 +472,7 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 1, "only the non-poisoned key writes");
 
@@ -513,7 +504,7 @@ async fn a_healthy_later_change_to_a_poisoned_key_survives_via_its_own_parked_co
         .expect("release_key");
     assert_eq!(replayed, 1);
 
-    let seg_seq2 = seal_active_segment(&mut client).await;
+    let seg_seq2 = pipeline::seal(&mut client).await;
     drain(&db.pool, seg_seq2, "worker").await;
 
     let total: String = client
@@ -593,7 +584,7 @@ async fn a_halting_schema_error_is_never_quarantined_and_pauses_what_it_reaches(
         .await
         .expect("halting_stop_stats before");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
     match result {
         Ok(Some(outcome)) => assert!(outcome.batch_drained, "the page drains"),
@@ -700,7 +691,7 @@ async fn a_halting_failure_an_isolation_probe_meets_pauses_what_it_reaches() {
         .await
         .expect("halting_stop_stats before");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let mut drains = 0;
     loop {
         drains += 1;
@@ -818,7 +809,7 @@ async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_hal
     .await
     .expect("create the composite-PK target table");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
 
     let total: String = client
@@ -1098,7 +1089,7 @@ async fn dropped_table_purge_lets_a_wedged_batch_drain() {
         Some(r#"{"id":"1","name":"gadget"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     client
         .batch_execute("drop table widgets")
@@ -1170,7 +1161,7 @@ async fn release_of_a_key_held_across_batches_re_derives_it_to_the_oracle() {
         .expect("release_key");
     assert_eq!(replayed, 1, "one held row for the key");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
 
     let oracle = recompute(&db.pool, &def, "id").await;
@@ -1269,7 +1260,7 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
         Some(r#"{"order_id":"1","amount":"5.00"}"#),
     )
     .await;
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
 
     let result = apply::drain_once(&db.pool, seg1, "worker", 1, "trellis_quarantine_test").await;
     match &result {
@@ -1349,7 +1340,7 @@ async fn repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still
         Some(r#"{"price":"20.00","tax":"2.00"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     let mut real_failures = 0;
     let outcome = loop {
@@ -1943,7 +1934,7 @@ async fn stage_large_page(
         )
         .await
         .expect("stage the large page");
-    let seg_seq = seal_active_segment(client).await;
+    let seg_seq = pipeline::seal(client).await;
     (orders, seg_seq)
 }
 
@@ -2123,7 +2114,7 @@ async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
         )
         .await;
     }
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     match drain_result(&db.pool, seg_seq).await {
         Err(ApplyError::Db(err)) => assert_eq!(err.code(), Some(&SqlState::CHECK_VIOLATION)),
@@ -2259,7 +2250,7 @@ async fn write_order(client: &Client, id: i32, price: &str, tax: &str) {
 /// charge crosses the threshold evicts the key and commits the rest of the
 /// page. Returns how many drains failed first.
 async fn drain_through_evictions(client: &mut Client, pool: &trellis::pool::Pool) -> usize {
-    let seg_seq = seal_active_segment(client).await;
+    let seg_seq = pipeline::seal(client).await;
     let mut failures = 0;
     loop {
         match drain_result(pool, seg_seq).await {
@@ -2632,7 +2623,7 @@ async fn a_page_parks_nothing_for_a_key_released_after_it_was_computed() {
         .expect("fix the cause");
 
     write_order(&client, 1, "60", "3").await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let mut phase1 = db.pool.get().await.expect("connection");
     let txn = phase1.transaction().await.expect("begin phase 1");
     claim::claim(&txn, seg_seq, "worker", 1)
@@ -2714,7 +2705,7 @@ async fn a_page_whose_fence_matches_parks_nothing_for_a_key_released_after_its_p
         .expect("fix the cause");
 
     write_order(&client, 1, "60", "3").await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let mut phase1 = db.pool.get().await.expect("connection");
     let txn = phase1.transaction().await.expect("begin phase 1");
     claim::claim(&txn, seg_seq, "worker", 1)
@@ -2886,7 +2877,7 @@ async fn an_eviction_after_a_release_does_not_poison_the_key_again() {
     assert_eq!(held, 0, "nothing is parked");
 
     // The release's `Recompute` is not held behind a new poison row.
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
     assert!(segment_state_is_drained(&client, seg_seq).await);
     assert!(!poison_marker_exists(&client, &orders, "7").await);

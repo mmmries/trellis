@@ -142,12 +142,6 @@ async fn start(transforms: &[String], seed: &str) -> Driver {
     Driver::start(&ddl, &columns, &transforms, &["public.w"]).await
 }
 
-async fn step(d: &mut Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
-}
-
 /// A Re-derive (an image-less change) of each of `keys`, drained.
 async fn re_derive(d: &mut Driver, keys: &[&str]) {
     d.stage_recomputes("public.w", keys).await;
@@ -196,26 +190,24 @@ async fn a_one_to_one_over_a_source_and_target_wider_than_50_columns_applies_and
     let narrow_oracle = "select id, c0, c119 from public.w order by id";
     let narrow_target = "select id, c0, c119 from public.narrow order by id";
 
-    step(
-        &mut d,
-        &format!("insert into public.w values {}, {}", row(1, 0), row(2, 0)),
-    )
+    d.step(&format!(
+        "insert into public.w values {}, {}",
+        row(1, 0),
+        row(2, 0)
+    ))
     .await;
     assert_eq!(d.rows(&wide_target).await, d.rows(&wide_oracle).await);
     assert_eq!(d.rows(narrow_target).await, d.rows(narrow_oracle).await);
 
-    step(
-        &mut d,
-        "update public.w set c0 = -1, c60 = -2, c119 = -3 where id = 1",
-    )
-    .await;
+    d.step("update public.w set c0 = -1, c60 = -2, c119 = -3 where id = 1")
+        .await;
     assert_eq!(d.rows(&wide_target).await, d.rows(&wide_oracle).await);
     assert_eq!(d.rows(narrow_target).await, d.rows(narrow_oracle).await);
 
     // The Re-derive re-reads the live row: every source column, past the
     // first chunk. A key that is gone re-derives to a delete.
     re_derive(&mut d, &["1", "2"]).await;
-    step(&mut d, "delete from public.w where id = 2").await;
+    d.step("delete from public.w where id = 2").await;
     re_derive(&mut d, &["2"]).await;
     assert_eq!(d.rows(&wide_target).await, d.rows(&wide_oracle).await);
     assert_eq!(d.rows(narrow_target).await, d.rows(narrow_oracle).await);
@@ -223,7 +215,7 @@ async fn a_one_to_one_over_a_source_and_target_wider_than_50_columns_applies_and
 
     // An update whose Re-derive has to change the target: the source row
     // changes under capture, then a Re-derive of the key lands the live row.
-    step(&mut d, "update public.w set c100 = 7 where id = 1").await;
+    d.step("update public.w set c100 = 7 where id = 1").await;
     re_derive(&mut d, &["1"]).await;
     assert_eq!(d.rows(&wide_target).await, d.rows(&wide_oracle).await);
 
@@ -279,9 +271,10 @@ async fn an_aggregate_with_a_target_wider_than_50_columns_applies_and_re_derives
     );
 
     assert_eq!(d.rows(&target).await, d.rows(&oracle).await);
-    step(&mut d, "update public.w set c119 = 5000 where id = 1").await;
-    step(&mut d, "update public.w set c3 = c3 + 11 where id = 2").await;
-    step(&mut d, "delete from public.w where id = 3").await;
+    d.step("update public.w set c119 = 5000 where id = 1").await;
+    d.step("update public.w set c3 = c3 + 11 where id = 2")
+        .await;
+    d.step("delete from public.w where id = 3").await;
     re_derive(&mut d, &["1", "2", "3"]).await;
     assert_eq!(d.rows(&target).await, d.rows(&oracle).await);
     let downstream = format!(

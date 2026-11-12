@@ -13,6 +13,9 @@
 
 use std::collections::HashMap;
 
+#[path = "pipeline.rs"]
+pub mod pipeline;
+
 use testkit::TestDatabase;
 use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
@@ -28,30 +31,6 @@ pub async fn connect_raw(dsn: &str) -> Client {
          set extra_float_digits to 3"
     );
     testkit::connect_with(dsn, &setup).await
-}
-
-pub async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    // A full ring answers `RingFull` until drained segments are retired,
-    // exactly as the engine's own seal-on-demand handles it.
-    let outcome = match seal::seal_phase1_retrying(client, seal::SEAL_GATE_WAIT).await {
-        Ok(outcome) => outcome,
-        Err(trellis::StagingError::RingFull { .. }) => {
-            trellis::staging::retire_drained_segments(client)
-                .await
-                .expect("retire drained segments");
-            seal::seal_phase1_waiting(client).await
-        }
-        Err(trellis::StagingError::SealGateBlocked) => panic!(
-            "seal phase 1: the seal gate stayed blocked; transactions holding an xid: {}",
-            seal::xid_holders(client).await
-        ),
-        Err(err) => panic!("seal phase 1: {err:?}"),
-    };
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
 }
 
 /// Creates `public.<table>` with `ddl`'s columns, the 1-1 definition `text`
@@ -109,7 +88,7 @@ pub async fn stage(client: &mut Client, table: &str, rows: &[(String, String)]) 
         )
         .await
         .expect("stage the page");
-    seal_active_segment(client).await
+    pipeline::seal(client).await
 }
 
 /// Inserts `rows` into the source too, so a recompute of the target from

@@ -18,6 +18,9 @@
 //! `defs_aggregate_chained_single_column_group_key.rs`, the front-door
 //! aggregate-chaining fixture.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::collections::HashMap;
 use testkit::connect_raw;
 
@@ -27,16 +30,6 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::integer::IntWidth;
 use trellis::staging::apply;
-use trellis::staging::{has_pending, retire_drained_segments};
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
 
 async fn active_seg_table(client: &Client) -> String {
     let ring_slot: i16 = client
@@ -88,34 +81,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
-}
-
-/// Seals and drains repeatedly until nothing is pending anywhere in the ring
-/// — used only for the two definitions' own (empty, no source rows yet)
-/// from-scratch backfills, not for the hops this test actually inspects
-/// metrics around (those drain one segment at a time, below).
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let seg = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg,
-            "e2e_latency_aggregate_test",
-            1,
-            "trellis_e2e_latency_aggregate_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 /// Drains exactly one sealed segment, once, for the two hops this test
@@ -207,13 +172,13 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
         .await
         .expect("install the upstream aggregate");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     install_definition(&db.pool, SKU_TOTALS_V2, &sku_totals_columns(), "public")
         .await
         .expect("install the aggregate chained onto the upstream aggregate");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     // The one source-committed change this whole test traces: a brand-new
     // group's only row.
@@ -236,7 +201,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
 
     // Hop 0: sales -> e2e_latency_agg_sku_totals (intermediate aggregate;
     // has a downstream reader).
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let outcome1 = drain(&db.pool, seg1).await;
     assert_eq!(outcome1.keys_written, 1, "one new group written");
 
@@ -271,7 +236,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
     // downstream-propagation step 4) — no second, independently-staged
     // change anywhere. A `Recompute` row staged with `src_changed: None`
     // would leave neither histogram able to observe anything here.
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     let outcome2 = drain(&db.pool, seg2).await;
     assert_eq!(
         outcome2.keys_written, 1,

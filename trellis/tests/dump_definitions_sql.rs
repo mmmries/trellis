@@ -25,7 +25,6 @@ use std::process::Command;
 use testkit::TestCluster;
 use tokio_postgres::Client;
 use trellis::dump::{CLASSIFICATION, Class, ID_PLACEHOLDER, names_table};
-use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -66,35 +65,6 @@ fn load(dsn: &str, schema_sql: &str, appendix: &str) {
             .arg(dsn),
         "psql load",
     );
-}
-
-/// Seals and drains the ring through the engine's own apply path until
-/// nothing is pending: the stand-in for the maintenance loop and drain workers.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "dump_test",
-            1,
-            "dump_test_wake",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
 fn run(cmd: &mut Command, what: &str) -> String {
@@ -158,7 +128,7 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
         .await
         .expect("capture pass");
     build_everything(t.pool()).await;
-    drain_to_quiescence(t.pool(), raw).await;
+    pipeline::settle(t.pool(), raw).await;
     build_everything(t.pool()).await;
 }
 
@@ -545,7 +515,7 @@ async fn a_loaded_database_builds_its_definitions() {
     // so the builds are followed by the drain the worker would run.
     for _ in 0..3 {
         build_everything(t2.pool()).await;
-        drain_to_quiescence(t2.pool(), &mut worker).await;
+        pipeline::settle(t2.pool(), &mut worker).await;
     }
 
     let statuses = rows_json(&after, STATUSES).await;

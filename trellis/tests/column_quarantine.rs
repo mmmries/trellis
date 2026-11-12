@@ -47,18 +47,9 @@ fn is_data_exception(err: &ApplyError) -> bool {
 // Shared scaffolding (mirrors `tests/quarantine.rs`)
 // ---------------------------------------------------------------------
 
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
 /// The ring table `insert_cdc_row` must target *right now* — `seg_0` is only
 /// correct for a test's first, never-yet-sealed batch; every batch after
-/// that has rotated the active ring slot forward (`seal_active_segment`
+/// that has rotated the active ring slot forward (`pipeline::seal`
 /// advances `segment_pointer`), and inserting into a already-sealed table
 /// would silently stage into the wrong (already-closed) batch. Every test
 /// below that stages more than one batch reads this fresh before each one.
@@ -222,7 +213,7 @@ async fn stage_bad_orders(client: &mut Client, pool: &trellis::pool::Pool, ids: 
         )
         .await;
     }
-    let seg_seq = seal_active_segment(client).await;
+    let seg_seq = pipeline::seal(client).await;
     let result =
         apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
     assert!(
@@ -394,7 +385,7 @@ async fn a_column_fuse_trip_that_waits_out_the_lock_timeout_trips_on_the_next_fa
         Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let result = apply::drain_once(
         &impatient,
         seg_seq,
@@ -475,7 +466,7 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         Some(r#"{"price":"10.00","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     apply::drain_once(
         &db.pool,
         seg_seq,
@@ -524,7 +515,7 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
         Some(r#"{"price":"999.00","tax":"999.00"}"#),
     )
     .await;
-    let seg_seq2 = seal_active_segment(&mut client).await;
+    let seg_seq2 = pipeline::seal(&mut client).await;
     apply::drain_once(
         &db.pool,
         seg_seq2,
@@ -771,7 +762,7 @@ async fn a_fuse_trip_whose_cascade_failed_at_a_grandchild_is_completed_by_the_ca
         Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let result = apply::drain_once(
         &impatient_pool(&db),
         seg_seq,
@@ -1078,7 +1069,7 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
         )
         .await;
     }
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     apply::drain_once(
         &db.pool,
         seg_seq,
@@ -1475,7 +1466,7 @@ async fn an_existing_row_level_fuse_scenario_is_unaffected() {
         Some(r#"{"price":"20.00","tax":"2.00"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     let outcome = loop {
         match apply::drain_once(
@@ -1591,7 +1582,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
         Some(r#"{"price":"5.00","tax":"1.00"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     apply::drain_once(
         &db.pool,
         seg_seq,
@@ -1607,7 +1598,7 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
     // marker for `order_stats` into the (still-open) active ring segment —
     // seal and drain once more to actually run the aggregate's own write
     // path against it.
-    let seg_seq2 = seal_active_segment(&mut client).await;
+    let seg_seq2 = pipeline::seal(&mut client).await;
     apply::drain_once(
         &db.pool,
         seg_seq2,
@@ -2025,7 +2016,7 @@ async fn a_shared_field_name_charges_only_the_sibling_whose_field_fails() {
         )
         .await;
     }
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let result = apply::drain_once(
         &db.pool,
         seg_seq,
@@ -2221,7 +2212,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         Some(r#"{"price":"30.00","tax":"3.00"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     apply::drain_once(
         &db.pool,
         seg_seq,
@@ -2362,7 +2353,7 @@ async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::pool::Pool, 
             .await
             .expect("stage bare-src_table cdc row");
     }
-    let seg_seq = seal_active_segment(client).await;
+    let seg_seq = pipeline::seal(client).await;
     let result =
         apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
     assert!(
@@ -2640,7 +2631,7 @@ async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
     )
     .await;
     for _ in 0..16 {
-        let seg_seq = seal_active_segment(&mut client).await;
+        let seg_seq = pipeline::seal(&mut client).await;
         while apply::drain_once(
             &db.pool,
             seg_seq,
@@ -2772,7 +2763,7 @@ async fn change_item(
 async fn drain_staged(client: &mut Client, pool: &trellis::pool::Pool) {
     use trellis::staging::{has_pending, retire_drained_segments};
     for _ in 0..16 {
-        let seg_seq = seal_active_segment(client).await;
+        let seg_seq = pipeline::seal(client).await;
         while apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test")
             .await
             .expect("drain_once")

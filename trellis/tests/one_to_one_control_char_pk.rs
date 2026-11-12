@@ -11,6 +11,9 @@
 //! re-fetch, the target write, and the update/delete lookups all have to
 //! agree on that raw text.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::collections::HashMap;
 use testkit::connect_raw;
 
@@ -20,7 +23,6 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{create_definition, create_target_table};
 use trellis::pool::Pool;
-use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 
 /// Stages one CDC change for `orders` into the active ring segment, shaped
 /// the way capture stages it: the raw key text, and text-valued JSON images.
@@ -53,37 +55,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?}: {e}"));
-}
-
-/// Seals and drains through the engine's own apply path until nothing is
-/// pending: the hand-driven stand-in for a running `Client`'s drain workers.
-async fn drain_to_quiescence(pool: &Pool, client: &mut Client) {
-    // No live capture stages anything here, so there is no real staged
-    // watermark to hold apply back. A saturated one never does.
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "control_char_pk_test",
-            1,
-            "trellis_control_char_pk_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 async fn target_count(raw: &Client) -> i64 {
@@ -188,7 +159,7 @@ async fn a_one_to_one_target_stores_the_raw_source_pk_even_with_a_control_charac
         Some(r#"{"id":"plain","a":"3.00","b":"4.00"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     let ids: Vec<String> = raw
         .query("select id from totals order by id", &[])
@@ -220,7 +191,7 @@ async fn a_one_to_one_target_stores_the_raw_source_pk_even_with_a_control_charac
         Some(r#"{"id":"a\u0001b","a":"10.00","b":"2.00"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     let total: Option<String> = raw
         .query_opt("select total::text from totals where id = $1", &[&soh_id])
@@ -243,7 +214,7 @@ async fn a_one_to_one_target_stores_the_raw_source_pk_even_with_a_control_charac
         .await
         .expect("delete source row");
     stage_cdc(&raw, &soh_id, "delete", Some(r#"{"id":"a\u0001b"}"#), None).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     let ids: Vec<String> = raw
         .query("select id from totals", &[])

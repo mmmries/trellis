@@ -1164,7 +1164,10 @@ async fn capture_images(
 ) -> Result<bool, ApplyError> {
     use crate::capture::install::Installed;
 
-    if catalog::is_definition_target(client, table).await? {
+    if crate::defs::source_key::is_trellis_target(client, table)
+        .await
+        .map_err(catalog::CatalogError::from)?
+    {
         return Ok(true);
     }
     let schema: String = client
@@ -2397,14 +2400,16 @@ async fn reads_a_target(
     client: &impl GenericClient,
     definition: &Definition,
 ) -> Result<bool, ChunkQueueError> {
-    if catalog::is_definition_target(client, &definition.source_table).await? {
-        return Ok(true);
-    }
+    let mut tables = vec![definition.source_table.clone()];
     if crate::defs::join::spec(&definition.def).is_some() {
-        for joined in catalog::joined_tables_of(client, definition.id).await? {
-            if catalog::is_definition_target(client, &joined).await? {
-                return Ok(true);
-            }
+        tables.extend(catalog::joined_tables_of(client, definition.id).await?);
+    }
+    for table in &tables {
+        if crate::defs::source_key::is_trellis_target(client, table)
+            .await
+            .map_err(catalog::CatalogError::from)?
+        {
+            return Ok(true);
         }
     }
     Ok(false)

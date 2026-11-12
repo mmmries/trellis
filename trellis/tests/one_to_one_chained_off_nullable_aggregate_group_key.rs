@@ -30,6 +30,9 @@
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::collections::HashMap;
 use testkit::connect_raw;
 
@@ -37,17 +40,6 @@ use testkit::TestCluster;
 use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-use trellis::staging::apply;
-use trellis::staging::{has_pending, retire_drained_segments};
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
 
 async fn active_seg_table(client: &Client) -> String {
     let ring_slot: i16 = client
@@ -89,31 +81,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
-}
-
-/// Seals and drains repeatedly until nothing is pending anywhere in the ring.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let seg = seal_active_segment(client).await;
-        while apply::drain_once(
-            pool,
-            seg,
-            "oneone_chained_off_null_group_test",
-            1,
-            "trellis_oneone_chained_off_null_group_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
@@ -199,13 +166,13 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
         .await
         .expect("install the aggregate");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, client).await;
+    pipeline::settle(&db.pool, client).await;
 
     install_definition(&db.pool, SKU_TOTALS_ECHO, &sku_totals_columns(), "public")
         .await
         .expect("install the 1-1 chained onto the aggregate");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, client).await;
+    pipeline::settle(&db.pool, client).await;
 
     assert_eq!(
         sku_totals(client).await,
@@ -256,7 +223,7 @@ async fn a_null_keyed_upstream_group_reaches_the_chained_target_keyed_by_a_real_
         Some(r#"{"id":"7","sku":null,"amount":"6"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     assert_eq!(
         sku_totals(&client).await.get(&None).cloned(),
@@ -291,7 +258,7 @@ async fn a_null_keyed_upstream_group_reaches_the_chained_target_keyed_by_a_real_
         Some(r#"{"id":"8","sku":null,"amount":"4"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     assert_eq!(
         sku_totals(&client).await.get(&None).cloned(),
@@ -331,7 +298,7 @@ async fn a_null_keyed_upstream_group_reaches_the_chained_target_keyed_by_a_real_
         None,
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     assert_eq!(
         sku_totals(&client).await.get(&None).cloned(),
@@ -385,7 +352,7 @@ async fn a_real_sentinel_character_group_key_round_trips_undoubled_in_the_chaine
         Some(r#"{"id":"9","sku":"\u0001","amount":"5"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     let sentinel_echo_total: Option<String> = client
         .query_opt(

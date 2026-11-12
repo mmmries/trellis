@@ -169,7 +169,7 @@ pub enum ApplyError {
     /// Every page of the target would reproduce it, so it halts the target
     /// rather than charging each key a death.
     GroupBasisUnsupported { target: String, what: &'static str },
-    /// A `JOIN`'s `T` write (`super::group_basis`, ADR-0019's strict form)
+    /// A `JOIN`'s `T` page write (`super::group_basis`, ADR-0019's strict form)
     /// staged `groups` groups that have no hidden row: the writer didn't lock
     /// them (`GroupTargetPlan::lock_sql` inserts the missing rows and locks
     /// the rest), so applying would have dropped their deltas. A gap in the

@@ -29,16 +29,12 @@
 //! Harness conventions (`install_definition` + drain the chunk queue, then
 //! introspect `information_schema`) follow `defs_typed_literals.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
-
-use pipeline::{connect, start_and_settle_builds};
-
 #[path = "support/render_lab.rs"]
 mod render_lab;
 #[path = "support/wait_live.rs"]
 mod wait_live;
 
+use render_lab::pipeline::{connect, start_and_settle_builds};
 use render_lab::{Lab, Outcome};
 
 use std::collections::HashMap;

@@ -9,13 +9,16 @@
 //! lease are out of scope — a claimed batch is expected to sit
 //! in `draining` with rows in `seg_claims` by the end of every test here.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 use testkit::connect_raw;
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
-use trellis::staging::{BucketFilter, SegmentState, claim, fold, seal};
+use trellis::staging::{BucketFilter, SegmentState, claim, fold};
 
 /// Claims in a transaction of its own and commits it. `claim::claim` takes a
 /// transaction: it holds the segment row's lock until commit.
@@ -58,14 +61,6 @@ async fn insert_many_recompute(client: &Client, table: &str, prefix: &str, n: us
         .batch_execute(&sql)
         .await
         .unwrap_or_else(|e| panic!("insert {n} recompute rows into {table} failed: {e}"));
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
 }
 
 async fn segment_state(client: &Client, seg_seq: i64) -> SegmentState {
@@ -127,7 +122,7 @@ async fn partition_is_exact_the_union_of_per_bucket_folds_equals_the_whole_batch
         insert_recompute(&client, "seg_0", key).await;
     }
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
 
     for &bucket_count in &[1i64, 3, 8] {
@@ -180,7 +175,7 @@ async fn the_sql_bucket_definition_agrees_with_the_host_oracle() {
         routes.insert(key.clone(), route_of(&client, key).await);
     }
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
 
     for &bucket_count in &[1i64, 4, 8] {
@@ -210,7 +205,7 @@ async fn the_flip_cte_actually_runs_even_when_this_calls_share_is_empty() {
     let mut client = connect_raw(db.dsn()).await;
 
     insert_recompute(&client, "seg_0", "solo-key").await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     assert_eq!(bucket_count_of(&client, seg_seq).await, 1);
 
     // Pre-claim the batch's one bucket directly (bypassing `claim`), so a
@@ -251,7 +246,7 @@ async fn a_second_claim_of_an_already_draining_batch_still_succeeds() {
     let mut client = connect_raw(db.dsn()).await;
 
     insert_recompute(&client, "seg_0", "k").await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     client
         .execute(
             "update segments set bucket_count = 4 where seg_seq = $1",
@@ -289,7 +284,7 @@ async fn two_overlapping_workers_get_disjoint_buckets_no_bucket_claimed_twice() 
     let mut client_b = connect_raw(db.dsn()).await;
 
     insert_recompute(&client_a, "seg_0", "k").await;
-    let seg_seq = seal_active_segment(&mut client_a).await;
+    let seg_seq = pipeline::seal(&mut client_a).await;
     client_a
         .execute(
             "update segments set bucket_count = 8 where seg_seq = $1",
@@ -344,7 +339,7 @@ async fn share_sizing_a_lone_worker_takes_everything_n_workers_take_about_a_nth(
     let mut client = connect_raw(db.dsn()).await;
 
     insert_recompute(&client, "seg_0", "solo").await;
-    let solo_seg = seal_active_segment(&mut client).await;
+    let solo_seg = pipeline::seal(&mut client).await;
     client
         .execute(
             "update segments set bucket_count = 8 where seg_seq = $1",
@@ -363,7 +358,7 @@ async fn share_sizing_a_lone_worker_takes_everything_n_workers_take_about_a_nth(
     );
 
     insert_recompute(&client, "seg_1", "quad").await;
-    let quad_seg = seal_active_segment(&mut client).await;
+    let quad_seg = pipeline::seal(&mut client).await;
     client
         .execute(
             "update segments set bucket_count = 8 where seg_seq = $1",
@@ -390,7 +385,7 @@ async fn bucket_count_is_fixed_at_seal_from_row_count_alone_and_never_moves() {
 
     // Below MIN_ROWS_TO_SPLIT (256): seals to a single bucket.
     insert_recompute(&client, "seg_0", "small-batch").await;
-    let small_seg = seal_active_segment(&mut client).await;
+    let small_seg = pipeline::seal(&mut client).await;
     assert_eq!(
         bucket_count_of(&client, small_seg).await,
         1,
@@ -405,7 +400,7 @@ async fn bucket_count_is_fixed_at_seal_from_row_count_alone_and_never_moves() {
         claim::MIN_ROWS_TO_SPLIT as usize,
     )
     .await;
-    let big_seg = seal_active_segment(&mut client).await;
+    let big_seg = pipeline::seal(&mut client).await;
     assert_eq!(
         bucket_count_of(&client, big_seg).await,
         claim::SEG_BUCKETS as i16,
@@ -518,7 +513,7 @@ async fn held_share_reads_the_claims_table_rather_than_recomputing() {
     let mut client = connect_raw(db.dsn()).await;
 
     insert_recompute(&client, "seg_0", "k").await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     client
         .execute(
             "update segments set bucket_count = 8 where seg_seq = $1",

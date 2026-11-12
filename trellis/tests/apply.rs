@@ -34,15 +34,6 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
         .collect()
 }
 
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
 async fn segment_state(client: &Client, seg_seq: i64) -> SegmentState {
     let state: String = client
         .query_one("select state from segments where seg_seq = $1", &[&seg_seq])
@@ -244,7 +235,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 2, "orders 1 and 2 must be written");
     assert_eq!(outcome.keys_deleted, 1, "order 3 must be deleted");
@@ -328,7 +319,7 @@ async fn explicitly_qualified_source_reads_the_right_table_on_a_live_refetch() {
     .await
     .expect("create definition against the explicitly-qualified source");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(
         outcome.keys_written, 3,
@@ -462,7 +453,7 @@ async fn explicitly_qualified_target_receives_a_live_cdc_write() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 2, "orders 1 and 2 must be written");
     assert_eq!(outcome.keys_deleted, 1, "order 3 must be deleted");
@@ -577,7 +568,7 @@ async fn same_named_sources_in_different_schemas_each_drain_against_their_own_ta
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 2, "one write per target");
 
@@ -647,7 +638,7 @@ async fn a_fully_drained_single_bucket_batch_flips_the_segment_to_drained() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     assert_eq!(segment_state(&client, seg_seq).await, SegmentState::Sealed);
 
     let outcome = drain(&db.pool, seg_seq, "worker").await;
@@ -706,7 +697,7 @@ async fn a_claim_lost_mid_drain_rolls_back_and_applies_nothing() {
         Some(r#"{"price":"10.00","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     // Phase 1 by hand: claim, own, fold, commit — exactly what
     // `drain_once`'s opening block does.
@@ -800,7 +791,7 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
         Some(r#"{"price":"10.00","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
@@ -916,7 +907,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
         Some(r#"{"price":"10.00","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     let mut phase1_client = db.pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
@@ -1008,7 +999,7 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(
         outcome.keys_written, 0,
@@ -1072,7 +1063,7 @@ async fn a_recompute_folded_with_a_cdc_update_still_repairs_a_stale_one_to_one_r
         Some(r#"{"id":"1","price":"20.00","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     drain(&db.pool, seg_seq, "worker").await;
 
     let total: String = client
@@ -1177,7 +1168,7 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(
         outcome.keys_deleted, 3,
@@ -1206,7 +1197,7 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
 
     // Downstream propagation: the cleared keys 1-3 and the written key 4
     // must all have staged a recompute trigger for order_summary.
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     let outcome2 = drain(&db.pool, seg2, "worker").await;
     assert_eq!(
         outcome2.keys_deleted, 3,
@@ -1248,11 +1239,11 @@ async fn next_claimable_segment_never_hands_out_a_segment_past_an_undrained_trun
         Some(r#"{"v":"a"}"#),
     )
     .await;
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
 
     // Segment 2: bears a truncate — forces bucket_count = 1.
     insert_truncate_row(&client, "seg_1", "orders").await;
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
 
     // Segment 3: ordinary again, sealed after the truncate.
     insert_cdc_row(
@@ -1265,7 +1256,7 @@ async fn next_claimable_segment_never_hands_out_a_segment_past_an_undrained_trun
         Some(r#"{"v":"b"}"#),
     )
     .await;
-    let seg3 = seal_active_segment(&mut client).await;
+    let seg3 = pipeline::seal(&mut client).await;
 
     // All three sealed and undrained: the barrier must return the lowest,
     // seg1 — never skipping ahead to the truncate or past it.
@@ -1393,7 +1384,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     .await;
 
     // Hop 0: orders -> order_totals, direct apply.
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let outcome1 = drain(&db.pool, seg1, "worker").await;
     assert_eq!(outcome1.keys_written, 1);
     let total: String = client
@@ -1428,7 +1419,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
 
     // Hop 1: order_totals -> order_summary, driven by the recompute
     // trigger, which carries no image and must re-read order_totals live.
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     let outcome2 = drain(&db.pool, seg2, "worker").await;
     assert_eq!(outcome2.keys_written, 1);
     let grand_total: String = client
@@ -1541,7 +1532,7 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 2);
 
@@ -1612,7 +1603,7 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
 
     insert_cdc_row(&client, "seg_0", "items", "1", "insert", None, Some("{}")).await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 1);
 
@@ -1699,7 +1690,7 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 2);
 
@@ -1809,7 +1800,7 @@ async fn a_jsonb_column_passthrough_round_trips_through_compute() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 2);
 
@@ -1923,7 +1914,7 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 2);
 
@@ -2006,7 +1997,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         .await
         .expect("reload config");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, N);
 
@@ -2118,7 +2109,7 @@ async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
         .await
         .expect("stage recompute rows");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, N as usize);
 
@@ -2268,7 +2259,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         .await
         .expect("reload config");
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg_seq, "worker").await;
     assert_eq!(outcome.keys_written, 3, "1, 2, and 5 must be written");
     assert_eq!(outcome.keys_deleted, 2, "3 and 4 must be deleted");
@@ -2382,7 +2373,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
         Some(r#"{"price":"20.00","tax":"2.00"}"#),
     )
     .await;
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
 
     // Segment 2: order 2's second update (same key as segment 1, so the
     // merge must collapse both into one write reflecting only the final
@@ -2407,7 +2398,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
         Some(r#"{"price":"1.00","tax":"0.10"}"#),
     )
     .await;
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
 
     let outcome = apply::drain_many(&db.pool, &[seg1, seg2], "worker", 1, "trellis_apply_test")
         .await
@@ -2468,12 +2459,12 @@ async fn next_claimable_segments_stops_at_the_first_undrained_truncate() {
         Some(r#"{"v":"a"}"#),
     )
     .await;
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
 
     // Segment 2: bears a truncate — a two-directional barrier that must
     // never be coalesced with anything else.
     insert_truncate_row(&client, "seg_1", "orders").await;
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
 
     // Segment 3: ordinary again, sealed after the truncate.
     insert_cdc_row(
@@ -2486,7 +2477,7 @@ async fn next_claimable_segments_stops_at_the_first_undrained_truncate() {
         Some(r#"{"v":"b"}"#),
     )
     .await;
-    let seg3 = seal_active_segment(&mut client).await;
+    let seg3 = pipeline::seal(&mut client).await;
 
     // All three sealed and undrained: a wide batch request must stop at
     // seg1, excluding the truncate-bearing seg2 and everything past it —
@@ -2662,7 +2653,7 @@ async fn a_recompute_read_before_a_newer_batch_drains_does_not_overwrite_it() {
 
     // The definition's own enumeration already staged a recompute for id 1;
     // batch 1 is that segment. Its Phase 2 reads price = 10.00.
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
 
     client
@@ -2679,7 +2670,7 @@ async fn a_recompute_read_before_a_newer_batch_drains_does_not_overwrite_it() {
         Some(r#"{"price":"20.00","tax":"1.00"}"#),
     )
     .await;
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     drain(&db.pool, seg2, "fast_worker").await;
     assert_eq!(order_total(&client, 1).await.as_deref(), Some("21.00"));
 
@@ -2715,7 +2706,7 @@ async fn an_older_cdc_image_applied_after_a_newer_one_does_not_overwrite_it() {
         Some(r#"{"id":"1","price":"15.00","tax":"1.00"}"#),
     )
     .await;
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
 
     client
@@ -2732,7 +2723,7 @@ async fn an_older_cdc_image_applied_after_a_newer_one_does_not_overwrite_it() {
         Some(r#"{"id":"1","price":"20.00","tax":"1.00"}"#),
     )
     .await;
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     drain(&db.pool, seg2, "fast_worker").await;
     assert_eq!(order_total(&client, 1).await.as_deref(), Some("21.00"));
 
@@ -2767,7 +2758,7 @@ async fn a_stale_write_applied_after_a_newer_delete_does_not_resurrect_the_row()
         Some(r#"{"id":"1","price":"10.00","tax":"1.00"}"#),
     )
     .await;
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
 
     client
@@ -2784,7 +2775,7 @@ async fn a_stale_write_applied_after_a_newer_delete_does_not_resurrect_the_row()
         None,
     )
     .await;
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     drain(&db.pool, seg2, "fast_worker").await;
     assert_eq!(order_total(&client, 1).await, None);
 
@@ -2803,7 +2794,7 @@ async fn a_stale_write_applied_after_a_newer_delete_does_not_resurrect_the_row()
 async fn a_stale_delete_applied_after_a_newer_insert_does_not_remove_the_row() {
     let (_cluster, db, mut client) = out_of_order_fixture(Some("(1, 10.00, 1.00)")).await;
     // Settle the definition's own enumeration first.
-    seal_active_segment(&mut client).await;
+    pipeline::seal(&mut client).await;
     drain_everything_left(&db.pool, &client).await;
     assert_eq!(order_total(&client, 1).await.as_deref(), Some("11.00"));
 
@@ -2821,7 +2812,7 @@ async fn a_stale_delete_applied_after_a_newer_insert_does_not_remove_the_row() {
         None,
     )
     .await;
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let stale_plan = claim_and_compute(&db.pool, seg1, "slow_worker").await;
 
     client
@@ -2841,7 +2832,7 @@ async fn a_stale_delete_applied_after_a_newer_insert_does_not_remove_the_row() {
         Some(r#"{"id":"1","price":"30.00","tax":"1.00"}"#),
     )
     .await;
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     drain(&db.pool, seg2, "fast_worker").await;
     assert_eq!(order_total(&client, 1).await.as_deref(), Some("31.00"));
 

@@ -49,7 +49,7 @@ use std::process::Command;
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
-use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{apply, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
@@ -70,34 +70,6 @@ async fn build_everything(pool: &trellis::pool::Pool) {
         .await
         .expect("dispatch registered definitions' builds");
     trellis::staging::build::settle_builds(pool).await;
-}
-
-/// Seals and drains the ring until nothing is pending.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "dump_test",
-            1,
-            "dump_test_wake",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
 fn run(cmd: &mut Command, what: &str) -> String {
@@ -231,7 +203,7 @@ async fn a_restored_dump_builds_its_definitions() {
         trellis::client::reconcile_pass(&mut raw, t.pool(), SCHEMA)
             .await
             .expect("capture pass");
-        drain_to_quiescence(t.pool(), &mut raw).await;
+        pipeline::settle(t.pool(), &mut raw).await;
     }
     // The partitioned source's aggregate is restored like the rest; this
     // hand-driven harness doesn't settle its build (it pauses here without
@@ -354,7 +326,7 @@ async fn a_restored_dump_builds_its_definitions() {
         trellis::client::reconcile_pass(&mut worker, t2.pool(), SCHEMA)
             .await
             .expect("reconcile pass");
-        drain_to_quiescence(t2.pool(), &mut worker).await;
+        pipeline::settle(t2.pool(), &mut worker).await;
     }
     let statuses = rows_json(&after, STATUSES).await;
     assert!(built(&statuses), "{statuses:?}");
@@ -1279,7 +1251,7 @@ async fn a_restored_target_keeps_the_objects_a_user_added_and_builds() {
         trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
             .await
             .expect("reconcile pass");
-        drain_to_quiescence(t2.pool(), &mut after).await;
+        pipeline::settle(t2.pool(), &mut after).await;
     }
     assert_eq!(
         rows_json(&after, STATUSES).await,
@@ -1389,7 +1361,7 @@ async fn a_restored_aggregate_keeps_its_group_key_beside_a_constraint_named_befo
         trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
             .await
             .expect("reconcile pass");
-        drain_to_quiescence(t2.pool(), &mut after).await;
+        pipeline::settle(t2.pool(), &mut after).await;
     }
     after
         .batch_execute(
@@ -1400,7 +1372,7 @@ async fn a_restored_aggregate_keeps_its_group_key_beside_a_constraint_named_befo
     trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
         .await
         .expect("reconcile pass");
-    drain_to_quiescence(t2.pool(), &mut after).await;
+    pipeline::settle(t2.pool(), &mut after).await;
     assert_eq!(rows_json(&after, STATUSES).await, ["public.og live"]);
     assert_eq!(
         rows_json(&after, "select to_jsonb(t) from public.og t order by g").await,
@@ -1416,7 +1388,7 @@ async fn settle(t: &Trellis, raw: &mut Client) {
         trellis::client::reconcile_pass(raw, t.pool(), SCHEMA)
             .await
             .expect("capture pass");
-        drain_to_quiescence(t.pool(), raw).await;
+        pipeline::settle(t.pool(), raw).await;
     }
 }
 

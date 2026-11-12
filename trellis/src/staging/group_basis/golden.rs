@@ -296,9 +296,7 @@ fn join_target(golden: &mut Golden, plan: &GroupTargetPlan) {
     golden.add("lock_sql", &plan.lock_sql());
     golden.add("apply_sql", &plan.apply_sql(None));
     golden.add("apply_sql images", &plan.apply_sql(Some(&images)));
-    golden.add("apply_hidden_sql", &plan.apply_hidden_sql());
-    golden.add("match_hidden_build_sql", &plan.match_hidden_build_sql());
-    golden.add("update_hidden_build_sql", &plan.update_hidden_build_sql());
+    golden.add("upsert_hidden_build_sql", &plan.upsert_hidden_build_sql());
     golden.add("target_groups_sql", &plan.target_groups_sql());
     golden.add("compare_held_sql", &plan.compare_held_sql(None));
     golden.add(
@@ -362,8 +360,7 @@ fn a_join_structure_plan_emits_its_golden_sql() {
             join_target(&mut golden, &t);
             t.set_staged_parts(Some(all_free(&shape)));
             golden.add("free apply_sql", &t.apply_sql(None));
-            golden.add("free match_hidden_build_sql", &t.match_hidden_build_sql());
-            golden.add("free update_hidden_build_sql", &t.update_hidden_build_sql());
+            golden.add("free upsert_hidden_build_sql", &t.upsert_hidden_build_sql());
             golden.check(&format!("join_target_{name}{label}"));
         }
     }

@@ -29,10 +29,6 @@ const AGG: &str = "TRANSFORM g FROM public.inc GROUP BY ga WITHOUT SOURCE INDEX 
 const AGG_ACTUAL: &str = "select ga, n, sy from public.g order by ga";
 const AGG_EXPECTED: &str = "select ga, count(*), sum(y) from public.inc group by ga order by ga";
 
-async fn exec(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 async fn settle(d: &mut Driver) {
     let pool = d.pool().clone();
     for _ in 0..2 {
@@ -71,22 +67,18 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
         &["public.inc"],
     )
     .await;
-    exec(
-        &d,
-        "insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 3)",
-    )
-    .await;
+    d.write("insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 3)")
+        .await;
     d.settle().await;
     assert_converged(&d).await;
-    exec(&d, "create index one_ga on public.one (ga)").await;
+    d.write("create index one_ga on public.one (ga)").await;
     let one_acl = "select relacl::text from pg_class where oid = 'public.one'::regclass";
-    exec(&d, "grant select on public.one to public").await;
+    d.write("grant select on public.one to public").await;
     let acl = d.rows(one_acl).await;
 
     // What an earlier release left: the key is `(id) include (x)` and was
     // read as `(id, x)`; the catalog has no key records.
-    exec(
-        &d,
+    d.write(
         "alter table public.inc drop constraint inc_pkey, \
              add primary key (id) include (x)",
     )
@@ -137,7 +129,7 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
     // RESUME would do: the 1-1 target is re-keyed in place before its
     // rebuild (the re-keying the resumes below make), and the aggregate,
     // whose key the attach already recorded, is rebuilt.
-    exec(&d, "update public.inc set y = 7 where id = 3").await;
+    d.write("update public.inc set y = 7 where id = 3").await;
     settle(&mut d).await;
     let outcomes = [
         "RESUME would re-key public.one by (id) in place, dropping the former key column x \
@@ -160,16 +152,14 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
     );
 
     // The source changes while the definitions are paused.
-    exec(
-        &d,
+    d.write(
         "update public.inc set y = 9 where id = 1; delete from public.inc where id = 2; \
          insert into public.inc values (4, 2, 40, 4)",
     )
     .await;
 
     // A user's view and index on the column the re-keying drops hold it.
-    exec(
-        &d,
+    d.write(
         "create view public.one_x as select id, x from public.one; \
          create index one_x_ix on public.one (x)",
     )
@@ -190,7 +180,7 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
         } else {
             "drop index public.one_x_ix"
         };
-        exec(&d, drop).await;
+        d.write(drop).await;
     }
     for name in ["one", "g"] {
         trellis::staging::quarantine::resume_transform(d.pool(), name)
@@ -230,8 +220,7 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
 
     // The live path keys by `(id)` now: an update of the INCLUDE column,
     // and a NULL in it, are updates of the same row.
-    exec(
-        &d,
+    d.write(
         "alter table public.inc alter column x drop not null; \
          update public.inc set x = x + 1, y = y + 1 where id = 1; \
          update public.inc set x = null where id = 3; \
@@ -256,8 +245,7 @@ async fn a_covering_index_beside_the_key_pauses_nothing_at_attach() {
         &["public.inc"],
     )
     .await;
-    exec(
-        &d,
+    d.write(
         "insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2); \
          create index inc_cover on public.inc (id) include (x); \
          create unique index inc_cover_u on public.inc (id) include (y)",
@@ -298,11 +286,8 @@ async fn a_one_to_one_reader_of_a_mis_keyed_target_pauses_and_resume_re_keys_it(
         &["public.inc"],
     )
     .await;
-    exec(
-        &d,
-        "insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2)",
-    )
-    .await;
+    d.write("insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2)")
+        .await;
     d.settle().await;
     let columns = std::collections::HashMap::from([
         ("id".to_string(), int4()),
@@ -320,11 +305,8 @@ async fn a_one_to_one_reader_of_a_mis_keyed_target_pauses_and_resume_re_keys_it(
         ["(public.one,live)", "(public.two,live)"]
     );
 
-    exec(
-        &d,
-        "alter table public.inc drop constraint inc_pkey, add primary key (id) include (x)",
-    )
-    .await;
+    d.write("alter table public.inc drop constraint inc_pkey, add primary key (id) include (x)")
+        .await;
     d.ctl
         .batch_execute("delete from definition_keys")
         .await
@@ -356,7 +338,7 @@ async fn a_one_to_one_reader_of_a_mis_keyed_target_pauses_and_resume_re_keys_it(
         "the reader's corrected key is recorded"
     );
 
-    exec(&d, "update public.inc set y = 70 where id = 1").await;
+    d.write("update public.inc set y = 70 where id = 1").await;
     settle(&mut d).await;
     // The reader's resume waits for its upstream to be live, and re-keys
     // it then.
@@ -367,8 +349,7 @@ async fn a_one_to_one_reader_of_a_mis_keyed_target_pauses_and_resume_re_keys_it(
     }
     settle(&mut d).await;
     settle(&mut d).await;
-    exec(
-        &d,
+    d.write(
         "update public.inc set x = x + 1, y = 80 where id = 2; \
          insert into public.inc values (3, 2, 30, 3)",
     )
@@ -409,16 +390,12 @@ async fn a_deferrable_key_with_an_include_column_pauses_with_both_reasons() {
         &["public.inc"],
     )
     .await;
-    exec(
-        &d,
-        "insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 3)",
-    )
-    .await;
+    d.write("insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 3)")
+        .await;
     d.settle().await;
     assert_converged(&d).await;
 
-    exec(
-        &d,
+    d.write(
         "alter table public.inc drop constraint inc_pkey, \
              add primary key (id) include (x) deferrable",
     )
@@ -453,8 +430,7 @@ async fn a_deferrable_key_with_an_include_column_pauses_with_both_reasons() {
         "the key columns are recorded, not the INCLUDE column"
     );
 
-    exec(
-        &d,
+    d.write(
         "alter table public.inc drop constraint inc_pkey, add primary key (id); \
          update public.inc set y = 9 where id = 1",
     )
