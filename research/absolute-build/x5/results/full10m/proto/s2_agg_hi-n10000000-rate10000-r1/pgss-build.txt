@@ -1,0 +1,25 @@
+1|249370|9917647|5458699778|76346|6603|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), a as (select s."grp_h
+189091|59125|183412|3215886940|397568|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+224375|49444|224375|1700989504|202918|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+53|22901|52|123080|26|0|update backfill_chunks set claimed_at = now() where id = $1 and claimed_by = $2 and not done
+81360|21117|78842|594794449|70269|0|delete from posts where id = $1
+1160|19998|1160|218|0|0|select not exists ( select $4 from backfill_chunks bc where bc.definition_id = d.id and not bc.done and not (bc.fuse_rearmed_at is distinct from d.fuse_rearmed_
+882|19547|882|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next
+58403|18785|56543|1384681709|173431|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+1010|17737|1010|0|0|0|select count(*) from trellis.seg_1
+47|17091|47|119867|28|0|insert into worker_registry (worker_id, registered_at, last_seen, version, staging, drain, standby, staging_pid) values ($1, now(), now(), $2, $3, $4, $5, $6) o
+266946|14698|266946|104912815|211|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, case when n."id" i
+305235|13579|305235|97232881|265|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, n."id"
+42514|10289|42514|310087221|37376|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+932|9031|932|0|0|0|select w.worker_id, j->>$2, coalesce((j->>$3)::boolean, $4), (j->>$5)::int4, w.last_seen > now() - (interval $6 * $1) from "trellis".worker_registry w, lateral 
+74|8895|0|0|0|0|select bc.id, bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at from backfill_chunks bc join transform_definitions d on d.id = bc.definition_id where bc.cla
+26|8711|52|73974|18|0|insert into drainers (drainer_id, last_seen) select distinct d, now() from unnest($1::text[]) as d on conflict (drainer_id) do update set last_seen = excluded.l
+12146|8114|121501|963909673|114066|0|delete from posts where author_id = $1
+37463|7676|37463|209313694|23931|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+3543|6193|68882|234841763|25854|0|delete from posts where author_id = $1
+49|5996|47|0|0|0|select d.id, d.source_table, d.target_table, d.grammar_version, d.floor_version, coalesce( case when d.status <> all($1::text[]) then $2 || quote_literal(d.stat
+48|5058|0|0|0|0|with dead as ( select worker_id from worker_registry where last_seen < now() - (interval $2 * $1) for update skip locked ) delete from worker_registry where wor
+16774|5046|16242|335055677|41914|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+91439|4775|260705|81000222|90|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, o."id"
+14824|4731|14388|270362328|33418|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+650888|3884|650888|0|0|0|present := case when exists (select $1 from trellis_new) then (select count(*) from pg_catalog.pg_attribute a where a.attrelid = $2 and a.at

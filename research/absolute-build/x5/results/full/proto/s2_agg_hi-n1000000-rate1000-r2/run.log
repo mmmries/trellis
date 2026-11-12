@@ -1,0 +1,2 @@
+trellis running: staging=on, drain_threads=2
+press Ctrl-C to stop

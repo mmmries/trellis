@@ -1,0 +1,6 @@
+target_rows=127597
+plain_rows=127597
+target_minus_plain=0
+plain_minus_target=0
+poison=0
+status=live

@@ -1,0 +1,5 @@
+tag=s2_agg-n1000000-rate0-r2 label=full tr=/home/mike/code/trellis-lane-r-x5/target/x5-bin/trellis-base
+trellis 0.2.0
+ 15:25:49 up 1 day, 23:54,  1 user,  load average: 9.51, 14.89, 17.17
+rustc=1 cargo=1
+transform: TRANSFORM author_totals FROM posts GROUP BY author_id SELECT author_id AS author_id, COUNT(*) AS n, SUM(score) AS total_score, SUM(likes) AS total_likes

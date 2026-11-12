@@ -1,0 +1,25 @@
+5|1859|101226|29122146|0|0|insert into "trellis"."agg_1" ("author_id") select distinct "author_id" from ( select "author_id" from pg_temp."trellis_group_sides_1_34563cf2bd068379" union al
+1|1336|101202|52229643|2|55|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), rg as (select distinc
+1|267|101223|218494|0|0|insert into pg_temp."trellis_group_recompute_1_f01a0db369afd2ce" ("author_id") select "author_id" from "trellis"."agg_1" h union all select "author_id" as "auth
+1293|159|1282|6812435|796|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+1331|99|1331|1011716|61|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+557|56|555|2165116|254|0|delete from posts where id = $1
+590|55|590|617772|49|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+386|36|249|360657|37|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+240|34|240|1616185|190|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+270|32|267|1808283|214|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+724|30|724|303287|3|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, case when n."id" i
+726|22|726|228798|0|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, n."id"
+47|22|188|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exists (select from pg_ca
+222|19|222|113572|3|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+188|17|188|114228|4|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+178|14|125|120028|12|0|delete from posts where id = $1
+1803|13|1803|0|0|0|present := case when exists (select $1 from trellis_new) then (select count(*) from pg_catalog.pg_attribute a where a.attrelid = $2 and a.at
+66|11|676|3034205|358|0|delete from posts where author_id = $1
+61|11|750|1909223|223|0|delete from posts where author_id = $1
+91|10|91|526114|61|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+243|9|524|161842|0|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, o."id"
+138|9|138|61216|1|0|insert into "trellis"."seg_0" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, case when n."id" i
+75|7|75|501599|59|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+75|6|51|58115|5|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+77|6|55|61615|5|0|update posts set grp_hi = $1, author_id = $2 where id = $3

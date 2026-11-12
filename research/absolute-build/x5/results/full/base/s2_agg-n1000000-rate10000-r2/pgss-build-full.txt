@@ -1,0 +1,98 @@
+-- calls=5 ms=3557 rows=110725 wal=35229655 fpi=0 temp_mb=0
+insert into "trellis"."agg_1" ("author_id") select distinct "author_id" from ( select "author_id" from pg_temp."trellis_group_sides_1_34563cf2bd068379" union all select "author_id" from pg_temp."trellis_group_recompute_1_f01a0db369afd2ce" ) as g order by "author_id" on conflict ("author_id") do update set __n = excluded.__n where $1
+
+-- calls=1 ms=2291 rows=110396 wal=57356531 fpi=0 temp_mb=60
+with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), rg as (select distinct "author_id" from pg_temp."trellis_group_recompute_1_f01a0db369afd2ce"), a as (select s."author_id"::integer as "author_id", count(*)::bigint as __rn, (count(*) filter (where (s."score") is not null))::bigint as __rc1, coalesce(sum((s."score")) filter (where scale((s."score")) is not null), $2) as __rs1, (select case when __v.__ka is null then $3::jsonb else ( select jsonb_object_agg(__z.__sk, __z.__sc) from ( select __u.__sk::text as __sk, sum($4)::bigint as __sc from unnest(__v.__ka, __v.__wa) as __u(__sk, __sw) where __u.__sk is not null group by __u.__sk having sum($5) <> $6) as __z) end from (select array_agg(coalesce(scale((s."score"))::text, (s."score")::text)) filter (where (s."score") is not null and scale((s."score")) is distinct from $7) as __ka, $8::bigint[] as __wa) as __v) as __rk1, (count(*) filter (where (s."likes") is not null))::bigint as __rc2, coalesce(sum((s."likes")::numeric), $9) as __rs2 from "public"."posts" s group by 1), r as ( select h.__hc, coalesce(a.__rn, $10) as __rn, coalesce(a.__rc1, $11) as __rc1, coalesce(a.__rs1, $12::numeric) as __rs1, coalesce(a.__rk1, $13::jsonb) as __rk1, coalesce(a.__rc2, $14) as __rc2, coalesce(a.__rs2, $15::numeric) as __rs2 from rg cross join lateral (select x.ctid from "trellis"."agg_1" x where x."author_id" = rg."author_id" union all select x.ctid from "trellis"."agg_1" x where (rg."author_id" is null) and x."author_id" is null limit $16) as h(__hc) left join a on array[a."author_id"] = array[rg."author_id"] ), up as ( update "trellis"."agg_1" u set __n = r.__rn, __count_1 = r.__rc1, __sum_1 = r.__rs1, __scales_1 = r.__rk1, __count_2 = r.__rc2, __sum_2 = r.__rs2, __basis = snap.__snap, __stamp = snap.__seg from r, snap where u.ctid = r.__hc returning u."author_id", u.__n as __nn, u.__count_1 as __nc1, u.__sum_1 as __ns1, u.__scales_1 as __nk1, u.__count_2 as __nc2, u.__sum_2 as __ns2 ), nv as (select up.*, __nf.__nf0, __nf.__nf1, __nf.__nf2 from up cross join lateral (select ("__trellis_a0")::bigint as __nf0, ("__trellis_a1")::numeric as __nf1, ("__trellis_a2")::bigint as __nf2 from (select up.__nn as "__trellis_a0", case when up.__nc1 = $17 then $18 else ((case when up.__nk1 is null then round(up.__ns1, $19) when coalesce(((up.__nk1) ->> $20)::bigint, $21) > $22 or (coalesce(((up.__nk1) ->> $23)::bigint, $24) > $25 and coalesce(((up.__nk1) ->> $26)::bigint, $27) > $28) then $29::numeric when coalesce(((up.__nk1) ->> $30)::bigint, $31) > $32 then $33::numeric when coalesce(((up.__nk1) ->> $34)::bigint, $35) > $36 then $37::numeric else round(up.__ns1, coalesce(greatest(case when (up.__nc1) > (select coalesce(sum(value::bigint), $38) from jsonb_each_text(up.__nk1)) then $39 end, (select max(key::int) from jsonb_each_text(up.__nk1) where key not in ($40 /*, ... */) and value::bigint > $41)), $42)) end))::numeric end as "__trellis_a1", case when up.__nc2 = $43 then $44 else (up.__ns2)::bigint end as "__trellis_a2") as a) as __nf), cur as ( select nv.*, t.* , (nv.__nn > $45) is distinct from (t.__tc is not null) or (nv.__nn > $46 and not ((nv.__nf0, nv.__nf1, scale(nv.__nf1), nv.__nf2) is not distinct from (t.__vf0, t.__vf1, scale(t.__vf1), t.__vf2))) as __changed from nv left join lateral (select x.ctid, x."n", x."total_score", x."total_likes" from "public"."author_totals" x where x."author_id" = nv."author_id" union all select x.ctid, x."n", x."total_score", x."total_likes" from "public"."author_totals" x where (nv."author_id" is null) and x."author_id" is null limit $47) as t(__tc, __vf0, __vf1, __vf2) on $48 ), written as ( insert into "public"."author_totals" ("author_id", "n", "total_score", "total_likes") select "author_id", __nf0, __nf1, __nf2 from cur where __changed and __nn > $49 order by "author_id" on conflict ("author_id") do update set "n" = excluded."n", "total_score" = excluded."total_score", "total_likes" = excluded."total_likes" ), deleted as ( delete from "public"."author_totals" where ctid = any(array( select __tc from cur where __changed and __nn <= $50 and __tc is not null)) ) select coalesce(replace(cur."author_id"::text, chr($51), chr($52) || chr($53)), chr($54)), cur.__changed, cur.__nn > $55, cur.__tc is not null, $56::text, cur.__nn, cur.__nc1, cur.__ns1::text, cur.__nc2, cur.__ns2::text from cur
+
+-- calls=17697 ms=2102 rows=16805 wal=6326914 fpi=68 temp_mb=0
+update posts set likes = likes + 1, score = score + 0.5 where id = $1
+
+-- calls=17168 ms=1234 rows=17168 wal=8414634 fpi=14 temp_mb=0
+insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+
+-- calls=7623 ms=804 rows=7262 wal=2039996 fpi=36 temp_mb=0
+delete from posts where id = $1
+
+-- calls=8226 ms=731 rows=8226 wal=3882547 fpi=4 temp_mb=0
+insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+
+-- calls=3187 ms=614 rows=3049 wal=1712614 fpi=13 temp_mb=0
+update posts set grp_hi = $1, author_id = $2 where id = $3
+
+-- calls=12547 ms=543 rows=12547 wal=4887243 fpi=0 temp_mb=0
+insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images)
+        select $17, case when n."id" is not null then format($18, n."id") else format($19, o."id") end,
+            case when not (n."id" is not null) then $20 when not (o."id" is not null) then $21 else $22 end,
+            l, case when o."id" is not null then jsonb_build_object($23, case when num_nulls(o."author_id") = $24 then $25 else format($26, o."author_id") end, $27, case when num_nulls(o."id") = $28 then $29 else format($30, o."id") end, $31, case when num_nulls(o."likes") = $32 then $33 else format($34, o."likes") end, $35, case when num_nulls(o."score") = $36 then $37 else format($38, o."score") end) end, case when n."id" is not null then jsonb_build_object($39, case when num_nulls(n."author_id") = $40 then $41 else format($42, n."author_id") end, $43, case when num_nulls(n."id") = $44 then $45 else format($46, n."id") end, $47, case when num_nulls(n."likes") = $48 then $49 else format($50, n."likes") end, $51, case when num_nulls(n."score") = $52 then $53 else format($54, n."score") end) end, l, ts, $55
+        from trellis_old o
+        full join trellis_new n on format($56, o."id") = format($57, n."id") collate "C"
+        where not (o."id" is not null) or not (n."id" is not null)
+            or pg_catalog.record_image_ne(row(o."author_id", o."id", o."likes", o."score"), row(n."author_id", n."id", n."likes", n."score"))
+
+-- calls=1 ms=538 rows=110550 wal=618178 fpi=0 temp_mb=0
+insert into pg_temp."trellis_group_recompute_1_f01a0db369afd2ce" ("author_id") select "author_id" from "trellis"."agg_1" h union all select "author_id" as "author_id" from "public"."author_totals" t union all select distinct s."author_id"::integer as "author_id" from "public"."posts" s union all select s."author_id"::integer as "author_id" from (select old_image as __i from "trellis".seg_0 where src_table = $1 and jsonb_typeof(old_image) = $2 union all select transition_images -> $3 from "trellis".seg_0 where src_table = $1 and jsonb_typeof(transition_images -> $4) = $5 union all select old_image as __i from "trellis".seg_1 where src_table = $1 and jsonb_typeof(old_image) = $6 union all select transition_images -> $7 from "trellis".seg_1 where src_table = $1 and jsonb_typeof(transition_images -> $8) = $9 union all select old_image as __i from "trellis".seg_2 where src_table = $1 and jsonb_typeof(old_image) = $10 union all select transition_images -> $11 from "trellis".seg_2 where src_table = $1 and jsonb_typeof(transition_images -> $12) = $13 union all select old_image as __i from "trellis".seg_3 where src_table = $1 and jsonb_typeof(old_image) = $14 union all select transition_images -> $15 from "trellis".seg_3 where src_table = $1 and jsonb_typeof(transition_images -> $16) = $17) as r cross join lateral jsonb_populate_record($18::"public"."posts", r.__i) as s
+
+-- calls=3723 ms=526 rows=3563 wal=2012617 fpi=15 temp_mb=0
+update posts set grp_hi = $1, author_id = $2 where id = $3
+
+-- calls=14404 ms=494 rows=14404 wal=4560325 fpi=3 temp_mb=0
+insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images)
+        select $17, format($18, n."id"), $19, l, $20, jsonb_build_object($21, case when num_nulls(n."author_id") = $22 then $23 else format($24, n."author_id") end, $25, case when num_nulls(n."id") = $26 then $27 else format($28, n."id") end, $29, case when num_nulls(n."likes") = $30 then $31 else format($32, n."likes") end, $33, case when num_nulls(n."score") = $34 then $35 else format($36, n."score") end), l, ts, $37
+        from trellis_new n
+
+-- calls=2827 ms=324 rows=2827 wal=1371548 fpi=2 temp_mb=0
+insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+
+-- calls=5227 ms=285 rows=686 wal=225818 fpi=0 temp_mb=0
+update posts set likes = likes + 1, score = score + 0.5 where id = $1
+
+-- calls=1098 ms=233 rows=1051 wal=583871 fpi=2 temp_mb=0
+update posts set grp_hi = $1, author_id = $2 where id = $3
+
+-- calls=34707 ms=191 rows=34707 wal=0 fpi=0 temp_mb=0
+present := case when exists (select $1 from trellis_new)
+        then (select count(*) from pg_catalog.pg_attribute a
+            where a.attrelid = $2 and a.attnum > $3 and not a.attisdropped
+              and a.attname = any (array[$4 /*, ... */]::name[])) else $5 end
+
+-- calls=744 ms=189 rows=10328 wal=2853201 fpi=22 temp_mb=0
+delete from posts where author_id = $1
+
+-- calls=4248 ms=186 rows=12419 wal=3837630 fpi=0 temp_mb=0
+insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images)
+        select $17, format($18, o."id"), $19, l, jsonb_build_object($20, case when num_nulls(o."author_id") = $21 then $22 else format($23, o."author_id") end, $24, case when num_nulls(o."id") = $25 then $26 else format($27, o."id") end, $28, case when num_nulls(o."likes") = $29 then $30 else format($31, o."likes") end, $32, case when num_nulls(o."score") = $33 then $34 else format($35, o."score") end), $36, l, ts, $37
+        from trellis_old o
+
+-- calls=2431 ms=163 rows=2431 wal=1176013 fpi=1 temp_mb=0
+insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+
+-- calls=851 ms=151 rows=8490 wal=2439570 fpi=50 temp_mb=0
+delete from posts where author_id = $1
+
+-- calls=1001 ms=136 rows=956 wal=524632 fpi=1 temp_mb=0
+update posts set grp_hi = $1, author_id = $2 where id = $3
+
+-- calls=2206 ms=74 rows=277 wal=57366 fpi=0 temp_mb=0
+delete from posts where id = $1
+
+-- calls=1 ms=69 rows=9338 wal=0 fpi=0 temp_mb=0
+with fenced as (select src_table, key, old_image::text as old_image, new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, appended_at, change_id, route, op, row_txid, transition_images::text as transition_images from seg_1 where pg_visible_in_snapshot(row_txid, $1::text::pg_snapshot) union all select src_table, key, old_image::text as old_image, new_image::text as new_image, lsn, origin_lsn, src_changed, hop_gen, appended_at, change_id, route, op, row_txid, transition_images::text as transition_images from seg_0 where pg_visible_in_snapshot(row_txid, $2::text::pg_snapshot) and not pg_visible_in_snapshot(row_txid, $3::text::pg_snapshot)), truncates as materialized ( select src_table, lsn, change_id from fenced where op = $4 ), filtered as ( select * from fenced f where route % $5::bigint = any($6::bigint[])  and f.op not in ($7 /*, ... */) and not exists ( select $8 from truncates t where t.src_table = f.src_table and (t.lsn, t.change_id) > (f.lsn, f.change_id) ) ) select filtered.src_table, filtered.key, (array_agg(array[new_image, op, lsn::text, row_txid::text] order by lsn desc, change_id desc) filter (where (old_image is not null or new_image is not null or op = $9) and op <> $10))[$11][$12] as new_image, (array_agg(old_image order by lsn asc, change_id asc) filter (where (old_image is not null or new_image is not null) and op <> $13))[$14] as old_image, max(src_changed) as src_changed, case when bool_or(origin_lsn is null) then $15 else min(origin_lsn) end as origin_lsn, max(lsn) as lsn, case when bool_or(src_changed is not null) then $16 else max(hop_gen) end as hop_gen, min(appended_at) as first_seen, bool_or(op = $17) as is_truncate, (array_agg(old_image order by lsn asc, change_id asc) filter (where op = $18 and old_image is not null))[$19] as prior_image, count(*) as row_count, bool_or(op = $20) as has_recompute, coalesce((array_agg(array[new_image, op, lsn::text, row_txid::text] order by lsn desc, change_id desc) filter (where (old_image is not null or new_image is not null or op = $21) and op <> $22))[$23][$24] = $25, $26) as ends_in_delete, ((array_agg(array[new_image, op, lsn::text, row_txid::text] order by lsn desc, change_id desc) filter (where (old_image is not null or new_image is not null or op = $27) and op <> $28))[$29][$30])::pg_lsn as last_lsn, (array_agg(array[new_image, op, lsn::text, row_txid::text] order by lsn desc, change_id desc) filter (where (old_image is not null or new_image is not null or op = $31) and op <> $32))[$33][$34] as last_row_txid, array_agg(json_build_object($35, row_txid::text, $36, lsn::text, $37, op, $38, old_image::json, $39, new_image::json, $40, transition_images::json)::text order by lsn, change_id) filter (where op in ($41 /*, ... */)) as group_sides from filtered group by src_table, key limit $42
+
+-- calls=40708 ms=63 rows=40708 wal=0 fpi=0 temp_mb=0
+SELECT pg_catalog.set_config($15, cast(st as text), $16)
+
+-- calls=1111 ms=56 rows=1111 wal=433342 fpi=0 temp_mb=0
+insert into "trellis"."seg_0" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images)
+        select $17, case when n."id" is not null then format($18, n."id") else format($19, o."id") end,
+            case when not (n."id" is not null) then $20 when not (o."id" is not null) then $21 else $22 end,
+            l, case when o."id" is not null then jsonb_build_object($23, case when num_nulls(o."author_id") = $24 then $25 else format($26, o."author_id") end, $27, case when num_nulls(o."id") = $28 then $29 else format($30, o."id") end, $31, case when num_nulls(o."likes") = $32 then $33 else format($34, o."likes") end, $35, case when num_nulls(o."score") = $36 then $37 else format($38, o."score") end) end, case when n."id" is not null then jsonb_build_object($39, case when num_nulls(n."author_id") = $40 then $41 else format($42, n."author_id") end, $43, case when num_nulls(n."id") = $44 then $45 else format($46, n."id") end, $47, case when num_nulls(n."likes") = $48 then $49 else format($50, n."likes") end, $51, case when num_nulls(n."score") = $52 then $53 else format($54, n."score") end) end, l, ts, $55
+        from trellis_old o
+        full join trellis_new n on format($56, o."id") = format($57, n."id") collate "C"
+        where not (o."id" is not null) or not (n."id" is not null)
+            or pg_catalog.record_image_ne(row(o."author_id", o."id", o."likes", o."score"), row(n."author_id", n."id", n."likes", n."score"))
+
+-- calls=1296 ms=52 rows=1296 wal=425052 fpi=2 temp_mb=0
+insert into "trellis"."seg_0" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images)
+        select $17, format($18, n."id"), $19, l, $20, jsonb_build_object($21, case when num_nulls(n."author_id") = $22 then $23 else format($24, n."author_id") end, $25, case when num_nulls(n."id") = $26 then $27 else format($28, n."id") end, $29, case when num_nulls(n."likes") = $30 then $31 else format($32, n."likes") end, $33, case when num_nulls(n."score") = $34 then $35 else format($36, n."score") end), l, ts, $37
+        from trellis_new n
+

@@ -1,0 +1,25 @@
+1|32614|966159|682598562|30025|644|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), rg as (select distinc
+44801|13106|41784|166334010|18113|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+42619|9058|42619|55922031|3890|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+5|6692|966467|306453218|49|47|insert into "trellis"."agg_1" ("grp_hi") select distinct "grp_hi" from ( select "grp_hi" from pg_temp."trellis_group_sides_1_44d1af5ecae2d619" union all select 
+8|5278|11|50442|6|0|delete from trellis.agg_1 where ctid = any(array( select ctid from trellis.agg_1 where __zero and (__basis is null or __stamp <= $2) order by grp_hi limit $1 fo
+19361|5229|18060|46856212|5109|0|delete from posts where id = $1
+20578|4761|20578|33351054|2700|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+57917|3378|57917|22463495|23|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, case when n."id" i
+9321|2727|8700|48165672|5402|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+68465|2709|68465|21435829|33|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, n."id"
+7846|2130|7328|38720860|4319|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+1|1964|966346|598496|0|0|insert into pg_temp."trellis_group_recompute_1_f8ecc87fa7762b2e" ("grp_hi") select "grp_hi" from "trellis"."agg_1" h union all select "grp_hi" as "grp_hi" from 
+20031|1530|58175|17977853|8|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, o."id"
+151|1479|151|0|0|0|select count(*) from trellis.seg_1
+1796|1379|25713|48239776|4905|0|delete from posts where author_id = $1
+9|1278|9|3043|2|0|update backfill_chunks set claimed_at = now() where id = $1 and claimed_by = $2 and not done
+158|1034|158|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next
+6077|1033|6077|5649508|264|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+6896|988|6896|7699051|459|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+197|986|197|0|0|0|select not exists ( select $4 from backfill_chunks bc where bc.definition_id = d.id and not bc.done and not (bc.fuse_rearmed_at is distinct from d.fuse_rearmed_
+2036|942|20142|52012731|5647|0|delete from posts where author_id = $1
+4|901|8|1765|1|0|insert into drainers (drainer_id, last_seen) select distinct d, now() from unnest($1::text[]) as d on conflict (drainer_id) do update set last_seen = excluded.l
+148824|892|148824|0|0|0|present := case when exists (select $1 from trellis_new) then (select count(*) from pg_catalog.pg_attribute a where a.attrelid = $2 and a.at
+2380|782|2236|10583640|1162|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+12688|716|1298|5822881|636|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1

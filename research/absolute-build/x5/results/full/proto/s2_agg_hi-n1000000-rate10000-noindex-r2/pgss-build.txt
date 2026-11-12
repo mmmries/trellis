@@ -1,0 +1,25 @@
+1|7133|959995|470556705|53|571|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), a as (select s."grp_h
+25790|3291|24200|53275593|5359|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+24451|2215|24451|16684909|578|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+29674|1282|29674|11513904|15|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, case when n."id" i
+11068|1258|10418|18216118|1895|0|delete from posts where id = $1
+34592|1158|34592|10779624|6|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, n."id"
+11853|1044|11853|7790636|251|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+1|844|3744|20584969|3208|25|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), rg as (select distinc
+5441|711|5125|16136153|1724|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+4532|579|4269|12779091|1350|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+10251|438|29845|9227092|3|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, o."id"
+76965|420|76965|0|0|0|present := case when exists (select $1 from trellis_new) then (select count(*) from pg_catalog.pg_attribute a where a.attrelid = $2 and a.at
+1052|409|14818|18278507|1689|0|delete from posts where author_id = $1
+4008|359|4008|2967638|130|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+7422|325|779|1693363|169|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+1201|313|11883|20213481|2074|0|delete from posts where author_id = $1
+3465|305|3465|2217982|69|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+1581|205|1486|4935808|531|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+1407|178|1326|4182553|447|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+3202|147|326|601573|63|0|delete from posts where id = $1
+90624|137|90624|0|0|0|SELECT pg_catalog.set_config($15, cast(st as text), $16)
+35|117|35|0|0|0|select count(*) from trellis.seg_1
+90622|82|90622|0|0|0|SELECT pg_catalog.set_config($20, cast(st as text), $21)
+30832|80|30832|0|0|0|reread := exists (select $1 from trellis_old o group by o."id" having count(*) > $2) or exists (select $3 from trellis_new n 
+1153|67|1153|445257|0|0|insert into "trellis"."seg_0" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, case when n."id" i

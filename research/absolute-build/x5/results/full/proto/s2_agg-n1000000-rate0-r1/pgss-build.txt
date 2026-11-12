@@ -1,0 +1,25 @@
+1|2318|99995|47507879|2|44|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), a as (select s."autho
+1|34|0|13461|2|0|create table "public"."author_totals" ("author_id" integer, "n" bigint, "total_score" numeric, "total_likes" bigint, unique nulls not distinct ("author_id"))
+59|32|236|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exists (select from pg_ca
+1|30|0|27677|2|0|create table "trellis"."agg_1" ("author_id" integer, __n bigint not null default 0, __count_1 bigint not null default 0, __sum_1 numeric not null default 0, __s
+1|21|1|828|0|0|insert into schema_edges (from_node_id, to_node_id, kind) values ($1, $2, $3) on conflict (from_node_id, to_node_id, kind) do nothing
+59|15|0|0|0|0|set timezone to $1
+1|12|0|2149|1|0|create index on "trellis"."agg_1" ("author_id") where __zero
+2|9|2|837|0|0|insert into schema_nodes (table_name, is_source, is_target) values ($1, $2, $3) on conflict (table_name) do update set
+1|9|0|0|0|0|select v.transform_id, d.source_table, n.nspname::text || $1 || t.typname::text, v.label, e.enumlabel::text from definition_enum_values v join (select d.id as t
+1|9|1|680|0|0|insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) select id, $2, fuse_rearmed_at, pg_current_xact_id() from transform_definitions wh
+59|4|0|0|0|0|set timezone_abbreviations to $1
+1|4|0|13527|0|0|create temp table if not exists "trellis_group_sides_1_34563cf2bd068379" ("author_id" integer, __txid xid8, __lsn pg_lsn, __n bigint, __c1 bigint, __s1 numeric,
+33|4|33|0|0|0|select pid from pg_locks where locktype = $2 and granted and objsubid = $3 and database = (select oid from pg_database where datname = current_database()) and (
+12|3|96|0|0|0|select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod), a.atttypid, a.a
+1|3|1|289|0|0|insert into source_table_versions (source_table, version) values ($1, $2) on conflict (source_table) do updat
+29|3|87|0|0|0|with cols as ( select array_agg(a.attname::text) as names, array_agg(a.attnum) as attnums, array_agg(a.attcollation::oid) as collations from pg_catalog.pg_attri
+2|2|0|0|0|0|insert into definition_types (transform_id, type_oid, type_name) select $1, k.type_oid, k.type_name from definition_key_types k where k.transform_id = $1 and k.
+28|2|28|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next
+28|2|28|0|0|0|select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, d.join_table, array(select j.table_name from (select $4 as position, d.join_table a
+185|2|185|0|0|0|select set_config($1, case when kept between $2 and $3 then kept::text else $4 end, $5) from (select (extract($6 from current_setting($7)::interval) * $8)::bigi
+1|2|1|1306|0|0|insert into transform_definitions (target_table, source_table, source_version, definition_text, source_columns, status, grammar
+33|1|33|0|0|0|select w.worker_id, j->>$2, coalesce((j->>$3)::boolean, $4), (j->>$5)::int4, w.last_seen > now() - (interval $6 * $1) from "trellis".worker_registry w, lateral 
+132|1|132|0|0|0|select to_regclass($1) is not null
+11|1|11|0|0|0|with recorded as ( select coalesce($3::text[], ( select k.key_columns from definition_keys k 
+33|1|33|0|0|0|select extract(epoch from clock_timestamp()), count(*) filter (where state in ('sealed','draining')), coalesce(sum(row

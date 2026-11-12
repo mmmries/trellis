@@ -1,0 +1,5 @@
+tag=s2_agg_hi-n1000000-rate10000-r2 label=full tr=/home/mike/code/trellis-lane-r-x5/target/x5-bin/trellis-proto
+trellis 0.2.0
+ 15:35:27 up 2 days, 4 min,  1 user,  load average: 4.40, 4.62, 10.32
+rustc=0 cargo=0
+transform: TRANSFORM hi_totals FROM posts GROUP BY grp_hi SELECT grp_hi AS grp_hi, COUNT(*) AS n, SUM(score) AS total_score, SUM(likes) AS total_likes

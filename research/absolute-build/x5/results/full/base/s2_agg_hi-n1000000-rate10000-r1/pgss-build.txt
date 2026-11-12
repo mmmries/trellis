@@ -1,0 +1,25 @@
+1|36340|954969|683416183|29768|665|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $1) as __seg), rg as (select distinc
+61963|19527|57008|170987824|18117|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+59863|15180|59863|64066294|3954|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+5|11517|955125|302682262|37|47|insert into "trellis"."agg_1" ("grp_hi") select distinct "grp_hi" from ( select "grp_hi" from pg_temp."trellis_group_sides_1_44d1af5ecae2d619" union all select 
+28674|9561|28674|36867116|2707|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+70495|8807|70495|27364095|20|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, case when n."id" i
+27156|7513|25042|45688833|4749|0|delete from posts where id = $1
+85672|6962|85672|26748236|32|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, n."id"
+9|6647|7|25419|3|0|delete from trellis.agg_1 where ctid = any(array( select ctid from trellis.agg_1 where __zero and (__basis is null or __stamp <= $2) order by grp_hi limit $1 fo
+11114|4635|10254|38714329|4111|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+12777|4114|11720|45285466|4837|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+2486|3716|35317|52149564|5070|0|delete from posts where author_id = $1
+1|3289|955059|567314|0|0|insert into pg_temp."trellis_group_recompute_1_f8ecc87fa7762b2e" ("grp_hi") select "grp_hi" from "trellis"."agg_1" h union all select "grp_hi" as "grp_hi" from 
+2822|2645|28190|51894802|5414|0|delete from posts where author_id = $1
+9624|2562|9624|9321416|540|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+196|2231|196|0|0|0|select count(*) from trellis.seg_1
+3733|1990|3425|11917038|1253|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+3230|1862|2997|9769642|1009|0|update posts set grp_hi = $1, author_id = $2 where id = $3
+24804|1754|72073|22245796|8|0|insert into "trellis"."seg_1" (src_table, key, op, lsn, old_image, new_image, origin_lsn, src_changed, transition_images) select $17, format($18, o."id"
+185160|1554|185160|0|0|0|present := case when exists (select $1 from trellis_new) then (select count(*) from pg_catalog.pg_attribute a where a.attrelid = $2 and a.at
+17784|1502|1681|4790424|501|0|update posts set likes = likes + 1, score = score + 0.5 where id = $1
+8311|1416|8311|7195730|343|0|insert into posts values ($1,$2,1,1,$3,$4,$5,'x5')
+11|1277|11|4832|3|0|insert into worker_registry (worker_id, registered_at, last_seen, version, staging, drain, standby, staging_pid) values ($1, now(), now(), $2, $3, $4, $5, $6) o
+11|942|11|5092|3|0|update backfill_chunks set claimed_at = now() where id = $1 and claimed_by = $2 and not done
+7629|773|711|1278356|133|0|delete from posts where id = $1
