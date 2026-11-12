@@ -91,16 +91,19 @@ grace period, whether or not a write arrived:
   on the next pass;
 - a 1-1 `JOIN`'s joined table losing the unique key on its `ON` columns: the
   `JOIN` pauses on the next pass;
-- a primary key redefined: its readers pause on the next drained change or
-  the next pass.
+- a primary key redefined, or the table created again with another one: the
+  readers keyed by it pause on the next drained change or the next pass.
 
-A primary key made deferrable halts its readers on the next drain of a change.
-A dropped primary key leaves the table uncapturable (a capture holdup in
-`status()`), and halts its readers on the next drain of a change to it. A
-target that lost the index over its key has no detector: `RESUME` and a rebuild
-refuse until the index is back. These pause nothing: an equivalent index
-built before the old one is dropped, `REINDEX CONCURRENTLY`, a rename and
-pg_repack.
+A primary key made deferrable halts its readers on the next drain of a change,
+unless a unique index that isn't deferrable is over exactly its columns, which
+the drain then keys the table by. A dropped primary key leaves the table
+uncapturable (a capture holdup in `status()`), and halts its readers on the
+next drain of a change to it. A table read through `KEY (…)` is keyed by it
+whatever its primary key does. A target that lost the index over its key has
+no detector: `RESUME` and a rebuild refuse until the index is back, and
+Trellis never keys the target by another index. These pause nothing: an
+equivalent index built before the old one is dropped, `REINDEX CONCURRENTLY`,
+a rename and pg_repack.
 
 #### Index
 
@@ -203,135 +206,42 @@ new leaf, dropped leaf, `DEFAULT` or `HASH` re-split) is not.
 definition against the table now at that name, reinstalls capture and rebuilds
 from that table. If the table was created again with another primary key, what
 Trellis stored under the old key is discarded. A 1-1 target is first re-keyed
-in place, or the resume refuses, as [the key entry](#the-key-a-transform-keys-each-table-by)
-describes. Plan a scripted `RESUME` after a swap, or after a bulk load with
+in place, or the resume refuses
+([`PAUSE` and `RESUME`](operations.md#pause-and-resume)). Plan a scripted `RESUME` after a swap, or after a bulk load with
 triggers disabled ([embedding](embedding.md)).
 
 #### The key a transform keys each table by
 
-**Condition:** The key a transform keys each table by: its source's and a
-`JOIN`'s joined table's primary key, or the key its definition names with
-`KEY (…)` directly after the table (`FROM orders KEY (customer_id, id)`,
-`JOIN b KEY (…) ON`); for another transform's target, the key Trellis gave that
-target; and its own target's key (a 1-1 target's is its source's key, an
-aggregate's or `JOIN`'s its `UNIQUE NULLS NOT DISTINCT` group key).
+A transform keys each table it reads by the table's primary key, or by the
+columns a `KEY (…)` written directly after the table names
+(`FROM orders KEY (customer_id, id)`, `JOIN b KEY (…) ON`). Another
+transform's target is keyed by the key Trellis gave it. A target is keyed by
+its source's key (1-1, and a 1-1 `JOIN` by its `FROM` table's), or by its
+`UNIQUE NULLS NOT DISTINCT` group key (aggregate, `JOIN`). The rules and their
+reasons are [ADR-0026](decisions/0026-source-keys.md). Define refuses:
 
-A source with no primary key and no `KEY`, a source or joined table whose
-primary key is deferrable (`DEFERRABLE`, initially immediate or deferred) and
-no `KEY`, a `KEY` no index backs, a `KEY` on another transform's target, and a
-key other than the one the table's other transforms use.
+- no primary key and no `KEY` (`NoPrimaryKey`, naming both remedies);
+- a deferrable primary key and no `KEY` (`DeferrablePrimaryKey`). Recreate it
+  in one statement, as the message says
+  (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`): Postgres can't
+  make a key not deferrable in place;
+- a `KEY` no unique index backs (`KeyNotBacked`). The index must be valid, not
+  deferrable, not partial and over no expression, with exactly the `KEY`'s
+  columns in any order, default operator classes and the columns' own
+  collations, and every column `NOT NULL` or the index `NULLS NOT DISTINCT`. A
+  partitioned table's unique index holds its partition key, so its `KEY` names
+  those columns too;
+- a `KEY` on another transform's target (`KeyOnTrellisTarget`);
+- a key other than the one the table's other transforms use
+  (`KeyDiffersFromReaders`, naming the key to write), so a second transform
+  over a `KEY` table repeats the `KEY`.
 
-**Refused at define:** Yes: `NoPrimaryKey` (naming `KEY (…)` and
-`ADD PRIMARY KEY` as remedies), `DeferrablePrimaryKey` (naming the key and the
-one-statement recreation), `KeyNotBacked`, `KeyOnTrellisTarget` and
-`KeyDiffersFromReaders` (naming the key to write). Trellis never keys a table
-by a unique index it picked itself, nor by a deferrable key, primary or not:
-one can hold duplicate keys inside a transaction.
-
-A `KEY` needs a unique index whose key columns are exactly its columns, in any
-order (an `INCLUDE` column is not a key column), valid, not deferrable, not
-partial, over no expression, each column under its type's default operator
-class and its own collation, with every column `NOT NULL` or the index
-`NULLS NOT DISTINCT`; any such index backs it, so a nullable key works through
-`KEY` on a `NULLS NOT DISTINCT` index. Its column types are held to the
-key-type allowlist as a primary key's are.
-
-A partitioned table's unique index must hold its partition key, so its `KEY`
-names those columns too. A table is keyed one way for every transform that
-reads it, as its `FROM` or joined table alike: a second definition over a `KEY`
-table repeats the `KEY`, and one over a table its other transforms key by its
-primary key writes none.
-
-Trellis records one key per table, the first time a transform keys by it, and
-keys the table by the primary key or unique index over exactly those columns
-for every transform that reads or writes it, in the key's own column order. A
-unique index or constraint added to the table later, one an adopted target
-(`ADOPT EXISTING TABLE`) already had, one a dump restore creates before the key
-(it creates constraints in name order), and the key rebuilt by
-`REINDEX CONCURRENTLY` change nothing.
-
-The record belongs to the table it was taken from: a table dropped and created
-again is keyed by its own key, whatever transforms of the old one remain.
-
-**If it appears after define:** A source's primary key redefined in place, or
-the table created again with another one, pauses the transforms that key it by
-its primary key (the rows above). `RESUME` of an aggregate or `JOIN` takes the
-table's primary key now as its key, for every transform that reads the table,
-and rebuilds; with no primary key it refuses rather than take another unique
-index.
-
-A 1-1 transform's target is keyed by its source's key (a 1-1 `JOIN`'s, by its
-`FROM` table's): its `RESUME` re-validates it as define would and, where define
-would accept it, re-keys the target in place to the new key under the rebuild's
-lock.
-
-A new key column the transform doesn't select is added as a key column, copied
-as define copies one (its type with no modifier, and its collation), which
-empties the target until the rebuild; a former key column it doesn't create is
-dropped, and the rows the narrower key repeats are deleted until the rebuild
-writes them again (on a plain 1-1 transform,
-`ALTER TRANSFORM … ADD <column> AS <column>` once it is live adds it back as a
-field); and the primary key is replaced
-(`DROP CONSTRAINT …, ADD PRIMARY KEY (…)`), keeping the table, your indexes and
-grants.
-
-The pause message says which columns `RESUME` will add and drop. The target's
-new key is recorded, which pauses the transforms reading the target, and their
-own `RESUME` follows these rules over it.
-
-It refuses, naming the conflict, while define would refuse the transform (over
-a partitioned source, say), when a new key column's name is taken by a column
-of the target that isn't a copy of it (a field of that name, or a column you
-added), and when a view, index or foreign key of yours depends on a column it
-would drop or on the key constraint it replaces.
-
-A primary key made deferrable after define (dropped and added again
-`DEFERRABLE`) halts every transform reading the table on the next drain of a
-change to it, with a `capture_failure` naming the key and the remedy, unless a
-unique index that isn't deferrable is over exactly its columns, which the drain
-then keys the table by; `RESUME` refuses as define does either way.
-
-A table its transforms key by `KEY` is keyed by it whatever its primary key
-does: a primary key added, redefined, made deferrable or dropped pauses
-nothing. Its backing index may be replaced by an equivalent one at any time
-(build the new one before dropping the old): `REINDEX CONCURRENTLY`, a rename,
-pg_repack and `ADD PRIMARY KEY USING INDEX` change nothing.
-
-With none left valid (dropped, a failed build's invalid index, or a partitioned
-root's index left invalid), the staging worker's next reconcile pass pauses
-every transform reading the table, with no grace and whether or not a write
-arrived, naming the table, the key and a ready-to-run `create unique index`; a
-swap that drops the old index first pauses when a pass runs between the two.
-
-A partitioned root's index stays invalid after a leaf's index is repaired until
-`ALTER INDEX … ATTACH PARTITION` runs again for that leaf, and the message says
-so. `RESUME` and a rebuild refuse until an index backs the key again, naming
-the table, the key and the unique indexes it has.
-
-A target, its own or one it reads, left with no valid, non-partial,
-non-deferrable unique index over its key (dropped, or never created by a
-restore): `RESUME` and a rebuild refuse, naming the table, the key and the
-unique indexes it has, and Trellis never keys the table by another index.
-
-**Remedy:** Name the key with `KEY (…)`, backed by a unique index over exactly
-those columns, or add a primary key (`ALTER TABLE … ADD PRIMARY KEY`, or
-`ADD PRIMARY KEY USING INDEX` over an existing unique index); write the key the
-message names. Recreate a deferrable primary key not deferrable in one
-statement (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`: Postgres
-can't change it in place), then `RESUME`, or name a `KEY (…)` over a unique
-index that isn't deferrable.
-
-For an aggregate or `JOIN`, `RESUME`, after adding a primary key if the table
-has none. For a 1-1 transform, `RESUME`; when it refuses, drop the object it
-names, drop or rename your column it names, or, for a field of the new key
-column's name, restore the key, resume and rename the field with
-`ALTER TRANSFORM`; or `DROP TRANSFORM` and define it again. For a `KEY`, create
-a unique index backing it again (on a partitioned table, re-run
-`ALTER INDEX … ATTACH PARTITION` for a repaired leaf's index), then `RESUME`.
-
-For a target, create a unique index over exactly its key columns again
-(`UNIQUE NULLS NOT DISTINCT` if one can be `NULL`), then `RESUME`; or
-`DROP TRANSFORM` and define it again.
+Trellis records each table's key the first time a transform keys by it, tied
+to that table. A unique index added later, one an adopted target already had,
+the order a dump restore creates constraints in and `REINDEX CONCURRENTLY`
+change nothing. After define the key is the [Key](#key) class. What `RESUME`
+takes as the key, and how it re-keys a 1-1 target in place, is in
+[`PAUSE` and `RESUME`](operations.md#pause-and-resume).
 
 #### Row-level security on a role Trellis runs as
 
@@ -550,25 +460,8 @@ When `b` is another transform's 1-1 target, its `ON` columns must also include
 every column of its primary key, so a unique index added to the target never
 admits a join on another column. Trellis orders changes per primary-key value
 only, so only the primary key is unique at every instant while the upstream
-drains. An `a` that is a 1-1 target may be joined on any columns. A field is
-any expression over `<table>.<column>` columns of either table. The target is
-keyed by `a`'s primary key.
-
-The joined table needs no source index. Trellis builds the target in chunks of
-`a`'s primary key, keeps it readable across a `RESUME`, and applies changes,
-re-derives and `TRUNCATE`s of either table. A `TRUNCATE` of `a` empties the
-target. A `TRUNCATE` of `b` starts a rebuild, so the transform reads
-`backfilling`, and a row keeps the `b` columns it held (an `INNER` row stays)
-until the rebuild reaches it.
-
-A `b` that is another transform's target is never truncated. A `TRUNCATE` of
-that transform's source reaches the `JOIN` as a delete of every row of `b`,
-like any other change of `b`. A page whose changes fail on more rows of `a`
-than its bisection can name pauses the transform and everything downstream of
-it, with a `capture_failure` of kind `halt`. The same goes for a chunk of a
-`b` change's fan-out. Otherwise, a row of `a` that a page fails to write, for
-its own change or a change of `b`, is held in quarantine on its first failure,
-and the page applies every other change.
+drains. An `a` that is a 1-1 target may be joined on any columns. How the
+target is built and kept is in [Granularity](#1-1-join).
 
 After define, a widening of a column it copies (`a`'s key, a field, `R`, `M`
 and `J`) is handled as [the widening entry](#a-column-trellis-copies-widened)
@@ -580,7 +473,7 @@ and pauses nothing
 ([known correctness gaps](known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
 `RESUME` refuses a `b` whose `ON` columns are no longer unique. It re-keys the
 target to a changed key of `a` as for a 1-1 transform
-([the key entry](#the-key-a-transform-keys-each-table-by)).
+([`PAUSE` and `RESUME`](operations.md#pause-and-resume)).
 
 To fix a refusal, join `b` on a unique key: a 1-1 target's, on columns that
 include its primary key, or join the table that transform reads. Give an
@@ -624,9 +517,7 @@ of its fan-out ([1-1 JOIN](#1-1-join)).
 
 After define, each joined table is handled as the 1-1 `JOIN` handles `b`, at
 whichever position it is joined. That includes a value of an enum read there
-being relabelled. A `TRUNCATE` of a joined table, at any position, starts a
-rebuild. One statement that truncates several of the star's tables is one
-rebuild. `RESUME` re-validates every position as define does, and re-keys the
+being relabelled. `RESUME` re-validates every position as define does, and re-keys the
 target to a changed key of `a`. Join a snowflake's outer table through a
 transform of its own, and join that target.
 
@@ -685,18 +576,10 @@ relation.
 
 With `ADOPT EXISTING TABLE` after the target
 (`TRANSFORM t ADOPT EXISTING TABLE FROM s …`), define builds into the existing
-table instead. The table must be plain, empty, and shaped exactly as define
-would create it:
-
-- the same columns, in the same order;
-- each column with the type (no modifier), collation and nullability define
-  gives it;
-- the key define creates: the primary key, or an aggregate's or `JOIN`'s
-  `UNIQUE NULLS NOT DISTINCT` group key, not deferrable and with no `INCLUDE`
-  columns.
-
-Define records that key, so a unique constraint the table already has never
-keys it instead ([the key entry](#the-key-a-transform-keys-each-table-by)). The
+table instead. The table must be a plain, empty table that the defining role
+owns (or holds its owner's privileges) and can write, shaped exactly as define
+would create it. Define records the key it would create, so a unique
+constraint the table already has never keys it instead ([the key entry](#the-key-a-transform-keys-each-table-by)). The
 table may carry anything a user may add to any target, with the outcomes
 [any target has](#target-tables-are-trellis-owned): indexes, unique or not;
 constraints; triggers; rules; foreign keys, its own or another table's
@@ -705,26 +588,36 @@ referencing it; grants; comments; row security policies, subject to
 extended statistics; publications; views over it; storage parameters; and a
 replica identity.
 
-Anything else refuses with `TargetNotAdoptable`, a `validation` error whose
-message names the property by code:
+Anything else refuses with `TargetNotAdoptable`, a `validation` error (a
+`not_found` one for `missing`). Its message names the first difference found,
+by code, checked in the order below (the column rows one column at a time):
 
-- `missing`: no such table (a `not_found` error);
-- `not_a_table`, `partitioned`, `partition`, `inheritance`, `typed_table`,
-  `unlogged`, `extension_member`, `access_method`, `not_empty`;
-- `not_owner`: the defining role is neither the table's owner nor a member
-  that inherits the owner's privileges, so it couldn't alter or drop the table
-  later;
-- `privilege`: the role lacks `SELECT`, `INSERT`, `UPDATE`, `DELETE` or
-  `TRUNCATE` on the table;
-- `missing_column`, `extra_column`, `column_order`, `column_type`,
-  `column_collation`, `column_nullability`, `column_default`,
-  `generated_column`, `identity_column`, `key`, `owned_sequence`;
-- `unrecognized`: a constraint or dependent object the check doesn't know, so
-  a new Postgres feature refuses until Trellis learns it.
-
-The message names the first difference. To fix it, empty the table, fix the
-column, `ALTER TABLE … OWNER TO` the defining role or grant it membership in
-the owner `WITH INHERIT TRUE`, or grant the missing privilege.
+| Code | The table | Remedy |
+|---|---|---|
+| `missing` | doesn't exist | Define without `ADOPT EXISTING TABLE` to create it |
+| `not_a_table` | is a view, materialized view, foreign table, sequence, index or other relation, not a table | Adopt a plain table, or define under another name |
+| `not_owner` | is owned by a role whose privileges the defining role doesn't inherit, so Trellis couldn't alter or drop it later | `ALTER TABLE … OWNER TO` the defining role, or grant it membership in the owner `WITH INHERIT TRUE` |
+| `privilege` | lacks `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` for the defining role, which Trellis writes it as | Grant the privilege the message names |
+| `not_empty` | has rows | Empty it, or define under another name without the opt-in |
+| `partitioned` | is partitioned | Adopt a plain table |
+| `partition` | is a partition of another table | `DETACH PARTITION` it |
+| `inheritance` | has an inheritance parent or child | `ALTER TABLE <child> NO INHERIT <parent>`, for its parent and for each child |
+| `typed_table` | is a typed table (`OF <type>`) | `ALTER TABLE … NOT OF` |
+| `unlogged` | is `UNLOGGED` | `ALTER TABLE … SET LOGGED` |
+| `extension_member` | belongs to an extension | `ALTER EXTENSION … DROP TABLE`, as the extension's owner |
+| `access_method` | uses another table access method than define's | `ALTER TABLE … SET ACCESS METHOD` |
+| `missing_column` | lacks a column define creates | Add the column |
+| `extra_column` | has a column define doesn't create | Drop the column |
+| `column_order` | has define's columns in another order | Create the table again in define's order |
+| `generated_column` | has a generated column | `ALTER COLUMN … DROP EXPRESSION`; a virtual one can't be, so create the table again |
+| `identity_column` | has an identity column | `ALTER COLUMN … DROP IDENTITY` |
+| `column_type` | has a column of another type, or with a type modifier (define creates none) | `ALTER COLUMN … TYPE` to the type the message names |
+| `column_collation` | has a column with another collation | Alter the column to the collation the message names |
+| `column_nullability` | has a column `NOT NULL` where define's isn't, or the reverse | `SET` or `DROP NOT NULL` |
+| `column_default` | has a column with a default | `ALTER COLUMN … DROP DEFAULT` |
+| `key` | isn't keyed as define keys it: the primary key, or an aggregate's or `JOIN`'s `UNIQUE NULLS NOT DISTINCT` group key, over the same columns in the same order, not deferrable and with no `INCLUDE` columns | Add the key the message names, dropping a primary key that differs (`DROP CONSTRAINT …, ADD PRIMARY KEY (…)`) |
+| `owned_sequence` | has a sequence owned by one of its columns | `ALTER SEQUENCE … OWNED BY NONE`, or drop it |
+| `unrecognized` | has a constraint or dependent object the check doesn't know, so a new Postgres feature refuses until Trellis learns it | Drop the object the message names |
 
 The emptiness and shape are checked under a lock that keeps writes and DDL out
 until define commits. Another definition's target in the same instance refuses
@@ -968,9 +861,10 @@ lists the checks.
 Trellis keeps a copy of each table (`R` for `a`, an `M` for the table at each
 position) and a lock row per position and join key (`J`) in its own catalog
 schema ([data flow](data-flow.md#a-1-1-joins-hidden-state)), named by the transform's
-internal id, which readers get no grant on. Define registers the transform,
-creates its target and builds it from both tables in chunks of `a`'s primary
-key. Then:
+internal id, which readers get no grant on. The joined tables need no source
+index. Define registers the transform, creates its target and builds it from
+both tables in chunks of `a`'s primary key, and the target stays readable
+across a `RESUME`'s rebuild. Then:
 
 - A change of an `a` row rewrites its target row.
 - A change of a `b` row recomputes every `a` row on its join key at its
@@ -982,12 +876,20 @@ key. Then:
   last chunk commits. `status()` warns, per position, when a join key holds
   more than 250,000 `a` rows, a key whose `b` change takes seconds to reach
   every row ([status reference](status-reference.md#join)).
-- A `TRUNCATE` of `a` empties the target; one of a joined table, at any
-  position, rebuilds it.
+- A `TRUNCATE` of `a` empties the target. One of a joined table, at any
+  position, starts a rebuild, so the transform reads `backfilling`, and a row
+  keeps the joined columns it held (an `INNER` row stays) until the rebuild
+  reaches it. One statement that truncates several of the tables is one
+  rebuild. A joined table that is another transform's target is never
+  truncated: a `TRUNCATE` of that transform's source arrives as a delete of
+  every row.
 - A row whose field Postgres can't compute (an overflow, a division by zero)
   is held in quarantine on its first failure, and the page applies the rest.
   A row held by a joined table's change says so in its error
   (`sample_quarantined`): the table, its position and the row's join key there.
+  A page whose changes fail on more rows of `a` than its bisection can name,
+  or such a chunk of a joined table's fan-out, pauses the transform and
+  everything downstream of it, with a `capture_failure` of kind `halt`.
 
 A schema change of any of its tables pauses the whole transform as it does a
 join aggregate. `self_check` compares the target, every copy and the uniqueness
@@ -1168,7 +1070,7 @@ names the columns Trellis keys that table by, in the order written, instead of
 its primary key. A table with no primary key needs one. Every key space takes
 it, on either table of a `JOIN`. The key must be backed by a unique index over
 exactly those columns, and every transform reading the table names the same
-key (the [key row](#the-key-a-transform-keys-each-table-by) of Supported sources and targets).
+key ([the key entry](#the-key-a-transform-keys-each-table-by)).
 The rendered definition, and so a schema dump, carries it. A definition that
 writes it carries the release that added it as its [floor](#floors).
 
@@ -1277,7 +1179,7 @@ from what the definition uses then, so an `ALTER` that removes the only newer
 construct lowers it; a pause never changes it. When a column it reads changes type, the staging worker's next capture
 pass validates it again over the new type: if it still validates, the floor
 is recorded again, and can go up or down; if it doesn't, the definition
-pauses (the rows above). `status()` reports it as `floor`, and `trellis status` prints it as
+pauses ([Retype](#retype)). `status()` reports it as `floor`, and `trellis status` prints it as
 `floor=` on each definition's line. It is what to read before rolling an
 application back to an earlier Trellis release
 ([upgrading — Rolling back](upgrading.md#rolling-back),
