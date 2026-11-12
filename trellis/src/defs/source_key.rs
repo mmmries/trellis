@@ -155,15 +155,23 @@ pub(crate) async fn backing(
     ))
 }
 
-/// Whether `table` (an unquoted `schema.table`) has a primary key.
-async fn has_primary_key(
+/// `table`'s primary key columns (an unquoted `schema.table`), in key order;
+/// none when it has no primary key or doesn't exist.
+pub(crate) async fn primary_key_names(
     client: &impl GenericClient,
     table: &str,
-) -> Result<bool, tokio_postgres::Error> {
+) -> Result<Vec<String>, tokio_postgres::Error> {
     Ok(client
         .query_one(
-            "select exists (select 1 from pg_catalog.pg_index i \
-                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary)",
+            "select array( \
+                 select a.attname::text \
+                 from pg_catalog.pg_index i \
+                 cross join unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                 join pg_catalog.pg_attribute a \
+                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary \
+                   and k.ord <= i.indnkeyatts \
+                 order by k.ord)",
             &[&ddl::regclass_arg(table)],
         )
         .await?
@@ -216,21 +224,6 @@ pub(crate) async fn is_trellis_target(
         .get(0))
 }
 
-/// Whether `table` (an unquoted `schema.table`) is a partitioned table.
-async fn is_partitioned(
-    client: &impl GenericClient,
-    table: &str,
-) -> Result<bool, tokio_postgres::Error> {
-    Ok(client
-        .query_one(
-            "select exists (select 1 from pg_catalog.pg_class \
-                 where oid = pg_catalog.to_regclass($1) and relkind = 'p')",
-            &[&ddl::regclass_arg(table)],
-        )
-        .await?
-        .get(0))
-}
-
 /// The key a definition keys `table` (an unquoted `schema.table`) by, given
 /// the key it declares for it, and for each key column the allowlist entry
 /// that admitted its type ([`ddl::admitted_primary_key`]'s second value).
@@ -261,13 +254,13 @@ pub(crate) async fn admitted_key(
                 table: table.to_string(),
                 key: key.to_vec(),
                 indexes: super::recorded_keys::unique_indexes(client, table).await?,
-                partitioned: is_partitioned(client, table).await?,
+                partitioned: super::partition_tree::is_partitioned_root(client, table).await?,
             });
         };
         let admitted_by = ddl::admit_key_types(client, table, &columns).await?;
         return Ok((columns, admitted_by));
     }
-    if !has_primary_key(client, table).await? {
+    if primary_key_names(client, table).await?.is_empty() {
         // A table with a record and no index over it reports that first:
         // its key was dropped after define.
         if let Some(missing) = super::recorded_keys::missing(client, table).await? {

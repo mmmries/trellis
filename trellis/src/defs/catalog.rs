@@ -1955,20 +1955,6 @@ async fn reject_non_live_upstream(
     })
 }
 
-/// Whether `qualified_table` is some definition's target table.
-pub(crate) async fn is_definition_target(
-    client: &impl GenericClient,
-    qualified_table: &str,
-) -> Result<bool, CatalogError> {
-    Ok(client
-        .query_one(
-            "select exists (select 1 from transform_definitions where target_table = $1)",
-            &[&qualified_table],
-        )
-        .await?
-        .get(0))
-}
-
 /// Edits an already-registered 1-1 transform's calculated fields in place —
 /// `ALTER TRANSFORM`'s catalog-side implementation (ADR-0015), reached
 /// through [`crate::Trellis::apply`] like every other definition-changing
@@ -2462,7 +2448,7 @@ pub async fn alter_transform(
     // stays paused through this edit, and its own resume rebuilds it.
     let holds_for_capture = builds_fields
         && reads_new_source_columns(&current.def, &merged)
-        && !is_definition_target(&*txn, &current.source_table).await?;
+        && !super::source_key::is_trellis_target(&*txn, &current.source_table).await?;
     if holds_for_capture {
         // Every field the build rewrites, so a sibling reading an edited
         // field by alias is held out (and listed as paused) with it, rather
@@ -5046,7 +5032,7 @@ async fn side_read_table(
     client: &impl GenericClient,
     table: &str,
 ) -> Result<(String, super::row_security::Readers), CatalogError> {
-    let readers = if is_definition_target(client, table).await? {
+    let readers = if super::source_key::is_trellis_target(client, table).await? {
         super::row_security::Readers::Session
     } else {
         super::row_security::Readers::Ring
@@ -5901,22 +5887,6 @@ pub async fn assert_regexp_patterns_accepted(
     Ok(())
 }
 
-/// Whether `qualified` (an unquoted `schema.table`) has a primary key, the
-/// part of [`change_keyed`]'s rule a partitioned root is held to as well.
-async fn has_primary_key(
-    client: &impl GenericClient,
-    qualified: &str,
-) -> Result<bool, tokio_postgres::Error> {
-    Ok(client
-        .query_one(
-            "select exists (select 1 from pg_catalog.pg_index i \
-                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary)",
-            &[&ddl::regclass_arg(qualified)],
-        )
-        .await?
-        .get(0))
-}
-
 /// Whether trigger capture can key `schema.table`'s changes:
 /// it is a plain table (`relkind = 'r'`) with a primary key, or one the
 /// definition names a `KEY (...)` for (`declared`, ADR-0026), whose backing
@@ -5982,7 +5952,7 @@ async fn reject_unkeyed_source(
     qualified_source: &str,
     def: &TransformDef,
 ) -> Result<(), CatalogError> {
-    if is_definition_target(client, qualified_source).await? {
+    if super::source_key::is_trellis_target(client, qualified_source).await? {
         return Ok(());
     }
     let Some((schema, table)) = qualified_source.split_once('.') else {
@@ -5992,14 +5962,13 @@ async fn reject_unkeyed_source(
     };
     if let Some(tree) = super::partition_tree::read_partition_tree(client, qualified_source).await?
     {
-        // The plain-table rule's primary key holds for a partitioned root
-        // too: `ddl::source_primary_key` also takes a qualifying unique
-        // index, which [`change_keyed`] doesn't.
         // A partitioned root is keyed as a plain table is: by its primary
         // key or a `KEY (...)`, never by a unique index Trellis picks
         // (ADR-0026).
         if super::source_key::declared_for(def, qualified_source).is_none()
-            && !has_primary_key(client, qualified_source).await?
+            && super::source_key::primary_key_names(client, qualified_source)
+                .await?
+                .is_empty()
         {
             return Err(CatalogError::Ddl(DdlError::NoPrimaryKey {
                 source_table: qualified_source.to_string(),
