@@ -3,13 +3,64 @@
 A transform describes how one derived (target) table is produced from one or
 more source tables. Its definition is two separately-chosen pieces: the
 **granularity** of the target's primary-key space, and the
-[**calculated fields**](expressions.md) that populate its non-key columns. Every source row participates: a
-`WHERE` other than `TRUE` is refused
-([#804](https://github.com/salesforce-misc/trellis/issues/804)).
+[**calculated fields**](expressions.md) that populate its non-key columns.
 
 Trellis maintains these tables **incrementally** as source data changes, trading
 spikey read load for a steady write load that keeps the table cheap to read (see
 the README for fuller motivation).
+
+## Statements
+
+`Trellis::apply(text)`, or `trellis apply '<statement>'` from a shell, takes
+one statement, with no `;`. Keywords are case-insensitive.
+
+```text
+TRANSFORM <table> [ADOPT EXISTING TABLE]
+  FROM <table> [KEY (<column>, ...)] [[AS] <alias>]
+  [<join> ...]
+  [GROUP BY <column>, ...]
+  [WITHOUT SOURCE INDEX]
+  SELECT <expression> AS <field>, ...
+  [WHERE TRUE]
+
+<table> ::= [<schema>.]<name>
+<join>  ::= [INNER | LEFT [OUTER]] JOIN <table> [KEY (<column>, ...)] [[AS] <alias>]
+              ON <side>.<column> = <side>.<column> [AND ...]
+<side>  ::= <table> | <alias>
+
+ALTER TRANSFORM <transform> <change>, ...
+<change> ::= ADD <expression> AS <field> | ALTER <field> AS <expression> | DROP <field>
+
+PAUSE  TRANSFORM <transform> | <name>.<field>
+RESUME TRANSFORM <transform> | <name>.<field>
+DROP   TRANSFORM <transform>
+
+<transform> ::= <table>, the target
+```
+
+- The clauses between `FROM` and `SELECT` choose the
+  [granularity](#granularity): none is 1-1, `GROUP BY` an aggregate,
+  `JOIN ... GROUP BY` a join aggregate, `JOIN` alone a 1-1 `JOIN` (more than
+  one `JOIN`: a star).
+- `ADOPT EXISTING TABLE` builds into an existing empty table instead of
+  creating one, and `KEY (...)` keys a table by those columns instead of its
+  primary key ([details](#changing-a-definition)).
+- Aliases are for a `JOIN` only. There every column, in `ON`, `GROUP BY` and
+  the fields, is written `<side>.<column>`, and `ON` takes only equalities
+  joined by `AND`.
+- `WITHOUT SOURCE INDEX` (with `GROUP BY` only) skips
+  [the index `self_check` pages by](#a-source-without-the-index-its-self_check-walk-pages-by).
+- `<expression>` is the [expression grammar](expressions.md); `<field>` names
+  a target column.
+- `WHERE` takes only `TRUE`: every source row participates
+  ([#804](https://github.com/salesforce-misc/trellis/issues/804)).
+- `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table.
+  `<name>.<field>` pauses or resumes one field of the transform named `<name>`
+  ([addressing](#changing-a-definition)).
+
+What a definition may read is the [refusal table](#refusals); why the
+statement has this shape is
+[0004-transform-definition-grammar](decisions/0004-transform-definition-grammar.md).
 
 ## Supported sources and targets
 
@@ -1040,17 +1091,8 @@ has the polling pattern.
 
 ## Changing a definition
 
-Every definition-changing operation is one statement of the same grammar a
-definition itself is written in, run through one entrypoint —
-`Trellis::apply(text)`, or `trellis apply '<statement>'` from a shell:
-
-```text
-TRANSFORM <target> [ADOPT EXISTING TABLE] FROM <source> [KEY (<columns>)] [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
-
-PAUSE  TRANSFORM <target>[.<column>]
-RESUME TRANSFORM <target>[.<column>]
-DROP   TRANSFORM <target>
-```
+Every definition-changing operation is one of the [statements](#statements),
+run through `apply`.
 
 **Adopting an existing target.** `ADOPT EXISTING TABLE` after the target
 builds the transform into a table of the target's name that already exists,
