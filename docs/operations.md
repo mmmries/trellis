@@ -145,10 +145,10 @@ trip both its column fuse and the whole-transform fuse, run `RESUME TRANSFORM
 An aggregate or `JOIN` reading a table by its primary key takes the primary
 key the table has now, for every transform that reads the table, and
 rebuilds; with no primary key left it refuses rather than take another unique
-index. A `KEY (…)`'s columns never change: its resume refuses until a unique
+index, until you add one. A `KEY (…)`'s columns never change: its resume refuses until a unique
 index backs them again. A target that lost the index over its key refuses
 until a unique index over exactly its key columns is created again
-(`UNIQUE NULLS NOT DISTINCT` if one can be `NULL`). Both refusals name the
+(`UNIQUE NULLS NOT DISTINCT` if one can be `NULL`). Each refusal names the
 table, the key and the unique indexes it has.
 
 A 1-1 target is keyed by its source's key (a 1-1 `JOIN`'s, by its `FROM`

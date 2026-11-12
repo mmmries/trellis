@@ -590,7 +590,7 @@ replica identity.
 
 Anything else refuses with `TargetNotAdoptable`, a `validation` error (a
 `not_found` one for `missing`). Its message names the first difference found,
-by code, in the order below:
+by code, checked in the order below (the column rows one column at a time):
 
 | Code | The table | Remedy |
 |---|---|---|
@@ -601,21 +601,21 @@ by code, in the order below:
 | `not_empty` | has rows | Empty it, or define under another name without the opt-in |
 | `partitioned` | is partitioned | Adopt a plain table |
 | `partition` | is a partition of another table | `DETACH PARTITION` it |
-| `inheritance` | has an inheritance parent or child | `NO INHERIT` |
+| `inheritance` | has an inheritance parent or child | `ALTER TABLE <child> NO INHERIT <parent>`, for its parent and for each child |
 | `typed_table` | is a typed table (`OF <type>`) | `ALTER TABLE … NOT OF` |
 | `unlogged` | is `UNLOGGED` | `ALTER TABLE … SET LOGGED` |
-| `extension_member` | belongs to an extension | `ALTER EXTENSION … DROP TABLE` |
+| `extension_member` | belongs to an extension | `ALTER EXTENSION … DROP TABLE`, as the extension's owner |
 | `access_method` | uses another table access method than define's | `ALTER TABLE … SET ACCESS METHOD` |
 | `missing_column` | lacks a column define creates | Add the column |
 | `extra_column` | has a column define doesn't create | Drop the column |
 | `column_order` | has define's columns in another order | Create the table again in define's order |
-| `generated_column` | has a generated column | Make it a plain column |
+| `generated_column` | has a generated column | `ALTER COLUMN … DROP EXPRESSION`; a virtual one can't be, so create the table again |
 | `identity_column` | has an identity column | `ALTER COLUMN … DROP IDENTITY` |
 | `column_type` | has a column of another type, or with a type modifier (define creates none) | `ALTER COLUMN … TYPE` to the type the message names |
 | `column_collation` | has a column with another collation | Alter the column to the collation the message names |
 | `column_nullability` | has a column `NOT NULL` where define's isn't, or the reverse | `SET` or `DROP NOT NULL` |
 | `column_default` | has a column with a default | `ALTER COLUMN … DROP DEFAULT` |
-| `key` | isn't keyed as define keys it: the primary key, or an aggregate's or `JOIN`'s `UNIQUE NULLS NOT DISTINCT` group key, over the same columns in the same order, not deferrable and with no `INCLUDE` columns | Add the key the message names |
+| `key` | isn't keyed as define keys it: the primary key, or an aggregate's or `JOIN`'s `UNIQUE NULLS NOT DISTINCT` group key, over the same columns in the same order, not deferrable and with no `INCLUDE` columns | Add the key the message names, dropping a primary key that differs (`DROP CONSTRAINT …, ADD PRIMARY KEY (…)`) |
 | `owned_sequence` | has a sequence owned by one of its columns | `ALTER SEQUENCE … OWNED BY NONE`, or drop it |
 | `unrecognized` | has a constraint or dependent object the check doesn't know, so a new Postgres feature refuses until Trellis learns it | Drop the object the message names |
 
