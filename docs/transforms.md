@@ -141,6 +141,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | Condition | Error | After define | Remedy |
 |---|---|---|---|
 | **Source tables and partitioning** | | | |
+| A table the role Trellis runs as can't use: it lacks `USAGE` on the table's schema, or neither owns the table nor holds a privilege on it | `TableNotAccessible` | [Shape](#shape): a revoked table privilege halts the readers on the next drain; a revoked schema `USAGE` stalls capture, unreported, until granted back ([#1921](https://github.com/salesforce-misc/trellis/issues/1921)) | `GRANT USAGE ON SCHEMA`, or membership in the owner ([roles](recommendations.md#one-trellis-role)) |
 | A partition (a leaf or a middle), a partitioned root that is itself a partition, or a table in an inheritance hierarchy: a statement trigger fires only for the table a statement names | `SourceNotChangeKeyed` | [Shape](#shape) (`ATTACH PARTITION`, `INHERIT`, a child created `INHERITS` it, or a drop and recreate as one) | Use a plain table; after a change, `DETACH PARTITION` or `NO INHERIT`, then `RESUME` |
 | [A source dropped, renamed, swapped, or its capture disrupted](#a-source-dropped-renamed-swapped-or-its-capture-disrupted) | n/a | [Disruption](#disruption) | Put the table back, then `RESUME` |
 | A partitioned root ([0017](decisions/0017-partitioned-sources.md)) whose partition key, at any level, the group key omits: an aggregate's `GROUP BY`, or a `JOIN` table's `GROUP BY` and `ON` columns from that table | `PartitionedSource`, naming the column | [Shape](#shape): a sub-level added later | Add the column to the `GROUP BY` or join on it; after a change, detach the sub-level, then `RESUME` |
@@ -149,7 +150,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A partitioned root as a 1-1 transform's `FROM` (partitioned targets are not supported) | `PartitionedSource` | [Disruption](#disruption): the source dropped and created again partitioned; `RESUME` then refuses | Aggregate over it, or use a plain table |
 | **Source keys** | | | |
 | An aggregate target, or a 1-1 target over one, as another Trellis instance's source: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint, not a primary key. Inside the owning instance it can be chained off | `NoPrimaryKey` | [Disruption](#disruption): only by the table being replaced by such a target; `RESUME` then refuses | Chain within the instance ([instance-identity](instance-identity.md)), group over a 1-1 transform, or name the group key with `KEY (…)` |
-| [The key a transform keys each table by](#the-key-a-transform-keys-each-table-by) | `NoPrimaryKey`, `DeferrablePrimaryKey`, `KeyNotBacked`, `KeyOnTrellisTarget`, `KeyDiffersFromReaders` | [Key](#key) | Name a `KEY (…)` or add a primary key; [details](#the-key-a-transform-keys-each-table-by) |
+| [The key a transform keys each table by](#the-key-a-transform-keys-each-table-by) | `NoPrimaryKey`, `RecordedKeyMissing`, `DeferrablePrimaryKey`, `KeyNotBacked`, `KeyOnTrellisTarget`, `KeyDiffersFromReaders`, `UnsupportedPrimaryKeyType` | [Key](#key) | Name a `KEY (…)` or add a primary key; [details](#the-key-a-transform-keys-each-table-by) |
 | **Row-level security and replication** | | | |
 | [Row-level security on a role Trellis runs as](#row-level-security-on-a-role-trellis-runs-as) | `RowSecurityApplies`, `ExtremeSourceNotReadable` | [Shape](#shape) | `BYPASSRLS`, or the owner without `FORCE ROW LEVEL SECURITY`; then `RESUME` |
 | A table a logical-replication subscription in the same database replicates into, in any sync state or disabled: its apply worker fires only row-level triggers. Publishing a table is fine | `Subscribed` | [Shape](#shape) | Remove the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then `RESUME` |
@@ -166,22 +167,25 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | **Source indexes** | | | |
 | [A source without the index its `self_check` walk pages by](#a-source-without-the-index-its-self_check-walk-pages-by) | `SourceIndexMissing` | [Index](#index) | Create the index the message names, or define `WITHOUT SOURCE INDEX` |
 | **`JOIN` transforms** | | | |
-| [An unsupported `JOIN` shape](#an-unsupported-join-shape) | `TableAlias`, `AliasedTableName`, `JoinTooManyTables`, `JoinSelf`, … | [Text](#text) | Rewrite it in the admitted shape |
+| [An unsupported `JOIN` shape](#an-unsupported-join-shape) | `UnsupportedKeySpace`, `TableAlias`, `AliasedTableName`, `JoinSelf`, `JoinTooManyTables`, `JoinOnSameSide`, `JoinOnRepeatedPair`, `JoinUnqualifiedColumn`, `JoinUnknownTable`, `JoinUnresolvedColumn`, `JoinMixedSideArgument`, `JoinFieldShape` | [Text](#text) | Rewrite it in the admitted shape |
 | [A 1-1 `JOIN`](#a-1-1-join) | `OneToOneJoinKeyNotUnique`, `OneToOneJoinAggregate`, `OneToOneJoinUnsupported`, `PartitionedSource`, `JoinOnRepeatedColumn` | [Key](#key), [Retype](#retype), [Shape](#shape) | Join `b` on a unique key; give an aggregate a `GROUP BY` |
 | [1-1 `JOIN` of more than two tables (star)](#1-1-join-of-more-than-two-tables-star) | `StarJoinTooManyTables`, `JoinOnReadsAnotherJoinedTable`, the 1-1 `JOIN`'s at each position | As for a 1-1 `JOIN`, at each position | At most 5 tables, each joined to `a` on a unique key |
 | `ON` columns that differ in type or collation (a modifier never counts; `text` and `varchar` are one type), are off the join-key allowlist in [type-support](type-support.md) (a domain always is), or have a nondeterministic collation; a `GROUP BY` key of a type that can't be one | `JoinKeyTypeMismatch`, `JoinUnsupportedKeyType`, `JoinNondeterministicCollation`, `UnsupportedGroupByKeyType` | [Retype](#retype); a change between deterministic collations pauses nothing, but `RESUME` refuses until they match | Alter one column to match the other, then `RESUME` |
 | **Aggregate functions** | | | |
 | [`MIN` or `MAX` in a plain aggregate](#min-or-max-in-a-plain-aggregate) | `ExtremeOfExpression`, `UnsupportedExtremeArgument`, `ChainedExtreme`, `ExtremesWithoutSourceIndex`, `ExtremeIndexMissing` | [Index](#index), [Retype](#retype) | Create the index the message names; a plain column |
+| A field reading a column that is neither a `GROUP BY` key nor inside an aggregate, or named after a key but not that key (`GROUP BY id SELECT SUM(id) AS id`) | `UngroupedColumnReference`, `GroupingColumnFieldMustBePassthrough` | [Text](#text) | Aggregate the column, or rename the field |
 | `MIN` or `MAX` in a `JOIN` transform | `DeferredAggregate` (`MIN/MAX`) | [Text](#text) | Take it in a plain aggregate over one table |
 | `bool_and`, `bool_or`, `bit_and` or `bit_or` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1118](https://github.com/salesforce-misc/trellis/issues/1118) |
 | `SUM` or `AVG` over anything but `smallint`, `integer`, `bigint` and `numeric`: a running float sum drifts from Postgres's | `DeferredAggregate` (`float and interval SUM/AVG`), `UnsupportedAggregateArgument` for another type | [Retype](#retype) | An integer or `numeric` column ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)) |
 | `array_agg`, `string_agg` or `jsonb_agg` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1040](https://github.com/salesforce-misc/trellis/issues/1040) |
 | **Filters and chaining** | | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE`: partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)) | parse error | [Text](#text) | None |
+| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE`: partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)) | `UnsupportedPredicate` | [Text](#text) | None |
+| A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | `TargetEqualsSource`, `TableCycle` | [Text](#text) | Another target |
 | Chaining off a transform that is not `live` | `TransformNotLive` | n/a | Wait for the upstream to go `live` |
 | **Target names** | | | |
-| [A target whose name is taken](#a-target-whose-name-is-taken) | `TargetTableExists`, `TargetNotAdoptable` | n/a | Another name, or `ADOPT EXISTING TABLE` |
+| [A target whose name is taken](#a-target-whose-name-is-taken) | `TargetTableExists`, `TargetTableSuffixCollision`, `TargetNotAdoptable` | n/a | Another name, or `ADOPT EXISTING TABLE` |
 | A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | `TargetNameHasReaders`, naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it (`DependentsBlockDrop`) | `DROP TRANSFORM` each reader named (paused first), or another name |
+| A target name ending in `__ledger`, or over 55 bytes: its ledger, `<target>__ledger`, must fit Postgres's 63 | `ReservedTargetSuffix`, `TargetNameTooLong` | [Text](#text) | Another name |
 | A target in this instance's catalog schema, or in a schema holding another instance's `trellis_instance` table, whose uninstall would drop it ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)) | `TargetInCatalogSchema` | [Resume only](#resume-only) | An ordinary schema; after define, `DROP TRANSFORM` and define it there |
 
 ### Details
@@ -220,7 +224,8 @@ its source's key (1-1, and a 1-1 `JOIN` by its `FROM` table's), or by its
 `UNIQUE NULLS NOT DISTINCT` group key (aggregate, `JOIN`). The rules and their
 reasons are [ADR-0026](decisions/0026-source-keys.md). Define refuses:
 
-- no primary key and no `KEY` (`NoPrimaryKey`, naming both remedies);
+- no primary key and no `KEY` (`NoPrimaryKey`, naming both remedies, or
+  `RecordedKeyMissing` once a transform has recorded the table's key);
 - a deferrable primary key and no `KEY` (`DeferrablePrimaryKey`). Recreate it
   in one statement, as the message says
   (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`): Postgres can't
@@ -232,6 +237,8 @@ reasons are [ADR-0026](decisions/0026-source-keys.md). Define refuses:
   partitioned table's unique index holds its partition key, so its `KEY` names
   those columns too;
 - a `KEY` on another transform's target (`KeyOnTrellisTarget`);
+- a key column off the [join-key allowlist](type-support.md)
+  (`UnsupportedPrimaryKeyType`);
 - a key other than the one the table's other transforms use
   (`KeyDiffersFromReaders`, naming the key to write), so a second transform
   over a `KEY` table repeats the `KEY`.
@@ -407,7 +414,7 @@ Refused, with or without a `GROUP BY` (a join without one is a
 [1-1 `JOIN`](#a-1-1-join)):
 
 - **Join type.** `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `LATERAL`, `USING` and
-  comma joins (parse errors). For `RIGHT JOIN`, swap the tables and use
+  comma joins (`UnsupportedKeySpace`). For `RIGHT JOIN`, swap the tables and use
   `LEFT JOIN`.
 - **Tables.** A table joined to itself, even under two aliases, since one
   captured change would feed both sides (`JoinSelf`). One table joined twice,
@@ -567,7 +574,9 @@ The name is taken when a relation of any kind already exists in the target
 schema under the target's name, or under the name of a table Trellis keeps
 beside it (`<target>__ledger`). That includes another definition's target, in
 this instance or in another instance sharing the target schema. The error is
-`TargetTableExists`, a `conflict` error. Trellis writes only to target tables
+`TargetTableExists`, a `conflict` error. Two of an instance's definitions
+can't share a bare target name in two schemas either
+(`TargetTableSuffixCollision`). Trellis writes only to target tables
 it creates, or to an empty table it adopts on request, and `DROP TRANSFORM`
 drops the target, so it never takes over an existing relation unasked. Choose
 another target name, give the instance its own target schema
