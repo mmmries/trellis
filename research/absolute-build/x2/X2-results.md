@@ -62,7 +62,7 @@ Full tables with per-statement times, FPI, temp and HOT counts: `results/summary
 
 ## Reading
 
-1. **Writing once is worth about 2.5× over the best two-write form** at 1M and 10M groups (A 58.8 s against c1
+1. **Writing once is worth 2.1–2.5× over the best two-write form** at 1M and 10M groups (10M: A 58.8 s against c1
    146 s at 10M), and halves the WAL and the hidden table. A and B cost the same on a fresh build.
 2. **Key order alone removes the collapse at 10M** (1,999 s → 146 s fresh; 1,350 s → 173 s rebuild) but leaves the
    build near 10× the plain query. At 1M groups it saves only 12 %: the order effect needs a table larger than
