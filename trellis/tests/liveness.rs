@@ -15,9 +15,10 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
+use testkit::connect_raw;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse};
@@ -38,20 +39,6 @@ async fn claim_committed(
     let won = claim::claim(&txn, seg_seq, claimed_by, live_workers).await?;
     txn.commit().await?;
     Ok(won)
-}
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
-/// `claims.rs`/`sealing.rs`/`fold.rs`'s convention.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
 }
 
 async fn insert_recompute(client: &Client, table: &str, key: &str) {

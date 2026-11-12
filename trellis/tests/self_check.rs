@@ -48,9 +48,10 @@
 //! re-check's own matching logic directly.
 
 use std::time::Duration;
+use testkit::connect_raw;
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::hierarchy::Hierarchy;
 use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
@@ -61,20 +62,6 @@ use trellis::{
     CaptureFault, Config, Divergence, SelfCheckError, SelfCheckJobState, SelfCheckMode,
     SelfCheckOutcome, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
-/// `trellis/tests/app_converge.rs`'s own helper of the same name.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// Bounds `self_check`'s own internal convergence await. Every
 /// [`converged_fixture`] target is already caught up when `self_check`

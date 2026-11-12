@@ -12,7 +12,7 @@ mod drain_driver;
 
 use std::collections::HashMap;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
@@ -25,10 +25,6 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
                        tag text); \
                    create unique index on public.b (k); \
                    create index on public.a (k)";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 fn int8() -> ValueType {
     ValueType::Integer(IntWidth::Int8)

@@ -10,16 +10,11 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::self_check::{Divergence, SelfCheckScope, compare_page};
 
 const SRC: &str = "public.src";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 async fn start() -> Driver {
     Driver::start(

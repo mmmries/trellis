@@ -25,6 +25,7 @@
 //! panics with its stuck `(src_table, key)` pairs, rather than
 //! retrying a `draining` segment forever.
 
+use pipeline::numeric_columns;
 use std::collections::HashMap;
 
 use trellis::defs::ast::ValueType;
@@ -33,14 +34,10 @@ use trellis::defs::install_definition;
 #[path = "support/trigger_pipeline.rs"]
 mod trigger_pipeline;
 
-use trigger_pipeline::Pipeline;
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
-}
+use trigger_pipeline::Pipeline;
 
 fn rows(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
     pairs

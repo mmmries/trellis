@@ -14,6 +14,7 @@
 //! Capture is the real triggers, and the ring is drained by hand
 //! (`support/trigger_pipeline.rs`), so nothing here polls for convergence.
 
+use pipeline::numeric_columns;
 use std::collections::HashMap;
 
 use trellis::defs::ast::ValueType;
@@ -22,18 +23,14 @@ use trellis::defs::install_definition;
 #[path = "support/trigger_pipeline.rs"]
 mod trigger_pipeline;
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use trigger_pipeline::Pipeline;
 
 const SOURCE_DDL: &str = "create schema \"Shop\"; \
      create table \"Shop\".\"OrderItems\" (id bigint primary key, order_id bigint, qty integer); \
      insert into \"Shop\".\"OrderItems\" (id, order_id, qty) values (1, 10, 2), (2, 10, 3), (3, 20, 5)";
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
-}
 
 fn rows(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
     pairs

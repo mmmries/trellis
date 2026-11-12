@@ -21,15 +21,11 @@ mod drain_driver;
 
 use std::collections::HashMap;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::{TransformStatus, ValueType};
 use trellis::integer::IntWidth;
 use trellis::{Trellis, TrellisError, TrellisOptions};
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {

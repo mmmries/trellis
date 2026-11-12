@@ -21,11 +21,10 @@ mod drain_driver;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
 
 const DDL: &str = "create table public.fa (id integer primary key, g integer, k integer, \
@@ -52,10 +51,6 @@ const ORACLE: &str = "select a.g, b.gb, count(*), sum(a.v + a.v), sum(b.ys), cou
                           group by k, gb \
                       ) b on a.k = b.k \
                       group by a.g, b.gb order by a.g, b.gb";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 fn columns() -> Vec<(&'static str, ValueType)> {
     vec![

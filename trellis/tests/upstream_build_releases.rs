@@ -29,7 +29,7 @@ async fn a_release_the_build_asked_for_survives_a_worker_stop() {
         .expect("request a backfill of up's source");
     // The chunks complete `up`'s rebuild, and no pass runs after that
     // commit.
-    run_backfill_chunks(d.pool()).await;
+    settle_builds(d.pool()).await;
     settle_tolerant(&mut d).await;
     assert_eq!(status_of(&trellis, "up").await, "Live");
     assert_eq!(

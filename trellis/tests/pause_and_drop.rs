@@ -42,8 +42,12 @@
 //! - the target's `schema_nodes` row is actually reaped, not merely
 //!   unreachable (`dropping_reaps_the_targets_schema_nodes_row`)
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, definer, start_and_settle_builds};
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 // Internals reaches (ADR-0012's `internals` feature, on for this crate's own
 // test targets), for two reasons. The durable chunk queue's dispatch gate has
@@ -54,22 +58,7 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::chunk_queue;
 use trellis::intake::harness;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-use trellis::{CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions};
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) with `search_path`
-/// pinned — the same helper every other integration test in this directory
-/// uses to check Postgres's own view of what the engine did.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
+use trellis::{CatalogError, TransformStatus, TrellisError};
 
 /// The kinds of a Re-derive build's work rows, for
 /// `chunk_queue::claim_chunks_of`.
@@ -78,16 +67,6 @@ const REDERIVE_KINDS: [&str; 3] = [
     chunk_queue::KIND_REDERIVE,
     chunk_queue::KIND_SWEEP,
 ];
-
-/// A define-only facade connection: no staging worker, no drain threads.
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
 
 /// `transform_definitions.status` for a bare target, straight from Postgres
 /// — deliberately not [`Trellis::status`], so a test asserting on a status
@@ -115,19 +94,6 @@ async fn table_exists(raw: &Client, schema: &str, table: &str) -> bool {
 
 async fn count(raw: &Client, sql: &str) -> i64 {
     raw.query_one(sql, &[]).await.expect("count query").get(0)
-}
-
-/// Starts every registered definition's build and runs it to completion: the
-/// hand-driven stand-in for the staging worker and a drain worker
-/// (`alter_transform.rs`'s helper of the same name). A 1-1 target reaches
-/// `live` this way with no running pipeline and nothing to wait for.
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Stages the CDC row capture would stage for `insert into orders (id, g, a)
@@ -221,7 +187,7 @@ async fn pausing_twice_is_a_no_op_success() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 6).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -283,7 +249,7 @@ async fn pausing_twice_is_a_no_op_success() {
 async fn pausing_an_unregistered_transform_reports_not_found() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     let err = trellis
         .apply("PAUSE TRANSFORM no_such_transform")
@@ -332,7 +298,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // drained through the engine's own apply path, and the resume's build is
     // started and run by hand, so each claim is checked the moment its
     // precondition holds instead of polled for under a wall-clock budget.
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -464,7 +430,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // Claim 2, outcome: the target comes back reconciled against the *current*
     // source — including the eight rows written while it was paused, whose
     // change records were drained for the sibling and never held for it.
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
     assert_eq!(
         count(
@@ -505,7 +471,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 6).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply(
             "TRANSFORM order_rollup FROM orders GROUP BY g \
@@ -599,9 +565,9 @@ async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
     seed_source(&raw, "orders", 40).await;
     let text = "TRANSFORM order_doubles FROM orders SELECT a + a AS x";
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(text).await.expect("define");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "order_doubles").await.as_deref(),
         Some("live")
@@ -623,7 +589,7 @@ async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
         persisted_status(&raw, "order_doubles").await.as_deref(),
         Some("waiting_to_backfill")
     );
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "order_doubles").await.as_deref(),
         Some("live")
@@ -672,7 +638,7 @@ async fn dropping_reaps_the_targets_schema_nodes_row() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 3).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -728,7 +694,7 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 6).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -821,7 +787,7 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 6).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -906,7 +872,7 @@ async fn dropping_an_unregistered_definition_is_a_no_op_success() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 3).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     trellis
         .apply("DROP TRANSFORM never_defined")
@@ -946,7 +912,7 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 3).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -995,7 +961,7 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_a_siblings_poiso
     let raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 6).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -1145,7 +1111,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
     let mut raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 40).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     // A plain 1-1 transform's build starts with a durable plan job before
     // it is built, which is exactly the in-flight backfill
     // state under test here.
@@ -1225,7 +1191,7 @@ async fn dropping_leaves_capture_to_the_staging_worker() {
     let mut raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 4).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await

@@ -10,50 +10,20 @@
 //! share of the change stream is never folded into its target. Every test
 //! drives the build and the drain by hand, so they wait on nothing.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, definer, start_and_settle_builds};
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
+use tokio_postgres::Client;
+use trellis::Trellis;
+use trellis::config::DEFAULT_TARGET_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-use trellis::{Config, Trellis, TrellisOptions};
 
 const TEST_NAME: &str = "resume_drops_deleted_keys_test";
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'"
-        ))
-        .await
-        .expect("set search_path");
-    client
-}
-
-/// A define-only facade connection (no staging worker, no drain threads), for
-/// the `PAUSE`/`RESUME` statements an operator would run.
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
-
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker's pass starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
-}
 
 /// Seals and drains until nothing is pending anywhere in the ring. A bounded
 /// deterministic loop, not a wait-for-convergence poll.
@@ -86,7 +56,7 @@ async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
 
 /// Builds what `RESUME` left `waiting_to_backfill`, then drains what it staged.
 async fn run_resume_rebuild(pool: &trellis::pool::Pool, client: &mut Client) {
-    drain_backfill_chunks(pool).await;
+    start_and_settle_builds(pool).await;
     drain_to_quiescence(pool, client).await;
 }
 
@@ -142,7 +112,7 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     .await
     .expect("install the aggregate");
     // Registration only records the aggregate: run its build.
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_rollup").await, "live");
     let built: Vec<(i64, String)> = client
@@ -161,7 +131,7 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
         "precondition: group 0 is built before the pause"
     );
 
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     operator
         .apply("PAUSE TRANSFORM order_rollup")
         .await
@@ -218,11 +188,11 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
     )
     .await
     .expect("install the 1-1");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_doubles").await, "live");
 
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     operator
         .apply("PAUSE TRANSFORM order_doubles")
         .await
@@ -297,7 +267,7 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
 /// seam. A bounded loop, not a convergence wait.
 async fn settle(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..8 {
-        drain_backfill_chunks(pool).await;
+        start_and_settle_builds(pool).await;
         drain_to_quiescence(pool, client).await;
         let outstanding: i64 = client
             .query_one("select count(*) from backfill_chunks where not done", &[])
@@ -372,7 +342,7 @@ async fn resume_rebuilds_a_one_to_one_through_deletes_and_reinserted_keys() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_orders(&client).await;
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     apply_all(
         &operator,
         &["TRANSFORM order_doubles FROM orders SELECT a + a AS x"],
@@ -415,7 +385,7 @@ async fn resume_rebuilds_an_aggregate_through_whole_partial_and_reinserted_delet
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_orders(&client).await;
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     apply_all(
         &operator,
         &["TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total"],
@@ -467,7 +437,7 @@ async fn resume_drops_extinct_composite_and_null_groups() {
         )
         .await
         .expect("seed lines");
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     apply_all(
         &operator,
         &["TRANSFORM line_rollup FROM lines GROUP BY g, h WITHOUT SOURCE INDEX SELECT sum(a) AS total"],
@@ -511,7 +481,7 @@ async fn resume_drops_an_extinct_group_one_hop_down_a_chain() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_orders(&client).await;
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     apply_all(
         &operator,
         &["TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total"],
@@ -562,7 +532,7 @@ async fn resume_leaves_a_live_sibling_on_the_same_source_alone() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_orders(&client).await;
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     apply_all(
         &operator,
         &[
@@ -621,7 +591,7 @@ async fn resume_drops_orphans_from_mixed_case_targets() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     create_orders(&client).await;
-    let operator = define_only(db.dsn()).await;
+    let operator = definer(db.dsn()).await;
     apply_all(
         &operator,
         &[

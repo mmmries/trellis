@@ -18,33 +18,13 @@
 //! - a statement outside the grammar changes nothing
 //!   (`statements_outside_the_grammar_are_parse_errors_that_change_nothing`)
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer};
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
-use trellis::{Applied, Config, ErrorCode, TransformStatus, Trellis, TrellisError, TrellisOptions};
-
-/// Connects directly to `dsn` with `search_path` pinned, like every other
-/// integration test here, so assertions read Postgres rather than the engine.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
+use tokio_postgres::Client;
+use trellis::{Applied, ErrorCode, TransformStatus, TrellisError};
 
 /// An aggregate-shaped source.
 async fn seed(raw: &Client) {
@@ -71,10 +51,10 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 async fn every_statement_form_dispatches_through_the_one_entrypoint() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed(&raw).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
 
     // TRANSFORM — reports the target table it registered.
     let applied = trellis
@@ -170,10 +150,10 @@ async fn every_statement_form_dispatches_through_the_one_entrypoint() {
 async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed(&raw).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -215,7 +195,7 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
 async fn relationship_statements_are_parse_errors_that_register_nothing() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table users (id bigint primary key, name text); \
          create table widgets (id bigint primary key, owner_id bigint);",
@@ -223,7 +203,7 @@ async fn relationship_statements_are_parse_errors_that_register_nothing() {
     .await
     .expect("seed sources");
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     for statement in [
         "RELATIONSHIP owner FROM widgets.owner_id TO users.id",
         "DROP RELATIONSHIP widgets.owner",

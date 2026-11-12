@@ -6,36 +6,16 @@
 //!
 //! No test runs a pipeline: each asserts what a lookup finds or refuses.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer};
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::{
-    ApplyError, CatalogError, Config, SelfCheckError, SelfCheckMode, Trellis, TrellisError,
-    TrellisOptions,
-};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
-}
+use tokio_postgres::Client;
+use trellis::config::DEFAULT_TARGET_SCHEMA;
+use trellis::{ApplyError, CatalogError, SelfCheckError, SelfCheckMode, Trellis, TrellisError};
 
 async fn persisted_status(raw: &Client) -> Option<String> {
     raw.query_opt(
@@ -56,14 +36,14 @@ async fn setup() -> (
 ) {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into orders select s, s % 2, s from generate_series(1, 4) s;",
     )
     .await
     .expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     let qualified = trellis
         .apply(
             "TRANSFORM rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",

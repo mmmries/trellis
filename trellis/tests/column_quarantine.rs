@@ -14,11 +14,15 @@
 //! image directly into the ring, rather than routing through the capture
 //! triggers).
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
 use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
@@ -42,18 +46,6 @@ fn is_data_exception(err: &ApplyError) -> bool {
 // ---------------------------------------------------------------------
 // Shared scaffolding (mirrors `tests/quarantine.rs`)
 // ---------------------------------------------------------------------
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute("set search_path to trellis, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'")
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn seal_active_segment(client: &mut Client) -> i64 {
     use trellis::staging::seal;
@@ -84,13 +76,6 @@ async fn active_segment_table(client: &Client) -> String {
         other => panic!("unexpected ring slot {other}"),
     }
     .to_string()
-}
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
 }
 
 /// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every bare

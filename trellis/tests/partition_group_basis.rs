@@ -24,7 +24,7 @@ mod drain_driver;
 
 use std::time::{Duration, Instant};
 
-use drain_driver::{Driver, Running};
+use drain_driver::{Driver, Running, int4};
 use trellis::capture::partitions::{self, PendingCorrection};
 use trellis::capture::reconcile::PassOutcome;
 use trellis::config::{Config, DEFAULT_SCHEMA};
@@ -90,10 +90,6 @@ const SEED: &str = "insert into public.items select i, i % 16, i from generate_s
 
 fn int8() -> ValueType {
     ValueType::Integer(IntWidth::Int8)
-}
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
 }
 
 struct Fx {

@@ -10,22 +10,11 @@
 //! both images detoasted, so each case here must converge.
 
 use std::time::{Duration, Instant};
+use testkit::connect_with;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::{Config, Trellis, TrellisOptions};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute("set search_path to public")
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// A 2240-byte text value unique to `n`. Its column is `STORAGE EXTERNAL`,
 /// so it is stored out of line, uncompressed.
@@ -52,7 +41,7 @@ async fn symmetric_difference(raw: &Client, target: &str, oracle: &str) -> i64 {
 async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "set search_path to public").await;
     raw.batch_execute(
         "create table posts (id bigint primary key, author text, word_count int); \
          alter table posts alter column author set storage external; \
@@ -181,7 +170,7 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
 async fn an_unchanged_toasted_column_of_a_plain_one_to_one_source_converges() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "set search_path to public").await;
     raw.batch_execute(&format!(
         "create table docs (id bigint primary key, body text, n int); \
          alter table docs alter column body set storage external; \

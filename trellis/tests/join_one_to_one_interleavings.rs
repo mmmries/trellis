@@ -30,9 +30,8 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::ApplyError;
 use trellis::staging::interleave::PausePoint;
 
@@ -42,10 +41,6 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
                        tag text); \
                    create unique index on public.b (k); \
                    create index on public.a (k)";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 /// One join kind: `LEFT` keeps an `a` row with no `b` match, `INNER` drops it.
 #[derive(Debug, Clone, Copy, PartialEq)]

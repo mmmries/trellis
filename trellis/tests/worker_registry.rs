@@ -15,26 +15,12 @@
 //! reclaim pass runs" is the semantic under test, not an incidental detail.
 
 use std::time::Duration;
+use testkit::connect_raw;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use tokio_postgres::Client;
 use trellis::staging::worker_registry;
 use trellis::{Client as TrellisClient, ClientOptions, Config, Trellis, TrellisOptions};
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
-/// `client_e2e.rs`/`liveness.rs`'s own helper of the same name.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn worker_registry_row_count(client: &Client) -> i64 {
     client
