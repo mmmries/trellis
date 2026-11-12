@@ -681,7 +681,7 @@ async fn rederive_keys(
         for part in parts {
             params.push(part);
         }
-        let pick = sweep_pick(plan, pattern);
+        let pick = sweep_pick(&plan.pk, pattern);
         let done = rederive(txn, plan, None, &pick, &params, pattern_keys.len()).await?;
         outcome.keys += done.keys;
         outcome.written += done.written;
@@ -698,11 +698,11 @@ type PatternKeys<'a> = (Vec<&'a str>, Vec<Vec<String>>);
 /// (`pattern[i]`: part `i` is `NULL`): by `is null` on a `NULL` part's
 /// column, and on the others by a keyset of their typed parts (`$2..`, one
 /// `text[]` per non-`NULL` column, in key order), `$1` being the keys.
-fn sweep_pick(plan: &OneToOnePlan, pattern: &[bool]) -> Pick {
+pub(in crate::staging) fn sweep_pick(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> Pick {
     let mut arrays = Vec::new();
     let mut columns = Vec::new();
     let mut matched: Vec<(String, Option<String>)> = Vec::new();
-    for (column, null) in plan.pk.iter().zip(pattern) {
+    for (column, null) in pk.iter().zip(pattern) {
         let ident = quote_ident(&column.name);
         if *null {
             matched.push((ident, None));
@@ -792,13 +792,13 @@ async fn lock_chunk_entries(
 
 /// How a chunk or a sweep batch picks its keys' rows in
 /// [`rederive_statement`].
-struct Pick {
+pub(in crate::staging) struct Pick {
     /// What follows `from <source> s` in the source read: the join and
     /// filter that pick the locked keys' rows.
-    src_from: String,
+    pub(in crate::staging) src_from: String,
     /// A predicate over the target aliased `t` that picks the locked keys'
     /// target rows.
-    target_where: String,
+    pub(in crate::staging) target_where: String,
     /// The locked keys' `text[]` parameter.
     keys: String,
 }

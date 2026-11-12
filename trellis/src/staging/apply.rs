@@ -3592,7 +3592,7 @@ pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
 /// itself stays uncast and its index usable), `select`ing `columns`, locked
 /// `for update` in key order. `pk_ident` is the quoted key column and
 /// `pk_cast` its type.
-fn single_lock_statement(
+pub(super) fn single_lock_statement(
     target_ident: &str,
     pk_ident: &str,
     pk_cast: &str,
@@ -3631,7 +3631,7 @@ async fn lock_single_keys(
 
 /// [`apply_target`]'s delete for a single-column key: the target rows of the
 /// bound `text[]` keys at `$1`, `returning` the key text `returning`.
-fn single_delete_statement(
+pub(super) fn single_delete_statement(
     target_ident: &str,
     pk_ident: &str,
     pk_cast: &str,
@@ -3674,7 +3674,11 @@ async fn delete_single_keys(
 /// The join is deliberately not also restricted by one `t.<col> = any(<its
 /// array>)` per key column: see [`bounds_keyset_by_array`]. It runs under
 /// `ENTRY_PLAN_SETTINGS` instead ([`lock_composite_keys`]).
-fn composite_lock_statement(target_ident: &str, pk: &[PrimaryKeyColumn], columns: &str) -> String {
+pub(super) fn composite_lock_statement(
+    target_ident: &str,
+    pk: &[PrimaryKeyColumn],
+    columns: &str,
+) -> String {
     format!(
         "select {columns} from {target_ident} as t join {} on ({}) \
          order by {} for update of t",
@@ -3798,7 +3802,7 @@ pub(super) fn null_pattern_match(
 /// [`apply_target`]'s pre-lock of the target rows of one `NULL` pattern's
 /// keys ([`null_pattern_match`] at `$1`), `select`ing `columns`, locked `for
 /// update of t` in key order.
-fn null_pattern_lock_statement(
+pub(super) fn null_pattern_lock_statement(
     target_ident: &str,
     pk: &[PrimaryKeyColumn],
     pattern: &[bool],
@@ -3822,7 +3826,7 @@ fn null_pattern_lock_statement(
 
 /// [`apply_target`]'s delete of the target rows of one `NULL` pattern's keys
 /// ([`null_pattern_match`] at `$1`), `returning` the key text `returning`.
-fn null_pattern_delete_statement(
+pub(super) fn null_pattern_delete_statement(
     target_ident: &str,
     pk: &[PrimaryKeyColumn],
     pattern: &[bool],

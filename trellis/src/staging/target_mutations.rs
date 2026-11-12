@@ -756,6 +756,34 @@ fn new_images_query<'a>(
     })
 }
 
+/// [`new_images_query`]'s statement for `keys`, for the golden tests.
+#[cfg(test)]
+pub(super) fn new_images_sql(
+    target: &str,
+    image_columns: &[String],
+    pk: &[PrimaryKeyColumn],
+    keys: &[&str],
+) -> String {
+    let keys: BTreeMap<String, KeyMutation> = keys
+        .iter()
+        .map(|key| {
+            let mutation = KeyMutation {
+                prior_image: None,
+                hop_gen: 0,
+                src_changed: None,
+                origin_lsn: None,
+            };
+            (key.to_string(), mutation)
+        })
+        .collect();
+    let feed = ImageFeed {
+        key_columns: pk.to_vec(),
+    };
+    new_images_query(target, image_columns, &feed, &keys)
+        .expect("keys of `pk`")
+        .sql
+}
+
 /// The current WAL insert position, as this transaction's write token — see
 /// the module doc's "The write token".
 async fn read_write_token(txn: &Transaction<'_>) -> Result<PgLsn, ApplyError> {
