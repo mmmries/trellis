@@ -64,7 +64,6 @@ use testkit::TestCluster;
 use tokio_postgres::Client;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::chunk_queue;
-use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{
     Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
@@ -1186,39 +1185,6 @@ async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
     .unwrap_or_else(|e| panic!("stage cdc for orders row {id}: {e}"));
 }
 
-/// Seals and drains through the engine's own apply path until nothing is
-/// pending anywhere in the ring: the hand-driven stand-in for a running
-/// `Client`'s maintenance loop and drain workers (the same helper
-/// `pause_and_drop.rs` uses).
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    // No live capture stages anything here, so there is no real staged
-    // watermark to hold apply back. A saturated one never does.
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "alter_transform_test",
-            1,
-            "trellis_alter_transform_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
 /// The field applies from the `ALTER`'s commit, while its build runs,
 /// and the rest of the target stays live: checked at a fixed
 /// point with one of three chunks built, by hand, with no pipeline running.
@@ -1249,7 +1215,7 @@ async fn the_field_applies_while_its_build_runs_and_the_rest_of_the_target_stays
         .expect("define");
     start_and_settle_builds(&db.pool).await;
     let mut ring = connect(db.dsn()).await;
-    drain_to_quiescence(&db.pool, &mut ring).await;
+    pipeline::settle(&db.pool, &mut ring).await;
 
     trellis
         .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
@@ -1283,7 +1249,7 @@ async fn the_field_applies_while_its_build_runs_and_the_rest_of_the_target_stays
     }
     tokio::time::timeout(
         Duration::from_secs(60),
-        drain_to_quiescence(&db.pool, &mut ring),
+        pipeline::settle(&db.pool, &mut ring),
     )
     .await
     .expect("live apply must not wait on the build");

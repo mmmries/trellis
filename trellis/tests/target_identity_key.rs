@@ -64,7 +64,7 @@ async fn start(definitions: &[&str]) -> Driver {
         &["public.a", "public.b"],
     )
     .await;
-    exec(&d, SEED).await;
+    d.write(SEED).await;
     d.settle().await;
     d
 }
@@ -89,10 +89,6 @@ async fn start_chain() -> Driver {
     d
 }
 
-async fn exec(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 /// The index backing `target`'s key, as define created it: its only unique
 /// index before the test adds one.
 async fn key_index(d: &Driver, target: &str) -> String {
@@ -111,8 +107,8 @@ async fn key_index(d: &Driver, target: &str) -> String {
 /// than the user's.
 async fn reindex_key_after(d: &Driver, target: &str, user_sql: &str) {
     let key = key_index(d, target).await;
-    exec(d, user_sql).await;
-    exec(d, &format!("reindex index concurrently {key}")).await;
+    d.write(user_sql).await;
+    d.write(&format!("reindex index concurrently {key}")).await;
 }
 
 /// Pauses `name` by hand, the way a capture disruption does, resumes it, and
@@ -155,8 +151,7 @@ async fn assert_live(d: &Driver) {
 
 /// Writes after the resume, so the live path keys its writes too.
 async fn write_more(d: &mut Driver) {
-    exec(
-        d,
+    d.write(
         "insert into public.a values (5, 3, 1, 1), (6, null, 2, 2); \
          update public.a set x = x + 1 where id = 1; delete from public.a where id = 3",
     )
@@ -286,8 +281,7 @@ fn a_columns() -> std::collections::HashMap<String, ValueType> {
 #[tokio::test]
 async fn an_adopted_aggregate_keeps_its_group_key_beside_an_older_user_constraint() {
     let mut d = start(&[]).await;
-    exec(
-        &d,
+    d.write(
         "create table public.agg (ga integer, n bigint, sx bigint, \
              constraint agg_user unique nulls not distinct (n, ga)); \
          alter table public.agg add constraint agg_key unique nulls not distinct (ga)",
@@ -360,13 +354,10 @@ async fn an_existing_definition_gets_its_key_record_at_attach() {
 async fn a_resume_and_a_build_refuse_when_the_recorded_key_has_no_index() {
     let mut d = start(&[AGG]).await;
     let key = key_index(&d, "public.agg").await;
-    exec(
-        &d,
-        &format!(
-            "alter table public.agg add constraint agg_user unique nulls not distinct (n, ga); \
+    d.write(&format!(
+        "alter table public.agg add constraint agg_user unique nulls not distinct (n, ga); \
              alter table public.agg drop constraint {key}"
-        ),
-    )
+    ))
     .await;
     d.ctl
         .execute(
@@ -388,15 +379,13 @@ async fn a_resume_and_a_build_refuse_when_the_recorded_key_has_no_index() {
         assert!(refusal.contains(part), "{part:?} in {refusal}");
     }
 
-    exec(
-        &d,
-        "alter table public.agg add constraint agg_ga_key unique nulls not distinct (ga)",
-    )
-    .await;
+    d.write("alter table public.agg add constraint agg_ga_key unique nulls not distinct (ga)")
+        .await;
     trellis::staging::quarantine::resume_transform(d.pool(), "agg")
         .await
         .expect("resumes with the key back");
-    exec(&d, "alter table public.agg drop constraint agg_ga_key").await;
+    d.write("alter table public.agg drop constraint agg_ga_key")
+        .await;
     let pool = d.pool().clone();
     trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
         .await

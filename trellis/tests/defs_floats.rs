@@ -38,16 +38,12 @@
 //!
 //! Harness conventions follow `defs_exact_integers.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
-
-use pipeline::{connect, start_and_settle_builds};
-
 #[path = "support/render_lab.rs"]
 mod render_lab;
 
 use std::collections::HashMap;
 
+use render_lab::pipeline::{connect, start_and_settle_builds};
 use render_lab::{Lab, Outcome};
 use testkit::TestCluster;
 use tokio_postgres::Client;

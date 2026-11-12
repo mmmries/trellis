@@ -22,6 +22,9 @@
 //! `a_token_after_an_asynchronous_commit_waits_for_the_write`
 //! writes through a real capture trigger and never drains.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::time::{Duration, Instant};
 use testkit::connect_raw;
 
@@ -31,7 +34,7 @@ use tokio_postgres::types::PgLsn;
 use trellis::capture::install;
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::staging::{StagingError, apply, has_pending, retire_drained_segments, seal};
+use trellis::staging::{StagingError, apply};
 use trellis::{BlockingTrellis, Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
 
 /// Inserts a bare recompute row directly into `seg_0` (the fresh, always-
@@ -47,24 +50,6 @@ async fn insert_pending_row(client: &Client, key: &str, origin_lsn: PgLsn) {
         )
         .await
         .expect("insert pending row with origin_lsn");
-}
-
-/// Seals the active segment and drains it through the engine's own apply
-/// path, repeating until nothing is pending: the hand-driven stand-in for a
-/// running `Client`'s drain workers (`self_check.rs`'s helper of the same
-/// name).
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let sealed = seal_active_segment(client).await;
-        drain_segment(pool, sealed).await;
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 /// Drains every bucket of the sealed segment `seg_seq` through the engine's
@@ -83,15 +68,6 @@ async fn drain_segment(pool: &trellis::pool::Pool, seg_seq: i64) {
     .expect("drain_once")
     .is_some()
     {}
-}
-
-/// Seals the active segment (both phases), returning the sealed `seg_seq`.
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
 }
 
 /// `Trellis::watermark_token`/`Trellis::await_converged` against a real
@@ -166,7 +142,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
     // stands between the token and convergence.
     let token = trellis.watermark_token().await.expect("watermark_token");
     // Sealed but not drained, as a staging-only pipeline would leave it.
-    let sealed = seal_active_segment(&mut raw).await;
+    let sealed = pipeline::seal(&mut raw).await;
 
     {
         let converged = trellis.await_converged(token, Duration::from_secs(30));
@@ -184,7 +160,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
         // The same in-flight call, resumed after the drain: it has to notice
         // on a later poll, not just on a fresh call.
         drain_segment(&db.pool, sealed).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        pipeline::settle(&db.pool, &mut raw).await;
         converged
             .await
             .expect("await_converged should succeed once the write has been applied");

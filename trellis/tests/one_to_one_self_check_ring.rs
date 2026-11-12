@@ -26,16 +26,6 @@ async fn start() -> Driver {
     .await
 }
 
-async fn step(d: &mut Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-    let batch = d.seal().await;
-    d.drain(batch, "step").await;
-}
-
-async fn exec(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 /// Every page of one comparison of `t`, `limit` rows at a time, with no wait
 /// and no re-check: the divergences, the keys it couldn't vouch for exactly,
 /// and whether it couldn't vouch for any.
@@ -73,20 +63,15 @@ fn cell(key: &str, column: &str, persisted: &str, recomputed: &str) -> Divergenc
 #[tokio::test]
 async fn pending_changes_to_a_correct_target_give_no_divergence_on_one_pass() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4)",
-    )
-    .await;
-    exec(
-        &d,
+    d.step("insert into public.src values (1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4)")
+        .await;
+    d.write(
         "update public.src set v = 11 where id = 1; update public.src set v = 12 where id = 1; \
          delete from public.src where id = 2; insert into public.src values (5, 50, 5)",
     )
     .await;
     let sealed = d.seal().await;
-    exec(
-        &d,
+    d.write(
         "update public.src set w = 9 where id = 3; update public.src set w = 10 where id = 3; \
          delete from public.src where id = 4; insert into public.src values (4, 41, 4); \
          update public.src set v = 51 where id = 5",
@@ -111,21 +96,12 @@ async fn pending_changes_to_a_correct_target_give_no_divergence_on_one_pass() {
 #[tokio::test]
 async fn a_planted_error_is_caught_with_pending_changes_present() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 10, 1), (2, 20, 2), (3, 30, 3)",
-    )
-    .await;
-    exec(
-        &d,
-        "update public.t set total = total + 1000 where id in (1, 3)",
-    )
-    .await;
-    exec(
-        &d,
-        "update public.src set v = 11 where id = 1; update public.src set v = 12 where id = 1",
-    )
-    .await;
+    d.step("insert into public.src values (1, 10, 1), (2, 20, 2), (3, 30, 3)")
+        .await;
+    d.write("update public.t set total = total + 1000 where id in (1, 3)")
+        .await;
+    d.write("update public.src set v = 11 where id = 1; update public.src set v = 12 where id = 1")
+        .await;
     let (found, uncertain, all) = compare(&d, 10).await;
     // The hot key's target row is the old image's plus the plant; the quiet
     // key's is the live row's plus the plant.
@@ -144,19 +120,14 @@ async fn a_planted_error_is_caught_with_pending_changes_present() {
 #[tokio::test]
 async fn a_pending_insert_expects_no_row_and_a_pending_delete_expects_one() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 10, 1), (2, 20, 2)",
-    )
-    .await;
-    exec(
-        &d,
-        "insert into public.src values (3, 30, 3); delete from public.src where id = 2",
-    )
-    .await;
+    d.step("insert into public.src values (1, 10, 1), (2, 20, 2)")
+        .await;
+    d.write("insert into public.src values (3, 30, 3); delete from public.src where id = 2")
+        .await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
-    exec(&d, "delete from public.t where id = 2").await;
-    exec(&d, "insert into public.t (id, total, w) values (3, 33, 3)").await;
+    d.write("delete from public.t where id = 2").await;
+    d.write("insert into public.t (id, total, w) values (3, 33, 3)")
+        .await;
     let (found, _, _) = compare(&d, 10).await;
     assert_eq!(
         found,
@@ -173,12 +144,9 @@ async fn a_pending_insert_expects_no_row_and_a_pending_delete_expects_one() {
 #[tokio::test]
 async fn an_image_less_pending_change_leaves_only_its_key_uncertain() {
     let mut d = start().await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 10, 1), (2, 20, 2)",
-    )
-    .await;
-    exec(&d, "update public.src set v = 11 where id = 2").await;
+    d.step("insert into public.src values (1, 10, 1), (2, 20, 2)")
+        .await;
+    d.write("update public.src set v = 11 where id = 2").await;
     d.stage_recomputes(SRC, &["1"]).await;
     let (found, uncertain, all) = compare(&d, 10).await;
     assert_eq!(found, []);
@@ -189,8 +157,8 @@ async fn an_image_less_pending_change_leaves_only_its_key_uncertain() {
 #[tokio::test]
 async fn a_pending_truncate_leaves_every_key_uncertain() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 10, 1)").await;
-    exec(&d, "truncate public.src").await;
+    d.step("insert into public.src values (1, 10, 1)").await;
+    d.write("truncate public.src").await;
     let (_, _, all) = compare(&d, 10).await;
     assert!(all);
 }
@@ -201,8 +169,8 @@ async fn a_pending_truncate_leaves_every_key_uncertain() {
 #[tokio::test]
 async fn a_one_to_one_page_never_scans_a_drained_ring_slot() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 10, 1)").await;
-    step(&mut d, "insert into public.src values (2, 20, 2)").await;
+    d.step("insert into public.src values (1, 10, 1)").await;
+    d.step("insert into public.src values (2, 20, 2)").await;
     let states = d.rows("select state from segments order by seg_seq").await;
     assert_eq!(states.last().map(String::as_str), Some("(active)"));
     assert_eq!(states[0], "(drained)");
@@ -237,10 +205,10 @@ async fn a_one_to_one_page_never_scans_a_drained_ring_slot() {
 #[tokio::test]
 async fn a_change_a_later_batch_overtook_is_not_expected() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 10, 1)").await;
-    exec(&d, "update public.src set v = 11 where id = 1").await;
+    d.step("insert into public.src values (1, 10, 1)").await;
+    d.write("update public.src set v = 11 where id = 1").await;
     let first = d.seal().await;
-    exec(&d, "update public.src set v = 12 where id = 1").await;
+    d.write("update public.src set v = 12 where id = 1").await;
     let second = d.seal().await;
     d.drain(second, "second").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
@@ -253,10 +221,10 @@ async fn a_change_a_later_batch_overtook_is_not_expected() {
 #[tokio::test]
 async fn a_change_a_re_derive_saw_is_not_expected() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 10, 1)").await;
+    d.step("insert into public.src values (1, 10, 1)").await;
     d.stage_recomputes(SRC, &["1"]).await;
     let first = d.seal().await;
-    exec(&d, "update public.src set v = 11 where id = 1").await;
+    d.write("update public.src set v = 11 where id = 1").await;
     let second = d.seal().await;
     d.drain(first, "first").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
@@ -269,10 +237,10 @@ async fn a_change_a_re_derive_saw_is_not_expected() {
 #[tokio::test]
 async fn a_change_below_the_truncate_floor_is_not_expected() {
     let mut d = start().await;
-    step(&mut d, "insert into public.src values (1, 10, 1)").await;
-    exec(&d, "update public.src set v = 11 where id = 1").await;
+    d.step("insert into public.src values (1, 10, 1)").await;
+    d.write("update public.src set v = 11 where id = 1").await;
     let first = d.seal().await;
-    exec(&d, "truncate public.src").await;
+    d.write("truncate public.src").await;
     let second = d.seal().await;
     d.drain(second, "second").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
@@ -295,20 +263,14 @@ async fn pending_changes_are_subtracted_by_key_value_after_a_source_key_re_colla
         &[SRC],
     )
     .await;
-    step(
-        &mut d,
+    d.step(
         "insert into public.src values ('k01', 10, 1), ('K02', 20, 2), ('k03', 30, 3), \
          ('K04', 40, 4), ('k05', 50, 5)",
     )
     .await;
-    exec(
-        &d,
-        r#"alter table public.src alter column id type text collate "C""#,
-    )
-    .await;
-    exec(
-        &d,
-        "update public.src set v = 21 where id = 'K02'; delete from public.src where id = 'K04'; \
+    d.write(r#"alter table public.src alter column id type text collate "C""#)
+        .await;
+    d.write("update public.src set v = 21 where id = 'K02'; delete from public.src where id = 'K04'; \
          insert into public.src values ('k06', 60, 6); update public.src set v = 11 where id = 'k01'",
     )
     .await;
@@ -319,11 +281,8 @@ async fn pending_changes_are_subtracted_by_key_value_after_a_source_key_re_colla
             "limit {limit}"
         );
     }
-    exec(
-        &d,
-        "update public.t set total = total + 1000 where id = 'k03'",
-    )
-    .await;
+    d.write("update public.t set total = total + 1000 where id = 'k03'")
+        .await;
     let (found, _, _) = compare(&d, 2).await;
     assert_eq!(found, [cell("k03", "total", "1033", "33")]);
 }

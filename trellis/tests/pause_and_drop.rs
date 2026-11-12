@@ -57,7 +57,6 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 // pipeline; see the module doc.
 use trellis::defs::chunk_queue;
 use trellis::intake::harness;
-use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{CatalogError, TransformStatus, TrellisError};
 
 /// The kinds of a Re-derive build's work rows, for
@@ -119,38 +118,6 @@ async fn stage_orders_insert(raw: &Client, id: i64, g: i64, a: i64) {
     )
     .await
     .unwrap_or_else(|e| panic!("stage cdc for orders row {id}: {e}"));
-}
-
-/// Seals and drains through the engine's own apply path until nothing is
-/// pending anywhere in the ring: the hand-driven stand-in for a running
-/// `Client`'s maintenance loop and drain workers.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    // No live capture stages anything here, so there is no real staged
-    // watermark to hold apply back. A saturated one never does.
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "pause_and_drop_test",
-            1,
-            "trellis_pause_and_drop_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
 /// Seeds a source table. Aggregates are this file's default
@@ -334,7 +301,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     }
 
     // Claim 1: the sibling converges anyway, and nothing is left holding the
-    // slots its rows arrived in. `drain_to_quiescence` only returns once the
+    // slots its rows arrived in. `pipeline::settle` only returns once the
     // ring has nothing pending, so a paused definition that pinned its share
     // of the ring fails it outright. The retention bookkeeping is then
     // asserted directly: a segment sits in `sealed`/`draining` until every
@@ -345,7 +312,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // ADR-0014's "Resume reconciles with source, not by catch-up" section rules
     // out — those segments could never finish draining, and the ring would
     // fill and wedge for `order_echo` too.
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
     let expected_total: i64 = (1..=12).sum();
     assert_eq!(
         count(
@@ -431,7 +398,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     // source — including the eight rows written while it was paused, whose
     // change records were drained for the sibling and never held for it.
     start_and_settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
     assert_eq!(
         count(
             &raw,

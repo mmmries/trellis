@@ -12,13 +12,16 @@
 //! The caller-side poll drains nothing, so these tests hold the predicate and
 //! the poll to the doc; the engine's workers are what make a token clear.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::time::Duration;
 use testkit::connect_raw;
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use trellis::staging::{StagingError, converge, seal};
+use trellis::staging::{StagingError, converge};
 
 /// Inserts a bare recompute row with an explicit `origin_lsn` (recompute's
 /// own type, `StagedChange::Recompute`, never carries one — this reaches
@@ -47,14 +50,6 @@ async fn set_segment_state(client: &Client, seg_seq: i64, state: &str) {
         .expect("set segment state");
 }
 
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
 #[tokio::test]
 async fn never_false_converged_until_active_and_sealed_all_clear() {
     let cluster = TestCluster::start();
@@ -75,7 +70,7 @@ async fn never_false_converged_until_active_and_sealed_all_clear() {
     // Seal the active segment: the row now lives in a sealed, non-active
     // slot. Condition 3 must pick up exactly where condition 2 left off —
     // still not converged.
-    let sealed_seg_seq = seal_active_segment(&mut client).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
     assert!(
         !converge::converged_through(&client, token)
             .await
@@ -124,7 +119,7 @@ async fn the_band_would_lie_the_slot_does_not() {
     // A row with a comfortably high origin, present before the seal — if a
     // band existed, this is the only row it would have summarized.
     insert_with_origin(&client, "seg_0", "high-origin", Some(900)).await;
-    seal_active_segment(&mut client).await;
+    pipeline::seal(&mut client).await;
 
     let token = PgLsn::from(50);
     assert!(
@@ -174,7 +169,7 @@ async fn a_drained_slots_unfenced_straggler_still_gates_convergence() {
 
     // Nothing in the active segment yet; seal it as-is, capturing S_1 over
     // an empty slot.
-    let sealed_seg_seq = seal_active_segment(&mut client).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
 
     // A straggler lands directly in the now-sealed slot, after S_1 was
     // captured — genuinely invisible in S_1 forever, the same shape
@@ -227,7 +222,7 @@ async fn a_part_drained_batch_reports_its_whole_slot_pending() {
     let mut client = connect_raw(db.dsn()).await;
 
     insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
-    let sealed_seg_seq = seal_active_segment(&mut client).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
 
     let token = PgLsn::from(50);
 
@@ -306,7 +301,7 @@ async fn has_pending_reflects_ring_state() {
         "a row in the active tail counts as pending"
     );
 
-    let sealed_seg_seq = seal_active_segment(&mut client).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
     assert!(
         converge::has_pending(&client)
             .await
@@ -345,7 +340,7 @@ async fn pending_count_counts_every_pending_row() {
         2
     );
 
-    let sealed_seg_seq = seal_active_segment(&mut client).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
     set_segment_state(&client, sealed_seg_seq, "drained").await;
     assert_eq!(
         converge::pending_count(&client)
@@ -362,7 +357,7 @@ async fn await_converged_returns_once_the_predicate_flips_true() {
     let mut client = connect_raw(db.dsn()).await;
 
     insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
-    let sealed_seg_seq = seal_active_segment(&mut client).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
 
     let token = PgLsn::from(50);
 
@@ -389,7 +384,7 @@ async fn await_converged_times_out_with_a_named_error() {
     let mut client = connect_raw(db.dsn()).await;
 
     insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
-    seal_active_segment(&mut client).await;
+    pipeline::seal(&mut client).await;
     // Deliberately never mark the segment drained — convergence can never
     // be reached.
 

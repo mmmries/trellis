@@ -66,16 +66,6 @@ async fn install(d: &Driver, definition: &str, columns: &[(&str, ValueType)]) {
         .unwrap_or_else(|e| panic!("install {definition}: {e}"));
 }
 
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-/// Writes `sql` and drains it, and everything it propagates, to quiescence.
-async fn step(d: &mut Driver, sql: &str) {
-    write(d, sql).await;
-    d.settle().await;
-}
-
 /// Asserts `actual` equals the oracle `expected`, both over the settled
 /// pipeline.
 async fn assert_equal(d: &mut Driver, actual: &str, expected: &str) {
@@ -98,7 +88,7 @@ async fn assert_both(d: &mut Driver) {
 async fn start(seed: Option<&str>) -> Driver {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[AGG], &[SRC]).await;
     if let Some(seed) = seed {
-        step(&mut d, seed).await;
+        d.step_settle(seed).await;
     }
     install(&d, A2, &agg_columns()).await;
     trellis::intake::harness::settle_builds(d.pool()).await;
@@ -120,11 +110,8 @@ async fn assert_live(d: &Driver) {
 #[tokio::test]
 async fn a_group_with_a_null_key_part_reaches_the_one_to_one_reader() {
     let mut d = start(None).await;
-    step(
-        &mut d,
-        "insert into public.src values (1, 1, null, 1), (2, 1, 2, 1)",
-    )
-    .await;
+    d.step_settle("insert into public.src values (1, 1, null, 1), (2, 1, 2, 1)")
+        .await;
     assert_both(&mut d).await;
     assert_eq!(
         d.rows("select g, h, n from public.a2 where h is null")
@@ -180,31 +167,35 @@ async fn rows_moving_into_within_and_out_of_a_null_keyed_group() {
     .await;
     assert_both(&mut d).await;
     // Into: an insert creates the group, a second grows it.
-    step(&mut d, "insert into public.src values (4, 1, null, 4)").await;
+    d.step_settle("insert into public.src values (4, 1, null, 4)")
+        .await;
     assert_both(&mut d).await;
-    step(&mut d, "insert into public.src values (5, 1, null, 5)").await;
+    d.step_settle("insert into public.src values (5, 1, null, 5)")
+        .await;
     assert_both(&mut d).await;
     // Into by update of a group column to NULL, and both parts NULL.
-    step(&mut d, "update public.src set h = null where id = 2").await;
+    d.step_settle("update public.src set h = null where id = 2")
+        .await;
     assert_both(&mut d).await;
-    step(
-        &mut d,
-        "update public.src set g = null, h = null where id = 3",
-    )
-    .await;
+    d.step_settle("update public.src set g = null, h = null where id = 3")
+        .await;
     assert_both(&mut d).await;
     // Within: a member's value changes, and the group's key stays.
-    step(&mut d, "update public.src set v = 40 where id = 4").await;
+    d.step_settle("update public.src set v = 40 where id = 4")
+        .await;
     assert_both(&mut d).await;
     // Out of it by update from NULL, and between two NULL-keyed groups.
-    step(&mut d, "update public.src set h = 7 where id = 5").await;
+    d.step_settle("update public.src set h = 7 where id = 5")
+        .await;
     assert_both(&mut d).await;
-    step(&mut d, "update public.src set g = null where id = 4").await;
+    d.step_settle("update public.src set g = null where id = 4")
+        .await;
     assert_both(&mut d).await;
     // Out by delete: each NULL-keyed group goes extinct.
-    step(&mut d, "delete from public.src where id = 2").await;
+    d.step_settle("delete from public.src where id = 2").await;
     assert_both(&mut d).await;
-    step(&mut d, "delete from public.src where id in (3, 4)").await;
+    d.step_settle("delete from public.src where id in (3, 4)")
+        .await;
     assert_both(&mut d).await;
     assert_eq!(
         d.rows("select g, h from public.a2 where g is null or h is null")
@@ -229,8 +220,7 @@ async fn a_build_over_a_one_row_source_with_a_null_key_writes_it() {
 #[tokio::test]
 async fn a_chunked_build_writes_every_null_keyed_group() {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[AGG], &[SRC]).await;
-    step(
-        &mut d,
+    d.step_settle(
         "insert into public.src \
          select i, case when i % 5 = 0 then null else i % 7 end, \
                 case when i % 3 = 0 then null else i % 4 end, i \
@@ -355,10 +345,11 @@ async fn a_chain_of_aggregate_and_two_one_to_one_readers_keeps_the_null_group() 
         "update public.src set g = 4 where id = 2",
         "delete from public.src where g is null",
     ] {
-        step(&mut d, sql).await;
+        d.step_settle(sql).await;
         assert_equal(&mut d, C_ACTUAL, C_ORACLE).await;
     }
-    step(&mut d, "insert into public.src values (5, null, 0, 5)").await;
+    d.step_settle("insert into public.src values (5, null, 0, 5)")
+        .await;
     assert_equal(&mut d, C_ACTUAL, C_ORACLE).await;
     assert_eq!(
         d.rows("select g, inc from public.c where g is null").await,
@@ -457,7 +448,7 @@ async fn a_rollup_over_the_reader_follows_its_null_keyed_rows() {
         "delete from public.src where g is null and h is null",
         "update public.src set h = 2 where id = 1",
     ] {
-        step(&mut d, sql).await;
+        d.step_settle(sql).await;
         assert_equal(&mut d, ROLL, ORACLE).await;
     }
 }

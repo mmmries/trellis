@@ -17,15 +17,7 @@ use testkit::TestCluster;
 use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
-use trellis::staging::{apply, seal};
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
+use trellis::staging::apply;
 
 async fn drain(pool: &trellis::pool::Pool, seg_seq: i64) {
     while apply::drain_once(pool, seg_seq, "origin_test", 1, "wake")
@@ -132,7 +124,7 @@ async fn derived_rows_carry_their_source_commits_origin_hop_by_hop() {
         ("3".to_string(), None),
     ]);
 
-    let first = seal_active_segment(&mut client).await;
+    let first = pipeline::seal(&mut client).await;
     drain(&db.pool, first).await;
     assert_eq!(
         staged_origins(&client, "public.hop_a").await,
@@ -140,7 +132,7 @@ async fn derived_rows_carry_their_source_commits_origin_hop_by_hop() {
         "the first hop's rows carry their source rows' origins"
     );
 
-    let second = seal_active_segment(&mut client).await;
+    let second = pipeline::seal(&mut client).await;
     drain(&db.pool, second).await;
     assert_eq!(
         staged_origins(&client, "public.hop_b").await,

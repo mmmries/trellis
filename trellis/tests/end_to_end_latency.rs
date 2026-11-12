@@ -30,15 +30,6 @@ use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, Transfor
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
 use trellis::staging::apply;
 
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
 /// Stages one image-bearing (CDC-shaped) change directly into `table`,
 /// mirroring `apply.rs`'s helper of the same name — except this one also
 /// sets `src_changed` to `now()` (`apply.rs`'s own helper leaves it `NULL`,
@@ -218,7 +209,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     .await;
 
     // Hop 0: orders -> chain_totals (intermediate; has a downstream reader).
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let outcome1 = drain(&db.pool, seg1, "worker").await;
     assert_eq!(outcome1.keys_written, 1);
 
@@ -254,7 +245,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     // hop-to-hop propagation path for multi-hop chains: were this `Recompute`
     // row to carry no `src_changed`, neither histogram could observe
     // anything here; it carries hop 0's own origin forward.
-    let seg2 = seal_active_segment(&mut client).await;
+    let seg2 = pipeline::seal(&mut client).await;
     let outcome2 = drain(&db.pool, seg2, "worker").await;
     assert_eq!(outcome2.keys_written, 1);
 
@@ -410,7 +401,7 @@ async fn end_to_end_latency_fires_for_every_terminal_transform_in_a_fan_out() {
     )
     .await;
 
-    let seg1 = seal_active_segment(&mut client).await;
+    let seg1 = pipeline::seal(&mut client).await;
     let outcome = drain(&db.pool, seg1, "worker").await;
     assert_eq!(outcome.keys_written, 2, "one write per fan-out branch");
 
