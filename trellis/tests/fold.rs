@@ -9,13 +9,16 @@
 //! and is meant to fail on a naive implementation: a blanket `COALESCE`, a
 //! filter on `op`, an own-slot-only window, or ignoring `change_id`.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::time::SystemTime;
 use testkit::connect_raw;
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
 use tokio_postgres::types::PgLsn;
-use trellis::staging::{BucketFilter, FoldedChange, TRUNCATE_SENTINEL_KEY, fold, seal};
+use trellis::staging::{BucketFilter, FoldedChange, TRUNCATE_SENTINEL_KEY, fold};
 
 /// One raw row to insert into a ring table, with every fold-relevant column
 /// exposed (unlike `StagedChange`, which enforces the image-bearing/
@@ -81,16 +84,6 @@ fn find<'a>(folded: &'a [FoldedChange], key: &str) -> &'a FoldedChange {
         .iter()
         .find(|f| f.key == key)
         .unwrap_or_else(|| panic!("key {key:?} missing from fold output: {folded:?}"))
-}
-
-/// Seals the currently-active segment and returns its `seg_seq` — the tests'
-/// standard "close the batch" step before folding it.
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
 }
 
 #[tokio::test]
@@ -169,7 +162,7 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
     // "recomputed": a bare recompute trigger from reverse propagation.
     insert_row(&client, "seg_0", &RawRow::recompute("recomputed", 1)).await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -252,7 +245,7 @@ async fn a_key_born_in_the_batch_folds_old_image_to_null_via_the_change_id_tie_b
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -316,7 +309,7 @@ async fn image_less_rows_never_win_an_arg_extreme_but_still_produce_a_record() {
     insert_row(&client, "seg_0", &RawRow::recompute("all-image-less", 0)).await;
     insert_row(&client, "seg_0", &RawRow::recompute("all-image-less", 0)).await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -370,7 +363,7 @@ async fn an_image_less_load_bearing_row_survives_the_fold_unfiltered_by_op() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -425,7 +418,7 @@ async fn origin_lsn_least_merges_while_lsn_greatest_advances() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -471,9 +464,9 @@ async fn a_straddler_folds_in_correctly_via_the_both_slots_fence() {
         .await
         .expect("insert straddler");
 
-    let seg1 = seal_active_segment(&mut sealer).await;
+    let seg1 = pipeline::seal(&mut sealer).await;
     writer_txn.commit().await.expect("commit straddler");
-    let seg2 = seal_active_segment(&mut sealer).await;
+    let seg2 = pipeline::seal(&mut sealer).await;
 
     let txn1 = sealer.transaction().await.expect("begin fold txn 1");
     let folded1 = fold::fold(&txn1, seg1, BucketFilter::all())
@@ -509,7 +502,7 @@ async fn bucket_filter_partitions_the_batch_disjointly_and_completely() {
         insert_row(&client, "seg_0", &RawRow::recompute(&format!("key-{i}"), 0)).await;
     }
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
 
     const BUCKET_COUNT: i64 = 4;
@@ -625,7 +618,7 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
     // unconditionally, regardless of the truncate.
     insert_row(&client, "seg_0", &RawRow::recompute("recomputed", 1)).await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -732,7 +725,7 @@ async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -782,7 +775,7 @@ async fn several_truncates_each_void_only_earlier_rows_of_their_own_table() {
             .expect("insert row");
     }
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -832,7 +825,7 @@ async fn has_recompute_survives_a_fold_with_the_keys_cdc_change() {
     insert_row(&client, "seg_0", &update("plain")).await;
     insert_row(&client, "seg_0", &RawRow::recompute("bare", 0)).await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await
@@ -954,7 +947,7 @@ async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let txn = client.transaction().await.expect("begin fold txn");
     let folded = fold::fold(&txn, seg_seq, BucketFilter::all())
         .await

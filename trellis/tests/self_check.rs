@@ -47,6 +47,9 @@
 //! `reproduced_keeps_only_divergences_seen_on_both_passes` unit-test the
 //! re-check's own matching logic directly.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::time::Duration;
 use testkit::connect_raw;
 
@@ -55,9 +58,9 @@ use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::hierarchy::Hierarchy;
 use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
+use trellis::staging::seal;
 use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
 use trellis::staging::self_check_job::{WorkerOptions, run_to_end, work_once};
-use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{
     CaptureFault, Config, Divergence, SelfCheckError, SelfCheckJobState, SelfCheckMode,
     SelfCheckOutcome, TransformStatus, Trellis, TrellisError, TrellisOptions,
@@ -75,38 +78,6 @@ const GENEROUS_TIMEOUT: Duration = Duration::from_secs(30);
 /// still running when the terminate lands, since the deadline is enforced
 /// mid-poll.
 const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Seals the active segment and drains it through the engine's own apply
-/// path, repeating until nothing is pending — the hand-driven stand-in for a
-/// running `Client`'s drain workers.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    // Capture triggers stage in the writer's own transaction, so there is
-    // no staged watermark to hold apply back. A saturated one never does.
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "self_check_test",
-            1,
-            "trellis_self_check_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
-}
 
 /// Installs `table`'s capture triggers with one capture reconcile pass, the
 /// staging worker's, which also records the table's capture gate.
@@ -196,7 +167,7 @@ async fn converged_fixture(
         .await
         .unwrap_or_else(|e| panic!("insert source row {key}: {e}"));
     }
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     (trellis, raw)
 }
@@ -299,7 +270,7 @@ async fn self_check_reports_a_definition_under_a_rebuild_as_not_live() {
     assert_eq!(report.next_after, None);
 
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut { raw }).await;
+    pipeline::settle(&db.pool, &mut { raw }).await;
     let report = check().await;
     assert!(
         matches!(report.outcome, SelfCheckOutcome::Converged),
@@ -343,7 +314,7 @@ async fn self_check_reports_a_reader_of_a_rebuilding_upstream_as_catching_up() {
     )
     .await;
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
     let reported = || async {
         trellis
             .status("price_copies")
@@ -410,7 +381,7 @@ async fn self_check_reports_a_reader_of_a_rebuilding_upstream_as_catching_up() {
     );
 
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
     assert_eq!(reported().await, TransformStatus::Live);
     let report = check().await;
     assert!(
@@ -1945,7 +1916,7 @@ async fn a_page_after_a_re_collation_reads_the_target_by_its_key_index() {
 //
 // A job is registered by the call and run by a drain worker, a keyset page per
 // pass. These tests hand-drive the worker (`work_once`) the way
-// `drain_to_quiescence` hand-drives the drain, so they wait for nothing; the
+// `pipeline::settle` hand-drives the drain, so they wait for nothing; the
 // two that run a live `Client` say so.
 // ---------------------------------------------------------------------------
 

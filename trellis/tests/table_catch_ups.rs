@@ -27,12 +27,8 @@ use tokio_postgres::types::PgLsn;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
 use trellis::intake::harness;
-use trellis::staging::{CdcOp, StagedChange, apply, seal};
-use trellis::staging::{has_pending, retire_drained_segments};
+use trellis::staging::{CdcOp, StagedChange};
 use trellis::{Config, Trellis, TrellisOptions};
-
-const TEST_NAME: &str = "table_catch_ups_test";
-const WAKE: &str = "table_catch_ups_wake";
 
 async fn connect_trellis(dsn: &str) -> Trellis {
     Trellis::connect(
@@ -43,31 +39,10 @@ async fn connect_trellis(dsn: &str) -> Trellis {
     .expect("connect a define-only Trellis")
 }
 
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, WAKE)
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(pool, outcome.sealed_seg_seq, TEST_NAME, 1, WAKE)
-            .await
-            .expect("drain_once")
-            .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
-}
-
 /// Builds every registered definition and drains the ring.
 async fn bring_live(pool: &trellis::pool::Pool, client: &mut Client) {
     harness::settle_builds(pool).await;
-    drain_to_quiescence(pool, client).await;
+    pipeline::settle(pool, client).await;
     let not_live: i64 = client
         .query_one(
             "select count(*) from transform_definitions where status <> 'live'",
@@ -301,7 +276,7 @@ async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {
     )
     .await;
     harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sales_copy").await, "live");
     assert_eq!(
@@ -415,7 +390,7 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
     );
 
     harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     assert_eq!(
@@ -471,7 +446,7 @@ async fn a_requested_backfill_during_a_rebuild_enqueues_another() {
     );
 
     harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sku_totals").await, "live");
     assert_eq!(
@@ -503,7 +478,7 @@ async fn a_table_whose_capture_is_reinstalled_rebuilds_its_readers() {
     bring_live(&db.pool, &mut client).await;
     capture(&mut client, &["public.sales"]).await;
     harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
     assert_eq!(status_of(&client, "public.sales_copy").await, "live");
 
     uninstall(&mut client, "public.sales").await;
@@ -518,7 +493,7 @@ async fn a_table_whose_capture_is_reinstalled_rebuilds_its_readers() {
     assert_eq!(build_seg, Some(active_seq(&client).await));
 
     harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     assert_eq!(status_of(&client, "public.sales_copy").await, "live");
     let ids: Vec<i32> = copy_rows(&client).await.into_iter().map(|r| r.0).collect();

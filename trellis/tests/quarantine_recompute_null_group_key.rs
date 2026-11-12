@@ -35,6 +35,9 @@
 //! NULLS NOT DISTINCT` like `sku_totals`, so it holds the `NULL` group's row,
 //! and the resumed column is restored there too.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::collections::HashMap;
 use testkit::connect_raw;
 
@@ -42,39 +45,6 @@ use testkit::TestCluster;
 use tokio_postgres::Client;
 use trellis::defs::{ValueType, install_definition};
 use trellis::staging::quarantine;
-use trellis::staging::{has_pending, retire_drained_segments};
-
-/// Seals and drains repeatedly until nothing is pending anywhere in the ring
-/// — needed after installing `sku_totals_echo` so its own downstream
-/// propagation settles before this test reaches into `column_status`.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::apply;
-    use trellis::staging::seal;
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "quarantine_recompute_null_group_key_test",
-            1,
-            "trellis_quarantine_recompute_null_group_key_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
-}
 
 fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
     pairs
@@ -160,13 +130,13 @@ async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panickin
         .await
         .expect("install the aggregate");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     install_definition(&db.pool, SKU_TOTALS_ECHO, &sku_totals_columns(), "public")
         .await
         .expect("install the 1-1 chained onto the aggregate");
     trellis::intake::harness::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     // Sanity checks: the upstream aggregate holds the NULL group, and so
     // does the chained 1-1 target.
@@ -222,7 +192,7 @@ async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panickin
     // The resume registers the column's field build; run it, then
     // drain the NULL-keyed key its plan staged.
     trellis::staging::build::settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut client).await;
+    pipeline::settle(&db.pool, &mut client).await;
 
     let echo_after = sku_totals_echo(&client).await;
     assert_eq!(

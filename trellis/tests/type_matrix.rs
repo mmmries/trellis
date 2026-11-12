@@ -511,10 +511,6 @@ async fn settle_tolerant(d: &mut Driver) -> usize {
     failures
 }
 
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 /// One cell: a source, one definition named `c`, a seed, an alter, a write,
 /// and the SQL that reads the target and its oracle (the source) in the same
 /// shape.
@@ -716,7 +712,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
         "{place:?}, {}: a column Trellis created has a type modifier",
         ty.label
     );
-    write(&d, &scn.seed_sql).await;
+    d.write(&scn.seed_sql).await;
     d.settle().await;
     // The seed is a captured write before any change: the apply's cast of
     // it to the copy's type must keep it whole (a bare `bit` is `bit(1)`).
@@ -733,7 +729,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
         scn.alter_sql.clone()
     };
     d.ctl.batch_execute(&alter_sql).await.expect("alter");
-    write(&d, &scn.hi_sql).await;
+    d.write(&scn.hi_sql).await;
     let drain_failures = settle_tolerant(&mut d).await;
     let diverged_before_pass = diverged(&d, &scn.target_sql, &scn.oracle_sql).await;
     let trellis = facade(d.db.dsn()).await;
@@ -1390,8 +1386,7 @@ async fn paired_string_keys_of_different_bounds_never_truncate() {
         &["public.a", "public.b", "public.e"],
     )
     .await;
-    write(
-        &d,
+    d.write(
         "insert into public.a values (1, 'abcdefghijkl', 1), (2, 'abcdefghij', 2); \
          insert into public.b values (1, 'abcdefghij', 10); \
          insert into public.e values (1, 'abcdefghij', 10), (2, 'abcdefghijkl', 20)",

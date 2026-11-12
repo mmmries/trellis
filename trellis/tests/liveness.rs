@@ -13,6 +13,9 @@
 //! [`FenceMissBackoff`]'s pure sequence is covered in-module
 //! (`trellis/src/staging/liveness.rs`'s `#[cfg(test)]`), not here.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 use testkit::connect_raw;
@@ -23,9 +26,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse};
 use trellis::staging::apply::{self, DrainHooks};
-use trellis::staging::{
-    HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, claim, liveness, seal,
-};
+use trellis::staging::{HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, claim, liveness};
 
 /// Claims in a transaction of its own and commits it. `claim::claim` takes a
 /// transaction: it holds the segment row's lock until commit.
@@ -54,14 +55,6 @@ async fn insert_recompute(client: &Client, table: &str, key: &str) {
         .expect("insert recompute row");
 }
 
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
 async fn segment_state(client: &Client, seg_seq: i64) -> SegmentState {
     let state: String = client
         .query_one("select state from segments where seg_seq = $1", &[&seg_seq])
@@ -88,7 +81,7 @@ async fn claimed_buckets(client: &Client, seg_seq: i64, claimed_by: &str) -> Vec
 /// test in this file starts from.
 async fn seal_one_bucket_batch(client: &mut Client, key: &str) -> i64 {
     insert_recompute(client, "seg_0", key).await;
-    seal_active_segment(client).await
+    pipeline::seal(client).await
 }
 
 /// Backdates every claim on `seg_seq` by an hour: far past any TTL a test
@@ -494,7 +487,7 @@ async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_sta
             .await
             .expect("stage insert");
     }
-    let seg = seal_active_segment(&mut client).await;
+    let seg = pipeline::seal(&mut client).await;
 
     // Writes to the target wait behind this lock; reads (the fold, compute)
     // do not.

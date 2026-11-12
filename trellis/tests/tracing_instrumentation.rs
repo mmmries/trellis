@@ -183,15 +183,6 @@ fn install_capture() -> (tracing::subscriber::DefaultGuard, Captured) {
 // Shared scaffolding (mirrors apply.rs/end_to_end_latency.rs/quarantine.rs)
 // ---------------------------------------------------------------------
 
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
 async fn insert_cdc_row(
     client: &Client,
     table: &str,
@@ -287,7 +278,7 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
     )
     .await;
 
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
     let outcome = apply::drain_once(
         &db.pool,
         seg_seq,
@@ -539,7 +530,7 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
         Some(r#"{"price":"not-a-number","tax":"1.50"}"#),
     )
     .await;
-    let seg_seq = seal_active_segment(&mut client).await;
+    let seg_seq = pipeline::seal(&mut client).await;
 
     let result = apply::drain_once(
         &db.pool,

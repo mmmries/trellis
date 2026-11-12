@@ -38,22 +38,13 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::{TransformStatus, ValueType, create_definition, install_definition};
 use trellis::staging::apply;
 use trellis::staging::quarantine;
-use trellis::staging::{has_pending, retire_drained_segments};
+use trellis::staging::retire_drained_segments;
 
 fn numeric(names: &[&str]) -> HashMap<String, ValueType> {
     names
         .iter()
         .map(|n| (n.to_string(), ValueType::Numeric))
         .collect()
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1_waiting(client).await;
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
 }
 
 /// Bare `name` qualified under [`DEFAULT_SCHEMA`] — matches
@@ -105,42 +96,14 @@ async fn insert_cdc_row(
         .unwrap_or_else(|e| panic!("insert cdc row {key:?} into {table} failed: {e}"));
 }
 
-/// Runs any dispatched backfill chunks, then seals and drains repeatedly
-/// until nothing is pending anywhere in the ring — the same harness
-/// `defs_install_definition.rs` uses. A definition's build reads its source
-/// itself rather than staging it into the ring (ADR-0002), so the
-/// builds run first.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    start_and_settle_builds(pool).await;
-    // A throwaway, always-caught-up watermark — this helper
-    // has no live capture running (these tests stage CDC rows by hand),
-    // and none of this file's tests exercise guard (a) specifically, so a
-    // real watermark would only ever make guard (a) reject spuriously.
-    for _ in 0..16 {
-        let seg = seal_active_segment(client).await;
-        while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
-            .await
-            .expect("drain_once")
-            .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
-}
-
-/// Seals and drains repeatedly, like [`drain_to_quiescence`], but exits once
+/// Seals and drains repeatedly, like [`pipeline::settle`], but exits once
 /// `target` reaches [`TransformStatus::Live`] rather than waiting for
 /// `has_pending` to clear entirely. Needed whenever a scenario leaves a
 /// permanently-parked `poison_held` row behind (an evicted key with no
 /// releasable fix, by construction) — [`has_pending`] counts *any* parked
 /// contribution as pending forever (it hasn't drained, it's
 /// excluded from the active batch until release replays it), so
-/// `drain_to_quiescence` would spin for all 16 rounds and panic even though
+/// `pipeline::settle` would spin for all 16 rounds and panic even though
 /// the one thing this test actually cares about — the target reaching live
 /// again — already happened.
 async fn drain_until_live(pool: &trellis::pool::Pool, client: &mut Client, target: &str) {
@@ -149,11 +112,10 @@ async fn drain_until_live(pool: &trellis::pool::Pool, client: &mut Client, targe
     if status_of(client, target).await == TransformStatus::Live {
         return;
     }
-    // See `drain_to_quiescence`'s own comment — no live capture
-    // is running here either, so a throwaway, always-caught-up watermark is
-    // correct.
+    // No live capture runs here (these tests stage CDC rows by hand), so a
+    // throwaway, always-caught-up watermark is correct.
     for _ in 0..16 {
-        let seg = seal_active_segment(client).await;
+        let seg = pipeline::seal(client).await;
         while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
             .await
             .expect("drain_once")
@@ -198,12 +160,12 @@ async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
 }
 
 /// One seal/drain/retire round, with no exit condition of its own — the
-/// "flush whatever is still staged" step [`drain_to_quiescence`] can't be
+/// "flush whatever is still staged" step [`pipeline::settle`] can't be
 /// used for once a scenario has parked a permanently-unreleasable
 /// `poison_held` row (see [`drain_until_live`]'s own comment on why
 /// `has_pending` never clears then).
 async fn drain_one_round(pool: &trellis::pool::Pool, client: &mut Client) {
-    let seg = seal_active_segment(client).await;
+    let seg = pipeline::seal(client).await;
     while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
         .await
         .expect("drain_once")
@@ -241,7 +203,7 @@ async fn evict_keys_for_real(
         )
         .await;
     }
-    let seg_seq = seal_active_segment(raw).await;
+    let seg_seq = pipeline::seal(raw).await;
 
     // Each external `drain_once` call charges every still-failing key's
     // death counter once (`isolate_and_evict`'s probe loop) and, unless that
@@ -251,9 +213,8 @@ async fn evict_keys_for_real(
     // `DEFAULT_DEATH_THRESHOLD` (5) takes five external failures, the fifth
     // of which evicts every one of `keys` together (they all fail every
     // attempt alike) and lets the retry drain succeed within that same call.
-    // See `drain_to_quiescence`'s own comment — no live capture
-    // is running here either, so a throwaway, always-caught-up watermark is
-    // correct.
+    // No live capture runs here (these tests stage CDC rows by hand), so a
+    // throwaway, always-caught-up watermark is correct.
     let mut real_failures = 0;
     loop {
         match apply::drain_once(
@@ -430,7 +391,8 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
 
     // Start the resumed definition's rebuild and run it to completion.
     start_and_settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    start_and_settle_builds(&db.pool).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     assert_eq!(
         status_of(&raw, "t2").await,
@@ -499,7 +461,8 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     start_and_settle_builds(&db.pool).await;
     // Drained to quiescence so the CDC rows this test stages next are
     // isolated in a fresh segment of their own.
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    start_and_settle_builds(&db.pool).await;
+    pipeline::settle(&db.pool, &mut raw).await;
     assert_eq!(status_of(&raw, "t4").await, TransformStatus::Live);
 
     // Stage a real CDC change for five distinct *keys* that are themselves
@@ -631,7 +594,8 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     .expect("install_definition");
     start_and_settle_builds(&db.pool).await;
     start_and_settle_builds(&db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    start_and_settle_builds(&db.pool).await;
+    pipeline::settle(&db.pool, &mut raw).await;
     assert_eq!(status_of(&raw, "t6").await, TransformStatus::Live);
 
     let s6 = qualify_fixture_table("s6");

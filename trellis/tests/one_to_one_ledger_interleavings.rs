@@ -98,10 +98,6 @@ async fn assert_oracle(d: &mut Driver, flavour: Flavour) {
     );
 }
 
-async fn write(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 // ------------------------------------------------------------- the harness
 
 /// Every pause point a flavour has fires, in page order, and holds the page
@@ -110,7 +106,7 @@ async fn write(d: &Driver, sql: &str) {
 async fn pause_points_fire_in_page_order(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 5)]).await;
     d.stage_recomputes(SRC, &["1"]).await;
-    write(&d, "insert into public.src values (3, 2, 7)").await;
+    d.write("insert into public.src values (3, 2, 7)").await;
     let batch = d.seal().await;
     let mut points = vec![
         PausePoint::AfterPlaceholders,
@@ -150,7 +146,7 @@ async fn pause_points_fire_in_page_order_one_to_one() {
 /// then count C exactly once.
 async fn exp2_2(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 5)]).await;
-    write(&d, "update public.src set v = 20 where id = 1").await;
+    d.write("update public.src set v = 20 where id = 1").await;
     let c_batch = d.seal().await;
     d.stage_recomputes(SRC, &["1"]).await;
     let r_batch = d.seal().await;
@@ -185,7 +181,7 @@ async fn exp2_2b(flavour: Flavour) {
         )
         .await;
     let frozen = a.reached(PausePoint::AfterRederiveRead).await;
-    write(&d, "update public.src set v = 20 where id = 1").await;
+    d.write("update public.src set v = 20 where id = 1").await;
     let c_batch = d.seal().await;
     let b = d.drain_frozen(c_batch, "b", &[]).await;
     d.wait_blocked_behind(frozen.backend_pid).await;
@@ -218,9 +214,9 @@ const A_Z_B: &[(i32, i32, i32)] = &[(1, 1, 10), (5, 2, 50), (6, 3, 60)];
 /// of order (C2's first).
 async fn exp2_5b(flavour: Flavour) {
     let mut d = start(flavour, A_Z_B).await;
-    write(&d, "update public.src set g = 2 where id = 1").await;
+    d.write("update public.src set g = 2 where id = 1").await;
     let first = d.seal().await;
-    write(&d, "update public.src set g = 3 where id = 1").await;
+    d.write("update public.src set g = 3 where id = 1").await;
     let second = d.seal().await;
     d.drain(second, "a").await;
     d.drain(first, "b").await;
@@ -238,9 +234,9 @@ async fn exp2_5b_one_to_one() {
 /// order `drain_second_first` says.
 async fn same_key_two_batches(flavour: Flavour, first: &str, second: &str, second_first: bool) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    write(&d, first).await;
+    d.write(first).await;
     let b1 = d.seal().await;
-    write(&d, second).await;
+    d.write(second).await;
     let b2 = d.seal().await;
     if second_first {
         d.drain(b2, "a").await;
@@ -330,7 +326,7 @@ async fn exp2_9d_one_to_one() {
 /// tombstone GC would never collect.
 async fn a_change_from_before_a_truncate_does_not_come_back(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    write(&d, "truncate public.src").await;
+    d.write("truncate public.src").await;
     d.settle().await;
     assert_eq!(d.rows(flavour.actual()).await, Vec::<String>::new());
 
@@ -383,11 +379,11 @@ async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() 
 /// B's change, and the key's row is in the target.
 async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10)]).await;
-    write(&d, "truncate public.src").await;
+    d.write("truncate public.src").await;
     d.settle().await;
     stage_pre_truncate_insert(&d, "9", r#"{"id":"9","g":"1","v":"90"}"#).await;
     let stale = d.seal().await;
-    write(&d, "insert into public.src values (9, 1, 90)").await;
+    d.write("insert into public.src values (9, 1, 90)").await;
     let live = d.seal().await;
 
     let mut page_a = d
@@ -429,11 +425,8 @@ async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry_one_to_one()
 /// before the insert's trigger reads it.
 async fn a_truncate_then_an_insert_in_one_transaction_keeps_the_insert(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    write(
-        &d,
-        "begin; truncate public.src; insert into public.src values (7, 1, 70); commit",
-    )
-    .await;
+    d.write("begin; truncate public.src; insert into public.src values (7, 1, 70); commit")
+        .await;
     let ring: Vec<String> = (0..4)
         .map(|slot| format!("select op, key, lsn from {DEFAULT_SCHEMA}.seg_{slot}"))
         .collect();
@@ -468,7 +461,7 @@ async fn exp2_10(flavour: Flavour) {
         .batch_execute("begin; update public.src set v = 15 where id = 1")
         .await
         .expect("open C");
-    write(&d, "update public.src set v = 21 where id = 2").await;
+    d.write("update public.src set v = 21 where id = 2").await;
     d.stage_recomputes(SRC, &["1"]).await;
     let r_batch = d.seal().await;
     d.drain(r_batch, "a").await;
@@ -508,7 +501,7 @@ async fn recompute_before_delete_batch(flavour: Flavour) {
     d.stage_recomputes_with_prior(SRC, &[("1", Some(image))])
         .await;
     let r_batch = d.seal().await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let c_batch = d.seal().await;
     d.drain(r_batch, "a").await;
     d.drain(c_batch, "b").await;
@@ -539,9 +532,9 @@ async fn moved_key_released_from_quarantine(flavour: Flavour) {
         .expect("poison key 1");
     d.stage_recomputes(SRC, &["5"]).await;
     let r_batch = d.seal().await;
-    write(&d, "update public.src set g = 2 where id = 1").await;
+    d.write("update public.src set g = 2 where id = 1").await;
     d.drain(r_batch, "a").await;
-    write(&d, "update public.src set g = 3 where id = 1").await;
+    d.write("update public.src set g = 3 where id = 1").await;
     d.stage_recomputes(SRC, &["1"]).await;
     let c_batch = d.seal().await;
     d.drain(c_batch, "b").await;
@@ -577,7 +570,8 @@ async fn nested_same_key(flavour: Flavour) {
         )
         .await
         .expect("create the application trigger");
-    write(&d, "update public.src set g = 1, v = 30 where id = 1").await;
+    d.write("update public.src set g = 1, v = 30 where id = 1")
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "a").await;
     assert_oracle(&mut d, flavour).await;
@@ -796,9 +790,9 @@ async fn tombstones(d: &Driver, flavour: Flavour) -> Vec<String> {
 /// the update applies to a fresh entry and brings key 1 back.
 async fn exp2_9_gc_waits_for_the_older_update(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    write(&d, "update public.src set v = 15 where id = 1").await;
+    d.write("update public.src set v = 15 where id = 1").await;
     let b1 = d.seal().await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let b2 = d.seal().await;
     d.drain(b2, "a").await;
     assert_eq!(tombstones(&d, flavour).await, ["(1)"]);
@@ -823,9 +817,9 @@ async fn exp2_9_gc_waits_for_the_older_update_one_to_one() {
 /// key 3 back.
 async fn a_new_keys_tombstone_waits_for_its_older_insert(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    write(&d, "insert into public.src values (3, 2, 5)").await;
+    d.write("insert into public.src values (3, 2, 5)").await;
     let b1 = d.seal().await;
-    write(&d, "delete from public.src where id = 3").await;
+    d.write("delete from public.src where id = 3").await;
     let b2 = d.seal().await;
     d.drain(b2, "a").await;
     assert_eq!(tombstones(&d, flavour).await, ["(3)"]);
@@ -873,11 +867,11 @@ async fn a_revived_keys_tombstone_is_stamped_afresh(flavour: Flavour) {
         (false, None),
         "a live entry no write made a tombstone has no stamp"
     );
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let b1 = d.seal().await;
     d.drain(b1, "a").await;
     assert_eq!(entry_stamp(&d, flavour, 1).await, (true, Some(b1)));
-    write(&d, "insert into public.src values (1, 2, 11)").await;
+    d.write("insert into public.src values (1, 2, 11)").await;
     let b2 = d.seal().await;
     d.drain(b2, "a").await;
     assert_eq!(
@@ -885,9 +879,9 @@ async fn a_revived_keys_tombstone_is_stamped_afresh(flavour: Flavour) {
         (false, Some(b1)),
         "the revival keeps the old stamp"
     );
-    write(&d, "update public.src set v = 12 where id = 1").await;
+    d.write("update public.src set v = 12 where id = 1").await;
     let b3 = d.seal().await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let b4 = d.seal().await;
     d.drain(b4, "a").await;
     assert_eq!(entry_stamp(&d, flavour, 1).await, (true, Some(b4)));
@@ -917,7 +911,7 @@ async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch(flavour: Flavour
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
     d.stage_recomputes(SRC, &["1"]).await;
     let b1 = d.seal().await;
-    write(&d, "update public.src set v = 15 where id = 1").await;
+    d.write("update public.src set v = 15 where id = 1").await;
     let b2 = d.seal().await;
     d.drain(b1, "r").await;
     assert_eq!(
@@ -925,7 +919,7 @@ async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch(flavour: Flavour
         (false, None),
         "a Re-derive that leaves the entry live stamps nothing"
     );
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let b3 = d.seal().await;
     d.drain(b3, "a").await;
     assert_eq!(entry_stamp(&d, flavour, 1).await, (true, Some(b3)));
@@ -951,9 +945,9 @@ async fn a_rederives_tombstone_outlives_the_changes_its_read_saw(flavour: Flavou
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
     d.stage_recomputes(SRC, &["1"]).await;
     let b1 = d.seal().await;
-    write(&d, "update public.src set v = 15 where id = 1").await;
+    d.write("update public.src set v = 15 where id = 1").await;
     let b2 = d.seal().await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     d.drain(b1, "r").await;
     let b3 = d.seal().await;
     let (tombstone, stamp) = entry_stamp(&d, flavour, 1).await;
@@ -979,12 +973,12 @@ async fn a_rederives_tombstone_outlives_the_changes_its_read_saw_one_to_one() {
 /// stays until the lagging batch has drained.
 async fn an_out_of_order_drain_holds_gc_back(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
-    write(&d, "delete from public.src where id = 3").await;
+    d.write("delete from public.src where id = 3").await;
     let b1 = d.seal().await;
     d.drain(b1, "a").await;
-    write(&d, "update public.src set v = 15 where id = 1").await;
+    d.write("update public.src set v = 15 where id = 1").await;
     let b2 = d.seal().await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let b3 = d.seal().await;
     d.drain(b3, "a").await;
     assert_eq!(tombstones(&d, flavour).await, ["(1)", "(3)"]);
@@ -1014,16 +1008,13 @@ async fn an_out_of_order_drain_holds_gc_back_one_to_one() {
 /// it, so key 3's tombstone must outlive the GC.
 async fn gc_under_a_concurrent_reinsert(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let b1 = d.seal().await;
     d.drain(b1, "a").await;
-    write(
-        &d,
-        "insert into public.src values (1, 1, 30); update public.src set v = 6 where id = 3",
-    )
-    .await;
+    d.write("insert into public.src values (1, 1, 30); update public.src set v = 6 where id = 3")
+        .await;
     let b2 = d.seal().await;
-    write(&d, "delete from public.src where id = 3").await;
+    d.write("delete from public.src where id = 3").await;
     let b3 = d.seal().await;
     d.drain(b3, "a").await;
     assert_eq!(tombstones(&d, flavour).await, ["(1)", "(3)"]);
@@ -1063,20 +1054,14 @@ async fn gc_under_a_concurrent_reinsert_one_to_one() {
 /// is a deadlock; A gives it back first, so B goes first and A follows.
 async fn an_entry_lost_to_the_gc_never_deadlocks(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20), (3, 2, 5)]).await;
-    write(&d, "delete from public.src where id = 2").await;
+    d.write("delete from public.src where id = 2").await;
     let b1 = d.seal().await;
     d.drain(b1, "a").await;
-    write(
-        &d,
-        "update public.src set v = 11 where id = 1; insert into public.src values (2, 1, 25)",
-    )
-    .await;
+    d.write("update public.src set v = 11 where id = 1; insert into public.src values (2, 1, 25)")
+        .await;
     let b2 = d.seal().await;
-    write(
-        &d,
-        "update public.src set v = 12 where id = 1; update public.src set v = 26 where id = 2",
-    )
-    .await;
+    d.write("update public.src set v = 12 where id = 1; update public.src set v = 26 where id = 2")
+        .await;
     let b3 = d.seal().await;
     assert_eq!(tombstones(&d, flavour).await, ["(2)"]);
 
@@ -1311,15 +1296,15 @@ async fn heap_only(d: &Driver, flavour: Flavour, id: i32) -> bool {
 /// left as it was.
 async fn a_live_entrys_apply_and_rederive_are_hot(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 20)]).await;
-    write(&d, "delete from public.src where id = 1").await;
+    d.write("delete from public.src where id = 1").await;
     let b1 = d.seal().await;
     d.drain(b1, "a").await;
-    write(&d, "insert into public.src values (1, 1, 11)").await;
+    d.write("insert into public.src values (1, 1, 11)").await;
     let b2 = d.seal().await;
     d.drain(b2, "a").await;
     assert_eq!(entry_stamp(&d, flavour, 1).await, (false, Some(b1)));
 
-    write(&d, "update public.src set v = 12 where id = 1").await;
+    d.write("update public.src set v = 12 where id = 1").await;
     let b3 = d.seal().await;
     d.drain(b3, "a").await;
     assert!(heap_only(&d, flavour, 1).await, "the Apply is HOT");
@@ -1346,7 +1331,7 @@ async fn a_live_entrys_apply_and_rederive_are_hot_one_to_one() {
 /// entry and count key 2 a second time beside A's.
 async fn a_rederive_queues_on_a_new_keys_applied_entry(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10)]).await;
-    write(&d, "insert into public.src values (2, 1, 5)").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
     let insert = d.seal().await;
     let mut a = d
         .drain_frozen(
@@ -1356,7 +1341,8 @@ async fn a_rederive_queues_on_a_new_keys_applied_entry(flavour: Flavour) {
         )
         .await;
     let frozen = a.reached(PausePoint::AfterEntryLock).await;
-    write(&d, "update public.src set g = 2, v = 50 where id = 2").await;
+    d.write("update public.src set g = 2, v = 50 where id = 2")
+        .await;
     d.stage_recomputes(SRC, &["2"]).await;
     let rederive = d.seal().await;
     let r = d.drain_frozen(rederive, "r", &[]).await;
@@ -1393,8 +1379,8 @@ async fn a_new_keys_apply_queues_on_a_rederives_placeholder(flavour: Flavour) {
         )
         .await;
     let frozen = r.reached(PausePoint::AfterPlaceholders).await;
-    write(&d, "insert into public.src values (2, 1, 5)").await;
-    write(&d, "update public.src set v = 50 where id = 2").await;
+    d.write("insert into public.src values (2, 1, 5)").await;
+    d.write("update public.src set v = 50 where id = 2").await;
     let writes = d.seal().await;
     let a = d.drain_frozen(writes, "a", &[]).await;
     d.wait_blocked_behind(frozen.backend_pid).await;

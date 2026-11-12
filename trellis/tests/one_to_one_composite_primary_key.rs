@@ -36,7 +36,6 @@ use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef};
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
-use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 
 /// Stages one CDC change for `order_lines` into the active ring segment,
 /// shaped the way capture stages it: `key` is the composite key joined with
@@ -70,37 +69,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?}: {e}"));
-}
-
-/// Seals and drains through the engine's own apply path until nothing is
-/// pending: the hand-driven stand-in for a running `Client`'s drain workers.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    // No live capture stages anything here, so there is no real staged
-    // watermark to hold apply back. A saturated one never does.
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "composite_pk_test",
-            1,
-            "trellis_composite_pk_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
 }
 
 /// The transform this file exercises: a 1-1 passthrough-plus-arithmetic
@@ -242,7 +210,7 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
     ] {
         stage_cdc(&raw, key, "insert", None, Some(image)).await;
     }
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     let snapshot = target_snapshot(&raw).await;
     assert_eq!(snapshot.len(), 4, "one target row per composite key");
@@ -269,7 +237,7 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
         Some(r#"{"order_id":"1","line_no":"1","price":"10.00","qty":"10"}"#),
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     let snapshot = target_snapshot(&raw).await;
     assert_eq!(snapshot.len(), 4, "the update must not add or remove a row");
@@ -301,7 +269,7 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
         None,
     )
     .await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    pipeline::settle(&db.pool, &mut raw).await;
 
     let remaining = target_snapshot(&raw).await;
     assert_eq!(remaining.len(), 3, "the delete must remove exactly one row");
