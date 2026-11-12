@@ -155,15 +155,7 @@ async fn build_afresh(
         &[&id],
     )
     .await?;
-    txn.execute(
-        "update transform_definitions \
-         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
-        &[
-            &crate::defs::model::StoredStatus::WaitingToBackfill.as_str(),
-            &id,
-        ],
-    )
-    .await?;
+    super::lifecycle::start_over(txn, id).await?;
     crate::instance_log::info!(
         definition_id = id,
         to = %crate::defs::model::StoredStatus::WaitingToBackfill.as_str(),

@@ -685,15 +685,7 @@ async fn start(
                 .await?
                 .get(0)
     };
-    txn.execute(
-        "update transform_definitions set status = $2, build = $3 where id = $1",
-        &[
-            &definition.id,
-            &StoredStatus::Backfilling.as_str(),
-            &BUILD_REDERIVE,
-        ],
-    )
-    .await?;
+    crate::defs::lifecycle::start_rederive(&txn, definition.id).await?;
     // The caller found any field awaiting capture ready, so it
     // applies from this commit, and the build's chunks write it.
     let dependents = release_awaiting_capture(&txn, &definition.def.target, None).await?;
@@ -739,18 +731,16 @@ pub(crate) async fn rebuild_candidates(
 ) -> Result<Vec<i64>, tokio_postgres::Error> {
     Ok(client
         .query(
-            "select d.id from transform_definitions d \
-             where (d.source_table = any($1) or d.join_table = any($1) \
-                    or exists (select from definition_join_tables j \
-                               where j.transform_id = d.id and j.table_name = any($1))) \
-               and (d.status = $2 or (d.status = $3 and d.build = $4)) \
-             order by d.id",
-            &[
-                &tables,
-                &StoredStatus::Live.as_str(),
-                &StoredStatus::Backfilling.as_str(),
-                &BUILD_REDERIVE,
-            ],
+            &format!(
+                "select d.id from transform_definitions d \
+                 where (d.source_table = any($1) or d.join_table = any($1) \
+                        or exists (select from definition_join_tables j \
+                                   where j.transform_id = d.id and j.table_name = any($1))) \
+                   and {} \
+                 order by d.id",
+                crate::defs::model::applying_sql("d")
+            ),
+            &[&tables],
         )
         .await?
         .into_iter()
@@ -768,15 +758,12 @@ pub(crate) async fn rebuildable(
 ) -> Result<Vec<i64>, tokio_postgres::Error> {
     Ok(client
         .query(
-            "select id from transform_definitions \
-             where id = any($1) and (status = $2 or (status = $3 and build = $4)) \
-             order by id",
-            &[
-                &ids,
-                &StoredStatus::Live.as_str(),
-                &StoredStatus::Backfilling.as_str(),
-                &BUILD_REDERIVE,
-            ],
+            &format!(
+                "select id from transform_definitions \
+                 where id = any($1) and {} order by id",
+                crate::defs::model::APPLYING_SQL
+            ),
+            &[&ids],
         )
         .await?
         .into_iter()
@@ -940,11 +927,7 @@ pub(crate) async fn start_field_build(
     fields: &[String],
 ) -> Result<(), tokio_postgres::Error> {
     if status == StoredStatus::Live {
-        txn.execute(
-            "update transform_definitions set status = $2, build = $3 where id = $1",
-            &[&id, &StoredStatus::Backfilling.as_str(), &BUILD_REDERIVE],
-        )
-        .await?;
+        crate::defs::lifecycle::start_rederive(txn, id).await?;
     }
     txn.execute(
         "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid, fields) \

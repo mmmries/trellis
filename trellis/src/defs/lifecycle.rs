@@ -63,7 +63,7 @@
 //! a process that drops a transform needs no privileges on the source
 //! tables.
 
-use tokio_postgres::Transaction;
+use tokio_postgres::{GenericClient, Transaction};
 
 use super::catalog::CatalogError;
 use super::model::{EdgeKind, StoredStatus};
@@ -458,19 +458,64 @@ pub(crate) async fn pause(
     if add {
         pause_message::add_reason(txn, id, reason.reason()).await?;
     }
+    Ok(pause_unless_frozen(txn, id).await?)
+}
+
+/// Moves definition `id` to `paused` unless it's frozen (a quarantined one
+/// stays quarantined), in the caller's transaction. Returns whether it did.
+pub(crate) async fn pause_unless_frozen(
+    txn: &impl GenericClient,
+    id: i64,
+) -> Result<bool, tokio_postgres::Error> {
     let paused = txn
         .execute(
-            "update transform_definitions set status = $2 \
-             where id = $1 and status = any($3)",
+            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
             &[
                 &id,
                 &StoredStatus::Paused.as_str(),
                 &StoredStatus::dispatchable(),
             ],
         )
-        .await?
-        == 1;
-    Ok(paused)
+        .await?;
+    Ok(paused == 1)
+}
+
+/// Moves definition `id` to `backfilling` under a Re-derive build, which
+/// applies from this commit (`super::model::APPLYING_SQL`). The caller holds
+/// its row and has checked the status it moves from.
+pub(crate) async fn start_rederive(
+    txn: &impl GenericClient,
+    id: i64,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "update transform_definitions set status = $2, build = $3 where id = $1",
+        &[
+            &id,
+            &StoredStatus::Backfilling.as_str(),
+            &crate::staging::build::BUILD_REDERIVE,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Starts definition `id` over: `waiting_to_backfill`, so the staging
+/// worker starts its build, with no build (one it was under is over) and a
+/// new fuse epoch (`fuse_rearmed_at = now()`) that a stale chunk or
+/// eviction checks against. One statement, so the epoch and the status
+/// change together. The caller holds its row. A dump's reset
+/// (`crate::dump`) also clears `build_seg`; this keeps it.
+pub(crate) async fn start_over(
+    txn: &impl GenericClient,
+    id: i64,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "update transform_definitions \
+         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
+        &[&StoredStatus::WaitingToBackfill.as_str(), &id],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Inserts definition `id`'s `capture_failures` record, if it exists and

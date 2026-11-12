@@ -719,14 +719,11 @@ async fn enqueue(
     let txn = client.transaction().await?;
     let applies = txn
         .query_opt(
-            "select status from transform_definitions \
-             where id = $1 and (status = $2 or (status = $3 and build = $4)) for update",
-            &[
-                &definition_id,
-                &StoredStatus::Live.as_str(),
-                &StoredStatus::Backfilling.as_str(),
-                &build::BUILD_REDERIVE,
-            ],
+            &format!(
+                "select status from transform_definitions where id = $1 and {APPLYING_SQL} \
+                 for update"
+            ),
+            &[&definition_id],
         )
         .await?;
     let Some(row) = applies else {
@@ -755,15 +752,7 @@ async fn enqueue(
     .await?;
     let flipped = status == StoredStatus::Live.as_str();
     if flipped {
-        txn.execute(
-            "update transform_definitions set status = $2, build = $3 where id = $1",
-            &[
-                &definition_id,
-                &StoredStatus::Backfilling.as_str(),
-                &build::BUILD_REDERIVE,
-            ],
-        )
-        .await?;
+        crate::defs::lifecycle::start_rederive(&*txn, definition_id).await?;
     }
     txn.commit().await?;
     if flipped {
