@@ -1865,6 +1865,8 @@ pub(crate) async fn target_column_types(
 
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod plan_shapes;
 
 #[cfg(test)]
 mod tests {

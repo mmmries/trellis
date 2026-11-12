@@ -3582,8 +3582,11 @@ impl GroupTargetPlan {
     /// cells against the update's rows (a cell with no hidden row has a
     /// `NULL` `__hc`, which matches none). It is the bare `not exists`: an
     /// `or` beside it keeps it a subplan, which rescans the update's rows
-    /// once per cell when they outgrow memory.
-    fn join_build_sql(&self, grouped: &str, cells: &str, deltas: &str) -> [String; 2] {
+    /// once per cell when they outgrow memory. They are inserted in group
+    /// order, so the hidden table's group index fills in order: in hash
+    /// order, each insert dirties a random index page, written again as a
+    /// full-page image after every checkpoint.
+    pub(super) fn join_build_sql(&self, grouped: &str, cells: &str, deltas: &str) -> [String; 2] {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let held = self
@@ -3638,6 +3641,7 @@ impl GroupTargetPlan {
                  insert into {hidden} ({insert_cols}) \
                  select {insert_values} from {cells} r, snap \
                  where not exists (select from up where up.__hc = r.__hc) \
+                 order by {r_cols} \
              ), \
              d as (insert into {deltas} ({delta_cols}) select {delta_values} from {cells} r) \
              select count(*) from {cells}",
@@ -3645,6 +3649,7 @@ impl GroupTargetPlan {
             sets = (self.shape)
                 .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")))
                 .join(", "),
+            r_cols = insert_values[..cols.len()].join(", "),
             insert_cols = insert_cols.join(", "),
             insert_values = insert_values.join(", "),
             delta_cols = delta_cols.join(", "),
