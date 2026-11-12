@@ -584,7 +584,7 @@ async fn refusal(
         Rekey::Unbacked { declared } => Some(CatalogError::Ddl(DdlError::KeyNotBacked {
             table: table.to_string(),
             indexes: unique_indexes(client, table).await?,
-            partitioned: super::source_key::is_partitioned(client, table).await?,
+            partitioned: super::partition_tree::is_partitioned_root(client, table).await?,
             key: declared,
         })),
     })
