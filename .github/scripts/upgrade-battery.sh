@@ -1306,6 +1306,11 @@ if want mixed; then
     done
     if [ "$taken" -eq 1 ] && run_alive new-mixedemb; then
       record PASS mixed "once $old_tag stopped, the embedded candidate worker ran the migrations itself, with no migrate step, and took over (its live worker_registry row carries version $cand_ver)"
+      # ADR-0023 rule 3: it ran the takeover work too, recorded with it.
+      att=$(scalar "$port" mixedemb "select coalesce(attached_version, 'none') from trellis.trellis_instance")
+      [ "$att" = "$cand_ver" ] &&
+        record PASS mixed "the embedded candidate recorded the takeover work as version $cand_ver's" ||
+        record FAIL mixed "after the embedded candidate took over, trellis_instance.attached_version is $att, not $cand_ver"
     else
       record FAIL mixed "the embedded candidate worker did not migrate and take over within 60 s of $old_tag stopping (process $(run_alive new-mixedemb && echo running || echo exited), log: $(tail -c 300 "$logs/run-new-mixedemb.log" | tr '\n' ' '))"
     fi

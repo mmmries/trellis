@@ -54,17 +54,29 @@ stage, drain or change state side by side.
    marker). With migrations pending and nothing live, a background process
    migrates: its pass runs `migrate`, the ordinary one (the identity and
    attach checks, the catalog floor, the refusal of a changed migration or a
-   gap, the takeover work), and takes over in the same pass. `migrate` takes
+   gap, the takeover work), and takes over in the same pass. The takeover
+   work (the grammar-version pauses, the recorded-key backfill, the
+   numeric-partials conversion, a queued restore) runs once per binary
+   version, whether or not migrations are pending: `migrate` records its
+   version on the marker (`attached_version`) in the work's own transaction,
+   so a kill leaves all of it or none, and a restore queue is its own marker
+   until it is restored. A background process that would take over with
+   nothing pending runs `migrate` first in the same way when the marker
+   records another version or a restore is queued. With nothing pending,
+   `migrate` runs no migration runner, so a role that can only read and write
+   Trellis's tables runs the work that writes rows, and stands by as below for
+   work that alters tables (a conversion, a restore). `migrate` takes
    the handover lock exclusive and decides again under it, so it never runs
    beside a process that went live since the pass decided, and two processes
-   that find the migrations pending at once run them one after the other: the
-   second finds nothing left. When `migrate` refuses (the process's role
+   that find the migrations or the takeover work due at once run them one
+   after the other: the second finds nothing left. When `migrate` refuses (the process's role
    can't alter Trellis's tables, the history doesn't fit, the floor), the
    process stands by, says why, and tries again a minute later (at the next
    standby poll when the refusal was a fault, such as a lost connection). An
    explicit `migrate` still works, before or instead of that (`trellis run`
    migrates before it starts its pipeline, a deploy step, a release task): it
-   is idempotent, and leaves a background process nothing pending. A
+   is idempotent, and leaves a background process of its version nothing to
+   run. A
    define-only handle runs no background process, so nothing migrates for it
    but its own `migrate`.
 4. **Standby.** While another version is live, or this binary's migrations are
@@ -104,7 +116,9 @@ stage, drain or change state side by side.
    refused, why; a read that can't read the catalog until they run refuses
    with them (`version_handover`). A background process logs when it starts
    standing by, why, and when it takes over, naming the migrations it ran
-   first. A process killed without a clean shutdown leaves its row
+   first, or saying it ran the takeover work. `migrations_pending` also
+   carries a refusal of the takeover work alone, with no migrations named. A
+   process killed without a clean shutdown leaves its row
    live for up to the reclaim TTL, which delays the takeover by as much; the
    message says so.
 8. **Symmetric.** The rules hold for a rollback between two releases that both
@@ -124,9 +138,9 @@ Start the new version: its processes stand by, its state-changing calls refuse,
 and capture never stops (the triggers keep staging changes in the
 application's own transactions). Stop the old version: within one standby poll
 of its clean shutdown (or the reclaim TTL, for a process killed without one),
-the new version takes over. Where its migrations are pending, one of its
-background processes runs them first, in the same pass; no deploy step has
-to.
+the new version takes over. One of its background processes first runs its
+pending migrations, if any, and its takeover work, in the same pass; no
+deploy step has to.
 
 ## Rejected
 

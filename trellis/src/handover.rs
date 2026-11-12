@@ -117,9 +117,11 @@ pub(crate) enum StandBy {
     /// any process is).
     OtherVersion(OtherVersionLive),
     /// Nothing is live, but the instance hasn't been migrated to this
-    /// binary's migrations yet. What [`decide`] says; the background process
-    /// then runs `migrate` in the same pass and takes over, and stands by
-    /// only when `migrate` refuses ([`StandBy::CannotMigrate`]).
+    /// binary's migrations yet (what [`decide`] says), or this binary hasn't
+    /// run its takeover work (`crate::migrate::takeover_work_due`). The
+    /// background process then runs `migrate` in the same pass and takes
+    /// over, and stands by only when `migrate` refuses
+    /// ([`StandBy::CannotMigrate`]).
     MigrationsPending,
     /// This binary's migrations are pending, nothing else is live, and the
     /// process's `migrate` refused: it can't run them (its role lacks the
@@ -305,7 +307,8 @@ impl std::error::Error for OtherVersionLive {}
 pub struct MigrationsPending {
     /// This binary's version.
     pub this_version: String,
-    /// The pending migrations, by name (`V9__worker_versions`), oldest first.
+    /// The pending migrations, by name (`V9__worker_versions`), oldest first:
+    /// none when only the takeover work is.
     pub migrations: Vec<String>,
     /// Why this handle's background process couldn't run them at its last
     /// try, with the remedy: `None` while it hasn't tried (a process of
@@ -315,13 +318,16 @@ pub struct MigrationsPending {
 
 impl fmt::Display for MigrationsPending {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "this binary's migrations haven't run on this instance ({}); this binary is \
-             version {}",
-            self.migrations.join(", "),
-            self.this_version
-        )?;
+        if self.migrations.is_empty() {
+            write!(f, "this binary's takeover work hasn't run on this instance")?;
+        } else {
+            let names = self.migrations.join(", ");
+            write!(
+                f,
+                "this binary's migrations haven't run on this instance ({names})"
+            )?;
+        }
+        write!(f, "; this binary is version {}", self.this_version)?;
         match &self.cannot_run {
             Some(reason) => write!(
                 f,

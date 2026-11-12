@@ -551,16 +551,9 @@ async fn a_process_that_goes_live_before_the_migration_holds_it_back() {
     assert!(log.contains("trellis-old-1-00"), "{log}");
 }
 
-/// Rule 3's refusals: a role that can read and write Trellis's tables but
-/// not alter them can't run the migrations, so its background process
-/// stands by and says why, in its log and in `status()`, and tries again
-/// every pass; once another role runs `migrate`, it takes over.
-#[tokio::test]
-async fn a_role_that_cannot_migrate_stands_by_and_says_so() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let raw = raw(&db).await;
-    rewind_to_v8(&raw).await;
+/// A role that can read and write Trellis's tables but not create or alter
+/// them, as its config, and the grants that give it the tables there now.
+async fn dml_only_role(db: &testkit::TestDatabase, raw: &Client) -> (Config, String) {
     let role = format!("handover_dml_{}", std::process::id());
     let grants = format!(
         "grant usage on schema {schema} to {role}; \
@@ -572,8 +565,22 @@ async fn a_role_that_cannot_migrate_stands_by_and_says_so() {
         .await
         .expect("a role with DML rights only");
     assert!(db.dsn().contains("user=postgres"), "{}", db.dsn());
-    let as_role = Config::from_dsn(db.dsn().replace("user=postgres", &format!("user={role}")))
+    let config = Config::from_dsn(db.dsn().replace("user=postgres", &format!("user={role}")))
         .expect("config");
+    (config, grants)
+}
+
+/// Rule 3's refusals: a role that can read and write Trellis's tables but
+/// not alter them can't run the migrations, so its background process
+/// stands by and says why, in its log and in `status()`, and tries again
+/// every pass; once another role runs `migrate`, it takes over.
+#[tokio::test]
+async fn a_role_that_cannot_migrate_stands_by_and_says_so() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    let (as_role, grants) = dml_only_role(&db, &raw).await;
 
     let worker = Trellis::connect(
         as_role.clone(),
@@ -693,7 +700,8 @@ async fn a_define_only_handle_never_migrates() {
 
 /// While another version is live and nothing is pending, `migrate` changes
 /// nothing and succeeds, so a deploy's migration step that has nothing to
-/// migrate doesn't fail.
+/// migrate doesn't fail. It doesn't record its version as the one that ran
+/// the takeover work, and a marker naming another version doesn't refuse it.
 #[tokio::test]
 async fn migrate_with_nothing_pending_beside_another_version_changes_nothing() {
     let cluster = TestCluster::start();
@@ -705,6 +713,12 @@ async fn migrate_with_nothing_pending_beside_another_version_changes_nothing() {
     )
     .await
     .expect("a live process of another version");
+    raw.execute(
+        "update trellis_instance set attached_version = $1",
+        &[&OTHER],
+    )
+    .await
+    .expect("the other version ran the takeover work");
     let trellis = Trellis::connect(config(&db), TrellisOptions::default())
         .await
         .expect("connect");
@@ -712,6 +726,7 @@ async fn migrate_with_nothing_pending_beside_another_version_changes_nothing() {
         .migrate()
         .await
         .expect("nothing to migrate and nothing to change");
+    assert_eq!(attached(&raw).await.as_deref(), Some(OTHER));
     refused(trellis.apply("PAUSE TRANSFORM nothing").await);
     trellis.shutdown().await.expect("shutdown");
 }
@@ -1081,4 +1096,226 @@ async fn a_handle_below_the_catalog_floor_stands_by_and_refuses_until_it_meets_i
 
     worker.shutdown().await.expect("shutdown");
     definer.shutdown().await.expect("shutdown");
+}
+
+/// The version the marker records as the last to run the takeover work.
+async fn attached(raw: &Client) -> Option<String> {
+    raw.query_one("select attached_version from trellis_instance", &[])
+        .await
+        .expect("the marker")
+        .get(0)
+}
+
+/// Defines `t` over `public.s`, then stores text for it that an earlier
+/// release accepted and this one refuses, which the takeover work pauses.
+async fn define_refused_text(db: &testkit::TestDatabase, raw: &Client) {
+    raw.batch_execute("create table public.s (id bigint primary key, a numeric)")
+        .await
+        .expect("source");
+    let definer = Trellis::connect(config(db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    definer
+        .apply("TRANSFORM t FROM s SELECT a + 1 AS x")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shutdown");
+    raw.execute(
+        "update transform_definitions set definition_text = 'TRANSFORM t FROM s SELECT a+1AS x'",
+        &[],
+    )
+    .await
+    .expect("text this release refuses");
+}
+
+/// Whether `t` is paused.
+async fn t_paused(raw: &Client) -> bool {
+    raw.query_one(
+        "select status = 'paused' from transform_definitions where target_table = 'public.t'",
+        &[],
+    )
+    .await
+    .expect("t")
+    .get(0)
+}
+
+/// A schema dump's restore queue with nothing in it; restoring it drops it.
+async fn queue_restore(raw: &Client) {
+    raw.batch_execute(
+        "create table restore_queue (ordinal integer primary key, source_table text not null, \
+         target_table text not null, join_table text, definition_text text not null, \
+         grammar_version integer not null, floor_version text not null)",
+    )
+    .await
+    .expect("a restore queue");
+}
+
+async fn restore_queued(raw: &Client) -> bool {
+    raw.query_one("select to_regclass('restore_queue') is not null", &[])
+        .await
+        .expect("to_regclass")
+        .get(0)
+}
+
+const TOOK_OVER: &str = "no other Trellis version is live any more; taking over";
+const RAN_THE_WORK: &str = "ran this binary's takeover work; taking over";
+
+/// Rules 3 and 7: the takeover work runs once per binary version, and the
+/// marker records it in the work's own transaction. A kill after the
+/// migrations and before the work leaves the marker unset, so the next pass
+/// runs the work (pausing text this release refuses) and takes over; a
+/// restart of the same version runs none; a queued restore is due whatever
+/// the marker says.
+#[tokio::test]
+async fn a_pass_runs_the_takeover_work_this_version_has_not_then_takes_over() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    define_refused_text(&db, &raw).await;
+    raw.execute("update trellis_instance set attached_version = null", &[])
+        .await
+        .expect("killed before the takeover work committed");
+    assert!(!t_paused(&raw).await);
+
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    assert_eq!(pass.log.as_deref(), Some(RAN_THE_WORK));
+    assert!(t_paused(&raw).await, "the work paused the refused text");
+    assert_eq!(
+        attached(&raw).await.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over, "{pass:?}");
+    assert_eq!(
+        pass.log.as_deref(),
+        Some(TOOK_OVER),
+        "a restart runs no work"
+    );
+
+    queue_restore(&raw).await;
+    let pass = handover_pass_as(&pool, &config(&db), "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over, "{pass:?}");
+    assert_eq!(pass.log.as_deref(), Some(RAN_THE_WORK));
+    assert!(!restore_queued(&raw).await, "the queue was restored");
+}
+
+/// Rule 3 for a release with no new migration: a process of another version
+/// with nothing pending runs the takeover work and records its version before
+/// it takes over.
+#[tokio::test]
+async fn a_version_with_no_new_migration_runs_the_takeover_work() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    define_refused_text(&db, &raw).await;
+    let other = config(&db).with_binary_version(OTHER);
+    let pool = trellis::pool::Pool::new(&other).expect("pool");
+    let pass = handover_pass_as(&pool, &other, "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over && pass.migrated.is_empty(), "{pass:?}");
+    assert_eq!(pass.log.as_deref(), Some(RAN_THE_WORK));
+    assert!(t_paused(&raw).await);
+    assert_eq!(attached(&raw).await.as_deref(), Some(OTHER));
+}
+
+/// Rule 3 with nothing pending runs no migration runner, so a role that can
+/// read and write Trellis's tables but not create them takes over when the
+/// marker names its version, and runs the work that writes only rows. Work it
+/// can't finish commits nothing, the marker included; work that needs more (a
+/// restore) stands it by, saying why in its log and `status()`, backing off.
+#[tokio::test]
+async fn a_role_that_cannot_migrate_runs_the_takeover_work_it_can() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    define_refused_text(&db, &raw).await;
+    let (as_role, grants) = dml_only_role(&db, &raw).await;
+    let pool = trellis::pool::Pool::new(&as_role).expect("pool");
+    let pass = handover_pass_as(&pool, &as_role, "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over, "{pass:?}");
+    assert_eq!(pass.log.as_deref(), Some(TOOK_OVER), "the marker matches");
+
+    let role = format!("handover_dml_{}", std::process::id());
+    raw.batch_execute(&format!(
+        "update trellis_instance set attached_version = null; \
+         revoke update on transform_definitions from {role}"
+    ))
+    .await
+    .expect("work the role can't finish");
+    let pass = handover_pass_as(&pool, &as_role, "probe")
+        .await
+        .expect("pass");
+    assert!(!pass.took_over, "{pass:?}");
+    assert!(!t_paused(&raw).await);
+    assert_eq!(attached(&raw).await, None, "nothing committed");
+
+    raw.batch_execute(&grants).await.expect("grants");
+    let pass = handover_pass_as(&pool, &as_role, "probe")
+        .await
+        .expect("pass");
+    assert!(pass.took_over, "{pass:?}");
+    assert_eq!(pass.log.as_deref(), Some(RAN_THE_WORK));
+    assert!(t_paused(&raw).await);
+    assert_eq!(
+        attached(&raw).await.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    queue_restore(&raw).await;
+    raw.batch_execute(&grants)
+        .await
+        .expect("grants on the queue");
+    let pass = handover_pass_as(&pool, &as_role, "probe")
+        .await
+        .expect("a refused restore is a standby, not an error");
+    assert!(!pass.took_over, "{pass:?}");
+    assert!(
+        pass.retry_in
+            .is_some_and(|wait| wait > std::time::Duration::from_secs(30)),
+        "{pass:?}"
+    );
+    let log = pass.log.expect("the standby is logged");
+    assert!(log.contains("this role cannot run them"), "{log}");
+    assert!(restore_queued(&raw).await);
+    let worker = Trellis::connect(
+        as_role,
+        TrellisOptions {
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a standby connects without error");
+    let pending = worker
+        .status("t")
+        .await
+        .expect("status")
+        .expect("defined")
+        .migrations_pending
+        .expect("status says why it stands by");
+    assert!(pending.migrations.is_empty(), "{pending:?}");
+    let reason = pending.cannot_run.expect("its pass tried");
+    assert!(reason.contains("this role cannot run them"), "{reason}");
+    // With no migration pending, the catalog is current: a read that fails
+    // fails with its own error, not as a version handover.
+    raw.batch_execute(&format!(
+        "revoke select on transform_definitions from {role}"
+    ))
+    .await
+    .expect("a read the role can't make");
+    let err = worker.definitions().await.expect_err("can't read");
+    assert_ne!(err.code(), ErrorCode::VersionHandover, "{err}");
+    worker.shutdown().await.expect("shutdown");
 }
