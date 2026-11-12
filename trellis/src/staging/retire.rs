@@ -391,6 +391,13 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
     Ok(collected)
 }
 
+/// Research prototype (#1917 X3), test-only: set, the zero-group pass
+/// collects a plain aggregate's zero groups under a build too, as it did
+/// before the prototype, so a test can show the skip is needed.
+#[cfg(any(test, feature = "test-util"))]
+pub static X3_GC_IGNORES_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Every table holding zero groups: each group-basis aggregate's hidden
 /// table (`super::group_basis::hidden_table_name`) and each `JOIN`'s `P`,
 /// `M` and `T` (`crate::defs::join::HiddenTable`), schema-qualified and
@@ -413,7 +420,8 @@ fn hidden_tables_sql() -> String {
                           and not a.attisdropped), \
                 exists (select 1 from pg_catalog.pg_attribute a \
                         where a.attrelid = c.oid and a.attname = '__xbasis' \
-                          and not a.attisdropped) \
+                          and not a.attisdropped), \
+                d.id, c.relname = {agg} \
          from transform_definitions d \
          join pg_catalog.pg_class c on c.relname in ({agg}, {p}, {m}, {t}) \
           and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
@@ -450,14 +458,24 @@ fn hidden_tables_sql() -> String {
 /// under its write, which then inserts the cell afresh with its basis
 /// (`super::group_basis`'s `join_build_sql`).
 async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, StagingError> {
-    let tables: Vec<(String, Option<String>, bool, bool)> = client
+    #[allow(clippy::type_complexity)]
+    let tables: Vec<(String, Option<String>, bool, bool, i64, bool)> = client
         .query(&hidden_tables_sql(), &[])
         .await?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .map(|row| {
+            (
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            )
+        })
         .collect();
     let mut collected = 0;
-    for (hidden, group_cols, basis, xbasis) in &tables {
+    for (hidden, group_cols, basis, xbasis, definition_id, aggregate) in &tables {
         let Some(group_cols) = group_cols else {
             continue;
         };
@@ -474,6 +492,22 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
                     break;
                 }
                 return Err(err.into());
+            }
+            // Research prototype (#1917 X3): a plain aggregate's fresh build
+            // inserts each absent group from its snapshot, which is right
+            // only if no hidden row a page applied to is removed between
+            // that snapshot and its commit. So, as for a ledger, a
+            // definition under a build is skipped ([`NOT_BUILDING_SQL`]).
+            #[cfg(any(test, feature = "test-util"))]
+            let aggregate =
+                &(*aggregate && !X3_GC_IGNORES_BUILD.load(std::sync::atomic::Ordering::Relaxed));
+            if *aggregate {
+                match txn.query_opt(NOT_BUILDING_SQL, &[definition_id]).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) if is_lock_not_available(&err) => break,
+                    Err(err) => return Err(err.into()),
+                }
             }
             // Planted bug: collect every zero group, whatever its
             // basis and stamp. See `crate::plant`.
