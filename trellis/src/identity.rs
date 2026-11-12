@@ -81,13 +81,17 @@ pub(crate) async fn prepare_attach(
     let existed_before = schema_exists(client, schema).await?;
 
     // Fully qualified (not relying on `search_path`) because the schema
-    // itself may not exist yet on a brand-new database.
-    client
-        .batch_execute(&format!(
-            "create schema if not exists {}",
-            quote_ident(schema)
-        ))
-        .await?;
+    // itself may not exist yet on a brand-new database. Only when it doesn't:
+    // `create schema if not exists` needs `CREATE` on the database even then,
+    // and a role without it still runs the takeover work (ADR-0023, rule 3).
+    if !existed_before {
+        client
+            .batch_execute(&format!(
+                "create schema if not exists {}",
+                quote_ident(schema)
+            ))
+            .await?;
+    }
 
     match read_marker(client, schema).await? {
         Some(marker) => {
@@ -152,21 +156,26 @@ pub(crate) async fn prepare_attach(
 ///   that covers every case.)
 /// - **A changed target schema.** The target schema is configuration that can
 ///   change between deploys, so the marker's `target_schema` follows the
-///   config; it is the only column the update touches, and it is skipped
-///   when the value already matches.
+///   config; the update is skipped when it and `attached_version` match.
+///
+/// It also records `attached_version`, the binary version that ran the
+/// takeover work: the caller runs it in the work's own transaction (ADR-0023,
+/// rule 3).
 pub(crate) async fn seed_marker(
-    client: &mut tokio_postgres::Client,
+    client: &impl tokio_postgres::GenericClient,
     config: &Config,
 ) -> Result<(), Error> {
     let schema = config.schema();
     let target_schema = config.target_schema();
     client
         .execute(
-            "insert into trellis_instance (schema_name, target_schema) \
-             values ($1, $2) \
-             on conflict (singleton) do update set target_schema = excluded.target_schema \
-             where trellis_instance.target_schema is distinct from excluded.target_schema",
-            &[&schema, &target_schema],
+            "insert into trellis_instance (schema_name, target_schema, attached_version) \
+             values ($1, $2, $3) \
+             on conflict (singleton) do update set target_schema = excluded.target_schema, \
+               attached_version = excluded.attached_version \
+             where (trellis_instance.target_schema, trellis_instance.attached_version) \
+               is distinct from (excluded.target_schema, excluded.attached_version)",
+            &[&schema, &target_schema, &config.binary_version()],
         )
         .await?;
     Ok(())

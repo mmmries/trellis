@@ -192,19 +192,17 @@ values, I measured 51 MB in all, against 15 GB for one materialized row per fact
 
 ### A writer locks `J[k]` `FOR UPDATE`, reads the other side after the lock, and writes `T` in its own transaction
 
+How every writer locks and writes is defined in
+[ADR-0028](0028-locking-and-writing.md). A JOIN transform's writers follow it
+with `J` as the lock that stands for a join key:
+
 - **JR1, lock order.** Every writer of `P` or `M` (a page, a build step, a cell
   recompute, a leaf correction) locks `J[k]` `FOR UPDATE` for every non-null
   key it touches; a key with a `NULL` in any column joins nothing and takes
-  no `J` row and no lock. A writer creates the `J` rows its keys lack with
-  one sorted `insert … on conflict do nothing`, then locks all of them with
-  one sorted `select … for update`. Every writer takes its locks in one
-  order: build-chunk rows, the pair's truncate lock row, `J` rows sorted by
-  key (by the tuple of join columns), `P` and `M` cells sorted, then `T`
-  groups sorted, each class in one sorted statement.
+  no `J` row and no lock. It creates the `J` rows its keys lack and takes its
+  locks in ADR-0028's order (I5), each class in one sorted statement.
 - **JR2, read after the lock.** A writer reads the other side's partials and
-  `J.matches` only in statements after its `J` lock statement. Pages and builds
-  run under `READ COMMITTED`, so each of those statements sees every writer the
-  lock waited for.
+  `J.matches` only in statements after its `J` lock statement (ADR-0028, I1).
 - **JR3, one transaction.** An `a`-side writer adds `ΔP ⊗ M`, plus `ΔP ⊗ U`
   where `matches = 0`, to `T` in the same transaction as its change to `P`. A
   `b`-side writer adds `P ⊗ ΔM`, and when `matches` crosses zero moves the key's
@@ -245,9 +243,11 @@ terms. With `FOR UPDATE` on both sides every key's mode is the same, so the rule
 holds by construction. A page that locked a key `FOR SHARE` and later upgraded it
 deadlocked against a page doing the same.
 
-The strict form of the `T` write is kept: a nonzero delta for a `T` group the
-writer didn't lock is an error, not a silent insert, so a gap in the computed
-lock set fails loudly instead of losing a delta.
+The strict form of the `T` write is kept for pages: a nonzero delta for a `T`
+group the writer didn't lock is an error, not a silent insert, so a gap in the
+computed lock set fails loudly instead of losing a delta. A build locks and
+writes `T`'s groups in one sorted upsert, its lock set and its write set the
+same by construction ([ADR-0028](0028-locking-and-writing.md), W3).
 
 ### `TRUNCATE` of either side excludes writers of both, behind a two-sided barrier
 

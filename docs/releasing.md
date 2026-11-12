@@ -269,7 +269,8 @@ does not build, is a finding. `bundle install` may add a `bundler` line to
 **Refusals the script does not build (the `grammar` step).** The script constructs the
 refusals it can build with the old CLI. Check the rest by reading the
 candidate's list of refusals against what the old build accepted (the
-"Supported sources and targets" section of [transforms](transforms.md), the
+refusal tables of [transforms](transforms.md#refusals) and
+[expressions](expressions.md#refusals), the
 changes since the predecessor's tag), and for each one the old build accepts,
 define it under the old CLI, upgrade, and confirm the outcome: text the
 candidate can't parse pauses with a reason that names the remedy, and the remedy
@@ -289,7 +290,8 @@ build and expects the candidate to migrate and converge. It then does the
 same with an embedded application's worker as the candidate (the library
 probe's `worker`: a handle with the staging worker and drain threads that
 never calls `migrate`) on a database of its own, so nothing but the worker's
-handover pass can run the migrations. A candidate that runs beside the old
+handover pass can run the migrations, and expects the marker to record that the
+worker ran the takeover work. A candidate that runs beside the old
 one, exits, pauses definitions, or (the worker) doesn't migrate once the old
 one stops fails the step, and the finding is filed.
 
@@ -328,7 +330,7 @@ For each release, the notes carry:
   them.
 - **Definitions that pause because the new version keys a table
   differently,** each with its remedy
-  ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
+  ([the key entry](transforms.md#the-key-a-transform-keys-each-table-by)).
 - **Changes an upgrade makes that users don't see,** so a question about them
   has an answer: a build restarted, hidden tables re-laid out, a definition
   rebuilt at the takeover.

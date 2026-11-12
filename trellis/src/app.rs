@@ -1120,11 +1120,15 @@ impl Trellis {
                     status.migrations_pending = pending;
                     status
                 })),
-                (Err(error), Some(pending)) => Err(TrellisError::MigrationsPending {
-                    pending,
-                    error: Box::new(error),
-                }),
-                (Err(error), None) => Err(error),
+                // Only pending migrations explain a catalog it can't read:
+                // with none, it is current, and the error is the read's own.
+                (Err(error), Some(pending)) if !pending.migrations.is_empty() => {
+                    Err(TrellisError::MigrationsPending {
+                        pending,
+                        error: Box::new(error),
+                    })
+                }
+                (Err(error), _) => Err(error),
             }
         })
         .await
@@ -1138,13 +1142,16 @@ impl Trellis {
         client: &tokio_postgres::Client,
     ) -> Result<Option<crate::handover::MigrationsPending>, TrellisError> {
         let migrations = crate::migrate::pending_migrations(client, self.config.schema()).await?;
-        Ok(
-            (!migrations.is_empty()).then(|| crate::handover::MigrationsPending {
+        // With none pending, its background process may still stand by for
+        // the takeover work it can't run.
+        let cannot_run = self.client.as_ref().and_then(Client::cannot_migrate);
+        Ok((!migrations.is_empty() || cannot_run.is_some()).then(|| {
+            crate::handover::MigrationsPending {
                 this_version: self.config.binary_version().to_string(),
                 migrations,
-                cannot_run: self.client.as_ref().and_then(Client::cannot_migrate),
-            }),
-        )
+                cannot_run,
+            }
+        }))
     }
 
     /// `error`, unless this binary's migrations are pending: then a read
@@ -1156,11 +1163,13 @@ impl Trellis {
         error: TrellisError,
     ) -> TrellisError {
         match self.migrations_pending_now(client).await {
-            Ok(Some(pending)) => TrellisError::MigrationsPending {
-                pending,
-                error: Box::new(error),
-            },
-            Ok(None) | Err(_) => error,
+            Ok(Some(pending)) if !pending.migrations.is_empty() => {
+                TrellisError::MigrationsPending {
+                    pending,
+                    error: Box::new(error),
+                }
+            }
+            Ok(_) | Err(_) => error,
         }
     }
 

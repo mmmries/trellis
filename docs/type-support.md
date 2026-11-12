@@ -256,7 +256,7 @@ nonzero operands), `sum(real)` is `real`, `avg(real)` is
 unlike the operators, and is modelled separately. `+`, `-`, `*` and `/` admit
 a float mixed with an exact numeric. `>` admits a float against a bare number literal
 (`f > 0.5`, `f > 1`) and refuses a float against any other exact numeric
-([Supported sources and targets](transforms.md#supported-sources-and-targets)).
+([expressions — Refusals](expressions.md#refusals)).
 As in Postgres, the literal is cast to `double precision` and a `real` operand
 is widened to `double precision`, so the comparison runs in `double precision`:
 with `r = 0.1::real`, `r > 0.1` is true (the widened `r` is 0.10000000149...),
@@ -298,7 +298,7 @@ overflow raise `22003` or `22012` for the row, as an overflowing `+` does. Where
 Postgres would truncate, round differently by type or cast behind the user's
 back (`integer / integer`, an integer or float argument to `ROUND`, `%` on a
 float), define refuses the expression with a remedy
-([transforms](transforms.md#supported-sources-and-targets)).
+([expressions](expressions.md#refusals)).
 Checked in `trellis/tests/arithmetic_key_spaces.rs` and
 `trellis/tests/one_to_one_render.rs`.
 
@@ -351,7 +351,7 @@ column; a field that reads it is computed from the literal, as Postgres
 would read the inlined text (`NULL AS z, COALESCE(z, 1) AS n` makes `n` an
 `integer`). Where Postgres finds a `NULL` ambiguous, or types it by its
 function-candidate rules (a function or aggregate argument), define refuses it
-([transforms](transforms.md#supported-sources-and-targets)).
+([expressions](expressions.md#refusals)).
 Checked in `trellis/tests/logic_key_spaces.rs`, `trellis/tests/null_literal_key_spaces.rs`,
 `trellis/tests/one_to_one_render.rs` and the harness.
 
@@ -381,7 +381,7 @@ key types). `infinity` and `-infinity` follow Postgres. `d + n` past
 `CAST` of a date past 294276-12-31 raise `22008` for the row, which is
 quarantined like any data error. A constant that does fails every row the
 same way: define doesn't evaluate constants
-([transforms](transforms.md#calculated-fields)).
+([expressions](expressions.md#arithmetic)).
 
 What each form reads: none of these reads `DateStyle`, `IntervalStyle` or
 `TimeZone` (the pins above stay). `AT TIME ZONE 'UTC'` parses its zone name
@@ -389,7 +389,7 @@ under `timezone_abbreviations`, which every Trellis session pins to
 `Default` (`pool::EXPRESSION_INPUT_GUCS`). Where Postgres would silently pick
 a `STABLE` overload that reads `TimeZone`, produce an `interval`, or read the
 time zone database, define refuses the expression with a remedy
-([transforms](transforms.md#supported-sources-and-targets)).
+([expressions](expressions.md#refusals)).
 Checked in `trellis/tests/date_key_spaces.rs`,
 `trellis/tests/one_to_one_render.rs` and the harness.
 

@@ -171,9 +171,9 @@ an `interval`-producing `-`, a `STABLE` overload Postgres picks silently,
 `integer / integer`'s truncation, text ordering under a collation, a relative
 typed literal. It also refuses a `/` or `%` whose divisor is written as a
 literal zero, since every row with a dividend would fail. Each refusal is named
-in the error, carries a remedy, and is listed in the
-[Supported sources and targets](../transforms.md#supported-sources-and-targets)
-section, which is the only reference for them. The narrowing runs one way: a
+in the error, carries a remedy, and is listed in
+[expressions — Refusals](../expressions.md#refusals), the only reference for
+them. The narrowing runs one way: a
 refusal can later become an acceptance of Postgres's meaning, but Trellis never
 accepts text Postgres refuses, or gives a meaning Postgres doesn't, to work
 around one.
