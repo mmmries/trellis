@@ -4509,20 +4509,10 @@ async fn complete_resume(
         )
         .await?
         .map_or((false, None), |row| (row.get(0), row.get(1)));
-    // `fuse_rearmed_at = now()` in the same statement, not a separate one:
-    // it is this resume's epoch, part of the same atomic "this transform
-    // starts over" transition as the status drop, and what a
-    // stale chunk or eviction checks against.
-    //
-    // `build = null` too: a definition paused during a Re-derive
-    // build is no longer under one. The staging worker's next pass starts a
-    // new one (`staging::build::start_ready_builds`).
-    txn.execute(
-        "update transform_definitions \
-         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
-        &[&StoredStatus::WaitingToBackfill.as_str(), &id],
-    )
-    .await?;
+    // A definition paused during a Re-derive build is no longer under one.
+    // The staging worker's next pass starts a new one
+    // (`staging::build::start_ready_builds`).
+    crate::defs::lifecycle::start_over(txn, id).await?;
     // The rebuild casts each source value through its live type,
     // and the capture pass compares the key columns against what it builds
     // from.

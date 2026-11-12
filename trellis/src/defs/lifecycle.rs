@@ -63,7 +63,7 @@
 //! a process that drops a transform needs no privileges on the source
 //! tables.
 
-use tokio_postgres::Transaction;
+use tokio_postgres::{GenericClient, Transaction};
 
 use super::catalog::CatalogError;
 use super::model::{EdgeKind, StoredStatus};
@@ -458,19 +458,64 @@ pub(crate) async fn pause(
     if add {
         pause_message::add_reason(txn, id, reason.reason()).await?;
     }
+    Ok(pause_unless_frozen(txn, id).await?)
+}
+
+/// Moves definition `id` to `paused` unless it's frozen (a quarantined one
+/// stays quarantined), in the caller's transaction. Returns whether it did.
+pub(crate) async fn pause_unless_frozen(
+    txn: &impl GenericClient,
+    id: i64,
+) -> Result<bool, tokio_postgres::Error> {
     let paused = txn
         .execute(
-            "update transform_definitions set status = $2 \
-             where id = $1 and status = any($3)",
+            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
             &[
                 &id,
                 &StoredStatus::Paused.as_str(),
                 &StoredStatus::dispatchable(),
             ],
         )
-        .await?
-        == 1;
-    Ok(paused)
+        .await?;
+    Ok(paused == 1)
+}
+
+/// Moves definition `id` to `backfilling` under a Re-derive build, which
+/// applies from this commit (`super::model::APPLYING_SQL`). The caller holds
+/// its row and has checked the status it moves from.
+pub(crate) async fn start_rederive(
+    txn: &impl GenericClient,
+    id: i64,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "update transform_definitions set status = $2, build = $3 where id = $1",
+        &[
+            &id,
+            &StoredStatus::Backfilling.as_str(),
+            &crate::staging::build::BUILD_REDERIVE,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Starts definition `id` over: `waiting_to_backfill`, so the staging
+/// worker starts its build, with no build (one it was under is over) and a
+/// new fuse epoch (`fuse_rearmed_at = now()`) that a stale chunk or
+/// eviction checks against. One statement, so the epoch and the status
+/// change together. The caller holds its row. A dump's reset
+/// (`crate::dump`) also clears `build_seg`; this keeps it.
+pub(crate) async fn start_over(
+    txn: &impl GenericClient,
+    id: i64,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "update transform_definitions \
+         set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
+        &[&StoredStatus::WaitingToBackfill.as_str(), &id],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Inserts definition `id`'s `capture_failures` record, if it exists and
@@ -1169,5 +1214,122 @@ mod tests {
         assert!(error.starts_with("relabelled"), "{error}");
         assert_eq!(kind, "capture");
         assert_eq!(lsn, Some(PgLsn::from(5)));
+    }
+
+    /// Sets definition `id`'s stored `status` and `build`.
+    async fn set_state(txn: &Transaction<'_>, id: i64, status: &str, build: Option<&str>) {
+        txn.execute(
+            "update transform_definitions set status = $2, build = $3 where id = $1",
+            &[&id, &status, &build],
+        )
+        .await
+        .expect("set state");
+    }
+
+    /// Definition `id`'s status, whether it applies, and whether it is
+    /// under a build.
+    async fn state(txn: &Transaction<'_>, id: i64) -> (String, bool, bool) {
+        let row = txn
+            .query_one(
+                &format!(
+                    "select status, {}, build is not null from transform_definitions where id = $1",
+                    crate::defs::model::APPLYING_SQL
+                ),
+                &[&id],
+            )
+            .await
+            .expect("state");
+        (row.get(0), row.get(1), row.get(2))
+    }
+
+    /// A pause moves a running definition to `paused` and leaves a frozen
+    /// one as it is.
+    #[tokio::test]
+    async fn a_pause_leaves_a_frozen_definition_frozen() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, id) = live_definition(&db).await;
+        let mut client = pool.get().await.expect("client");
+        let txn = client.transaction().await.expect("txn");
+        for frozen in ["quarantined", "paused"] {
+            set_state(&txn, id, frozen, None).await;
+            assert!(!pause_unless_frozen(&*txn, id).await.expect("pause"));
+            assert_eq!(state(&txn, id).await.0, frozen);
+        }
+        set_state(&txn, id, "backfilling", Some("rederive")).await;
+        assert!(pause_unless_frozen(&*txn, id).await.expect("pause"));
+        let (status, applies, _) = state(&txn, id).await;
+        assert_eq!((status.as_str(), applies), ("paused", false));
+    }
+
+    /// A Re-derive start makes a `live` definition apply under a build that
+    /// isn't `live`; starting over ends the build, so it doesn't apply until
+    /// its next build starts, under a new fuse epoch, and keeps `build_seg`.
+    #[tokio::test]
+    async fn a_rederive_start_applies_and_a_start_over_ends_it() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, id) = live_definition(&db).await;
+        let mut client = pool.get().await.expect("client");
+        let txn = client.transaction().await.expect("txn");
+
+        start_rederive(&*txn, id).await.expect("start");
+        assert_eq!(
+            state(&txn, id).await,
+            ("backfilling".to_string(), true, true)
+        );
+
+        txn.execute(
+            "update transform_definitions \
+             set fuse_rearmed_at = now() - interval '1 hour', build_seg = 7 where id = $1",
+            &[&id],
+        )
+        .await
+        .expect("an old epoch");
+        start_over(&*txn, id).await.expect("start over");
+        assert_eq!(
+            state(&txn, id).await,
+            ("waiting_to_backfill".to_string(), false, false)
+        );
+        let row = txn
+            .query_one(
+                "select fuse_rearmed_at = now(), build_seg from transform_definitions \
+                 where id = $1",
+                &[&id],
+            )
+            .await
+            .expect("epoch");
+        assert!(row.get::<_, bool>(0), "a new fuse epoch");
+        assert_eq!(row.get::<_, Option<i64>>(1), Some(7), "build_seg kept");
+    }
+
+    /// Only a definition that applies is a rebuild candidate or rebuildable.
+    #[tokio::test]
+    async fn only_an_applying_definition_is_rebuilt() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, id) = live_definition(&db).await;
+        let mut client = pool.get().await.expect("client");
+        let txn = client.transaction().await.expect("txn");
+        for (status, build, applies) in [
+            ("live", None, true),
+            ("backfilling", Some("rederive"), true),
+            ("backfilling", None, false),
+            ("waiting_to_backfill", None, false),
+            ("paused", None, false),
+            ("quarantined", None, false),
+        ] {
+            set_state(&txn, id, status, build).await;
+            let expected = if applies { vec![id] } else { Vec::new() };
+            let candidates =
+                crate::staging::build::rebuild_candidates(&*txn, &["public.s".to_string()])
+                    .await
+                    .expect("candidates");
+            assert_eq!(candidates, expected, "{status} {build:?}");
+            let rebuildable = crate::staging::build::rebuildable(&*txn, &[id])
+                .await
+                .expect("rebuildable");
+            assert_eq!(rebuildable, expected, "{status} {build:?}");
+        }
     }
 }

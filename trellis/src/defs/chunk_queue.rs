@@ -906,17 +906,7 @@ async fn pause_for_build_failure(
     txn: &tokio_postgres::Transaction<'_>,
     id: i64,
 ) -> Result<(), tokio_postgres::Error> {
-    let paused = txn
-        .execute(
-            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
-            &[
-                &id,
-                &StoredStatus::Paused.as_str(),
-                &StoredStatus::dispatchable(),
-            ],
-        )
-        .await?;
-    if paused == 1 {
+    if super::lifecycle::pause_unless_frozen(txn, id).await? {
         crate::instance_log::warn!(
             definition_id = id,
             to = %StoredStatus::Paused.as_str(),
