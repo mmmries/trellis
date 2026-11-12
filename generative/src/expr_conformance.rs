@@ -715,7 +715,7 @@ impl Fixture {
                 }
                 Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
                 Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                    stack.extend(e.logic_children());
+                    stack.extend(e.children());
                 }
                 Expr::FunctionCall { name, args } => {
                     if name == "REGEXP_COUNT"
@@ -799,10 +799,9 @@ pub fn has_literal_zero_divisor(expr: &Expr) -> bool {
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             has_literal_zero_divisor(operand)
         }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-            .logic_children()
-            .into_iter()
-            .any(has_literal_zero_divisor),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            expr.children().into_iter().any(has_literal_zero_divisor)
+        }
         Expr::FunctionCall { args, .. } => args.iter().any(has_literal_zero_divisor),
         _ => false,
     }

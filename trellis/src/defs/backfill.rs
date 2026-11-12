@@ -225,83 +225,7 @@ fn substitute_field_aliases(
             charge_budget(budget, 1)?;
             Ok(Expr::Column(column.clone()))
         }
-        Expr::NumberLiteral(text) => {
-            charge_budget(budget, 1)?;
-            Ok(Expr::NumberLiteral(text.clone()))
-        }
-        Expr::StringLiteral(text) => {
-            charge_budget(budget, 1)?;
-            Ok(Expr::StringLiteral(text.clone()))
-        }
-        Expr::BooleanLiteral(_) | Expr::Null => {
-            charge_budget(budget, 1)?;
-            Ok(expr.clone())
-        }
-        Expr::TypedLiteral { value_type, text } => {
-            charge_budget(budget, 1)?;
-            Ok(Expr::TypedLiteral {
-                value_type: *value_type,
-                text: text.clone(),
-            })
-        }
-        Expr::Negate(operand) => {
-            charge_budget(budget, 1)?;
-            Ok(Expr::Negate(Box::new(substitute_field_aliases(
-                operand,
-                self_name,
-                fields_by_name,
-                visiting,
-                memo,
-                budget,
-            )?)))
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            charge_budget(budget, 1)?;
-            expr.map_logic_children(|child| {
-                substitute_field_aliases(child, self_name, fields_by_name, visiting, memo, budget)
-            })
-            .expect("a logic node")
-        }
-        Expr::Cast {
-            expr: operand,
-            target,
-        } => {
-            charge_budget(budget, 1)?;
-            Ok(Expr::Cast {
-                expr: Box::new(substitute_field_aliases(
-                    operand,
-                    self_name,
-                    fields_by_name,
-                    visiting,
-                    memo,
-                    budget,
-                )?),
-                target: *target,
-            })
-        }
-        Expr::BinaryOp { op, lhs, rhs } => {
-            charge_budget(budget, 1)?;
-            Ok(Expr::BinaryOp {
-                op: *op,
-                lhs: Box::new(substitute_field_aliases(
-                    lhs,
-                    self_name,
-                    fields_by_name,
-                    visiting,
-                    memo,
-                    budget,
-                )?),
-                rhs: Box::new(substitute_field_aliases(
-                    rhs,
-                    self_name,
-                    fields_by_name,
-                    visiting,
-                    memo,
-                    budget,
-                )?),
-            })
-        }
-        Expr::FunctionCall { name, args } => {
+        _ => {
             charge_budget(budget, 1)?;
             // An aggregate's argument reads source columns, never another
             // aggregate field by alias (SQL's rule; see
@@ -309,25 +233,19 @@ fn substitute_field_aliases(
             // MIN(val) AS lo` must stay `MIN(val)` over the source column,
             // not nest into `MIN(SUM(val))`.
             let aggregate_scope;
-            let fields_by_name = if super::registry::lookup_aggregate_function(name).is_some() {
+            let mut fields_by_name = fields_by_name;
+            if let Expr::FunctionCall { name, .. } = expr
+                && super::registry::is_aggregate_name(name)
+            {
                 let aggregates = super::validate::aggregate_field_names(
                     fields_by_name.iter().map(|(n, e)| (*n, *e)),
                 );
                 aggregate_scope =
                     super::validate::without_aggregate_fields(fields_by_name, &aggregates);
-                &aggregate_scope
-            } else {
-                fields_by_name
-            };
-            let args = args
-                .iter()
-                .map(|arg| {
-                    substitute_field_aliases(arg, self_name, fields_by_name, visiting, memo, budget)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expr::FunctionCall {
-                name: name.clone(),
-                args,
+                fields_by_name = &aggregate_scope;
+            }
+            expr.try_map_children(|child| {
+                substitute_field_aliases(child, self_name, fields_by_name, visiting, memo, budget)
             })
         }
     }
@@ -356,26 +274,9 @@ fn charge_budget(budget: &mut usize, cost: usize) -> Result<(), BackfillError> {
 
 /// Total number of nodes in `expr`'s tree.
 fn node_count(expr: &Expr) -> usize {
-    match expr {
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => 1,
-        Expr::BinaryOp { lhs, rhs, .. } => 1 + node_count(lhs) + node_count(rhs),
-        Expr::Negate(operand) => 1 + node_count(operand),
-        Expr::Cast { expr, .. } => 1 + node_count(expr),
-        Expr::FunctionCall { args, .. } => 1 + args.iter().map(node_count).sum::<usize>(),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            1 + expr
-                .logic_children()
-                .into_iter()
-                .map(node_count)
-                .sum::<usize>()
-        }
-    }
+    let mut count = 0;
+    expr.walk(&mut |_| count += 1);
+    count
 }
 
 /// Substitutes cross-field-alias references in every field of `def`, returning

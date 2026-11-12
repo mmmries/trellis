@@ -2132,18 +2132,12 @@ mod tests {
             }
         }
         fn zero_dividend(expr: &Expr) -> bool {
-            let children: Vec<&Expr> = match expr {
-                Expr::BinaryOp { lhs, rhs, .. } => vec![lhs, rhs],
-                Expr::FunctionCall { args, .. } => args.iter().collect(),
-                Expr::Negate(operand) => vec![operand],
-                _ => expr.logic_children(),
-            };
             let zero_over = matches!(
                 expr,
                 Expr::BinaryOp { op: Operator::Divide | Operator::Modulo, lhs, .. }
                     if matches!(&**lhs, Expr::NumberLiteral(t) | Expr::TypedLiteral { text: t, .. } if t == "0")
             );
-            zero_over || children.into_iter().any(zero_dividend)
+            zero_over || expr.children().into_iter().any(zero_dividend)
         }
         assert!(
             end_to_end.iter().any(zero_dividend),
@@ -2175,14 +2169,7 @@ mod tests {
             );
             out.push(((**rhs).clone(), guarded));
         }
-        let children: Vec<&Expr> = match expr {
-            Expr::BinaryOp { lhs, rhs, .. } => vec![lhs, rhs],
-            Expr::FunctionCall { args, .. } => args.iter().collect(),
-            Expr::Negate(operand) => vec![operand],
-            Expr::Cast { expr, .. } => vec![expr],
-            _ => expr.logic_children(),
-        };
-        for child in children {
+        for child in expr.children() {
             divisors(child, out);
         }
     }

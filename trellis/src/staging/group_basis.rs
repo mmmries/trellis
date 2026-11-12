@@ -290,6 +290,7 @@ use tokio_postgres::types::PgLsn;
 use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType, group_by_contains};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::oracle::{render_expr_sql, render_qualified_expr_sql};
+use crate::defs::registry::is_aggregate_name;
 use crate::integer::IntWidth;
 use crate::pool::{jsonb_build_object_sql, quote_ident, quote_literal};
 
@@ -628,7 +629,7 @@ fn rewrite_with(
     let rewrite =
         |e: &Expr, shape: &mut GroupShape| rewrite_with(e, type_of, arg_of, shape, extremes);
     match expr {
-        Expr::FunctionCall { name, args } if is_aggregate(name) => {
+        Expr::FunctionCall { name, args } if is_aggregate_name(name) => {
             let agg = match (name.to_ascii_uppercase().as_str(), args.as_slice()) {
                 (function @ ("MIN" | "MAX"), [arg]) if extremes => {
                     extreme_column(arg)?;
@@ -672,31 +673,9 @@ fn rewrite_with(
             };
             Some(Expr::Column(placeholder(k)))
         }
-        Expr::FunctionCall { name, args } => Some(Expr::FunctionCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| rewrite(a, shape))
-                .collect::<Option<Vec<_>>>()?,
-        }),
-        Expr::BinaryOp { op, lhs, rhs } => Some(Expr::BinaryOp {
-            op: *op,
-            lhs: Box::new(rewrite(lhs, shape)?),
-            rhs: Box::new(rewrite(rhs, shape)?),
-        }),
-        Expr::Negate(operand) => Some(Expr::Negate(Box::new(rewrite(operand, shape)?))),
-        Expr::Cast {
-            expr: operand,
-            target,
-        } => Some(Expr::Cast {
-            expr: Box::new(rewrite(operand, shape)?),
-            target: *target,
-        }),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-            .map_logic_children(|child| rewrite(child, &mut *shape).ok_or(()))
-            .expect("a logic node")
+        _ => expr
+            .try_map_children(|child| rewrite(child, &mut *shape).ok_or(()))
             .ok(),
-        other => Some(other.clone()),
     }
 }
 
@@ -714,29 +693,15 @@ fn distinct_arguments(
 ) -> Vec<Expr> {
     fn walk(expr: &Expr, out: &mut Vec<Expr>) {
         match expr {
-            Expr::FunctionCall { name, args } if args.len() == 1 && is_aggregate(name) => {
+            Expr::FunctionCall { name, args } if args.len() == 1 && is_aggregate_name(name) => {
                 if !out.contains(&args[0]) {
                     out.push(args[0].clone());
                 }
             }
-            Expr::FunctionCall { args, .. } => args.iter().for_each(|a| walk(a, out)),
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                walk(lhs, out);
-                walk(rhs, out);
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, out),
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                for child in expr.logic_children() {
-                    walk(child, out);
-                }
-            }
-            Expr::Column(_)
-            | Expr::SourceColumn { .. }
-            | Expr::NumberLiteral(_)
-            | Expr::StringLiteral(_)
-            | Expr::BooleanLiteral(_)
-            | Expr::Null
-            | Expr::TypedLiteral { .. } => {}
+            _ => expr
+                .children()
+                .into_iter()
+                .for_each(|child| walk(child, out)),
         }
     }
     let mut out = Vec::new();
@@ -746,13 +711,6 @@ fn distinct_arguments(
         }
     }
     out
-}
-
-/// Whether `name` is an aggregate function, admitted or not.
-fn is_aggregate(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    crate::defs::registry::AGGREGATE_FUNCTIONS.contains(&upper.as_str())
-        || crate::defs::validate::is_deferred_aggregate_name(&upper)
 }
 
 /// The hidden table's bare name in the catalog schema, for definition `id`

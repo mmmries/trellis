@@ -304,27 +304,14 @@ fn qualify(
         | Expr::StringLiteral(_)
         | Expr::BooleanLiteral(_)
         | Expr::Null
-        | Expr::TypedLiteral { .. } => expr.clone(),
-        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
-            op: *op,
-            lhs: Box::new(sub(lhs)?),
-            rhs: Box::new(sub(rhs)?),
-        },
-        Expr::Negate(operand) => Expr::Negate(Box::new(sub(operand)?)),
-        Expr::Cast { expr, target: ty } => Expr::Cast {
-            expr: Box::new(sub(expr)?),
-            target: *ty,
-        },
-        Expr::FunctionCall { name, args } => Expr::FunctionCall {
-            name: name.clone(),
-            args: args.iter().map(&mut sub).collect::<Result<_, _>>()?,
-        },
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            match expr.map_logic_children(&mut sub) {
-                Some(rebuilt) => rebuilt?,
-                None => expr.clone(),
-            }
-        }
+        | Expr::TypedLiteral { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::Negate(_)
+        | Expr::Cast { .. }
+        | Expr::FunctionCall { .. }
+        | Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::Case { .. } => expr.try_map_children(&mut sub)?,
     })
 }
 

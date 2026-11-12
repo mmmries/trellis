@@ -1439,7 +1439,7 @@ mod tests {
                 Expr::Negate(operand) => has_bare_null(operand),
                 // `CAST(NULL AS <type>)` is typed.
                 Expr::Cast { .. } => false,
-                _ => expr.logic_children().into_iter().any(has_bare_null),
+                _ => expr.children().into_iter().any(has_bare_null),
             }
         }
         let slots: Vec<crate::expr_gen::Column> = crate::generate::DERIVED_SLOTS

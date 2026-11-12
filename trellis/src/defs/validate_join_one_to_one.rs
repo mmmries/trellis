@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use super::ast::{Expr, KeySpace, QualifiedColumn, TransformDef};
 use super::join::Side;
 use super::validate::{
-    JoinColumnInfo, RESERVED_COLUMN_PREFIX, ValidationError, is_deferred_aggregate_name,
-    join_field_value_type, join_resolver, validate_join_tables_and_on,
+    JoinColumnInfo, RESERVED_COLUMN_PREFIX, ValidationError, join_field_value_type, join_resolver,
+    validate_join_tables_and_on,
 };
 
 /// Validates a [`KeySpace::JoinOneToOne`] definition against the live columns
@@ -170,30 +170,22 @@ fn check_field_expr<'a>(
         | Expr::BooleanLiteral(_)
         | Expr::Null
         | Expr::TypedLiteral { .. } => Ok(()),
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            check_field_expr(lhs, field, resolve)?;
-            check_field_expr(rhs, field, resolve)
+        Expr::FunctionCall { name, .. } if super::registry::is_aggregate_name(name) => {
+            Err(ValidationError::OneToOneJoinAggregate {
+                field: field.to_string(),
+                function: name.to_ascii_uppercase(),
+            })
         }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            check_field_expr(operand, field, resolve)
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-            .logic_children()
+        Expr::FunctionCall { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::Negate(_)
+        | Expr::Cast { .. }
+        | Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::Case { .. } => expr
+            .children()
             .into_iter()
             .try_for_each(|child| check_field_expr(child, field, resolve)),
-        Expr::FunctionCall { name, args } => {
-            let upper = name.to_ascii_uppercase();
-            if is_deferred_aggregate_name(&upper)
-                || super::registry::AGGREGATE_FUNCTIONS.contains(&upper.as_str())
-            {
-                return Err(ValidationError::OneToOneJoinAggregate {
-                    field: field.to_string(),
-                    function: upper,
-                });
-            }
-            args.iter()
-                .try_for_each(|arg| check_field_expr(arg, field, resolve))
-        }
     }
 }
 
