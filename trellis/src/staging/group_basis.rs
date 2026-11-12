@@ -4120,10 +4120,11 @@ impl GroupTargetPlan {
         )
     }
 
-    /// A JOIN build's visible compare for `T` ([`apply_join_build_groups`]),
+    /// A JOIN build's visible compare for `T` ([`compare_join_build_groups`]),
     /// over every group of the staging table (the product's groups and
     /// [`Self::target_groups_sql`]'s zero rows), already locked and with the
-    /// staged deltas applied to the hidden partials: each group's visible
+    /// staged deltas added to the hidden partials
+    /// ([`Self::upsert_hidden_build_sql`]): each group's visible
     /// row, computed from the partials it now holds, is compared with the row
     /// the target holds ([`Self::held_tail_sql`]). That repairs a visible row
     /// that disagrees with the partials, and removes one whose group has no
@@ -4158,8 +4159,9 @@ impl GroupTargetPlan {
 
     /// A JOIN build's enumeration of `T`'s groups (ADR-0002's R8, one level
     /// up): a zero row in `T`'s staging table for every group the visible
-    /// target holds and every group `T`'s hidden table holds, so the lock of
-    /// [`Self::lock_sql`] covers them with the product's groups, and the
+    /// target holds and every group `T`'s hidden table holds, so the upsert
+    /// of [`Self::upsert_hidden_build_sql`] locks them with the product's
+    /// groups, and the
     /// compare reaches a visible row whose group has no source row left. A
     /// zero row changes no partial.
     fn target_groups_sql(&self) -> String {

@@ -1715,10 +1715,11 @@ pub(crate) async fn recompute_routed(
 ///    the cells' changes into `T`.
 ///    A cell first seen after the enumeration is not locked, so it is not
 ///    written: its pages apply it.
-/// 4. `T`: its groups are locked after the product, so the set is the
-///    product's groups, read from rows held under `J`, plus every group of the
-///    visible target and of `T`'s hidden table (R8 one level up). `T` changes
-///    only as the product's delta; every locked group's visible row is then
+/// 4. `T`: its groups are locked and written after the product, in one
+///    sorted upsert, so the set is the product's groups, read from rows held
+///    under `J`, plus every group of the visible target and of `T`'s hidden
+///    table (R8 one level up). `T` changes only as the product's delta; every
+///    locked group's visible row is then
 ///    compared with the row the target holds, which removes the row of a
 ///    group no source row backs and repairs a row that disagrees with `T`'s
 ///    partials.
