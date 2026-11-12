@@ -25,6 +25,7 @@ Trellis is also available as a command-line tool and as Elixir and Ruby bindings
 
 * [Embedding Trellis in an application](https://github.com/salesforce-misc/trellis/blob/main/docs/embedding.md)
 * [Transform grammar and supported sources and targets](https://github.com/salesforce-misc/trellis/blob/main/docs/transforms.md)
+* [Expressions: what a calculated field may contain](https://github.com/salesforce-misc/trellis/blob/main/docs/expressions.md)
 * [Running Trellis well](https://github.com/salesforce-misc/trellis/blob/main/docs/recommendations.md)
 * [Known correctness gaps](https://github.com/salesforce-misc/trellis/blob/main/docs/known-correctness-gaps.md)
 * [API documentation](https://docs.rs/trellis-pg)
