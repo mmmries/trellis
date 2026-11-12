@@ -37,24 +37,14 @@
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{ValueType, install_definition};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
     pairs
@@ -74,7 +64,7 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
 async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_without_panicking() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let client = connect(db.dsn()).await;
 
     client
         .batch_execute(
@@ -184,7 +174,7 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
 
 /// Seals and drains until nothing is pending anywhere in the ring.
 async fn drain_to_quiescence(pool: &trellis::pool::Pool, dsn: &str) {
-    let mut client = connect_raw(dsn).await;
+    let mut client = connect(dsn).await;
     for _ in 0..16 {
         trellis::staging::seal_if_active_nonempty(&mut client, "nullable_group_key_wake")
             .await

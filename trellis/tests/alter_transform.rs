@@ -51,34 +51,23 @@
 //!   `altering_an_expression_into_a_narrower_passthrough_is_refused`,
 //!   `a_retype_a_view_blocks_is_refused_and_rolls_back`)
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, definer, start_and_settle_builds};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::chunk_queue;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{
     Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) with `search_path`
-/// pinned — the same helper every other integration test in this directory
-/// uses to check Postgres's own view of what the engine did.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// Polls `predicate` until it holds or `timeout` elapses, then panics with
 /// `message` — the same no-bare-sleep discipline every other integration
@@ -98,16 +87,6 @@ where
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-/// A define-only facade connection: no staging worker, no drain threads.
-async fn define_only(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a define-only Trellis")
 }
 
 /// The live pipeline: capture, ring maintenance, and drain workers — what
@@ -235,7 +214,7 @@ fn into_altered(applied: Applied) -> (Vec<String>, Vec<String>, Vec<String>) {
 async fn an_added_passthrough_column_has_the_type_define_gives_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.posts (id int primary key, title text, price numeric(10,2), \
                                     author varchar(8), qty int, note text, ts timestamptz); \
@@ -245,7 +224,7 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
     .await
     .expect("seed");
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     for text in [
         "TRANSFORM edited FROM public.posts SELECT title AS title",
         "TRANSFORM defined FROM public.posts SELECT title AS title, price AS price, \
@@ -336,10 +315,10 @@ async fn an_added_passthrough_column_has_the_type_define_gives_it() {
 async fn add_single_column_backfills_existing_rows() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 25).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -388,10 +367,10 @@ async fn add_single_column_backfills_existing_rows() {
 async fn drop_single_column_removes_the_physical_column() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
         .await
@@ -426,10 +405,10 @@ async fn drop_single_column_removes_the_physical_column() {
 async fn alter_single_column_recomputes_existing_rows() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 25).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
         .await
@@ -497,10 +476,10 @@ async fn alter_single_column_recomputes_existing_rows() {
 async fn altering_a_field_to_a_different_result_type_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
         .await
@@ -585,10 +564,10 @@ async fn altering_a_field_to_a_different_result_type_is_refused() {
 async fn a_type_changing_alter_refuses_the_whole_statement() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
         .await
@@ -647,9 +626,9 @@ async fn modifier_fixture(
     )
     .await
     .expect("seed");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis.apply(transform_text).await.expect("define");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     trellis
 }
 
@@ -673,7 +652,7 @@ async fn target_filenode(raw: &Client, table: &str) -> i64 {
 async fn altering_a_passthrough_into_a_wider_expression_changes_no_column_type() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect_raw(db.dsn()).await;
+    let mut raw = connect(db.dsn()).await;
     let trellis =
         modifier_fixture(&db, &raw, "TRANSFORM t FROM public.posts SELECT price AS p").await;
     assert_eq!(
@@ -750,7 +729,7 @@ async fn altering_a_passthrough_into_a_wider_expression_changes_no_column_type()
 async fn altering_a_varchar_passthrough_into_a_text_expression_changes_no_column_type() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let trellis = modifier_fixture(
         &db,
         &raw,
@@ -794,7 +773,7 @@ async fn altering_a_varchar_passthrough_into_a_text_expression_changes_no_column
 async fn altering_an_expression_into_another_family_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let trellis = modifier_fixture(
         &db,
         &raw,
@@ -834,10 +813,10 @@ async fn altering_an_expression_into_another_family_is_refused() {
 async fn combined_add_drop_alter_in_one_statement() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 25).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
         .await
@@ -893,19 +872,6 @@ async fn combined_add_drop_alter_in_one_statement() {
 // ---------------------------------------------------------------------
 // Single-pass backfill and the version fence
 // ---------------------------------------------------------------------
-
-/// Starts every registered definition's build and runs it to completion,
-/// flipping a freshly-defined 1-1 target to `live` with no running
-/// `Client`. This is the hand-driven stand-in for the staging worker and a
-/// drain worker that `defs_install_definition.rs` uses.
-async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
-    // ADR-0002: registration only records a definition; the staging
-    // worker starts its build.
-    trellis::intake::harness::start_registered_builds(pool)
-        .await
-        .expect("dispatch registered definitions' builds");
-    trellis::staging::build::settle_builds(pool).await;
-}
 
 /// The target's rows as `(id, xmin)` text, in key order: a row any write
 /// touched has a new `xmin`.
@@ -975,15 +941,15 @@ async fn an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, ROWS).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
         .expect("define");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "order_calc").await.as_deref(),
         Some("live")
@@ -1088,15 +1054,15 @@ async fn one_field_build_reads_each_row_once_under_concurrent_writes() {
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, ROWS).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
         .expect("define");
-    drain_backfill_chunks(&db.pool).await;
+    start_and_settle_builds(&db.pool).await;
     assert_eq!(
         persisted_status(&raw, "order_calc").await.as_deref(),
         Some("live"),
@@ -1122,7 +1088,7 @@ async fn one_field_build_reads_each_row_once_under_concurrent_writes() {
         let stop = Arc::clone(&stop);
         let updates = Arc::clone(&updates);
         tokio::spawn(async move {
-            let client = connect_raw(&dsn).await;
+            let client = connect(&dsn).await;
             let mut id = 1i64;
             while !stop.load(Ordering::Relaxed) {
                 // Rewrite `a` in place (`id` stays the key), so every value
@@ -1273,16 +1239,16 @@ async fn the_field_applies_while_its_build_runs_and_the_rest_of_the_target_stays
 
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, ROWS).await;
 
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
         .expect("define");
-    drain_backfill_chunks(&db.pool).await;
-    let mut ring = connect_raw(db.dsn()).await;
+    start_and_settle_builds(&db.pool).await;
+    let mut ring = connect(db.dsn()).await;
     drain_to_quiescence(&db.pool, &mut ring).await;
 
     trellis
@@ -1409,10 +1375,10 @@ async fn column_pause_state(raw: &Client, transform: &str, column: &str) -> Opti
 async fn an_alter_leaves_a_pause_it_did_not_create_in_place() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 6).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
         .await
@@ -1482,10 +1448,10 @@ async fn an_alter_leaves_a_pause_it_did_not_create_in_place() {
 async fn dropping_a_paused_field_clears_its_quarantine_state() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 6).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
         .await
@@ -1573,10 +1539,10 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
 async fn a_pause_landing_mid_field_build_survives_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 6).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
         .await
@@ -1597,7 +1563,7 @@ async fn a_pause_landing_mid_field_build_survives_it() {
         .expect("drain the ring");
 
     // Freeze the build: `order_calc` is `order_next`'s source.
-    let mut locker = connect_raw(db.dsn()).await;
+    let mut locker = connect(db.dsn()).await;
     let lock = locker.transaction().await.expect("begin the lock holder");
     lock.batch_execute(&format!(
         "lock table {DEFAULT_TARGET_SCHEMA}.order_calc in access exclusive mode"
@@ -1606,7 +1572,7 @@ async fn a_pause_landing_mid_field_build_survives_it() {
     .expect("lock the ALTER's source table");
 
     // The ALTER returns with its source still locked: it reads nothing of it.
-    let operator = define_only(db.dsn()).await;
+    let operator = pipeline::definer(db.dsn()).await;
     tokio::time::timeout(
         Duration::from_secs(30),
         operator.apply(
@@ -1687,10 +1653,10 @@ async fn a_pause_landing_mid_field_build_survives_it() {
 async fn an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -1700,7 +1666,7 @@ async fn an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock() {
     let trellis = Arc::new(running(db.dsn()).await);
     wait_for_live(&raw, "order_calc").await;
 
-    let mut drain = connect_raw(db.dsn()).await;
+    let mut drain = connect(db.dsn()).await;
     let txn = drain.transaction().await.expect("begin");
     txn.query_one(
         "select version from source_table_versions \
@@ -1767,10 +1733,10 @@ async fn an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock() {
 async fn edits_are_idempotent_in_both_directions() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -1854,10 +1820,10 @@ async fn edits_are_idempotent_in_both_directions() {
 async fn an_add_and_a_drop_of_the_same_field_in_one_edit_cancel() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -1933,10 +1899,10 @@ async fn an_add_and_a_drop_of_the_same_field_in_one_edit_cancel() {
 async fn a_drop_then_add_of_the_same_field_replaces_it_with_the_new_type() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, a + a AS z")
         .await
@@ -1984,10 +1950,10 @@ async fn a_drop_then_add_of_the_same_field_replaces_it_with_the_new_type() {
 async fn add_an_existing_field_with_a_different_formula_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -2018,10 +1984,10 @@ async fn add_an_existing_field_with_a_different_formula_is_rejected() {
 async fn altering_a_field_that_does_not_exist_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -2060,10 +2026,10 @@ async fn altering_a_field_that_does_not_exist_is_rejected() {
 async fn add_and_alter_that_would_cycle_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, a AS m")
         .await
@@ -2109,7 +2075,7 @@ async fn persisted_source_columns(raw: &Client, target: &str) -> String {
 /// Defines `order_calc` over `a`, runs the pipeline and waits for it live.
 async fn live_order_calc(db: &testkit::TestDatabase, raw: &Client) -> Trellis {
     seed_orders(raw, 5).await;
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -2124,7 +2090,7 @@ async fn live_order_calc(db: &testkit::TestDatabase, raw: &Client) -> Trellis {
 async fn an_added_field_named_after_a_column_the_source_gained_is_refused_like_define() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let trellis = live_order_calc(&db, &raw).await;
     let version = persisted_definition_version(&raw, "order_calc").await;
 
@@ -2177,7 +2143,7 @@ async fn an_added_field_named_after_a_column_the_source_gained_is_refused_like_d
 async fn an_added_field_reading_a_column_the_source_dropped_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let trellis = live_order_calc(&db, &raw).await;
     let version = persisted_definition_version(&raw, "order_calc").await;
     let recorded = persisted_source_columns(&raw, "order_calc").await;
@@ -2215,7 +2181,7 @@ async fn an_added_field_reading_a_column_the_source_dropped_is_refused() {
 async fn an_added_field_can_read_a_column_the_source_gained_and_the_edit_records_it() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let trellis = live_order_calc(&db, &raw).await;
 
     raw.batch_execute("alter table orders add column c3 numeric; update orders set c3 = id * 10")
@@ -2259,7 +2225,7 @@ async fn an_added_field_can_read_a_column_the_source_gained_and_the_edit_records
 async fn an_edit_over_an_unchanged_schema_leaves_the_recorded_columns_alone() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     let trellis = live_order_calc(&db, &raw).await;
     let recorded = persisted_source_columns(&raw, "order_calc").await;
 
@@ -2276,14 +2242,14 @@ async fn an_edit_over_an_unchanged_schema_leaves_the_recorded_columns_alone() {
 async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resume() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table readings (id bigint primary key, x integer, y numeric); \
          insert into readings select s, s, s from generate_series(1, 3) s;",
     )
     .await
     .expect("seed readings");
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM reading_calc FROM readings SELECT x AS x, y AS y")
         .await
@@ -2298,7 +2264,7 @@ async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resum
     // until the pipeline restarts below, so the edits meet a live
     // definition over the retyped column.
     trellis.shutdown().await.expect("stop the pipeline");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = pipeline::definer(db.dsn()).await;
 
     raw.batch_execute("alter table readings alter column x type double precision")
         .await
@@ -2389,9 +2355,9 @@ async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resum
 async fn a_field_reading_a_column_the_source_dropped_is_dropped_by_an_edit_and_refuses_others() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
         .await
@@ -2402,7 +2368,7 @@ async fn a_field_reading_a_column_the_source_dropped_is_dropped_by_an_edit_and_r
     // No capture pass from here on, so nothing pauses the definition for
     // the dropped column before the edits below.
     trellis.shutdown().await.expect("stop the pipeline");
-    let trellis = define_only(db.dsn()).await;
+    let trellis = pipeline::definer(db.dsn()).await;
 
     raw.batch_execute("alter table orders drop column b")
         .await
@@ -2441,10 +2407,10 @@ async fn a_field_reading_a_column_the_source_dropped_is_dropped_by_an_edit_and_r
 async fn dropping_a_field_still_read_by_a_dependent_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
         .await
@@ -2503,10 +2469,10 @@ async fn dropping_a_field_still_read_by_a_dependent_is_refused() {
 async fn dropping_a_transform_names_the_specific_column_a_dependent_reads() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
         .await
@@ -2566,10 +2532,10 @@ async fn dropping_a_transform_names_the_specific_column_a_dependent_reads() {
 async fn dropping_a_field_read_by_a_downstream_aggregates_group_by_key_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 6).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
         .await
@@ -2633,7 +2599,7 @@ async fn dropping_a_field_read_by_a_downstream_aggregates_group_by_key_is_refuse
 async fn altering_an_aggregate_transform_is_unsupported() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
          insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
@@ -2643,7 +2609,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
 
     // The aggregate's build runs in the background; settling it here
     // brings the definition live without a running pipeline.
-    let trellis = define_only(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
     trellis
         .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
@@ -2664,10 +2630,10 @@ async fn altering_an_aggregate_transform_is_unsupported() {
 async fn altering_a_target_that_is_not_live_is_rejected() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     seed_orders(&raw, 5).await;
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
         .await
@@ -2706,7 +2672,7 @@ async fn altering_a_target_that_is_not_live_is_rejected() {
 async fn an_added_qualified_passthrough_of_a_reserved_word_column_is_a_copy() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table public.rw (id int primary key, val int, \"order\" bigint, \
                                  \"group\" varchar(8)); \
@@ -2715,7 +2681,7 @@ async fn an_added_qualified_passthrough_of_a_reserved_word_column_is_a_copy() {
     .await
     .expect("seed");
 
-    let definer = define_only(db.dsn()).await;
+    let definer = definer(db.dsn()).await;
     definer
         .apply("TRANSFORM edited FROM public.rw SELECT rw.val AS val")
         .await

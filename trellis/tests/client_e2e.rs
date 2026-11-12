@@ -17,33 +17,23 @@
 #[path = "support/sql_recompute.rs"]
 mod sql_recompute;
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
 use std::time::Duration;
 
 use sql_recompute::recompute;
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
+use tokio_postgres::Client;
+use trellis::config::DEFAULT_TARGET_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_definition, create_target_table, install_definition,
 };
 use trellis::pool::Pool;
 use trellis::{Client as TrellisClient, ClientOptions};
-
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) and pins
-/// `search_path`, matching `apply.rs`'s helper of the same name.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 /// Polls `predicate` on `interval` until it returns `true`, or panics with
 /// `message` once `timeout` elapses. Every wait in this file goes through
@@ -63,13 +53,6 @@ where
         }
         tokio::time::sleep(interval).await;
     }
-}
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
 }
 
 /// The transform this file exercises throughout: a 1-1 sum of two source

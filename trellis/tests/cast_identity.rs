@@ -10,22 +10,13 @@
 #[path = "support/wait_live.rs"]
 mod wait_live;
 
-use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::{Config, Trellis, TrellisOptions};
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
+use pipeline::connect;
+use testkit::TestCluster;
+use trellis::config::DEFAULT_TARGET_SCHEMA;
+use trellis::{Config, Trellis, TrellisOptions};
 
 /// The identity casts, each over the source column of its own type, beside
 /// the `numeric(12,2)` and `timestamp(3)` columns whose modifiers the cast
@@ -58,7 +49,7 @@ const TEXT_PAIRS: &[(&str, &str)] = &[
 async fn a_cast_to_the_operands_own_type_keeps_the_value_and_its_text() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table s (id bigint primary key, i2 smallint, i4 integer, i8 bigint, \
              n numeric(12,2), ts timestamp(3)); \
@@ -161,7 +152,7 @@ async fn a_cast_to_the_operands_own_type_keeps_the_value_and_its_text() {
 async fn a_sum_over_a_cast_to_the_columns_own_type_defines() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let raw = connect(db.dsn()).await;
     raw.batch_execute(
         "create table s (id bigint primary key, grp integer, qty bigint); \
          create index on s (grp); \

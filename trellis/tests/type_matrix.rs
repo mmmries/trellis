@@ -55,12 +55,12 @@
 mod drain_driver;
 
 use std::time::Duration;
+use trellis::staging::build::settle_builds;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use testkit::TestCluster;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{PgType, ValueType};
-use trellis::integer::IntWidth;
 use trellis::staging::apply;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{Config, SelfCheckMode, Trellis, TrellisOptions};
@@ -511,18 +511,8 @@ async fn settle_tolerant(d: &mut Driver) -> usize {
     failures
 }
 
-/// Claims, runs and finishes every pending backfill chunk, then settles the
-/// builds.
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
 async fn write(d: &Driver, sql: &str) {
     d.user().await.batch_execute(sql).await.expect(sql);
-}
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
 }
 
 /// One cell: a source, one definition named `c`, a seed, an alter, a write,
@@ -761,7 +751,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     let mut pauses = Vec::new();
     let mut trace = Vec::new();
     for _ in 0..8 {
-        run_backfill_chunks(d.pool()).await;
+        settle_builds(d.pool()).await;
         settle_tolerant(&mut d).await;
         let status = status_of(&trellis, "c").await;
         trace.push(status.clone());

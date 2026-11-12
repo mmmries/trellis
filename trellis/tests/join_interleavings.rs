@@ -60,7 +60,7 @@ mod drain_driver;
 
 use std::time::{Duration, Instant};
 
-use drain_driver::{Driver, RunningDrain};
+use drain_driver::{Driver, RunningDrain, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
@@ -84,10 +84,6 @@ const POINTS: [PausePoint; 7] = [
     PausePoint::AfterGroupUpsert,
     PausePoint::BeforeCommit,
 ];
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 /// The join key: `a.k = b.k`, or the pair `(t, k)`.
 #[derive(Debug, Clone, Copy, PartialEq)]

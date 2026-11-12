@@ -19,10 +19,8 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::build;
 
 const ONE: &str = "TRANSFORM s_one FROM public.s SELECT v AS v";
@@ -33,10 +31,6 @@ const SUMS: &str = "TRANSFORM u_sums FROM public.u GROUP BY g WITHOUT SOURCE IND
                     SELECT COUNT(*) AS n, SUM(v) AS total";
 const SUMS_ACTUAL: &str = "select g, n, total from public.u_sums order by g";
 const SUMS_EXPECTED: &str = "select g, count(*), sum(v) from public.u group by g order by g";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 async fn exec(d: &Driver, sql: &str) {
     d.user().await.batch_execute(sql).await.expect(sql);

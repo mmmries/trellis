@@ -15,14 +15,15 @@ mod drain_driver;
 #[path = "support/sql_recompute.rs"]
 mod sql_recompute;
 
+use drain_driver::pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 use sql_recompute::recompute;
 use testkit::{TestCluster, TestDatabase};
+use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
@@ -42,20 +43,6 @@ fn is_data_exception(err: &ApplyError) -> bool {
     }
 }
 
-/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
-/// `apply.rs`/`converge.rs`'s convention.
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
-
 async fn seal_active_segment(client: &mut Client) -> i64 {
     use trellis::staging::seal;
     let outcome = seal::seal_phase1_waiting(client).await;
@@ -72,13 +59,6 @@ async fn segment_state_is_drained(client: &Client, seg_seq: i64) -> bool {
         .expect("read segment state")
         .get(0);
     state == "drained"
-}
-
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
 }
 
 /// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every bare

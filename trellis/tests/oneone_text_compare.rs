@@ -11,20 +11,15 @@ mod drain_driver;
 
 use std::time::Duration;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{PgType, ValueType};
 use trellis::float::FloatWidth;
-use trellis::integer::IntWidth;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{Config, SelfCheckMode, Trellis, TrellisOptions};
 
 const COLLATION: &str = "create collation public.case_insensitive \
      (provider = icu, locale = 'und-u-ks-level2', deterministic = false);";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 async fn write(d: &Driver, sql: &str) {
     d.user().await.batch_execute(sql).await.expect(sql);

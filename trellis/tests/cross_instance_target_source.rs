@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ddl::DdlError;
 use trellis::defs::{CatalogError, ValueType, install_definition, tables_to_capture};
@@ -26,15 +26,7 @@ use trellis::{Config, migrate::migrate_with_pool};
 const INSTANCE_B: &str = "instance_b";
 
 async fn connect_raw(dsn: &str, schema: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {schema}, public"))
-        .await
-        .expect("set search_path");
-    client
+    testkit::connect_with(dsn, &format!("set search_path to {schema}, public")).await
 }
 
 fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {

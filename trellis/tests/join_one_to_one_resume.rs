@@ -19,7 +19,7 @@ mod drain_driver;
 
 use std::collections::HashMap;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
@@ -40,10 +40,6 @@ const SEED: &str = "insert into public.a \
                         from generate_series(1, 20) i; \
                     insert into public.b select i, i * 10, i * 100, 'k' || i \
                         from generate_series(1, 6) i";
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {

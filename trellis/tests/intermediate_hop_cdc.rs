@@ -15,24 +15,20 @@
 //! (`support/trigger_pipeline.rs`) so every hop lands in its own batch,
 //! rather than relying on seal timing.
 
+use pipeline::numeric_columns;
 use std::collections::HashMap;
 
 use trellis::capture::install::{Installed, installed};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::ValueType;
 use trellis::defs::install_definition;
 
 #[path = "support/trigger_pipeline.rs"]
 mod trigger_pipeline;
 
-use trigger_pipeline::Pipeline;
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
-}
+use trigger_pipeline::Pipeline;
 
 fn groups(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
     pairs

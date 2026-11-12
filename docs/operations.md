@@ -28,7 +28,7 @@ a row says so.
 | (no `capture_failure`, and no `backfill_failure`) | An operator ran `PAUSE TRANSFORM` | `RESUME` when you're ready |
 | (no `capture_failure`; the error is on `backfill_failure`) | Its build kept failing in a way no retry gets past: a chunk failure that is neither transient nor narrowed to a key, on its fifth charged attempt, or an aggregate's build, which can't be narrowed to a key ([A build that keeps failing](observability.md#a-build-that-keeps-failing)) | Fix what the error names, then `RESUME` |
 | `column <columns> of <table>, which this definition reads, was renamed or dropped` | A source column it reads was renamed or dropped; capture now leaves it out ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)). The staging worker drops the reason once the column is back | Restore the column, then `RESUME`; or `DROP TRANSFORM` and define it again |
-| `the primary key of <table> changed from (<columns>) to (<columns>)` | Its source's primary key was redefined, or another definition's resume re-recorded the table's key while this one ran. The staging worker drops the reason once the key is put back | `RESUME`, which rebuilds it over the new key, re-keying a 1-1 target in place first ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)) |
+| `the primary key of <table> changed from (<columns>) to (<columns>)` | Its source's primary key was redefined, or another definition's resume re-recorded the table's key while this one ran. The staging worker drops the reason once the key is put back | `RESUME`, which rebuilds it over the new key, re-keying a 1-1 target in place first ([`PAUSE` and `RESUME`](#pause-and-resume)) |
 | `no valid unique index backs KEY (<columns>) on <table> any more` | The unique index backing a declared `KEY (…)` was dropped or made invalid, so the table can take two rows with one key. The staging worker drops the reason once an index backs it | Create the index the message names (build a replacement before dropping the old one), then `RESUME`. On a partitioned table, re-run `ALTER INDEX … ATTACH PARTITION` for a repaired leaf's index |
 | `no valid index on <table> has led with (<columns>) in that order for 5 minutes` | A `MIN`/`MAX` field's probe index was missing on every staging worker pass for 5 minutes ([`extreme_index_gaps`](status-reference.md#extreme_index_gaps)). The staging worker drops the reason once the index exists | Create the index the message names, then `RESUME` |
 | `the unique key on the ON columns of <table> (<columns>) is gone` | A 1-1 `JOIN`'s joined table lost the unique key on its `ON` columns, so a row of the `FROM` table can match more than one of its rows | Create the unique index again (remove duplicates first), then `RESUME` |
@@ -48,7 +48,7 @@ a row says so.
 | `this release can't run transform <target>: …` | Its `floor` is above this release, or it was written under a newer grammar, or a newer release stored a value for it (its status, its build, a build chunk's kind, a build job's cursor tag or a partition correction's phase), or the partition tree of a source it reads, that this one doesn't know: a later release defined, rebuilt or ran it, and this one was rolled back to ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). Trellis pauses it when it attaches, when a background process takes over, and before each state-changing call, and never reads its text. Its target keeps its rows and stops updating; the rest of the instance runs | Roll forward to the release the message names or later, then `RESUME` it there, which rebuilds it, or `DROP` it there ([before rolling back](upgrading.md#before-rolling-back)) |
 | `the stored definition was written under grammar version <n>, and this binary reads grammar versions <oldest> and later`, or `the stored definition of transform <target> is refused by this release` | Its stored text is older than this release reads, or this release refuses it | `DROP TRANSFORM` and define it again in the current grammar |
 | `transform <target> was built by an earlier release over <table>'s key with its INCLUDE columns`, or `transform <target> reads <source>, which an earlier release built over …` | A release before 0.2.0 read a source key's `INCLUDE` columns (`primary key (id) include (x)`) as key columns, so the definition's target, ledger and staged keys are keyed by them too, as is a 1-1 transform reading its 1-1 target. The upgrade pauses each such definition once | `RESUME` (a reader's waits for its upstream's), which re-keys a 1-1 target in place (its rows, your indexes and grants stay; the former key column it no longer creates is dropped) and rebuilds; it refuses, naming them, while a view or index of yours depends on that column. Or `DROP TRANSFORM` and define it again |
-| `transform <target> reads <table>, which has no primary key`, `transform <target> reads <table>, whose primary key (<columns>) is deferrable`, or `<target> must name its key as KEY (...)` | An earlier release keyed it by a key Trellis no longer takes: a unique index it chose for a table with no primary key, or a deferrable primary key ([the key row](transforms.md#the-key-a-transform-keys-each-table-by)). The upgrade pauses it | Add the primary key the message names (not deferrable), then `RESUME`; or `DROP TRANSFORM` and define it again with a valid `KEY (…)` |
+| `transform <target> reads <table>, which has no primary key`, `transform <target> reads <table>, whose primary key (<columns>) is deferrable`, or `<target> must name its key as KEY (...)` | An earlier release keyed it by a key Trellis no longer takes: a unique index it chose for a table with no primary key, or a deferrable primary key ([the key entry](transforms.md#the-key-a-transform-keys-each-table-by)). The upgrade pauses it | Add the primary key the message names (not deferrable), then `RESUME`; or `DROP TRANSFORM` and define it again with a valid `KEY (…)` |
 | `the drain halted: …` or `the re-derive build of <target> couldn't start: …`, kind `halt` | A failure every key reproduces (a source key the drain can't use, a propagation wave past the hop bound, an aggregate the group basis can't apply, a read or write refused to a role Trellis runs as: a missing privilege, naming the role and the table, or row-level security), or a build start that fails the same way on every pass. It pauses the definitions it reaches and everything downstream of them ([A halting failure](observability.md#a-halting-failure)) | Fix the cause (grant the privilege, or `BYPASSRLS`), then `RESUME` each halted definition, in any order |
 
 A definition this release can't run gets that reason first, with any reason
@@ -84,7 +84,7 @@ Two more messages describe a paused definition's state rather than a reason:
 | `capture_wait` | Installing or widening capture is waiting for a table lock | Wait for the lock holder it names |
 | A `self_check` report with divergences | The target differs from a recompute of it | Find the gap in [known correctness gaps](known-correctness-gaps.md) and use its repair |
 | `version_handover`, and state-changing calls refused with the `version_handover` code | A Trellis process of another version is live on the instance: this version's background processes stand by and its changes refuse ([version handover](decisions/0023-version-handover.md)) | Stop the other version's processes; this version takes over within a standby poll (5 seconds), or the reclaim TTL (30 seconds) after a process killed without a clean shutdown ([rolling deploys](embedding.md#rolling-deploys)) |
-| `migrations_pending` with `cannot_run`, or `status()` refused with the `version_handover` code naming pending migrations | This version's migrations haven't run: a process of another version is still live, or this process's `migrate` was refused (`cannot_run` says why, often a role that can't alter Trellis's tables). Its background processes stand by, checking every 5 seconds, and try a refused `migrate` again a minute later | Stop the other version's processes; for a refusal, fix its cause or run `migrate` with a role that can ([upgrading](upgrading.md#upgrading)) |
+| `migrations_pending` with `cannot_run`, or `status()` refused with the `version_handover` code naming pending migrations | This version's migrations (or, naming none, its takeover work) haven't run: a process of another version is still live, or this process's `migrate` was refused (`cannot_run` says why, often a role that can't alter Trellis's tables). Its background processes stand by, checking every 5 seconds, and try a refused `migrate` again a minute later | Stop the other version's processes; for a refusal, fix its cause or run `migrate` with a role that can ([upgrading](upgrading.md#upgrading)) |
 | `below_catalog_floor`, and `migrate` and state-changing calls refused with the `version_floor` code | The catalog floor, the oldest Trellis version that can read the catalog, is above this version: a later release migrated the database ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). This version's background processes stand by meanwhile | Run the version the message names, or a later one ([the catalog floor](upgrading.md#the-catalog-floor)) |
 
 ## Repair tools
@@ -125,15 +125,6 @@ define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 * its target table is missing;
 * its ledger table is missing.
 
-It also refuses while a key it uses changed in a way it can't re-record: a
-table it reads has no primary key left to take, its target lost the index
-over its key, or re-keying a 1-1 target to its source's new key would take a
-column name the target already has, or drop a column or key constraint an
-object of yours depends on. A 1-1 definition whose source key changed while
-it was paused has its target re-keyed in place to the new key first, or the
-resume refuses naming what blocks it
-([the key row](transforms.md#the-key-a-transform-keys-each-table-by)).
-
 A `JOIN` has no ledger. Its resume drops and recreates its hidden tables
 instead, keeps the target, and rebuilds both sides and the target's groups
 from the sources, in one transaction, or per side and leaf when a side is a
@@ -148,6 +139,41 @@ refuses a field whose capture is still being widened.
 It also refuses while the definition is paused, so when one field's failures
 trip both its column fuse and the whole-transform fuse, run `RESUME TRANSFORM
 <target>` first and then `RESUME TRANSFORM <target>.<column>`.
+
+**A changed key.** A resume takes each table's key as define would now
+([transforms — the key](transforms.md#the-key-a-transform-keys-each-table-by)).
+An aggregate or `JOIN` reading a table by its primary key takes the primary
+key the table has now, for every transform that reads the table, and
+rebuilds; with no primary key left it refuses rather than take another unique
+index, until you add one. A `KEY (…)`'s columns never change: its resume refuses until a unique
+index backs them again. A target that lost the index over its key refuses
+until a unique index over exactly its key columns is created again
+(`UNIQUE NULLS NOT DISTINCT` if one can be `NULL`). Each refusal names the
+table, the key and the unique indexes it has.
+
+A 1-1 target is keyed by its source's key (a 1-1 `JOIN`'s, by its `FROM`
+table's), so its resume first re-keys the target in place to the new key,
+under the rebuild's lock, keeping the table, your indexes and grants:
+
+* A new key column the transform doesn't select is added as define copies
+  one (its type with no modifier, and its collation), which empties the
+  target until the rebuild.
+* A former key column it doesn't create is dropped, and the rows the
+  narrower key repeats are deleted until the rebuild writes them again. On a
+  plain 1-1 transform, `ALTER TRANSFORM … ADD <column> AS <column>` once it
+  is `live` adds it back as a field.
+* The primary key is replaced (`DROP CONSTRAINT …, ADD PRIMARY KEY (…)`).
+
+The pause message says which columns the resume will add and drop. The
+target's new key is recorded, which pauses the transforms reading the
+target, and their own resumes follow these rules over it. The re-key refuses,
+naming the conflict, while define would refuse the transform, when a new key
+column's name is taken by a column of the target that isn't a copy of it (a
+field of that name, or a column you added), and when a view, index or foreign
+key of yours depends on a column it would drop or on the key constraint it
+replaces. Drop the object it names, or drop or rename your column; for a
+field of the new key column's name, restore the key, resume, and rename the
+field with `ALTER TRANSFORM`; or `DROP TRANSFORM` and define it again.
 
 **What a resume changes.**
 

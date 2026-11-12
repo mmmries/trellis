@@ -26,10 +26,9 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::Config;
 use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
 use trellis::{Trellis, TrellisOptions};
@@ -88,10 +87,6 @@ async fn status_and_error(d: &Driver, target: &str) -> (String, Option<String>) 
         .expect("the build's jobs")
         .get(0);
     (status, error)
-}
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
 }
 
 // ------------------------------------------------------------------ plain 1-1

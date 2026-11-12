@@ -7,21 +7,9 @@
 //! implementation to.
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use testkit::connect_raw;
+use tokio_postgres::Client;
 use trellis::staging::{StagingError, retire, seal};
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn seal_and_fence(sealer: &mut Client) -> i64 {
     let outcome = seal::seal_phase1_waiting(sealer).await;

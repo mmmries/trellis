@@ -18,10 +18,8 @@ mod drain_driver;
 
 use std::time::{Duration, Instant};
 
-use drain_driver::Driver;
+use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ValueType;
-use trellis::integer::IntWidth;
 use trellis::staging::ApplyError;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::{HeartbeatDaemon, HeartbeatDaemonConfig, liveness};
@@ -34,10 +32,6 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
 /// The `a` rows on key 10: fewer than one fan-out chunk (the default), so
 /// its page recomputes them all in its own transaction.
 const KEY_ROWS: i64 = 25;
-
-fn int4() -> ValueType {
-    ValueType::Integer(IntWidth::Int4)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {

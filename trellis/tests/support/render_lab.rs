@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use testkit::TestDatabase;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{create_definition, create_target_table, parse, source_primary_key};
@@ -23,18 +23,11 @@ use trellis::staging::apply::{self, ApplyError};
 /// A raw connection with the session settings the engine's own text parity
 /// relies on.
 pub async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; \
-             set extra_float_digits to 3"
-        ))
-        .await
-        .expect("set search_path");
-    client
+    let setup = format!(
+        "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; \
+         set extra_float_digits to 3"
+    );
+    testkit::connect_with(dsn, &setup).await
 }
 
 pub async fn seal_active_segment(client: &mut Client) -> i64 {

@@ -12,18 +12,13 @@
 //! failure next time.
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::partitions::{Key, pinned_settings};
 use trellis::staging::partition_correction::{Route, RouteColumn, route_predicate};
 
 async fn connect(cluster: &TestCluster) -> (testkit::TestDatabase, Client) {
     let db = cluster.create_empty_database().await;
-    let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let client = testkit::connect_with(db.dsn(), "").await;
     (db, client)
 }
 
