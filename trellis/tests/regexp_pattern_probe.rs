@@ -6,26 +6,12 @@
 //! space.
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
 use trellis::defs::{FieldDef, assert_regexp_patterns_accepted, parse};
-use trellis::{Config, Trellis, TrellisOptions};
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
+use pipeline::{connect_with, definer};
 
 const SETUP: &str = "create table public.s (id int primary key, g int, txt text); \
      create table public.j (id int primary key, g int, name text)";
@@ -88,7 +74,7 @@ fn definitions(pattern: &str) -> Vec<(&'static str, String)> {
 async fn define_refuses_a_pattern_postgres_rejects_in_every_key_space() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(SETUP).await.expect("setup");
     let trellis = definer(db.dsn()).await;
     for pattern in PG_REJECTS {
@@ -113,7 +99,7 @@ async fn define_refuses_a_pattern_postgres_rejects_in_every_key_space() {
 async fn define_admits_a_pattern_only_postgres_accepts() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(SETUP).await.expect("setup");
     let trellis = definer(db.dsn()).await;
     for pattern in PG_ACCEPTS {
@@ -140,7 +126,7 @@ fn id(pattern: &str) -> String {
 async fn alter_refuses_a_pattern_postgres_rejects_and_admits_one_it_accepts() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(SETUP).await.expect("setup");
     let trellis = definer(db.dsn()).await;
     trellis
@@ -178,7 +164,7 @@ async fn alter_refuses_a_pattern_postgres_rejects_and_admits_one_it_accepts() {
 async fn resume_refuses_a_planted_pattern_postgres_rejects() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(SETUP).await.expect("setup");
     let trellis = definer(db.dsn()).await;
     for (space, text) in definitions("zzz") {
@@ -219,7 +205,7 @@ async fn resume_refuses_a_planted_pattern_postgres_rejects() {
 async fn a_refused_probe_leaves_the_callers_transaction_usable() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
+    let mut raw = connect_with(db.dsn(), "").await;
     let txn = raw.transaction().await.expect("begin");
     let bad = parse("TRANSFORM t FROM s SELECT REGEXP_COUNT(txt, '(?P<n>a)') AS n").expect("parse");
     let err = assert_regexp_patterns_accepted(&txn, &bad, None)
@@ -251,7 +237,7 @@ async fn a_refused_probe_leaves_the_callers_transaction_usable() {
 async fn a_probe_error_other_than_an_invalid_pattern_is_not_a_refusal() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
+    let mut raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(
         "create role regexp_probe_denied; \
          revoke execute on function pg_catalog.regexp_count(text, text) from public",
@@ -285,7 +271,7 @@ async fn a_probe_error_other_than_an_invalid_pattern_is_not_a_refusal() {
 async fn admitted_patterns_count_as_postgres_counts() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     let row = raw
         .query_one(
             "select regexp_count('abab', '(ab)\\1'), regexp_count('ab ac', 'a(?=b)'), \
@@ -308,7 +294,7 @@ async fn admitted_patterns_count_as_postgres_counts() {
 async fn which_refusal_a_resume_gets_over_an_unkeyed_source_depends_on_the_key_space() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(SETUP).await.expect("setup");
     let trellis = definer(db.dsn()).await;
     let spaces = definitions("zzz");

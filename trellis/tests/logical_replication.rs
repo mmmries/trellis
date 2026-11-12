@@ -18,25 +18,22 @@
 //! Nothing polls for convergence: every pass is stepped by hand, and
 //! no test waits for a subscription to apply anything.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use testkit::{StopMode, TestCluster};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 use trellis::defs::subscription::{Subscribed, subscribed};
 use trellis::intake::harness;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{CaptureFault, CatalogError, Divergence, SelfCheckOutcome, TrellisError};
 
-const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+use pipeline::{capture_pass, connect_with};
+
+const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
 /// `CREATE SUBSCRIPTION name` to `publication`, published in the database
 /// `conninfo` reaches, disabled and with no slot unless `options` says
@@ -87,7 +84,7 @@ fn found(table: &str, subscription: &str, enabled: bool) -> Option<Subscribed> {
 async fn the_check_reads_real_subscription_states_as_a_non_superuser() {
     let cluster = TestCluster::start();
     let db = cluster.create_empty_database().await;
-    let admin = connect(db.dsn()).await;
+    let admin = connect_with(db.dsn(), "").await;
     admin
         .batch_execute(
             "create role sub_reader login; \
@@ -98,7 +95,7 @@ async fn the_check_reads_real_subscription_states_as_a_non_superuser() {
         )
         .await
         .expect("tables, a publication and a non-superuser role");
-    let reader = connect(&db.dsn().replace("user=postgres", "user=sub_reader")).await;
+    let reader = connect_with(&db.dsn().replace("user=postgres", "user=sub_reader"), "").await;
     let check = |table: &'static str| {
         let reader = &reader;
         async move { subscribed(reader, table).await.expect("check") }
@@ -163,7 +160,7 @@ async fn the_check_reads_real_subscription_states_as_a_non_superuser() {
 
     // Another database subscribes to its own `public.t`.
     let other = cluster.create_empty_database().await;
-    let other_admin = connect(other.dsn()).await;
+    let other_admin = connect_with(other.dsn(), "").await;
     other_admin
         .batch_execute(&format!(
             "create table public.t (id int primary key); \
@@ -206,7 +203,7 @@ async fn the_check_reads_real_subscription_states_as_a_non_superuser() {
 async fn a_refresh_that_drops_the_table_from_the_subscription_clears_the_check() {
     let cluster = TestCluster::start();
     {
-        let admin = connect(&cluster.database_dsn("postgres")).await;
+        let admin = connect_with(&cluster.database_dsn("postgres"), "").await;
         admin
             .batch_execute("alter system set wal_level = logical")
             .await
@@ -215,7 +212,7 @@ async fn a_refresh_that_drops_the_table_from_the_subscription_clears_the_check()
     cluster.restart(StopMode::Fast);
     let publisher = cluster.create_empty_database().await;
     let subscriber = cluster.create_empty_database().await;
-    let pub_admin = connect(publisher.dsn()).await;
+    let pub_admin = connect_with(publisher.dsn(), "").await;
     pub_admin
         .batch_execute(
             "create table public.t (id int primary key); \
@@ -230,7 +227,7 @@ async fn a_refresh_that_drops_the_table_from_the_subscription_clears_the_check()
         .batch_execute("select pg_create_logical_replication_slot('s_live', 'pgoutput')")
         .await
         .expect("a slot for the subscription");
-    let admin = connect(subscriber.dsn()).await;
+    let admin = connect_with(subscriber.dsn(), "").await;
     admin
         .batch_execute(&format!(
             "create role sub_reader login; \
@@ -242,7 +239,11 @@ async fn a_refresh_that_drops_the_table_from_the_subscription_clears_the_check()
         ))
         .await
         .expect("an enabled subscription");
-    let reader = connect(&subscriber.dsn().replace("user=postgres", "user=sub_reader")).await;
+    let reader = connect_with(
+        &subscriber.dsn().replace("user=postgres", "user=sub_reader"),
+        "",
+    )
+    .await;
     assert_eq!(
         subscribed(&reader, "public.t").await.expect("check"),
         found("public.t", "s_live", true)
@@ -287,7 +288,7 @@ struct Instance {
 
 async fn instance(cluster: &TestCluster) -> Instance {
     let db = cluster.create_empty_database().await;
-    let admin = connect(db.dsn()).await;
+    let admin = connect_with(db.dsn(), "").await;
     admin
         .batch_execute(&format!(
             "create role sub_trellis login; \
@@ -312,7 +313,7 @@ async fn instance(cluster: &TestCluster) -> Instance {
     trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the login role");
-    let raw = connect(&dsn).await;
+    let raw = connect_with(&dsn, "").await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
         .expect("set search_path");
@@ -393,22 +394,6 @@ async fn defining_refuses_a_table_a_subscription_replicates_into() {
         .await
         .expect("accepted once nothing replicates into the joined side");
     it.trellis.shutdown().await.expect("shutdown");
-}
-
-/// The capture half of one staging-worker pass.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = trellis::capture::reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
 async fn status(trellis: &trellis::Trellis, target: &str) -> trellis::DefinitionStatus {

@@ -6,19 +6,16 @@
 //! every check is a catalog read or an `apply` call.
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::partition_tree::{
     PartitionRefusal, PartitionTree, Strategy, read_partition_tree, server_version_num,
 };
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect_with;
 
 struct Instance {
     db: TestDatabase,
@@ -28,7 +25,7 @@ struct Instance {
 
 async fn instance(cluster: &TestCluster, ddl: &str) -> Instance {
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(ddl)
         .await
         .expect("the application's tables");

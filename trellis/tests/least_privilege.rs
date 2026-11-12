@@ -38,24 +38,21 @@
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{
     ClientOptions, Config, DefinitionStatus, SelfCheckOutcome, TransformStatus, Trellis,
     TrellisOptions,
 };
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect_with;
+
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 const TARGETS: &str = "trellis_targets";
 const WAIT: Duration = Duration::from_secs(60);
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
 
 /// Every `WARN` or `ERROR` event logged on any thread, so a privilege
 /// refusal a background worker logs and retries is still seen.
@@ -319,7 +316,7 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     logged::install();
     let cluster = TestCluster::start();
     let db = cluster.create_empty_database().await;
-    let admin = connect(db.dsn()).await;
+    let admin = connect_with(db.dsn(), "").await;
     set_up(&admin, db.name()).await;
 
     let dsn = as_role(db.dsn(), "trellis");
@@ -344,7 +341,7 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
         },
     )
     .expect("start the staging and drain workers as the Trellis role");
-    let app = connect(&as_role(db.dsn(), "app")).await;
+    let app = connect_with(&as_role(db.dsn(), "app"), "").await;
 
     // Define a 1-1, an aggregate and a two-table JOIN transform.
     apply(

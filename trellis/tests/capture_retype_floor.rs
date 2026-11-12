@@ -11,23 +11,14 @@
 //! nothing waits for convergence.
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 use trellis::{Config, Trellis, TrellisOptions};
 
-const SCHEMA: &str = "trellis";
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
+use pipeline::connect;
 
 /// A handle running as 0.3.0, in which the identity integer cast arrived.
 async fn later_release(dsn: &str) -> Trellis {
@@ -44,9 +35,7 @@ async fn later_release(dsn: &str) -> Trellis {
 
 /// One staging-worker pass, with the handle's floors.
 async fn pass(raw: &mut Client, trellis: &Trellis) {
-    trellis::client::reconcile_pass(raw, trellis.pool(), SCHEMA)
-        .await
-        .expect("reconcile pass");
+    pipeline::reconcile_pass(raw, trellis.pool()).await;
 }
 
 /// Runs every queued build to completion by hand, so the definitions are

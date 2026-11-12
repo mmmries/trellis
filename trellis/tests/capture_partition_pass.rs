@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::partitions::{self, PendingCorrection};
 use trellis::capture::reconcile::PassOutcome;
 use trellis::config::DEFAULT_SCHEMA;
@@ -18,19 +18,12 @@ use trellis::intake::harness;
 use trellis::staging::apply::ApplyError;
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
-const SOURCE: &str = "public.items";
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
+use pipeline::connect;
+
+const SOURCE: &str = "public.items";
 
 struct Instance {
     db: TestDatabase,
@@ -91,17 +84,7 @@ async fn instance(cluster: &TestCluster, tree: &str) -> Instance {
 
 /// The capture half of one staging-worker pass.
 async fn pass(raw: &mut Client, pool: &trellis::pool::Pool) -> PassOutcome {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    trellis::capture::reconcile::reconcile(
-        raw,
-        DEFAULT_SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .expect("capture pass")
+    pipeline::capture_pass_within(raw, pool, Duration::from_secs(5)).await
 }
 
 async fn clean_pass(it: &mut Instance) -> PassOutcome {

@@ -3,127 +3,14 @@
 //! group-basis knob, which is process-wide and would change every aggregate
 //! build in `capture_disruption.rs`.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
-
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
 
-const SCHEMA: &str = "trellis";
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_disruption_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_disruption_test",
-            1,
-            "trellis_capture_missed_ddl_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-/// Every definition's status, by bare target name.
-async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
-    raw.query(
-        "select split_part(target_table, '.', 2), status from transform_definitions",
-        &[],
-    )
-    .await
-    .expect("read statuses")
-    .into_iter()
-    .map(|row| {
-        (
-            row.get(0),
-            trellis::defs::StoredStatus::from_persisted(row.get(1))
-                .expect("a stored status")
-                .into(),
-        )
-    })
-    .collect()
-}
-
-/// Alternates staging-worker passes, builds and drains until every
-/// definition is live: a bounded number of explicit steps.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
-    for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let statuses = statuses(raw).await;
-        if statuses.values().all(|s| *s == TransformStatus::Live) {
-            return;
-        }
-    }
-    panic!("not every definition went live: {:?}", statuses(raw).await);
-}
+use pipeline::{bring_live_all, capture_pass, connect, definer};
 
 /// The table-gone case for a `JOIN`'s joined table: it pauses its reader (the
 /// 1-1 and aggregate sources are the matrix's). A `JOIN`'s joined table once
@@ -148,7 +35,7 @@ async fn a_gone_joined_table_pauses_its_readers() {
         )
         .await
         .expect("define jl");
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     app.batch_execute("drop table public.jb")
         .await

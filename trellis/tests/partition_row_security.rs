@@ -23,7 +23,7 @@
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 use trellis::defs::chunk_queue;
 use trellis::staging::build::{self, WorkerOptions};
@@ -32,15 +32,12 @@ use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{apply, seal};
 use trellis::{SelfCheckOutcome, Trellis};
 
-const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+use pipeline::connect_with;
+
+const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
 struct Instance {
     _db: testkit::TestDatabase,
@@ -56,7 +53,7 @@ struct Instance {
 /// capture.
 async fn instance(cluster: &TestCluster) -> Instance {
     let db = cluster.create_empty_database().await;
-    let admin = connect(db.dsn()).await;
+    let admin = connect_with(db.dsn(), "").await;
     admin
         .batch_execute(&format!(
             "create role rls_trellis login; \
@@ -79,7 +76,7 @@ async fn instance(cluster: &TestCluster) -> Instance {
     trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the login role");
-    let raw = connect(&dsn).await;
+    let raw = connect_with(&dsn, "").await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
         .expect("set search_path");

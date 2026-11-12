@@ -31,22 +31,15 @@ use std::collections::BTreeMap;
 
 use testkit::TestCluster;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, IsolationLevel, NoTls};
+use tokio_postgres::{Client, IsolationLevel};
 use trellis::capture::install::{self, Progress};
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 
 /// `public.t (id bigint primary key, g int, a int)` holding `(1..=10, i, i)`,
 /// captured imaging `g` and `a`.

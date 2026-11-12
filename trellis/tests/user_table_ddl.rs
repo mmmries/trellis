@@ -15,9 +15,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use tokio_postgres::Client;
 use trellis::locks::{DdlRetry, USER_TABLE_DDL_LOCK_TIMEOUT, set_local_lock_timeout};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect;
 
 /// How long the `CREATE TRIGGER` test holds the lock the DDL needs.
 const HOLD: Duration = Duration::from_secs(2);
@@ -28,18 +32,6 @@ async fn backend_pid(client: &Client) -> i32 {
         .await
         .expect("pid")
         .get(0)
-}
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
 }
 
 /// Inserts into `public.t` one row at a time until `stop`.
