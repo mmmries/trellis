@@ -32,10 +32,6 @@ const SUMS: &str = "TRANSFORM u_sums FROM public.u GROUP BY g WITHOUT SOURCE IND
 const SUMS_ACTUAL: &str = "select g, n, total from public.u_sums order by g";
 const SUMS_EXPECTED: &str = "select g, count(*), sum(v) from public.u group by g order by g";
 
-async fn exec(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 async fn settle(d: &mut Driver) {
     let pool = d.pool().clone();
     for _ in 0..2 {
@@ -65,8 +61,7 @@ async fn a_released_definition_over_a_table_with_no_primary_key_takes_its_index_
         &["public.s", "public.u"],
     )
     .await;
-    exec(
-        &d,
+    d.write(
         "insert into public.s values (1, 10), (2, 20); \
          insert into public.u values (1, 1, 1, 5), (2, 2, 1, 6), (3, null, 2, 7)",
     )
@@ -77,8 +72,7 @@ async fn a_released_definition_over_a_table_with_no_primary_key_takes_its_index_
 
     // What an earlier release left: both tables lost their primary key,
     // and the catalog has no key records.
-    exec(
-        &d,
+    d.write(
         "alter table public.s drop constraint s_pkey; \
          alter table public.u drop constraint u_pkey",
     )
@@ -125,8 +119,7 @@ async fn a_released_definition_over_a_table_with_no_primary_key_takes_its_index_
         reasons[0]
     );
 
-    exec(
-        &d,
+    d.write(
         "insert into public.s values (3, 30); update public.s set v = 21 where id = 2; \
          delete from public.s where id = 1",
     )
@@ -136,7 +129,7 @@ async fn a_released_definition_over_a_table_with_no_primary_key_takes_its_index_
     assert_eq!(d.rows(ONE_ACTUAL).await, d.rows(ONE_EXPECTED).await);
 
     // The remedy: a primary key, then RESUME.
-    exec(&d, "alter table public.u add primary key (id)").await;
+    d.write("alter table public.u add primary key (id)").await;
     trellis::staging::quarantine::resume_transform(d.pool(), "u_sums")
         .await
         .expect("resume");
@@ -173,15 +166,13 @@ async fn a_released_one_to_one_whose_dropped_key_differs_from_the_chosen_index_p
         &["public.s", "public.u"],
     )
     .await;
-    exec(
-        &d,
+    d.write(
         "insert into public.s values (1, 10, 100), (2, 20, 200); \
          insert into public.u values (1, 10, 1, 5), (2, 20, 1, 6), (3, 30, 2, 7)",
     )
     .await;
     d.settle().await;
-    exec(
-        &d,
+    d.write(
         "alter table public.s drop constraint s_pkey; \
          alter table public.u drop constraint u_pkey",
     )
@@ -222,8 +213,7 @@ async fn a_released_one_to_one_whose_dropped_key_differs_from_the_chosen_index_p
         reasons[0]
     );
 
-    exec(
-        &d,
+    d.write(
         "update public.s set v = 101 where id = 1; update public.s set n = 99 where id = 2; \
          insert into public.s values (3, 30, 300); \
          update public.u set g = 2 where id = 1; update public.u set n = 99 where id = 2; \
@@ -234,7 +224,7 @@ async fn a_released_one_to_one_whose_dropped_key_differs_from_the_chosen_index_p
     assert_eq!(d.rows(SUMS_ACTUAL).await, d.rows(SUMS_EXPECTED).await);
 
     // The remedy the message names.
-    exec(&d, "alter table public.s add primary key (id)").await;
+    d.write("alter table public.s add primary key (id)").await;
     trellis::staging::quarantine::resume_transform(d.pool(), "s_one")
         .await
         .expect("resume");
@@ -244,7 +234,7 @@ async fn a_released_one_to_one_whose_dropped_key_differs_from_the_chosen_index_p
         ["(public.s_one,live)", "(public.u_sums,live)"]
     );
     assert_eq!(d.rows(BY_N_ACTUAL).await, d.rows(BY_N_EXPECTED).await);
-    exec(&d, "update public.s set v = 102 where id = 1").await;
+    d.write("update public.s set v = 102 where id = 1").await;
     settle(&mut d).await;
     assert_eq!(d.rows(BY_N_ACTUAL).await, d.rows(BY_N_EXPECTED).await);
 }
@@ -269,8 +259,7 @@ async fn a_released_definition_over_a_deferrable_primary_key_pauses() {
         &["public.s", "public.u"],
     )
     .await;
-    exec(
-        &d,
+    d.write(
         "insert into public.s values (1, 10), (2, 20); \
          insert into public.u values (1, 1, 1, 5), (2, 2, 1, 6), (3, null, 2, 7)",
     )
@@ -279,8 +268,7 @@ async fn a_released_definition_over_a_deferrable_primary_key_pauses() {
 
     // What an earlier release left: definitions over deferrable primary
     // keys (in both modes), and no key records.
-    exec(
-        &d,
+    d.write(
         "alter table public.s drop constraint s_pkey, \
              add primary key (id) deferrable initially immediate; \
          alter table public.u drop constraint u_pkey, \
@@ -341,8 +329,7 @@ async fn a_released_definition_over_a_deferrable_primary_key_pauses() {
     );
 
     // The remedy: recreate each key not deferrable, then RESUME.
-    exec(
-        &d,
+    d.write(
         "alter table public.s drop constraint s_pkey, add primary key (id); \
          alter table public.u drop constraint u_pkey, add primary key (id); \
          insert into public.s values (3, 30); update public.u set v = 60 where id = 2",
@@ -385,8 +372,7 @@ async fn a_released_join_over_a_deferrable_key_and_a_table_with_none_takes_both(
         &["public.a", "public.b"],
     )
     .await;
-    exec(
-        &d,
+    d.write(
         "insert into public.b values (1), (2); \
          insert into public.a values (1, 1, 1), (2, 1, 2), (3, 2, 1)",
     )
@@ -394,8 +380,7 @@ async fn a_released_join_over_a_deferrable_key_and_a_table_with_none_takes_both(
     d.settle().await;
     assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
 
-    exec(
-        &d,
+    d.write(
         "alter table public.a drop constraint a_pkey, add primary key (id) deferrable; \
          alter table public.b drop constraint b_pkey",
     )
@@ -426,8 +411,7 @@ async fn a_released_join_over_a_deferrable_key_and_a_table_with_none_takes_both(
         "{reasons:?}"
     );
 
-    exec(
-        &d,
+    d.write(
         "alter table public.a drop constraint a_pkey, add primary key (id); \
          insert into public.a values (4, 2, 2)",
     )
@@ -460,7 +444,8 @@ async fn a_released_definition_with_a_label_over_63_bytes_pauses_rather_than_sto
         &["public.s"],
     )
     .await;
-    exec(&d, "insert into public.s values (1, 10), (2, 20)").await;
+    d.write("insert into public.s values (1, 10), (2, 20)")
+        .await;
     d.settle().await;
 
     // What 0.1.0 left: the label as written, under grammar 1, and the
@@ -474,7 +459,7 @@ async fn a_released_definition_with_a_label_over_63_bytes_pauses_rather_than_sto
         )
         .await
         .expect("store the released text");
-    exec(&d, "alter table public.s drop constraint s_pkey").await;
+    d.write("alter table public.s drop constraint s_pkey").await;
     d.ctl
         .batch_execute("delete from definition_keys")
         .await
@@ -505,7 +490,7 @@ async fn a_released_definition_with_a_label_over_63_bytes_pauses_rather_than_sto
         reasons[0]
     );
     // Every definition still loads, and the sibling follows its source.
-    exec(&d, "insert into public.s values (3, 30)").await;
+    d.write("insert into public.s values (3, 30)").await;
     settle(&mut d).await;
     assert_eq!(d.rows(ONE_ACTUAL).await, d.rows(ONE_EXPECTED).await);
 }

@@ -42,10 +42,6 @@ async fn start() -> Driver {
     .await
 }
 
-async fn exec(d: &Driver, sql: &str) {
-    d.user().await.batch_execute(sql).await.expect(sql);
-}
-
 async fn hidden(d: &Driver) -> String {
     let id = d
         .rows("select id from transform_definitions where target_table = 'public.agg'")
@@ -178,7 +174,8 @@ async fn an_aggregate_field_reading_another_field_by_name_converges() {
 async fn a_page_still_to_apply_is_not_caught_up_rather_than_diverged() {
     let mut d = start().await;
     d.step("insert into public.src values (1, 1, 10)").await;
-    exec(&d, "insert into public.src values (2, 1, 5), (3, 2, 1)").await;
+    d.write("insert into public.src values (2, 1, 5), (3, 2, 1)")
+        .await;
     let batch = d.seal().await;
     let page = check_page(
         d.pool(),
@@ -208,10 +205,9 @@ async fn a_hand_edited_partial_is_reported_until_it_is_restored() {
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();
 
-    exec(
-        &d,
-        &format!("update {hidden} set __sum_1 = __sum_1 + 1 where g = 1"),
-    )
+    d.write(&format!(
+        "update {hidden} set __sum_1 = __sum_1 + 1 where g = 1"
+    ))
     .await;
     let (found, _, _) = walk(&d, 10).await;
     // The visible row, which the partials now disagree with, is reported too.
@@ -223,20 +219,20 @@ async fn a_hand_edited_partial_is_reported_until_it_is_restored() {
         ]
     );
 
-    exec(
-        &d,
-        &format!("update {hidden} set __sum_1 = __sum_1 - 1 where g = 1"),
-    )
+    d.write(&format!(
+        "update {hidden} set __sum_1 = __sum_1 - 1 where g = 1"
+    ))
     .await;
     assert_eq!(walk(&d, 10).await.0, []);
 
     // The visible row against the partials, in the same walk.
-    exec(&d, "update public.agg set total = 99 where g = 2").await;
+    d.write("update public.agg set total = 99 where g = 2")
+        .await;
     assert_eq!(
         walk(&d, 1).await.0,
         [cell("2", "total", Some("99"), Some("7"))]
     );
-    exec(&d, "update public.agg set total = 7 where g = 2").await;
+    d.write("update public.agg set total = 7 where g = 2").await;
     assert_eq!(walk(&d, 1).await.0, []);
 }
 
@@ -251,8 +247,9 @@ async fn missing_extra_and_stale_groups_are_reported() {
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();
 
-    exec(&d, "delete from public.agg where g = 1").await;
-    exec(&d, "insert into public.agg (g, total, n) values (9, 1, 1)").await;
+    d.write("delete from public.agg where g = 1").await;
+    d.write("insert into public.agg (g, total, n) values (9, 1, 1)")
+        .await;
     let (found, _, _) = walk(&d, 2).await;
     assert!(
         found.contains(&Divergence::MissingRow { key: "1".into() }),
@@ -265,11 +262,10 @@ async fn missing_extra_and_stale_groups_are_reported() {
     assert_eq!(found.len(), 2, "{found:?}");
 
     // A group the source never had, in the hidden table with a count.
-    exec(&d, "delete from public.agg where g = 9").await;
-    exec(
-        &d,
-        &format!("insert into {hidden} (g, __n, __count_1, __sum_1) values (8, 1, 1, 3)"),
-    )
+    d.write("delete from public.agg where g = 9").await;
+    d.write(&format!(
+        "insert into {hidden} (g, __n, __count_1, __sum_1) values (8, 1, 1, 3)"
+    ))
     .await;
     let (found, _, _) = walk(&d, 3).await;
     let key = "8";
@@ -290,7 +286,8 @@ async fn missing_extra_and_stale_groups_are_reported() {
 
     // The same group with its visible row: the partials and the target
     // agree with each other, so only the source says the row is extra.
-    exec(&d, "insert into public.agg (g, total, n) values (8, 3, 1)").await;
+    d.write("insert into public.agg (g, total, n) values (8, 3, 1)")
+        .await;
     let (found, _, _) = walk(&d, 3).await;
     assert!(
         found.contains(&Divergence::ExtraRow { key: key.into() }),
@@ -315,12 +312,10 @@ async fn a_write_made_while_capture_was_off_is_reported() {
     let mut d = start().await;
     d.step("insert into public.src values (1, 1, 10), (2, 2, 5)")
         .await;
-    exec(
-        &d,
-        "alter table public.src disable trigger trellis_capture_insert",
-    )
-    .await;
-    exec(&d, "insert into public.src values (3, 1, 100), (4, 3, 1)").await;
+    d.write("alter table public.src disable trigger trellis_capture_insert")
+        .await;
+    d.write("insert into public.src values (3, 1, 100), (4, 3, 1)")
+        .await;
     let off = check_page(
         d.pool(),
         "agg",
@@ -340,11 +335,8 @@ async fn a_write_made_while_capture_was_off_is_reported() {
         ),
         other => panic!("expected the capture fault, got {other:?}"),
     }
-    exec(
-        &d,
-        "alter table public.src enable always trigger trellis_capture_insert",
-    )
-    .await;
+    d.write("alter table public.src enable always trigger trellis_capture_insert")
+        .await;
     d.settle().await;
 
     let (found, _, _) = walk(&d, 10).await;
@@ -408,11 +400,8 @@ async fn composite_keys_with_null_parts_and_expression_arguments() {
         assert_eq!(compared, 5, "four live groups and an emptied one");
     }
 
-    exec(
-        &d,
-        "update public.agg set sb = 99 where g = 1 and h is null",
-    )
-    .await;
+    d.write("update public.agg set sb = 99 where g = 1 and h is null")
+        .await;
     let (found, _, _) = walk(&d, 2).await;
     assert!(
         matches!(found.as_slice(), [Divergence::Cell { column, persisted, .. }]
@@ -447,7 +436,8 @@ async fn a_key_on_one_side_only_is_reported_alike_at_every_page_size() {
     };
 
     // Only the target has group 15.
-    exec(&d, "insert into public.agg (g, total, n) values (15, 1, 1)").await;
+    d.write("insert into public.agg (g, total, n) values (15, 1, 1)")
+        .await;
     let mut found = Vec::new();
     for limit in [1, 2, 3, 100] {
         found.push(walk(&d, limit).await.0);
@@ -456,20 +446,14 @@ async fn a_key_on_one_side_only_is_reported_alike_at_every_page_size() {
         same_at_every_limit(found),
         [Divergence::ExtraRow { key: "15".into() }]
     );
-    exec(&d, "delete from public.agg where g = 15").await;
+    d.write("delete from public.agg where g = 15").await;
 
     // Only the source has group 15.
-    exec(
-        &d,
-        "alter table public.src disable trigger trellis_capture_insert",
-    )
-    .await;
-    exec(&d, "insert into public.src values (5, 15, 7)").await;
-    exec(
-        &d,
-        "alter table public.src enable always trigger trellis_capture_insert",
-    )
-    .await;
+    d.write("alter table public.src disable trigger trellis_capture_insert")
+        .await;
+    d.write("insert into public.src values (5, 15, 7)").await;
+    d.write("alter table public.src enable always trigger trellis_capture_insert")
+        .await;
     d.settle().await;
     let mut found = Vec::new();
     for limit in [1, 2, 3, 100] {
@@ -518,15 +502,11 @@ async fn ring_rows_not_applied_yet_are_subtracted_from_the_source() {
     d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7), (4, null, 1),                                        (5, 3, 2)",
     )
     .await;
-    exec(
-        &d,
-        "insert into public.src values (6, 1, 1), (7, 4, 3);          update public.src set g = 2 where id = 2;          update public.src set v = null where id = 1",
+    d.write("insert into public.src values (6, 1, 1), (7, 4, 3);          update public.src set g = 2 where id = 2;          update public.src set v = null where id = 1",
     )
     .await;
     let sealed = d.seal().await;
-    exec(
-        &d,
-        "delete from public.src where id = 5;          update public.src set g = null, v = 9 where id = 3;          insert into public.src values (8, 5, 4);          update public.src set v = v + 1 where id = 8",
+    d.write("delete from public.src where id = 5;          update public.src set g = null, v = 9 where id = 3;          insert into public.src values (8, 5, 4);          update public.src set v = v + 1 where id = 8",
     )
     .await;
     for limit in [1, 2, 100] {
@@ -553,9 +533,9 @@ async fn ring_rows_not_applied_yet_are_subtracted_from_the_source() {
 async fn a_group_of_negative_count_has_no_row_to_miss() {
     let mut d = start().await;
     d.step("insert into public.src values (1, 1, 10)").await;
-    exec(&d, "insert into public.src values (2, 2, 5)").await;
+    d.write("insert into public.src values (2, 2, 5)").await;
     let insertion = d.seal().await;
-    exec(&d, "delete from public.src where id = 2").await;
+    d.write("delete from public.src where id = 2").await;
     let deletion = d.seal().await;
     d.drain(deletion, "early").await;
     let hidden = hidden(&d).await;
@@ -587,16 +567,12 @@ async fn a_planted_error_on_a_group_with_pending_changes_is_reported_exactly() {
         .await;
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();
-    exec(
-        &d,
-        &format!("update {hidden} set __sum_1 = __sum_1 + 1000000 where g = 1"),
-    )
+    d.write(&format!(
+        "update {hidden} set __sum_1 = __sum_1 + 1000000 where g = 1"
+    ))
     .await;
-    exec(
-        &d,
-        "insert into public.src values (4, 1, 100); update public.src set v = 6 where id = 2",
-    )
-    .await;
+    d.write("insert into public.src values (4, 1, 100); update public.src set v = 6 where id = 2")
+        .await;
     let (found, uncertain, all) = compare(&d, 10).await;
     assert_eq!(
         found,
@@ -659,7 +635,7 @@ async fn a_held_keys_parked_and_pending_changes_are_subtracted() {
         "the change was parked"
     );
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
-    exec(&d, "update public.src set g = 3 where id = 1").await;
+    d.write("update public.src set g = 3 where id = 1").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
     let batch = d.seal().await;
     d.drain(batch, "parks").await;
@@ -923,7 +899,7 @@ async fn a_pending_truncate_leaves_every_group_uncertain() {
     let mut d = start().await;
     d.step("insert into public.src values (1, 1, 10), (2, 2, 20)")
         .await;
-    exec(&d, "truncate public.src").await;
+    d.write("truncate public.src").await;
     let (_, _, all) = compare(&d, 10).await;
     assert!(all);
     d.settle().await;
@@ -939,20 +915,17 @@ async fn a_pending_change_a_groups_basis_saw_is_not_subtracted() {
     let mut d = start().await;
     d.step("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)")
         .await;
-    exec(&d, "insert into public.src values (4, 1, 100)").await;
+    d.write("insert into public.src values (4, 1, 100)").await;
     let batch = d.seal().await;
     let hidden = hidden(&d).await;
-    exec(
-        &d,
-        &format!(
-            "update {hidden} set __n = 3, __count_1 = 3, __sum_1 = 115, \
+    d.write(&format!(
+        "update {hidden} set __n = 3, __count_1 = 3, __sum_1 = 115, \
                  __basis = pg_current_snapshot() where g = 1; \
              update public.agg set total = 115, n = 3 where g = 1"
-        ),
-    )
+    ))
     .await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
-    exec(&d, "insert into public.src values (5, 1, 1)").await;
+    d.write("insert into public.src values (5, 1, 1)").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
     d.drain(batch, "refuses").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
@@ -969,13 +942,11 @@ async fn a_pending_change_a_groups_basis_saw_is_not_subtracted() {
 async fn a_pending_change_at_or_below_the_truncate_floor_is_not_subtracted() {
     let mut d = start().await;
     d.step("insert into public.src values (1, 1, 10)").await;
-    exec(&d, "insert into public.src values (2, 1, 5), (3, 2, 7)").await;
+    d.write("insert into public.src values (2, 1, 5), (3, 2, 7)")
+        .await;
     let before = d.seal().await;
-    exec(
-        &d,
-        "truncate public.src; insert into public.src values (4, 2, 1)",
-    )
-    .await;
+    d.write("truncate public.src; insert into public.src values (4, 2, 1)")
+        .await;
     let truncate = d.seal().await;
     d.drain(truncate, "a").await;
     assert_eq!(
@@ -1015,11 +986,8 @@ async fn groups_page_in_their_key_order_with_the_null_group_last() {
     // A planted divergence on the group after the `9` boundary is reported
     // once, in the numeric order.
     let hidden = hidden(&d).await;
-    exec(
-        &d,
-        &format!("update {hidden} set __n = __n + 1 where g = 10"),
-    )
-    .await;
+    d.write(&format!("update {hidden} set __n = __n + 1 where g = 10"))
+        .await;
     let (found, _, _) = walk(&d, 3).await;
     assert!(!found.is_empty(), "{found:?}");
     assert!(
@@ -1057,7 +1025,7 @@ async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_grou
     };
     let without = explain(&d).await;
     assert!(!without.contains("src_g_idx"), "{without}");
-    exec(&d, "create index src_g_idx on public.src (g)").await;
+    d.write("create index src_g_idx on public.src (g)").await;
     let with = explain(&d).await;
     assert!(
         with.contains("Index Scan using src_g_idx on src"),
@@ -1097,11 +1065,8 @@ async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
         ("src_ghv", "g, h, v"),
         ("src_back", "g desc, h desc"),
     ] {
-        exec(
-            &d,
-            &format!("create index {name} on public.src ({columns})"),
-        )
-        .await;
+        d.write(&format!("create index {name} on public.src ({columns})"))
+            .await;
         let pool = d.pool().clone();
         let plan = trellis::staging::self_check::explain_page(&pool, "agg", Some("5\u{1f}5"), 3)
             .await
@@ -1119,7 +1084,7 @@ async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
             !plan.contains("HashAggregate"),
             "index ({columns}):\n{plan}"
         );
-        exec(&d, &format!("drop index public.{name}")).await;
+        d.write(&format!("drop index public.{name}")).await;
     }
 }
 
@@ -1154,8 +1119,7 @@ async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_witho
     // Pending: a group emptied (only the ring still holds its rows), a new
     // group (only in the source and the ring), and a row moved into the
     // `NULL` region.
-    exec(
-        &d,
+    d.write(
         "delete from public.src where g = 2 and h = 9; \
          insert into public.src values (100, 3, null, 1), (101, null, 5, 2); \
          update public.src set g = null, h = null where id = 6",
@@ -1163,7 +1127,8 @@ async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_witho
     .await;
     for indexed in [false, true] {
         if indexed {
-            exec(&d, "create index src_g_h_idx on public.src (g, h)").await;
+            d.write("create index src_g_h_idx on public.src (g, h)")
+                .await;
         }
         for limit in [1, 2, 3, 4, 100] {
             assert_eq!(
@@ -1173,11 +1138,8 @@ async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_witho
             );
         }
         // A group only the target has, between two in the `NULL` region.
-        exec(
-            &d,
-            "insert into public.agg (g, h, total, n) values (null, 7, 1, 1)",
-        )
-        .await;
+        d.write("insert into public.agg (g, h, total, n) values (null, 7, 1, 1)")
+            .await;
         for limit in [1, 2, 3, 4, 100] {
             let (found, uncertain, all) = compare(&d, limit).await;
             assert_eq!(
@@ -1189,7 +1151,8 @@ async fn nullable_composite_groups_with_ring_only_keys_page_alike_with_and_witho
             );
             assert_eq!((uncertain, all), (vec![], false));
         }
-        exec(&d, "delete from public.agg where g is null and h = 7").await;
+        d.write("delete from public.agg where g is null and h = 7")
+            .await;
     }
 }
 
@@ -1255,27 +1218,19 @@ async fn a_planted_divergence_is_reported_until_request_backfill_repairs_it() {
     let hidden = hidden(&d).await;
     let name = hidden.rsplit('.').next().unwrap().to_string();
 
-    exec(
-        &d,
-        &format!(
-            "update {hidden} set __sum_1 = __sum_1 + 1000 where g = 1; \
+    d.write(&format!(
+        "update {hidden} set __sum_1 = __sum_1 + 1000 where g = 1; \
              update public.agg set total = 99 where g = 2; \
              delete from {hidden} where g = 3; delete from public.agg where g = 3; \
              insert into public.agg (g, total, n) values (42, 1, 1)"
-        ),
-    )
+    ))
     .await;
-    exec(
-        &d,
-        "alter table public.src disable trigger trellis_capture_insert",
-    )
-    .await;
-    exec(&d, "insert into public.src values (6, 4, 100), (7, 7, 1)").await;
-    exec(
-        &d,
-        "alter table public.src enable always trigger trellis_capture_insert",
-    )
-    .await;
+    d.write("alter table public.src disable trigger trellis_capture_insert")
+        .await;
+    d.write("insert into public.src values (6, 4, 100), (7, 7, 1)")
+        .await;
+    d.write("alter table public.src enable always trigger trellis_capture_insert")
+        .await;
     d.settle().await;
 
     let (found, _, _) = walk(&d, 100).await;
