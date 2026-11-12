@@ -340,54 +340,47 @@ pub enum Plant {
     /// change of that side from before the truncate, which reaches a page
     /// after the truncate's, applies over it.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `t8_a_stale_page_after_the_truncate_is_refused`, and at position 2 of
-    /// a star by `join_star_truncate`'s
-    /// `pp_t8_a_stale_page_after_the_truncate_is_refused`.
+    /// Pinned by `join_star_truncate`'s
+    /// `pp_t8_a_stale_page_after_the_truncate_is_refused`, at the two-table
+    /// shape and on a star.
     Join1TruncateNoFloor,
     /// ADR-0021 (#1375 T1 to T7, #1399): a 1-1 `JOIN`'s truncate page takes
     /// the pair's lock row `FOR SHARE`, as every other page does, instead of
     /// `FOR UPDATE`, so a page of the pair runs beside the truncate's, which
     /// the barrier alone doesn't order against a page in flight.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `t1_to_t7_a_truncate_races_a_page_of_either_side`, and on a star by
-    /// `join_star_truncate`'s
-    /// `pp_t1_to_t7_a_truncate_races_a_page_of_either_table`. A truncate of
-    /// a joined table masks it: the definition row and the rebuild's start,
-    /// which takes the lock row `FOR UPDATE`, order its page anyway, so it
-    /// fails only on a `TRUNCATE a`.
+    /// Pinned by `join_star_truncate`'s
+    /// `pp_t1_to_t7_a_truncate_races_a_page_of_either_table`, at the two-table
+    /// shape and on a star. A truncate of a joined table masks it: the
+    /// definition row and the rebuild's start, which takes the lock row `FOR
+    /// UPDATE`, order its page anyway, so it fails only on a `TRUNCATE a`.
     Join1TruncateShareLock,
     /// ADR-0021 (#1399): a `TRUNCATE a` of a 1-1 `JOIN` raises `R`'s floor but
     /// leaves its entries. The target is empty, and a later change of `b`
     /// fans out to those entries and writes the rows of `a` rows that are
     /// gone.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_truncate_of_a_empties_r_and_a_later_b_change_writes_nothing`, and
-    /// on a star by `join_star_truncate`'s
-    /// `px4_a_truncate_of_a_empties_r_and_a_later_change_at_position_2_writes_nothing`.
+    /// Pinned by `join_star_truncate`'s
+    /// `px4_a_truncate_of_a_empties_r_and_the_target_and_later_changes_apply`,
+    /// at the two-table shape and on a star.
     Join1TruncateKeepsR,
     /// ADR-0021 (#1399): a `TRUNCATE b` of a 1-1 `JOIN`, at any position,
     /// raises that position's `M` floor but leaves its entries, so an `a`
     /// change before the rebuild reaches its key joins the `b` row that is
     /// gone.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_truncate_of_b_empties_m_before_the_rebuild_runs`, and on a star by
-    /// `join_star_truncate`'s
-    /// `px5_a_truncate_at_position_2_empties_its_m_before_the_rebuild_runs`
-    /// and
+    /// Pinned by `join_star_truncate`'s
+    /// `px5_a_truncate_of_a_joined_table_empties_its_m_before_the_rebuild_runs`,
+    /// at the two-table shape and on a star, and
     /// `xt1_a_page_truncating_both_joined_tables_empties_both_ms_and_starts_one_rebuild`.
     Join1TruncateKeepsM,
     /// ADR-0021 (#1399): a `TRUNCATE b` of a 1-1 `JOIN` starts no rebuild of
     /// the target, so the rows of `a` keep the `b` side they held, and
     /// nothing rewrites them.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_truncate_of_b_rebuilds_the_target`, and on a star by
-    /// `join_star_truncate`'s
-    /// `px6_a_truncate_at_position_2_rebuilds_the_target` and
+    /// Pinned by `join_star_truncate`'s
+    /// `px6_a_truncate_of_a_joined_table_rebuilds_the_target`, at the
+    /// two-table shape and on a star, and
     /// `xt1_a_page_truncating_both_joined_tables_empties_both_ms_and_starts_one_rebuild`.
     Join1TruncateNoRebuild,
     /// ADR-0021 (#1399): a `TRUNCATE b` page of a 1-1 `JOIN` takes its
@@ -395,11 +388,10 @@ pub enum Plant {
     /// start holds the definition's row and waits for the lock row, so the
     /// two deadlock.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_truncate_of_b_page_and_a_rebuild_start_take_the_definition_row_first`,
-    /// and on a star by `join_star_truncate`'s
-    /// `px7_a_truncate_at_position_2_and_a_rebuild_start_take_the_definition_row_first`
-    /// and `xt1_a_page_truncating_both_joined_tables_takes_the_definition_row_first`.
+    /// Pinned by `join_star_truncate`'s
+    /// `px7_a_truncate_of_a_joined_table_and_a_rebuild_start_take_the_definition_row_first`,
+    /// at the two-table shape and on a star, and
+    /// `xt1_a_page_truncating_both_joined_tables_takes_the_definition_row_first`.
     Join1TruncateDefAfterLock,
     /// ADR-0021 (#1513): a 1-1 `JOIN`'s fan-out writes the target rows of the
     /// `a` rows the definition holds in quarantine, so a `b` change rewrites
