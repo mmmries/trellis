@@ -98,6 +98,17 @@ pub const KINDS_4: [&[Kind]; 5] = [
     &[I, I, I, L],
 ];
 
+/// The shapes a per-position pin runs at: the two-table `JOIN`, and the last
+/// position of a three-table star, with position 1 present, matched and
+/// idle.
+pub const SHAPES: [Shape; 2] = [
+    Shape::TWO,
+    Shape {
+        positions: 2,
+        at: 2,
+    },
+];
+
 /// A star's number of joined positions, and the position under test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shape {
@@ -405,10 +416,12 @@ pub async fn write_uncaptured(d: &Driver, table: &str, sql: &str) {
 }
 
 /// One writer of a pin: a captured change, a Re-derive of a table's keys,
-/// or both in one page.
+/// or both in one page. `Each` writes its statements in a transaction each,
+/// into one page.
 #[derive(Debug, Clone, Copy)]
 pub enum Writer {
     Change(&'static str),
+    Each(&'static [&'static str]),
     Rederive(&'static str, &'static [&'static str]),
     Both(&'static str, &'static [&'static str], &'static str),
 }
@@ -418,6 +431,11 @@ impl Writer {
     pub async fn seal(self, d: &mut Driver) -> i64 {
         match self {
             Writer::Change(sql) => write(d, sql).await,
+            Writer::Each(sqls) => {
+                for sql in sqls {
+                    write(d, sql).await;
+                }
+            }
             Writer::Rederive(table, keys) => d.stage_recomputes(table, keys).await,
             Writer::Both(table, keys, sql) => {
                 write(d, sql).await;

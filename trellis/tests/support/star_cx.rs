@@ -91,6 +91,12 @@ impl Orientation {
     pub fn writer(self, writer: Writer) -> Writer {
         match writer {
             Writer::Change(sql) => Writer::Change(leak(self.sql(sql))),
+            Writer::Each(sqls) => Writer::Each(Box::leak(
+                sqls.iter()
+                    .map(|sql| leak(self.sql(sql)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )),
             Writer::Rederive(table, keys) => Writer::Rederive(leak(self.sql(table)), keys),
             Writer::Both(table, keys, sql) => {
                 Writer::Both(leak(self.sql(table)), keys, leak(self.sql(sql)))

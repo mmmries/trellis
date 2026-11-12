@@ -10,36 +10,24 @@
 //!   shape of [`SHAPES`]: the two-table JOIN and a star of three tables at
 //!   its last position.
 //!   - the build, then changes of `a` and of the table at `at`;
-//!   - F3 (#1371): an `a` move racing an update of its new key, a family;
-//!   - M (#1375): two crossing mixed pages, a race;
 //!   - T1 and T2 (#1375): a truncate of either side racing a page of the
 //!     other, races whose truncate may start a rebuild;
 //!   - C (#1375): a page on a build chunk's key queues behind the chunk;
 //!   - the chunked fan-out (#1405): a change past one chunk finishes in
 //!     chunks.
 //!
-//! The two-table suites (`join_one_to_one_*.rs`) keep their own fixtures;
-//! the same bodies run here at `Shape { positions: 1, at: 1 }`.
+//! The #1371 and #1375 families (F, M, N, R) run over [`SHAPES`] in
+//! `join_star_families.rs` and `join_star_joined_families.rs`.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 #[path = "support/star.rs"]
 mod star;
 
-use star::{Kind, Shape, Star};
+use star::{Kind, SHAPES, Shape, Star};
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::build::{self, Step};
 use trellis::staging::interleave::PausePoint;
-
-/// The shapes the per-position pins run at: the two-table JOIN, and the last
-/// position of a three-table star.
-const SHAPES: [Shape; 2] = [
-    Shape::TWO,
-    Shape {
-        positions: 2,
-        at: 2,
-    },
-];
 
 /// The shapes the pins run at: [`SHAPES`].
 fn shapes() -> Vec<Shape> {
@@ -235,51 +223,6 @@ async fn the_build_and_changes_of_either_side_apply() {
         ] {
             star::step(&mut d, &shape.sql(sql)).await;
             star::assert_oracle(&mut d, &stars).await;
-        }
-    }
-}
-
-/// F3 (#1371): an `a` key move `10 → 20` ‖ an update of key 20 in the table
-/// at `at`; whichever drains first, frozen at its commit, the other queues
-/// on `J[20]`.
-#[tokio::test]
-async fn f3_an_a_move_races_a_b_update_of_its_new_key() {
-    for shape in shapes() {
-        star::family(
-            shape,
-            A_ROWS,
-            B_ROWS,
-            "update public.a set {k} = 20 where id = 1",
-            "update {b} set w = 222 where id = 2",
-        )
-        .await;
-    }
-}
-
-/// Two crossing mixed pages (#1375's M1–M6): one moves `a` row 1 from 10 to
-/// 20 and changes key 20, the other moves row 2 (or row 3) onto 10 and
-/// changes key 10. Each locks both its keys in one sorted `J` statement, so
-/// the second queues on the first and neither deadlocks, in either order.
-#[tokio::test]
-async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
-    for shape in shapes() {
-        for other_a in [
-            "update public.a set {k} = 10 where id = 2",
-            "update public.a set {k} = 10 where id = 3",
-        ] {
-            for star in shape.stars() {
-                for one_first in [true, false] {
-                    let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
-                    star::write(&d, &shape.sql("update public.a set {k} = 20 where id = 1")).await;
-                    star::write(&d, &shape.sql("update {b} set w = 250 where id = 2")).await;
-                    let one = d.seal().await;
-                    star::write(&d, &shape.sql(other_a)).await;
-                    star::write(&d, &shape.sql("update {b} set w = 150 where id = 1")).await;
-                    let two = d.seal().await;
-                    let (first, second) = if one_first { (one, two) } else { (two, one) };
-                    star::race(&mut d, star, first, second).await;
-                }
-            }
         }
     }
 }

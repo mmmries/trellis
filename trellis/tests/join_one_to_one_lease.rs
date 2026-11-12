@@ -6,11 +6,12 @@
 //! bucket queues behind the first's page, the first fails its claim check
 //! when it reaches it, and nothing it wrote commits.
 //!
-//! The scenarios shrink the fan-out chunk to 25 rows and play the lease by
-//! hand: aging a claim and sweeping it is what a stalled worker looks like
-//! once the TTL passed (`reclaim_stale`, as `drain_paging.rs` does), and the
-//! heartbeat daemon runs for real against a short interval. Nothing sleeps:
-//! the only waits are on a concrete condition with a bound.
+//! The scenarios fan out to 25 rows, well inside one fan-out chunk, so the
+//! page recomputes them all itself. They play the lease by hand: aging a
+//! claim and sweeping it is what a stalled worker looks like once the TTL
+//! passed (`reclaim_stale`, as `drain_paging.rs` does), and the heartbeat
+//! daemon runs for real against a short interval. Nothing sleeps: the only
+//! waits are on a concrete condition with a bound.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -30,9 +31,9 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
                    create unique index on public.b (k); \
                    create index on public.a (k)";
 
-/// The fan-out chunk these tests run with: key 10 holds exactly this many
-/// `a` rows, so its page recomputes them all.
-const CAP: i64 = 25;
+/// The `a` rows on key 10: fewer than one fan-out chunk (the default), so
+/// its page recomputes them all in its own transaction.
+const KEY_ROWS: i64 = 25;
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -66,15 +67,15 @@ impl Kind {
     }
 }
 
-/// `kind` over `CAP` rows of `a` on key 10, one on key 20, and `b` rows on
-/// both keys, built and live, with the fan-out chunk at `CAP`.
+/// `kind` over `KEY_ROWS` rows of `a` on key 10, one on key 20, and `b`
+/// rows on both keys, built and live.
 async fn start(kind: Kind) -> Driver {
     let seed = format!(
-        "insert into public.a select i, 10, i from generate_series(1, {CAP}) i; \
+        "insert into public.a select i, 10, i from generate_series(1, {KEY_ROWS}) i; \
          insert into public.a values (100, 20, 100); \
          insert into public.b values (1, 10, 100), (2, 20, 200)"
     );
-    let d = Driver::start(
+    Driver::start(
         &format!("{DDL}; {seed}"),
         &[("k", int4()), ("x", int4())],
         &[&format!(
@@ -85,9 +86,7 @@ async fn start(kind: Kind) -> Driver {
         )],
         &["public.a", "public.b"],
     )
-    .await;
-    d.set_fan_out_chunk_rows(CAP as usize);
-    d
+    .await
 }
 
 async fn write(d: &Driver, sql: &str) {
@@ -180,7 +179,7 @@ async fn backend_xid(d: &Driver, pid: i32) -> String {
         .expect("the frozen page has written, so it holds an xid")
 }
 
-/// A fan-out of exactly one chunk whose worker loses its claim to the TTL
+/// A fan-out within one chunk whose worker loses its claim to the TTL
 /// sweep while the page is frozen before the fan-out, holding the key's
 /// locks. The second instance claims the freed bucket and queues behind the
 /// page's locks; when the first goes on it writes its 25 rows, fails its
@@ -240,23 +239,23 @@ async fn a_fan_out_that_outlives_its_claim_is_applied_once_by_the_next_instance(
         );
         let written_by: Vec<String> = d
             .rows(&format!(
-                "select distinct xmin::text from {target} where id <= {CAP} order by 1"
+                "select distinct xmin::text from {target} where id <= {KEY_ROWS} order by 1"
             ))
             .await;
         assert_eq!(
             written_by.len(),
             1,
-            "{kind:?}: the {CAP} rows of the fan-out were written by one transaction: {written_by:?}"
+            "{kind:?}: the {KEY_ROWS} rows of the fan-out were written by one transaction: {written_by:?}"
         );
         assert_exact(&mut d, kind, "the second instance's apply").await;
         let totals = d
             .rows(&format!(
-                "select count(*) from {target} where id <= {CAP} and total = id + 500"
+                "select count(*) from {target} where id <= {KEY_ROWS} and total = id + 500"
             ))
             .await;
         assert_eq!(
             totals,
-            [format!("({CAP})")],
+            [format!("({KEY_ROWS})")],
             "{kind:?}: each row has x + 500"
         );
     }
@@ -342,12 +341,12 @@ async fn a_fan_out_whose_heartbeat_is_alive_keeps_its_claim_from_the_next_instan
         assert_exact(&mut d, kind, "the first instance's apply").await;
         let totals = d
             .rows(&format!(
-                "select count(*) from {target} where id <= {CAP} and total = id + 500"
+                "select count(*) from {target} where id <= {KEY_ROWS} and total = id + 500"
             ))
             .await;
         assert_eq!(
             totals,
-            [format!("({CAP})")],
+            [format!("({KEY_ROWS})")],
             "{kind:?}: each row has x + 500"
         );
     }

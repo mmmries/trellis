@@ -1288,7 +1288,8 @@ async fn s9_self_check_while_the_upstream_lags_reports_nothing_and_misses_nothin
 // ------------------------------------------- the plants' pins, `a` seam-fed
 
 // The ADR-0021 page plants (`join1_*` of #1396–#1398) are pinned by
-// `join_one_to_one_interleavings` on captured sides. These are the same pins
+// `join_one_to_one_interleavings` and the star families on captured sides
+// (at the two-table shape). These are the same pins
 // with `a` a 1-1 target of the captured `public.a`, joined on its non-key
 // `k`, and `b` captured: a change of `a` is applied by the upstream's page
 // and reaches the `JOIN` as its seam row, in a batch of its own, and the
