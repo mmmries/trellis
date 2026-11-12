@@ -213,7 +213,7 @@ async fn record_except(
     // key, the key its source had at define, not by whatever the source's
     // identity reads as now.
     let source_key = if unkeyed == Some(source) && keys_target_by_source(def) {
-        primary_key_names(client, target).await?
+        super::source_key::primary_key_names(client, target).await?
     } else {
         key_of(client, source).await?
     };
@@ -584,14 +584,7 @@ async fn refusal(
         Rekey::Unbacked { declared } => Some(CatalogError::Ddl(DdlError::KeyNotBacked {
             table: table.to_string(),
             indexes: unique_indexes(client, table).await?,
-            partitioned: client
-                .query_one(
-                    "select exists (select 1 from pg_catalog.pg_class \
-                         where oid = pg_catalog.to_regclass($1) and relkind = 'p')",
-                    &[&ddl::regclass_arg(table)],
-                )
-                .await?
-                .get(0),
+            partitioned: super::source_key::is_partitioned(client, table).await?,
             key: declared,
         })),
     })
@@ -1100,29 +1093,6 @@ async fn deferrable_reasons(
     Ok(reasons)
 }
 
-/// `table`'s primary key columns, in key order; none when it has no primary
-/// key or doesn't exist.
-async fn primary_key_names(
-    client: &impl GenericClient,
-    table: &str,
-) -> Result<Vec<String>, tokio_postgres::Error> {
-    Ok(client
-        .query_one(
-            "select array( \
-                 select a.attname::text \
-                 from pg_catalog.pg_index i \
-                 cross join unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
-                 join pg_catalog.pg_attribute a \
-                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
-                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary \
-                   and k.ord <= i.indnkeyatts \
-                 order by k.ord)",
-            &[&ddl::regclass_arg(table)],
-        )
-        .await?
-        .get(0))
-}
-
 /// A released definition over a user table with no primary key, which an
 /// earlier release keyed by a unique index it chose (its oldest qualifying
 /// one): the definition `id` gets that index's key columns as an explicit
@@ -1202,7 +1172,7 @@ async fn declare_released_keys(
             )));
         }
         if keys_target_by_source(def) && !matches!(side, Some(Side::Joined(_))) {
-            let built_on = primary_key_names(txn, target).await?;
+            let built_on = super::source_key::primary_key_names(txn, target).await?;
             let mut chosen_set = chosen.clone();
             chosen_set.sort();
             let mut built_set = built_on.clone();

@@ -600,47 +600,12 @@ impl From<super::backfill::BackfillError> for DdlError {
     }
 }
 
-/// Introspects `source_table`'s primary key from `pg_catalog`, via a bound
-/// `::regclass` cast (`to_regclass($1)`) rather than string-interpolating the
-/// table name into the query. `source_table` is the unquoted `schema.table`
-/// identity, quoted for the lookup by [`regclass_arg`], which
-/// `to_regclass` resolves exactly (ADR-0011) — every real caller
-/// passes one (`Definition::source_table`, or
-/// `catalog::resolve_source_for_install`'s equivalent at definition-acceptance
-/// time), so this does not depend on the connection's `search_path`
-/// (`crate::pool`'s session bootstrap). A
-/// bare table name still resolves via `search_path` exactly as before, for
-/// any caller that genuinely has nothing more specific. Rejects only a
-/// *zero*-column arity (no primary key, and no qualifying unique index
-/// either — [`DdlError::NoPrimaryKey`]); a composite (multi-column) primary
-/// key is returned in full, in the key's own declared column order
-/// (the key columns' positions in `i.indkey`, the same ordinal-position
-/// convention the capture trigger's key expression follows for the
-/// identical reason) — every consumer takes the key at whatever arity it has.
-/// Also gates every resolved column's *type*: only
-/// [`super::join_key_types::is_text_stable_join_key_type`]'s allowlist is accepted,
-/// returning [`DdlError::UnsupportedPrimaryKeyType`] otherwise
-/// — every caller of this function ultimately compares the returned key via
-/// `::text` casts, so an unsafe type here would risk the same silent
-/// divergence a `JOIN` key is already guarded against.
-/// The key is the table's record (`definition_keys`): a declared `KEY (...)`
-/// or the primary key define admitted for a user table
-/// (`super::source_key::admitted_key`, ADR-0026), the key Trellis gave a
-/// target. A table with no record falls back to its own unique constraint
-/// when it has no `PRIMARY KEY`; define records every table it keys by, so
-/// only a Trellis target is ever read that way. [`create_aggregate_target_table`] keys its
-/// grouping columns with a `UNIQUE NULLS NOT DISTINCT` constraint rather than
-/// a `PRIMARY KEY`, precisely so a NULL grouping value is representable
-/// (`PRIMARY KEY` forbids `NULL` outright) — so an aggregate target chained
-/// into as another definition's source (`TRANSFORM x FROM some_aggregate`,
-/// for instance) has no `indisprimary` row at all. Without this
-/// fallback every such chain would regress from working to
-/// [`DdlError::NoPrimaryKey`]. Ties among multiple qualifying unique indexes
-/// break on `indexrelid` ascending (oldest first) for a deterministic choice;
-/// partial (`indpred`) and deferred (`not indimmediate`) unique indexes are
-/// excluded because either would make the index an unreliable stand-in for a
-/// row identity (a partial index doesn't cover every row; a deferred one
-/// doesn't guarantee uniqueness at statement end).
+/// The key `source_table` (an unquoted `schema.table`, [`regclass_arg`]) is
+/// keyed by: its `identity_key_columns`, in key order, each column's type
+/// admitted by the key-type allowlist ([`DdlError::UnsupportedPrimaryKeyType`]
+/// otherwise), since every caller compares the key as `::text`. Refuses a
+/// table with no key ([`DdlError::NoPrimaryKey`]). Define decides which key
+/// that is (`source_key::admitted_key`, ADR-0026); this reads it.
 pub async fn source_primary_key(
     pool: &Pool,
     source_table: &str,
