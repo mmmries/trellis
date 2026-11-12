@@ -17,8 +17,7 @@ const TABLES: [&str; 2] = [
 
 /// Variants no refusal table names, as `Enum::Variant`.
 const EXEMPT: &[&str] = &[
-    // Syntax Postgres refuses too: the message is the whole story.
-    "ParseError::UnexpectedChar",
+    // Generic syntax errors: the message says what was expected.
     "ParseError::UnexpectedToken",
     "ParseError::UnexpectedEof",
     "ParseError::UnterminatedString",
@@ -53,8 +52,6 @@ const EXEMPT: &[&str] = &[
     "DdlError::AliasSubstitution",
     "DdlError::UnroutedAggregate",
     "CatalogError::UnknownValueType",
-    // Never constructed: an unknown operator symbol is `UnexpectedChar`.
-    "ParseError::UnsupportedOperator",
     // Unreachable while `DeferredAggregate` refuses `STRING_AGG` (#1040).
     "ValidationError::StringAggSeparatorNotLiteral",
     // Statements on an existing transform (transforms.md, "Changing a
@@ -106,7 +103,7 @@ fn variants(name: &str, source: &str) -> Vec<String> {
 fn named(doc: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut in_table = false;
-    for line in doc.lines() {
+    for line in doc.lines().map(|line| line.replace("\\|", "")) {
         in_table = line.starts_with("| Condition | Error |") || (in_table && line.starts_with('|'));
         let Some(cell) = line.split('|').nth(2).filter(|_| in_table) else {
             continue;
