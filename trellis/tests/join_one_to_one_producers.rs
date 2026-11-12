@@ -1,8 +1,8 @@
 //! The producers of Re-derives of a 1-1 `JOIN` (ADR-0021, #1401): what stages
 //! or starts one apart from the drain's own pages. A build chunk, a rebuild
 //! and `RESUME` are covered by `join_one_to_one_build.rs`, a Re-derive page of
-//! either side by `join_one_to_one_interleavings.rs`; this file holds what
-//! those leave out.
+//! either side by `join_star_families.rs` and `join_star_joined_families.rs`;
+//! this file holds what those leave out.
 //!
 //! - **`NULL` primary-key parts.** A side that is an aggregate's target is
 //!   keyed by its nullable `GROUP BY` column (`unique nulls not distinct`).
