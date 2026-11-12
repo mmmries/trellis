@@ -1073,10 +1073,12 @@ impl JoinTargetPlan {
             .zip(&jc)
             .map(|(c, j)| format!("{c} as {j}"))
             .collect();
+        // In key order, as `J`'s rows and index are: a build updates every
+        // key, and in hash order each update dirties a random page.
         ctes.push(format!(
             "matched as ( \
                  update {j} j set __matches = j.__matches + x.__d \
-                 from (select {mj_as}, sum(__dn) as __d from {dm} group by {mj}) x \
+                 from (select {mj_as}, sum(__dn) as __d from {dm} group by {mj} order by {mj}) x \
                  where {j_x} and x.__d <> 0 \
              )",
             j = self.j_ident,

@@ -1,7 +1,8 @@
 //! The plans of a `JOIN` build's statements over every cell or group
 //! (#1876), read by `EXPLAIN` in the build's own transaction after
 //! [`build`] ran, so its working tables hold the build's rows and
-//! statistics: `P`'s insert sorted by cell, and the compare by hash joins.
+//! statistics: `P`'s insert sorted by cell, the compare by hash joins, and
+//! `J.__matches` updated in key order.
 
 use std::collections::HashMap;
 
@@ -88,6 +89,17 @@ async fn a_join_builds_statements_over_every_cell_keep_their_plans() {
         "CTE d",
     );
     assert!(insert.contains("Sort Key: r_1.post, r_1.tag"), "{cells}");
+
+    // `J.__matches` is updated in key order, each key through `J`'s index.
+    let product = explain(&txn, &plan.product_sql()).await;
+    let matched = section(
+        &product,
+        &format!("Update on {}", HiddenTable::Matches.name(id)),
+        "\n  CTE ",
+    );
+    for node in ["Nested Loop", "Sort Key: __dm.id", "Index Scan using"] {
+        assert!(matched.contains(node), "{node}:\n{product}");
+    }
 
     // The compare reads `T` and the target by hash joins, not a lookup per
     // group.
