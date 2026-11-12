@@ -162,7 +162,7 @@ an entry under [Details](#details) where it needs more room.
 | Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | `NonAssociativeComparison` | [Text](transforms.md#text) | Join them with `AND`, or add parentheses |
 | **Grammar forms and typing** | | | |
 | `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, and the simple `CASE <operand> WHEN <value> THEN …` | `UnsupportedIsForm`, `SimpleCaseUnsupported` | [Text](transforms.md#text) | `x IS NOT DISTINCT FROM TRUE` (`IS DISTINCT FROM` for the `NOT` forms), `x IS NULL`; `CASE WHEN <operand> = <value> THEN …` |
-| [An untyped `NULL` literal](#an-untyped-null-literal) | `UntypedNull` | [Text](transforms.md#text) | `CAST(NULL AS <type>)` |
+| [An untyped `NULL` literal](#an-untyped-null-literal) | `UntypedNull` | [Text](transforms.md#text); beside a column (`date_col + NULL`), [Retype](transforms.md#retype) | `CAST(NULL AS <type>)` |
 | A `CASE` condition that isn't `boolean`, or `CASE` results that don't unify as `COALESCE`'s do (`THEN 1 ELSE 'x'`). Results unify to a common type: two integers to the wider, an exact numeric with a float to the float, otherwise `numeric` | `CaseConditionNotBoolean`, `CaseResultTypeMismatch` | [Retype](transforms.md#retype) | Make the results one type, with `CAST` |
 | `NULLIF(a, b)` where Postgres casts `a` to compare it: an integer `a` with a `numeric` `b`, or an exact `a` with a float `b` | `NullIfFirstArgumentCast` | [Retype](transforms.md#retype) | `NULLIF(CAST(a AS numeric), b)`, or the float first |
 | **Expression size** | | | |
@@ -259,7 +259,8 @@ refused:
   `double precision`.
 - A float argument to `ROUND`: a float rounds half to even and `numeric` half
   away from zero, so one name would carry two rules.
-- A scale that is a column or an expression.
+- A scale that is a column or an expression. A negative literal is a scale
+  (`ROUND(a, -2)`).
 
 The errors are `NumericFunctionArgument` (with the reason),
 `ScaleNotIntegerLiteral`, and `FunctionArgTypeMismatch` for a non-numeric
