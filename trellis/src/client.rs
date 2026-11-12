@@ -2955,14 +2955,13 @@ async fn handover_pass(
         .take();
     let config = match (&verdict, &process.migrate) {
         (Verdict::StandBy(handover::StandBy::MigrationsPending), Some(config)) => config,
-        // Anything else ends a back-off: the next refusal starts its own.
+        // Anything else ends a back-off: the next refusal starts its own. It
+        // also ends what a refusal said: the process no longer waits on it.
         _ => {
-            if verdict == Verdict::TakeOver {
-                *process
-                    .cannot_migrate
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            }
+            *process
+                .cannot_migrate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             return Ok(PassOutcome {
                 verdict,
                 migrated: None,
@@ -2992,7 +2991,7 @@ async fn handover_pass(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             Ok(PassOutcome {
                 verdict: decide_pass(process, drain).await?,
-                migrated: Some(migrated),
+                migrated,
             })
         }
         // A process of another version went live since the first decision:

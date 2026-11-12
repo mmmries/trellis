@@ -1308,5 +1308,14 @@ async fn a_role_that_cannot_migrate_runs_the_takeover_work_it_can() {
     assert!(pending.migrations.is_empty(), "{pending:?}");
     let reason = pending.cannot_run.expect("its pass tried");
     assert!(reason.contains("this role cannot run them"), "{reason}");
+    // With no migration pending, the catalog is current: a read that fails
+    // fails with its own error, not as a version handover.
+    raw.batch_execute(&format!(
+        "revoke select on transform_definitions from {role}"
+    ))
+    .await
+    .expect("a read the role can't make");
+    let err = worker.definitions().await.expect_err("can't read");
+    assert_ne!(err.code(), ErrorCode::VersionHandover, "{err}");
     worker.shutdown().await.expect("shutdown");
 }

@@ -1120,11 +1120,15 @@ impl Trellis {
                     status.migrations_pending = pending;
                     status
                 })),
-                (Err(error), Some(pending)) => Err(TrellisError::MigrationsPending {
-                    pending,
-                    error: Box::new(error),
-                }),
-                (Err(error), None) => Err(error),
+                // Only pending migrations explain a catalog it can't read:
+                // with none, it is current, and the error is the read's own.
+                (Err(error), Some(pending)) if !pending.migrations.is_empty() => {
+                    Err(TrellisError::MigrationsPending {
+                        pending,
+                        error: Box::new(error),
+                    })
+                }
+                (Err(error), _) => Err(error),
             }
         })
         .await
@@ -1159,11 +1163,13 @@ impl Trellis {
         error: TrellisError,
     ) -> TrellisError {
         match self.migrations_pending_now(client).await {
-            Ok(Some(pending)) => TrellisError::MigrationsPending {
-                pending,
-                error: Box::new(error),
-            },
-            Ok(None) | Err(_) => error,
+            Ok(Some(pending)) if !pending.migrations.is_empty() => {
+                TrellisError::MigrationsPending {
+                    pending,
+                    error: Box::new(error),
+                }
+            }
+            Ok(_) | Err(_) => error,
         }
     }
 

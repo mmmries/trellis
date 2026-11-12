@@ -265,12 +265,17 @@ pub async fn migrate_with_pool(pool: &Pool, config: &Config) -> Result<(), Error
         .map(|_| ())
 }
 
-/// [`migrate_with_pool`], returning the migrations it ran, by name
-/// (`V9__worker_versions`), oldest first: none when another `migrate` ran
-/// them first. What a background process runs when it takes over with this
-/// binary's migrations or takeover work pending (ADR-0023, rule 3).
-pub(crate) async fn migrate_reporting(pool: &Pool, config: &Config) -> Result<Vec<String>, Error> {
-    migrate_carrying(pool, config, &Migrations::embedded()).await
+/// [`migrate_with_pool`] as a background process runs it when it takes over
+/// with this binary's migrations or takeover work pending (ADR-0023, rule
+/// 3): the migrations it ran, by name (`V9__worker_versions`), oldest first,
+/// or `None` when it ran no takeover work. With nothing pending, it runs the
+/// work only while it is still due under the handover lock, so of processes
+/// that find it due at once, the first runs it and the rest change nothing.
+pub(crate) async fn migrate_reporting(
+    pool: &Pool,
+    config: &Config,
+) -> Result<Option<Vec<String>>, Error> {
+    attach_with_lock(pool, config, &Migrations::embedded(), Attach::WhenDue).await
 }
 
 /// [`migrate_with_pool`] for a binary carrying `migrations`: a test stands
@@ -280,11 +285,31 @@ async fn migrate_carrying(
     config: &Config,
     migrations: &Migrations,
 ) -> Result<Vec<String>, Error> {
+    attach_with_lock(pool, config, migrations, Attach::Always)
+        .await
+        .map(Option::unwrap_or_default)
+}
+
+/// Whether an attach with nothing pending runs the takeover work.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attach {
+    /// Every time: an explicit `migrate`.
+    Always,
+    /// Only while [`takeover_work_due`]: a background process's takeover.
+    WhenDue,
+}
+
+async fn attach_with_lock(
+    pool: &Pool,
+    config: &Config,
+    migrations: &Migrations,
+    when: Attach,
+) -> Result<Option<Vec<String>>, Error> {
     // One attach at a time per database: the instance-conflict check reads
     // the markers other attaches write. The attach runs on the lock's own
     // session, so the lock can't end before it. See `identity::AttachLock`.
     let mut lock = identity::AttachLock::acquire(pool).await?;
-    let attached = attach(lock.client(), pool, config, migrations).await;
+    let attached = attach(lock.client(), pool, config, migrations, when).await;
     lock.release().await;
     attached
 }
@@ -294,7 +319,8 @@ async fn attach(
     pool: &Pool,
     config: &Config,
     migrations: &Migrations,
-) -> Result<Vec<String>, Error> {
+    when: Attach,
+) -> Result<Option<Vec<String>>, Error> {
     identity::prepare_attach(pg_client, config).await?;
 
     // ADR-0024: refuse a catalog this binary can't read before anything
@@ -316,7 +342,7 @@ async fn attach(
     pg_client
         .execute("select pg_advisory_lock($1)", &[&handover_key])
         .await?;
-    let attached = attach_under_handover(pg_client, pool, config, migrations).await;
+    let attached = attach_under_handover(pg_client, pool, config, migrations, when).await;
     let _ = pg_client
         .execute("select pg_advisory_unlock($1)", &[&handover_key])
         .await;
@@ -336,7 +362,8 @@ async fn attach_under_handover(
     pool: &Pool,
     config: &Config,
     migrations: &Migrations,
-) -> Result<Vec<String>, Error> {
+    when: Attach,
+) -> Result<Option<Vec<String>>, Error> {
     let observed = handover::observe(&*pg_client, config.schema(), true).await?;
     let other_version =
         match handover::decide(config.binary_version(), &observed, handover::Asker::Migrate) {
@@ -357,7 +384,7 @@ async fn attach_under_handover(
         {
             return Err(Error::OtherVersionLive(seen));
         }
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     // No runner when nothing is pending: refinery's `create table if not
@@ -369,6 +396,11 @@ async fn attach_under_handover(
             .is_empty();
     let ran = if pending {
         run_migrations(pg_client, migrations).await?
+    } else if when == Attach::WhenDue
+        && !takeover_work_due(&*pg_client, config.schema(), config.binary_version()).await?
+    {
+        // Another process of this version ran it since this one decided.
+        return Ok(None);
     } else {
         Vec::new()
     };
@@ -391,7 +423,7 @@ async fn attach_under_handover(
     // defined (`crate::dump`): restore them now, with the catalog current.
     crate::dump::restore_queued(pool, config).await?;
 
-    Ok(ran)
+    Ok(Some(ran))
 }
 
 /// Whether a schema dump's restore queue is waiting in `config`'s schema
@@ -860,5 +892,56 @@ mod tests {
             )
             .await;
         assert!(refused.is_err(), "{refused:?}");
+    }
+
+    /// ADR-0023 rule 3: a background process's takeover `migrate` runs the
+    /// takeover work only while it is still due under the handover lock. Of
+    /// two processes that found it due at once, the second finds the marker
+    /// the first wrote, and runs nothing (here: leaves text this release
+    /// refuses unpaused); an explicit `migrate` runs it every time. (That it
+    /// runs when due: `tests/version_handover.rs`.)
+    #[tokio::test]
+    async fn a_takeover_migrate_runs_the_work_only_while_it_is_due() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let raw = pool.connect_unpooled().await.expect("connect");
+        raw.batch_execute("create table public.s (id bigint primary key, a numeric)")
+            .await
+            .expect("source");
+        let handle = crate::Trellis::connect(config.clone(), crate::TrellisOptions::default())
+            .await
+            .expect("connect");
+        handle
+            .apply("TRANSFORM t FROM s SELECT a + 1 AS x")
+            .await
+            .expect("define");
+        handle.shutdown().await.expect("shutdown");
+        raw.batch_execute(
+            "update trellis.transform_definitions \
+             set definition_text = 'TRANSFORM t FROM s SELECT a+1AS x'",
+        )
+        .await
+        .expect("text this release refuses");
+        let paused = async || -> bool {
+            raw.query_one(
+                "select status = 'paused' from trellis.transform_definitions",
+                &[],
+            )
+            .await
+            .expect("t")
+            .get(0)
+        };
+
+        let ran = migrate_reporting(&pool, &config).await.expect("migrate");
+        assert_eq!(ran, None, "the marker names this version: not due");
+        assert!(!paused().await, "ran no work");
+
+        migrate_with_pool(&pool, &config).await.expect("migrate");
+        assert!(
+            paused().await,
+            "an explicit migrate runs the work every time"
+        );
     }
 }

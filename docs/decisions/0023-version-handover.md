@@ -68,8 +68,8 @@ stage, drain or change state side by side.
    work that alters tables (a conversion, a restore). `migrate` takes
    the handover lock exclusive and decides again under it, so it never runs
    beside a process that went live since the pass decided, and two processes
-   that find the migrations pending at once run them one after the other: the
-   second finds nothing left. When `migrate` refuses (the process's role
+   that find the migrations or the takeover work due at once run them one
+   after the other: the second finds nothing left. When `migrate` refuses (the process's role
    can't alter Trellis's tables, the history doesn't fit, the floor), the
    process stands by, says why, and tries again a minute later (at the next
    standby poll when the refusal was a fault, such as a lost connection). An
