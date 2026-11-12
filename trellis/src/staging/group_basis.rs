@@ -3829,7 +3829,7 @@ impl GroupTargetPlan {
             &self.absolute_sets(),
             BY_CTID,
             &returning.join(", "),
-            &self.held_tail_sql(image_columns),
+            &self.held_tail_sql(image_columns, false),
         )
     }
 
@@ -4010,8 +4010,10 @@ impl GroupTargetPlan {
     /// partials give is compared with the row the target **holds**, upserted
     /// where its values differ, deleted where the count is 0, and each prior
     /// image is the held row. Returns rows in [`Self::visible_tail_sql`]'s
-    /// layout, with each partial's value in place of its change.
-    fn held_tail_sql(&self, image_columns: Option<&[String]>) -> String {
+    /// layout, with each partial's value in place of its change. `bulk`
+    /// reads the held rows by a hash join on [`Self::group_match`], not a
+    /// lookup per group: for a set that is the whole target.
+    fn held_tail_sql(&self, image_columns: Option<&[String]>, bulk: bool) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let mut applied = self.shape.returned(|p| format!("cur.{}", p.name("__n")));
@@ -4076,13 +4078,37 @@ impl GroupTargetPlan {
             }
             None => "null::text".to_string(),
         };
+        let held_rows = if bulk {
+            let read: Vec<String> = (lookup_columns.iter().zip(&lookup_names))
+                .map(|(c, n)| format!("{c} as {n}"))
+                .collect();
+            format!(
+                "left join (select {}, {} from {} x) t on {}",
+                read.join(", "),
+                self.target_group_values(),
+                self.target_ident,
+                self.group_match("t", "nv")
+            )
+        } else {
+            format!(
+                "left join lateral {} as t({}) on true",
+                self.group_lookup(
+                    &self.target_ident,
+                    Population::Target,
+                    "nv",
+                    &lookup_columns.join(", ")
+                ),
+                lookup_names.join(", ")
+            )
+        };
+        let t_names: Vec<String> = lookup_names.iter().map(|n| format!("t.{n}")).collect();
         format!(
             "nv as (select up.*, {nf_all} from up cross join {new_fields}), \
              cur as ( \
-                 select nv.*, t.* , \
+                 select nv.*, {t_names}, \
                         (nv.__nn > 0) is distinct from (t.__tc is not null) \
                             or (nv.__nn > 0 and not ({same_values})) as __changed \
-                 from nv left join lateral {lookup_target} as t({lookup_names}) on true \
+                 from nv {held_rows} \
              ), \
              written as ( \
                  insert into {target} ({col_list}{field_list}) \
@@ -4105,13 +4131,7 @@ impl GroupTargetPlan {
                     .collect::<Vec<_>>()
                     .join(", ")
             },
-            lookup_target = self.group_lookup(
-                &self.target_ident,
-                Population::Target,
-                "nv",
-                &lookup_columns.join(", ")
-            ),
-            lookup_names = lookup_names.join(", "),
+            t_names = t_names.join(", "),
             target = self.target_ident,
             field_list = field_names
                 .iter()
@@ -4133,32 +4153,27 @@ impl GroupTargetPlan {
     /// row, computed from the partials it now holds, is compared with the row
     /// the target holds ([`Self::held_tail_sql`]). That repairs a visible row
     /// that disagrees with the partials, and removes one whose group has no
-    /// partial left, which a delta alone never reaches.
-    fn compare_held_sql(&self, image_columns: Option<&[String]>) -> String {
+    /// partial left, which a delta alone never reaches. A build reads every
+    /// group, so both reads are hash joins on [`Self::group_match`].
+    pub(super) fn compare_held_sql(&self, image_columns: Option<&[String]>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let names = self.shape.each_partial(|p| p.name("__n"));
-        let columns = self.shape.each_partial(|p| format!("x.{}", p.hidden()));
         let up_groups: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
-        let up_values: Vec<String> = names.iter().map(|n| format!("h.{n}")).collect();
+        let up_values =
+            (self.shape).each_partial(|p| format!("x.{} as {}", p.hidden(), p.name("__n")));
         format!(
             "with rg as (select distinct {col_list} from {staged}), \
              up as ( \
                  select {up_groups}, {up_values} from rg \
-                 cross join lateral {lookup_hidden} as h({names}) \
+                 join {hidden} x on {matched} \
              ), \
              {tail}",
             staged = self.staged,
             up_groups = up_groups.join(", "),
             up_values = up_values.join(", "),
-            lookup_hidden = self.group_lookup(
-                &self.hidden_ident,
-                Population::Hidden,
-                "rg",
-                &columns.join(", ")
-            ),
-            names = names.join(", "),
-            tail = self.held_tail_sql(image_columns),
+            hidden = self.hidden_ident,
+            matched = self.group_match("x", "rg"),
+            tail = self.held_tail_sql(image_columns, true),
         )
     }
 
@@ -4325,7 +4340,8 @@ const PLAN_RESET: &str =
     "set local enable_nestloop to default; set local enable_seqscan to default";
 
 /// A `JOIN` build's settings for its statements over every cell
-/// ([`write_join_build_cells`], `super::join`'s product): they join cell sets
+/// ([`write_join_build_cells`], `super::join`'s product, the compare of
+/// [`compare_join_build_groups`]): they join cell sets
 /// on [`GroupTargetPlan::group_match`]'s arrays, which a merge join must sort,
 /// and sorting arrays costs several times hashing them.
 pub(super) const BULK_PLAN_SETTINGS: &str = "set local enable_mergejoin = off";
@@ -4638,9 +4654,11 @@ pub(super) async fn compare_join_build_groups(
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    txn.batch_execute(BULK_PLAN_SETTINGS).await?;
     let rows = txn
         .query(&plan.compare_held_sql(image_columns.as_deref()), &[])
         .await?;
+    txn.batch_execute(BULK_PLAN_RESET).await?;
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
 }

@@ -1,7 +1,7 @@
 //! The plans of a `JOIN` build's statements over every cell or group
 //! (#1876), read by `EXPLAIN` in the build's own transaction after
 //! [`build`] ran, so its working tables hold the build's rows and
-//! statistics.
+//! statistics: `P`'s insert sorted by cell, and the compare by hash joins.
 
 use std::collections::HashMap;
 
@@ -88,6 +88,15 @@ async fn a_join_builds_statements_over_every_cell_keep_their_plans() {
         "CTE d",
     );
     assert!(insert.contains("Sort Key: r_1.post, r_1.tag"), "{cells}");
+
+    // The compare reads `T` and the target by hash joins, not a lookup per
+    // group.
+    let compare = explain(&txn, &plan.t.compare_held_sql(None)).await;
+    let cur = section(&compare, "CTE cur", "CTE written");
+    assert_eq!(cur.matches("Hash Cond: ((ARRAY[").count(), 2, "{compare}");
+    for node in ["Nested Loop", "Index Scan", "Index Only Scan"] {
+        assert!(!cur.contains(node), "{node}:\n{compare}");
+    }
 
     txn.rollback().await.expect("rollback");
 }
