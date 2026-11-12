@@ -75,6 +75,7 @@ Each numbered step has its own document:
 | ③ | Sealing: making a batch immutable | [03-sealing-and-the-fence.md](03-sealing-and-the-fence.md) | Every staged row belongs to exactly one batch — none in two, none in zero. |
 | ④ | Claiming and the claim-time fold | [04-claiming-and-the-fold.md](04-claiming-and-the-fold.md) | Parallel workers partition a batch without a lock, and a key's changes collapse losslessly. |
 | ⑤ | Applying, and non-idempotent deltas | [05-apply-and-exactly-once-deltas.md](05-apply-and-exactly-once-deltas.md) | A delta is applied exactly once — never twice, never zero times. |
+| ⑤ | Aggregate groups | [group-basis.md](group-basis.md) | An aggregate group moves by exactly the changes its basis hasn't counted. |
 | ⑥ | Cleanup, reclaim, and quarantine | [06-cleanup-and-reclaim.md](06-cleanup-and-reclaim.md) | Storage is bounded, and no cleanup step can retire un-applied work. |
 | — | Proving it (read-your-writes) | [07-convergence-and-await.md](07-convergence-and-await.md) | A caller can block until its own write is reflected, and the predicate never lies. |
 | — | Invariants and the tests that pin them | [08-invariants-and-pins.md](08-invariants-and-pins.md) | What is essential to correctness, what is a Postgres-specific choice, what tests pin it. |
@@ -111,7 +112,8 @@ high-volume ones be append-only and vacuum-free.
 [01](01-capture-by-triggers.md) → [02](02-the-staging-ring.md) →
 [03](03-sealing-and-the-fence.md) in order — the fence in 03 needs the append
 discipline in 02. [04](04-claiming-and-the-fold.md) and
-[05](05-apply-and-exactly-once-deltas.md) are the worker half, read as a pair.
+[05](05-apply-and-exactly-once-deltas.md) are the worker half, read as a pair;
+[the group basis](group-basis.md) is 05's aggregate path.
 [06](06-cleanup-and-reclaim.md) and [07](07-convergence-and-await.md) are the
 operational half; read 07 before designing any read-your-writes predicate — it
 is the easiest part of the design to get silently wrong.

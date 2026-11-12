@@ -11,10 +11,10 @@
 //!
 //! Nothing polls for convergence: every pass is stepped by hand.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 use trellis::defs::row_security::{Readers, RowSecurity, applying};
 use trellis::intake::harness;
@@ -22,15 +22,12 @@ use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{apply, seal};
 use trellis::{CaptureFault, CatalogError, Divergence, SelfCheckOutcome, TrellisError};
 
-const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+use pipeline::{capture_pass, connect_with};
+
+const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
 /// The table settings the matrix runs through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +48,7 @@ enum Setting {
 async fn the_check_matches_postgres_for_every_role_and_table_setting() {
     let cluster = TestCluster::start();
     let db = cluster.create_empty_database().await;
-    let client = connect(db.dsn()).await;
+    let client = connect_with(db.dsn(), "").await;
     client
         .batch_execute(
             "create role rls_owner nologin; \
@@ -178,7 +175,7 @@ async fn the_check_matches_postgres_for_every_role_and_table_setting() {
 async fn the_ring_owner_is_checked_as_well_as_the_session_role() {
     let cluster = TestCluster::start();
     let db = cluster.create_empty_database().await;
-    let client = connect(db.dsn()).await;
+    let client = connect_with(db.dsn(), "").await;
     client
         .batch_execute(
             "create role rls_ring nologin; \
@@ -299,7 +296,7 @@ struct Instance {
 
 async fn instance(cluster: &TestCluster) -> Instance {
     let db = cluster.create_empty_database().await;
-    let admin = connect(db.dsn()).await;
+    let admin = connect_with(db.dsn(), "").await;
     admin
         .batch_execute(&format!(
             "create role rls_trellis login; \
@@ -322,7 +319,7 @@ async fn instance(cluster: &TestCluster) -> Instance {
     trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the login role");
-    let raw = connect(&dsn).await;
+    let raw = connect_with(&dsn, "").await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
         .expect("set search_path");
@@ -435,24 +432,6 @@ async fn defining_refuses_a_table_whose_policies_apply_to_the_trellis_role() {
         .await
         .expect("a role with BYPASSRLS is exempt");
     it.trellis.shutdown().await.expect("shutdown");
-}
-
-/// The capture half of one staging-worker pass. Returns the waiting
-/// definitions it found ready to build.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) -> Vec<i64> {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = trellis::capture::reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-    outcome.ready
 }
 
 async fn status(trellis: &trellis::Trellis, target: &str) -> trellis::DefinitionStatus {
@@ -1136,7 +1115,7 @@ async fn a_target_its_writer_owns_is_not_checked_for_the_ring_owner() {
     let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
     let pool = trellis::pool::Pool::new(&config).expect("pool");
-    let mut raw = connect(&dsn).await;
+    let mut raw = connect_with(&dsn, "").await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
         .expect("set search_path");
@@ -1221,7 +1200,7 @@ async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
     let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
     let pool = trellis::pool::Pool::new(&config).expect("pool");
-    let mut raw = connect(&dsn).await;
+    let mut raw = connect_with(&dsn, "").await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
         .expect("set search_path");

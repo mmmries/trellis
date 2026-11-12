@@ -16,9 +16,14 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::defs::ValueType;
 use trellis::{CatalogError, Config, ErrorCode, Trellis, TrellisOptions};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect_with;
 
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 const TARGETS: &str = "trellis_targets";
@@ -27,14 +32,6 @@ const TARGETS: &str = "trellis_targets";
 const JOIN_CUSTOMERS: &str = "TRANSFORM by_amount FROM public.orders JOIN public.customers \
      ON orders.customer_id = customers.id GROUP BY orders.amount WITHOUT SOURCE INDEX \
      SELECT orders.amount AS amount, COUNT(*) AS n";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
 
 fn as_role(dsn: &str, role: &str) -> String {
     assert!(dsn.contains("user=postgres"), "{dsn}");
@@ -49,7 +46,7 @@ async fn set_up(
     cluster: &TestCluster,
 ) -> (testkit::TestDatabase, Client, trellis::pool::Pool, Trellis) {
     let db = cluster.create_empty_database().await;
-    let admin = connect(db.dsn()).await;
+    let admin = connect_with(db.dsn(), "").await;
     let database = db.name();
     admin
         .batch_execute(&format!(

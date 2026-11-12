@@ -11,10 +11,8 @@
 //!
 //! Nothing polls for convergence: every pass is stepped by hand.
 
-use std::time::{Duration, Instant};
-
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::TransformStatus;
 use trellis::defs::hierarchy::Hierarchy;
@@ -22,13 +20,10 @@ use trellis::intake::harness;
 use trellis::staging::apply::ApplyError;
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{capture_pass, connect_with};
 
 struct Instance {
     db: TestDatabase,
@@ -40,7 +35,7 @@ struct Instance {
 /// referencing `p`) and the given definitions, live.
 async fn instance(cluster: &TestCluster, definitions: &[&str]) -> Instance {
     let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
+    let mut raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
         .await
         .expect("set search_path");
@@ -64,22 +59,6 @@ async fn instance(cluster: &TestCluster, definitions: &[&str]) -> Instance {
     capture_pass(&mut raw, &db.pool).await;
     harness::settle_builds(&db.pool).await;
     Instance { db, raw, trellis }
-}
-
-/// The capture half of one staging-worker pass.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = trellis::capture::reconcile::reconcile(
-        raw,
-        DEFAULT_SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
 async fn status(trellis: &Trellis, target: &str) -> trellis::DefinitionStatus {
@@ -542,7 +521,7 @@ async fn assert_unpaused(it: &Instance, step: &str) {
 async fn the_check_reports_each_way_a_table_is_in_a_hierarchy() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(db.dsn()).await;
+    let raw = connect_with(db.dsn(), "").await;
     raw.batch_execute(
         "create table public.plain (id int primary key); \
          create table public.top (id int not null) partition by range (id); \

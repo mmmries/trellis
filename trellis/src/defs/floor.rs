@@ -636,9 +636,9 @@ pub(crate) fn collect<T>(validate: impl FnOnce() -> T) -> (T, Vec<Feature>) {
 /// The value and type rules define's validation admits `def` by, over the
 /// live columns of the table it reads (`from`) and, for a `JOIN`, of the
 /// joined table: the validation define and a resume run on the same types
-/// ([`super::validate::validate`] or [`super::validate::validate_join`],
-/// and the aggregate family check), collected with [`collect`]. The
-/// validator's refusal when it no longer admits them.
+/// ([`super::validate::validate_live`] or [`super::validate::validate_join`]),
+/// collected with [`collect`]. The validator's refusal when it no longer
+/// admits them.
 pub(crate) fn validated_features(
     def: &TransformDef,
     from: &std::collections::HashMap<String, super::validate::JoinColumnInfo>,
@@ -646,14 +646,7 @@ pub(crate) fn validated_features(
 ) -> Result<Vec<Feature>, super::validate::ValidationError> {
     let (result, used) = collect(|| match joined {
         Some(joined) => super::validate::validate_join(def, from, joined),
-        None => {
-            let value_types = from
-                .iter()
-                .map(|(name, info)| (name.clone(), info.value_type))
-                .collect();
-            super::validate::validate(def, &value_types)?;
-            super::validate::validate_aggregate_admitted(def, from)
-        }
+        None => super::validate::validate_live(def, from),
     });
     result.map(|()| used)
 }
@@ -1712,7 +1705,8 @@ mod tests {
         super::super::validate::JoinColumnInfo {
             value_type,
             pg_type: pg_type.to_string(),
-            type_oid: 0,
+            type_oid: super::super::join_key_types::rendered_type(pg_type)
+                .map_or(super::super::join_key_types::USER_TYPE_OID, |ty| ty.oid()),
             typmod: -1,
             collation_oid: 0,
             collation: None,

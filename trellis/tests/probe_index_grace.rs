@@ -14,7 +14,7 @@ mod resume_passes;
 
 use std::time::Duration;
 
-use resume_passes::{SCHEMA, bring_live, drain_to_quiescence, full_pass, rows, setup, status};
+use resume_passes::{SCHEMA, bring_live, reconcile_pass, rows, settle, setup, status};
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
 
@@ -80,7 +80,7 @@ async fn the_probe_index_pauses_once_its_grace_has_passed() {
     raw.batch_execute("drop index public.src_g_v_idx")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = status(&trellis, "agg").await;
     assert_eq!(reported.status, TransformStatus::Paused);
     let failure = reported.capture_failure.expect("why");
@@ -100,7 +100,7 @@ async fn the_probe_index_pauses_once_its_grace_has_passed() {
     raw.batch_execute("create index src_g_v_idx on public.src (g, v)")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let failure = status(&trellis, "agg")
         .await
         .capture_failure
@@ -131,9 +131,9 @@ async fn inside_the_grace_nothing_pauses_and_a_found_index_stops_the_clock() {
         .unwrap()
         .get(0);
     let checks = || trellis::staging::probe_index_checks(&database, SCHEMA, id);
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let settled = checks();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(checks(), settled, "an unchanged table is not checked again");
 
     raw.batch_execute(
@@ -143,8 +143,8 @@ async fn inside_the_grace_nothing_pauses_and_a_found_index_stops_the_clock() {
     .await
     .unwrap();
     for pass in 1..=3 {
-        full_pass(&mut raw, &db.pool).await;
-        drain_to_quiescence(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
         let reported = status(&trellis, "agg").await;
         assert_eq!(reported.status, TransformStatus::Live, "pass {pass}");
         assert_eq!(reported.capture_failure, None, "pass {pass}");
@@ -156,10 +156,10 @@ async fn inside_the_grace_nothing_pauses_and_a_found_index_stops_the_clock() {
     raw.batch_execute("create index src_g_v_idx on public.src (g, v)")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let found = checks();
     assert_eq!(found, settled + 4);
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(
         checks(),
         found,
@@ -191,7 +191,7 @@ async fn an_equivalent_index_pauses_nothing_even_with_no_grace() {
         } else {
             outcome.unwrap_or_else(|e| panic!("{statement}: {e}"));
         }
-        full_pass(&mut raw, &db.pool).await;
+        reconcile_pass(&mut raw, &db.pool).await;
         let reported = status(&trellis, "agg").await;
         assert_eq!(reported.status, TransformStatus::Live, "{statement}");
         assert_eq!(reported.capture_failure, None, "{statement}");
@@ -199,6 +199,6 @@ async fn an_equivalent_index_pauses_nothing_even_with_no_grace() {
     raw.batch_execute("delete from public.src where id = 5")
         .await
         .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     converged(&raw).await;
 }

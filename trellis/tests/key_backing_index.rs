@@ -10,9 +10,7 @@
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
 
-use resume_passes::{
-    SCHEMA, bring_live, connect, drain_to_quiescence, full_pass, rows, setup, status,
-};
+use resume_passes::{SCHEMA, bring_live, connect, reconcile_pass, rows, settle, setup, status};
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
 
@@ -81,7 +79,7 @@ async fn a_dropped_key_index_pauses_every_reader_on_the_next_pass() {
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(&cluster, KEYLESS, &[ONE, AGG]).await;
     raw.batch_execute("drop index public.s_key").await.unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     for target in ["s_one", "s_sums"] {
         let reported = status(&trellis, target).await;
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
@@ -103,7 +101,7 @@ async fn a_dropped_key_index_pauses_every_reader_on_the_next_pass() {
     raw.batch_execute("create unique index s_key on public.s (k1, k2)")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let failure = status(&trellis, "s_sums")
         .await
         .capture_failure
@@ -171,7 +169,7 @@ async fn routine_maintenance_of_the_key_index_pauses_nothing() {
             } else {
                 outcome.unwrap_or_else(|e| panic!("{statement}: {e}"));
             }
-            full_pass(&mut raw, &db.pool).await;
+            reconcile_pass(&mut raw, &db.pool).await;
             assert_live(&trellis, &["s_one", "s_sums"], statement).await;
         }
         raw.batch_execute(&format!(
@@ -180,8 +178,8 @@ async fn routine_maintenance_of_the_key_index_pauses_nothing() {
         ))
         .await
         .unwrap();
-        drain_to_quiescence(&db.pool, &mut raw).await;
-        full_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
         assert_live(&trellis, &["s_one", "s_sums"], &step.join("; ")).await;
         converged(&raw).await;
     }
@@ -243,7 +241,7 @@ async fn an_invalid_copy_beside_the_index_and_other_routine_operations_pause_not
         raw.batch_execute(statement)
             .await
             .unwrap_or_else(|e| panic!("{statement}: {e}"));
-        full_pass(&mut raw, &db.pool).await;
+        reconcile_pass(&mut raw, &db.pool).await;
         assert_live(&trellis, &["s_sums"], statement).await;
         let next = 100 + n;
         raw.batch_execute(&format!(
@@ -252,8 +250,8 @@ async fn an_invalid_copy_beside_the_index_and_other_routine_operations_pause_not
         ))
         .await
         .unwrap();
-        drain_to_quiescence(&db.pool, &mut raw).await;
-        full_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
+        reconcile_pass(&mut raw, &db.pool).await;
         assert_live(&trellis, &["s_sums"], statement).await;
     }
     assert_eq!(
@@ -290,7 +288,7 @@ async fn a_key_column_recollated_keeps_its_index_backing_the_key() {
     raw.batch_execute("alter table public.c alter column k type text collate \"C\"")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reasons = status(&trellis, "c_sums")
         .await
         .capture_failure
@@ -311,11 +309,11 @@ async fn a_key_column_recollated_keeps_its_index_backing_the_key() {
 async fn a_key_column_made_nullable_pauses() {
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(&cluster, KEYLESS, &[AGG]).await;
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     raw.batch_execute("alter table public.s alter column k2 drop not null")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = status(&trellis, "s_sums").await;
     assert_eq!(reported.status, TransformStatus::Paused);
     let reasons = reported.capture_failure.expect("why").reasons;
@@ -351,7 +349,7 @@ async fn a_failed_build_after_the_drop_pauses() {
         .await,
         [[Some("false".to_string())]]
     );
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = status(&trellis, "s_sums").await;
     assert_eq!(reported.status, TransformStatus::Paused);
     assert_eq!(reported.capture_failure.expect("why").reasons, [UNBACKED]);
@@ -370,18 +368,18 @@ async fn steady_state_adds_no_check() {
         .unwrap()
         .get(0);
     let checks = || trellis::staging::key_backing_checks(&database, SCHEMA, "public.s");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let settled = checks();
     assert!(settled >= 1, "the key has been checked");
-    full_pass(&mut raw, &db.pool).await;
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(checks(), settled, "an unchanged table is not checked again");
     raw.batch_execute("create index s_v on public.s (v)")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(checks(), settled + 1, "an index change is checked");
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(checks(), settled + 1);
 }
 
@@ -400,7 +398,7 @@ async fn a_table_keyed_by_its_primary_key_is_not_checked() {
     raw.batch_execute("alter table public.p drop constraint p_k_key")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_live(&trellis, &["p_sums"], "drop the unique constraint").await;
     let database: String = raw
         .query_one("select current_database()::text", &[])
@@ -467,7 +465,7 @@ async fn a_partitioned_root_left_invalid_after_a_leaf_repair_pauses() {
         [[Some("true".to_string()), Some("false".to_string())]],
         "the leaf is repaired and the root is still invalid"
     );
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let reported = status(&trellis, "pt_sums").await;
     assert_eq!(reported.status, TransformStatus::Paused);
     assert_eq!(
@@ -485,7 +483,7 @@ async fn a_partitioned_root_left_invalid_after_a_leaf_repair_pauses() {
     raw.batch_execute("alter index public.pt_key_new attach partition public.pt_1_key")
         .await
         .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     let failure = status(&trellis, "pt_sums")
         .await
         .capture_failure

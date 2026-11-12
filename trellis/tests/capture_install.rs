@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
-use tokio_postgres::{Client, IsolationLevel, NoTls};
+use tokio_postgres::{Client, IsolationLevel};
 use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, CaptureAction, Installed, LockingOperation, Progress};
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, function_name, trigger_name};
@@ -41,27 +41,18 @@ use trellis::intake::harness;
 use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
 use trellis::staging::self_check::CheckPageExt;
-use trellis::staging::{
-    MIN_ROWS_TO_SPLIT, TRUNCATE_SENTINEL_KEY, apply, has_pending, retire_drained_segments, seal,
-};
+use trellis::staging::{MIN_ROWS_TO_SPLIT, TRUNCATE_SENTINEL_KEY, apply, seal};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{connect, settle};
 
 const TEST_NAME: &str = "capture_install_test";
 const WAKE: &str = "capture_install_wake";
 
 /// How long the lock tests hold a writer open.
 const HOLD: Duration = Duration::from_secs(2);
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {DEFAULT_SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
 
 async fn backend_pid(client: &Client) -> i32 {
     client
@@ -1355,21 +1346,6 @@ async fn a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate() {
     }
 }
 
-/// Seals and drains until nothing is pending anywhere in the ring. A bounded
-/// deterministic loop, not a wait-for-convergence poll.
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    for _ in 0..16 {
-        drain_batch(pool, seal_both_phases(client).await).await;
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
-}
-
 /// Drains every bucket of `batch`.
 async fn drain_batch(pool: &trellis::pool::Pool, batch: i64) {
     while apply::drain_once(pool, batch, TEST_NAME, 1, WAKE)
@@ -1451,7 +1427,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
     );
     harness::settle_builds(&db.pool).await;
     assert_eq!(status_of(&client, "public.sku_of").await, "live");
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
 
     // Staged by the narrow function, and sealed into a batch of its own that
     // stays undrained until it drains alone below.
@@ -1514,7 +1490,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
         .batch_execute("insert into public.sales values (5, 'b', 3)")
         .await
         .expect("write after the widen");
-    drain_to_quiescence(&db.pool, &mut client).await;
+    settle(&db.pool, &mut client).await;
     let poisoned: i64 = client
         .query_one(
             "select (select count(*) from poison) + (select count(*) from poison_held)",

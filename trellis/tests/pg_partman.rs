@@ -38,32 +38,15 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
+use trellis::Trellis;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
 
-const SCHEMA: &str = "trellis";
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
+use pipeline::{connect, definer, drain, reconcile_pass, seal};
+use trellis::staging::build::settle_builds;
 
 /// Panics, naming the build, when the `postgres` on `PATH` has no pg_partman.
 fn require_partman() {
@@ -212,54 +195,6 @@ impl Mode {
     }
 }
 
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    drain(pool, client, 16, true).await;
-}
-
-/// Up to `rounds` seal/drain rounds; with `strict`, panics unless the ring
-/// ends quiet (a writer running alongside never lets it).
-async fn drain(pool: &trellis::pool::Pool, client: &mut Client, rounds: usize, strict: bool) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..rounds {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "pg_partman_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "pg_partman_test",
-            1,
-            "trellis_capture_missed_ddl_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    assert!(
-        !strict,
-        "the ring did not reach quiescence within {rounds} seal/drain rounds"
-    );
-}
-
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
 async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
     raw.query(sql, &[])
         .await
@@ -397,9 +332,9 @@ impl Harness {
             failures: Vec::new(),
         };
         for _ in 0..10 {
-            full_pass(&mut h.raw, &h.db.pool).await;
-            run_backfill_chunks(&h.db.pool).await;
-            drain_to_quiescence(&h.db.pool, &mut h.raw).await;
+            reconcile_pass(&mut h.raw, &h.db.pool).await;
+            settle_builds(&h.db.pool).await;
+            pipeline::settle(&h.db.pool, &mut h.raw).await;
             if h.statuses()
                 .await
                 .iter()
@@ -426,9 +361,9 @@ impl Harness {
     async fn settle(&mut self, rounds: usize) -> (usize, String) {
         let mut diff = String::new();
         for round in 1..=rounds {
-            full_pass(&mut self.raw, &self.db.pool).await;
-            run_backfill_chunks(&self.db.pool).await;
-            drain_to_quiescence(&self.db.pool, &mut self.raw).await;
+            reconcile_pass(&mut self.raw, &self.db.pool).await;
+            settle_builds(&self.db.pool).await;
+            pipeline::settle(&self.db.pool, &mut self.raw).await;
             diff = oracle_diff(&self.raw, self.mode.group).await;
             if diff.is_empty() {
                 return (round, diff);
@@ -657,7 +592,7 @@ async fn run_mode(mode: Mode) {
             "select partman.run_maintenance('public.ev')",
         )
         .await;
-        full_pass(&mut h.raw, &h.db.pool).await;
+        reconcile_pass(&mut h.raw, &h.db.pool).await;
     }
     let (f1, f2) = (w1.await.unwrap(), w2.await.unwrap());
     println!("[{name}] concurrent writers: {f1} and {f2} statements refused");
@@ -840,9 +775,10 @@ async fn partman_background_worker() {
     let start = Instant::now();
     let mut worker_done = None;
     while start.elapsed() < Duration::from_secs(60) {
-        full_pass(&mut h.raw, &h.db.pool).await;
-        run_backfill_chunks(&h.db.pool).await;
-        drain(&h.db.pool, &mut h.raw, 1, false).await;
+        reconcile_pass(&mut h.raw, &h.db.pool).await;
+        settle_builds(&h.db.pool).await;
+        let batch = seal(&mut h.raw).await;
+        drain(&h.db.pool, batch, "pg_partman").await;
         if worker_done.is_none() && leaf_count(&h.raw).await != leaves_before {
             worker_done = Some(start.elapsed());
         }
@@ -896,9 +832,9 @@ async fn partman_background_worker_blocked_by_rows_in_the_default() {
     let start = Instant::now();
     let mut tick = 0;
     while refusals(&h) < 3 && start.elapsed() < Duration::from_secs(60) {
-        full_pass(&mut h.raw, &h.db.pool).await;
-        run_backfill_chunks(&h.db.pool).await;
-        drain_to_quiescence(&h.db.pool, &mut h.raw).await;
+        reconcile_pass(&mut h.raw, &h.db.pool).await;
+        settle_builds(&h.db.pool).await;
+        pipeline::settle(&h.db.pool, &mut h.raw).await;
         println!(
             "[bgw-blocked] tick {tick}: {:?}",
             oracle_diff(&h.raw, h.mode.group).await
@@ -983,7 +919,7 @@ async fn partman_default_beside_short_lived_and_retired_leaves() {
     let leaf = leaf[0][0].clone().expect("a leaf");
     // The staging worker applies the write (it drains on its own clock, the
     // reconcile pass on another) before the leaf goes.
-    drain_to_quiescence(&h.db.pool, &mut h.raw).await;
+    pipeline::settle(&h.db.pool, &mut h.raw).await;
     println!(
         "[gap] a brand-new leaf {leaf} took a write; before the drop: {:?}",
         oracle_diff(&h.raw, h.mode.group).await

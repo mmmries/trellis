@@ -225,8 +225,15 @@ fn collect_columns(
 /// column name could collide with a SQL keyword; literals carry an explicit
 /// cast so the rendered text is unambiguous regardless of context.
 pub fn render_expr_sql(expr: &Expr) -> String {
+    render_with(expr, &|name| quote_ident(name))
+}
+
+/// [`render_expr_sql`] and [`render_qualified_expr_sql`]: the expression
+/// with each column read rendered by `column` (of its name).
+fn render_with(expr: &Expr, column: &dyn Fn(&str) -> String) -> String {
+    let render = |e: &Expr| render_with(e, column);
     match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
+        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => column(name),
         Expr::NumberLiteral(text) => number_literal_sql(text),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::BooleanLiteral(value) => value.to_string(),
@@ -235,26 +242,20 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = super::registry::operator_spec(*op).symbol;
-            format!(
-                "({} {symbol} {})",
-                render_expr_sql(lhs),
-                render_expr_sql(rhs)
-            )
+            format!("({} {symbol} {})", render(lhs), render(rhs))
         }
-        Expr::Negate(operand) => format!("(-({}))", render_expr_sql(operand)),
-        Expr::Cast { expr, target } => {
-            format!("cast({} as {target})", render_expr_sql(expr))
-        }
-        Expr::Not(operand) => format!("(not {})", render_expr_sql(operand)),
+        Expr::Negate(operand) => format!("(-({}))", render(operand)),
+        Expr::Cast { expr, target } => format!("cast({} as {target})", render(expr)),
+        Expr::Not(operand) => format!("(not {})", render(operand)),
         Expr::IsNull { expr, negated } => format!(
             "({} is {}null)",
-            render_expr_sql(expr),
+            render(expr),
             if *negated { "not " } else { "" }
         ),
         Expr::Case {
             branches,
             otherwise,
-        } => render_case_sql(branches, otherwise.as_deref(), render_expr_sql),
+        } => render_case_sql(branches, otherwise.as_deref(), render),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             // `COUNT(*)`: the parser's only accepted `COUNT`
             // shape, but its AST has no argument to render — `count()` is
@@ -264,10 +265,10 @@ pub fn render_expr_sql(expr: &Expr) -> String {
             "count(*)".to_string()
         }
         Expr::FunctionCall { name, args } => match super::ast::as_extract(name, args) {
-            Some((field, operand)) => format!("extract({field} from {})", render_expr_sql(operand)),
+            Some((field, operand)) => format!("extract({field} from {})", render(operand)),
             None => {
-                let rendered_args: Vec<String> = args.iter().map(render_expr_sql).collect();
-                format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
+                let rendered: Vec<String> = args.iter().map(render).collect();
+                format!("{}({})", name.to_lowercase(), rendered.join(", "))
             }
         },
     }
@@ -323,60 +324,7 @@ pub(crate) fn number_literal_sql(text: &str) -> String {
 /// `s`), for SQL that reads the source under an alias: the group-basis and
 /// `JOIN` partial reads.
 pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String {
-    match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
-            format!("{source_sql}.{}", quote_ident(name))
-        }
-        Expr::NumberLiteral(text) => number_literal_sql(text),
-        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
-        Expr::BooleanLiteral(value) => value.to_string(),
-        // Bare, so Postgres types it from the same context `validate` did.
-        Expr::Null => "null".to_string(),
-        Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
-        Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = super::registry::operator_spec(*op).symbol;
-            format!(
-                "({} {symbol} {})",
-                render_qualified_expr_sql(lhs, source_sql),
-                render_qualified_expr_sql(rhs, source_sql)
-            )
-        }
-        Expr::Negate(operand) => {
-            format!("(-({}))", render_qualified_expr_sql(operand, source_sql))
-        }
-        Expr::Cast { expr, target } => format!(
-            "cast({} as {target})",
-            render_qualified_expr_sql(expr, source_sql)
-        ),
-        Expr::Not(operand) => format!("(not {})", render_qualified_expr_sql(operand, source_sql)),
-        Expr::IsNull { expr, negated } => format!(
-            "({} is {}null)",
-            render_qualified_expr_sql(expr, source_sql),
-            if *negated { "not " } else { "" }
-        ),
-        Expr::Case {
-            branches,
-            otherwise,
-        } => render_case_sql(branches, otherwise.as_deref(), |e| {
-            render_qualified_expr_sql(e, source_sql)
-        }),
-        Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            "count(*)".to_string()
-        }
-        Expr::FunctionCall { name, args } => match super::ast::as_extract(name, args) {
-            Some((field, operand)) => format!(
-                "extract({field} from {})",
-                render_qualified_expr_sql(operand, source_sql)
-            ),
-            None => {
-                let rendered: Vec<String> = args
-                    .iter()
-                    .map(|arg| render_qualified_expr_sql(arg, source_sql))
-                    .collect();
-                format!("{}({})", name.to_lowercase(), rendered.join(", "))
-            }
-        },
-    }
+    render_with(expr, &|name| format!("{source_sql}.{}", quote_ident(name)))
 }
 
 #[cfg(test)]
@@ -532,5 +480,50 @@ mod tests {
             render_expr_sql(&expr),
             "regexp_count(\"description\", 'o''clock'::text)"
         );
+    }
+
+    /// Every construct of the grammar, through both write-path renderers:
+    /// the same text but for a column, which the qualified renderer reads
+    /// through the alias it is given.
+    #[test]
+    fn both_write_path_renderers_render_every_construct_alike() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s SELECT CASE WHEN a > 1 AND NOT (b IS NULL) THEN -(a + 2.5) \
+             WHEN b IS NOT NULL THEN CAST(b AS numeric) ELSE COALESCE(a, NULL) END AS x, \
+             EXTRACT(year FROM d) AS y, DATE '2024-01-01' AS z, 'o''clock' AS w, \
+             TRUE AS v, ROUND(m, 2) AS r, s.a AS sa, -2147483648 AS lo",
+        )
+        .expect("parses");
+        let mut exprs: Vec<Expr> = def.fields.into_iter().map(|f| f.expr).collect();
+        // `COUNT(*)`, which no 1-1 field holds, renders its `*` back.
+        exprs.push(Expr::FunctionCall {
+            name: "COUNT".to_string(),
+            args: Vec::new(),
+        });
+        let expected = [
+            "(case when ((\"a\" > 1::integer) AND (not (\"b\" is null))) \
+             then (-((\"a\" + 2.5::numeric))) when (\"b\" is not null) \
+             then cast(\"b\" as numeric) else coalesce(\"a\", null) end)",
+            "extract(year from \"d\")",
+            "'2024-01-01'::date",
+            "'o''clock'::text",
+            "true",
+            "round(\"m\", 2::integer)",
+            "\"a\"",
+            "(-2147483648)::integer",
+            "count(*)",
+        ];
+        assert_eq!(exprs.len(), expected.len());
+        for (expr, expected) in exprs.iter().zip(expected) {
+            assert_eq!(render_expr_sql(expr), expected);
+            assert_eq!(
+                render_qualified_expr_sql(expr, "q"),
+                expected
+                    .replace("\"a\"", "q.\"a\"")
+                    .replace("\"b\"", "q.\"b\"")
+                    .replace("\"d\"", "q.\"d\"")
+                    .replace("\"m\"", "q.\"m\"")
+            );
+        }
     }
 }

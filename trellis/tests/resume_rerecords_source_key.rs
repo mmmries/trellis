@@ -12,8 +12,7 @@
 mod resume_passes;
 
 use resume_passes::{
-    RECREATED, SOURCE, bring_live, capture_pass, drain_to_quiescence, full_pass, rows, setup,
-    status,
+    RECREATED, SOURCE, bring_live, capture_pass, reconcile_pass, rows, settle, setup, status,
 };
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
@@ -55,7 +54,7 @@ async fn an_aggregate_resumes_onto_a_primary_key_redefined_in_place() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(
         status(&trellis, "c_sums").await.status,
         TransformStatus::Paused
@@ -70,7 +69,7 @@ async fn an_aggregate_resumes_onto_a_primary_key_redefined_in_place() {
     )
     .await
     .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
 
@@ -100,7 +99,7 @@ async fn one_reader_s_resume_re_records_the_key_for_every_reader() {
     raw.batch_execute("insert into public.c values (4, 8, 1); delete from public.c where id = 1")
         .await
         .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, COUNTS_ACTUAL).await,
         rows(&raw, COUNTS_ORACLE).await
@@ -116,7 +115,7 @@ async fn one_reader_s_resume_re_records_the_key_for_every_reader() {
     raw.batch_execute("insert into public.c values (5, 7, 2)")
         .await
         .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
     assert_eq!(
         rows(&raw, COUNTS_ACTUAL).await,
@@ -153,7 +152,7 @@ async fn a_define_over_a_recreated_table_takes_the_new_table_s_key() {
     );
     // The new reader is paused with the old one for the capture the drop
     // removed, and resumes with it.
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     trellis.apply("RESUME TRANSFORM c_copy").await.unwrap();
     bring_live(&mut raw, &db.pool, &trellis, &["c_copy"]).await;
     let copy_oracle = "select pid::text, id::text, amount::text from public.c order by 1, 2";
@@ -165,7 +164,7 @@ async fn a_define_over_a_recreated_table_takes_the_new_table_s_key() {
     raw.batch_execute("insert into public.c values (4, 8, 1); delete from public.c where id = 1")
         .await
         .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
     assert_eq!(rows(&raw, copy_actual).await, rows(&raw, copy_oracle).await);
 }
@@ -185,7 +184,7 @@ async fn a_resume_takes_no_unique_index_as_a_changed_key() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(
         status(&trellis, "c_sums").await.status,
         TransformStatus::Paused
@@ -247,7 +246,7 @@ async fn a_re_record_pauses_the_readers_still_running_on_the_old_key() {
     raw.batch_execute("insert into public.c values (100, 2, 7); delete from public.c where id = 1")
         .await
         .unwrap();
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         rows(&raw, COUNTS_ACTUAL).await,
         rows(&raw, COUNTS_ORACLE).await
@@ -296,7 +295,7 @@ async fn an_aggregate_resumes_onto_a_primary_key_moved_beside_the_old_key_s_inde
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     assert_eq!(
         status(&trellis, "c_sums").await.status,
         TransformStatus::Paused
@@ -311,8 +310,8 @@ async fn an_aggregate_resumes_onto_a_primary_key_moved_beside_the_old_key_s_inde
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
-    drain_to_quiescence(&db.pool, &mut raw).await;
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
     assert_eq!(
         status(&trellis, "c_sums").await.status,
         TransformStatus::Live
@@ -334,7 +333,7 @@ async fn a_refused_resume_keeps_the_old_record() {
     )
     .await
     .unwrap();
-    full_pass(&mut raw, &db.pool).await;
+    reconcile_pass(&mut raw, &db.pool).await;
     trellis
         .apply("RESUME TRANSFORM c_sums")
         .await

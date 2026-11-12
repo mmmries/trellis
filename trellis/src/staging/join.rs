@@ -175,8 +175,8 @@ use crate::pool::quote_ident;
 use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
 use super::group_basis::{
-    self, Arg, ColumnCollations, GroupCollations, GroupShape, GroupTargetPlan, NO_SCALES, SumPart,
-    Writer,
+    self, Arg, ColumnCollations, GroupCollations, GroupShape, GroupTargetPlan, NO_SCALES, Partial,
+    SumPart, Writer,
 };
 use super::target_mutations::TargetMutations;
 
@@ -732,7 +732,6 @@ impl JoinTargetPlan {
     /// sides apply, so it reads `P` as it was before them.
     fn refill_sql(&self) -> String {
         let p_args = &self.from.plan.shape.args;
-        let m_args = &self.joined.plan.shape.args;
         // The `FROM` side's `T` group columns, which `P` holds; the joined
         // side's are `NULL` in every unmatched term.
         let from_groups: Vec<String> = self
@@ -750,38 +749,23 @@ impl JoinTargetPlan {
             })
             .collect();
         let mut insert_cols = quoted(&self.t.shape.group_cols);
-        insert_cols.extend(["__txid", "__lsn", "__n"].map(String::from));
+        insert_cols.extend(["__txid", "__lsn"].map(String::from));
         select.extend([
             "pg_current_xact_id()".to_string(),
             "'0/0'::pg_lsn".to_string(),
-            "q.__n".to_string(),
         ]);
         let mut sums = from_groups.clone();
-        sums.push("sum(__n)::bigint as __n".to_string());
-        let mut nonzero = vec!["sum(__n) <> 0".to_string()];
-        for (i, arg) in p_args.iter().chain(m_args).enumerate() {
-            let from = i < p_args.len();
-            let i = i + 1;
-            insert_cols.push(format!("__c{i}"));
-            if from {
-                sums.push(format!("sum(__count_{i})::bigint as __c{i}"));
-                nonzero.push(format!("sum(__count_{i}) <> 0"));
-                select.push(format!("q.__c{i}"));
-            } else {
-                select.push("0".to_string());
+        let mut nonzero = Vec::new();
+        for p in self.t.shape.partials() {
+            let staged = p.name("__");
+            insert_cols.push(staged.clone());
+            if p.arg().is_some_and(|i| i > p_args.len()) {
+                select.push(p.zero().to_string());
+                continue;
             }
-            for part in arg.parts() {
-                let staged = part.name("__", i);
-                insert_cols.push(staged.clone());
-                if from {
-                    let total = part.total(&part.hidden(i), None, arg.scale);
-                    sums.push(format!("{total} as {staged}"));
-                    nonzero.push(part.nonzero(&total));
-                    select.push(format!("q.{staged}"));
-                } else {
-                    select.push(part.zero().to_string());
-                }
-            }
+            sums.push(format!("{} as {staged}", p.total(&p.hidden(), None)));
+            nonzero.push(p.sum_nonzero(&p.hidden()));
+            select.push(format!("q.{staged}"));
         }
         let group_by = if from_groups.is_empty() {
             String::new()
@@ -829,23 +813,20 @@ impl JoinTargetPlan {
         let (dp, dm) = ("__dp", "__dm");
         let summed = |name: &str, side: &SidePlan| {
             let keys = quoted(&side.plan.shape.group_cols).join(", ");
-            let mut columns = vec![keys.clone(), "sum(__dn)::bigint as __dn".to_string()];
-            for (i, arg) in side.plan.shape.args.iter().enumerate() {
-                let i = i + 1;
-                columns.push(format!("sum(__dc{i})::bigint as __dc{i}"));
-                for part in arg.parts() {
-                    let delta = part.name("__d", i);
-                    // A map no delta holds is `NULL`, with no array
-                    // aggregate: its state would also make Postgres size the
-                    // hash table for a large state per cell, and spill.
-                    let total = if *part == SumPart::Scales && side.delta_map_free(i) {
+            let mut columns = vec![keys.clone()];
+            columns.extend(side.plan.shape.each_partial(|p| {
+                let delta = p.name("__d");
+                // A map no delta holds is `NULL`, with no array aggregate:
+                // its state would also make Postgres size the hash table for
+                // a large state per cell, and spill.
+                let total = match p {
+                    Partial::Sum(SumPart::Scales, i) if side.delta_map_free(i) => {
                         NO_SCALES.to_string()
-                    } else {
-                        part.total(&delta, None, arg.scale)
-                    };
-                    columns.push(format!("{total} as {delta}"));
-                }
-            }
+                    }
+                    _ => p.total(&delta, None),
+                };
+                format!("{total} as {delta}")
+            }));
             format!(
                 "{name} as materialized (select {} from {} group by {keys})",
                 columns.join(", "),
@@ -853,9 +834,7 @@ impl JoinTargetPlan {
             )
         };
         let delta_ctes = vec![summed(dp, &self.from), summed(dm, &self.joined)];
-        let p_args = self.from.plan.shape.args.clone();
-        let m_args = self.joined.plan.shape.args.clone();
-        let fa = p_args.len();
+        let fa = self.from.plan.shape.args.len();
         let pj = quoted(&self.from.join_cols);
         let mj = quoted(&self.joined.join_cols);
         let jc = quoted(&self.j_cols);
@@ -872,206 +851,112 @@ impl JoinTargetPlan {
         // `NULL` matching `NULL`.
         let cell_eq = self.from.plan.group_match("d", "p");
         // One term's select list: `T`'s group columns (`P`'s from `a`, `M`'s
-        // from `b`, or `NULL` when `b` is `None`), then `__n`, then per
-        // argument its count and each of its sum's partials (`part`, of the
-        // argument's 1-based index in `T`, and of the partial).
-        let term = |a: &str,
-                    b: Option<&str>,
-                    n: String,
-                    counts: Vec<String>,
-                    part: &dyn Fn(usize, SumPart) -> String| {
-            let mut columns: Vec<String> = self
-                .t_groups
-                .iter()
-                .map(|(side, c)| {
-                    let c = quote_ident(c);
-                    match (side, b) {
-                        (Side::From, _) => format!("{a}.{c} as {c}"),
-                        (Side::Joined(_), Some(b)) => format!("{b}.{c} as {c}"),
-                        (Side::Joined(_), None) => format!("null as {c}"),
-                    }
-                })
-                .collect();
-            columns.push(format!("({n})::bigint as __n"));
-            for (i, arg) in p_args.iter().chain(&m_args).enumerate() {
-                columns.push(format!("({})::bigint as __c{}", counts[i], i + 1));
-                for sum_part in arg.parts() {
-                    columns.push(format!(
-                        "({})::{} as {}",
-                        part(i + 1, *sum_part),
-                        sum_part.sql_type(),
-                        sum_part.name("__", i + 1)
-                    ));
-                }
-            }
-            columns.join(", ")
+        // from `b`, or `NULL` when `b` is `None`), then each of `T`'s
+        // partials, `value` of it.
+        let term =
+            |a: &str, b: Option<&str>, value: &dyn Fn(Partial) -> String| {
+                let mut columns: Vec<String> = self
+                    .t_groups
+                    .iter()
+                    .map(|(side, c)| {
+                        let c = quote_ident(c);
+                        match (side, b) {
+                            (Side::From, _) => format!("{a}.{c} as {c}"),
+                            (Side::Joined(_), Some(b)) => format!("{b}.{c} as {c}"),
+                            (Side::Joined(_), None) => format!("null as {c}"),
+                        }
+                    })
+                    .collect();
+                columns.extend(self.t.shape.each_partial(|p| {
+                    format!("({})::{} as {}", value(p), p.sql_type(), p.name("__"))
+                }));
+                columns.join(", ")
+            };
+        // `T`'s partial `p` as `M`'s own, if it is one of `M`'s arguments'.
+        let m_part = |p: Partial| match p {
+            Partial::Count(i) if i > fa => Some(Partial::Count(i - fa)),
+            Partial::Sum(part, i) if i > fa => Some(Partial::Sum(part, i - fa)),
+            Partial::Rows | Partial::Count(_) | Partial::Sum(..) => None,
         };
+        // A cell's delta of `side`'s partial `p`, through `alias`: a map no
+        // delta holds ([`SidePlan::delta_map_free`]) is `NULL`, so every
+        // product and difference of it folds away when the statement is
+        // planned.
+        let delta = |side: &SidePlan, alias: &str, p: Partial| match p {
+            Partial::Sum(SumPart::Scales, i) if side.delta_map_free(i) => NO_SCALES.to_string(),
+            _ => format!("{alias}.{}", p.name("__d")),
+        };
+        let d_delta = |p: Partial| delta(&self.from, "d", p);
         // `P_old` of cell `p`, given its delta row `d` (left joined).
-        let p_old_n = "(p.__n - coalesce(d.__dn, 0))".to_string();
-        let p_old_c = |i: usize| format!("(p.__count_{i} - coalesce(d.__dc{i}, 0))");
-        // The reference scale of `T`'s argument `i` (1-based).
-        let scale_of = |i: usize| {
-            if i <= fa {
-                p_args[i - 1].scale
-            } else {
-                m_args[i - 1 - fa].scale
+        let p_old = |p: Partial| match p {
+            Partial::Sum(part, _) => {
+                let d = format!("coalesce({}, {})", d_delta(p), part.zero());
+                part.sub(&format!("p.{}", p.hidden()), &d)
+            }
+            Partial::Rows | Partial::Count(_) => {
+                format!("(p.{} - coalesce(d.{}, 0))", p.hidden(), p.name("__d"))
             }
         };
-        let held = |_: usize, _: SumPart, column: String| column;
-        // A cell's delta of partial `part` of the side's argument `i`
-        // (1-based), through `alias`: a map no delta holds
-        // ([`SidePlan::delta_map_free`]) is `NULL`, so every product and
-        // difference of it folds away when the statement is planned.
-        let from_free: Vec<bool> = (1..=fa).map(|i| self.from.delta_map_free(i)).collect();
-        let joined_free: Vec<bool> = (1..=m_args.len())
-            .map(|j| self.joined.delta_map_free(j))
-            .collect();
-        let delta = |free: &[bool], alias: &str, i: usize, part: SumPart| {
-            if part == SumPart::Scales && free[i - 1] {
-                NO_SCALES.to_string()
-            } else {
-                format!("{alias}.{}", part.name("__d", i))
-            }
-        };
-        let d_delta = |i: usize, part: SumPart| delta(&from_free, "d", i, part);
-        let e_delta = |j: usize, part: SumPart| delta(&joined_free, "e", j, part);
-        let zero = |_: usize, part: SumPart| part.zero().to_string();
-        let times = |i: usize, part: SumPart, a: &str, n: &str| part.times(a, n, scale_of(i));
-        let sub = |i: usize, part: SumPart, a: &str, b: &str| part.sub(a, b, scale_of(i));
-        let p_old = |i: usize, part: SumPart| {
-            sub(
-                i,
-                part,
-                &held(i, part, format!("p.{}", part.hidden(i))),
-                &format!("coalesce({}, {})", d_delta(i, part), zero(i, part)),
-            )
-        };
-        // The argument `i` of `T` (1-based) as the `i - fa`-th of `M`.
-        let m_index = |i: usize| i - fa;
+        let p_old_n = p_old(Partial::Rows);
         let mut terms = Vec::new();
         // ΔP ⊗ M_new.
-        {
-            let mut counts = Vec::new();
-            for i in 1..=fa {
-                counts.push(format!("d.__dc{i} * m.__n"));
-            }
-            for j in 1..=m_args.len() {
-                counts.push(format!("d.__dn * m.__count_{j}"));
-            }
-            let part = |i: usize, part: SumPart| {
-                if i <= fa {
-                    times(i, part, &d_delta(i, part), "m.__n")
-                } else {
-                    times(
-                        i,
-                        part,
-                        &held(i, part, format!("m.{}", part.hidden(m_index(i)))),
-                        "d.__dn",
-                    )
-                }
-            };
-            terms.push(format!(
-                "select {} from {dp} d join {m} m on {}",
-                term("d", Some("m"), "d.__dn * m.__n".to_string(), counts, &part),
-                key_eq("m", &mj, "d", &pj),
-            ));
-        }
+        let value = |p: Partial| match (p, m_part(p)) {
+            (_, None) => p.times(&d_delta(p), "m.__n"),
+            (Partial::Count(_), Some(q)) => format!("d.__dn * m.{}", q.hidden()),
+            (_, Some(q)) => q.times(&format!("m.{}", q.hidden()), "d.__dn"),
+        };
+        terms.push(format!(
+            "select {} from {dp} d join {m} m on {}",
+            term("d", Some("m"), &value),
+            key_eq("m", &mj, "d", &pj),
+        ));
         // P_old ⊗ ΔM.
-        {
-            let mut counts = Vec::new();
-            for i in 1..=fa {
-                counts.push(format!("{} * e.__dn", p_old_c(i)));
-            }
-            for j in 1..=m_args.len() {
-                counts.push(format!("{p_old_n} * e.__dc{j}"));
-            }
-            let part = |i: usize, part: SumPart| {
-                if i <= fa {
-                    times(i, part, &p_old(i, part), "e.__dn")
-                } else {
-                    times(i, part, &e_delta(m_index(i), part), &p_old_n)
-                }
-            };
-            terms.push(format!(
-                "select {} from {dm} e join {p} p on {} left join {dp} d on {cell_eq}",
-                term("p", Some("e"), format!("{p_old_n} * e.__dn"), counts, &part),
-                key_eq("p", &pj, "e", &mj),
-            ));
-        }
+        let value = |p: Partial| match (p, m_part(p)) {
+            (_, None) => p.times(&p_old(p), "e.__dn"),
+            (Partial::Count(_), Some(q)) => format!("{p_old_n} * e.{}", q.name("__d")),
+            (_, Some(q)) => q.times(&delta(&self.joined, "e", q), &p_old_n),
+        };
+        terms.push(format!(
+            "select {} from {dm} e join {p} p on {} left join {dp} d on {cell_eq}",
+            term("p", Some("e"), &value),
+            key_eq("p", &pj, "e", &mj),
+        ));
         let mut ctes = delta_ctes;
         if self.left {
-            let zero_b = |counts: &mut Vec<String>| {
-                for _ in 0..m_args.len() {
-                    counts.push("0".to_string());
-                }
-            };
             // A `P` cell with a `NULL` key part: always unmatched.
-            {
-                let mut counts: Vec<String> = (1..=fa).map(|i| format!("d.__dc{i}")).collect();
-                zero_b(&mut counts);
-                let part = |i: usize, part: SumPart| {
-                    if i <= fa {
-                        d_delta(i, part)
-                    } else {
-                        zero(i, part)
-                    }
-                };
-                let null_key: Vec<String> = pj.iter().map(|c| format!("d.{c} is null")).collect();
-                terms.push(format!(
-                    "select {} from {dp} d where {}",
-                    term("d", None, "d.__dn".to_string(), counts, &part),
-                    null_key.join(" or ")
-                ));
-            }
+            let value = |p: Partial| match m_part(p) {
+                None => d_delta(p),
+                Some(_) => p.zero().to_string(),
+            };
+            let null_key: Vec<String> = pj.iter().map(|c| format!("d.{c} is null")).collect();
+            terms.push(format!(
+                "select {} from {dp} d where {}",
+                term("d", None, &value),
+                null_key.join(" or ")
+            ));
             // Every `P` cell of a key the page changed: `[matches_new = 0] P_new
             // - [matches_old = 0] P_old` (a flip, or a change while unmatched).
-            {
-                let mut counts: Vec<String> = (1..=fa)
-                    .map(|i| format!("jd.__new * p.__count_{i} - jd.__old * {}", p_old_c(i)))
-                    .collect();
-                zero_b(&mut counts);
-                let part = |i: usize, part: SumPart| {
-                    if i <= fa {
-                        sub(
-                            i,
-                            part,
-                            &times(
-                                i,
-                                part,
-                                &held(i, part, format!("p.{}", part.hidden(i))),
-                                "jd.__new",
-                            ),
-                            &times(i, part, &p_old(i, part), "jd.__old"),
-                        )
-                    } else {
-                        zero(i, part)
-                    }
-                };
-                // With `matches_new > 0` the term is `-P_old`, which adds
-                // nothing when every partial of `P_old` is 0: a cell a build
-                // inserted, on a key its `M` matched.
-                let mut p_old_nonzero: Vec<String> = vec![format!("{p_old_n} <> 0")];
-                for (i, arg) in p_args.iter().enumerate() {
-                    let i = i + 1;
-                    p_old_nonzero.push(format!("{} <> 0", p_old_c(i)));
-                    for sum_part in arg.parts() {
-                        p_old_nonzero.push(sum_part.nonzero(&p_old(i, *sum_part)));
-                    }
+            let value = |p: Partial| match (p, m_part(p)) {
+                (_, Some(_)) => p.zero().to_string(),
+                (Partial::Sum(..), None) => p.sub(
+                    &p.times(&format!("p.{}", p.hidden()), "jd.__new"),
+                    &p.times(&p_old(p), "jd.__old"),
+                ),
+                (Partial::Rows | Partial::Count(_), None) => {
+                    format!("jd.__new * p.{} - jd.__old * {}", p.hidden(), p_old(p))
                 }
-                terms.push(format!(
-                    "select {} from jd join {p} p on {} left join {dp} d on {cell_eq} \
-                     where jd.__new <> 0 or (jd.__old <> 0 and ({}))",
-                    term(
-                        "p",
-                        None,
-                        format!("jd.__new * p.__n - jd.__old * {p_old_n}"),
-                        counts,
-                        &part
-                    ),
-                    key_eq("p", &pj, "jd", &jc),
-                    p_old_nonzero.join(" or "),
-                ));
-            }
+            };
+            // With `matches_new > 0` the term is `-P_old`, which adds
+            // nothing when every partial of `P_old` is 0: a cell a build
+            // inserted, on a key its `M` matched.
+            let p_old_nonzero = self.from.plan.shape.each_partial(|p| p.nonzero(&p_old(p)));
+            terms.push(format!(
+                "select {} from jd join {p} p on {} left join {dp} d on {cell_eq} \
+                 where jd.__new <> 0 or (jd.__old <> 0 and ({}))",
+                term("p", None, &value),
+                key_eq("p", &pj, "jd", &jc),
+                p_old_nonzero.join(" or "),
+            ));
             let pj_as: Vec<String> = pj
                 .iter()
                 .zip(&jc)
@@ -1119,35 +1004,24 @@ impl JoinTargetPlan {
         // spill, even when no term holds a map (the common page).
         let t_cols = quoted(&self.t.shape.group_cols);
         let mut insert_cols = t_cols.clone();
-        insert_cols.extend(["__txid", "__lsn", "__n"].map(String::from));
-        let mut sums = vec!["sum(__n)::bigint as __n".to_string()];
-        let mut values = vec!["a.__n".to_string()];
-        let mut nonzero = vec!["sum(__n) <> 0".to_string()];
-        let mut maps = Vec::new();
-        let mut map_values = Vec::new();
-        let mut holds = Vec::new();
-        let mut flags = Vec::new();
-        for (i, arg) in p_args.iter().chain(&m_args).enumerate() {
-            let i = i + 1;
-            insert_cols.push(format!("__c{i}"));
-            sums.push(format!("sum(__c{i})::bigint as __c{i}"));
-            values.push(format!("a.__c{i}"));
-            nonzero.push(format!("sum(__c{i}) <> 0"));
-            for part in arg.parts() {
-                let staged = part.name("__", i);
-                let total = part.total(&staged, None, arg.scale);
-                insert_cols.push(staged.clone());
-                if *part == SumPart::Scales {
-                    maps.push(format!("{total} as {staged}"));
-                    values.push(format!("km.{staged}"));
-                    map_values.push(format!("km.{staged} is not null"));
-                    holds.push(format!("{staged} is not null"));
-                    flags.push(format!("coalesce(bool_and(km.{staged} is null), true)"));
-                } else {
-                    nonzero.push(part.nonzero(&total));
-                    sums.push(format!("{total} as {staged}"));
-                    values.push(format!("a.{staged}"));
-                }
+        insert_cols.extend(["__txid", "__lsn"].map(String::from));
+        let (mut sums, mut values, mut nonzero) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut maps, mut map_values, mut holds, mut flags) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for p in self.t.shape.partials() {
+            let staged = p.name("__");
+            let total = p.total(&staged, None);
+            insert_cols.push(staged.clone());
+            if let Partial::Sum(SumPart::Scales, _) = p {
+                maps.push(format!("{total} as {staged}"));
+                values.push(format!("km.{staged}"));
+                map_values.push(format!("km.{staged} is not null"));
+                holds.push(format!("{staged} is not null"));
+                flags.push(format!("coalesce(bool_and(km.{staged} is null), true)"));
+            } else {
+                nonzero.push(p.sum_nonzero(&staged));
+                sums.push(format!("{total} as {staged}"));
+                values.push(format!("a.{staged}"));
             }
         }
         ctes.push(format!("terms as ({})", terms.join(" union all ")));
@@ -1260,14 +1134,11 @@ impl JoinTargetPlan {
                 hidden
             }
         };
-        columns.push(named("__dn".into(), "__n".into()));
-        for (i, arg) in side.plan.shape.args.iter().enumerate() {
-            let i = i + 1;
-            columns.push(named(format!("__dc{i}"), format!("__count_{i}")));
-            for part in arg.parts() {
-                columns.push(named(part.name("__d", i), part.hidden(i)));
-            }
-        }
+        columns.extend(
+            side.plan
+                .shape
+                .each_partial(|p| named(p.name("__d"), p.hidden())),
+        );
         columns
     }
 
@@ -1290,7 +1161,7 @@ impl JoinTargetPlan {
                 .iter()
                 .map(|c| {
                     if c.starts_with("__scales_") {
-                        format!("{} as {c}", SumPart::Scales.total(c, None, None))
+                        format!("{} as {c}", SumPart::Scales.total(c, None))
                     } else {
                         format!("sum({c}) as {c}")
                     }
@@ -1771,8 +1642,7 @@ pub(crate) async fn release(
     group_basis::name_groups(txn, &side_plan.plan, cells, &[key.to_string()]).await?;
     let mut mutations = TargetMutations::new();
     write_locked(txn, &plan, &mut mutations, false, false).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(true)
 }
 
@@ -1809,8 +1679,7 @@ pub(crate) async fn recompute_routed(
     group_basis::name_groups(txn, &side_plan.plan, cells, &[]).await?;
     let mut mutations = TargetMutations::new();
     write_locked(txn, &plan, &mut mutations, false, false).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(())
 }
 
@@ -1906,8 +1775,7 @@ pub(crate) async fn build(
             group_basis::apply_join_build_groups(txn, &plan.t, &mut mutations).await?
         }
     };
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(counts)
 }
 
@@ -1984,6 +1852,9 @@ pub(crate) async fn target_column_types(
         .map(|row| (row.get(0), row.get(1)))
         .collect())
 }
+
+#[cfg(test)]
+mod golden;
 
 #[cfg(test)]
 mod tests {

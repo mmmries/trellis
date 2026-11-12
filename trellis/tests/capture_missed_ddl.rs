@@ -10,127 +10,15 @@
 //! `capture_auto_rebuilds_total`), or a pause. Nothing polls for
 //! convergence.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
-
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
 
-const SCHEMA: &str = "trellis";
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_missed_ddl_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_missed_ddl_test",
-            1,
-            "trellis_capture_missed_ddl_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-/// Every definition's status, by bare target name.
-async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
-    raw.query(
-        "select split_part(target_table, '.', 2), status from transform_definitions",
-        &[],
-    )
-    .await
-    .expect("read statuses")
-    .into_iter()
-    .map(|row| {
-        (
-            row.get(0),
-            trellis::defs::StoredStatus::from_persisted(row.get(1))
-                .expect("a stored status")
-                .into(),
-        )
-    })
-    .collect()
-}
-
-/// Alternates staging-worker passes, builds and drains until every
-/// definition is live: a bounded number of explicit steps.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
-    for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let statuses = statuses(raw).await;
-        if statuses.values().all(|s| *s == TransformStatus::Live) {
-            return;
-        }
-    }
-    panic!("not every definition went live: {:?}", statuses(raw).await);
-}
+use pipeline::{bring_live_all, capture_pass, connect, definer, reconcile_pass, settle, statuses};
+use trellis::staging::build::settle_builds;
 
 async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
     raw.query(sql, &[])
@@ -215,7 +103,7 @@ async fn run_cases(cases: &[Case]) {
             trellis.apply(&text).await.expect(&text);
         }
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
 
     let app = connect(db.dsn()).await;
     let mut failures = Vec::new();
@@ -794,7 +682,7 @@ async fn a_same_type_rewrite_rebuilds_its_readers_to_the_new_values() {
     ] {
         trellis.apply(text).await.expect(text);
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
 
     raw.batch_execute("alter table public.w alter column b type int using b * 10")
         .await
@@ -806,7 +694,7 @@ async fn a_same_type_rewrite_rebuilds_its_readers_to_the_new_values() {
     }
     assert_eq!(auto_rebuilds("public.w", "value_rewrite"), 1);
 
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(
         rows(&raw, "select id::text, b::text from public.wb order by id").await,
         rows(&raw, "select id::text, b::text from public.w order by id").await,
@@ -854,7 +742,7 @@ async fn a_retyped_field_rebuilds_while_valid_and_pauses_otherwise() {
     ] {
         trellis.apply(text).await.expect(text);
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
 
     // A `SUM` argument's scale changed between two `numeric(p,s)` types.
@@ -870,7 +758,7 @@ async fn a_retyped_field_rebuilds_while_valid_and_pauses_otherwise() {
         "{statuses_now:?}"
     );
     assert_eq!(auto_rebuilds("public.f", "column_changed"), 1);
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     // Equal as numbers: the rebuild keeps a group whose sum didn't change
     // as it was, rendered at the old scale.
     assert_eq!(
@@ -931,9 +819,9 @@ async fn a_retyped_field_rebuilds_while_valid_and_pauses_otherwise() {
 /// [`bring_live`], leaving `paused` paused.
 async fn bring_live_except(raw: &mut Client, pool: &trellis::pool::Pool, paused: &[&str]) {
     for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
+        reconcile_pass(raw, pool).await;
+        settle_builds(pool).await;
+        settle(pool, raw).await;
         let statuses = statuses(raw).await;
         if statuses
             .iter()
@@ -966,7 +854,7 @@ async fn a_same_type_rewrite_of_a_partitioned_source_rebuilds_its_readers() {
     let trellis = definer(db.dsn()).await;
     let text = "TRANSFORM psum FROM public.p GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, SUM(b) AS total";
     trellis.apply(text).await.expect(text);
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let leaves = "select string_agg(distinct node::regclass::text, ',' order by node::regclass::text) \
                   from capture_baselines where table_name = 'public.p'";
     assert_eq!(
@@ -987,7 +875,7 @@ async fn a_same_type_rewrite_of_a_partitioned_source_rebuilds_its_readers() {
         vec![vec![Some("p_0,p_1,p_2".to_string())]]
     );
     assert_eq!(auto_rebuilds("public.p", "value_rewrite"), 0);
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
 
     raw.batch_execute("alter table public.p alter column b type int using b * 10")
         .await
@@ -995,7 +883,7 @@ async fn a_same_type_rewrite_of_a_partitioned_source_rebuilds_its_readers() {
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(statuses(&raw).await["psum"], TransformStatus::Backfilling);
     assert_eq!(auto_rebuilds("public.p", "value_rewrite"), 1);
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(
         rows(
             &raw,

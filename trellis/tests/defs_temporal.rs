@@ -768,12 +768,9 @@ async fn temporal_join_keys_are_admitted_per_family() {
 }
 
 /// A `timestamp(3)` column must be recognized as `timestamp without time
-/// zone` despite `format_type` rendering its modifier *inside* the name.
-///
-/// This is the concrete reason `join_key_types::base_type_name` replaced
-/// `split('(')`: `timestamp(3) without time zone` truncates to `timestamp`,
-/// which is on no list, so a perfectly good sub-second-precision key would
-/// have been silently refused.
+/// zone` despite `format_type` rendering its modifier *inside* the name: a
+/// key's type is its OID, which no modifier changes, so a sub-second-precision
+/// key is admitted however the modifier is rendered.
 #[tokio::test]
 async fn a_precision_modified_temporal_key_is_still_recognized() {
     let cluster = TestCluster::start();

@@ -35,12 +35,17 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::sql::{CaptureSpec, install_statements};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{install_definition, tables_to_capture};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::connect_with;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -182,15 +187,6 @@ fn strings(names: &[&str]) -> Vec<String> {
     names.iter().map(|s| s.to_string()).collect()
 }
 
-async fn connect(dsn: &str, setup: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client.batch_execute(setup).await.expect("session setup");
-    client
-}
-
 /// One ring row, as the comparison sees it.
 struct RingRow {
     txid: String,
@@ -251,7 +247,7 @@ async fn ring_rows(raw: &Client, after: i64, table: &str, spec: &CaptureSpec) ->
 async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect(
+    let raw = connect_with(
         db.dsn(),
         &format!("set search_path to {DEFAULT_SCHEMA}, public"),
     )
@@ -357,7 +353,7 @@ async fn trigger_capture_stages_the_golden_images_under_a_foreign_session() {
     ))
     .await
     .expect("create the application role");
-    let mut writer = connect(db.dsn(), &format!("set role {APP_ROLE}; {HOSTILE}")).await;
+    let mut writer = connect_with(db.dsn(), &format!("set role {APP_ROLE}; {HOSTILE}")).await;
     let usage: bool = writer
         .query_one(
             "select has_schema_privilege($1, 'usage')",

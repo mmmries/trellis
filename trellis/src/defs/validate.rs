@@ -388,8 +388,7 @@ pub enum ValidationError {
     /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
     /// why the bar is canonical form rather than "Postgres would parse it":
     /// in short, immutability (`date_in` is `STABLE` precisely because of
-    /// `'today'`) and text round-trip identity between the literal and
-    /// Postgres's rendering of the value.
+    /// `'today'`) and a validity check that needs no Postgres.
     InvalidTypedLiteral {
         field: String,
         value_type: ValueType,
@@ -1573,38 +1572,21 @@ pub fn validate(
         KeySpace::Aggregate { group_by } => {
             // Checked ahead of the per-field checks below, so a bad
             // `GROUP BY` clause is never masked by a field error instead.
-            let mut seen: HashSet<&str> = HashSet::with_capacity(group_by.len());
-            for key in group_by {
-                let Some(value_type) = source_columns.get(key) else {
-                    return Err(ValidationError::UnresolvedGroupByColumn {
+            // A key is its bare column name; its collation is the
+            // catalog's to check.
+            check_group_by_keys(group_by.iter().map(|key| {
+                let value_type = source_columns.get(key).copied().ok_or_else(|| {
+                    ValidationError::UnresolvedGroupByColumn {
                         column: key.clone(),
-                    });
-                };
-                reject_unsupported_group_by_key_type(key, *value_type)?;
-                // Each key becomes a target column named after
-                // it, so a repeated key would reach the target DDL as a
-                // duplicate column. Checked after the key itself resolves,
-                // so an unknown column is reported as such rather than as a
-                // clash.
-                if !seen.insert(key) {
-                    return Err(ValidationError::GroupByKeysShareTargetColumn {
-                        first: key.clone(),
-                        second: key.clone(),
-                        column: key.clone(),
-                    });
-                }
-                // A key's column sits beside the target's hidden
-                // `__`-prefixed columns, so it may not use their prefix.
-                if key.starts_with(RESERVED_COLUMN_PREFIX) {
-                    return Err(ValidationError::ReservedGroupByColumnName {
-                        key: key.clone(),
-                        column: key.clone(),
-                    });
-                }
-            }
-            // Every key resolved and is distinct, so this is the width of the
-            // target's unique key.
-            check_index_key_width(|| "GROUP BY".to_string(), group_by.len())?;
+                    }
+                })?;
+                Ok(GroupByKey {
+                    written: key.clone(),
+                    column: key,
+                    value_type,
+                    collation: None,
+                })
+            }))?;
             for field in &def.fields {
                 // DDL generation (`ddl::create_aggregate_target_table`)
                 // treats a field named after a grouping column's target
@@ -1736,6 +1718,70 @@ pub fn validate(
     }
 
     Ok(())
+}
+
+/// One resolved `GROUP BY` key, as [`check_group_by_keys`] checks it.
+struct GroupByKey<'a> {
+    /// The key as the definition spells it, for a refusal.
+    written: String,
+    /// Its column name, which is also the target column it becomes.
+    column: &'a str,
+    value_type: ValueType,
+    /// The key's table and live column when its collation is checked here
+    /// (a `JOIN`'s); a plain key's collation is the catalog's.
+    collation: Option<(&'a str, &'a JoinColumnInfo)>,
+}
+
+/// The `GROUP BY` key rules a plain aggregate and an aggregate `JOIN`
+/// share, refused in this order per key: it resolves (`keys` yields the
+/// resolution's refusal in its place), it has an admitted key type, its
+/// collation is deterministic (when checked), it doesn't share its target
+/// column with an earlier key, and its column avoids the reserved prefix.
+/// Then the keys together fit an index: the target's unique key. Returns
+/// the keys' column names.
+fn check_group_by_keys<'a>(
+    keys: impl ExactSizeIterator<Item = Result<GroupByKey<'a>, ValidationError>>,
+) -> Result<HashSet<&'a str>, ValidationError> {
+    let width = keys.len();
+    let mut seen: HashMap<&str, String> = HashMap::with_capacity(width);
+    for key in keys {
+        let key = key?;
+        reject_unsupported_group_by_key_type(key.column, key.value_type)?;
+        if let Some((table, info)) = key.collation
+            && !info.collation_deterministic
+        {
+            return Err(ValidationError::NondeterministicKeyCollation(Box::new(
+                NondeterministicKeyCollation {
+                    key: KeyColumnRole::GroupBy,
+                    table: table.to_string(),
+                    column: key.column.to_string(),
+                    collation: info.collation.clone().unwrap_or_default(),
+                },
+            )));
+        }
+        // Each key becomes a target column named after its column, so two
+        // keys of one column name would reach the target DDL as a duplicate
+        // column. Checked after the key resolves, so an unknown column is
+        // reported as such rather than as a clash.
+        if let Some(first) = seen.get(key.column) {
+            return Err(ValidationError::GroupByKeysShareTargetColumn {
+                first: first.clone(),
+                second: key.written,
+                column: key.column.to_string(),
+            });
+        }
+        // A key's column sits beside the target's hidden `__`-prefixed
+        // columns, so it may not use their prefix.
+        if key.column.starts_with(RESERVED_COLUMN_PREFIX) {
+            return Err(ValidationError::ReservedGroupByColumnName {
+                key: key.written,
+                column: key.column.to_string(),
+            });
+        }
+        seen.insert(key.column, key.written);
+    }
+    check_index_key_width(|| "GROUP BY".to_string(), width)?;
+    Ok(seen.into_keys().collect())
 }
 
 /// Refuses a `MIN`/`MAX` definition declared `WITHOUT SOURCE INDEX`
@@ -2031,6 +2077,23 @@ pub(crate) fn validate_aggregate_admitted(
     Ok(())
 }
 
+/// [`validate`] over a table's live columns, then the aggregate family
+/// check their declared modifiers make possible
+/// ([`validate_aggregate_admitted`]): a plain definition's validation, as
+/// [`validate_join`] is a `JOIN`'s. The catalog runs the two apart, with its
+/// own refusals between them.
+pub(crate) fn validate_live(
+    def: &TransformDef,
+    columns: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let value_types = columns
+        .iter()
+        .map(|(name, info)| (name.clone(), info.value_type))
+        .collect();
+    validate(def, &value_types)?;
+    validate_aggregate_admitted(def, columns)
+}
+
 /// [`validate_aggregate_admitted`]'s walk of one field's expression.
 fn check_aggregate_calls(
     expr: &Expr,
@@ -2069,29 +2132,43 @@ fn check_aggregate_calls(
             let Ok(value_type) = infer_expr_type_in("", arg, &ColumnTypes::Live(columns)) else {
                 return Ok(());
             };
-            let column = match arg {
-                Expr::Column(column) | Expr::SourceColumn { column, .. } => columns.get(column),
-                _ => None,
-            };
-            let (pg_type, typmod, trellis_target) = match column {
-                Some(info) => (info.pg_type.clone(), info.typmod, info.trellis_target),
-                None => (super::ddl::pg_type_name(value_type).into_owned(), -1, false),
-            };
-            check_aggregate_admitted(
-                &upper,
-                AggregateScope::Plain,
-                Some(&AggregateArg {
-                    column: &render_field_expr(arg),
-                    value_type,
-                    pg_type: &pg_type,
-                    typmod,
-                    trellis_target,
-                    expression: column.is_none(),
-                }),
-            )
+            check_aggregate_argument(&upper, AggregateScope::Plain, arg, value_type, columns)
         }
         _ => Ok(()),
     }
+}
+
+/// [`check_aggregate_admitted`] for `function`'s one argument `arg`, typed
+/// `value_type` over `columns` (the one table it reads): a lone column
+/// carries its live type, declared modifier and owner; an expression has
+/// its result type and no declared scale.
+fn check_aggregate_argument(
+    function: &str,
+    scope: AggregateScope,
+    arg: &Expr,
+    value_type: ValueType,
+    columns: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let column = match arg {
+        Expr::Column(column) | Expr::SourceColumn { column, .. } => columns.get(column),
+        _ => None,
+    };
+    let (pg_type, typmod, trellis_target) = match column {
+        Some(info) => (info.pg_type.clone(), info.typmod, info.trellis_target),
+        None => (super::ddl::pg_type_name(value_type).into_owned(), -1, false),
+    };
+    check_aggregate_admitted(
+        function,
+        scope,
+        Some(&AggregateArg {
+            column: &render_field_expr(arg),
+            value_type,
+            pg_type: &pg_type,
+            typmod,
+            trellis_target,
+            expression: column.is_none(),
+        }),
+    )
 }
 
 fn written(column: &QualifiedColumn) -> String {
@@ -2205,7 +2282,7 @@ fn validate_join_on<'a>(
     resolve: &impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError>,
 ) -> Result<(), ValidationError> {
     let check_key_type = |column: &QualifiedColumn, info: &JoinColumnInfo| {
-        if !super::join_key_types::admit_join_key(&info.pg_type, info.is_enum) {
+        if !super::join_key_types::admit_join_key(info.type_oid, info.is_enum) {
             return Err(ValidationError::JoinUnsupportedKeyType {
                 reference: written(column),
                 pg_type: info.pg_type.clone(),
@@ -2326,38 +2403,18 @@ pub fn validate_join(
     validate_join_tables_and_on(def, join, left, joined)?;
     let resolve = join_resolver(def, join, left, joined);
 
-    let mut key_columns: HashMap<&str, &QualifiedColumn> =
-        HashMap::with_capacity(join.group_by.len());
-    for key in &join.group_by {
+    // A key is qualified and resolves through either table, whose
+    // collation is checked with it. Its column name is the target's and
+    // `T`'s.
+    let key_columns = check_group_by_keys(join.group_by.iter().map(|key| {
         let (_, info) = resolve(key)?;
-        reject_unsupported_group_by_key_type(&key.column, info.value_type)?;
-        if !info.collation_deterministic {
-            return Err(ValidationError::NondeterministicKeyCollation(Box::new(
-                NondeterministicKeyCollation {
-                    key: KeyColumnRole::GroupBy,
-                    table: key.table.clone(),
-                    column: key.column.clone(),
-                    collation: info.collation.clone().unwrap_or_default(),
-                },
-            )));
-        }
-        if let Some(earlier) = key_columns.insert(key.column.as_str(), key) {
-            return Err(ValidationError::GroupByKeysShareTargetColumn {
-                first: written(earlier),
-                second: written(key),
-                column: key.column.clone(),
-            });
-        }
-        if key.column.starts_with(RESERVED_COLUMN_PREFIX) {
-            return Err(ValidationError::ReservedGroupByColumnName {
-                key: written(key),
-                column: key.column.clone(),
-            });
-        }
-    }
-
-    // The target's and `T`'s unique key.
-    check_index_key_width(|| "GROUP BY".to_string(), join.group_by.len())?;
+        Ok(GroupByKey {
+            written: written(key),
+            column: &key.column,
+            value_type: info.value_type,
+            collation: Some((&key.table, info)),
+        })
+    }))?;
     // A side's hidden partials table is keyed by its `ON` columns, then its
     // `GROUP BY` columns not among them: wider than either clause alone.
     for side in super::join::sides(join) {
@@ -2409,7 +2466,7 @@ pub fn validate_join(
             }
             continue;
         }
-        if key_columns.contains_key(field.name.as_str()) {
+        if key_columns.contains(field.name.as_str()) {
             return Err(shape(
                 "only the GROUP BY key itself can take the name of a GROUP BY key's column",
             ));
@@ -2584,30 +2641,11 @@ fn check_join_field_expr<'a>(
                 }
                 Some(side) => *side,
             };
+            // The argument is typed over its one side. A column it reads
+            // resolved there above, and a bare one was refused.
             let columns = side_columns(side, root, joined);
-            // The argument's type over its one side, and for a lone column
-            // its declared modifier (an expression's `numeric` result has no
-            // declared scale).
             let value_type = infer_expr_type_in(field, arg, &ColumnTypes::Live(columns))?;
-            let (pg_type, typmod, trellis_target) = match arg {
-                Expr::SourceColumn { column, .. } => columns
-                    .get(column)
-                    .map(|info| (info.pg_type.clone(), info.typmod, info.trellis_target))
-                    .unwrap_or_default(),
-                _ => (super::ddl::pg_type_name(value_type).into_owned(), -1, false),
-            };
-            check_aggregate_admitted(
-                &upper,
-                AggregateScope::Join,
-                Some(&AggregateArg {
-                    column: &render_field_expr(arg),
-                    value_type,
-                    pg_type: &pg_type,
-                    typmod,
-                    trellis_target,
-                    expression: !matches!(arg, Expr::SourceColumn { .. }),
-                }),
-            )
+            check_aggregate_argument(&upper, AggregateScope::Join, arg, value_type, columns)
         }
     }
 }
@@ -3366,7 +3404,7 @@ fn group_by_key_rule(value_type: ValueType) -> Option<super::registry::GroupByKe
         // `defs_enum.rs`) renders each value as its own label text
         // verbatim; an enum value's identity *is* that label (a `pg_enum`
         // row keyed by OID), so there is no deeper representation for two
-        // distinct values to collide under — see `join_key_types::is_enum_type_name`'s
+        // distinct values to collide under — see `join_key_types::JoinKey::Enum`'s
         // own doc comment for the fuller version of this same reasoning
         // (the join-key/PK key roles' dynamic counterpart of this
         // static gate).
@@ -7700,10 +7738,180 @@ mod tests {
              GROUP BY orders.sku, items.sku SELECT COUNT(*) AS n",
         )
         .unwrap();
-        assert!(matches!(
+        assert_eq!(
             validate_join(&def, &left, &[&right]),
-            Err(ValidationError::GroupByKeysShareTargetColumn { .. })
+            Err(ValidationError::GroupByKeysShareTargetColumn {
+                first: "orders.sku".into(),
+                second: "items.sku".into(),
+                column: "sku".into(),
+            })
+        );
+        // A key's collation is checked with it.
+        let (mut left, right) = tables();
+        let mut region = jcol(ValueType::Text, "text", 25, -1);
+        region.collation = Some("ci".into());
+        region.collation_deterministic = false;
+        left.insert("region".into(), region);
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT COUNT(*) AS n",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_join(&def, &left, &[&right]),
+            Err(ValidationError::NondeterministicKeyCollation(Box::new(
+                NondeterministicKeyCollation {
+                    key: KeyColumnRole::GroupBy,
+                    table: "orders".into(),
+                    column: "region".into(),
+                    collation: "ci".into(),
+                }
+            )))
+        );
+        // Only the key itself takes its column's name.
+        assert!(matches!(
+            check_text(
+                "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY orders.region SELECT COUNT(*) AS region"
+            ),
+            Err(ValidationError::JoinFieldShape { detail, .. })
+                if detail.starts_with("only the GROUP BY key itself")
         ));
+    }
+
+    /// An aggregate's lone column argument is checked with its live
+    /// declared type and modifier, in a plain aggregate and a `JOIN` alike.
+    #[test]
+    fn an_aggregate_argument_carries_its_columns_declared_type_and_modifier() {
+        use super::super::floor::{Feature, collect};
+        use super::super::registry::{AggregateAdmissionRule, TypeRule};
+        let scaled = Feature::TypeRule(TypeRule::AggregateAdmission(
+            AggregateAdmissionRule::SumAvgScaledNumeric,
+        ));
+        let varchar = || jcol(ValueType::Text, "character varying(5)", 1043, 9);
+        let refused = |column: &str| {
+            Err(ValidationError::UnsupportedAggregateArgument {
+                function: "SUM".into(),
+                column: column.into(),
+                pg_type: "character varying(5)".into(),
+            })
+        };
+
+        let plain = side(&[
+            ("g", int4()),
+            ("v", jcol(ValueType::Numeric, "numeric(10,2)", 1700, 655366)),
+        ]);
+        let def = parsed("TRANSFORM t FROM s GROUP BY g SELECT g AS g, SUM(v) AS s");
+        let (result, used) = collect(|| validate_live(&def, &plain));
+        assert_eq!(result, Ok(()));
+        assert!(used.contains(&scaled), "{used:?}");
+
+        let (mut left, right) = tables();
+        left.insert("code".into(), varchar());
+        let join = |select: &str| {
+            parse_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY orders.region SELECT {select}"
+            ))
+            .unwrap()
+        };
+        let (result, used) =
+            collect(|| validate_join(&join("SUM(orders.total) AS s"), &left, &[&right]));
+        assert_eq!(result, Ok(()));
+        assert!(used.contains(&scaled), "{used:?}");
+        assert_eq!(
+            validate_join(&join("SUM(orders.code) AS s"), &left, &[&right]),
+            refused("orders.code")
+        );
+    }
+
+    /// Both shapes refuse `GROUP BY` keys one key at a time, in one order: a
+    /// key's refusal comes before any later key's, its type before its
+    /// collation, its collation before a clash with an earlier key, and every
+    /// key's refusal before the index width.
+    #[test]
+    fn group_by_key_refusals_come_key_by_key_in_one_order() {
+        let float = ValueType::Float(crate::float::FloatWidth::Float8);
+        let wide = |last: &str| {
+            let mut keys: Vec<String> = (0..INDEX_MAX_KEYS).map(|i| format!("k{i}")).collect();
+            keys.push(last.to_string());
+            keys
+        };
+        let type_refused = |column: &str| {
+            Err(ValidationError::UnsupportedGroupByKeyType {
+                column: column.into(),
+                value_type: float,
+            })
+        };
+
+        let mut plain: HashMap<String, ValueType> = (0..INDEX_MAX_KEYS)
+            .map(|i| (format!("k{i}"), ValueType::Integer(IntWidth::Int4)))
+            .collect();
+        plain.insert("f".into(), float);
+        let plain_check = |keys: &str| {
+            validate(
+                &parsed(&format!(
+                    "TRANSFORM t FROM s GROUP BY {keys} SELECT COUNT(*) AS n"
+                )),
+                &plain,
+            )
+        };
+        assert_eq!(plain_check("f, missing"), type_refused("f"));
+        assert_eq!(
+            plain_check("missing, f"),
+            Err(ValidationError::UnresolvedGroupByColumn {
+                column: "missing".into()
+            })
+        );
+        assert_eq!(plain_check(&wide("f").join(", ")), type_refused("f"));
+
+        let (mut left, mut right) = tables();
+        for i in 0..INDEX_MAX_KEYS {
+            left.insert(format!("k{i}"), int4());
+        }
+        let mut odd = jcol(float, "double precision", 701, -1);
+        odd.collation = Some("ci".into());
+        odd.collation_deterministic = false;
+        left.insert("odd".into(), odd);
+        left.insert("sku".into(), jcol(ValueType::Text, "text", 25, -1));
+        let sku = right.get_mut("sku").expect("sku");
+        sku.collation = Some("ci".into());
+        sku.collation_deterministic = false;
+        let join_check = |keys: &str| {
+            validate_join(
+                &parse_text(&format!(
+                    "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+                     GROUP BY {keys} SELECT COUNT(*) AS n"
+                ))
+                .unwrap(),
+                &left,
+                &[&right],
+            )
+        };
+        assert_eq!(
+            join_check("items.weight, items.nope"),
+            type_refused("weight")
+        );
+        assert_eq!(
+            join_check("items.nope, items.weight"),
+            Err(ValidationError::JoinUnresolvedColumn {
+                reference: "items.nope".into()
+            })
+        );
+        assert_eq!(join_check("orders.odd"), type_refused("odd"));
+        assert!(matches!(
+            join_check("orders.sku, items.sku"),
+            Err(ValidationError::NondeterministicKeyCollation(refusal))
+                if refusal.table == "items"
+        ));
+        let qualified: Vec<String> = wide("weight")
+            .iter()
+            .map(|key| match key.as_str() {
+                "weight" => "items.weight".to_string(),
+                key => format!("orders.{key}"),
+            })
+            .collect();
+        assert_eq!(join_check(&qualified.join(", ")), type_refused("weight"));
     }
 
     #[test]

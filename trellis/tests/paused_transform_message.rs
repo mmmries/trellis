@@ -8,111 +8,16 @@
 use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
-use trellis::{CaptureFailure, Config, Trellis, TrellisOptions};
+use trellis::{CaptureFailure, Trellis};
+
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, status};
 
 const SCHEMA: &str = "trellis";
-
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only, which pauses and refreshes.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "paused_message_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "paused_message_test",
-            1,
-            "trellis_paused_message_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-async fn stored_status(raw: &Client, target: &str) -> TransformStatus {
-    let text: String = raw
-        .query_one(
-            "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
-            &[&target],
-        )
-        .await
-        .expect("read status")
-        .get(0);
-    trellis::defs::StoredStatus::from_persisted(&text)
-        .expect("a stored status")
-        .into()
-}
-
-/// Alternates staging-worker passes, builds and drains until `target` is
-/// live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, target: &str) {
-    for _ in 0..8 {
-        full_pass(raw, pool).await;
-        trellis::staging::build::settle_builds(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        if stored_status(raw, target).await == TransformStatus::Live {
-            return;
-        }
-    }
-    panic!("{target} did not go live within 8 pass/drain rounds");
-}
 
 /// `target`'s reported status and its `capture_failure`.
 async fn paused(trellis: &Trellis, target: &str) -> CaptureFailure {
@@ -156,8 +61,8 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trell
     ] {
         trellis.apply(text).await.expect(text);
     }
-    bring_live(raw, pool, "t").await;
-    bring_live(raw, pool, "s").await;
+    bring_live(raw, pool, &["t"]).await;
+    bring_live(raw, pool, &["s"]).await;
     trellis
 }
 
@@ -234,7 +139,7 @@ async fn two_reasons_show_and_resume_honours_the_restore_that_came_first() {
     assert!(restored_flag, "the second reason kept the restore's state");
 
     trellis.apply("RESUME TRANSFORM t").await.expect("resume");
-    bring_live(&mut raw, &db.pool, "t").await;
+    bring_live(&mut raw, &db.pool, &["t"]).await;
     let rows: Vec<(i32, i32)> = raw
         .query("select a, b from public.t order by a", &[])
         .await
@@ -298,8 +203,8 @@ async fn a_key_changed_again_while_paused_rewrites_the_message() {
         "{gone:?}"
     );
     capture_pass(&mut raw, &db.pool).await;
-    assert_eq!(stored_status(&raw, "s").await, TransformStatus::Paused);
-    assert_eq!(stored_status(&raw, "t").await, TransformStatus::Paused);
+    assert_eq!(status(&raw, "s").await, TransformStatus::Paused);
+    assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
 }
 
 /// A read column renamed pauses its reader; renamed back while it stays
@@ -340,12 +245,12 @@ async fn a_cause_fixed_while_paused_leaves_the_message_and_the_pause() {
         "the cause it was paused for is gone. RESUME would rebuild public.t from public.u"
     );
     for _ in 0..2 {
-        full_pass(&mut raw, &db.pool).await;
+        reconcile_pass(&mut raw, &db.pool).await;
     }
-    assert_eq!(stored_status(&raw, "t").await, TransformStatus::Paused);
+    assert_eq!(status(&raw, "t").await, TransformStatus::Paused);
 
     trellis.apply("RESUME TRANSFORM t").await.expect("resume");
-    bring_live(&mut raw, &db.pool, "t").await;
+    bring_live(&mut raw, &db.pool, &["t"]).await;
 }
 
 /// A paused definition whose relations don't change is evaluated once,
@@ -445,7 +350,7 @@ async fn the_outcome_is_what_resume_does() {
     );
     assert_eq!(column_type("public.t", "a").await, "integer");
     trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
-    bring_live(&mut raw, &db.pool, "t").await;
+    bring_live(&mut raw, &db.pool, &["t"]).await;
     assert_eq!(column_type("public.t", "a").await, "bigint");
 
     // A key redefined: the 1-1 reader's RESUME re-keys its target as its
@@ -469,9 +374,9 @@ async fn the_outcome_is_what_resume_does() {
         key_and_columns(&app, "public.t").await,
         ("PRIMARY KEY (id, g)".into(), "{id,a,b,g}".into())
     );
-    bring_live(&mut raw, &db.pool, "t").await;
+    bring_live(&mut raw, &db.pool, &["t"]).await;
     trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
-    bring_live(&mut raw, &db.pool, "s").await;
+    bring_live(&mut raw, &db.pool, &["s"]).await;
 
     // A column dropped: the refusal names it, and RESUME refuses.
     app.batch_execute("alter table public.u drop column b")
@@ -494,7 +399,7 @@ async fn the_outcome_is_what_resume_does() {
         )
         .unwrap_or_else(|| panic!("{dropped}"));
     assert!(err.to_string().contains(named), "{err} vs {dropped}");
-    assert_eq!(stored_status(&raw, "s").await, TransformStatus::Paused);
+    assert_eq!(status(&raw, "s").await, TransformStatus::Paused);
 }
 
 /// `public.u`'s recorded key, as `definition_keys` holds it.
@@ -542,7 +447,7 @@ async fn a_moved_key_outcome_re_records_it_then_rebuilds() {
         "{id,g}",
         "the resume re-recorded it"
     );
-    bring_live(&mut raw, &db.pool, "s").await;
+    bring_live(&mut raw, &db.pool, &["s"]).await;
 }
 
 /// A key the outcome would re-record is locked by another transaction (a
@@ -625,7 +530,7 @@ async fn assert_outcome_is_the_refusal(
         .to_string();
     assert!(reason.contains(names), "{reason}");
     assert_eq!(outcome, format!("RESUME would refuse: {reason}"));
-    assert_eq!(stored_status(raw, target).await, TransformStatus::Paused);
+    assert_eq!(status(raw, target).await, TransformStatus::Paused);
 }
 
 /// A 1-1 transform's source whose primary key moved: what its outcome says
@@ -664,7 +569,7 @@ async fn a_re_keying_outcome_of_a_one_to_one_is_what_resume_does() {
         key_and_columns(&app, "public.t").await,
         ("PRIMARY KEY (id, g)".into(), "{id,a,b,g}".into())
     );
-    bring_live(&mut raw, &db.pool, "t").await;
+    bring_live(&mut raw, &db.pool, &["t"]).await;
 
     // Narrowed with a view over g: refused, naming the view.
     app.batch_execute(
@@ -694,7 +599,7 @@ async fn a_re_keying_outcome_of_a_one_to_one_is_what_resume_does() {
         key_and_columns(&app, "public.t").await,
         ("PRIMARY KEY (id)".into(), "{id,a,b}".into())
     );
-    bring_live(&mut raw, &db.pool, "t").await;
+    bring_live(&mut raw, &db.pool, &["t"]).await;
 
     // Widened again, over a column g the user added to the target: refused,
     // naming it.
@@ -791,7 +696,7 @@ async fn a_second_pause_adds_its_reason_and_keeps_the_first() {
         )
     );
     trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
-    bring_live(&mut raw, &db.pool, "s").await;
+    bring_live(&mut raw, &db.pool, &["s"]).await;
     let totals: Vec<(i32, i64)> = raw
         .query("select g, total::bigint from public.s order by g", &[])
         .await

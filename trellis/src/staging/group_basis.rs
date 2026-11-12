@@ -476,6 +476,30 @@ impl GroupShape {
         &self.group_types
     }
 
+    /// Its partials, in the order every statement and table lists them.
+    pub(crate) fn partials(&self) -> Vec<Partial> {
+        partials_of(self.args.iter().map(Arg::parts))
+    }
+
+    /// The partials a write's returned rows carry after the group's state
+    /// ([`written_groups`]), each read as `f`: every one but the maps, a
+    /// sum as text.
+    fn returned(&self, f: impl Fn(Partial) -> String) -> Vec<String> {
+        let partials = self.partials().into_iter();
+        partials
+            .filter_map(|p| match p {
+                Partial::Sum(SumPart::Scales, _) => None,
+                Partial::Sum(..) => Some(format!("{}::text", f(p))),
+                Partial::Rows | Partial::Count(_) => Some(f(p)),
+            })
+            .collect()
+    }
+
+    /// `f` of each of its partials ([`Self::partials`]).
+    pub(crate) fn each_partial(&self, f: impl Fn(Partial) -> String) -> Vec<String> {
+        self.partials().into_iter().map(f).collect()
+    }
+
     /// The hidden extremes, one per distinct `MIN`/`MAX` call, in
     /// [`Self::aggs`]' order. Empty for every definition with no `MIN` or
     /// `MAX`, whose hidden table and statements are as they were.
@@ -887,7 +911,7 @@ impl SumPart {
     /// aggregate (those meeting `condition`, if any): its zero over no rows.
     /// A map folds only the maps that aren't `NULL`, so one change's map is
     /// taken as it is, and no map at all is `NULL`.
-    pub(crate) fn total(self, value: &str, condition: Option<&str>, _scale: Option<i32>) -> String {
+    pub(crate) fn total(self, value: &str, condition: Option<&str>) -> String {
         match self {
             SumPart::Scales => {
                 let only = match condition {
@@ -906,7 +930,7 @@ impl SumPart {
     }
 
     /// `a + b`. A map plus `NULL` is itself, with no map read.
-    pub(crate) fn add(self, a: &str, b: &str, _scale: Option<i32>) -> String {
+    pub(crate) fn add(self, a: &str, b: &str) -> String {
         match self {
             SumPart::Scales => format!(
                 "(case when {b} is null then {a} else {} end)",
@@ -917,7 +941,7 @@ impl SumPart {
     }
 
     /// `a - b`. A map less `NULL` is itself, with no map read.
-    pub(crate) fn sub(self, a: &str, b: &str, _scale: Option<i32>) -> String {
+    pub(crate) fn sub(self, a: &str, b: &str) -> String {
         match self {
             SumPart::Scales => format!(
                 "(case when {b} is null then {a} else {} end)",
@@ -928,13 +952,151 @@ impl SumPart {
     }
 
     /// `a × n`, for the integer `n`. A `NULL` map times anything is `NULL`.
-    pub(crate) fn times(self, a: &str, n: &str, _scale: Option<i32>) -> String {
+    pub(crate) fn times(self, a: &str, n: &str) -> String {
         match self {
             SumPart::Scales => format!(
                 "(case when {a} is null then {NO_SCALES} else {} end)",
                 scales_times(a, n)
             ),
             SumPart::Sum => format!("({a} * {n})"),
+        }
+    }
+}
+
+/// One partial of a group's hidden row, in the order every statement and
+/// table lists them ([`GroupShape::partials`]): the row count, then per
+/// argument `i` (1-based) its non-null count and its sum's partials. Each is
+/// named `<prefix><stem>` in a working table (`__n`, `__c1`, `__s1`; `__dn`
+/// for a change, `__nn` for a new value, …) and [`Self::hidden`] in the
+/// hidden table. An extreme is not one: it is combined, not summed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Partial {
+    /// The group's row count.
+    Rows,
+    /// Argument `i`'s non-null count.
+    Count(usize),
+    /// One of argument `i`'s sum's partials.
+    Sum(SumPart, usize),
+}
+
+impl Partial {
+    /// Its working column under `prefix`.
+    pub(crate) fn name(self, prefix: &str) -> String {
+        match self {
+            Partial::Rows => format!("{prefix}n"),
+            Partial::Count(i) => format!("{prefix}c{i}"),
+            Partial::Sum(part, i) => part.name(prefix, i),
+        }
+    }
+
+    /// Its hidden-table column.
+    pub(crate) fn hidden(self) -> String {
+        match self {
+            Partial::Rows => "__n".to_string(),
+            Partial::Count(i) => format!("__count_{i}"),
+            Partial::Sum(part, i) => part.hidden(i),
+        }
+    }
+
+    /// Its zero: a sum's typed ([`SumPart::zero`]), a count's `0`.
+    pub(crate) fn zero(self) -> &'static str {
+        match self {
+            Partial::Sum(part, _) => part.zero(),
+            Partial::Rows | Partial::Count(_) => "0",
+        }
+    }
+
+    /// Its SQL type.
+    pub(crate) fn sql_type(self) -> &'static str {
+        match self {
+            Partial::Sum(part, _) => part.sql_type(),
+            Partial::Rows | Partial::Count(_) => "bigint",
+        }
+    }
+
+    /// Its hidden-table column definition.
+    pub(crate) fn ddl(self) -> String {
+        match self {
+            Partial::Sum(part, i) => part.ddl(i),
+            Partial::Rows | Partial::Count(_) => {
+                format!("{} bigint not null default 0", self.hidden())
+            }
+        }
+    }
+
+    /// Whether its hidden-table column is its zero.
+    pub(crate) fn is_zero(self) -> String {
+        match self {
+            Partial::Sum(part, i) => part.is_zero(&part.hidden(i)),
+            Partial::Rows | Partial::Count(_) => format!("{} = 0", self.hidden()),
+        }
+    }
+
+    /// Its working column under `prefix` read through `alias`, its zero
+    /// where that is `NULL`: `coalesce(<alias>.<name>, <zero>) as <name>`.
+    pub(crate) fn or_zero(self, alias: &str, prefix: &str) -> String {
+        let n = self.name(prefix);
+        format!("coalesce({alias}.{n}, {}) as {n}", self.zero())
+    }
+
+    /// Whether `value` is not its zero.
+    pub(crate) fn nonzero(self, value: &str) -> String {
+        match self {
+            Partial::Sum(part, _) => part.nonzero(value),
+            Partial::Rows | Partial::Count(_) => format!("{value} <> 0"),
+        }
+    }
+
+    /// The total of its values `value` over an aggregate's rows (those
+    /// meeting `condition`, if any), as [`SumPart::total`].
+    pub(crate) fn total(self, value: &str, condition: Option<&str>) -> String {
+        match (self, condition) {
+            (Partial::Sum(part, _), _) => part.total(value, condition),
+            (Partial::Rows | Partial::Count(_), None) => format!("sum({value})::bigint"),
+            (Partial::Rows | Partial::Count(_), Some(c)) => {
+                format!("coalesce(sum({value}) filter (where {c}), 0)::bigint")
+            }
+        }
+    }
+
+    /// Whether the plain sum of its values `value` over an aggregate's rows
+    /// is not its zero.
+    pub(crate) fn sum_nonzero(self, value: &str) -> String {
+        match self {
+            Partial::Sum(part, _) => part.nonzero(&part.total(value, None)),
+            Partial::Rows | Partial::Count(_) => format!("sum({value}) <> 0"),
+        }
+    }
+
+    /// Its argument's 1-based index; `None` for the row count.
+    pub(crate) fn arg(self) -> Option<usize> {
+        match self {
+            Partial::Rows => None,
+            Partial::Count(i) | Partial::Sum(_, i) => Some(i),
+        }
+    }
+
+    /// `a + b`.
+    pub(crate) fn add(self, a: &str, b: &str) -> String {
+        match self {
+            Partial::Sum(part, _) => part.add(a, b),
+            Partial::Rows | Partial::Count(_) => format!("{a} + {b}"),
+        }
+    }
+
+    /// `a × n`, for the integer `n`.
+    pub(crate) fn times(self, a: &str, n: &str) -> String {
+        match self {
+            Partial::Sum(part, _) => part.times(a, n),
+            Partial::Rows | Partial::Count(_) => format!("{a} * {n}"),
+        }
+    }
+
+    /// `a - b`.
+    pub(crate) fn sub(self, a: &str, b: &str) -> String {
+        match self {
+            Partial::Sum(part, _) => part.sub(a, b),
+            Partial::Rows | Partial::Count(_) => format!("{a} - {b}"),
         }
     }
 }
@@ -1021,6 +1183,18 @@ fn strict_build_scales(x: &str, s: i32) -> String {
         "(case when bool_and(coalesce(scale(({x})) = {s}, ({x}) is null)) then {NO_SCALES} \
                else to_jsonb(('{OFF_SCALE} ' || count(*)::text)::bigint) end)"
     )
+}
+
+/// The partials of a group over arguments with sum partials `parts`, in
+/// the order every statement and table lists them: the row count, then per
+/// argument its count and its sum's partials.
+pub(crate) fn partials_of(parts: impl Iterator<Item = &'static [SumPart]>) -> Vec<Partial> {
+    let mut out = vec![Partial::Rows];
+    for (i, parts) in parts.enumerate() {
+        out.push(Partial::Count(i + 1));
+        out.extend(parts.iter().map(|&part| Partial::Sum(part, i + 1)));
+    }
+    out
 }
 
 /// The partials of an argument: none unsummed, [`NUMERIC_PARTS`] for a
@@ -1214,16 +1388,8 @@ fn hidden_table_columns(shape: &GroupShape) -> Vec<String> {
         .zip(&shape.group_types)
         .map(|(c, t)| format!("{} {t}", quote_ident(c)))
         .collect();
-    columns.push("__n bigint not null default 0".to_string());
-    let mut zero = vec!["__n = 0".to_string()];
-    for (i, arg) in shape.args.iter().enumerate() {
-        columns.push(format!("__count_{} bigint not null default 0", i + 1));
-        zero.push(format!("__count_{} = 0", i + 1));
-        for part in arg.parts() {
-            columns.push(part.ddl(i + 1));
-            zero.push(part.is_zero(&part.hidden(i + 1)));
-        }
-    }
+    columns.extend(shape.each_partial(Partial::ddl));
+    let zero = shape.each_partial(Partial::is_zero);
     let extremes = shape.extremes();
     for extreme in &extremes {
         columns.push(format!("{} {}", extreme.column(), extreme.pg_type));
@@ -1674,7 +1840,7 @@ pub(crate) struct GroupTargetPlan {
 
 /// What a page's staged sides hold of each `numeric` sum's partials, read
 /// as it stages them ([`stage_sides`]), so its apply sums only what it
-/// staged ([`GroupTargetPlan::staged_total`]).
+/// staged ([`GroupTargetPlan::staged_totals`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct StagedParts {
     /// The (1-based) arguments whose every staged map of exceptions is
@@ -1728,13 +1894,7 @@ fn staged_columns(shape: &GroupShape) -> Vec<String> {
         .collect();
     columns.push("__txid xid8".to_string());
     columns.push("__lsn pg_lsn".to_string());
-    columns.push("__n bigint".to_string());
-    for (i, arg) in shape.args.iter().enumerate() {
-        columns.push(format!("__c{} bigint", i + 1));
-        for part in arg.parts() {
-            columns.push(format!("{} {}", part.name("__", i + 1), part.sql_type()));
-        }
-    }
+    columns.extend(shape.each_partial(|p| format!("{} {}", p.name("__"), p.sql_type())));
     // Per extreme, the extreme of the insertion sides and of the
     // retraction sides, kept apart (Rx4: a sum can't say which side reached
     // the extreme).
@@ -1829,6 +1989,37 @@ impl GroupTargetPlan {
             collations: GroupCollations::default(),
             staged_parts: StagedSummary::default(),
         }
+    }
+
+    /// The plan of `definition`'s group-basis target over `shape` (its
+    /// [`route`]), with what it reads from the catalog in `client`: each
+    /// `numeric` sum's reference scale, the source's row identity and the
+    /// target's group identity. The drain builds its plans with
+    /// [`Self::new`] instead: it reads each source's identity once per page
+    /// and shares it among that source's definitions.
+    pub(crate) async fn read(
+        client: &impl tokio_postgres::GenericClient,
+        catalog_schema: &str,
+        definition: &crate::defs::model::Definition,
+        mut shape: GroupShape,
+    ) -> Result<Self, ApplyError> {
+        shape
+            .read_scales(
+                client,
+                &hidden_table_qualified(catalog_schema, definition.id),
+            )
+            .await?;
+        let source_pk = ddl::source_primary_key_in_txn(client, &definition.source_table).await?;
+        let identity = ddl::identity_key_columns(client, &definition.target_table).await?;
+        Ok(Self::new(
+            catalog_schema,
+            definition.id,
+            &definition.target_table,
+            &definition.source_table,
+            source_pk,
+            identity,
+            shape,
+        ))
     }
 
     /// The plan of one `JOIN` structure (`super::join`): `hidden` is its
@@ -2018,18 +2209,7 @@ impl GroupTargetPlan {
     /// the group's: `<prefix>n`, then per argument `<prefix>c<i>` and each
     /// of its partials' ([`SumPart::name`]), each `null::<type> as <name>`.
     fn working_columns(&self, prefix: &str) -> Vec<String> {
-        let mut columns = vec![format!("null::bigint as {prefix}n")];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            columns.push(format!("null::bigint as {prefix}c{}", i + 1));
-            for part in arg.parts() {
-                columns.push(format!(
-                    "null::{} as {}",
-                    part.sql_type(),
-                    part.name(prefix, i + 1)
-                ));
-            }
-        }
-        columns
+        (self.shape).each_partial(|p| format!("null::{} as {}", p.sql_type(), p.name(prefix)))
     }
 
     /// The visible target's group columns, `<col> as <col>` each, at the
@@ -2499,21 +2679,18 @@ impl GroupTargetPlan {
         )
     }
 
-    /// The SQL of aggregate `agg` over partials named by `n`, `count` (a
-    /// function of the argument's 1-based index), `sum` (of the index and
-    /// the partial, [`SumPart`]) and `extreme` (of the extreme). `args` are
-    /// the shape's arguments.
+    /// The SQL of aggregate `agg` over partials named by `partial` and
+    /// extremes named by `extreme`. `args` are the shape's arguments.
     fn agg_sql(
         agg: &Agg,
         args: &[Arg],
-        n: &str,
-        count: &dyn Fn(usize) -> String,
-        sum: &dyn Fn(usize, SumPart) -> String,
+        partial: &dyn Fn(Partial) -> String,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
+        let count = |i| partial(Partial::Count(i));
         let value = |i: usize| {
             sum_value(args[i].numeric, args[i].scale, &count(i + 1), &|part| {
-                sum(i + 1, part)
+                partial(Partial::Sum(part, i + 1))
             })
         };
         match agg {
@@ -2522,7 +2699,7 @@ impl GroupTargetPlan {
                 arg: *arg,
                 pg_type: pg_type.clone(),
             }),
-            Agg::CountStar => n.to_string(),
+            Agg::CountStar => partial(Partial::Rows),
             Agg::Count(i) => count(i + 1),
             Agg::Sum(i, cast) => format!(
                 "case when {c} = 0 then null else ({s})::{cast} end",
@@ -2538,14 +2715,12 @@ impl GroupTargetPlan {
     }
 
     /// A lateral subquery computing every field over partials named by
-    /// `n`, `count`, `sum` and `extreme`, as columns `<prefix>0`,
+    /// `partial` and extremes by `extreme`, as columns `<prefix>0`,
     /// `<prefix>1`, ….
     fn fields_lateral(
         &self,
         prefix: &str,
-        n: &str,
-        count: &dyn Fn(usize) -> String,
-        sum: &dyn Fn(usize, SumPart) -> String,
+        partial: &dyn Fn(Partial) -> String,
         extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
         let aggs: Vec<String> = self
@@ -2556,7 +2731,7 @@ impl GroupTargetPlan {
             .map(|(k, agg)| {
                 format!(
                     "{} as {}",
-                    Self::agg_sql(agg, &self.shape.args, n, count, sum, extreme),
+                    Self::agg_sql(agg, &self.shape.args, partial, extreme),
                     quote_ident(&placeholder(k))
                 )
             })
@@ -2598,14 +2773,12 @@ impl GroupTargetPlan {
                     "null::boolean".to_string(),
                     "null::boolean".to_string(),
                     "null::text".to_string(),
-                    "lost.n".to_string(),
                 ];
-                for arg in &self.shape.args {
-                    sentinel.push("null::bigint".to_string());
-                    if arg.summed {
-                        sentinel.push("null::text".to_string());
-                    }
-                }
+                sentinel.extend(self.shape.returned(|p| match p {
+                    Partial::Rows => "lost.n".to_string(),
+                    Partial::Count(_) => "null::bigint".to_string(),
+                    Partial::Sum(..) => "null".to_string(),
+                }));
                 format!(
                     "{} union all select {} from lost where lost.n > 0",
                     self.visible_tail_sql(image_columns),
@@ -2639,16 +2812,7 @@ impl GroupTargetPlan {
     /// counts it.
     fn match_hidden_build_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols);
-        let staged_parts = self.staged_parts.get();
-        let mut totals = vec!["sum(__n)::bigint as __n".to_string()];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            totals.push(format!("sum(__c{i})::bigint as __c{i}"));
-            for part in arg.parts() {
-                let total = self.staged_total(&staged_parts, i, *part, None);
-                totals.push(format!("{total} as {}", part.name("__", i)));
-            }
-        }
+        let totals = self.staged_totals(&self.staged_parts.get(), None);
         format!(
             "create temp table {HIDDEN_MATCH} on commit drop as \
              select s.*, x.ctid as __hc \
@@ -2670,25 +2834,7 @@ impl GroupTargetPlan {
     /// millions of groups the checkpoints that follow write each page again
     /// as a full-page image.
     fn update_hidden_build_sql(&self) -> String {
-        let staged_parts = self.staged_parts.get();
-        let mut sets = vec!["__n = u.__n + t.__n".to_string()];
-        let mut nonzero = vec!["t.__n <> 0".to_string()];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            sets.push(format!("__count_{i} = u.__count_{i} + t.__c{i}"));
-            nonzero.push(format!("t.__c{i} <> 0"));
-            for part in arg.parts() {
-                if *part == SumPart::Scales && self.map_free(&staged_parts, i) {
-                    continue;
-                }
-                let (staged, hidden) = (part.name("__", i), part.hidden(i));
-                sets.push(format!(
-                    "{hidden} = {}",
-                    part.add(&format!("u.{hidden}"), &format!("t.{staged}"), arg.scale)
-                ));
-                nonzero.push(part.nonzero(&format!("t.{staged}")));
-            }
-        }
+        let (sets, nonzero) = self.added(&self.staged_parts.get());
         format!(
             "update {hidden} u set {sets} from {HIDDEN_MATCH} t \
              where u.ctid = t.__hc and ({nonzero})",
@@ -2721,78 +2867,71 @@ impl GroupTargetPlan {
         }
     }
 
-    /// The total of partial `part` of argument `i` (1-based) over the staged
-    /// sides (those meeting `condition`, if any), each named as the staging
-    /// table names it. The map of an argument whose staged maps are all
-    /// `NULL` ([`StagedParts::free`]) is `NULL`: no map is read.
-    fn staged_total(
+    /// Each partial's total over the staged sides (those meeting
+    /// `condition`, if any), `… as <name>` as the staging table names it.
+    /// The map of an argument whose staged maps are all `NULL`
+    /// ([`StagedParts::free`]) is `NULL`: no map is read.
+    fn staged_totals(
         &self,
         staged_parts: &Option<StagedParts>,
-        i: usize,
-        part: SumPart,
         condition: Option<&str>,
-    ) -> String {
-        if part == SumPart::Scales && self.map_free(staged_parts, i) {
-            return NO_SCALES.to_string();
-        }
-        part.total(&part.name("__", i), condition, self.shape.args[i - 1].scale)
+    ) -> Vec<String> {
+        self.shape.each_partial(|p| {
+            let total = match self.map_free(staged_parts, p) {
+                true => NO_SCALES.to_string(),
+                false => p.total(&p.name("__"), condition),
+            };
+            format!("{total} as {}", p.name("__"))
+        })
     }
 
-    /// Whether every staged map of argument `i` (1-based) is `NULL`
+    /// The update of a hidden row `u` by the staged totals `t`
+    /// ([`Self::staged_totals`]): its `set` list, each partial plus its
+    /// total, and the tests that some total is not zero. A map every staged
+    /// side left `NULL` ([`Self::map_free`]) is kept as it is.
+    fn added(&self, staged_parts: &Option<StagedParts>) -> (Vec<String>, Vec<String>) {
+        let mut written = self.shape.partials();
+        written.retain(|&p| !self.map_free(staged_parts, p));
+        let set = |p: &Partial| {
+            let added = p.add(&format!("u.{}", p.hidden()), &format!("t.{}", p.name("__")));
+            format!("{} = {added}", p.hidden())
+        };
+        let nonzero = |p: &Partial| p.nonzero(&format!("t.{}", p.name("__")));
+        (
+            written.iter().map(set).collect(),
+            written.iter().map(nonzero).collect(),
+        )
+    }
+
+    /// Whether `p` is a map every staged side of its argument left `NULL`
     /// ([`StagedParts::free`]): its apply reads, sums and writes no map.
-    fn map_free(&self, staged_parts: &Option<StagedParts>, i: usize) -> bool {
-        staged_parts.as_ref().is_some_and(|p| p.free.contains(&i))
+    fn map_free(&self, staged_parts: &Option<StagedParts>, p: Partial) -> bool {
+        let free = |i| staged_parts.as_ref().is_some_and(|s| s.free.contains(&i));
+        matches!(p, Partial::Sum(SumPart::Scales, i) if free(i))
     }
 
     /// Whether every map its staging table holds of argument `i` (1-based)
     /// is `NULL`, as its writer last found it ([`StagedParts::free`]).
     pub(super) fn staged_map_free(&self, i: usize) -> bool {
-        self.map_free(&self.staged_parts.get(), i)
+        self.map_free(&self.staged_parts.get(), Partial::Sum(SumPart::Scales, i))
     }
 
     fn apply_sql_with(&self, tail: &str) -> String {
         let cols = quoted(&self.shape.group_cols);
-        let args = &self.shape.args;
         let staged_parts = self.staged_parts.get();
         // The per-(group, transaction) sums of each partial.
-        let mut sums = vec!["sum(__n)::bigint as __n".to_string()];
-        let mut totals = vec!["sum(__n)::bigint as __n".to_string()];
-        let mut sets = vec!["__n = u.__n + t.__n".to_string()];
-        let mut nonzero = vec!["t.__n <> 0".to_string()];
-        let mut returning = vec!["t.__n as __dn".to_string(), "u.__n as __nn".to_string()];
-        for (i, arg) in args.iter().enumerate() {
-            let i = i + 1;
-            sums.push(format!("sum(__c{i})::bigint as __c{i}"));
-            totals.push(format!("sum(__c{i})::bigint as __c{i}"));
-            sets.push(format!("__count_{i} = u.__count_{i} + t.__c{i}"));
-            nonzero.push(format!("t.__c{i} <> 0"));
-            returning.push(format!("t.__c{i} as __dc{i}, u.__count_{i} as __nc{i}"));
-            for part in arg.parts() {
-                let (staged, hidden) = (part.name("__", i), part.hidden(i));
-                let total = self.staged_total(&staged_parts, i, *part, None);
-                sums.push(format!("{total} as {staged}"));
-                totals.push(format!("{total} as {staged}"));
-                if *part == SumPart::Scales && self.map_free(&staged_parts, i) {
-                    // Every staged map is `NULL`: the row keeps its map.
-                    returning.push(format!(
-                        "{NO_SCALES} as {}, u.{hidden} as {}",
-                        part.name("__d", i),
-                        part.name("__n", i)
-                    ));
-                    continue;
-                }
-                sets.push(format!(
-                    "{hidden} = {}",
-                    part.add(&format!("u.{hidden}"), &format!("t.{staged}"), arg.scale)
-                ));
-                nonzero.push(part.nonzero(&format!("t.{staged}")));
-                returning.push(format!(
-                    "t.{staged} as {}, u.{hidden} as {}",
-                    part.name("__d", i),
-                    part.name("__n", i)
-                ));
-            }
-        }
+        let sums = self.staged_totals(&staged_parts, None);
+        let (sets, nonzero) = self.added(&staged_parts);
+        // Each partial's change and new value. Every staged map `NULL`: the
+        // row keeps its map.
+        let returning = self.shape.each_partial(|p| {
+            let change = match self.map_free(&staged_parts, p) {
+                true => NO_SCALES.to_string(),
+                false => format!("t.{}", p.name("__")),
+            };
+            let (d, n) = (p.name("__d"), p.name("__n"));
+            format!("{change} as {d}, u.{} as {n}", p.hidden())
+        });
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let matched = self.group_match("sg", "b");
         #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
@@ -2815,7 +2954,7 @@ impl GroupTargetPlan {
                  select sg.*, b.__hc from sg join b on {matched} \
                  where b.__basis is null or {unseen} \
              ), \
-             t as (select __hc, {totals} from f group by __hc), \
+             t as (select __hc, {sums} from f group by __hc), \
              up as ( \
                  update {hidden} u set {sets} from t \
                  where u.ctid = any(array(select t.__hc from t where {nonzero})) \
@@ -2825,7 +2964,7 @@ impl GroupTargetPlan {
              {tail}",
             basis_ctes = self.basis_ctes_sql(&sums),
             lost = self.lost_cte_sql(),
-            totals = totals.join(", "),
+            sums = sums.join(", "),
             hidden = self.hidden_ident,
             sets = sets.join(", "),
             nonzero = nonzero.join(" or "),
@@ -2856,21 +2995,8 @@ impl GroupTargetPlan {
         returning: &[String],
         unseen: &str,
     ) -> String {
-        let staged_parts = self.staged_parts.get();
         let mut sums = sums.to_vec();
-        let mut totals =
-            vec!["coalesce(sum(__n) filter (where __ok), 0)::bigint as __n".to_string()];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            totals.push(format!(
-                "coalesce(sum(__c{i}) filter (where __ok), 0)::bigint as __c{i}"
-            ));
-            for part in arg.parts() {
-                let staged = part.name("__", i);
-                let total = self.staged_total(&staged_parts, i, *part, Some("__ok"));
-                totals.push(format!("{total} as {staged}"));
-            }
-        }
+        let mut totals = self.staged_totals(&self.staged_parts.get(), Some("__ok"));
         let mut sets = sets.to_vec();
         let mut touched = nonzero.to_vec();
         let mut returning = returning.to_vec();
@@ -3025,13 +3151,7 @@ impl GroupTargetPlan {
     /// many cells it wrote.
     fn deltas_tail_sql(&self, deltas: &str) -> String {
         let mut columns = quoted(&self.shape.group_cols);
-        columns.push("__dn".to_string());
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            columns.push(format!("__dc{}", i + 1));
-            for part in arg.parts() {
-                columns.push(part.name("__d", i + 1));
-            }
-        }
+        columns.extend(self.shape.each_partial(|p| p.name("__d")));
         let columns = columns.join(", ");
         format!(
             "d as (insert into {deltas} ({columns}) select {columns} from up) \
@@ -3193,20 +3313,14 @@ impl GroupTargetPlan {
         let mut held_names = vec!["__hc".to_string()];
         let mut probes = Vec::with_capacity(extremes.len());
         let mut sets = Vec::with_capacity(extremes.len());
-        let mut returning = vec!["0::bigint as __dn".to_string(), "u.__n as __nn".to_string()];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            returning.push(format!("0::bigint as __dc{i}, u.__count_{i} as __nc{i}"));
-            for part in arg.parts() {
-                returning.push(format!(
-                    "{} as {}, u.{} as {}",
-                    part.zero(),
-                    part.name("__d", i),
-                    part.hidden(i),
-                    part.name("__n", i)
-                ));
-            }
-        }
+        let mut returning = self.shape.each_partial(|p| {
+            let (d, n) = (p.name("__d"), p.name("__n"));
+            let zero = match p {
+                Partial::Sum(..) => p.zero(),
+                Partial::Rows | Partial::Count(_) => "0::bigint",
+            };
+            format!("{zero} as {d}, u.{} as {n}", p.hidden())
+        });
         for x in &extremes {
             let column = x.column();
             held.push(format!("x.{column}"));
@@ -3286,40 +3400,20 @@ impl GroupTargetPlan {
     fn recompute_sql(&self, image_columns: Option<&[String]>, node: Option<&str>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let args = &self.shape.args;
-        let mut old = vec!["x.__n".to_string()];
-        let mut old_names = vec!["__on".to_string()];
+        let mut old = self.shape.each_partial(|p| format!("x.{}", p.hidden()));
+        let mut old_names = self.shape.each_partial(|p| p.name("__o"));
         // The scan form's partials, `NULL` for a group the node has no row of.
-        let mut zeroed = vec!["coalesce(n.__rn, 0) as __rn".to_string()];
-        let mut sets = vec!["__n = r.__rn".to_string()];
-        let mut returning = vec![
-            "u.__n - r.__on as __dn".to_string(),
-            "u.__n as __nn".to_string(),
-        ];
-        for (i, arg) in args.iter().enumerate() {
-            let i = i + 1;
-            old.push(format!("x.__count_{i}"));
-            old_names.push(format!("__oc{i}"));
-            sets.push(format!("__count_{i} = r.__rc{i}"));
-            zeroed.push(format!("coalesce(n.__rc{i}, 0) as __rc{i}"));
-            returning.push(format!(
-                "u.__count_{i} - r.__oc{i} as __dc{i}, u.__count_{i} as __nc{i}"
-            ));
-            for part in arg.parts() {
-                let (hidden, held, read) =
-                    (part.hidden(i), part.name("__o", i), part.name("__r", i));
-                old.push(format!("x.{hidden}"));
-                old_names.push(held.clone());
-                sets.push(format!("{hidden} = r.{read}"));
-                zeroed.push(format!("coalesce(n.{read}, {}) as {read}", part.zero()));
-                returning.push(format!(
-                    "{} as {}, u.{hidden} as {}",
-                    part.sub(&format!("u.{hidden}"), &format!("r.{held}"), arg.scale),
-                    part.name("__d", i),
-                    part.name("__n", i)
-                ));
-            }
-        }
+        let mut zeroed = self.shape.each_partial(|p| p.or_zero("n", "__r"));
+        let mut sets = self
+            .shape
+            .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")));
+        let mut returning = self.shape.each_partial(|p| {
+            let (h, d, n) = (p.hidden(), p.name("__d"), p.name("__n"));
+            format!(
+                "{} as {d}, u.{h} as {n}",
+                p.sub(&format!("u.{h}"), &format!("r.{}", p.name("__o")))
+            )
+        });
         // Rx6: the extremes from the same snapshot, which becomes their
         // basis too.
         let extremes = self.shape.extremes();
@@ -3425,13 +3519,11 @@ impl GroupTargetPlan {
     /// write that follows can't.
     fn join_group_sql(&self, node: &str, grouped: &str, strict: bool) -> String {
         let cols = quoted(&self.shape.group_cols);
-        let mut nulls = vec!["null".to_string(); cols.len() + 1];
-        for arg in &self.shape.args {
-            nulls.push("null".to_string());
-            for part in arg.parts() {
-                nulls.push(format!("null::{}", part.sql_type()));
-            }
-        }
+        let mut nulls = vec!["null".to_string(); cols.len()];
+        nulls.extend(self.shape.each_partial(|p| match p {
+            Partial::Sum(part, _) => format!("null::{}", part.sql_type()),
+            Partial::Rows | Partial::Count(_) => "null".to_string(),
+        }));
         format!(
             "create temp table {table} on commit drop as \
              select false as __meta, null::pg_snapshot as __snap, null::bigint as __seg, f.* \
@@ -3487,44 +3579,29 @@ impl GroupTargetPlan {
     fn join_build_sql(&self, grouped: &str, cells: &str, deltas: &str) -> [String; 2] {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let args = &self.shape.args;
-        let mut held = vec!["x.__n as __on".to_string()];
-        let mut cell = vec![
-            "coalesce(h.__on, 0) as __on".to_string(),
-            "coalesce(n.__rn, 0) as __rn".to_string(),
-        ];
-        let mut sets = vec!["__n = r.__rn".to_string()];
+        let held = self
+            .shape
+            .each_partial(|p| format!("x.{} as {}", p.hidden(), p.name("__o")));
+        let cell: Vec<String> = (self.shape.partials().into_iter())
+            .flat_map(|p| [p.or_zero("h", "__o"), p.or_zero("n", "__r")])
+            .collect();
+        let sets = self
+            .shape
+            .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")));
+        let r_cols: Vec<String> = cols.iter().map(|c| format!("r.{c}")).collect();
         let mut insert_cols = cols.clone();
-        insert_cols.push("__n".to_string());
-        let mut insert_values: Vec<String> = cols.iter().map(|c| format!("r.{c}")).collect();
-        insert_values.push("r.__rn".to_string());
+        insert_cols.extend(self.shape.each_partial(|p| p.hidden()));
+        let mut insert_values = r_cols.clone();
+        insert_values.extend(self.shape.each_partial(|p| format!("r.{}", p.name("__r"))));
         let mut delta_cols = cols.clone();
-        delta_cols.push("__dn".to_string());
-        let mut delta_values: Vec<String> = cols.iter().map(|c| format!("r.{c}")).collect();
-        delta_values.push("r.__rn - r.__on".to_string());
-        for (i, arg) in args.iter().enumerate() {
-            let i = i + 1;
-            held.push(format!("x.__count_{i} as __oc{i}"));
-            cell.push(format!("coalesce(h.__oc{i}, 0) as __oc{i}"));
-            cell.push(format!("coalesce(n.__rc{i}, 0) as __rc{i}"));
-            sets.push(format!("__count_{i} = r.__rc{i}"));
-            insert_cols.push(format!("__count_{i}"));
-            insert_values.push(format!("r.__rc{i}"));
-            delta_cols.push(format!("__dc{i}"));
-            delta_values.push(format!("r.__rc{i} - r.__oc{i}"));
-            for part in arg.parts() {
-                let (hidden, old, read) =
-                    (part.hidden(i), part.name("__o", i), part.name("__r", i));
-                held.push(format!("x.{hidden} as {old}"));
-                cell.push(format!("coalesce(h.{old}, {}) as {old}", part.zero()));
-                cell.push(format!("coalesce(n.{read}, {}) as {read}", part.zero()));
-                sets.push(format!("{hidden} = r.{read}"));
-                insert_cols.push(hidden);
-                insert_values.push(format!("r.{read}"));
-                delta_cols.push(part.name("__d", i));
-                delta_values.push(part.sub(&format!("r.{read}"), &format!("r.{old}"), arg.scale));
-            }
-        }
+        delta_cols.extend(self.shape.each_partial(|p| p.name("__d")));
+        let mut delta_values = r_cols;
+        delta_values.extend(self.shape.each_partial(|p| {
+            p.sub(
+                &format!("r.{}", p.name("__r")),
+                &format!("r.{}", p.name("__o")),
+            )
+        }));
         insert_cols.extend(["__basis", "__stamp"].map(String::from));
         insert_values.extend(["snap.__snap", "snap.__seg"].map(String::from));
         let rg_cols: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
@@ -3690,22 +3767,13 @@ impl GroupTargetPlan {
     fn rebuild_sql(&self, image_columns: Option<&[String]>, read: &RebuildRead) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let args = &self.shape.args;
-        let mut kept = vec!["coalesce(a.__rn, 0) as __rn".to_string()];
-        let mut sets = vec!["__n = r.__rn".to_string()];
-        let mut returning = vec!["u.__n as __nn".to_string()];
-        for (i, arg) in args.iter().enumerate() {
-            let i = i + 1;
-            kept.push(format!("coalesce(a.__rc{i}, 0) as __rc{i}"));
-            sets.push(format!("__count_{i} = r.__rc{i}"));
-            returning.push(format!("u.__count_{i} as __nc{i}"));
-            for part in arg.parts() {
-                let (hidden, read) = (part.hidden(i), part.name("__r", i));
-                kept.push(format!("coalesce(a.{read}, {}) as {read}", part.zero()));
-                sets.push(format!("{hidden} = r.{read}"));
-                returning.push(format!("u.{hidden} as {}", part.name("__n", i)));
-            }
-        }
+        let mut kept = self.shape.each_partial(|p| p.or_zero("a", "__r"));
+        let mut sets = self
+            .shape
+            .each_partial(|p| format!("{} = r.{}", p.hidden(), p.name("__r")));
+        let mut returning = self
+            .shape
+            .each_partial(|p| format!("u.{} as {}", p.hidden(), p.name("__n")));
         // Rx6: the extremes from the same `GROUP BY` and snapshot, which
         // becomes their basis too.
         let extremes = self.shape.extremes();
@@ -3866,7 +3934,7 @@ impl GroupTargetPlan {
                         &format!("array_agg(__g{i})"),
                         Some(&format!("array_agg({count})")),
                     ),
-                    _ => part.total(&name, None, arg.scale),
+                    _ => part.total(&name, None),
                 };
                 let agg = match (part, arg.scale) {
                     (SumPart::Scales, Some(s)) if strict => strict_build_scales(&arg.sql, s),
@@ -3983,15 +4051,7 @@ impl GroupTargetPlan {
     fn held_tail_sql(&self, image_columns: Option<&[String]>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let args = &self.shape.args;
-        let mut applied = vec!["cur.__nn".to_string()];
-        for (i, arg) in args.iter().enumerate() {
-            let i = i + 1;
-            applied.push(format!("cur.__nc{i}"));
-            if arg.summed {
-                applied.push(format!("cur.__ns{i}::text"));
-            }
-        }
+        let mut applied = self.shape.returned(|p| format!("cur.{}", p.name("__n")));
         // An absolute write leaves no extreme to probe.
         if !self.shape.extremes().is_empty() {
             applied.push("false".to_string());
@@ -4003,13 +4063,7 @@ impl GroupTargetPlan {
             .iter()
             .map(|(name, _, _)| quote_ident(name))
             .collect();
-        let new_fields = self.fields_lateral(
-            "__nf",
-            "up.__nn",
-            &|i| format!("up.__nc{i}"),
-            &|i, part| part.name("up.__n", i),
-            &|x| x.named("up.__n"),
-        );
+        let new_fields = self.fields_lateral("__nf", &|p| p.name("up.__n"), &|x| x.named("up.__n"));
         let nf: Vec<String> = (0..field_count).map(|j| format!("nv.__nf{j}")).collect();
         let held: Vec<String> = (0..field_count).map(|j| format!("t.__vf{j}")).collect();
         let held_names: Vec<String> = (0..field_count).map(|j| format!("__vf{j}")).collect();
@@ -4119,17 +4173,8 @@ impl GroupTargetPlan {
     fn compare_held_sql(&self, image_columns: Option<&[String]>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let mut names = vec!["__nn".to_string()];
-        let mut columns = vec!["x.__n".to_string()];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            names.push(format!("__nc{i}"));
-            columns.push(format!("x.__count_{i}"));
-            for part in arg.parts() {
-                names.push(part.name("__n", i));
-                columns.push(format!("x.{}", part.hidden(i)));
-            }
-        }
+        let names = self.shape.each_partial(|p| p.name("__n"));
+        let columns = self.shape.each_partial(|p| format!("x.{}", p.hidden()));
         let up_groups: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
         let up_values: Vec<String> = names.iter().map(|n| format!("h.{n}")).collect();
         format!(
@@ -4161,24 +4206,13 @@ impl GroupTargetPlan {
     /// zero row changes no partial.
     fn target_groups_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
-        let mut insert = vec!["__txid", "__lsn", "__n"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
+        let mut insert = vec!["__txid".to_string(), "__lsn".to_string()];
+        insert.extend(self.shape.each_partial(|p| p.name("__")));
         let mut zeros = vec![
             "pg_current_xact_id()".to_string(),
             "'0/0'::pg_lsn".to_string(),
-            "0".to_string(),
         ];
-        for (i, arg) in self.shape.args.iter().enumerate() {
-            let i = i + 1;
-            insert.push(format!("__c{i}"));
-            zeros.push("0".to_string());
-            for part in arg.parts() {
-                insert.push(part.name("__", i));
-                zeros.push(part.zero().to_string());
-            }
-        }
+        zeros.extend(self.shape.each_partial(|p| p.zero().to_string()));
         format!(
             "insert into {staged} ({cols}, {insert}) \
              select {cols}, {zeros} from ( \
@@ -4204,36 +4238,20 @@ impl GroupTargetPlan {
     fn visible_tail_sql(&self, image_columns: Option<&[String]>) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
-        let args = &self.shape.args;
         // An extreme has no change to subtract: `up` carries its prior
         // value (`__o…`) beside its new one (`__n…`).
-        let new_fields = self.fields_lateral(
-            "__nf",
-            "up.__nn",
-            &|i| format!("up.__nc{i}"),
-            &|i, part| part.name("up.__n", i),
-            &|x| x.named("up.__n"),
-        );
+        let new_fields = self.fields_lateral("__nf", &|p| p.name("up.__n"), &|x| x.named("up.__n"));
         // The prior image's partials are the new ones less the change. A
         // map no staged side changed ([`StagedParts::free`]) is the new one.
         let staged_parts = self.staged_parts.get();
-        let prior_fields = self.fields_lateral(
-            "__pf",
-            "(up.__nn - up.__dn)",
-            &|i| format!("(up.__nc{i} - up.__dc{i})"),
-            &|i, part| {
-                if part == SumPart::Scales && self.map_free(&staged_parts, i) {
-                    part.name("up.__n", i)
-                } else {
-                    part.sub(
-                        &part.name("up.__n", i),
-                        &part.name("up.__d", i),
-                        self.shape.args[i - 1].scale,
-                    )
-                }
-            },
-            &|x| x.named("up.__o"),
-        );
+        let prior = |p: Partial| match p {
+            _ if self.map_free(&staged_parts, p) => p.name("up.__n"),
+            Partial::Sum(..) => p.sub(&p.name("up.__n"), &p.name("up.__d")),
+            Partial::Rows | Partial::Count(_) => {
+                format!("({})", p.sub(&p.name("up.__n"), &p.name("up.__d")))
+            }
+        };
+        let prior_fields = self.fields_lateral("__pf", &prior, &|x| x.named("up.__o"));
         let field_count = self.shape.fields.len();
         let nf: Vec<String> = (0..field_count).map(|j| format!("__nf.__nf{j}")).collect();
         let pf: Vec<String> = (0..field_count).map(|j| format!("__pf.__pf{j}")).collect();
@@ -4279,13 +4297,7 @@ impl GroupTargetPlan {
             }
             None => "null::text".to_string(),
         };
-        let mut applied: Vec<String> = vec!["vis.__dn".to_string()];
-        for (i, arg) in args.iter().enumerate() {
-            applied.push(format!("vis.__dc{}", i + 1));
-            if arg.summed {
-                applied.push(format!("vis.__ds{}::text", i + 1));
-            }
-        }
+        let mut applied = self.shape.returned(|p| format!("vis.{}", p.name("__d")));
         // Whether the group's extremes are to be probed (Rx4).
         if !self.shape.extremes().is_empty() {
             applied.push("vis.__probe".to_string());
@@ -4900,23 +4912,12 @@ async fn plan_of(
     catalog_schema: &str,
     definition: &crate::defs::model::Definition,
 ) -> Result<Option<GroupTargetPlan>, ApplyError> {
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Ok(None);
     };
-    shape
-        .read_scales(txn, &hidden_table_qualified(catalog_schema, definition.id))
-        .await?;
-    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
-    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
-    Ok(Some(GroupTargetPlan::new(
-        catalog_schema,
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        source_pk,
-        identity,
-        shape,
-    )))
+    Ok(Some(
+        GroupTargetPlan::read(txn, catalog_schema, definition, shape).await?,
+    ))
 }
 
 /// A partition correction's recompute on a group-basis target
@@ -4944,8 +4945,7 @@ pub(crate) async fn recompute_routed(
     };
     let mut mutations = TargetMutations::new();
     let counts = recompute_named_groups(txn, &plan, groups, node, &mut mutations).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(Some(counts))
 }
 
@@ -4966,8 +4966,7 @@ pub(crate) async fn release(
     };
     let mut mutations = TargetMutations::new();
     recompute_groups(txn, &plan, groups, key, &mut mutations).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(true)
 }
 
@@ -5129,27 +5128,12 @@ pub(crate) async fn rebuild_definition(
     definition: &crate::defs::model::Definition,
     scope: Option<&RebuildScope>,
 ) -> Result<Option<(usize, usize)>, ApplyError> {
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(plan) = plan_of(txn, catalog_schema, definition).await? else {
         return Ok(None);
     };
-    shape
-        .read_scales(txn, &hidden_table_qualified(catalog_schema, definition.id))
-        .await?;
-    let source_pk = ddl::source_primary_key_in_txn(txn, &definition.source_table).await?;
-    let identity = ddl::identity_key_columns(txn, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        catalog_schema,
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        source_pk,
-        identity,
-        shape,
-    );
     let mut mutations = TargetMutations::new();
     let counts = rebuild(txn, &plan, scope, &mut mutations).await?;
-    let propagation = mutations.into_staged(txn).await?;
-    super::append::append(txn, &propagation.changes).await?;
+    mutations.flush(txn).await?;
     Ok(Some(counts))
 }
 
@@ -5304,29 +5288,14 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
             transform: target.to_string(),
         });
     };
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Err(ApplyError::GroupBasisUnsupported {
             target: definition.target_table,
             what: "a definition the group basis doesn't take",
         });
     };
     let mut client = pool.get().await?;
-    shape
-        .read_scales(
-            &**client,
-            &hidden_table_qualified(pool.schema(), definition.id),
-        )
-        .await?;
-    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        pool.schema(),
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
-        identity,
-        shape,
-    );
+    let plan = GroupTargetPlan::read(&**client, pool.schema(), &definition, shape).await?;
     let txn = client.transaction().await?;
     txn.batch_execute(&plan.staged_ddl()).await?;
     txn.batch_execute(PLAN_SETTINGS).await?;
@@ -5363,29 +5332,14 @@ pub async fn explain_whole_source_reads(
             transform: target.to_string(),
         });
     };
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Err(ApplyError::GroupBasisUnsupported {
             target: definition.target_table,
             what: "a definition the group basis doesn't take",
         });
     };
     let mut client = pool.get().await?;
-    shape
-        .read_scales(
-            &**client,
-            &hidden_table_qualified(pool.schema(), definition.id),
-        )
-        .await?;
-    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        pool.schema(),
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
-        identity,
-        shape,
-    );
+    let plan = GroupTargetPlan::read(&**client, pool.schema(), &definition, shape).await?;
     let txn = client.transaction().await?;
     txn.batch_execute(&format!(
         "{}; {}; set local enable_nestloop = off",
@@ -5423,7 +5377,7 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
             transform: target.to_string(),
         });
     };
-    let Some(mut shape) = route(&definition.def, &definition.source_columns) else {
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
         return Err(ApplyError::GroupBasisUnsupported {
             target: definition.target_table,
             what: "a definition the group basis doesn't take",
@@ -5436,22 +5390,7 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
         });
     }
     let mut client = pool.get().await?;
-    shape
-        .read_scales(
-            &**client,
-            &hidden_table_qualified(pool.schema(), definition.id),
-        )
-        .await?;
-    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
-    let plan = GroupTargetPlan::new(
-        pool.schema(),
-        definition.id,
-        &definition.target_table,
-        &definition.source_table,
-        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
-        identity,
-        shape,
-    );
+    let plan = GroupTargetPlan::read(&**client, pool.schema(), &definition, shape).await?;
     let txn = client.transaction().await?;
     txn.batch_execute(&format!(
         "{}; {}; set local enable_seqscan = off",
@@ -5469,6 +5408,9 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
         .collect::<Vec<_>>()
         .join("\n"))
 }
+
+#[cfg(test)]
+pub(super) mod golden;
 
 #[cfg(test)]
 mod tests {
@@ -6451,26 +6393,26 @@ mod tests {
                 let (ma, mb, mab) = (of(a, Some(2)), of(b, Some(2)), of(&both, Some(2)));
                 let (ma, mb, mab) = (format!("({ma})"), format!("({mb})"), format!("({mab})"));
                 assert_eq!(
-                    text(part.add(&ma, &mb, Some(2))).await,
+                    text(part.add(&ma, &mb)).await,
                     text(mab.clone()).await,
                     "{a:?} + {b:?}"
                 );
                 assert_eq!(
-                    text(part.sub(&mab, &mb, Some(2))).await,
+                    text(part.sub(&mab, &mb)).await,
                     text(ma.clone()).await,
                     "{a:?} + {b:?} - {b:?}"
                 );
             }
             let ma = format!("({})", of(a, Some(2)));
-            assert_eq!(text(part.times(&ma, "0", Some(2))).await, None, "{a:?} * 0");
+            assert_eq!(text(part.times(&ma, "0")).await, None, "{a:?} * 0");
             assert_eq!(
-                text(part.times(&ma, "1", Some(2))).await,
+                text(part.times(&ma, "1")).await,
                 text(ma.clone()).await,
                 "{a:?} * 1"
             );
             assert_eq!(
-                text(part.times(&ma, "2", Some(2))).await,
-                text(part.add(&ma, &ma, Some(2))).await,
+                text(part.times(&ma, "2")).await,
+                text(part.add(&ma, &ma)).await,
                 "{a:?} * 2"
             );
         }
@@ -6491,7 +6433,7 @@ mod tests {
             assert_eq!(
                 text(format!(
                     "select {} from (values {values}) as v(m, c)",
-                    part.total("m", condition, Some(2))
+                    part.total("m", condition)
                 ))
                 .await
                 .as_deref(),
@@ -6527,11 +6469,11 @@ mod tests {
         for a in sets {
             let ma = format!("({})", of(a, Some(2)));
             for n in ["0", "1", "2", "-1"] {
-                assert_eq!(text(part.times(NO_SCALES, n, Some(2))).await, None);
+                assert_eq!(text(part.times(NO_SCALES, n)).await, None);
             }
             let nothing = format!("coalesce({NO_SCALES}, {NO_SCALES})");
             assert_eq!(
-                text(part.sub(&ma, &nothing, Some(2))).await,
+                text(part.sub(&ma, &nothing)).await,
                 text(ma.clone()).await,
                 "{a:?} - NULL"
             );
@@ -6546,21 +6488,21 @@ mod tests {
             |select: String| format!("select array_agg(r order by g)::text from ({select}) r");
         let general = text(listed(format!(
             "select g, {} as m from {terms} group by g",
-            part.total("m", None, Some(2))
+            part.total("m", None)
         )))
         .await;
         let split = text(listed(format!(
             "select a.g, km.m from (select g from {terms} group by g) a \
              left join (select g, {} as m from {terms} where m is not null group by g) km \
              on array[a.g] = array[km.g]",
-            part.total("m", None, Some(2))
+            part.total("m", None)
         )))
         .await;
         assert_eq!(split, general);
         let first_term = text(listed(format!(
             "select g, case when (array_agg(m))[1] is null then {NO_SCALES} else {} end as m \
              from {terms} group by g",
-            part.total("m", None, Some(2))
+            part.total("m", None)
         )))
         .await;
         assert_ne!(first_term, general, "a first-term fast path goes unnoticed");

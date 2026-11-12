@@ -9,127 +9,17 @@
 //! between calls of the capture pass, which is called directly. Nothing
 //! polls for convergence.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use testkit::TestCluster;
-use tokio_postgres::{Client, NoTls};
-use trellis::capture::reconcile;
+use tokio_postgres::Client;
+use trellis::Trellis;
 use trellis::defs::TransformStatus;
-use trellis::{Config, Trellis, TrellisOptions};
 
-const SCHEMA: &str = "trellis";
+#[path = "support/pipeline.rs"]
+mod pipeline;
 
-async fn connect(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!("set search_path to {SCHEMA}, public"))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn definer(dsn: &str) -> Trellis {
-    Trellis::connect(
-        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
-        TrellisOptions::default(),
-    )
-    .await
-    .expect("connect a definer")
-}
-
-/// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    trellis::client::reconcile_pass(raw, pool, SCHEMA)
-        .await
-        .expect("reconcile pass");
-}
-
-/// The capture half of one pass only.
-async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
-    let desired = trellis::defs::tables_to_capture(pool)
-        .await
-        .expect("read the tables to capture");
-    let outcome = reconcile::reconcile(
-        raw,
-        SCHEMA,
-        &desired,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .await
-    .expect("capture pass");
-    assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
-}
-
-async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
-    use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
-    for _ in 0..16 {
-        let outcome = seal::seal_phase1_waiting(client).await;
-        seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_disruption_wake")
-            .await
-            .expect("seal phase 2");
-        while apply::drain_once(
-            pool,
-            outcome.sealed_seg_seq,
-            "capture_disruption_test",
-            1,
-            "trellis_capture_missed_ddl_test",
-        )
-        .await
-        .expect("drain_once")
-        .is_some()
-        {}
-        retire_drained_segments(client)
-            .await
-            .expect("retire drained segments");
-        if !has_pending(client).await.expect("has_pending") {
-            return;
-        }
-    }
-    panic!("the ring did not reach quiescence within 16 seal/drain rounds");
-}
-
-async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
-    trellis::staging::build::settle_builds(pool).await;
-}
-
-/// Every definition's status, by bare target name.
-async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
-    raw.query(
-        "select split_part(target_table, '.', 2), status from transform_definitions",
-        &[],
-    )
-    .await
-    .expect("read statuses")
-    .into_iter()
-    .map(|row| {
-        (
-            row.get(0),
-            trellis::defs::StoredStatus::from_persisted(row.get(1))
-                .expect("a stored status")
-                .into(),
-        )
-    })
-    .collect()
-}
-
-/// Alternates staging-worker passes, builds and drains until every
-/// definition is live: a bounded number of explicit steps.
-async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
-    for _ in 0..10 {
-        full_pass(raw, pool).await;
-        run_backfill_chunks(pool).await;
-        drain_to_quiescence(pool, raw).await;
-        let statuses = statuses(raw).await;
-        if statuses.values().all(|s| *s == TransformStatus::Live) {
-            return;
-        }
-    }
-    panic!("not every definition went live: {:?}", statuses(raw).await);
-}
+use pipeline::{bring_live_all, capture_pass, connect, definer, statuses};
 
 async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
     raw.query(sql, &[])
@@ -217,7 +107,7 @@ async fn run_cases(cases: &[Case]) {
     let trellis = definer(db.dsn()).await;
     let ids: Vec<String> = cases.iter().map(|(id, _, _)| id.to_lowercase()).collect();
     create_case_tables(&raw, &trellis, &ids).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
 
     let app = connect(db.dsn()).await;
     let mut failures = Vec::new();
@@ -452,7 +342,7 @@ async fn a_pg_upgrade_record_is_re_recorded_and_a_changed_catalog_oid_pauses_eve
     let trellis = definer(db.dsn()).await;
     let ids = vec!["rs1".to_string(), "rs2".to_string()];
     create_case_tables(&raw, &trellis, &ids).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     // `pg_upgrade`: another cluster identifier, with every trigger recreated.
     app.batch_execute(&recreate_triggers("t_rs2"))
@@ -511,7 +401,7 @@ async fn trellis_s_own_capture_changes_pause_nothing() {
     let trellis = definer(db.dsn()).await;
     let ids = vec!["own".to_string()];
     create_case_tables(&raw, &trellis, &ids).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(trigger_rows(&raw).await, vec![vec![Some("5".to_string())]]);
 
     // A widen: a new reader needs a column the images lack.
@@ -519,7 +409,7 @@ async fn trellis_s_own_capture_changes_pause_nothing() {
         .apply("TRANSFORM w_own FROM public.t_own SELECT u AS u")
         .await
         .unwrap();
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
     // A narrow: that reader goes.
     trellis.apply("PAUSE TRANSFORM w_own").await.unwrap();
@@ -540,7 +430,7 @@ async fn trellis_s_own_capture_changes_pause_nothing() {
         .apply("TRANSFORM again FROM public.t_own SELECT a AS a")
         .await
         .unwrap();
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
     assert_eq!(trigger_rows(&raw).await, vec![vec![Some("5".to_string())]]);
     for (t, s) in statuses(&raw).await {
@@ -558,7 +448,7 @@ async fn a_stale_generated_body_widens_without_a_pause() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["old".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     // An older generator's body: other text, with a comment whose hash
     // names that text.
@@ -624,7 +514,7 @@ async fn resume_waits_for_the_table_and_rebuilds_after_a_swap() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["sw".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
 
     app.batch_execute("alter table public.t_sw rename to t_sw_away")
@@ -665,7 +555,7 @@ async fn resume_waits_for_the_table_and_rebuilds_after_a_swap() {
             .await
             .unwrap_or_else(|e| panic!("{target}: {e}"));
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(
         rows(
             &raw,
@@ -720,7 +610,7 @@ async fn a_real_dump_and_restore_pauses_everything() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["rr".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
     let dump = cluster.root().join("whole.dump");
     let run = |command: &mut Command| {
@@ -795,7 +685,7 @@ async fn detect_capture_disruptions_pauses_readers_without_a_pass() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["dd".to_string(), "ok".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
 
     assert_eq!(
@@ -860,7 +750,7 @@ async fn an_operator_resume_repairs_a_disruption_seen_while_paused() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["op".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
 
     for target in ["r_op", "s_op"] {
@@ -894,7 +784,7 @@ async fn an_operator_resume_repairs_a_disruption_seen_while_paused() {
             .await
             .unwrap_or_else(|e| panic!("{target}: {e}"));
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(
         rows(&raw, "select a::text, b::text from public.r_op order by 1").await,
         rows(&raw, "select a::text, b::text from public.t_op order by 1").await
@@ -916,7 +806,7 @@ async fn a_pause_committing_meanwhile_is_never_recorded_as_a_disruption() {
     let mut raw = connect(db.dsn()).await;
     let trellis = definer(db.dsn()).await;
     create_case_tables(&raw, &trellis, &["race".to_string()]).await;
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
     app.batch_execute(
         "alter table public.t_race disable trigger all; \
@@ -1029,7 +919,7 @@ async fn a_definition_made_after_the_table_was_replaced_is_not_a_disruption() {
         .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
         .await
         .unwrap();
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(record_counts(&raw, "public.t_fg").await.0, 5);
 
     for text in ["PAUSE TRANSFORM r_fg", "DROP TRANSFORM r_fg"] {
@@ -1047,7 +937,7 @@ async fn a_definition_made_after_the_table_was_replaced_is_not_a_disruption() {
         .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
         .await
         .unwrap();
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(
         rows(&raw, "select a::text, b::text from public.r_fg order by a").await,
         rows(&raw, "select a::text, b::text from public.t_fg order by a").await
@@ -1071,7 +961,7 @@ async fn a_paused_reader_keeps_the_record_so_a_replaced_table_still_pauses() {
     ] {
         trellis.apply(text).await.unwrap();
     }
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
 
     trellis.apply("PAUSE TRANSFORM s_fg").await.unwrap();
     for text in ["PAUSE TRANSFORM r_fg", "DROP TRANSFORM r_fg"] {
@@ -1113,7 +1003,7 @@ async fn a_definition_made_again_on_the_same_table_before_a_pass_is_not_paused()
         .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
         .await
         .unwrap();
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     for text in ["PAUSE TRANSFORM r_fg", "DROP TRANSFORM r_fg"] {
         trellis.apply(text).await.expect(text);
     }
@@ -1127,7 +1017,7 @@ async fn a_definition_made_again_on_the_same_table_before_a_pass_is_not_paused()
         .apply("TRANSFORM r_fg FROM public.t_fg SELECT a AS a, b AS b")
         .await
         .unwrap();
-    bring_live(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
     assert_eq!(
         rows(&raw, "select a::text, b::text from public.r_fg order by a").await,
         rows(&raw, "select a::text, b::text from public.t_fg order by a").await
