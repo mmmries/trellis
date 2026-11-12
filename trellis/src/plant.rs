@@ -138,6 +138,60 @@ pub enum Plant {
     /// Pinned by `group_basis_rebuild`'s
     /// `a_page_that_commits_between_the_enumeration_and_the_locks`.
     GbBuildSnapshotBeforeLocks,
+    /// Research prototype (#1917 X6, candidate A): the zero-group GC
+    /// (`staging::retire`'s `collect_zero_groups`) collects a plain
+    /// aggregate's zero groups while its definition is under a build. A
+    /// fresh build's step 1 (`staging::group_basis`'s `write_once`) inserts
+    /// an absent group from its snapshot `S1`; a zero row a page made from
+    /// a change `S1` saw and one it didn't, collected before step 1 reaches
+    /// the group, lets step 1 count the first again and lose the second.
+    ///
+    /// Pinned by `group_basis_write_once_gc`'s
+    /// `the_zero_group_gc_must_skip_a_definition_under_a_fresh_build`.
+    AbGcIgnoresBuild,
+    /// Research prototype (#1917 X6, candidate A): a fresh build's step 1
+    /// enumerates no hidden row. A group a page created before `S1` whose
+    /// source rows are gone by `S1` (its change drained) is then neither
+    /// locked nor rewritten, and keeps the partials of the source rows that
+    /// predate capture.
+    ///
+    /// Pinned by `group_basis_write_once`'s
+    /// `a_vacated_group_drained_before_step_one_is_zeroed`.
+    AbEnumNoHidden,
+    /// Research prototype (#1917 X6, candidate A): a fresh build's step 1
+    /// enumerates no visible target row. A resume's target row whose group
+    /// has no source row, no hidden row and no undrained change is left in
+    /// the target.
+    ///
+    /// Pinned by `group_basis_write_once`'s
+    /// `a_resume_removes_a_target_row_only_the_target_names`.
+    AbEnumNoTarget,
+    /// Research prototype (#1917 X6, candidate A): a fresh build's step 1
+    /// enumerates no old image of an undrained change. A group whose last
+    /// source row was deleted before `S1`, its change undrained, is not
+    /// written; the delete's page later lands on a fresh row with no basis
+    /// and drives it negative.
+    ///
+    /// Pinned by `group_basis_write_once`'s
+    /// `a_group_vacated_by_an_undrained_change_is_zeroed`.
+    AbEnumNoRing,
+    /// Research prototype (#1917 X6, candidate A): step 2 rewrites the
+    /// stragglers from step 1's own `GROUP BY` and snapshot `S1`, not from a
+    /// snapshot taken after step 1. A page that created a straggler's row
+    /// after `S1`, applying a change `S1` didn't see, has it overwritten.
+    ///
+    /// Pinned by `group_basis_write_once`'s
+    /// `a_page_creates_a_group_inside_step_one_probe`.
+    AbStragglersFromS1,
+    /// Research prototype (#1917 X4/X6, candidate A per leaf): a leaf's
+    /// step 1 enumerates the hidden rows, visible rows and old images of
+    /// every group, not only those its scope routes to the leaf. Another
+    /// leaf's group with a hidden row is locked as a straggler and step 2
+    /// rewrites it from this leaf's `GROUP BY`, which has none of its rows.
+    ///
+    /// Pinned by `partition_group_basis_write_once`'s
+    /// `a_leaf_build_leaves_another_leafs_groups_alone`.
+    AbLeafUnrouted,
     /// ADR-0019 JR1: a `JOIN` page takes no `J` lock on its keys
     /// (`staging::join`'s `write_locked` inserts only the missing `J` rows).
     /// Two pages that change one key from opposite sides without sharing a
@@ -738,6 +792,12 @@ impl Plant {
         Plant::GbFoldSidesPerKey,
         Plant::GbEarlyZeroGc,
         Plant::GbBuildSnapshotBeforeLocks,
+        Plant::AbGcIgnoresBuild,
+        Plant::AbEnumNoHidden,
+        Plant::AbEnumNoTarget,
+        Plant::AbEnumNoRing,
+        Plant::AbStragglersFromS1,
+        Plant::AbLeafUnrouted,
         Plant::JoinNoJLock,
         Plant::JoinOtherSideBeforeJ,
         Plant::JoinDropFlip,
@@ -810,6 +870,12 @@ impl Plant {
             Plant::GbFoldSidesPerKey => "gb_fold_sides_per_key",
             Plant::GbEarlyZeroGc => "gb_early_zero_gc",
             Plant::GbBuildSnapshotBeforeLocks => "gb_build_snapshot_before_locks",
+            Plant::AbGcIgnoresBuild => "ab_gc_ignores_build",
+            Plant::AbEnumNoHidden => "ab_enum_no_hidden",
+            Plant::AbEnumNoTarget => "ab_enum_no_target",
+            Plant::AbEnumNoRing => "ab_enum_no_ring",
+            Plant::AbStragglersFromS1 => "ab_stragglers_from_s1",
+            Plant::AbLeafUnrouted => "ab_leaf_unrouted",
             Plant::JoinNoJLock => "join_no_j_lock",
             Plant::JoinOtherSideBeforeJ => "join_other_side_before_j",
             Plant::JoinDropFlip => "join_drop_flip",

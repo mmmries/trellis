@@ -504,6 +504,11 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
             if *aggregate {
                 match txn.query_opt(NOT_BUILDING_SQL, &[definition_id]).await {
                     Ok(Some(_)) => {}
+                    // Planted bug `ab_gc_ignores_build`: collect under a
+                    // build too. See `crate::plant`.
+                    #[cfg(any(test, feature = "test-util"))]
+                    Ok(None)
+                        if crate::plant::fires(crate::plant::Plant::AbGcIgnoresBuild, true) => {}
                     Ok(None) => break,
                     Err(err) if is_lock_not_available(&err) => break,
                     Err(err) => return Err(err.into()),

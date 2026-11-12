@@ -3706,6 +3706,22 @@ impl GroupTargetPlan {
         source: &str,
         own: bool,
     ) -> String {
+        self.enumeration_branches(scope, source, own)
+            .into_iter()
+            .map(|(_, branch)| branch)
+            .collect::<Vec<_>>()
+            .join(" union all ")
+    }
+
+    /// The `select`s [`Self::rebuild_groups_select_with`] unites, each named
+    /// by what it reads: `hidden`, `target`, `own` (the source's or leaf's
+    /// rows) and `ring` (the old images).
+    fn enumeration_branches(
+        &self,
+        scope: Option<&RebuildScope>,
+        source: &str,
+        own: bool,
+    ) -> Vec<(&'static str, String)> {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let (hidden_filter, target_filter, image_filter) = match scope {
             Some(scope) => (
@@ -3743,44 +3759,55 @@ impl GroupTargetPlan {
                 (false, false) => format!("{filter}{}", self.stage_filter),
             }
         };
+        let mut branches = vec![(
+            "hidden",
+            format!("select {cols} from {} h{hidden_filter}", self.hidden_ident),
+        )];
+        // A `JOIN` side's cells have no visible target of their own.
+        if !matches!(self.writer, Writer::JoinPartials { .. }) {
+            branches.push((
+                "target",
+                format!(
+                    "select {} from {} t{target_filter}",
+                    self.target_group_values(),
+                    self.target_ident
+                ),
+            ));
+        }
         // A leaf's own rows; the whole source for an unpartitioned rebuild;
         // none for the remainder, whose groups have no row of their own.
         let own = match scope {
-            _ if !own => String::new(),
-            None => format!(
-                " union all select distinct {values} from {src} s{filter}",
+            _ if !own => None,
+            None => Some(format!(
+                "select distinct {values} from {src} s{filter}",
                 values = self.group_values().join(", "),
                 src = self.source_row,
                 filter = staged(""),
-            ),
+            )),
             Some(RebuildScope {
                 node: Some(node), ..
-            }) => format!(
-                " union all select distinct {values} from {node} s{filter}",
+            }) => Some(format!(
+                "select distinct {values} from {node} s{filter}",
                 values = self.group_values().join(", "),
                 filter = staged(""),
-            ),
-            Some(_) => String::new(),
+            )),
+            Some(_) => None,
         };
-        let image_filter = staged(&image_filter);
-        // A `JOIN` side's cells have no visible target of their own.
-        let target_branch = match self.writer {
-            Writer::JoinPartials { .. } => String::new(),
-            _ => format!(
-                " union all select {} from {} t{target_filter}",
-                self.target_group_values(),
-                self.target_ident
-            ),
-        };
-        format!(
-            "select {cols} from {hidden} h{hidden_filter}{target_branch}{own} \
-             union all select {values} from ({images}) as r \
+        if let Some(own) = own {
+            branches.push(("own", own));
+        }
+        branches.push((
+            "ring",
+            format!(
+                "select {values} from ({images}) as r \
                  cross join lateral jsonb_populate_record(null::{src}, r.__i) as s{image_filter}",
-            hidden = self.hidden_ident,
-            values = self.group_values().join(", "),
-            src = self.source_row,
-            images = images.join(" union all "),
-        )
+                values = self.group_values().join(", "),
+                src = self.source_row,
+                images = images.join(" union all "),
+                image_filter = staged(&image_filter),
+            ),
+        ));
+        branches
     }
 
     /// A rebuild's write ([`rebuild`], R1, R5): over the groups of
@@ -3870,7 +3897,18 @@ impl GroupTargetPlan {
     /// didn't return (all now locked) goes to [`Self::recomputed`]: the
     /// stragglers, which step 2 rewrites from a later snapshot. `$1` is the
     /// ring's name for the source.
-    fn write_once_sql(&self, image_columns: Option<&[String]>) -> String {
+    ///
+    /// With `leaf` (#1917 X4: a leaf of a tree as recorded), the `GROUP BY`
+    /// reads the leaf and the enumeration names only the groups the leaf's
+    /// predicates route to it; the caller runs it under
+    /// [`write_once_settings`]. `s1_keep` is planted bug
+    /// `ab_stragglers_from_s1`'s table (`crate::plant`).
+    fn write_once_sql(
+        &self,
+        image_columns: Option<&[String]>,
+        leaf: Option<&RebuildScope>,
+        s1_keep: Option<&str>,
+    ) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let extremes = self.shape.extremes();
@@ -3919,9 +3957,49 @@ impl GroupTargetPlan {
             returning.push(format!("u.{} as {}", x.column(), x.named("__n")));
         }
         let c_order: Vec<String> = cols.iter().map(|col| format!("c.{col}")).collect();
+        let from = leaf
+            .and_then(|leaf| leaf.node.as_deref())
+            .unwrap_or(&self.source_row);
+        // Planted bugs `ab_enum_no_hidden`, `ab_enum_no_target`,
+        // `ab_enum_no_ring` (one branch of the enumeration left out) and
+        // `ab_leaf_unrouted` (a leaf's enumeration not routed to the leaf).
+        // See `crate::plant`.
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+        let mut routed = leaf;
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(crate::plant::Plant::AbLeafUnrouted, leaf.is_some()) {
+            routed = None;
+        }
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+        let mut branches = self.enumeration_branches(routed, "$1", false);
+        #[cfg(any(test, feature = "test-util"))]
+        branches.retain(|(name, _)| {
+            use crate::plant::{Plant, fires};
+            !match *name {
+                "hidden" => fires(Plant::AbEnumNoHidden, true),
+                "target" => fires(Plant::AbEnumNoTarget, true),
+                "ring" => fires(Plant::AbEnumNoRing, true),
+                _ => false,
+            }
+        });
+        let enumeration = if branches.is_empty() {
+            format!("select {col_list} from {} h where false", self.hidden_ident)
+        } else {
+            branches
+                .into_iter()
+                .map(|(_, branch)| branch)
+                .collect::<Vec<_>>()
+                .join(" union all ")
+        };
+        let keep = match s1_keep {
+            Some(keep) => format!(
+                "kept as (insert into {keep} select snap.*, a.* from snap left join a on true), "
+            ),
+            None => String::new(),
+        };
         format!(
             "with snap as materialized ({SNAPSHOT_AND_STAMP}), \
-             a as ({fresh}), \
+             a as ({fresh}), {keep}\
              e as (select distinct {col_list} from ({enumeration}) as e0), \
              c as (select {c_cols} from a full join e on {ae}), \
              up as ( \
@@ -3936,8 +4014,7 @@ impl GroupTargetPlan {
                  select {c_order} from c where not exists (select from up where {uc}) \
              ), \
              {tail}",
-            fresh = self.fresh_select(&self.group_values(), &self.source_row, false),
-            enumeration = self.rebuild_groups_select_with(None, "$1", false),
+            fresh = self.fresh_select(&self.group_values(), from, false),
             c_cols = c_cols.join(", "),
             ae = self.group_match("a", "e"),
             hidden = self.hidden_ident,
@@ -3957,12 +4034,13 @@ impl GroupTargetPlan {
     /// this one statement's snapshot (one row of `NULL`s past the snapshot
     /// when the source is empty).
     #[cfg(any(test, feature = "test-util"))]
-    fn planted_early_read_sql(&self, early: &str) -> String {
+    fn planted_early_read_sql(&self, early: &str, from: &str, no_data: bool) -> String {
         format!(
             "create temporary table {early} on commit drop as \
              with snap as materialized ({SNAPSHOT_AND_STAMP}) \
-             select snap.*, a.* from snap left join ({fresh}) as a on true",
-            fresh = self.fresh_select(&self.group_values(), &self.source_row, false),
+             select snap.*, a.* from snap left join ({fresh}) as a on true{data}",
+            fresh = self.fresh_select(&self.group_values(), from, false),
+            data = if no_data { " with no data" } else { "" },
         )
     }
 
@@ -5144,7 +5222,26 @@ pub(crate) async fn rebuild(
     // Research prototype (#1917 X3): a fresh build or resume of a plain
     // aggregate over an unpartitioned source writes each group once.
     if fresh && scope.is_none() && matches!(plan.writer, Writer::Aggregate) {
-        return write_once(txn, plan, mutations).await;
+        return write_once(txn, plan, None, mutations).await;
+    }
+    // Research prototype (#1917 X4): a fresh build's or a resume's leaf of a
+    // tree as recorded writes each group once too, its step 1 under the
+    // pinned settings with the session's path after them
+    // ([`write_once_settings`]); a leaf read through the root, the
+    // remainder and a session whose settings aren't the pool's stay on the
+    // three statements below.
+    if fresh
+        && matches!(plan.writer, Writer::Aggregate)
+        && let Some(
+            leaf @ RebuildScope {
+                node: Some(_),
+                read_node: true,
+                ..
+            },
+        ) = scope
+        && session_is_pinned(txn).await?
+    {
+        return write_once(txn, plan, Some(leaf), mutations).await;
     }
     let session = if scope.is_some() {
         Some(pin_settings(txn).await?)
@@ -5161,7 +5258,7 @@ pub(crate) async fn rebuild(
         let early = "pg_temp.trellis_planted_early_read".to_string();
         txn.batch_execute(&format!(
             "drop table if exists {early}; {}",
-            plan.planted_early_read_sql(&early)
+            plan.planted_early_read_sql(&early, &plan.source_row, false)
         ))
         .await?;
         Some(early)
@@ -5215,22 +5312,69 @@ pub(crate) async fn rebuild(
 /// index probe of the source each; more read the source by one `GROUP BY`.
 const STRAGGLER_PROBE_MAX: i64 = 10_000;
 
+/// Research prototype (#1917 X4): whether the session's `DateStyle` and
+/// `TimeZone` are the pinned ones (`crate::capture::partitions::pinned_settings`).
+/// Every Trellis connection pins them to these values
+/// (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`), so a leaf's step 1 can
+/// run its `GROUP BY` and its routing under one set of settings.
+async fn session_is_pinned(txn: &Transaction<'_>) -> Result<bool, ApplyError> {
+    Ok(txn
+        .query_one(
+            "select current_setting('datestyle') = 'ISO, YMD' \
+                    and current_setting('timezone') = 'UTC'",
+            &[],
+        )
+        .await?
+        .get(0))
+}
+
+/// Research prototype (#1917 X4): sets a leaf's step 1's settings, for the
+/// rest of the transaction or until [`restore_settings`], and returns what to
+/// restore: [`pin_settings`], then `search_path` = `pg_catalog, pg_temp`
+/// followed by the session's own path.
+///
+/// One statement has one set of settings, and a leaf's step 1 holds both the
+/// scope's routing (which must mean what it means under the pinned
+/// settings) and the source's `GROUP BY` and Trellis's own tables (which
+/// must mean what they mean under the session's). The two sets agree on
+/// both: `DateStyle` and `TimeZone` are equal ([`session_is_pinned`]), and
+/// the path lists the pinned path first, so every name the pinned path
+/// resolves resolves the same, while the session's schema, listed last,
+/// adds only names the pinned path doesn't have (Trellis's catalog tables,
+/// unqualified). The session's own path (`crate::pool::search_path_sql`)
+/// searches `pg_temp` and `pg_catalog` first too, in the other order for
+/// relations and types, which only a temporary relation named like a
+/// built-in type would tell apart; Trellis creates none.
+async fn write_once_settings(txn: &Transaction<'_>) -> Result<[String; 4], ApplyError> {
+    let saved = pin_settings(txn).await?;
+    txn.execute(
+        "select set_config('search_path', 'pg_catalog, pg_temp, ' || $1, true)",
+        &[&saved[0]],
+    )
+    .await?;
+    Ok(saved)
+}
+
 /// Research prototype (#1917 X3, candidate A): a fresh build's (or a
-/// resume's) absolute write of every group of an unpartitioned source, in
-/// the caller's `READ COMMITTED` transaction. The caller's definition is
-/// under a build (`backfilling`) from before step 1's snapshot to the
-/// commit, so the zero-group GC (`super::retire`) removes none of its
-/// hidden rows in that span.
+/// resume's) absolute write of every group of an unpartitioned source, or
+/// (X4) of one leaf's groups (`leaf`: a leaf of a tree as recorded), in the
+/// caller's `READ COMMITTED` transaction. The caller's definition is under a
+/// build (`backfilling`) from before step 1's snapshot to the commit, so the
+/// zero-group GC (`super::retire`) removes none of its hidden rows in that
+/// span.
 ///
 /// 1. One statement ([`GroupTargetPlan::write_once_sql`]): snapshot `S1`,
-///    `GROUP BY`, enumeration, and a key-ordered insert that writes every
-///    absent group once and locks every present one; the visible rows of
-///    the written groups; the stragglers (enumerated, not written) into
-///    [`GroupTargetPlan::recomputed`].
+///    `GROUP BY` (of the leaf), enumeration (routed to the leaf), and a
+///    key-ordered insert that writes every absent group once and locks
+///    every present one; the visible rows of the written groups; the
+///    stragglers (enumerated, not written) into
+///    [`GroupTargetPlan::recomputed`]. A leaf's runs under
+///    [`write_once_settings`].
 /// 2. If there are stragglers: [`GroupTargetPlan::rebuild_sql`] over them,
 ///    already locked, from its own snapshot, reading the source by one
 ///    index probe per group when they are few and the source has an index
-///    led by a group column, else by one `GROUP BY`.
+///    led by a group column, else by one `GROUP BY` of the source (of the
+///    leaf).
 ///
 /// Test-only pause points: [`PausePoint::AfterRebuildEnumerate`] fires
 /// before step 1 (nothing is locked, and nothing is enumerated yet);
@@ -5242,8 +5386,11 @@ const STRAGGLER_PROBE_MAX: i64 = 10_000;
 async fn write_once(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
+    leaf: Option<&RebuildScope>,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
+    let node = leaf.and_then(|leaf| leaf.node.as_deref());
+    let from = node.unwrap_or(&plan.source_row);
     // Planted bug `gb_build_snapshot_before_locks`: here, the stragglers
     // rewritten from a snapshot taken before step 1. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -5251,13 +5398,32 @@ async fn write_once(
         let early = "pg_temp.trellis_planted_early_read".to_string();
         txn.batch_execute(&format!(
             "drop table if exists {early}; {}",
-            plan.planted_early_read_sql(&early)
+            plan.planted_early_read_sql(&early, from, false)
         ))
         .await?;
         Some(early)
     } else {
         None
     };
+    // Planted bug `ab_stragglers_from_s1`: step 1 also keeps its own
+    // `GROUP BY` and snapshot, and step 2 rewrites the stragglers from them.
+    // See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let s1_keep = if early.is_none()
+        && crate::plant::armed() == Some(crate::plant::Plant::AbStragglersFromS1)
+    {
+        let keep = "pg_temp.trellis_planted_s1_read".to_string();
+        txn.batch_execute(&format!(
+            "drop table if exists {keep}; {}",
+            plan.planted_early_read_sql(&keep, from, true)
+        ))
+        .await?;
+        Some(keep)
+    } else {
+        None
+    };
+    #[cfg(not(any(test, feature = "test-util")))]
+    let s1_keep: Option<String> = None;
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
         txn,
@@ -5266,12 +5432,23 @@ async fn write_once(
     )
     .await?;
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
-    let rows = txn
-        .query(
-            &plan.write_once_sql(image_columns.as_deref()),
-            &[&plan.source],
-        )
-        .await?;
+    let saved = match leaf {
+        Some(_) => Some(write_once_settings(txn).await?),
+        None => None,
+    };
+    let sql = plan.write_once_sql(image_columns.as_deref(), leaf, s1_keep.as_deref());
+    // `$1` names the source in the ring branch, which a planted bug may
+    // leave out (`ab_enum_no_ring`).
+    let source: &(dyn tokio_postgres::types::ToSql + Sync) = &plan.source;
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = if sql.contains("$1") {
+        std::slice::from_ref(&source)
+    } else {
+        &[]
+    };
+    let rows = txn.query(&sql, params).await?;
+    if let Some(saved) = saved {
+        restore_settings(txn, &saved).await?;
+    }
     let (_, mut written, mut deleted) = written_groups(plan, rows, mutations);
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -5298,13 +5475,21 @@ async fn write_once(
             )
             .await?
             .get(0);
-    let read = if indexed {
-        RebuildRead::Probe
-    } else {
-        RebuildRead::Source
+    let read = match (indexed, node) {
+        (true, _) => RebuildRead::Probe,
+        (false, Some(node)) => RebuildRead::Node(node.to_string()),
+        (false, None) => RebuildRead::Source,
     };
     #[cfg(any(test, feature = "test-util"))]
-    let read = early.map_or(read, RebuildRead::Early);
+    let read = match (early, s1_keep) {
+        (Some(early), _) => RebuildRead::Early(early),
+        (None, Some(keep))
+            if crate::plant::fires(crate::plant::Plant::AbStragglersFromS1, true) =>
+        {
+            RebuildRead::Early(keep)
+        }
+        _ => read,
+    };
     let rows = txn
         .query(&plan.rebuild_sql(image_columns.as_deref(), &read), &[])
         .await?;

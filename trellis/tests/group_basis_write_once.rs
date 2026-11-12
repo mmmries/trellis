@@ -273,3 +273,116 @@ async fn pages_before_step_one_make_stragglers() {
     assert_eq!(partials(&d, Some(2)).await, ["(1,1,6,t)"]);
     assert_oracle(&mut d).await;
 }
+
+// --- #1917 X6: pins of A's own enumeration rules ---------------------------
+
+/// Group 2's last row deleted before the build, its change still undrained
+/// at `S1`: only the ring's old image names the group. Step 1 inserts it
+/// at zero with basis `S1`, and the delete's page, drained after the build,
+/// is refused. Without the ring branch (`ab_enum_no_ring`) the page lands
+/// on a fresh row with no basis and drives it negative.
+#[tokio::test]
+async fn a_group_vacated_by_an_undrained_change_is_zeroed() {
+    let mut d = seeded("(1, 1, 10), (2, 2, 5)", true).await;
+    d.write("delete from public.src where id = 2").await;
+    let undrained = d.seal().await;
+    define(&d).await;
+    build_frozen(&d, &[]).await.finish().await;
+    assert_finished(&d).await;
+    assert_eq!(
+        partials(&d, Some(2)).await,
+        ["(0,0,0,t)"],
+        "named by the old image"
+    );
+    d.drain(undrained, "undrained").await;
+    assert_eq!(partials(&d, Some(2)).await, ["(0,0,0,t)"], "refused");
+    assert_oracle(&mut d).await;
+}
+
+/// Group 2's last row deleted after define and before the build runs, its
+/// page drained (a hidden row on no basis, partials `-1`) and its segment
+/// retired: at `S1` only the hidden table names the group (the target has
+/// no row for it). Step 1 locks it as a straggler and step 2 zeroes it.
+/// Without the hidden branch (`ab_enum_no_hidden`) it keeps the page's `-1`.
+#[tokio::test]
+async fn a_vacated_group_drained_before_step_one_is_zeroed() {
+    let mut d = seeded("(1, 1, 10), (2, 2, 5)", true).await;
+    define(&d).await;
+    d.write("delete from public.src where id = 2").await;
+    let batch = d.seal().await;
+    d.drain(batch, "before").await;
+    // The delete's segment retires once its successor is drained too.
+    let next = d.seal().await;
+    d.drain(next, "next").await;
+    d.retire().await;
+    assert_eq!(
+        d.rows(&format!(
+            "select count(*) from ({}) r where old_image is not null",
+            (0..trellis::staging::append::RING_SIZE)
+                .map(|slot| format!("select old_image from {DEFAULT_SCHEMA}.seg_{slot}"))
+                .collect::<Vec<_>>()
+                .join(" union all ")
+        ))
+        .await,
+        ["(0)"],
+        "no old image is left in the ring"
+    );
+    assert_eq!(partials(&d, Some(2)).await, ["(-1,-1,-5,f)"]);
+    assert_eq!(
+        d.rows("select count(*) from public.agg").await,
+        ["(0)"],
+        "the target names no group"
+    );
+    build_frozen(&d, &[]).await.finish().await;
+    assert_finished(&d).await;
+    assert_eq!(
+        partials(&d, Some(2)).await,
+        ["(0,0,0,t)"],
+        "locked through the hidden branch, zeroed by step 2"
+    );
+    assert_oracle(&mut d).await;
+}
+
+/// A resume keeps the target: a target row no source row, hidden row or
+/// change backs (written by hand while paused) is named only by the
+/// target branch, and step 1's insert of it at zero removes it. Without the
+/// target branch (`ab_enum_no_target`) it stays.
+#[tokio::test]
+async fn a_resume_removes_a_target_row_only_the_target_names() {
+    let mut d = seeded("(1, 1, 10), (2, 2, 5)", true).await;
+    define(&d).await;
+    build_frozen(&d, &[]).await.finish().await;
+    assert_finished(&d).await;
+    let id: i64 = d
+        .ctl
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.agg'",
+            &[],
+        )
+        .await
+        .expect("id")
+        .get(0);
+    d.ctl
+        .batch_execute(
+            "update transform_definitions set status = 'paused' \
+             where target_table = 'public.agg'; \
+             insert into public.agg (g, total, n) values (99, 5, 1)",
+        )
+        .await
+        .expect("pause and write the target");
+    trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect("resume");
+    let pool = d.pool().clone();
+    build::start_ready_builds(&mut d.ctl, &pool, &[id])
+        .await
+        .expect("start the resumed build");
+    build_frozen(&d, &[]).await.finish().await;
+    assert_finished(&d).await;
+    assert_eq!(
+        d.rows("select count(*) from public.agg where g = 99").await,
+        ["(0)"],
+        "the row only the target named is gone"
+    );
+    assert_oracle(&mut d).await;
+}
