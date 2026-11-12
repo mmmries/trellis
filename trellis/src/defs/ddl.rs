@@ -699,49 +699,35 @@ pub(crate) async fn admitted_primary_key(
 }
 
 /// The allowlist entry that admits each of `columns`' types as a key of
-/// `source_table`, in order; refuses the first type it doesn't admit
-/// ([`DdlError::UnsupportedPrimaryKeyType`]). Every key Trellis keys a
-/// table by passes it: a primary key's and a declared `KEY`'s
+/// `source_table`, in order ([`super::join_key_types::key_entry`] over
+/// one [`super::live_table::LiveTable::read`]); refuses the first type it
+/// doesn't admit ([`DdlError::UnsupportedPrimaryKeyType`]). Every key
+/// Trellis keys a table by passes it: a primary key's and a declared `KEY`'s
 /// (`super::source_key::admitted_key`).
 pub(crate) async fn admit_key_types(
     client: &impl GenericClient,
     source_table: &str,
     columns: &[PrimaryKeyColumn],
 ) -> Result<Vec<super::join_key_types::JoinKey>, DdlError> {
-    let mut admitted_by = Vec::with_capacity(columns.len());
-    for column in columns {
-        // A live enum type joins the static allowlist above, as a `JOIN`
-        // key's does — see `join_key_types::JoinKey::Enum`'s own doc comment
-        // for why admitting it is safe.
-        if let Some(entry) =
-            super::join_key_types::admit_primary_key_type(client, &column.data_type).await?
-        {
-            admitted_by.push(entry);
-        } else {
-            // The message names a `pg_catalog` type as the source declares
-            // it, with its modifier (a copy of it has none), and any other
-            // type by the copy's qualified name: a domain named `"integer"`
-            // is not `integer`, and `format_type` can render it bare.
-            let declared: Option<String> = client
-                .query_opt(
-                    "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
-                     from pg_catalog.pg_attribute a \
-                     join pg_catalog.pg_type t on t.oid = a.atttypid \
-                     where a.attrelid = pg_catalog.to_regclass($1) and a.attname = $2 \
-                       and a.attnum > 0 and not a.attisdropped \
-                       and t.typnamespace = 'pg_catalog'::pg_catalog.regnamespace",
-                    &[&regclass_arg(source_table), &column.name],
-                )
-                .await?
-                .map(|row| row.get(0));
-            return Err(DdlError::UnsupportedPrimaryKeyType {
+    let live = super::live_table::LiveTable::read(client, source_table).await?;
+    columns
+        .iter()
+        .map(|column| {
+            let live = live.columns.get(&column.name);
+            live.and_then(|live| {
+                super::join_key_types::key_entry(live.info.type_oid, live.info.is_enum)
+            })
+            .ok_or_else(|| DdlError::UnsupportedPrimaryKeyType {
                 source_table: source_table.to_string(),
                 column: column.name.clone(),
-                pg_type: declared.unwrap_or_else(|| column.data_type.clone()),
-            });
-        }
-    }
-    Ok(admitted_by)
+                // A user type by its qualified name: a domain named
+                // `"integer"` is not `integer`.
+                pg_type: live
+                    .map_or(column.data_type.as_str(), |live| live.qualified_display())
+                    .to_string(),
+            })
+        })
+        .collect()
 }
 
 /// The catalog half of [`source_primary_key_in_txn`], with none of its
@@ -1602,8 +1588,8 @@ pub(crate) async fn field_column_pg_types(
         .map(|field| {
             let pg_type = match passthroughs
                 .get(field.name.as_str())
-                .and_then(|col| source_columns_live.column(col))
-                .map(|column| &column.info.copy_type)
+                .and_then(|col| source_columns_live.info(col))
+                .map(|info| &info.copy_type)
             {
                 Some(concrete) => concrete.clone(),
                 None => pg_type_name(
@@ -2209,7 +2195,8 @@ mod tests {
             .expect("definition_keys");
         let collations = ["default", "C", "POSIX", "und-x-icu"];
         let mut ddl = String::from(
-            "create table public.l (__from_key text collate \"C\" primary key); \
+            "create table public.transform_definitions (target_table text); \
+             create table public.l (__from_key text collate \"C\" primary key); \
              insert into public.l values ('a' || chr(31) || 'x'), ('B' || chr(31) || 'y'); ",
         );
         for (i, a) in collations.iter().enumerate() {

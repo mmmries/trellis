@@ -117,11 +117,6 @@ mod tests {
             "`type_sql` itself, with no modifier",
         ),
         (
-            "defs/ddl.rs",
-            1,
-            "the type a refused primary key column declares, for the message",
-        ),
-        (
             "defs/live_table.rs",
             1,
             "a live column's declared type (`LiveColumn::display`), for the key \

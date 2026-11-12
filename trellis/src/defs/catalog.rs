@@ -105,9 +105,8 @@ use super::model::{Definition, EdgeKind, NodeKind, SchemaNode, StoredStatus, Tra
 use super::parser::parse;
 use super::pg_type::PgType;
 use super::validate::{
-    JoinColumnInfo, KeyColumnRole, NondeterministicCollationTextFunction,
-    NondeterministicKeyCollation, ValidationError, infer_field_types,
-    reject_primary_key_named_fields, validate, validate_qualified_columns,
+    JoinColumnInfo, ValidationError, check_collation_reads, check_key_collations,
+    infer_field_types, reject_primary_key_named_fields, validate, validate_qualified_columns,
 };
 
 /// Why creating or reading a definition failed. [`CatalogError::code`]
@@ -2354,7 +2353,9 @@ pub async fn alter_transform(
     // as at install. Before any DDL, like the rechecks above.
     let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
     let live = LiveTable::read(&*txn, &current.source_table).await?;
-    assert_collation_safe_text_functions(&merged, &current.source_table, &live, Some(&edited))?;
+    check_collation_reads(&merged, Some(&edited), |read| {
+        Some((current.source_table.clone(), live.info(&read.column)?))
+    })?;
     assert_regexp_patterns_accepted(&txn, &merged, Some(&edited)).await?;
 
     for field in &real_drops {
@@ -4744,7 +4745,7 @@ async fn validate_for_define(
 pub(crate) struct JoinSides {
     /// The `FROM` table.
     pub from: String,
-    pub from_columns: HashMap<String, super::validate::JoinColumnInfo>,
+    pub from_columns: HashMap<String, JoinColumnInfo>,
     /// The `FROM` table's virtual generated columns, from the same read.
     pub from_virtual: VirtualColumns,
     /// Every joined table, by position: index 0 is position 1. Never empty.
@@ -4756,7 +4757,7 @@ pub(crate) struct JoinSides {
 pub(crate) struct JoinedSide {
     /// The qualified table.
     pub table: String,
-    pub columns: HashMap<String, super::validate::JoinColumnInfo>,
+    pub columns: HashMap<String, JoinColumnInfo>,
     /// Its virtual generated columns, from the same read.
     pub virtual_columns: VirtualColumns,
 }
@@ -4830,10 +4831,7 @@ impl JoinSides {
     }
 
     /// The live columns of `side`'s table.
-    pub(crate) fn columns(
-        &self,
-        side: super::join::Side,
-    ) -> &HashMap<String, super::validate::JoinColumnInfo> {
+    pub(crate) fn columns(&self, side: super::join::Side) -> &HashMap<String, JoinColumnInfo> {
         match side {
             super::join::Side::From => &self.from_columns,
             super::join::Side::Joined(position) => &self.joined[position.index()].columns,
@@ -4841,9 +4839,7 @@ impl JoinSides {
     }
 
     /// Each joined table's live columns, by position.
-    pub(crate) fn joined_column_maps(
-        &self,
-    ) -> Vec<&HashMap<String, super::validate::JoinColumnInfo>> {
+    pub(crate) fn joined_column_maps(&self) -> Vec<&HashMap<String, JoinColumnInfo>> {
         self.joined.iter().map(|side| &side.columns).collect()
     }
 
@@ -4972,40 +4968,6 @@ async fn qualified_table_exists(
     Ok(exists)
 }
 
-/// Rejects `table.column`, a column the engine matches as a key in the role
-/// `key`, if it has a nondeterministic collation. The key-column twin of
-/// [`assert_deterministic_join_collation`]: a nondeterministic collation's
-/// `=` (and so its `GROUP BY` and unique indexes) treats distinct strings as
-/// equal, while the engine matches keys by their exact text, so Postgres
-/// would fold rows the engine keeps apart. Refused, never reinterpreted
-/// by design.
-///
-/// A column with no collation, or the database default's, always passes:
-/// Postgres has no nondeterministic database default (`CREATE DATABASE`
-/// takes no `deterministic` option, and the `default` collation's
-/// `collisdeterministic` is always true), which is also why a target Trellis
-/// creates can't have a nondeterministic key. The check reads
-/// `collisdeterministic` rather than assuming that, so it would still hold if
-/// Postgres ever allowed one.
-fn assert_deterministic_key_collation(
-    key: KeyColumnRole,
-    table: &str,
-    column: &str,
-    resolved: &JoinColumnInfo,
-) -> Result<(), ValidationError> {
-    if resolved.collation_deterministic {
-        return Ok(());
-    }
-    Err(ValidationError::NondeterministicKeyCollation(Box::new(
-        NondeterministicKeyCollation {
-            key,
-            table: table.to_string(),
-            column: column.to_string(),
-            collation: resolved.collation.clone().unwrap_or_default(),
-        },
-    )))
-}
-
 /// Every check of definition `def` that reads the live schema of the tables
 /// it reads, in the order define runs them once those tables resolve.
 /// `tables` is the source alone (side `None`), or a `JOIN`'s tables, the
@@ -5048,9 +5010,12 @@ pub(crate) async fn validate_live_schema(
             .await
             .map_err(CatalogError::Ddl)?;
         let live = LiveTable::read(txn, table).await?;
-        assert_deterministic_definition_keys(def, table, &live, &key)?;
+        let source_key: Vec<&str> = key.iter().map(|column| column.name.as_str()).collect();
+        check_key_collations(def, table, &source_key, |name| live.info(name))?;
         if plain {
-            assert_collation_safe_text_functions(def, table, &live, None)?;
+            check_collation_reads(def, None, |read| {
+                Some((table.to_string(), live.info(&read.column)?))
+            })?;
             assert_regexp_patterns_accepted(txn, def, None).await?;
         }
         reject_unkeyed_source(txn, table, def).await?;
@@ -5882,48 +5847,6 @@ pub(crate) fn virtual_column_text(table: &str, column: &str, expression: &str) -
     )
 }
 
-/// Refuses a definition if any column the engine matches as one
-/// of its keys has a nondeterministic collation
-/// ([`assert_deterministic_key_collation`]). Those keys are:
-///
-/// - `table`'s row-identity key (`source_key`, which
-///   [`super::source_key::admitted_key`] just resolved): apply keys every
-///   staged change by it, and a 1-1 target mirrors it as its own key;
-/// - an aggregate's `GROUP BY` keys. The target's group key is their exact
-///   text.
-///
-/// Each column is looked up in `live`, `table`'s columns. A column that
-/// isn't there passes: every caller has already resolved it (it came from
-/// the table's own key index, or [`validate`] checked it), and the check
-/// that resolved it owns that error.
-///
-/// The target's own key columns need no check: Trellis creates the target
-/// with no `COLLATE` clause, so they take the database default, which is
-/// always deterministic.
-fn assert_deterministic_definition_keys(
-    def: &TransformDef,
-    table: &str,
-    live: &LiveTable,
-    source_key: &[ddl::PrimaryKeyColumn],
-) -> Result<(), ValidationError> {
-    let source_key = source_key
-        .iter()
-        .map(|column| (KeyColumnRole::SourceKey, column.name.as_str()));
-    let group_by = match &def.key_space {
-        KeySpace::Aggregate { group_by } => group_by.as_slice(),
-        _ => &[],
-    };
-    let group_by = group_by
-        .iter()
-        .map(|column| (KeyColumnRole::GroupBy, column.as_str()));
-    for (role, column) in source_key.chain(group_by) {
-        if let Some(resolved) = live.column(column) {
-            assert_deterministic_key_collation(role, table, column, &resolved.info)?;
-        }
-    }
-    Ok(())
-}
-
 /// Refuses a definition with a `REGEXP_COUNT` pattern literal Postgres
 /// rejects: Postgres alone judges the pattern, since it alone runs it. Each
 /// literal is bound to `select regexp_count('', $1::text)`, under a
@@ -5973,45 +5896,6 @@ pub async fn assert_regexp_patterns_accepted(
                     },
                 );
             }
-        }
-    }
-    Ok(())
-}
-
-/// Refuses a definition whose field `STRPOS`/
-/// `REGEXP_COUNT` reads a column with a nondeterministic collation
-/// ([`super::validate::collation_refusing_function_reads`]). Postgres raises
-/// `0A000` for both under such a collation, while the engine computes them
-/// from the exact text, so the two would disagree. `only_fields`, if given,
-/// limits the check to those fields (`ALTER TRANSFORM`'s added and altered
-/// ones). `live` is `qualified_source`'s columns. A column that doesn't
-/// exist passes, as in [`assert_deterministic_definition_keys`]: `validate`
-/// owns that error.
-fn assert_collation_safe_text_functions(
-    def: &TransformDef,
-    qualified_source: &str,
-    live: &LiveTable,
-    only_fields: Option<&[FieldDef]>,
-) -> Result<(), ValidationError> {
-    for read in super::validate::collation_refusing_function_reads(def) {
-        if let Some(only) = only_fields
-            && !only.iter().any(|field| field.name == read.field)
-        {
-            continue;
-        }
-        let Some(resolved) = live.column(&read.column) else {
-            continue;
-        };
-        if !resolved.info.collation_deterministic {
-            return Err(ValidationError::NondeterministicCollationTextFunction(
-                Box::new(NondeterministicCollationTextFunction {
-                    field: read.field,
-                    function: read.function,
-                    table: qualified_source.to_string(),
-                    column: read.column,
-                    collation: resolved.info.collation.clone().unwrap_or_default(),
-                }),
-            ));
         }
     }
     Ok(())
@@ -8377,91 +8261,6 @@ mod reported_status_tests {
         ]);
         assert_eq!(reported[&2], TransformStatus::Paused);
         assert_eq!(reported[&3], TransformStatus::Backfilling);
-    }
-}
-
-/// The pure key-collation check, over hand-built
-/// columns carrying the collations Postgres reports.
-#[cfg(test)]
-mod key_collation_tests {
-    use super::*;
-
-    fn column() -> JoinColumnInfo {
-        JoinColumnInfo {
-            value_type: ValueType::Text,
-            pg_type: "text".to_string(),
-            type_oid: 25,
-            typmod: -1,
-            collation_oid: 0,
-            collation: None,
-            collation_deterministic: true,
-            is_enum: false,
-            copy_type: "text".to_string(),
-            copy_collation: None,
-            trellis_target: false,
-        }
-    }
-
-    fn collated(mut column: JoinColumnInfo, name: &str) -> JoinColumnInfo {
-        column.collation = Some(name.to_string());
-        column
-    }
-
-    /// A key column with a nondeterministic collation is refused
-    /// in every key role, and the error names the column, its collation and
-    /// the key it belongs to.
-    #[test]
-    fn a_nondeterministic_key_column_is_rejected_naming_column_collation_and_role() {
-        let mut ci = collated(column(), "case_insensitive");
-        ci.collation_deterministic = false;
-        for (key, role) in [
-            (
-                KeyColumnRole::SourceKey,
-                "part of the source's row-identity key",
-            ),
-            (KeyColumnRole::GroupBy, "a GROUP BY key"),
-        ] {
-            let err = assert_deterministic_key_collation(key.clone(), "shop.orders", "code", &ci)
-                .unwrap_err();
-            assert_eq!(
-                err,
-                ValidationError::NondeterministicKeyCollation(Box::new(
-                    NondeterministicKeyCollation {
-                        key,
-                        table: "shop.orders".to_string(),
-                        column: "code".to_string(),
-                        collation: "case_insensitive".to_string(),
-                    }
-                ))
-            );
-            let message = err.to_string();
-            assert!(
-                message.starts_with(&format!("shop.orders.code is {role}, and its collation"))
-                    && message.contains(r#""case_insensitive" is nondeterministic"#),
-                "{message}"
-            );
-        }
-    }
-
-    /// A deterministic collation passes whether it's the default,
-    /// a non-default one (`"C"`), or absent (a type that isn't collatable).
-    #[test]
-    fn a_deterministic_or_absent_key_collation_passes() {
-        for resolved in [
-            collated(column(), "default"),
-            collated(column(), "C"),
-            column(),
-        ] {
-            assert!(
-                assert_deterministic_key_collation(
-                    KeyColumnRole::GroupBy,
-                    "public.t",
-                    "k",
-                    &resolved
-                )
-                .is_ok()
-            );
-        }
     }
 }
 
