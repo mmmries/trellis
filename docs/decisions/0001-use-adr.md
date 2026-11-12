@@ -69,9 +69,10 @@ describes is gone.
 - **Keep caveats and refusals in their reference docs.** Correctness gaps live
   only in [known correctness gaps](../known-correctness-gaps.md), cited by
   title; an ADR has no caveat list or limitations section. Define-time
-  refusals are listed in the
-  [Supported sources and targets](../transforms.md#supported-sources-and-targets)
-  section; an ADR may decide to refuse, and that section is the reference.
+  refusals are listed in the refusal tables of
+  [transforms](../transforms.md#refusals) and
+  [expressions](../expressions.md#refusals); an ADR may decide to refuse, and
+  those tables are the reference.
 
 ## More Information
 

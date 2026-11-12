@@ -237,7 +237,7 @@ shape:
 We ship the stable core first and add operators and functions incrementally,
 driven by community feedback. The bar for admitting one: (a) **semantics
 identical to a stable PostgreSQL 15+ operator/function**; (b) **immutable** per
-[transforms](../transforms.md#calculated-fields); (c) the renderer emits it as the Postgres function of that name.
+[expressions](../expressions.md#immutability); (c) the renderer emits it as the Postgres function of that name.
 Anything volatile, session- or collation-dependent stays out.
 
 Binary operators parse by precedence climbing over a per-operator precedence table
