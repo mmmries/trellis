@@ -244,10 +244,12 @@ holds by construction. A page that locked a key `FOR SHARE` and later upgraded i
 deadlocked against a page doing the same.
 
 The strict form of the `T` write is kept for pages: a nonzero delta for a `T`
-group the writer didn't lock is an error, not a silent insert, so a gap in the
+group the page didn't lock is an error, not a silent insert, so a gap in the
 computed lock set fails loudly instead of losing a delta. A build locks and
-writes `T`'s groups in one sorted upsert, its lock set and its write set the
-same by construction ([ADR-0028](0028-locking-and-writing.md), W3).
+writes `T`'s groups in one sorted upsert, every staged group inserted or added
+to (a zero delta locks its row without rewriting it), so its lock set and its
+write set are the same by construction
+([ADR-0028](0028-locking-and-writing.md#w3-where-a-page-can-write-the-same-rows-the-one-write-is-a-sorted-upsert-and-it-is-the-lock)).
 
 ### `TRUNCATE` of either side excludes writers of both, behind a two-sided barrier
 
@@ -341,10 +343,11 @@ row the collection deletes stays dead at that address, and no other cell's row
 can take it. The enumeration is a `create table as` too, for the same reason as
 the snapshot statement. A cell first seen after the enumeration belongs to its
 pages. It then carries both sides' changes into `T` as the product, as a page
-does. `T`'s groups are locked after the product,
-together with every group of the visible target and of `T`'s hidden table; `T`
-changes only as a delta, and each locked group's visible row is compared with
-the row the target holds. Pages apply from the build's first moment, and a page
+does. `T`'s groups are locked and written after the product, in one sorted
+upsert (ADR-0028, W3), together with every group of the visible target and of
+`T`'s hidden table; `T` changes only as a delta, and each locked group's
+visible row is compared with the row the target holds. Pages apply from the
+build's first moment, and a page
 that names a key the build holds waits for its commit. Readers see the old `T`
 and the old visible rows until then. One `GROUP BY` per structure was 2–12x
 cheaper than chunks in the model (84 s against 412–509 s on a 100M-row fact

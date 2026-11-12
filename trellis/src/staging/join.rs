@@ -119,10 +119,14 @@
 //!    these statements are planned for millions of cells.
 //! 5. `T`: its groups are locked **after** the product, so the set is exactly
 //!    the groups the product reads under `J`, with every group of the visible
-//!    target and of `T`'s hidden table added (R8 one level up). `T` changes
-//!    only as the product's delta; each locked group's visible row is then
-//!    compared with the row the target holds (prior images are the held
-//!    rows), which also removes the row of a group no source row backs.
+//!    target and of `T`'s hidden table added (R8 one level up). One sorted
+//!    upsert locks and writes them (ADR-0028, W3): each group's delta, zero or not, is
+//!    inserted as a new row or added to the row there, so the groups it
+//!    locks are the groups it writes, and a page's strict two-step form and
+//!    its lock-gap check have nothing to catch here. `T` changes only as the
+//!    product's delta; each group's visible row is then compared with the
+//!    row the target holds (prior images are the held rows), which also
+//!    removes the row of a group no source row backs.
 //!
 //! Readers see the old `T` and the old visible rows until the commit. A
 //! `TRUNCATE` page waits for the commit on the lock row and then clears what
@@ -142,8 +146,8 @@
 //! side whole, then each partitioned side's leaves in oid order and its
 //! remainder, each step the shape of [`recompute_routed`] (steps 1 to 4 above
 //! over the region's cells, `T` written as a delta from the partials), then a
-//! final step that locks every group of the visible target and of `T` and
-//! compares each visible row with the row the target holds. The job's cursor
+//! final step that locks every group of the visible target and of `T` (step
+//! 5's upsert, with no delta) and compares each visible row with the row the target holds. The job's cursor
 //! names the last step committed (`super::build::run_join_steps`). Readers
 //! see progressive values until the final step commits.
 //!
@@ -1452,9 +1456,10 @@ async fn write_locked(
     if bulk {
         txn.batch_execute(group_basis::BULK_PLAN_RESET).await?;
     }
-    // 5. `T`: lock the changed groups, sorted, then write them. A build
-    // locks every group of the visible target and of `T` as well, and
-    // compares each visible row with the one the target holds.
+    // 5. `T`: a page locks the changed groups, sorted, then writes them. A
+    // build stages every group of the visible target and of `T` as well,
+    // locks and writes them in one sorted upsert, and compares each visible
+    // row with the one the target holds.
     if build {
         group_basis::enumerate_target_groups(txn, &plan.t).await?;
     }
@@ -1462,20 +1467,24 @@ async fn write_locked(
         group_basis::analyze(txn, &[plan.t.staged()]).await?;
     }
     pause!(txn, BeforeJoinTargetLock, &plan.target);
-    // Planted bug: insert the missing `T` groups and lock none. See
-    // `crate::plant`.
-    #[cfg(any(test, feature = "test-util"))]
-    let t_lock = if crate::plant::fires(crate::plant::Plant::JoinTSkipLock, !build) {
-        plan.t.planted_insert_missing_sql()
+    if build {
+        group_basis::upsert_join_build_groups(txn, &plan.t).await?;
     } else {
-        plan.t.lock_sql()
-    };
-    #[cfg(not(any(test, feature = "test-util")))]
-    let t_lock = plan.t.lock_sql();
-    txn.execute(&t_lock, &[]).await?;
+        // Planted bug: insert the missing `T` groups and lock none. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let t_lock = if crate::plant::fires(crate::plant::Plant::JoinTSkipLock, true) {
+            plan.t.planted_insert_missing_sql()
+        } else {
+            plan.t.lock_sql()
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
+        let t_lock = plan.t.lock_sql();
+        txn.execute(&t_lock, &[]).await?;
+    }
     pause!(txn, AfterJoinTargetLock, &plan.target);
     let (written, removed) = if build {
-        group_basis::apply_join_build_groups(txn, &plan.t, mutations).await?
+        group_basis::compare_join_build_groups(txn, &plan.t, mutations).await?
     } else {
         let (_, written, removed) =
             group_basis::apply_locked_groups(txn, &plan.t, mutations).await?;
@@ -1706,10 +1715,11 @@ pub(crate) async fn recompute_routed(
 ///    the cells' changes into `T`.
 ///    A cell first seen after the enumeration is not locked, so it is not
 ///    written: its pages apply it.
-/// 4. `T`: its groups are locked after the product, so the set is the
-///    product's groups, read from rows held under `J`, plus every group of the
-///    visible target and of `T`'s hidden table (R8 one level up). `T` changes
-///    only as the product's delta; every locked group's visible row is then
+/// 4. `T`: its groups are locked and written after the product, in one
+///    sorted upsert, so the set is the product's groups, read from rows held
+///    under `J`, plus every group of the visible target and of `T`'s hidden
+///    table (R8 one level up). `T` changes only as the product's delta; every
+///    locked group's visible row is then
 ///    compared with the row the target holds, which removes the row of a
 ///    group no source row backs and repairs a row that disagrees with `T`'s
 ///    partials.
@@ -1770,9 +1780,9 @@ pub(crate) async fn build(
                 .await?;
             group_basis::enumerate_target_groups(txn, &plan.t).await?;
             pause!(txn, BeforeJoinTargetLock, &plan.target);
-            txn.execute(&plan.t.lock_sql(), &[]).await?;
+            group_basis::upsert_join_build_groups(txn, &plan.t).await?;
             pause!(txn, AfterJoinTargetLock, &plan.target);
-            group_basis::apply_join_build_groups(txn, &plan.t, &mut mutations).await?
+            group_basis::compare_join_build_groups(txn, &plan.t, &mut mutations).await?
         }
     };
     mutations.flush(txn).await?;
