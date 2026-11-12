@@ -5240,6 +5240,8 @@ pub(crate) async fn rebuild(
             },
         ) = scope
         && session_is_pinned(txn).await?
+        // Research measurement switch (X4): today's path for leaves.
+        && std::env::var_os("TRELLIS_X4_LEAF_TODAY").is_none()
     {
         return write_once(txn, plan, Some(leaf), mutations).await;
     }

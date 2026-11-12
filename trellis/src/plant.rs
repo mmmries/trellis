@@ -989,8 +989,10 @@ pub fn armed() -> Option<Plant> {
 /// is counted in [`fired`].
 pub fn fires(plant: Plant, changes_behavior: bool) -> bool {
     let fires = changes_behavior && armed() == Some(plant);
-    if fires {
-        FIRED.fetch_add(1, Ordering::Relaxed);
+    if fires && FIRED.fetch_add(1, Ordering::Relaxed) == 0 {
+        // Research (#1917 X6): a property run has no sweep line to say a
+        // plant was reached, so the first firing says so on stderr.
+        eprintln!("trellis plant {} fired", plant.name());
     }
     fires
 }
