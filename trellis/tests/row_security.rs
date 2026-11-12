@@ -1618,3 +1618,66 @@ async fn a_revoked_schema_usage_halts_the_readers_of_its_tables() {
     assert_eq!(totals, "1:3,2:2,3:2");
     it.trellis.shutdown().await.expect("shutdown");
 }
+
+/// A page that carries a table the role lost `USAGE` on and a table whose
+/// primary key was redefined: the redefined key still pauses its readers
+/// before the page computes anything for them, as on a page without the
+/// unreachable table, and only the unreachable table's readers halt.
+#[tokio::test]
+async fn a_revoked_schema_usage_leaves_another_tables_redefined_key_checked() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create schema app; grant usage on schema app to rls_trellis; \
+             create table app.o (id int primary key, cid int, amount int); \
+             insert into app.o select i, 1 + i % 3, i from generate_series(1, 6) i; \
+             alter table app.o owner to rls_trellis;",
+        )
+        .await
+        .expect("a source in a schema of its own");
+    for ddl in [
+        "TRANSFORM o_copy FROM app.o SELECT amount AS amount",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+
+    it.admin
+        .batch_execute(
+            "alter table public.c drop constraint c_pkey, add primary key (amount); \
+             revoke usage on schema app from rls_trellis; \
+             insert into app.o values (10, 1, 100); \
+             update public.c set amount = 77 where id = 1",
+        )
+        .await
+        .expect("redefine c's key, revoke, then write both schemas");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the drain pauses c's reader and halts app.o's");
+    let failure = halted(&it.trellis, "o_copy").await;
+    assert!(
+        failure
+            .error
+            .contains("role rls_trellis lacks USAGE on schema app"),
+        "{}",
+        failure.error
+    );
+    let c = status(&it.trellis, "c_copy").await;
+    assert_eq!(c.status, TransformStatus::Paused);
+    let failure = c.capture_failure.expect("the reason is reported");
+    assert_ne!(
+        failure.kind,
+        trellis::CaptureFailureKind::Halt,
+        "{failure:?}"
+    );
+    assert_eq!(failure.source_table, "public.c");
+    assert!(
+        failure.error.contains("primary key") && failure.error.contains("\"amount\""),
+        "{failure:?}"
+    );
+    assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
+    it.trellis.shutdown().await.expect("shutdown");
+}

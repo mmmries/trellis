@@ -5717,12 +5717,23 @@ async fn drain_batch(
     // A primary key redefined since capture was installed pauses
     // the table's readers before this page computes anything for them. A
     // check Postgres refuses (`42501`: the role lost `USAGE` on a source's
-    // schema) is left to the page, whose compute meets the same refusal
-    // and halts the readers of the table the role can't reach.
+    // schema) runs again over the page's other tables, and the tables the
+    // role can't reach are left to the page, whose compute meets the same
+    // refusal and halts their readers.
     let tables: std::collections::BTreeSet<&str> =
         folded.iter().map(|c| c.src_table.as_str()).collect();
     match super::schema_change::pause_readers_of_redefined_keys(pool, &tables).await {
-        Err(err) if quarantine::is_insufficient_privilege(&err) => {}
+        Err(err) if quarantine::is_insufficient_privilege(&err) => {
+            let client = pool.get().await?;
+            let mut reachable = std::collections::BTreeSet::new();
+            for &table in &tables {
+                if super::halt::schemas_usable(&**client, &[table.to_string()]).await? {
+                    reachable.insert(table);
+                }
+            }
+            drop(client);
+            super::schema_change::pause_readers_of_redefined_keys(pool, &reachable).await?;
+        }
         checked => checked?,
     }
 
