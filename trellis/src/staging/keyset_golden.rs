@@ -1,6 +1,6 @@
 //! Golden SQL of the statements that match a batch of keys through the key's
-//! index, one arm per `NULL` pattern (#1870 C), over a single-column, a
-//! two-column and a three-column nullable key.
+//! index, one arm per `NULL` pattern ([`super::keyset`]), over a
+//! single-column, a two-column and a three-column nullable key.
 
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::staging::golden_sql::Golden;
@@ -19,7 +19,7 @@ fn key(columns: &[(&str, &str)]) -> Vec<PrimaryKeyColumn> {
 
 #[test]
 fn keyset_statements_are_unchanged() {
-    let shapes: [(Vec<PrimaryKeyColumn>, Vec<Vec<Option<&str>>>); 3] = [
+    let shapes = [
         (
             key(&[("id", "integer")]),
             vec![vec![Some("1")], vec![Some("2")], vec![None]],
@@ -52,25 +52,10 @@ fn keyset_statements_are_unchanged() {
         golden.add(&format!("{n}: live rows"), &live.docs);
         golden.add(
             &format!("{n}: new images"),
-            &super::target_mutations::new_images_sql("public.tgt", &columns, pk, &keys),
+            &super::target_mutations::new_images_query("public.tgt", &columns, pk, keys.clone())
+                .expect("keys")
+                .sql,
         );
-        if n == 1 {
-            let ident = crate::pool::quote_ident(&pk[0].name);
-            let cast = &pk[0].data_type;
-            golden.add(
-                "1: single lock",
-                &super::apply::single_lock_statement("tgt", &ident, cast, "cols"),
-            );
-            golden.add(
-                "1: single delete",
-                &super::apply::single_delete_statement("tgt", &ident, cast, "ret"),
-            );
-        } else {
-            golden.add(
-                &format!("{n}: composite lock"),
-                &super::apply::composite_lock_statement("tgt", pk, "cols"),
-            );
-        }
         let mut patterns: Vec<Vec<bool>> = parts
             .iter()
             .map(|p| p.iter().map(Option::is_none).collect())
@@ -81,16 +66,10 @@ fn keyset_statements_are_unchanged() {
             let pick = super::build::one_to_one::sweep_pick(pk, pattern);
             golden.add(&format!("{n} {p}: sweep source"), &pick.src_from);
             golden.add(&format!("{n} {p}: sweep target"), &pick.target_where);
-            if pattern.contains(&true) {
-                golden.add(
-                    &format!("{n} {p}: pattern lock"),
-                    &super::apply::null_pattern_lock_statement("tgt", pk, pattern, "cols"),
-                );
-                golden.add(
-                    &format!("{n} {p}: pattern delete"),
-                    &super::apply::null_pattern_delete_statement("tgt", pk, pattern, "ret"),
-                );
-            }
+            let lock = super::apply::lock_statement("tgt", pk, pattern, "cols");
+            golden.add(&format!("{n} {p}: lock"), &lock);
+            let delete = super::apply::delete_statement("tgt", pk, pattern, "ret");
+            golden.add(&format!("{n} {p}: delete"), &delete);
         }
     }
     golden.check("keyset");

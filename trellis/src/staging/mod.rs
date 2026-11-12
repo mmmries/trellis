@@ -73,6 +73,7 @@ pub(crate) mod holdup;
 pub mod interleave;
 pub(crate) mod join;
 pub(crate) mod join_one_to_one;
+mod keyset;
 #[cfg(test)]
 mod keyset_golden;
 #[cfg(any(test, feature = "internals"))]

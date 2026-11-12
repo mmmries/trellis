@@ -45,6 +45,7 @@ use super::claim;
 use super::claim::{HeldShare, held_share};
 use super::error::StagingError;
 use super::fold::{self, FoldedChange, earliest_origin};
+use super::keyset::{Arm, ArmSql, Keyset};
 use super::liveness::FenceMissBackoff;
 use super::one_to_one_ledger;
 use super::quarantine;
@@ -623,9 +624,7 @@ pub(super) async fn record_row_image(
     Ok(rows.first().map(|row| row.get(0)))
 }
 
-/// The live read of a batch of keys' source rows and the arrays it binds:
-/// one [`LiveRowsArm`] per pattern of `NULL` key columns among the batch's
-/// keys.
+/// The live read of a batch of keys' source rows and the arrays it binds.
 pub(super) struct LiveRowsQuery<'a> {
     /// The read split by `jsonb_each_text` into `(k, column, value)` rows,
     /// for the tests of the read's plan.
@@ -635,128 +634,49 @@ pub(super) struct LiveRowsQuery<'a> {
     /// as a text-valued `jsonb` (the Re-derive read,
     /// `super::one_to_one_ledger::read_rows`).
     pub(super) docs: String,
-    arms: Vec<LiveRowsArm<'a>>,
-}
-
-/// The keys of one [`live_rows_query`] whose `pk` is `NULL` in
-/// exactly the same columns, bound as one `union all` arm.
-struct LiveRowsArm<'a> {
-    /// One array per `pk` column that is not `NULL` in this pattern, in
-    /// column order. A `NULL` column binds nothing: the arm matches it with
-    /// `is null`.
-    parts: Vec<Vec<Cow<'a, str>>>,
+    keyset: Keyset<(), Cow<'a, str>>,
 }
 
 impl LiveRowsQuery<'_> {
     /// The bind parameters, in the order `sql` (and `docs`) number them.
     pub(super) fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
-        self.arms
-            .iter()
-            .flat_map(|arm| arm.parts.iter().map(|part| part as &(dyn ToSql + Sync)))
-            .collect()
+        self.keyset.arms.values().flat_map(Arm::params).collect()
     }
 }
 
-/// Builds the live read of a batch of keys: one `union all` arm per
-/// pattern of `NULL` key columns present among `keys`, usually
-/// just one. Each arm joins its keys' non-`NULL` parts as a keyset relation
-/// (one array per such column, so the bind count doesn't grow with the
-/// batch) and matches with [`live_rows_join_cond`], so every arm probes an
-/// index on `pk`. Each matched row is returned as its own recomputed key
-/// text plus one `(column, value)` pair per column, via a `cross join
-/// lateral jsonb_each_text` (so decoding costs no extra round trip).
-///
-/// Matching a whole batch with `is not distinct from` on any column one of
-/// its keys binds a `NULL` for (the naive shape) is correct but not
-/// indexable: one `NULL`-keyed group in a batch turned the refetch into a
-/// nested loop over a sequential scan of the source. This is the same split
-/// `target_mutations::read_new_images` makes.
-///
-/// Every caller runs the statement under `super::ledger::ENTRY_PLAN_SETTINGS`
-/// (no sequential scan), and a single-column key's non-`NULL` arm also
-/// restricts the column to its array (`t.<col> = any(<array>)`), which the
-/// join already implies, so the source's side of whatever join the planner
-/// picks is read through the key's index and bounded by the batch.
-/// It takes both while the source's statistics lag its size (analyzed while
-/// small, grown since), for a page's 5,000 keys:
-///
-/// - Neither: a hash join over a sequential scan of the source, 100 ms at
-///   1.15M rows on PostgreSQL 16 and 17.
-/// - The bound alone: still a sequential scan on PostgreSQL 16, which prices
-///   an index scan for 5,000 values far above 17's estimate: 28 ms at 1.15M rows,
-///   and 41 ms at 2M, where the unbounded join had gone back to probing the
-///   index (23 ms). PostgreSQL 17 reads the index: 10–15 ms.
-/// - No sequential scan alone: a scan of the key's whole index, 31 ms.
-/// - Both: 15–19 ms on PostgreSQL 16, 10–15 ms on 17.
-///
-/// A composite key is never restricted this way ([`bounds_keyset_by_array`]):
-/// one `= any` per column took 1,474 ms against 13 ms for 5,000 keys of a
-/// four-column key at 1M rows with fresh statistics, and 946 ms on a
-/// two-column key at 20M rows. Without a sequential scan to hash, it probes
-/// the key's index once per key whether or not its statistics lag (18 ms on
-/// PostgreSQL 16 for 5,000 keys at 400k rows analyzed at 100, against 70 ms
-/// for the hash join over a sequential scan).
+/// Builds the live read of a batch of keys: one `union all` arm per pattern
+/// of `NULL` key columns among `keys` ([`super::keyset`]), usually just one,
+/// matched by [`ArmSql::bounded_matches`]. Each matched row is returned as its own recomputed key text
+/// and its row as a text-valued `jsonb`. Every caller runs it under
+/// `super::ledger::ENTRY_PLAN_SETTINGS`.
 pub(super) fn live_rows_query<'a>(
     source_table: &str,
     pk: &[PrimaryKeyColumn],
     row_columns: &[String],
     keys: &[&'a str],
 ) -> Result<LiveRowsQuery<'a>, ApplyError> {
-    // `pattern[i]`: key column `i` is NULL.
-    let mut arms: BTreeMap<Vec<bool>, LiveRowsArm<'a>> = BTreeMap::new();
-    for &key in keys {
-        let decoded = ddl::split_pk_key(pk, source_table, key)?;
-        let pattern: Vec<bool> = decoded.iter().map(Option::is_none).collect();
-        let arm = arms
-            .entry(pattern)
-            .or_insert_with_key(|pattern| LiveRowsArm {
-                parts: vec![Vec::new(); pattern.iter().filter(|null| !**null).count()],
-            });
-        for (column, part) in arm.parts.iter_mut().zip(decoded.into_iter().flatten()) {
-            column.push(part);
-        }
-    }
-
+    let keyset: Keyset<(), Cow<'a, str>> = keys
+        .iter()
+        .map(|key| Ok(((), ddl::split_pk_key(pk, source_table, key)?)))
+        .collect::<Result<_, ApplyError>>()?;
     let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
     // An explicit per-column `jsonb_build_object`, not
     // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment for why.
     let doc_expr = row_as_text_jsonb_sql("t", row_columns);
     let source_ident = ddl::qualified_source_table(source_table);
-    let mut next_param = 0;
-    let selects: Vec<String> = arms
-        .keys()
-        .map(|pattern| {
-            let mut arrays = Vec::new();
-            let mut u_cols = Vec::new();
-            let mut bounds = Vec::new();
-            for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
-                if !null {
-                    next_param += 1;
-                    let array = format!("${next_param}::text[]::{}[]", column.data_type);
-                    if bounds_keyset_by_array(pk) {
-                        bounds.push(format!("t.{} = any({array})", quote_ident(&column.name)));
-                    }
-                    arrays.push(array);
-                    u_cols.push(pk_keyset_col(i));
-                }
-            }
-            // An all-`NULL` pattern binds no array at all: its one possible
-            // row is found by `is null` alone.
-            let keyset = if arrays.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " join unnest({}) as u({}) on true",
-                    arrays.join(", "),
-                    u_cols.join(", ")
-                )
-            };
-            let mut cond = vec![live_rows_join_cond(pk, pattern)];
-            cond.extend(bounds);
+    let mut start = 1;
+    let selects: Vec<String> = keyset
+        .arms
+        .iter()
+        .map(|(pattern, arm)| {
+            let sql = ArmSql::new(pk, pattern, "u", start);
+            start += arm.parts.len();
+            let join = sql
+                .relation()
+                .map_or_else(String::new, |keys| format!(" join {keys} on true"));
             format!(
-                "select {k_expr} as k, {doc_expr} as doc from {source_ident} t{keyset} \
-                 where {}",
-                cond.join(" and "),
+                "select {k_expr} as k, {doc_expr} as doc from {source_ident} t{join} where {}",
+                sql.bounded_matches("t"),
             )
         })
         .collect();
@@ -768,30 +688,8 @@ pub(super) fn live_rows_query<'a>(
              cross join lateral jsonb_each_text(m.doc) e"
         ),
         docs,
-        arms: arms.into_values().collect(),
+        keyset,
     })
-}
-
-/// The match for one [`live_rows_query`] arm: a
-/// conjunction over `pk` where column `i` is `t.<col> is null` if
-/// `pattern[i]` (every key in this arm is `NULL` there), else `t.<col> =
-/// u.c<i>`. Never `is not distinct from`: that is not indexable,
-/// and within one arm it is never needed, since a column is either
-/// `NULL` for every key or for none.
-fn live_rows_join_cond(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> String {
-    pk.iter()
-        .zip(pattern)
-        .enumerate()
-        .map(|(i, (column, &null))| {
-            let col = quote_ident(&column.name);
-            if null {
-                format!("t.{col} is null")
-            } else {
-                format!("t.{col} = u.{}", pk_keyset_col(i))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" and ")
 }
 
 /// The live, `attnum`-ordered column names of `table`, from a
@@ -1598,39 +1496,6 @@ mod tests {
         );
     }
 
-    /// Regression pin: [`live_rows_join_cond`] matches a
-    /// column that is `NULL` in the arm's pattern with `is null` (so a
-    /// `NULL`-keyed group's live row is found instead of being mistaken for
-    /// "already deleted") and every other column with the indexable `=` —
-    /// never `is not distinct from`.
-    #[test]
-    fn live_rows_join_cond_matches_a_null_column_with_is_null_and_the_rest_with_eq() {
-        let pk: Vec<PrimaryKeyColumn> = ["warehouse", "sku"]
-            .into_iter()
-            .map(|name| PrimaryKeyColumn {
-                name: name.to_string(),
-                data_type: "integer".to_string(),
-                nullable: true,
-                collation: None,
-            })
-            .collect();
-
-        assert_eq!(
-            live_rows_join_cond(&pk, &[false, false]),
-            r#"t."warehouse" = u.c0 and t."sku" = u.c1"#,
-            "no NULL in the pattern: both columns keep the indexable `=`"
-        );
-        assert_eq!(
-            live_rows_join_cond(&pk, &[true, false]),
-            r#"t."warehouse" is null and t."sku" = u.c1"#,
-            "only the NULL column switches to `is null`, and binds no array"
-        );
-        assert_eq!(
-            live_rows_join_cond(&pk, &[true, true]),
-            r#"t."warehouse" is null and t."sku" is null"#
-        );
-    }
-
     /// A [`live_rows_query`] batch that includes
     /// `NULL`-keyed groups (an aggregate target read as a source) still
     /// probes the table's `UNIQUE NULLS NOT DISTINCT` index, at a
@@ -1699,7 +1564,7 @@ mod tests {
             assert_eq!(keys.len(), 500);
             let query = live_rows_query(table, &pk, &columns, &keys).expect("query");
             assert_eq!(
-                query.arms.len(),
+                query.keyset.arms.len(),
                 patterns,
                 "{table}: one arm per NULL pattern in the batch"
             );
@@ -1943,18 +1808,12 @@ mod tests {
         }
     }
 
-    /// A composite-key 1-1 target's pre-lock
-    /// ([`lock_composite_keys`]) is matched to its keys without comparing
-    /// every target row with every key, and without scanning the target.
-    ///
-    /// - `fresh`: a four-column key at 1M rows with fresh statistics.
-    ///   Bounding each key column by its own `= any` array made the planner
-    ///   expect one row from the target and loop over all 5,000 keys for
-    ///   each of the 5,000 rows it read: 25M comparisons, 2.3 s against
-    ///   25 ms.
-    /// - `stale`: a two-column key analyzed at 100 rows, then grown to 1M
-    ///   with autovacuum off. With sequential scans on, PostgreSQL 16 and 17
-    ///   both hashed the keys against a sequential scan of the target.
+    /// A composite-key 1-1 target's pre-lock ([`lock_rows`]) is matched to
+    /// its keys without comparing every target row with every key, and
+    /// without scanning the target (see [`super::keyset`]): `fresh`, a
+    /// four-column key at 1M rows with fresh statistics, and `stale`, a
+    /// two-column key analyzed at 100 rows, then grown to 1M with autovacuum
+    /// off.
     ///
     /// The plan is explained under the settings the pre-lock runs with, and
     /// the pre-lock itself must start no sequential scan of the target. It
@@ -2019,7 +1878,8 @@ mod tests {
                 .collect();
             let arrays = transpose_pk_parts(pk.len(), &parts);
             let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
-            let sql = composite_lock_statement(table, &pk, &key_sql);
+            let plain = vec![false; pk.len()];
+            let sql = lock_statement(table, &pk, &plain, &key_sql);
             let txn = client.transaction().await.expect("begin");
             let plan: String = crate::staging::ledger::query_by_entry_key(
                 &txn,
@@ -2058,7 +1918,7 @@ mod tests {
                 .expect("scans")
                 .get(0);
             let locked: std::collections::HashSet<String> =
-                lock_composite_keys(&txn, table, &pk, &key_sql, &arrays)
+                lock_rows(&txn, table, &pk, &plain, &key_sql, &params)
                     .await
                     .expect("lock")
                     .into_iter()
@@ -2083,7 +1943,7 @@ mod tests {
     }
 
     /// A single-column-key target's pre-lock
-    /// ([`lock_single_keys`]) starts no sequential scan of the target while
+    /// ([`lock_rows`]) starts no sequential scan of the target while
     /// its statistics lag its size. PostgreSQL 16 priced the index scan for
     /// thousands of `= any` keys so high that it read a 400k-row target
     /// analyzed at 100 in full and filtered it by the keys.
@@ -2120,8 +1980,6 @@ mod tests {
             .await
             .expect("identity");
         assert_eq!(pk.len(), 1);
-        let pk_ident = quote_ident(&pk[0].name);
-        let pk_cast = pk[0].data_type.as_str();
         let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
         let keys: Vec<String> = client
             .query(
@@ -2136,7 +1994,7 @@ mod tests {
         assert_eq!(keys.len(), 5000);
         let mut bound: Vec<&str> = keys.iter().map(String::as_str).collect();
         bound.reverse();
-        let sql = single_lock_statement(table, &pk_ident, pk_cast, &key_sql);
+        let sql = lock_statement(table, &pk, &[false], &key_sql);
         let txn = client.transaction().await.expect("begin");
         let plan: String = crate::staging::ledger::query_by_entry_key(
             &txn,
@@ -2160,13 +2018,12 @@ mod tests {
             .await
             .expect("scans")
             .get(0);
-        let locked: Vec<String> =
-            lock_single_keys(&txn, table, &pk_ident, pk_cast, &key_sql, &bound)
-                .await
-                .expect("lock")
-                .into_iter()
-                .map(|row| row.get(0))
-                .collect();
+        let locked: Vec<String> = lock_rows(&txn, table, &pk, &[false], &key_sql, &[&bound])
+            .await
+            .expect("lock")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
         let after: i64 = txn
             .query_one(seq_scans, &[&table])
             .await
@@ -2187,7 +2044,7 @@ mod tests {
     }
 
     /// The single-column key's delete
-    /// ([`delete_single_keys`]) reads the same stale target by the same
+    /// ([`delete_rows`]) reads the same stale target by the same
     /// keys, so it starts no sequential scan of it either, and still deletes
     /// every key.
     #[tokio::test]
@@ -2218,8 +2075,6 @@ mod tests {
         let pk = ddl::identity_key_columns(&client, table)
             .await
             .expect("identity");
-        let pk_ident = quote_ident(&pk[0].name);
-        let pk_cast = pk[0].data_type.as_str();
         let key_sql = ddl::pk_key_sql_expr(&pk, Some("t"));
         let keys: Vec<String> = client
             .query(
@@ -2233,7 +2088,7 @@ mod tests {
             .collect();
         assert_eq!(keys.len(), 5000);
         let bound: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let sql = single_delete_statement(table, &pk_ident, pk_cast, &key_sql);
+        let sql = delete_statement(table, &pk, &[false], &key_sql);
         let txn = client.transaction().await.expect("begin");
         let plan: String =
             crate::staging::ledger::query_by_entry_key(&txn, &format!("explain {sql}"), &[&bound])
@@ -2255,7 +2110,7 @@ mod tests {
             .expect("scans")
             .get(0);
         let deleted: std::collections::HashSet<String> =
-            delete_single_keys(&txn, table, &pk_ident, pk_cast, &key_sql, &bound)
+            delete_rows(&txn, table, &pk, &[false], &key_sql, &[&bound])
                 .await
                 .expect("delete")
                 .into_iter()
@@ -3502,307 +3357,13 @@ pub(super) fn decode_target_pk_parts(
         .collect())
 }
 
-/// `c0`, `c1`, … — collision-free column aliases for a keyset `unnest(...)`
-/// relation, one per `pk` column.
-pub(super) fn pk_keyset_col(i: usize) -> String {
-    format!("c{i}")
-}
-
-/// `unnest($start::text[]::t0[], $start+1::text[]::t1[], …) as k(c0, c1, …)`
-/// — `pk`'s columns as a bound keyset relation, one array bind parameter per
-/// column (so the whole keyset costs `pk.len()` bind parameters regardless of
-/// how many keys it carries, well under Postgres's bind cap). The multi-
-/// column match [`apply_target`] needs once a composite (arity > 1) primary
-/// key means a plain `= any($1::text[]::cast[])` doesn't identify a row
-/// on its own — arity 1 keeps that simpler form
-/// instead (see [`apply_target`]'s own arity branch). A 1-1 `JOIN`'s target
-/// write (`super::join_one_to_one`) uses it at every arity.
-pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
-    let arrays: Vec<String> = pk
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("${}::text[]::{}[]", start + i, c.data_type))
-        .collect();
-    let cols: Vec<String> = (0..pk.len()).map(pk_keyset_col).collect();
-    format!("unnest({}) as k({})", arrays.join(", "), cols.join(", "))
-}
-
-/// `<alias>.<col0> = k.c0 and <alias>.<col1> = k.c1 and …` — matches one row
-/// of `alias` against [`pk_keyset_unnest`]'s bound relation. Plain `=`, so
-/// only for keys with no `NULL` part: a key with one is matched by
-/// [`null_pattern_match`] instead.
-pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
-    pk.iter()
-        .enumerate()
-        .map(|(i, c)| format!("{alias}.{} = k.{}", quote_ident(&c.name), pk_keyset_col(i)))
-        .collect::<Vec<_>>()
-        .join(" and ")
-}
-
-/// Whether a join of a keyset to a table keyed by `key` should also restrict
-/// the key's column to the keyset's own array (`t.<col> = any(<array>)`),
-/// which the join already implies: only when `key` is a single column. Every
-/// keyset join that takes such a bound asks here.
-///
-/// The bound caps the table's side of whatever join the planner picks at the
-/// keyset. Without it, a table analyzed while small and grown since is read
-/// in full: at 1M rows analyzed at 100, a 5,000-key batch hashed a
-/// sequential scan of the table, 3 to 13 times slower than through its key's
-/// index.
-///
-/// A composite key isn't bounded. The planner multiplies one bound per
-/// column's selectivities as if they were independent, but a composite key's
-/// columns are each nearly as selective as the whole key, so it expects the
-/// bounded table to yield a row or two. It then loops over that scan and
-/// compares every bounded row with every key, quadratic in the batch,
-/// statistics fresh or not: 5,000 keys took 2.3 s to lock on a 1M-row target
-/// with a four-column key (25 ms unbounded), and 1.8 s on a 20M-row target
-/// with a two-column key (19 ms). A leading-column bound alone avoids that,
-/// but reads a whole tenant when the leading column is a low-cardinality one
-/// (84 ms against 4 ms for 500 keys over 1,000 tenants). Unbounded, a
-/// composite key is probed per key while its statistics are fresh, and can
-/// still be hashed against a sequential scan while they lag (139 ms against
-/// 27 ms bounded, two columns at 1M rows), unless the statement also runs
-/// under `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), as the
-/// source read, the endpoint feed's re-read, the sweep delete and the
-/// single-column and composite pre-locks ([`lock_single_keys`],
-/// [`lock_composite_keys`]) and the single-column delete
-/// ([`delete_single_keys`]) do. A composite key is always the full key of
-/// a primary key or unique index (`ddl::identity_key_columns`), so the
-/// settings always have an index to probe. Each composite statement
-/// among them has a plan test on a two-column key analyzed at 100 rows and
-/// grown to 400k or 1M, which counts the rows its scans actually read rather
-/// than the planner's estimates, and holds them to the batch.
-/// [`apply_target`]'s composite delete runs without the settings: its
-/// `exists` probed the key's index once per key for 5,000 keys of a
-/// two-column key analyzed at 100 rows and grown to 1M or 3M, and of a
-/// four-column one grown to 1M, on PostgreSQL 16, 17 and 18.
-///
-/// The bound alone isn't enough on PostgreSQL 16, which prices an index scan
-/// for thousands of `= any` values far above 17's estimate: it scanned a
-/// 400k-row table analyzed at 100 and filtered it by the bound, where 17
-/// read the index. So each statement that takes the bound also runs under
-/// those settings.
-pub(crate) fn bounds_keyset_by_array(key: &[PrimaryKeyColumn]) -> bool {
-    key.len() == 1
-}
-
-/// [`apply_target`]'s pre-lock for a single-column key: the target rows of
-/// the bound `text[]` keys at `$1` (cast to the key's type, so the column
-/// itself stays uncast and its index usable), `select`ing `columns`, locked
-/// `for update` in key order. `pk_ident` is the quoted key column and
-/// `pk_cast` its type.
-pub(super) fn single_lock_statement(
-    target_ident: &str,
-    pk_ident: &str,
-    pk_cast: &str,
-    columns: &str,
-) -> String {
-    format!(
-        "select {columns} from {target_ident} as t \
-         where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
-         order by t.{pk_ident} for update"
-    )
-}
-
-/// Runs [`single_lock_statement`] over `keys` under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), and returns
-/// the locked rows in key order. While a target's statistics lag its size,
-/// PostgreSQL 16 prices an index scan for thousands of `= any` values so
-/// high that it read a 400k-row target in full and filtered it by the keys;
-/// with the settings it probes the key's index. With fresh
-/// statistics the planner already probes the index, and the settings leave
-/// that plan alone.
-async fn lock_single_keys(
-    txn: &Transaction<'_>,
-    target_ident: &str,
-    pk_ident: &str,
-    pk_cast: &str,
-    columns: &str,
-    keys: &[&str],
-) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    super::ledger::query_by_entry_key(
-        txn,
-        &single_lock_statement(target_ident, pk_ident, pk_cast, columns),
-        &[&keys],
-    )
-    .await
-}
-
-/// [`apply_target`]'s delete for a single-column key: the target rows of the
-/// bound `text[]` keys at `$1`, `returning` the key text `returning`.
-pub(super) fn single_delete_statement(
-    target_ident: &str,
-    pk_ident: &str,
-    pk_cast: &str,
-    returning: &str,
-) -> String {
-    format!(
-        "delete from {target_ident} as t \
-         where t.{pk_ident} = any($1::text[]::{pk_cast}[]) \
-         returning {returning} as pk"
-    )
-}
-
-/// Runs [`single_delete_statement`] over `keys` under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), as
-/// [`lock_single_keys`] runs the pre-lock of the same rows, and returns the
-/// deleted keys' rows.
-async fn delete_single_keys(
-    txn: &Transaction<'_>,
-    target_ident: &str,
-    pk_ident: &str,
-    pk_cast: &str,
-    returning: &str,
-    keys: &[&str],
-) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    super::ledger::query_by_entry_key(
-        txn,
-        &single_delete_statement(target_ident, pk_ident, pk_cast, returning),
-        &[&keys],
-    )
-    .await
-}
-
-/// [`apply_target`]'s pre-lock for a composite key: the target
-/// rows of a bound keyset relation ([`pk_keyset_unnest`] at `$1`), `select`ing
-/// `columns`, locked `for update of t` in key order. No one column's `=
-/// any(...)` test identifies a row of a composite key, so the pre-lock joins
-/// the target to the keyset and locks only the real table's rows
-/// (`unnest(...)`'s derived rows aren't real table rows Postgres could lock).
-///
-/// The join is deliberately not also restricted by one `t.<col> = any(<its
-/// array>)` per key column: see [`bounds_keyset_by_array`]. It runs under
-/// `ENTRY_PLAN_SETTINGS` instead ([`lock_composite_keys`]).
-pub(super) fn composite_lock_statement(
-    target_ident: &str,
-    pk: &[PrimaryKeyColumn],
-    columns: &str,
-) -> String {
-    format!(
-        "select {columns} from {target_ident} as t join {} on ({}) \
-         order by {} for update of t",
-        pk_keyset_unnest(pk, 1),
-        pk_keyset_match(pk, "t"),
-        pk.iter()
-            .map(|c| format!("t.{}", quote_ident(&c.name)))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
-}
-
-/// Runs [`composite_lock_statement`] over the keys in `arrays` (column `j`'s
-/// parts in `arrays[j]`, as [`transpose_pk_parts`] gives them) under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), and returns
-/// the locked rows. While a target's statistics lag its size, the join
-/// alone hashed the keys against a sequential scan of the target: a
-/// two-column key at 1M rows analyzed at 100 took 133–167 ms on
-/// PostgreSQL 16 and 17, against 12–16 ms probing the key's index per key
-/// with the settings. With fresh statistics the planner already
-/// probes per key, and the settings leave that plan alone.
-async fn lock_composite_keys(
-    txn: &Transaction<'_>,
-    target_ident: &str,
-    pk: &[PrimaryKeyColumn],
-    columns: &str,
-    arrays: &[Vec<&str>],
-) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
-    let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
-    super::ledger::query_by_entry_key(
-        txn,
-        &composite_lock_statement(target_ident, pk, columns),
-        &params,
-    )
-    .await
-}
-
-/// The per-column bind arrays [`pk_keyset_unnest`] needs, transposed from
-/// `rows` (each an already-[`decode_target_pk_parts`]-decoded key, in `pk`'s
-/// own declared column order, a `NULL` part a `None` where `T` is an `Option`) so column `j`'s array
-/// is every row's `j`th part.
-pub(super) fn transpose_pk_parts<T: Clone>(arity: usize, rows: &[Vec<T>]) -> Vec<Vec<T>> {
-    (0..arity)
-        .map(|j| rows.iter().map(|r| r[j].clone()).collect())
-        .collect()
-}
-
-/// Decoded keys ([`decode_target_pk_parts`]) as [`apply_target`] matches
-/// them against its target: `plain`, each key with no `NULL` part (its
-/// parts, in key order), matched by the plain-key statements;
-/// and `patterns`, the keys with a `NULL` part, by their `NULL` pattern
-/// (`pattern[i]`: part `i` is `NULL`), each pattern's non-`NULL` parts
-/// transposed into one array per such column, as [`null_pattern_match`]
-/// binds them.
-///
-/// Matched per pattern because `is not distinct from` (or an `or … is
-/// null` arm) can't probe the key's index: `col is null` can, so each
-/// pattern's statement reaches its rows through the index, as
-/// `staging::target_mutations` matches its.
-#[derive(Default)]
-pub(super) struct MatchKeys<'a> {
-    pub(super) plain: Vec<Vec<&'a str>>,
-    pub(super) patterns: BTreeMap<Vec<bool>, Vec<Vec<&'a str>>>,
-}
-
-impl<'a> MatchKeys<'a> {
-    pub(super) fn of(keys: impl IntoIterator<Item = &'a Vec<Option<String>>>) -> Self {
-        let mut out = Self::default();
-        for key in keys {
-            let pattern: Vec<bool> = key.iter().map(Option::is_none).collect();
-            if !pattern.contains(&true) {
-                out.plain
-                    .push(key.iter().flatten().map(String::as_str).collect());
-                continue;
-            }
-            let columns = out.patterns.entry(pattern).or_insert_with_key(|pattern| {
-                vec![Vec::new(); pattern.iter().filter(|null| !**null).count()]
-            });
-            for (column, part) in columns.iter_mut().zip(key.iter().flatten()) {
-                column.push(part.as_str());
-            }
-        }
-        out
-    }
-}
-
-/// The match of `alias`'s row against the keys of one `NULL` pattern
-/// ([`MatchKeys::patterns`]): `<alias>.<col> is null` for each `NULL` part,
-/// and `<alias>.<col> = k.c<i>` for the others, against their keyset
-/// (`unnest(…) as k(c<i>, …)`, one `text[]` per non-`NULL` column, bound from
-/// `$start`). The keyset is `None` when every part is `NULL`: the pattern is
-/// then one key, matched by its `is null` tests alone.
-pub(super) fn null_pattern_match(
-    pk: &[PrimaryKeyColumn],
-    pattern: &[bool],
-    alias: &str,
-    start: usize,
-) -> (Option<String>, String) {
-    let mut arrays = Vec::new();
-    let mut cols = Vec::new();
-    let mut matched = Vec::with_capacity(pk.len());
-    for (i, (column, null)) in pk.iter().zip(pattern).enumerate() {
-        let ident = quote_ident(&column.name);
-        if *null {
-            matched.push(format!("{alias}.{ident} is null"));
-        } else {
-            arrays.push(format!(
-                "${}::text[]::{}[]",
-                start + arrays.len(),
-                column.data_type
-            ));
-            cols.push(pk_keyset_col(i));
-            matched.push(format!("{alias}.{ident} = k.{}", pk_keyset_col(i)));
-        }
-    }
-    let keyset = (!arrays.is_empty())
-        .then(|| format!("unnest({}) as k({})", arrays.join(", "), cols.join(", ")));
-    (keyset, matched.join(" and "))
-}
-
 /// [`apply_target`]'s pre-lock of the target rows of one `NULL` pattern's
-/// keys ([`null_pattern_match`] at `$1`), `select`ing `columns`, locked `for
-/// update of t` in key order.
-pub(super) fn null_pattern_lock_statement(
+/// keys ([`super::keyset`], bound from `$1`), `select`ing `columns`, locked
+/// in key order. A single-column key's non-`NULL` keys keep the simplest
+/// form, `= any($1)`, the key's column uncast so its index stays usable. The
+/// others join the arm's keyset and lock only the real table's rows (`for
+/// update of t`), or match the one all-`NULL` key by `is null` alone.
+pub(super) fn lock_statement(
     target_ident: &str,
     pk: &[PrimaryKeyColumn],
     pattern: &[bool],
@@ -3812,40 +3373,92 @@ pub(super) fn null_pattern_lock_statement(
         .iter()
         .map(|c| format!("t.{}", quote_ident(&c.name)))
         .collect();
-    match null_pattern_match(pk, pattern, "t", 1) {
-        (Some(keyset), matched) => format!(
-            "select {columns} from {target_ident} as t join {keyset} on ({matched}) \
-             order by {} for update of t",
-            order.join(", ")
+    let order = order.join(", ");
+    let arm = ArmSql::new(pk, pattern, "k", 1);
+    match (pk, pattern, arm.relation()) {
+        ([column], [false], _) => format!(
+            "select {columns} from {target_ident} as t \
+             where {order} = any($1::text[]::{}[]) order by {order} for update",
+            column.data_type
         ),
-        (None, matched) => {
-            format!("select {columns} from {target_ident} as t where {matched} for update of t")
-        }
+        (_, _, Some(keys)) => format!(
+            "select {columns} from {target_ident} as t join {keys} on ({}) \
+             order by {order} for update of t",
+            arm.matches("t")
+        ),
+        (_, _, None) => format!(
+            "select {columns} from {target_ident} as t where {} for update of t",
+            arm.matches("t")
+        ),
     }
 }
 
-/// [`apply_target`]'s delete of the target rows of one `NULL` pattern's keys
-/// ([`null_pattern_match`] at `$1`), `returning` the key text `returning`.
-pub(super) fn null_pattern_delete_statement(
+/// Runs [`lock_statement`] under `super::ledger::ENTRY_PLAN_SETTINGS` (see
+/// [`super::keyset`]) and returns the locked rows.
+async fn lock_rows(
+    txn: &Transaction<'_>,
+    target_ident: &str,
+    pk: &[PrimaryKeyColumn],
+    pattern: &[bool],
+    columns: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    let sql = lock_statement(target_ident, pk, pattern, columns);
+    super::ledger::query_by_entry_key(txn, &sql, params).await
+}
+
+/// [`apply_target`]'s delete of the target rows of one `NULL` pattern's keys,
+/// as [`lock_statement`] picks them, `returning` the key text `returning`.
+/// Keys with no `NULL` part of a composite key are matched by an `exists`
+/// over their keyset.
+pub(super) fn delete_statement(
     target_ident: &str,
     pk: &[PrimaryKeyColumn],
     pattern: &[bool],
     returning: &str,
 ) -> String {
-    match null_pattern_match(pk, pattern, "t", 1) {
-        (Some(keyset), matched) => format!(
-            "delete from {target_ident} as t using {keyset} where {matched} \
-             returning {returning} as pk"
+    let arm = ArmSql::new(pk, pattern, "k", 1);
+    let matched = arm.matches("t");
+    let pick = match (pk, pattern, arm.relation()) {
+        ([column], [false], _) => format!(
+            "where t.{} = any($1::text[]::{}[])",
+            quote_ident(&column.name),
+            column.data_type
         ),
-        (None, matched) => {
-            format!("delete from {target_ident} as t where {matched} returning {returning} as pk")
+        (_, _, Some(keys)) if !pattern.contains(&true) => {
+            format!("where exists (select 1 from {keys} where {matched})")
         }
+        (_, _, Some(keys)) => format!("using {keys} where {matched}"),
+        (_, _, None) => format!("where {matched}"),
+    };
+    format!("delete from {target_ident} as t {pick} returning {returning} as pk")
+}
+
+/// Runs [`delete_statement`]: a single-column key's non-`NULL` keys under
+/// `super::ledger::ENTRY_PLAN_SETTINGS`, as their pre-lock, and the others
+/// without (see [`super::keyset`]).
+async fn delete_rows(
+    txn: &Transaction<'_>,
+    target_ident: &str,
+    pk: &[PrimaryKeyColumn],
+    pattern: &[bool],
+    returning: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+    let sql = delete_statement(target_ident, pk, pattern, returning);
+    if pattern == [false] {
+        super::ledger::query_by_entry_key(txn, &sql, params).await
+    } else {
+        txn.query(&sql, params).await
     }
 }
 
-/// `columns` as the bind parameters of [`null_pattern_match`]'s keyset.
-fn pattern_params<'a>(columns: &'a [Vec<&'a str>]) -> Vec<&'a (dyn ToSql + Sync)> {
-    columns.iter().map(|c| c as &(dyn ToSql + Sync)).collect()
+/// The per-column bind arrays of `rows` (each a decoded key, in `pk`'s
+/// declared column order), so column `j`'s array is every row's `j`th part.
+pub(super) fn transpose_pk_parts<T: Clone>(arity: usize, rows: &[Vec<T>]) -> Vec<Vec<T>> {
+    (0..arity)
+        .map(|j| rows.iter().map(|r| r[j].clone()).collect())
+        .collect()
 }
 
 /// What [`settle_one_to_one_target`] did to one target: how many keys it
@@ -4056,7 +3669,7 @@ async fn settle_one_to_one_target(
 /// typed array per column and joins the target to that bound keyset.
 /// A key with a `NULL` part (a target over a nullable-keyed source)
 /// is locked and deleted by a statement per `NULL` pattern
-/// after the others ([`MatchKeys`]) —
+/// after the others ([`super::keyset`]) —
 /// either way the parameter count is `O(pk.len())`, not `O(batch size)`, so
 /// — unlike the upsert below — it never approaches the bind-parameter cap
 /// regardless of batch size. Because this transaction already holds every
@@ -4130,7 +3743,7 @@ async fn apply_target(
     // `decode_target_pk_parts` before treating it as a key value (or a
     // lock/match key) anywhere below. A `NULL` part is a real
     // SQL `NULL` in the target's `unique nulls not distinct` key, written
-    // as one and matched by `is null` (`MatchKeys`), never the sentinel text.
+    // as one and matched by `is null` (`super::keyset`), never the sentinel text.
     let decoded_writes: Vec<Vec<Option<String>>> = plan_writes
         .iter()
         .map(|w| decode_target_pk_parts(&plan.pk, target, &w.pk_text))
@@ -4151,33 +3764,21 @@ async fn apply_target(
         .collect();
     lock_key_parts.sort_unstable();
     lock_key_parts.dedup();
-    let lock_keys = MatchKeys::of(lock_key_parts);
     let lock_columns = format!("{lock_key_expr}{prior_select}");
-
-    let mut locked = if lock_keys.plain.is_empty() {
-        Vec::new()
-    } else if arity == 1 {
-        // A single bound `text[]` array.
-        let pk_ident = &pk_idents[0];
-        let pk_cast = plan.pk[0].data_type.as_str();
-        let keys: Vec<&str> = lock_keys.plain.iter().map(|p| p[0]).collect();
-        lock_single_keys(txn, &target_ident, pk_ident, pk_cast, &lock_columns, &keys).await?
-    } else {
-        // A composite key is matched against a bound keyset
-        // relation instead; see `composite_lock_statement`.
-        let arrays = transpose_pk_parts(arity, &lock_keys.plain);
-        lock_composite_keys(txn, &target_ident, &plan.pk, &lock_columns, &arrays).await?
-    };
-    // The keys with a `NULL` part, a statement per pattern, after the
-    // others, the patterns in `MatchKeys`' order and each one's keys in key
+    // A statement per `NULL` pattern, the keys with none first, each in key
     // order. That isn't ascending key order over a composite key (`(1,
     // NULL)` locks after `(2, 1)`).
-    for (pattern, columns) in &lock_keys.patterns {
+    let mut locked = Vec::new();
+    for (pattern, arm) in &Keyset::of_parts(lock_key_parts).arms {
+        let params: Vec<_> = arm.params().collect();
         locked.extend(
-            super::ledger::query_by_entry_key(
+            lock_rows(
                 txn,
-                &null_pattern_lock_statement(&target_ident, &plan.pk, pattern, &lock_columns),
-                &pattern_params(columns),
+                &target_ident,
+                &plan.pk,
+                pattern,
+                &lock_columns,
+                &params,
             )
             .await?,
         );
@@ -4297,63 +3898,26 @@ async fn apply_target(
         .collect();
 
     let mut deleted = Vec::new();
-    let delete_keys = MatchKeys::of(
+    let delete_keys = Keyset::of_parts(
         decoded_deletes
             .iter()
             .filter(|k| !write_keys.contains(&ddl::encode_pk_key(&plan.pk, k))),
     );
-    // `t.`-qualified (the composite branch's `exists (...)`
-    // subquery below introduces a second relation into scope, so an
-    // unqualified column reference would become ambiguous).
+    // `t.`-qualified (the composite delete's `exists (...)` subquery
+    // introduces a second relation into scope, so an unqualified column
+    // reference would become ambiguous).
     let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
-    if !delete_keys.plain.is_empty() {
-        let rows = if arity == 1 {
-            let pk_ident = &pk_idents[0];
-            let pk_cast = plan.pk[0].data_type.as_str();
-            let keys: Vec<&str> = delete_keys.plain.iter().map(|p| p[0]).collect();
-            delete_single_keys(
-                txn,
-                &target_ident,
-                pk_ident,
-                pk_cast,
-                &returning_pk_expr,
-                &keys,
-            )
-            .await?
-        } else {
-            // A composite key has no single column an
-            // `= any(...)` array test could name, so the delete instead
-            // matches any row whose full key tuple appears in a bound
-            // keyset relation (a correlated `exists`, mirroring the
-            // pre-lock's join above).
-            let arrays = transpose_pk_parts(arity, &delete_keys.plain);
-            let params: Vec<&(dyn ToSql + Sync)> = arrays.iter().map(|a| a as _).collect();
-            txn.query(
-                &format!(
-                    "delete from {target_ident} as t \
-                     where exists (select 1 from {} where {}) \
-                     returning {returning_pk_expr} as pk",
-                    pk_keyset_unnest(&plan.pk, 1),
-                    pk_keyset_match(&plan.pk, "t"),
-                ),
-                &params,
-            )
-            .await?
-        };
-        deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
-    }
-    for (pattern, columns) in &delete_keys.patterns {
-        let rows = txn
-            .query(
-                &null_pattern_delete_statement(
-                    &target_ident,
-                    &plan.pk,
-                    pattern,
-                    &returning_pk_expr,
-                ),
-                &pattern_params(columns),
-            )
-            .await?;
+    for (pattern, arm) in &delete_keys.arms {
+        let params: Vec<_> = arm.params().collect();
+        let rows = delete_rows(
+            txn,
+            &target_ident,
+            &plan.pk,
+            pattern,
+            &returning_pk_expr,
+            &params,
+        )
+        .await?;
         deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
     }
 
