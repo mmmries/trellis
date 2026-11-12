@@ -580,7 +580,9 @@ The Elixir and Ruby bindings report it as `version_handover`.
 
 Set while this binary's migrations haven't run on the instance: it names them,
 and `cannot_run` says why this handle's background process couldn't run them,
-when it tried and was refused, with the remedy
+when it tried and was refused, with the remedy. Also set, naming no
+migrations, while that process stands by because its role can't run the
+takeover work (a restore, a conversion)
 ([observability — Another version is live](observability.md#another-version-is-live)).
 The Elixir and Ruby bindings don't carry it yet.
 

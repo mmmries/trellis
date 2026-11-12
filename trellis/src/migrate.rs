@@ -173,6 +173,19 @@ pub(crate) async fn pending_migrations(
     if !has_history(client, schema).await? {
         return Ok(Vec::new());
     }
+    let runner = embedded::migrations::runner();
+    let mut carried = unapplied(client, schema, runner.get_migrations()).await?;
+    carried.sort_by_key(|migration| migration.version());
+    Ok(carried.into_iter().map(migration_name).collect())
+}
+
+/// The migrations of `list` that refinery's history on `schema` lacks, which
+/// it must have.
+async fn unapplied<'a>(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+    list: &'a [refinery::Migration],
+) -> Result<Vec<&'a refinery::Migration>, tokio_postgres::Error> {
     let history = format!("{}.refinery_schema_history", quote_ident(schema));
     let applied: std::collections::HashSet<i32> = client
         .query(&format!("select version from {history}"), &[])
@@ -180,14 +193,32 @@ pub(crate) async fn pending_migrations(
         .iter()
         .map(|row| row.get(0))
         .collect();
-    let runner = embedded::migrations::runner();
-    let mut carried: Vec<&refinery::Migration> = runner
-        .get_migrations()
+    Ok(list
         .iter()
         .filter(|migration| !applied.contains(&migration.version()))
-        .collect();
-    carried.sort_by_key(|migration| migration.version());
-    Ok(carried.into_iter().map(migration_name).collect())
+        .collect())
+}
+
+/// Whether a background process of `version` runs the takeover work before
+/// it takes over, with nothing pending (ADR-0023, rule 3): the marker records
+/// another version as the last to run it (or none), or a schema dump's
+/// restore queue waits.
+pub(crate) async fn takeover_work_due(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+    version: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let marker = format!("{}.trellis_instance", quote_ident(schema));
+    Ok(client
+        .query_one(
+            &format!(
+                "select (select attached_version from {marker}) is distinct from $1 \
+                    or pg_catalog.to_regclass($2) is not null"
+            ),
+            &[&version, &restore_queue(schema)],
+        )
+        .await?
+        .get(0))
 }
 
 /// A migration as the log and `status()` name it: `V9__worker_versions`.
@@ -237,7 +268,7 @@ pub async fn migrate_with_pool(pool: &Pool, config: &Config) -> Result<(), Error
 /// [`migrate_with_pool`], returning the migrations it ran, by name
 /// (`V9__worker_versions`), oldest first: none when another `migrate` ran
 /// them first. What a background process runs when it takes over with this
-/// binary's migrations pending (ADR-0023, rule 3).
+/// binary's migrations or takeover work pending (ADR-0023, rule 3).
 pub(crate) async fn migrate_reporting(pool: &Pool, config: &Config) -> Result<Vec<String>, Error> {
     migrate_carrying(pool, config, &Migrations::embedded()).await
 }
@@ -297,7 +328,9 @@ async fn attach(
 /// than the migrations. While another version is live and nothing is
 /// pending, the attach changes nothing: it has run its checks (the catalog
 /// floor and history among them), and refuses if the grammar check would
-/// pause a definition or the marker would change.
+/// pause a definition or the marker would change. Otherwise it runs the
+/// pending migrations, then the takeover work, which records this version on
+/// the marker.
 async fn attach_under_handover(
     pg_client: &mut tokio_postgres::Client,
     pool: &Pool,
@@ -327,20 +360,32 @@ async fn attach_under_handover(
         return Ok(Vec::new());
     }
 
-    let ran = run_migrations(pg_client, migrations).await?;
+    // No runner when nothing is pending: refinery's `create table if not
+    // exists` of its history needs `CREATE` on the schema even when the table
+    // exists, and a role without it still runs the takeover work below.
+    let pending = !has_history(&*pg_client, config.schema()).await?
+        || !unapplied(&*pg_client, config.schema(), &migrations.list)
+            .await?
+            .is_empty();
+    let ran = if pending {
+        run_migrations(pg_client, migrations).await?
+    } else {
+        Vec::new()
+    };
 
+    // The takeover work, in one transaction with the marker recording this
+    // version ran it (ADR-0023, rule 3), so a kill leaves all of it or none.
     // ADR-0018, ADR-0024 rule 3: before anything reads a stored definition,
     // pause each one this binary can't run (its floor or its grammar is
     // newer) or read (outside the support window, or text it refuses), each
-    // on its own, so the rest of the instance runs beside it.
-    crate::defs::grammar::check_stored_versions(pg_client, &config.floors()).await?;
-
-    // Always seed/reconcile the marker, not just on a "fresh attach" — see
-    // `identity::seed_marker` for why: it's an idempotent upsert, so a
-    // clean re-attach, a resumed crash between the runner creating
-    // `trellis_instance` and this committing, and a changed target schema
-    // are all handled by one statement rather than separate states to track.
-    identity::seed_marker(pg_client, config).await?;
+    // on its own, so the rest of the instance runs beside it. The marker is
+    // seeded every time, not just on a "fresh attach": see
+    // `identity::seed_marker`.
+    let txn = pg_client.transaction().await?;
+    let unrunnable = crate::defs::grammar::check_stored_versions(&txn, &config.floors()).await?;
+    identity::seed_marker(&txn, config).await?;
+    txn.commit().await?;
+    crate::defs::grammar::log_unrunnable_pauses(&unrunnable);
 
     // A database loaded from a schema dump has its definitions queued, not
     // defined (`crate::dump`): restore them now, with the catalog current.
@@ -353,15 +398,18 @@ async fn attach_under_handover(
 /// (`crate::dump::RESTORE_QUEUE`): restoring it changes state, which an
 /// attach beside another live version mustn't.
 async fn restore_queued(client: &tokio_postgres::Client, config: &Config) -> Result<bool, Error> {
-    let queue = format!(
-        "{}.{}",
-        quote_ident(config.schema()),
-        crate::dump::RESTORE_QUEUE
-    );
     Ok(client
-        .query_one("select pg_catalog.to_regclass($1) is not null", &[&queue])
+        .query_one(
+            "select pg_catalog.to_regclass($1) is not null",
+            &[&restore_queue(config.schema())],
+        )
         .await?
         .get(0))
+}
+
+/// The restore queue's qualified name in `schema`.
+fn restore_queue(schema: &str) -> String {
+    format!("{}.{}", quote_ident(schema), crate::dump::RESTORE_QUEUE)
 }
 
 /// Runs the pending migrations. Inside a public call (issue #599) it runs

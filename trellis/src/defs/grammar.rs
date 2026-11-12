@@ -358,38 +358,16 @@ pub(crate) fn unparsable_stored_text_reason(target: &str, error: &ParseError) ->
     )
 }
 
-/// [`pause_unloadable_in`] against this binary's window, in a transaction of
-/// its own on `client`, committed when `apply` and rolled back otherwise.
-async fn pause_unloadable_on(
-    client: &mut tokio_postgres::Client,
-    floors: &Floors,
-    apply: bool,
-) -> Result<usize, crate::Error> {
-    let txn = client.transaction().await?;
-    let (paused, unrunnable) = pause_unloadable_in(
-        &txn,
-        floors,
-        OLDEST_SUPPORTED_GRAMMAR_VERSION,
-        CURRENT_GRAMMAR_VERSION,
-    )
-    .await?;
-    if apply {
-        txn.commit().await?;
-        log_unrunnable_pauses(&unrunnable);
-    } else {
-        txn.rollback().await?;
-    }
-    Ok(paused)
-}
-
 /// The attach's check ([`pause_unloadable_in`]) against this binary's
-/// window: before anything reads a stored definition, pauses the ones this
-/// binary can't run or read. Returns how many it paused.
+/// window, in `txn`: before anything reads a stored definition, pauses the
+/// ones this binary can't run or read. Returns the ones it can't run, for the
+/// caller to log once it commits ([`log_unrunnable_pauses`]).
 pub(crate) async fn check_stored_versions(
-    client: &mut tokio_postgres::Client,
+    txn: &tokio_postgres::Transaction<'_>,
     floors: &Floors,
-) -> Result<usize, crate::Error> {
-    pause_unloadable_on(client, floors, true).await
+) -> Result<Vec<UnrunnableDefinition>, crate::Error> {
+    let (oldest, current) = (OLDEST_SUPPORTED_GRAMMAR_VERSION, CURRENT_GRAMMAR_VERSION);
+    Ok(pause_unloadable_in(txn, floors, oldest, current).await?.1)
 }
 
 /// [`check_stored_versions`] rolled back: how many definitions it would
@@ -399,7 +377,11 @@ pub(crate) async fn check_stored_versions_dry_run(
     client: &mut tokio_postgres::Client,
     floors: &Floors,
 ) -> Result<usize, crate::Error> {
-    pause_unloadable_on(client, floors, false).await
+    let txn = client.transaction().await?;
+    let (oldest, current) = (OLDEST_SUPPORTED_GRAMMAR_VERSION, CURRENT_GRAMMAR_VERSION);
+    let (paused, _) = pause_unloadable_in(&txn, floors, oldest, current).await?;
+    txn.rollback().await?;
+    Ok(paused)
 }
 
 #[cfg(test)]

@@ -289,7 +289,8 @@ build and expects the candidate to migrate and converge. It then does the
 same with an embedded application's worker as the candidate (the library
 probe's `worker`: a handle with the staging worker and drain threads that
 never calls `migrate`) on a database of its own, so nothing but the worker's
-handover pass can run the migrations. A candidate that runs beside the old
+handover pass can run the migrations, and expects the marker to record that the
+worker ran the takeover work. A candidate that runs beside the old
 one, exits, pauses definitions, or (the worker) doesn't migrate once the old
 one stops fails the step, and the finding is filed.
 

@@ -197,6 +197,19 @@ async fn numeric_tables(
 ) -> Result<Vec<NumericTable>, crate::Error> {
     let def = &definition.def;
     let tables = if crate::staging::join::applies(def) {
+        // A definition restored paused was never built: no tables to convert,
+        // and no layout to plan from.
+        let partials = super::join::HiddenTable::FromPartials.qualified(schema, definition.id);
+        let built: bool = txn
+            .query_one(
+                "select pg_catalog.to_regclass($1) is not null",
+                &[&partials],
+            )
+            .await?
+            .get(0);
+        if !built {
+            return Ok(Vec::new());
+        }
         let Some(joined) = super::catalog::join_table_of(txn, definition.id)
             .await
             .map_err(failed)?

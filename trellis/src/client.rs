@@ -2925,12 +2925,14 @@ pub(crate) async fn lock_handover_xact(
 #[derive(Debug)]
 struct PassOutcome {
     verdict: Verdict,
-    /// The pending migrations this pass ran before it took over, by name.
-    migrated: Vec<String>,
+    /// The pending migrations this pass ran before it took over, by name;
+    /// `None` when it ran no `migrate` (nor the takeover work).
+    migrated: Option<Vec<String>>,
 }
 
 /// One handover pass (ADR-0023): [`decide_pass`], and when it finds this
-/// binary's migrations pending with nothing else live, `migrate` (the
+/// binary's migrations or takeover work pending with nothing else live,
+/// `migrate` (the
 /// ordinary one: its attach checks, the catalog floor, the history check and
 /// the takeover work), then [`decide_pass`] again, which takes over. The
 /// migration runs between the two decisions, each under the exclusive
@@ -2955,9 +2957,15 @@ async fn handover_pass(
         (Verdict::StandBy(handover::StandBy::MigrationsPending), Some(config)) => config,
         // Anything else ends a back-off: the next refusal starts its own.
         _ => {
+            if verdict == Verdict::TakeOver {
+                *process
+                    .cannot_migrate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
             return Ok(PassOutcome {
                 verdict,
-                migrated: Vec::new(),
+                migrated: None,
             });
         }
     };
@@ -2973,7 +2981,7 @@ async fn handover_pass(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((due, pending));
         return Ok(PassOutcome {
             verdict,
-            migrated: Vec::new(),
+            migrated: None,
         });
     }
     match crate::migrate::migrate_reporting(&process.pool, config).await {
@@ -2984,14 +2992,14 @@ async fn handover_pass(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             Ok(PassOutcome {
                 verdict: decide_pass(process, drain).await?,
-                migrated,
+                migrated: Some(migrated),
             })
         }
         // A process of another version went live since the first decision:
         // `migrate` saw it under the lock and ran nothing.
         Err(crate::error::Error::OtherVersionLive(seen)) => Ok(PassOutcome {
             verdict: Verdict::StandBy(handover::StandBy::OtherVersion(seen)),
-            migrated: Vec::new(),
+            migrated: None,
         }),
         Err(err) => {
             let reason = cannot_migrate_reason(&err);
@@ -3019,7 +3027,7 @@ async fn handover_pass(
             }
             Ok(PassOutcome {
                 verdict: Verdict::StandBy(handover::StandBy::CannotMigrate(pending)),
-                migrated: Vec::new(),
+                migrated: None,
             })
         }
     }
@@ -3031,8 +3039,8 @@ async fn handover_pass(
 fn cannot_migrate_reason(err: &crate::error::Error) -> String {
     if permission_denied(err) {
         format!(
-            "migrations pending and this role cannot run them: run `migrate` with a role that \
-             can (`trellis run`, a deploy step) ({err})"
+            "migrations or takeover work pending and this role cannot run them: run `migrate` \
+             with a role that can (`trellis run`, a deploy step) ({err})"
         )
     } else {
         format!("migrate refused: {err}")
@@ -3062,7 +3070,16 @@ async fn decide_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdict
         )));
     }
     let observed = handover::observe(&txn, &process.schema, true).await?;
-    let verdict = handover::decide(&process.version, &observed, handover::Asker::Background);
+    let mut verdict = handover::decide(&process.version, &observed, handover::Asker::Background);
+    // ADR-0023 rule 3: the takeover work runs once per binary version, so a
+    // process that would take over with nothing pending runs it first when
+    // another version (or none) last ran it, or a restore is queued.
+    if verdict == Verdict::TakeOver
+        && !observed.migrations_pending
+        && crate::migrate::takeover_work_due(&txn, &process.schema, &process.version).await?
+    {
+        verdict = Verdict::StandBy(handover::StandBy::MigrationsPending);
+    }
     // ADR-0024 rule 3: before it stages, drains or builds anything, a process
     // that takes over pauses each definition this release can't run, which
     // nothing it runs then reads. Under the handover lock, so no other
@@ -3148,7 +3165,7 @@ pub async fn handover_pass_as(
                 .map(|(due, _)| due.saturating_duration_since(Instant::now()));
             HandoverPass {
                 took_over: outcome.verdict == Verdict::TakeOver,
-                migrated: outcome.migrated,
+                migrated: outcome.migrated.unwrap_or_default(),
                 log,
                 retry_in,
             }
@@ -3219,11 +3236,17 @@ impl HandoverLog {
     /// it took over.
     fn message(&self, outcome: &PassOutcome) -> Option<String> {
         let verdict = &outcome.verdict;
-        if *verdict == Verdict::TakeOver && !outcome.migrated.is_empty() {
-            return Some(format!(
-                "ran this binary's pending migrations ({}); taking over",
-                outcome.migrated.join(", ")
-            ));
+        if *verdict == Verdict::TakeOver
+            && let Some(ran) = &outcome.migrated
+        {
+            return Some(if ran.is_empty() {
+                "ran this binary's takeover work; taking over".to_string()
+            } else {
+                format!(
+                    "ran this binary's pending migrations ({}); taking over",
+                    ran.join(", ")
+                )
+            });
         }
         if self.last.as_ref() == Some(verdict) {
             return None;
@@ -3246,8 +3269,8 @@ impl HandoverLog {
                  again: {seen}"
             )),
             Verdict::StandBy(handover::StandBy::MigrationsPending) => Some(
-                "standing by: this binary's migrations haven't run on the instance; run \
-                 migrate, and this process takes over at its next standby poll"
+                "standing by: this binary's migrations or takeover work haven't run on the \
+                 instance; run migrate, and this process takes over at its next standby poll"
                     .to_string(),
             ),
             Verdict::StandBy(handover::StandBy::CannotMigrate(pending)) => Some(format!(

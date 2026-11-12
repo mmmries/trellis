@@ -26,8 +26,10 @@ Trellis:
    When the new release carries a migration, it migrates first, by itself:
    one of its background processes (a `trellis run`, or an embedded handle
    with `staging` or `drain_threads`) runs `migrate`, logs which migrations
-   ran, and takes over in the same pass. While a process of the old release
-   is live, nothing migrates.
+   ran, and takes over in the same pass. It runs the release's takeover work
+   (pausing what the release can't run, converting stored layouts, a queued
+   restore) the same way, migration or not. While a process of the old
+   release is live, nothing migrates.
 
 A deploy step that runs `migrate` (`bin/rails trellis:migrate`, an Elixir
 release task that calls `Trellis.migrate!`) still works, and is still how a
