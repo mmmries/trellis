@@ -177,6 +177,7 @@ use crate::pool::{Pool, quote_ident, quote_literal};
 use super::apply::ApplyError;
 use super::fold::FoldedChange;
 use super::join::{LockRowMode, Truncate, lock_row_sql};
+use super::keyset::{ArmSql, Keyset};
 use super::one_to_one_ledger::{self as ledger, EntryChange, LedgerRef};
 use super::one_to_one_render::{ImageColumn, OneToOneRender};
 use super::target_mutations::TargetMutations;
@@ -2937,7 +2938,21 @@ async fn write_target(
     }
 
     let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
-    let matched = super::apply::MatchKeys::of(decoded.iter());
+    let matched = Keyset::of_parts(&decoded);
+    // How a statement picks `t`'s rows of one pattern after `from <target>
+    // as t `: the keys with no `NULL` part by an `exists` over their keyset,
+    // the others by joining theirs with `join` (or by `is null` alone).
+    let pick = |pattern: &[bool], join: &str| {
+        let arm = ArmSql::new(&shape.pk, pattern, "k", 1);
+        let matches = arm.matches("t");
+        match arm.relation() {
+            Some(keys) if !pattern.contains(&true) => {
+                format!("where exists (select 1 from {keys} where {matches})")
+            }
+            Some(keys) => format!("{join}{keys} where {matches}"),
+            None => format!(" where {matches}"),
+        }
+    };
     let mut prior_images: HashMap<String, String> = HashMap::new();
     if let Some(image_sql) = &image_sql {
         let order: Vec<String> = shape
@@ -2946,39 +2961,15 @@ async fn write_target(
             .map(|c| format!("t.{}", quote_ident(&c.name)))
             .collect();
         let mut rows = Vec::new();
-        if !matched.plain.is_empty() {
-            let columns = super::apply::transpose_pk_parts(arity, &matched.plain);
-            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-            rows.extend(
-                txn.query(
-                    &format!(
-                        "select {key_expr}, ({image_sql})::text from {target} as t \
-                         where exists (select 1 from {keyset} where {matches}) \
-                         order by {order} for update of t",
-                        keyset = super::apply::pk_keyset_unnest(&shape.pk, 1),
-                        matches = super::apply::pk_keyset_match(&shape.pk, "t"),
-                        order = order.join(", "),
-                    ),
-                    &params,
-                )
-                .await?,
+        for (pattern, arm) in &matched.arms {
+            let params: Vec<_> = arm.params().collect();
+            let sql = format!(
+                "select {key_expr}, ({image_sql})::text from {target} as t {} \
+                 order by {} for update of t",
+                pick(pattern, ", "),
+                order.join(", "),
             );
-        }
-        for (pattern, columns) in &matched.patterns {
-            let (keyset, matches) = super::apply::null_pattern_match(&shape.pk, pattern, "t", 1);
-            let using = keyset.map_or_else(String::new, |keyset| format!(", {keyset}"));
-            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-            rows.extend(
-                txn.query(
-                    &format!(
-                        "select {key_expr}, ({image_sql})::text from {target} as t {using} \
-                         where {matches} order by {order} for update of t",
-                        order = order.join(", "),
-                    ),
-                    &params,
-                )
-                .await?,
-            );
+            rows.extend(txn.query(&sql, &params).await?);
         }
         prior_images = rows
             .into_iter()
@@ -2996,37 +2987,13 @@ async fn write_target(
             key = quote_ident(schema::KEY_COLUMN),
             has = shape.has_target_row_sql(),
         );
-        if !matched.plain.is_empty() {
-            let columns = super::apply::transpose_pk_parts(arity, &matched.plain);
-            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-            let rows = txn
-                .query(
-                    &format!(
-                        "delete from {target} as t \
-                         where exists (select 1 from {keyset} where {matches}) \
-                           and {unbacked} \
-                         returning {key_expr}",
-                        keyset = super::apply::pk_keyset_unnest(&shape.pk, 1),
-                        matches = super::apply::pk_keyset_match(&shape.pk, "t"),
-                    ),
-                    &params,
-                )
-                .await?;
-            deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
-        }
-        for (pattern, columns) in &matched.patterns {
-            let (keyset, matches) = super::apply::null_pattern_match(&shape.pk, pattern, "t", 1);
-            let using = keyset.map_or_else(String::new, |keyset| format!("using {keyset}"));
-            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-            let rows = txn
-                .query(
-                    &format!(
-                        "delete from {target} as t {using} \
-                         where {matches} and {unbacked} returning {key_expr}"
-                    ),
-                    &params,
-                )
-                .await?;
+        for (pattern, arm) in &matched.arms {
+            let params: Vec<_> = arm.params().collect();
+            let sql = format!(
+                "delete from {target} as t {} and {unbacked} returning {key_expr}",
+                pick(pattern, "using "),
+            );
+            let rows = txn.query(&sql, &params).await?;
             deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
         }
     }
