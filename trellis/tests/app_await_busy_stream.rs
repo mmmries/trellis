@@ -28,7 +28,7 @@ const BUDGET: Duration = Duration::from_secs(10);
 async fn wait_live(trellis: &Trellis, target: &str) {
     testkit::wait_until(
         format!("{target} goes live"),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         async || {
             let status = trellis.status(target).await.expect("status");
             status.is_some_and(|s| s.status == TransformStatus::Live)

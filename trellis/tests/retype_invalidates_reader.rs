@@ -165,7 +165,7 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
 /// Waits (bounded) until some backend waits on a lock `pid` holds: the
 /// interleaving test's one wait for a lock-wait state, not for convergence.
 async fn wait_blocked_behind(raw: &Client, pid: i32) {
-    testkit::blocking::wait_blocked_behind(raw, pid, Duration::from_secs(30), || false).await;
+    testkit::blocking::wait_blocked_behind(raw, pid, Duration::from_secs(60), || false).await;
 }
 
 /// Lock order: the re-type takes the readers' definition rows

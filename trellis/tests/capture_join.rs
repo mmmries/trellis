@@ -754,7 +754,8 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
         .expect("end the holder");
     testkit::wait_until(
         "the capture is uninstalled",
-        Duration::from_secs(30), // Read while the worker may be committing the uninstall: `installed`
+        Duration::from_secs(30),
+        // Read while the worker may be committing the uninstall: `installed`
         // reads every event in one statement, so it never sees half of it
         // (`captured_columns` fails on a partial install).
         || async { captured_columns(&raw, "public.u").await.is_none() },

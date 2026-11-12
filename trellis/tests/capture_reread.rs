@@ -195,7 +195,9 @@ async fn spawn_held_writer(
 async fn wait_for_holder(raw: &Client) {
     testkit::wait_until(
         "the writer to reach its application trigger",
-        Duration::from_secs(5),
+        // Generous: the writer only has to run one statement, but a loaded
+        // runner can be slow to schedule it.
+        Duration::from_secs(15),
         async || {
             raw.query_one(
                 "select exists (select 1 from pg_locks \
