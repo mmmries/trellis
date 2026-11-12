@@ -245,9 +245,12 @@ terms. With `FOR UPDATE` on both sides every key's mode is the same, so the rule
 holds by construction. A page that locked a key `FOR SHARE` and later upgraded it
 deadlocked against a page doing the same.
 
-The strict form of the `T` write is kept: a nonzero delta for a `T` group the
-writer didn't lock is an error, not a silent insert, so a gap in the computed
-lock set fails loudly instead of losing a delta.
+The strict form of the `T` write is kept for pages: a nonzero delta for a `T`
+group the page didn't lock is an error, not a silent insert, so a gap in the
+computed lock set fails loudly instead of losing a delta. A build locks and
+writes `T`'s groups in one sorted upsert, every staged group inserted or added
+to (a zero delta locks its row without rewriting it), so its lock set and write
+set are the same by construction.
 
 ### `TRUNCATE` of either side excludes writers of both, behind a two-sided barrier
 
@@ -341,9 +344,9 @@ row the collection deletes stays dead at that address, and no other cell's row
 can take it. The enumeration is a `create table as` too, for the same reason as
 the snapshot statement. A cell first seen after the enumeration belongs to its
 pages. It then carries both sides' changes into `T` as the product, as a page
-does. `T`'s groups are locked after the product,
-together with every group of the visible target and of `T`'s hidden table; `T`
-changes only as a delta, and each locked group's visible row is compared with
+does. `T`'s groups are locked and written after the product, in one sorted
+upsert, together with every group of the visible target and of `T`'s hidden
+table; `T` changes only as a delta, and each locked group's visible row is compared with
 the row the target holds. Pages apply from the build's first moment, and a page
 that names a key the build holds waits for its commit. Readers see the old `T`
 and the old visible rows until then. One `GROUP BY` per structure was 2–12x

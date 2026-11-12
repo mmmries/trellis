@@ -2789,56 +2789,30 @@ impl GroupTargetPlan {
         self.apply_sql_with(&tail)
     }
 
-    /// [`Self::apply_sql`] of `T` in a JOIN build ([`Self::compare_held_sql`]):
-    /// adds the staged deltas to the hidden partials and writes no visible
-    /// row. Returns how many groups it wrote, and how many staged groups had
-    /// no hidden row ([`Self::lost_cte_sql`]).
-    fn apply_hidden_sql(&self) -> String {
-        self.apply_sql_with("n as (select 1) select count(*), (select n from lost) from up")
-    }
-
-    /// Whether `T`'s JOIN build write takes the bulk path
-    /// ([`Self::match_hidden_build_sql`]): no extremes, so `T` holds no
-    /// basis and every staged change applies.
-    fn hidden_build_is_bulk(&self) -> bool {
-        self.shape.extremes().is_empty() && self.floor_key.is_none()
-    }
-
-    /// The first statement of [`Self::apply_hidden_sql`] with no extremes
-    /// (#1844): sums the staged rows once per group and matches each sum to
-    /// its hidden row with one join instead of a lookup per group, into
-    /// [`HIDDEN_MATCH`] in the hidden rows' `ctid` order. A staged group with
-    /// no hidden row has a null `__hc`, and is lost as [`Self::lost_cte_sql`]
-    /// counts it.
-    fn match_hidden_build_sql(&self) -> String {
-        let cols = quoted(&self.shape.group_cols);
-        let totals = self.staged_totals(&self.staged_parts.get(), None);
+    /// `T`'s lock and write in a JOIN build ([`upsert_join_build_groups`]),
+    /// one statement: each staged group's sums, inserted in
+    /// [`Self::lock_sql`]'s order (R7), as a new hidden row (zeros
+    /// included, so every staged group has one) or, on the conflict
+    /// [`Self::lock_sql`]'s insert arbitrates, added to the row there, under
+    /// its row lock. A row whose sums are all zero is locked, not rewritten.
+    /// The rows it locks are the rows it writes, so a build has no lock gap
+    /// to check; a page keeps [`Self::lock_sql`] and its check.
+    fn upsert_hidden_build_sql(&self) -> String {
+        let cols = quoted(&self.shape.group_cols).join(", ");
+        let staged_parts = self.staged_parts.get();
+        let totals = self.staged_totals(&staged_parts, None);
+        let parts = self.shape.each_partial(Partial::hidden);
+        let (sets, nonzero) =
+            self.added_from(&staged_parts, |p| format!("excluded.{}", p.hidden()));
         format!(
-            "create temp table {HIDDEN_MATCH} on commit drop as \
-             select s.*, x.ctid as __hc \
-             from (select {cols}, {totals} from {staged} group by {cols}) s \
-             left join {hidden} x on {matched} order by x.ctid",
-            cols = cols.join(", "),
+            "insert into {hidden} as u ({cols}, {parts}) \
+             select {cols}, {totals} from {staged} group by {cols} \
+             order by {cols} \
+             on conflict ({cols}) do update set {sets} where {nonzero}",
+            hidden = self.hidden_ident,
+            parts = parts.join(", "),
             totals = totals.join(", "),
             staged = self.staged,
-            hidden = self.hidden_ident,
-            matched = self.group_match("x", "s"),
-        )
-    }
-
-    /// The second statement of [`Self::apply_hidden_sql`] with no extremes:
-    /// adds each matched sum in [`HIDDEN_MATCH`] to its hidden row by
-    /// `ctid`. Run under [`HIDDEN_UPDATE_SETTINGS`], it reads the match in
-    /// order and fetches each row by a TID scan, so it rewrites `T`'s pages
-    /// in disk order: in hash order, every row dirties a random page, and at
-    /// millions of groups the checkpoints that follow write each page again
-    /// as a full-page image.
-    fn update_hidden_build_sql(&self) -> String {
-        let (sets, nonzero) = self.added(&self.staged_parts.get());
-        format!(
-            "update {hidden} u set {sets} from {HIDDEN_MATCH} t \
-             where u.ctid = t.__hc and ({nonzero})",
-            hidden = self.hidden_ident,
             sets = sets.join(", "),
             nonzero = nonzero.join(" or "),
         )
@@ -2854,9 +2828,11 @@ impl GroupTargetPlan {
 
     /// ADR-0019's strict `T` write, as [`Self::apply_sql_with`]'s `lost` CTE:
     /// how many staged groups [`Self::basis_ctes_sql`]'s lookup found no
-    /// hidden row for. Every writer of `T` runs [`Self::lock_sql`] first,
+    /// hidden row for. Every page of `T` runs [`Self::lock_sql`] first,
     /// which inserts a row for each staged group, so a group missing here is
-    /// a gap in the lock set, and the statement would drop its delta. Empty
+    /// a gap in the lock set, and the statement would drop its delta (a
+    /// build locks and writes in one statement instead,
+    /// [`Self::upsert_hidden_build_sql`]). Empty
     /// off a `JOIN`'s `T`: the aggregate path locks the groups it recomputes
     /// too and keeps its statement as it was.
     fn lost_cte_sql(&self) -> &'static str {
@@ -2890,13 +2866,22 @@ impl GroupTargetPlan {
     /// total, and the tests that some total is not zero. A map every staged
     /// side left `NULL` ([`Self::map_free`]) is kept as it is.
     fn added(&self, staged_parts: &Option<StagedParts>) -> (Vec<String>, Vec<String>) {
+        self.added_from(staged_parts, |p| format!("t.{}", p.name("__")))
+    }
+
+    /// [`Self::added`] with each partial's total read as `total(p)`.
+    fn added_from(
+        &self,
+        staged_parts: &Option<StagedParts>,
+        total: impl Fn(Partial) -> String,
+    ) -> (Vec<String>, Vec<String>) {
         let mut written = self.shape.partials();
         written.retain(|&p| !self.map_free(staged_parts, p));
         let set = |p: &Partial| {
-            let added = p.add(&format!("u.{}", p.hidden()), &format!("t.{}", p.name("__")));
+            let added = p.add(&format!("u.{}", p.hidden()), &total(*p));
             format!("{} = {added}", p.hidden())
         };
-        let nonzero = |p: &Partial| p.nonzero(&format!("t.{}", p.name("__")));
+        let nonzero = |p: &Partial| p.nonzero(&total(*p));
         (
             written.iter().map(set).collect(),
             written.iter().map(nonzero).collect(),
@@ -4619,28 +4604,32 @@ pub(super) async fn enumerate_target_groups(
     Ok(())
 }
 
-/// `T`'s write in a JOIN build, over the groups [`GroupTargetPlan::lock_sql`]
-/// locked: adds the product's deltas to the hidden partials, then replaces
-/// every locked group's visible row by comparing what its partials give with
-/// the row the target holds ([`GroupTargetPlan::compare_held_sql`]). Each
-/// changed visible row is recorded into `mutations`, with the held row as its
-/// prior image. Returns the rows it wrote and deleted.
-pub(super) async fn apply_join_build_groups(
+/// `T`'s lock and write in a JOIN build: one sorted upsert of every staged
+/// group's sums into the hidden partials
+/// ([`GroupTargetPlan::upsert_hidden_build_sql`]), which locks the rows it
+/// writes. A page locks first and writes after, and checks the two agree
+/// ([`GroupTargetPlan::lock_sql`], [`apply_locked_groups`]).
+pub(super) async fn upsert_join_build_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+) -> Result<(), ApplyError> {
+    // A `JOIN` admits no `MIN`/`MAX` (`DeferredAggregate`), so `T` holds no
+    // extremes or basis to weigh a staged change against: every one adds.
+    debug_assert!(plan.shape.extremes().is_empty() && plan.floor_key.is_none());
+    txn.execute(&plan.upsert_hidden_build_sql(), &[]).await?;
+    Ok(())
+}
+
+/// A JOIN build's visible write of `T`, after [`upsert_join_build_groups`]:
+/// replaces every group's visible row by comparing what its partials give
+/// with the row the target holds ([`GroupTargetPlan::compare_held_sql`]).
+/// Each changed visible row is recorded into `mutations`, with the held row
+/// as its prior image. Returns the rows it wrote and deleted.
+pub(super) async fn compare_join_build_groups(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
-    let lost = if plan.hidden_build_is_bulk() {
-        apply_hidden_build(txn, plan).await?
-    } else {
-        txn.batch_execute(PLAN_SETTINGS).await?;
-        let applied = txn.query_one(&plan.apply_hidden_sql(), &[]).await?;
-        txn.batch_execute(PLAN_RESET).await?;
-        applied.get(1)
-    };
-    if lost > 0 {
-        return Err(plan.lock_gap(lost));
-    }
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
     let rows = txn
         .query(&plan.compare_held_sql(image_columns.as_deref()), &[])
@@ -4648,52 +4637,6 @@ pub(super) async fn apply_join_build_groups(
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
 }
-
-/// `T`'s bulk write in a JOIN build (#1844): [`GroupTargetPlan::match_hidden_build_sql`]
-/// then [`GroupTargetPlan::update_hidden_build_sql`]. Returns how many staged
-/// groups had no hidden row, and writes nothing if any had.
-async fn apply_hidden_build(
-    txn: &Transaction<'_>,
-    plan: &GroupTargetPlan,
-) -> Result<i64, ApplyError> {
-    // `T` is written in this transaction, where no other session's
-    // statistics see it (#1839); the match wants a hash join.
-    analyze(txn, &[&plan.hidden_ident]).await?;
-    txn.batch_execute(&format!(
-        "drop table if exists {HIDDEN_MATCH}; {BULK_PLAN_SETTINGS}"
-    ))
-    .await?;
-    txn.batch_execute(&plan.match_hidden_build_sql()).await?;
-    let lost: i64 = txn
-        .query_one(
-            &format!("select count(*) from {HIDDEN_MATCH} where __hc is null"),
-            &[],
-        )
-        .await?
-        .get(0);
-    if lost > 0 {
-        txn.batch_execute(BULK_PLAN_RESET).await?;
-        return Ok(lost);
-    }
-    txn.batch_execute(HIDDEN_UPDATE_SETTINGS).await?;
-    txn.execute(&plan.update_hidden_build_sql(), &[]).await?;
-    txn.batch_execute(&format!(
-        "{HIDDEN_UPDATE_RESET}; {BULK_PLAN_RESET}; drop table {HIDDEN_MATCH}"
-    ))
-    .await?;
-    Ok(0)
-}
-
-/// [`apply_hidden_build`]'s match of staged sums to `T`'s hidden rows, in
-/// `ctid` order: a session temp table, dropped at commit.
-const HIDDEN_MATCH: &str = "pg_temp.trellis_join_hidden_match";
-
-/// The settings [`GroupTargetPlan::update_hidden_build_sql`] runs under, on
-/// top of [`BULK_PLAN_SETTINGS`]: with no hash join either, the join of the
-/// match to `T` on `ctid` is a nested loop over the match, in its order,
-/// with a TID scan of `T` inside.
-const HIDDEN_UPDATE_SETTINGS: &str = "set local enable_hashjoin = off";
-const HIDDEN_UPDATE_RESET: &str = "set local enable_hashjoin to default";
 
 /// The recompute of the groups in [`GroupTargetPlan::recomputed`], which
 /// the caller has locked (R1: [`lock_groups`] for a page, [`recompute_groups`]
@@ -5967,11 +5910,11 @@ mod tests {
         assert!(rows <= 40_000.0, "planned for 20000 cells: {write_plan}");
     }
 
-    /// ADR-0019's strict `T` write: a `JOIN`'s `T` page or build step whose
-    /// staged group has no hidden row (a writer that skipped
+    /// ADR-0019's strict `T` write: a `JOIN`'s `T` page whose staged group
+    /// has no hidden row (a writer that skipped
     /// [`GroupTargetPlan::lock_sql`], which inserts the missing rows) fails
     /// with [`ApplyError::GroupLockGap`], and rolls nothing in; the same
-    /// writer after the lock applies.
+    /// page after the lock applies.
     #[tokio::test]
     async fn a_join_t_write_of_a_group_with_no_hidden_row_is_an_error() {
         let cluster = testkit::TestCluster::start();
@@ -6036,22 +5979,6 @@ mod tests {
             .await
             .expect_err("a page over groups with no hidden row");
         is_gap(err, 2);
-        txn.rollback().await.expect("rollback");
-
-        // The build step's statement reads the same.
-        let txn = client.transaction().await.expect("begin");
-        txn.batch_execute(&plan.staged_ddl()).await.expect("staged");
-        txn.batch_execute(&format!(
-            "insert into {} (g, __txid, __lsn, __n, __c1, __s1) values \
-                 (1, pg_current_xact_id(), '0/10', 1, 1, 5)",
-            plan.staged
-        ))
-        .await
-        .expect("stage");
-        let err = apply_join_build_groups(&txn, &plan, &mut TargetMutations::assuming_read())
-            .await
-            .expect_err("a build step over a group with no hidden row");
-        is_gap(err, 1);
         txn.rollback().await.expect("rollback");
 
         // Locked first, as every writer is: applies.
@@ -6182,6 +6109,132 @@ mod tests {
                 .await
                 .expect("a locked page applies");
         assert_eq!((applied.len(), written, deleted), (2, 2, 0));
+        txn.rollback().await.expect("rollback");
+    }
+
+    /// A `JOIN` build's `T` write ([`upsert_join_build_groups`]), with no
+    /// lock statement before it: every staged group gets a hidden row, a
+    /// zero one included, inserted in group order; a group's delta adds to
+    /// the row there, the `NULL` group's included, with no second row; and
+    /// a row whose delta is zero is locked but not rewritten.
+    #[tokio::test]
+    async fn a_join_build_upserts_every_staged_group_of_t() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        };
+        let mut client = connect().await;
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
+        let def =
+            crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
+        let shape = route(&def, &columns()).expect("admitted");
+        let hidden = hidden_table_ident("trellis", 9);
+        client
+            .batch_execute(&format!(
+                "create schema if not exists trellis; {}; \
+                 create table public.t (g integer, s bigint)",
+                hidden_table_ddl("trellis", 9, &shape)
+            ))
+            .await
+            .expect("tables");
+        let plan = GroupTargetPlan::for_join(
+            "public.t",
+            hidden.clone(),
+            "trellis_test_t_upsert",
+            None,
+            Vec::new(),
+            shape,
+            Writer::JoinTarget,
+            None,
+            String::new(),
+        );
+        let stage = |rows: &str| {
+            format!(
+                "insert into {} (g, __txid, __lsn, __n, __c1, __s1) \
+                 select g, pg_current_xact_id(), '0/10', n, c, s from (values {rows}) \
+                     as v(g, n, c, s)",
+                plan.staged
+            )
+        };
+        let rows_sql =
+            format!("select g, __n, __count_1, __sum_1::bigint from {hidden} order by ctid");
+        type Row = (Option<i32>, i64, i64, i64);
+        let read = |rows: Vec<tokio_postgres::Row>| -> Vec<Row> {
+            rows.iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+                .collect()
+        };
+
+        // An empty `T`: groups staged out of order, a zero one and the
+        // `NULL` one among them, each inserted, in group order.
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&plan.staged_ddl()).await.expect("staged");
+        let descending: Vec<String> = (1..=40)
+            .rev()
+            .map(|g| format!("({g}, 1, 1, {g})"))
+            .collect();
+        txn.batch_execute(&stage(&format!(
+            "{}, (null::integer, 2, 2, 7), (41, 0, 0, 0)",
+            descending.join(", ")
+        )))
+        .await
+        .expect("stage");
+        upsert_join_build_groups(&txn, &plan).await.expect("upsert");
+        let rows = read(txn.query(&rows_sql, &[]).await.expect("rows"));
+        let mut expected: Vec<Row> = (1..=40).map(|g| (Some(g), 1, 1, i64::from(g))).collect();
+        expected.push((Some(41), 0, 0, 0));
+        expected.push((None, 2, 2, 7));
+        assert_eq!(rows, expected, "every staged group, in group order");
+        txn.commit().await.expect("commit");
+
+        // Over those rows: group 1 and the `NULL` group add, group 2's zero
+        // delta leaves its row as it was.
+        let txn = client.transaction().await.expect("begin");
+        txn.batch_execute(&plan.staged_ddl()).await.expect("staged");
+        txn.batch_execute(&stage(
+            "(1, 1, 1, 5), (1, 1, 1, 6), (2, 0, 0, 0), (null::integer, 1, 1, 3)",
+        ))
+        .await
+        .expect("stage");
+        let ctid_of_2 = format!("select ctid::text from {hidden} where g = 2");
+        let before: String = txn.query_one(&ctid_of_2, &[]).await.expect("ctid").get(0);
+        upsert_join_build_groups(&txn, &plan).await.expect("upsert");
+        let after: String = txn.query_one(&ctid_of_2, &[]).await.expect("ctid").get(0);
+        assert_eq!(before, after, "a zero delta does not rewrite its row");
+        let mut changed: Vec<Row> = read(txn.query(&rows_sql, &[]).await.expect("rows"))
+            .into_iter()
+            .filter(|(g, ..)| matches!(g, None | Some(1) | Some(2)))
+            .collect();
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![(None, 3, 3, 10), (Some(1), 3, 3, 12), (Some(2), 1, 1, 2)],
+            "deltas add to the rows there; no second row for any group"
+        );
+        // Group 2's row is locked all the same: another writer waits on it.
+        let other = connect().await;
+        let err = other
+            .query(
+                &format!("select 1 from {hidden} where g = 2 for update nowait"),
+                &[],
+            )
+            .await
+            .expect_err("group 2 is locked");
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "{err:?}"
+        );
         txn.rollback().await.expect("rollback");
     }
 

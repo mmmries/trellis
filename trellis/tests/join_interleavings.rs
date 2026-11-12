@@ -3410,6 +3410,69 @@ async fn family9_a_build_against_a_frozen_page_inner_pair_key() {
     a_build_against_a_frozen_page(Key::Pair, I).await;
 }
 
+/// A build's `T` upsert against a page on a group they share: `LEFT`'s
+/// unmatched `(4, NULL)` group, which the build stages from row 8 and a page
+/// of a new, unmatched key reaches without meeting any lock the build holds
+/// before its `T` write. The page writes the group while the build is frozen
+/// before that write, and either commits first, or holds the group's row
+/// (frozen after its `T` write) until the build's upsert queues behind it.
+/// Either way the upsert adds the build's delta to the page's row: the group
+/// counts both rows, once each, on a fresh build and on a rebuild in place.
+#[tokio::test]
+async fn a_page_racing_the_build_on_a_shared_t_group_lands_once() {
+    for in_place in [false, true] {
+        for page_holds in [false, true] {
+            let context = format!("in place: {in_place}, the page holds the group: {page_holds}");
+            let mut lab = seeded(Key::Single, &[L], BUILD_SEED).await;
+            let job = if in_place {
+                lab.build().await;
+                request_rebuild(&lab, "a").await;
+                "sweep"
+            } else {
+                "plan"
+            };
+            let mut building = lab
+                .build_frozen(job, &[PausePoint::BeforeJoinTargetLock])
+                .await;
+            building.reached(PausePoint::BeforeJoinTargetLock).await;
+            let batch = lab
+                .sealed("insert into public.a values (30, 4, 0, 40, 1)")
+                .await;
+            let target = L.target();
+            if page_holds {
+                let mut page = lab
+                    .d
+                    .drain_frozen(
+                        batch,
+                        "page",
+                        &[(PausePoint::AfterGroupUpsert, target.as_str())],
+                    )
+                    .await;
+                let reached = page.reached(PausePoint::AfterGroupUpsert).await;
+                lab.d
+                    .release(&mut building, PausePoint::BeforeJoinTargetLock)
+                    .await;
+                lab.d.wait_blocked_behind(reached.backend_pid).await;
+                lab.d.release(&mut page, PausePoint::AfterGroupUpsert).await;
+                page.finish().await;
+            } else {
+                lab.d.drain(batch, "page").await;
+                lab.d
+                    .release(&mut building, PausePoint::BeforeJoinTargetLock)
+                    .await;
+            }
+            building.finish().await;
+            lab.assert_built(&context).await;
+            assert_eq!(
+                hidden_rows(&lab, L, "t", "ga, gb, __n", "where ga = 4").await,
+                ["(4,,2)"],
+                "{context}: rows 8 and 30, each counted once"
+            );
+            lab.check(&context).await;
+        }
+    }
+}
+
 /// Runs `sql` on `lab`'s connection to `part` of `kind`'s hidden tables.
 async fn hidden_rows(
     lab: &Lab,
