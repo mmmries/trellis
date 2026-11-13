@@ -132,7 +132,8 @@ Nothing in the binding uses it.
   stays `:queued`.
 - `Trellis::Metrics.render_prometheus`: the process-wide metrics registry as
   Prometheus text, for a `/metrics` route the app already serves (the
-  binding opens no port; see [Metrics](#metrics)). It needs no handle.
+  binding opens no port; `Trellis::Metrics::RackApp` is a mountable route;
+  see [Metrics](#metrics)). It needs no handle.
 
 ```ruby
 require "trellis/pg"
@@ -212,21 +213,35 @@ Prometheus's text format. Every series carries a `trellis_instance` label
 shuts down. The metrics themselves are listed in
 [`docs/observability.md`](../../docs/observability.md).
 
-The binding opens no port, so serve the text from a route of the app's own:
+The binding opens no port. `Trellis::Metrics::RackApp` is a Rack app that
+serves the text, so a Rails app mounts it:
 
 ```ruby
 # config/routes.rb
-get "/metrics", to: proc {
-  [200, { "content-type" => "text/plain; version=0.0.4" }, [Trellis::Metrics.render_prometheus]]
-}
+mount Trellis::Metrics::RackApp, at: "/metrics/trellis"
 ```
 
-Under a forking server each worker process has its own registry, holding
-only its own handles' series, so Prometheus scrapes each worker (or the
-worker handle, `staging: true`, runs in a process of its own that it
-scrapes). A process forked while its parent had a handle running can't
-render the registry, as it can't connect: it raises
-`Trellis::ForkedHandleError` (see [Forking servers](#forking-servers)).
+It answers `GET` and `HEAD` and needs no Rack gem; in a `config.ru` it is
+`map("/metrics/trellis") { run Trellis::Metrics::RackApp }`. The mount is
+unauthenticated, like any Prometheus target.
+
+**Scrape the process that runs the worker.** The series that matter (the
+`ring_*` gauges, the latency histograms, `changes_applied_total`) are set in
+the process that runs the staging and drain work (`staging: true`,
+`drain_threads` above 0). A web process whose handle does neither holds only
+`trellis_instance_up`. A worker with no web server (`bin/rails runner`, a
+script) has no route to mount, so run it under a Rack server (a `config.ru` that boots the environment and
+runs the app above, in the same process as the handle) or render the text
+from a route of your own. Under a forking server each worker process has its own
+registry holding only its own handles' series, so Prometheus scrapes each. A
+process forked while its parent had a handle running can't render the
+registry, as it can't connect: it raises `Trellis::ForkedHandleError` (see
+[Forking servers](#forking-servers)).
+
+To put Trellis's series on an exporter the app already has
+(`prometheus-client`, `prometheus_exporter`, Yabeda), serve
+`Trellis::Metrics.render_prometheus` after the exporter's own body from a
+route of your own.
 
 ### Logs
 
