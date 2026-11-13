@@ -462,6 +462,14 @@ their lock rows, in [the order above](#join-targets)). The entry lock is ordered
 then pre-locked in key order, and an aggregate's group upsert writes its
 groups in group order.
 
+Every session Trellis opens sets `default_transaction_isolation` to
+`read committed` (`pool::READ_COMMITTED`), whatever the server's, database's
+or role's default, so a statement after a lock statement reads from a snapshot
+taken after the lock, as I1 requires
+([ADR-0028](../decisions/0028-locking-and-writing.md#i1-a-writer-reads-after-its-lock-under-read-committed)).
+A transaction that needs one snapshot for several reads asks for its level
+explicitly.
+
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
 residual serialization failures (`40001`/`40P01`) is the whole deadlock story.
@@ -527,6 +535,14 @@ reconcile pass leaves a table whose lock stays held to the next pass
 ([01](01-capture-by-triggers.md#installing-widening-narrowing-and-uninstalling)).
 The retire path's `TRUNCATE` is the older precedent: it takes its lock
 `NOWAIT` and skips the slot until the next tick.
+
+A `MIN`/`MAX` probe ([the group basis](group-basis.md#a-page)) takes the
+source's `ACCESS SHARE` lock while its page holds its groups. That conflicts
+with no row write; only an `ACCESS EXCLUSIVE` statement on the source (most
+`ALTER TABLE` forms, `DROP`, `TRUNCATE`, `VACUUM FULL`) queues behind it, until
+the probing page commits, and the application's statements queued behind that
+one wait with it. Behind an application's `ACCESS EXCLUSIVE` lock the probe
+times out, and the page rolls back with its group locks and is retried (I7).
 
 An autovacuum holding the table blocks the DDL the same way. Postgres cancels
 one only when a waiter runs its deadlock check, after `deadlock_timeout`,
