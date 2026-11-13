@@ -3762,6 +3762,9 @@ impl GroupTargetPlan {
             // recorded.
             RebuildRead::Probe => None,
         };
+        // `r` in the order the hidden rows are stored, so the update reaches
+        // them in that order (ADR-0028 W2); [`REBUILD_PLAN_SETTINGS`] rule
+        // out the hash join on `ctid` that would scatter them.
         let r = match a {
             Some(a) => format!(
                 "a as ({a}), {}",
@@ -3769,10 +3772,18 @@ impl GroupTargetPlan {
                     &kept,
                     "x.ctid",
                     "__hc",
-                    &format!("left join a on {}", self.group_match("a", "rg"))
+                    &format!(
+                        "left join a on {} order by h.__hc",
+                        self.group_match("a", "rg")
+                    )
                 )
             ),
-            None => self.hidden_read_sql(&kept, "x.ctid", "__hc", &self.probe_join_sql()),
+            None => self.hidden_read_sql(
+                &kept,
+                "x.ctid",
+                "__hc",
+                &format!("{} order by h.__hc", self.probe_join_sql()),
+            ),
         };
         #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
         let mut snap = SNAPSHOT_AND_STAMP.to_string();
@@ -4310,6 +4321,12 @@ const PLAN_RESET: &str =
 /// and sorting arrays costs several times hashing them.
 pub(super) const BULK_PLAN_SETTINGS: &str = "set local enable_mergejoin = off";
 pub(super) const BULK_PLAN_RESET: &str = "set local enable_mergejoin to default";
+
+/// [`rebuild`]'s settings for its replace ([`GroupTargetPlan::rebuild_sql`]):
+/// past `work_mem`, a hash join of the hidden rows to `r` spills into batches
+/// and hands the update its rows batch by batch, scattered over the table.
+const REBUILD_PLAN_SETTINGS: &str = "set local enable_hashjoin = off";
+const REBUILD_PLAN_RESET: &str = "set local enable_hashjoin to default";
 
 /// The most `GROUP BY` columns a group lookup writes one index probe per
 /// pattern of `NULL`s for (`GroupTargetPlan::group_lookup`): 15 probes at 4.
@@ -5054,9 +5071,11 @@ pub(crate) async fn rebuild(
     };
     #[cfg(any(test, feature = "test-util"))]
     let read = early.map_or(read, RebuildRead::Early);
+    txn.batch_execute(REBUILD_PLAN_SETTINGS).await?;
     let rows = txn
         .query(&plan.rebuild_sql(image_columns.as_deref(), &read), &[])
         .await?;
+    txn.batch_execute(REBUILD_PLAN_RESET).await?;
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
 }
@@ -5263,7 +5282,8 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
 /// aggregate's), for `target`'s group-basis definition, each read from the
 /// whole source. Planned with nested loops disabled, so a nested loop that
 /// matches the groups shows only where the match can't be hashed or merged;
-/// the lateral lookups of the hidden rows stay nested loops. It
+/// the lateral lookups of the hidden rows stay nested loops. The rebuild's
+/// is planned under its own settings too ([`REBUILD_PLAN_SETTINGS`]). It
 /// locks and writes nothing.
 #[cfg(any(test, feature = "internals"))]
 pub async fn explain_whole_source_reads(
@@ -5291,11 +5311,15 @@ pub async fn explain_whole_source_reads(
     ))
     .await?;
     let statements = [
-        plan.recompute_sql(None, Some(plan.source_row())),
-        plan.rebuild_sql(None, &RebuildRead::Source),
+        (plan.recompute_sql(None, Some(plan.source_row())), ""),
+        (
+            plan.rebuild_sql(None, &RebuildRead::Source),
+            REBUILD_PLAN_SETTINGS,
+        ),
     ];
     let mut plans = [String::new(), String::new()];
-    for (out, sql) in plans.iter_mut().zip(statements) {
+    for (out, (sql, settings)) in plans.iter_mut().zip(statements) {
+        txn.batch_execute(settings).await?;
         let rows = txn.query(&format!("explain {sql}"), &[]).await?;
         *out = rows
             .iter()
@@ -5929,6 +5953,76 @@ mod tests {
             .and_then(|rows| rows.parse().ok())
             .expect("estimated rows");
         assert!(rows <= 40_000.0, "planned for 20000 cells: {write_plan}");
+    }
+
+    /// A rebuild's replace updates the hidden rows in the order they are
+    /// stored (ADR-0028 W2), freshly inserted by the lock statement or held
+    /// and analyzed: `r` read in that order, then a merge join on `ctid` or,
+    /// for few groups, one TID probe per row. A hash join there spills into
+    /// batches and scatters the updates.
+    #[tokio::test]
+    async fn a_rebuild_updates_the_hidden_rows_in_their_stored_order() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let shape = shape_of("TRANSFORM t FROM s GROUP BY g SELECT COUNT(*) AS n, SUM(a) AS s");
+        let plan = GroupTargetPlan::new(
+            "trellis",
+            7,
+            "public.t",
+            "public.s",
+            Vec::new(),
+            golden::identity(&shape),
+            shape.clone(),
+        );
+        client
+            .batch_execute(&format!(
+                "create schema if not exists trellis; {}; {}; \
+                 create table public.segments (seg_seq bigint); \
+                 create table public.s (id integer primary key, g integer, a integer); \
+                 insert into public.s select i, i, i from generate_series(1, 20000) i; \
+                 analyze public.s",
+                hidden_table_ddl("trellis", 7, &shape),
+                target_table_ddl("public.t", &shape),
+            ))
+            .await
+            .expect("source, hidden and visible tables");
+        for analyzed in [false, true] {
+            let txn = client.transaction().await.expect("begin");
+            txn.batch_execute(&format!(
+                "{}; {}; insert into {} (g) select g from public.s; {}",
+                plan.staged_ddl(),
+                plan.recomputed_ddl(),
+                plan.recomputed,
+                plan.lock_sql(),
+            ))
+            .await
+            .expect("lock");
+            if analyzed {
+                analyze(&txn, &[&plan.hidden_ident]).await.expect("analyze");
+            }
+            txn.batch_execute(REBUILD_PLAN_SETTINGS)
+                .await
+                .expect("settings");
+            for read in [RebuildRead::Source, RebuildRead::Probe] {
+                let sql = plan.rebuild_sql(None, &read);
+                let shown = explain(&txn, &sql).await;
+                let up = &shown[shown.find("CTE up").expect("an update")..];
+                let up = &up[..up.find("CTE cur").expect("the visible tail")];
+                assert!(
+                    up.lines().any(|l| {
+                        (l.contains("Merge Cond") || l.contains("TID Cond")) && l.contains("r.__hc")
+                    }) && !up.lines().any(|l| l.contains("Hash") && l.contains("Join")),
+                    "{read:?}, analyzed {analyzed}: {shown}"
+                );
+            }
+            txn.rollback().await.expect("rollback");
+        }
     }
 
     /// ADR-0019's strict `T` write: a `JOIN`'s `T` page whose staged group
