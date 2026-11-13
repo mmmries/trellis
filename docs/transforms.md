@@ -247,44 +247,33 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 
 #### A source dropped, renamed, swapped, or its capture disrupted
 
-A source table or a `JOIN`'s joined table can be dropped, renamed away, moved
-to another schema, swapped for another table or replaced by a view after
-define. Its capture triggers or functions can also be disabled, dropped,
-recreated or replaced outside Trellis. Any of these pauses every reader with a
-`capture_failure` of kind `disruption`, which names the finding and says that
-changes made meanwhile may be missing. Nothing is reinstalled or rebuilt until
-a `RESUME`.
-
-On a partitioned source, the root and every node of its tree are checked, and
-the finding names the node. A root dropped and created again, swapped by
-renames or renamed away is a disruption, as is a plain table created again as
-a partitioned one, or the reverse. Partition maintenance (an attach, detach,
-new leaf, dropped leaf, `DEFAULT` or `HASH` re-split) is not.
-
-`RESUME` refuses while the table is missing. Otherwise it re-validates the
-definition against the table now at that name, reinstalls capture and rebuilds
-from that table. If the table was created again with another primary key, what
-Trellis stored under the old key is discarded. A 1-1 target is first re-keyed
-in place, or the resume refuses
-([`PAUSE` and `RESUME`](operations.md#pause-and-resume)). Plan a scripted `RESUME` after a swap, or after a bulk load with
-triggers disabled ([embedding](embedding.md)).
+A source or joined table dropped, renamed away, moved to another schema,
+swapped for another table or replaced by a view, or its capture triggers or
+functions disabled, dropped or replaced outside Trellis, is a
+[Disruption](#disruption). The `capture_failure` names the finding and says
+changes made meanwhile may be missing, and nothing is reinstalled until a
+`RESUME`. On a partitioned source every node of the tree is checked: a root
+dropped and created again, swapped or renamed away is a disruption, as is a
+plain table created again partitioned or the reverse; partition maintenance is
+not. `RESUME` refuses while the table is missing; otherwise it re-validates
+against the table now at that name and rebuilds from it
+([`PAUSE` and `RESUME`](operations.md#pause-and-resume)). Plan a scripted
+`RESUME` after a swap, or after a bulk load with triggers disabled
+([embedding](embedding.md)).
 
 #### The key a transform keys each table by
 
-A transform keys each table it reads by the table's primary key, or by the
-columns a `KEY (…)` written directly after the table names
-(`FROM orders KEY (customer_id, id)`, `JOIN b KEY (…) ON`). Another
-transform's target is keyed by the key Trellis gave it. A target is keyed by
-its source's key (1-1, and a 1-1 `JOIN` by its `FROM` table's), or by its
-`UNIQUE NULLS NOT DISTINCT` group key (aggregate, `JOIN`). The rules and their
-reasons are [ADR-0026](decisions/0026-source-keys.md). Define refuses:
+A transform keys each table it reads by its primary key, or by the columns of
+a `KEY (…)` written directly after the table (`FROM orders KEY (customer_id,
+id)`, `JOIN b KEY (…) ON`). Another transform's target is keyed by the key
+Trellis gave it. The rules and their reasons are
+[ADR-0026](decisions/0026-source-keys.md). Define refuses:
 
 - no primary key and no `KEY` (`NoPrimaryKey`, naming both remedies, or
   `RecordedKeyMissing` once a transform has recorded the table's key);
-- a deferrable primary key and no `KEY` (`DeferrablePrimaryKey`). Recreate it
-  in one statement, as the message says
-  (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`): Postgres can't
-  make a key not deferrable in place;
+- a deferrable primary key and no `KEY` (`DeferrablePrimaryKey`). Postgres
+  can't make a key not deferrable in place: recreate it in one statement
+  (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`);
 - a `KEY` no unique index backs (`KeyNotBacked`). The index must be valid, not
   deferrable, not partial and over no expression, with exactly the `KEY`'s
   columns in any order, default operator classes and the columns' own
@@ -295,177 +284,125 @@ reasons are [ADR-0026](decisions/0026-source-keys.md). Define refuses:
 - a key column off the [join-key allowlist](type-support.md)
   (`UnsupportedPrimaryKeyType`);
 - a key other than the one the table's other transforms use
-  (`KeyDiffersFromReaders`, naming the key to write), so a second transform
-  over a `KEY` table repeats the `KEY`.
+  (`KeyDiffersFromReaders`, naming the key to write).
 
-Trellis records each table's key the first time a transform keys by it, tied
-to that table. A unique index added later, one an adopted target already had,
-the order a dump restore creates constraints in and `REINDEX CONCURRENTLY`
-change nothing. After define the key is the [Key](#key) class. What `RESUME`
-takes as the key, and how it re-keys a 1-1 target in place, is in
+After define the key is the [Key](#key) class. What `RESUME` takes as the key,
+and how it re-keys a 1-1 target, is in
 [`PAUSE` and `RESUME`](operations.md#pause-and-resume).
 
 #### Row-level security on a role Trellis runs as
 
 Row-level security applies to a role when RLS is enabled and the role neither
 owns the table (directly or through membership) nor has `BYPASSRLS`, or owns
-it and the table is `FORCE ROW LEVEL SECURITY`. A superuser is exempt. Every
+it and the table is `FORCE ROW LEVEL SECURITY`; a superuser is exempt. Every
 Trellis connection runs with `row_security = off`, so a read or write the
 policies would filter fails rather than skipping rows.
 
-Define checks a source or target for the role that owns the ring, and checks a
-table that is another transform's target for the defining role. A `MIN`/`MAX`
-aggregate's source is also checked for the ring owner's `SELECT`
-(`ExtremeSourceNotReadable`), at define and on a whole-transform `RESUME`. A
-drain logs in as that role or a member of it, and re-reads a group's extreme
-from the source when the current one is deleted.
+Define checks a source or target for the role that owns the ring, including
+policies DDL around the target's creation applies (an event trigger forcing
+RLS on every new table), and a table that is another transform's target for
+the defining role. A `MIN`/`MAX` aggregate's source is also checked for the
+ring owner's `SELECT` (`ExtremeSourceNotReadable`), at define and on a
+whole-transform `RESUME`: a drain logs in as that role and re-reads a group's
+extreme from the source; the remedy is `GRANT SELECT`.
 
 After define, a refused build chunk pauses its transform after its charged
-retries, with the error on `backfill_failure`. On a partitioned source, define
-and the pass check the root only. A policy on a partition below it reaches
-none of the reads that follow writes, which all go through the root. The
-correction of that partition reads the partition itself, though, after a
-`TRUNCATE` of it, an attach of it with rows, or direct writes into it as a new
-leaf. That read is refused, and it pauses the transform after its charged
-retries in the same way. The refusals that only log or retry:
-[observability — A halting failure](observability.md#a-halting-failure). For
-a `MIN`/`MAX` source, the remedy is `GRANT SELECT` on it to the ring's owner.
+retries, with the error on `backfill_failure`
+([observability — A halting failure](observability.md#a-halting-failure)). On
+a partitioned source, define and the pass check the root only. A policy on a
+partition reaches only the correction that reads that partition (after its
+`TRUNCATE`, an attach with rows, or direct writes to it as a new leaf), which
+then pauses the transform the same way.
 
 #### A virtual generated column a definition reads
 
-This is a column defined `GENERATED ALWAYS AS (…) VIRTUAL` (PostgreSQL 18) that
-a definition reads: a 1-1 field, a `GROUP BY` key, an aggregate's argument, or
-a `JOIN`'s `ON` column or field on either table. A statement trigger's
-transition table holds no value for a virtual column, so capture can't image
-it. Define refuses it, as do an `ALTER TRANSFORM` that adds such a field and a
-`RESUME`, naming the table, the column and its expression. A definition on the
-same table that doesn't read the column is unaffected.
+A column `GENERATED ALWAYS AS (…) VIRTUAL` (PostgreSQL 18) that a definition
+reads, anywhere: a statement trigger's transition table holds no value for it,
+so capture can't image it. Define, an `ALTER TRANSFORM` that adds such a field
+and a `RESUME` refuse it, naming the table, the column and its expression. A
+definition on the same table that doesn't read it is unaffected. Write the
+expression in the definition where the grammar covers it (in a 1-1 transform,
+under a field name no source column has), or make the column `STORED`.
 
-A read column can become virtual after define: dropped and added again as
-virtual, or another column renamed onto its name. Until the next pass, the
-application's inserts and deletes on the table fail
-(`unexpected virtual generated column reference`). An update stages the column
-as `NULL`, or stages nothing when no other column capture reads changed. The
-resume's rebuild repairs the targets. A virtual column renamed onto the name
-and back before a pass pauses nothing
+A read column can become virtual after define (dropped and added again, or
+another renamed onto its name). Until the next pass the application's inserts
+and deletes on the table fail (`unexpected virtual generated column
+reference`), and an update stages the column as `NULL`; the resume's rebuild
+repairs the targets
 ([known correctness gaps](known-correctness-gaps.md#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)).
-
-Write the expression in the definition in place of the column where the
-grammar covers it (in a 1-1 transform, under a field name no source column
-has), or make the column `STORED`.
 
 #### A column Trellis copies, widened
 
-Trellis creates some columns with a source column's type, and widening that
-source column can outgrow them. These columns are:
-
-- a 1-1 target's key, passthrough and calculated columns;
-- an aggregate's `GROUP BY` key (copied into its target and its hidden table)
-  and its field columns;
-- a `JOIN`'s `GROUP BY` keys and `ON` columns (copied into its target and its
-  hidden tables, each with its type, no modifier, and its collation), and its
-  field columns;
-- a 1-1 `JOIN`'s key, its field columns, and the columns of its hidden `R`,
-  `M` and `J`.
-
-The widenings are `integer` → `bigint` (and `smallint` up), an integer →
-`numeric` (unless every value of the `numeric` fits the integer), and `real` →
-`double precision`. A wider modifier is no widening: a copy has none
+Trellis creates some columns with a source column's type: a 1-1 target's key,
+passthrough and calculated columns; an aggregate's `GROUP BY` keys and fields,
+in its target and hidden table; a `JOIN`'s `GROUP BY` keys, `ON` columns and
+fields, in its target and hidden tables; and a 1-1 `JOIN`'s key, fields, `R`,
+`M` and `J`. A widening can outgrow them: `integer` → `bigint` (and `smallint`
+up), an integer → `numeric` (unless every value of the `numeric` fits the
+integer), and `real` → `double precision`. A modifier change is no widening,
+since a copy has none, and needs no re-type, pause or rebuild
 ([ADR-0020](decisions/0020-type-identity.md),
-[the types of the columns Trellis creates](type-support.md#the-types-of-the-columns-trellis-creates)).
-A change of a modifier (a string bound, a `numeric` precision, a temporal
-precision, a move to `text`) needs no re-type, no pause and no rebuild.
+[type support](type-support.md#the-types-of-the-columns-trellis-creates)).
 
 After a widening, the staging worker pauses every transform that owns a column
-the new type outgrew, naming the source column and each of those columns. A
-narrowing pauses nothing here, except a `varchar(n)` key's. `RESUME` makes the
-staging worker `ALTER` each column whose type differs from the one define
-would give it now, under `ACCESS EXCLUSIVE`, then rebuilds. That is a table
-rewrite for `integer` → `bigint`, and reads of the target wait. A `JOIN`'s or
-a 1-1 `JOIN`'s hidden tables are created again at the new types instead
+the new type outgrew, naming the source column and each copy; a narrowing
+pauses nothing here, except a `varchar(n)` key's. `RESUME` re-types each copy
+under `ACCESS EXCLUSIVE` (a table rewrite for `integer` → `bigint`, which
+reads of the target wait for) and rebuilds; a `JOIN`'s and a 1-1 `JOIN`'s
+hidden tables are created again instead
 ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-re-typed-key-column-or-an-outgrown-copy)).
 
 #### A table of more than 1,600 columns
 
-Postgres caps one table at 1,600 columns (`MaxHeapAttributeNumber`). Trellis
-creates a target with a column per key and field, and hidden tables whose
-width follows the fields too:
-
-- an aggregate's hidden table has its `GROUP BY` columns, a column counting
-  each distinct argument, a column summing each one a `SUM` or `AVG` reads,
-  and a column for each distinct `MIN` or `MAX` call, with two more for their
-  basis and stamp when there is one;
-- a `JOIN`'s hidden partials tables do the same, per side and for the groups;
-- a 1-1 `JOIN`'s ledger for a side has a column for every column that side's
-  fields read.
-
-So about 800 distinct summed aggregate arguments overflow a hidden table that
-their target fits in. The error names the table's role and the limit. It is
-checked for the definition, `RESUME` and an `ALTER TRANSFORM … ADD`. An
-`ALTER TRANSFORM` also counts the columns earlier edits dropped, and the
-column a `DROP z, ADD … AS z` replaces, since Postgres counts a dropped column
-until the table is created again. If dropped fields filled the limit, drop the
-transform and define it again.
-
-An aggregate meets smaller limits first, and define does not refuse them. From
-about 270 distinct summed arguments, the statements that build and apply it
-exceed Postgres's 1,664-entry target list: its build pauses, or its changed
-groups are quarantined, with Postgres's error
-([#1518](https://github.com/salesforce-misc/trellis/issues/1518)). From about
-500, a hidden table's row can outgrow a heap page
+Postgres caps a table at 1,600 columns. Trellis creates a target with a column
+per key and field, and hidden tables whose width follows the fields: an
+aggregate's has its `GROUP BY` columns, a count per distinct argument, a sum
+per argument a `SUM` or `AVG` reads, and a column per distinct `MIN` or `MAX`
+(plus two for their basis and stamp); a `JOIN`'s partials do the same per side
+and for the groups; a 1-1 `JOIN`'s ledger for a side has a column per column
+its fields read. So about 800 distinct summed arguments overflow a hidden
+table their target fits in. The error names the table's role and the limit.
+It is checked at define, `RESUME` and `ALTER TRANSFORM … ADD`, which also
+counts the columns earlier edits dropped (Postgres counts them until the table
+is created again): if they filled the limit, drop the transform and define it
+again. Define doesn't refuse the smaller limits an aggregate meets first: from
+about 270 distinct summed arguments its statements exceed Postgres's
+1,664-entry target list
+([#1518](https://github.com/salesforce-misc/trellis/issues/1518)), and from
+about 500 a hidden row can outgrow a heap page
 ([#1516](https://github.com/salesforce-misc/trellis/issues/1516)).
 
 #### A source without the index its `self_check` walk pages by
 
-This applies to a `GROUP BY` aggregate or a `JOIN` whose source lacks the
-index its `self_check` walk pages by. For an aggregate, that is a valid,
-non-partial btree index on the plain source columns, whose leading columns are
-the `GROUP BY` columns in `GROUP BY` order. For a `JOIN`, each side needs one
-whose leading columns are that side's `ON` columns in `ON` order.
+A `GROUP BY` aggregate's source needs a valid, non-partial btree index on
+plain columns whose leading columns are the `GROUP BY` columns in order; each
+table of a `JOIN` needs one leading with its `ON` columns in `ON` order. A
+primary key or unique constraint that leads with them counts. An expression
+or partial index, a non-default operator class (`text_pattern_ops`) and mixed
+directions (`(a, b DESC)`; all ascending `NULLS LAST` or all `DESC NULLS FIRST`
+is fine) don't. A 1-1 target needs nothing, nor does a `JOIN`'s `T` part,
+which no single table's index serves.
 
-A primary key or unique constraint that leads with them counts. These don't:
-
-- an expression or partial index;
-- an index under a non-default operator class, such as `text_pattern_ops`;
-- an index whose leading columns aren't all ascending with `NULLS LAST` (the
-  default) or all `DESC` with `NULLS FIRST` (the `DESC` default, read
-  backward), such as `(a, b DESC)`.
-
-A 1-1 target needs nothing, since its walk pages by the primary key. A
-`JOIN`'s `T` part, with group columns from both tables, is served by no single
-table's index, so it needs none.
-
-The error names the table, the columns, and the part of the definition that
-needs the index (the `GROUP BY` columns, or a `JOIN`'s `ON` columns on its
-from or joined side). It also gives a ready-to-run `create index`. Writing
-`WITHOUT SOURCE INDEX` after the `GROUP BY` or `JOIN` clause
-(`TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT …`) opts that
-definition out. A definition with a `MIN` or `MAX` field can't opt out: it
-needs more ([the `MIN`/`MAX` entry](#min-or-max-in-a-plain-aggregate)). Builds
-need no index. An opted-out definition's gap is still listed in
-`source_index_gaps`, and its `self_check` still runs, scanning the source once
-per page.
+The error names the table, the columns and the part of the definition that
+needs the index, with a ready-to-run `create index`. Writing
+`WITHOUT SOURCE INDEX` after the `GROUP BY` or `JOIN` clause opts the
+definition out: its gap is still listed in `source_index_gaps`, and its
+`self_check` scans the source once per page. A definition with a `MIN` or
+`MAX` field can't opt out ([the `MIN`/`MAX` entry](#min-or-max-in-a-plain-aggregate)).
+Builds need no index.
 
 #### An unsupported `JOIN` shape
 
-Only `INNER` and `LEFT` equi-joins of different tables are admitted. A join
-with a `GROUP BY` takes two tables (a 1-1 `JOIN` may read more:
-[the star entry](#1-1-join-of-more-than-two-tables-star)). Every column is
-written `<table>.<column>`, or `<alias>.<column>` for a table given an alias.
-Each table is held to every rule here, as a `FROM` is. Either table may be
-another transform's target, read through that target's change feed. The build
-first waits out the transactions that began before it
-([data flow](data-flow.md#the-re-derive-build),
-[ADR-0019](decisions/0019-join-transforms.md#a-side-may-be-another-transforms-target-through-the-target-change-feed)).
+Only `INNER` and `LEFT` equi-joins of different tables are admitted, and a
+join with a `GROUP BY` takes two tables. Each table is held to every rule
+here, as a `FROM` is, and may be another transform's target, read through its
+change feed
+([ADR-0019](decisions/0019-join-transforms.md#a-side-may-be-another-transforms-target-through-the-target-change-feed)).
+A field is a `GROUP BY` key from either table, or a composition of aggregates
+(`COALESCE(SUM(items.qty), 0)`), each `COUNT(*)` or `COUNT`/`SUM`/`AVG` over one
+table's columns (`SUM(items.qty + 1)`), kept as a running total on that table.
 
-A field is either a `GROUP BY` key from either table, or a composition of
-aggregates with literals, operators and functions
-(`COALESCE(SUM(items.qty), 0)`). Each aggregate is `COUNT(*)`, or
-`COUNT`/`SUM`/`AVG` of a column or of an expression over one table's columns
-(`SUM(items.qty + 1)`). Each argument is kept as a running total on its own
-table, so an argument that reads both tables has no such total.
-
-Refused, with or without a `GROUP BY` (a join without one is a
+Refused, with or without a `GROUP BY` (without one it is a
 [1-1 `JOIN`](#a-1-1-join)):
 
 - **Join type.** `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `LATERAL`, `USING` and
@@ -496,91 +433,49 @@ Refused, with or without a `GROUP BY` (a join without one is a
 
 #### A 1-1 `JOIN`
 
-A 1-1 `JOIN` is `FROM a [LEFT|INNER] JOIN b ON … SELECT …` with no `GROUP BY`
-([ADR-0021](decisions/0021-one-to-one-join-transforms.md),
-[1-1 JOIN](#1-1-join)). Refused:
+A [1-1 `JOIN`](#1-1-join) is refused when:
 
 - `b`'s `ON` columns are not unique (`OneToOneJoinKeyNotUnique`);
-- an aggregate field (`OneToOneJoinAggregate`);
-- a column that starts with `__` is read (`OneToOneJoinUnsupported`);
+- a field is an aggregate (`OneToOneJoinAggregate`);
+- it reads a column that starts with `__` (`OneToOneJoinUnsupported`);
 - a side is partitioned (`PartitionedSource`);
 - the `ON` names one column in two terms (`JoinOnRepeatedColumn`);
 - the `ON` reads two columns of `a` whose names share their first 60 bytes;
 - `b` is another transform's 1-1 target, joined on columns that leave out part
-  of that target's primary key;
-- `WITHOUT SOURCE INDEX` (a parse error).
+  of that target's primary key: Trellis orders changes per primary-key value
+  only, so only that key is unique at every instant while the upstream drains
+  (an `a` that is a 1-1 target may be joined on any columns);
+- it says `WITHOUT SOURCE INDEX` (a parse error).
 
-`b`'s `ON` columns must contain a unique key of `b`. That can be its primary
-key, a unique constraint, or a non-partial unique index on plain columns
-(deferrable, or with `INCLUDE` columns, is fine for this check). It can also
-be the group key of an aggregate or `JOIN` target. `b`'s row-identity key (its
-primary key or `KEY`) is a separate rule: it must not be deferrable
-([the key entry](#the-key-a-transform-keys-each-table-by)), even when a
-deferrable key is what makes its `ON` columns unique.
+`b`'s `ON` columns contain a unique key of `b` when they hold its primary key,
+a unique constraint, a non-partial unique index on plain columns (deferrable,
+or with `INCLUDE` columns, is fine here), or the group key of an aggregate or
+`JOIN` target. `b`'s row-identity key is a separate rule
+([the key entry](#the-key-a-transform-keys-each-table-by)): it must not be
+deferrable, even when a deferrable key is what makes the `ON` columns unique.
 
-When `b` is another transform's 1-1 target, its `ON` columns must also include
-every column of its primary key, so a unique index added to the target never
-admits a join on another column. Trellis orders changes per primary-key value
-only, so only the primary key is unique at every instant while the upstream
-drains. An `a` that is a 1-1 target may be joined on any columns. How the
-target is built and kept is in [Granularity](#1-1-join).
-
-After define, a widening of a column it copies (`a`'s key, a field, `R`, `M`
-and `J`) is handled as [the widening entry](#a-column-trellis-copies-widened)
-describes. A field over both tables is reported against the table whose column
-widened, naming every column it is typed from. `b`'s unique key on its `ON`
-columns lost is the [Key](#key) class. A duplicate Postgres admits past a
-deferrable key under `session_replication_role = replica` leaves the key valid
-and pauses nothing
-([known correctness gaps](known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
-`RESUME` refuses a `b` whose `ON` columns are no longer unique. It re-keys the
-target to a changed key of `a` as for a 1-1 transform
-([`PAUSE` and `RESUME`](operations.md#pause-and-resume)).
-
-To fix a refusal, join `b` on a unique key: a 1-1 target's, on columns that
-include its primary key, or join the table that transform reads. Give an
-aggregate a `GROUP BY`. Rename a column of `a` whose name's first 60 bytes
-another `ON` column of `a` shares. For `b`'s unique key, restore the key, then
-`RESUME`
+After define, a widened copy is [the widening entry](#a-column-trellis-copies-widened),
+reported for a field over both tables against the table whose column widened.
+`b`'s unique key lost is the [Key](#key) class, and `RESUME` refuses until it
+is back
 ([recommendations](recommendations.md#keep-the-indexes-a-definition-relies-on)).
+A duplicate Postgres admits past a deferrable key under
+`session_replication_role = replica` pauses nothing
+([known correctness gaps](known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
 
 #### 1-1 `JOIN` of more than two tables (star)
 
-A star is a 1-1 `JOIN` of more than two tables
-(`FROM a JOIN b1 ON … LEFT JOIN b2 ON … SELECT …`, [1-1 JOIN](#1-1-join)).
-Refused:
-
-- more than 5 tables (`a` and 4 joined tables: `StarJoinTooManyTables`);
-- a joined table whose `ON` reads a joined table other than its own
-  (`JoinOnReadsAnotherJoinedTable`): a snowflake such as
-  `JOIN b2 ON b1.id = b2.id`, or an `ON` that reads `a` and two joined tables;
-- anything that breaks a rule of [the 1-1 `JOIN` entry](#a-1-1-join) or of
-  [the `JOIN` shape entry](#an-unsupported-join-shape) at any position. The
-  error names the table at that position.
-
-The joins read left to right, as Postgres reads them without parentheses, and
-each joined table is joined to `a` directly. Every rule of the 1-1 `JOIN`
-holds at each position:
-
-- its `ON` columns contain a unique key of its table
-  (`OneToOneJoinKeyNotUnique` names that table);
-- its row-identity key is not deferrable;
-- a joined 1-1 target is joined on columns that include its primary key;
-- no table is partitioned (`PartitionedSource`);
-- no two `ON` columns of `a` share their first 60 bytes;
-- the target isn't named after a table it reads (`TargetEqualsSource`).
-
-Every refusal of the `JOIN` shape holds at every position, each a parse error
-that names it: `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `LATERAL`, `USING`, a comma
-join, and a table read twice (`a` included) under any alias. A `JOIN` with a
-`GROUP BY` still reads two tables (`JoinTooManyTables`). A joined table with
-few distinct keys (a lookup) is admitted at any position, and `status()` warns
-of its fan-out ([1-1 JOIN](#1-1-join)).
-
-After define, each joined table is handled as the 1-1 `JOIN` handles `b`, at
-whichever position it is joined. That includes a value of an enum read there
-being relabelled. `RESUME` re-validates every position as define does, and re-keys the
-target to a changed key of `a`. Join a snowflake's outer table through a
+A [star](#1-1-join) is refused when it has more than 5 tables (`a` and 4
+joined: `StarJoinTooManyTables`), or a joined table's `ON` reads a joined table
+other than its own (`JoinOnReadsAnotherJoinedTable`), as in a snowflake
+(`JOIN b2 ON b1.id = b2.id`). Every rule of [the 1-1 `JOIN`](#a-1-1-join) and
+of [the `JOIN` shape](#an-unsupported-join-shape) holds at each position,
+including that the target isn't named after a table it reads
+(`TargetEqualsSource`), and the error names the table at that position. The
+joins read left to right, as Postgres reads them without parentheses. A
+lookup table with few distinct keys is admitted, and `status()` warns of its
+fan-out. After define, each joined table is handled as `b` is, and `RESUME`
+re-validates every position. Join a snowflake's outer table through a
 transform of its own, and join that target.
 
 #### `MIN` or `MAX` in a plain aggregate
@@ -593,68 +488,53 @@ refused when its argument:
 - is of a type other than `smallint`, `integer`, `bigint`, `numeric`, `real`,
   `double precision`, `date`, `time`, `timestamp`, `timestamptz`, `interval`
   or `oid`, so `text` is refused (`UnsupportedExtremeArgument`);
-- is a column of another transform's target (`ChainedExtreme`).
+- is a column of another transform's target (`ChainedExtreme`), which has no
+  such index and would need a long `CREATE INDEX` on a table Trellis owns.
 
-It is also refused in a definition declared `WITHOUT SOURCE INDEX`
-(`ExtremesWithoutSourceIndex`). And it is refused when the source lacks, for
-each argument, a valid, non-partial btree index that leads with the `GROUP BY`
-columns in order, then the argument, under the index rules of
+It is also refused `WITHOUT SOURCE INDEX` (`ExtremesWithoutSourceIndex`), and
+when the source lacks, per argument, a valid, non-partial btree index leading
+with the `GROUP BY` columns in order, then the argument, under the rules of
 [the source-index entry](#a-source-without-the-index-its-self_check-walk-pages-by)
-(`ExtremeIndexMissing`).
+(`ExtremeIndexMissing`). A deletion that removes a group's extreme re-reads
+the next one through that index
+([type support](type-support.md#min-and-max)); without it each re-read scans
+the group or the whole source, and a page can outrun `statement_timeout`. The
+error names the table, the columns and a ready-to-run `create index`, which
+also serves as the `GROUP BY` index. Take `MIN`/`MAX` of a plain column in the
+transform that reads the source (a stored generated column, for an
+expression).
 
-The index error names the table, the columns and a ready-to-run
-`create index`, one per argument, which also serves as the `GROUP BY` index. A
-group keeps each extreme. A deletion or update that removes it re-reads the
-group's next one from the source, after the group's lock, as one endpoint of
-that index ([type support](type-support.md#min-and-max)). Without the index,
-each re-read scans the group. With no `GROUP BY` index either, it scans the
-whole source, once per group. A page can then outrun `statement_timeout` and
-retry forever, so `WITHOUT SOURCE INDEX` doesn't apply. Another transform's
-target has no such index, and building one is a long `CREATE INDEX` on a table
-Trellis owns. Take `MIN`/`MAX` of a plain column in the transform that reads
-the source (a stored generated column, for an expression).
-
-When the probe index is lost after define, it is the [Index](#index) class.
-A probe index lost while the transform runs leaves the target exact. When the
-transform pauses, the `capture_failure` names the table, the columns and a
-ready-to-run `create index`. On a partitioned source, it also says to re-run
-`ALTER INDEX … ATTACH PARTITION` after repairing a leaf's index, whose repair
-alone leaves the root's index invalid. A rebuild that drops the old index
-first and takes longer than 5 minutes pauses
+A probe index lost after define is the [Index](#index) class, and the target
+stays exact meanwhile. The pause's `capture_failure` names a ready-to-run
+`create index`, and on a partitioned source says to re-run
+`ALTER INDEX … ATTACH PARTITION` after repairing a leaf's index
 ([recommendations](recommendations.md#keep-the-indexes-a-definition-relies-on)).
 
 #### A target whose name is taken
 
-The name is taken when a relation of any kind already exists in the target
-schema under the target's name, or under the name of a table Trellis keeps
-beside it (`<target>__ledger`). That includes another definition's target, in
-this instance or in another instance sharing the target schema. The error is
-`TargetTableExists`, a `conflict` error. Two of an instance's definitions
+The name is taken when a relation of any kind exists in the target schema
+under the target's name or `<target>__ledger`, another definition's target
+included, in this instance or another sharing the schema
+(`TargetTableExists`, a `conflict` error). Two of an instance's definitions
 can't share a bare target name in two schemas either
-(`TargetTableSuffixCollision`). Trellis writes only to target tables
-it creates, or to an empty table it adopts on request, and `DROP TRANSFORM`
-drops the target, so it never takes over an existing relation unasked. Choose
-another target name, give the instance its own target schema
-([instance-identity](instance-identity.md)), or drop or rename the existing
-relation.
+(`TargetTableSuffixCollision`). Trellis never takes over a relation unasked,
+since `DROP TRANSFORM` drops the target. Choose another name, give the
+instance its own target schema ([instance-identity](instance-identity.md)), or
+drop or rename the relation.
 
-With `ADOPT EXISTING TABLE` after the target
-(`TRANSFORM t ADOPT EXISTING TABLE FROM s …`), define builds into the existing
-table instead. The table must be a plain, empty table that the defining role
-owns (or holds its owner's privileges) and can write, shaped exactly as define
-would create it. Define records the key it would create, so a unique
-constraint the table already has never keys it instead ([the key entry](#the-key-a-transform-keys-each-table-by)). The
-table may carry anything a user may add to any target, with the outcomes
-[any target has](#target-tables-are-trellis-owned): indexes, unique or not;
-constraints; triggers; rules; foreign keys, its own or another table's
-referencing it; grants; comments; row security policies, subject to
-[the row-security entry](#row-level-security-on-a-role-trellis-runs-as);
-extended statistics; publications; views over it; storage parameters; and a
-replica identity.
-
-Anything else refuses with `TargetNotAdoptable`, a `validation` error (a
-`not_found` one for `missing`). Its message names the first difference found,
-by code, checked in the order below (the column rows one column at a time):
+With `ADOPT EXISTING TABLE` (`TRANSFORM t ADOPT EXISTING TABLE FROM s …`),
+define builds into the existing table instead, for example one restored from a
+schema dump. It must be a plain, empty table the defining role owns (or holds
+its owner's privileges) and can write, shaped exactly as define would create
+it; define records the key it would create, so a unique constraint the table
+has never keys it instead. It may carry anything
+[any target may](#target-tables-are-trellis-owned): indexes, constraints,
+triggers, rules, foreign keys, grants, comments, policies (subject to
+[the row-security entry](#row-level-security-on-a-role-trellis-runs-as)),
+extended statistics, publications, views, storage parameters and a replica
+identity. Anything else refuses with `TargetNotAdoptable`, a `validation`
+error (`not_found` for `missing`), naming the first difference, checked in
+this order (column rows one column at a time):
 
 | Code | The table | Remedy |
 |---|---|---|
@@ -685,14 +565,10 @@ by code, checked in the order below (the column rows one column at a time):
 
 The emptiness and shape are checked under a lock that keeps writes and DDL out
 until define commits. Another definition's target in the same instance refuses
-with `TargetTableExists`, empty or not. Another instance's empty target can't
-be told from a user's table, so don't adopt one: both instances would write
-it. Define always creates the ledger (`<target>__ledger`) and the hidden
-tables, and one whose name is taken refuses as it would without the opt-in.
-An adopted target is an ordinary one after define. Rows written into it by
-hand afterwards are the
-[known correctness gap](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)
-any target has.
+with `TargetTableExists`; another instance's empty target can't be told from a
+user's table, so don't adopt one: both instances would write it. Define always
+creates the ledger and hidden tables, refusing a taken name as without the
+opt-in. An adopted target is an ordinary one after define.
 
 ### Partitioned sources
 
