@@ -82,6 +82,7 @@ class RailsTest < Minitest::Test
     seen = boot("off_in")
     assert_equal false, seen.fetch("enabled")
     assert_equal false, seen.fetch("connected")
+    assert_equal "", seen.fetch("boot_warning")
     assert_match "Trellis is off in the", seen.fetch("warning")
     assert_match "(config.trellis.off_in): Trellis::Railtie.connect connects nothing", seen.fetch("warning")
     assert_equal false, seen.fetch("connected_after_connect")

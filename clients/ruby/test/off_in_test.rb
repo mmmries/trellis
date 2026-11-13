@@ -89,9 +89,12 @@ class OffInTest < Minitest::Test
     end
   end
 
-  # The environment is the migrating connection's own: `db:prepare` in
-  # development migrates the test database too.
-  def test_the_migration_helpers_refuse_in_an_off_environment_before_running_anything
+  # Run in the off environment itself (`RAILS_ENV=test bin/rails
+  # db:migrate`), the helpers refuse; run from an environment Trellis is on
+  # in (`db:prepare` in development migrates the test database too), they
+  # skip, and the migration completes. The database is the migrating
+  # connection's.
+  def test_the_migration_helpers_refuse_in_an_off_environment_and_skip_from_an_on_one
     database = database("migr")
     ActiveRecord::Base.establish_connection(db_config(database))
     TrellisTestApp.config.trellis.connect = { url: dsn(database) }
@@ -102,20 +105,25 @@ class OffInTest < Minitest::Test
       disable_ddl_transaction!
 
       def up
-        create_table :of_migrated
+        create_table :of_migrated, if_not_exists: true
         define "TRANSFORM of_migrated_copy FROM of_migrated SELECT id AS id"
       end
     end
     ActiveRecord::Migration.verbose = false
-    in_environment("development") do
-      error = assert_raises(ActiveRecord::MigrationError) { klass.new.migrate(:up) }
-      assert_includes error.message, "Trellis is off in the test environment"
-      assert_includes error.message, "loading the schema"
-      assert_includes error.message, "of_migrated_copy"
-      # The migration's own create_table ran; the database never got Trellis.
-      assert_nil to_regclass(database, "trellis.transform_definitions")
-      assert_raises(ActiveRecord::MigrationError) { klass.new.status("of_migrated_copy") }
-    end
+
+    Tasks.env = "test"
+    error = assert_raises(ActiveRecord::MigrationError) { klass.new.migrate(:up) }
+    assert_includes error.message, "Trellis is off in the test environment"
+    assert_includes error.message, "loading the schema"
+    assert_includes error.message, "of_migrated_copy"
+    assert_raises(ActiveRecord::MigrationError) { klass.new.status("of_migrated_copy") }
+
+    Tasks.env = "development"
+    klass.new.migrate(:up)
+    assert_nil klass.new.status("of_migrated_copy")
+    # The migration's own create_table ran; the database never got Trellis.
+    assert_nil to_regclass(database, "of_migrated_copy")
+    assert_nil to_regclass(database, "trellis.transform_definitions")
   end
 
   # The load of an off environment's database creates the targets as the

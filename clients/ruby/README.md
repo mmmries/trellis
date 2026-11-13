@@ -548,12 +548,13 @@ development leaves Trellis out of the test database too. Where it is off:
 - Nothing connects at boot. `Trellis::Railtie.connect` and `trellis:migrate`
   warn and do nothing.
 - A schema load creates the targets as the plain tables `structure.sql`
-  carries. It creates no Trellis schema and restores nothing (the definitions
-  stay queued in `trellis.restore_queue`, unread), so Rails' fixture
-  foreign-key check passes and the per-worker databases of `parallelize` load
-  without the `dump_database` refusal.
+  carries, with no capture triggers and nothing restored (the definitions
+  stay unread in `trellis.restore_queue`). Rails' fixture foreign-key check
+  passes, and the per-worker databases of `parallelize` load.
 - `define`, `apply` and `status` in a migration raise
   `ActiveRecord::MigrationError`: build the database by loading the schema.
+  Migrating it from development (`db:prepare`) skips them, and the next
+  `rails test` reloads it from the new dump.
 - `Trellis.enabled?` is false, for code that builds on Trellis (it is true
   without Rails). `Trellis.connect` itself is not gated.
 
@@ -564,23 +565,23 @@ row means zero:
 EventCount.insert_all([{ kind: "click", n: 3 }])
 ```
 
-### Running Trellis in a test
+### Running Trellis in tests
 
-A few tests may need Trellis for real. Take them out of the transaction and
-give them a handle with the workers on:
+Tests that need Trellis for real need it on in the test database, so leave
+`test` out of `off_in` (or switch it per run:
+`config.trellis.off_in = ENV["TRELLIS_TESTS"] ? [] : %w[test]`). Give the
+test environment's `config.trellis.connect` the workers (`staging: true,
+drain_threads: 1`), and take those tests out of the transaction:
 
 ```ruby
+require "trellis/test_support"
+
 class EventCountTest < ActiveSupport::TestCase
+  include Trellis::TestSupport
   self.use_transactional_tests = false # capture reads committed rows only
 
-  setup do
-    Trellis.connect(url: ENV.fetch("DATABASE_URL"), staging: true, drain_threads: 1)
-    Trellis.migrate # restores the definitions the schema load queued
-  end
-  teardown do
-    Trellis.shutdown
-    Event.delete_all # plain DELETEs; a table swap or disabled triggers pause capture
-  end
+  setup { resume_capture_disruptions } # the fixture load paused capture (below)
+  teardown { Event.delete_all } # plain DELETEs; a table swap or disabled triggers pause capture
 
   test "counts clicks" do
     3.times { Event.create!(kind: "click") }
@@ -590,11 +591,7 @@ class EventCountTest < ActiveSupport::TestCase
 end
 ```
 
-A transform that has not backfilled yet (`Trellis.status(...).status` is not
-`:live`) may still be missing rows when `await_converged` returns.
-
-Fixtures and bulk loads pause the definitions that read the tables they load
-(below). Two more things need care while Trellis is on in the test database:
+Two more things need care with Trellis on in the test database:
 
 - **Rails' fixture foreign-key check** resolves every foreign key without
   Trellis's schema and fails with `PG::UndefinedTable`. Set
@@ -627,8 +624,8 @@ Fixtures and bulk loads pause the definitions that read the tables they load
 
 ### Fixtures and bulk loads
 
-With Trellis on in the test database, Rails fixtures load with `disable_referential_integrity`, which disables
-every trigger on the loaded tables, Trellis's capture triggers included, and
+With Trellis on in the test database, Rails fixtures load with
+`disable_referential_integrity`, which disables every trigger on the loaded tables, Trellis's capture triggers included, and
 ends with `ENABLE TRIGGER ALL`. The rows it wrote never reached a target, so
 Trellis pauses every definition that reads the table (`status.capture_failure`
 has `kind: :disruption`) instead of letting a test read silently wrong data,
@@ -661,7 +658,6 @@ paused; the rest are still resumed, and the call then raises
 `Trellis::TestSupport::ResumeRefused` with `refused`, a hash of target to
 reason. The instance needs its staging worker and a drain worker (`staging:
 true, drain_threads: 1`), because the resume rebuilds through them.
-
 
 ## Schema dumps
 

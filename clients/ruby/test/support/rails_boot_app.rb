@@ -210,12 +210,14 @@ when "off_in", "off_in_elsewhere"
   # config.trellis.off_in: Trellis is off in this app's own environment, or
   # in another one only.
   BootApp.config.trellis.off_in = [ARGV.fetch(0) == "off_in" ? Rails.env : "elsewhere"]
-  BootApp.initialize!
-  seen[:enabled] = Trellis.enabled?
-  seen[:connected] = Trellis.connected?
   stderr = $stderr
   $stderr = StringIO.new
   begin
+    BootApp.initialize!
+    seen[:boot_warning] = $stderr.string
+    $stderr = StringIO.new
+    seen[:enabled] = Trellis.enabled?
+    seen[:connected] = Trellis.connected?
     Trellis::Railtie.connect
     seen[:warning] = $stderr.string
   rescue Trellis::ValidationError => e

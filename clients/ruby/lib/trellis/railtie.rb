@@ -40,7 +40,8 @@ module Trellis
   # `db:test:prepare` run from development leaves Trellis out of the test
   # database too. There, nothing connects at boot, Railtie.connect and
   # `trellis:migrate` do nothing, the schema load and dump hooks leave the
-  # target tables as plain ones, and the migration helpers refuse.
+  # target tables as plain ones, and the migration helpers refuse (or skip,
+  # migrating that database from an environment Trellis is on in).
   # Trellis.enabled? is the predicate; "Testing" in the README has the rest.
   #
   # When either is set, the app's handles connect in an after_initialize hook,
