@@ -728,9 +728,11 @@ an expression written differently that computes the same values (`2 * img`
 for `img * 2`), or to the expression the column already has. So does a
 rewrite (`VACUUM FULL`, `CLUSTER`) of a table with a read stored generated
 column between a major-version `pg_upgrade` and the first pass after it,
-and, on a server that keeps attribute versions, a rewriting `ALTER COLUMN
-... TYPE` of a column that rebuilds nothing itself (one no definition reads,
-or a pure widening): it moves the version of every column after it.
+and, on a server that keeps attribute versions, an `ALTER COLUMN ... TYPE`
+that rebuilds nothing itself (of a column no definition reads, a pure
+widening, or one that pauses every reader of the column) with a rewrite of
+the table, its own or another in the same window: it moves the version of
+every column after it.
 
 ## Nested writes to the same key
 

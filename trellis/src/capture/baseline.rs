@@ -131,9 +131,11 @@
 //! and a rewrite of the table (`VACUUM FULL`) between a major-version
 //! `pg_upgrade` and the first pass after it, which finds every read stored
 //! generated column's expression stored anew under a moved file node. On a
-//! server that keeps attribute versions, so does a rewriting `ALTER COLUMN
-//! ... TYPE` that rebuilds nothing itself (of an unread column, or a pure
-//! widening): it moves the row of every column after it.
+//! server that keeps attribute versions, so does an `ALTER COLUMN ... TYPE`
+//! that rebuilds nothing itself (of an unread column, a pure widening, or
+//! one that pauses every reader of the column) with a rewrite of the table,
+//! its own or another in the same window: it moves the row of every column
+//! after it.
 //!
 //! A pure widening with a `USING` that changes values (`integer` to `bigint
 //! USING b * 10`) is never R1's, and its row changed, so it isn't R3b's
@@ -195,9 +197,9 @@ type Columns = BTreeMap<(u32, String), Column>;
 
 /// The `pg_attribute` row `a` as `jsonb` text, without its attribute
 /// version, with `$opts` standing in for its `attoptions`. The version is
-/// the `pg_attver=<LSN>` entry PostgreSQL's 2026-11 minors (15.20, 16.16,
-/// 17.12, 18.7) keep in `attoptions`, or the `attversion` field later
-/// majors give the row. It moves on every `ALTER COLUMN ... TYPE` of the
+/// the `pg_attver=<LSN in decimal>` entry PostgreSQL's 2026-11 minors
+/// (15.20, 16.16, 17.12, 18.7) keep in `attoptions`, or the `attversion`
+/// field PostgreSQL 20 gives the row. It moves on every `ALTER COLUMN ... TYPE` of the
 /// column or one before it, so a row hashed with it would never read as
 /// unchanged after a rewrite. A row with no version renders exactly as
 /// `to_jsonb(a)` does.
@@ -1137,14 +1139,14 @@ mod tests {
         );
 
         // A version alone reads as no options at all.
-        assert_eq!(row("plain", Some(&["pg_attver=0/1A2B3C"])).await.0, plain);
+        assert_eq!(row("plain", Some(&["pg_attver=24379568"])).await.0, plain);
         assert_eq!(row("plain", Some(&["pg_attver=123"])).await.0, plain);
         // A version beside real options, wherever it sits, reads as those
         // options alone.
         for opts in [
             &["n_distinct=100", "n_distinct_inherited=5", "pg_attver=123"][..],
             &[
-                "pg_attver=0/16B3740",
+                "pg_attver=23803712",
                 "n_distinct=100",
                 "n_distinct_inherited=5",
             ][..],
@@ -1161,6 +1163,24 @@ mod tests {
             tuned
         );
         assert_ne!(row("tuned", Some(&["n_distinct=100"])).await.0, tuned);
+
+        // A version kept in its own `attversion` field (PostgreSQL 20 and
+        // later), stood in for here by a row with that field added.
+        let versioned: String = client
+            .query_one(
+                concat!(
+                    "select ",
+                    attribute_row!("a.attoptions"),
+                    " from pg_catalog.pg_attribute p, \
+                     lateral (select p.*, 24379568::bigint as attversion) a \
+                     where p.attrelid = 't'::regclass and p.attname = 'tuned'"
+                ),
+                &[],
+            )
+            .await
+            .expect("versioned row")
+            .get(0);
+        assert_eq!(versioned, tuned);
     }
 
     fn column(attnum: i16, ty: &str, typmod: i32, xmin: &str, filenode: u32, hash: &str) -> Column {
