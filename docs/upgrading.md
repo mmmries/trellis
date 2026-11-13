@@ -140,7 +140,7 @@ Each definition records its **floor**: the oldest Trellis release that can
 run it, the latest release any construct, key space, option or hidden-table
 layout it uses arrived in, or any argument value, type rule or key type
 define's validation admitted it by
-([Floors](transforms.md#floors)). `status()` reports it as `floor`
+([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md#recording-definition-floors)). `status()` reports it as `floor`
 (`"major.minor.patch"`, in the Elixir and Ruby bindings too), and
 `trellis status` prints it on each definition's line as `floor=`. Trellis
 records it when a definition is defined, altered or rebuilt by a resume;

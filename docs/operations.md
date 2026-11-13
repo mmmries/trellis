@@ -402,10 +402,32 @@ know:
 
 ## Partitioned sources
 
-[Transforms — Partitioned sources](transforms.md#partitioned-sources) says what a
-partition operation does to the counts and how to avoid the window. This is what
-each one costs and what to expect around it
-([ADR-0017](decisions/0017-partitioned-sources.md)).
+Every partition of a [partitioned source](transforms.md#partitioned-sources)
+carries the capture triggers, so a write through the parent or to any
+partition counts once, including an `UPDATE` that moves a row between
+partitions, and a write to a table that has left the tree counts for nothing.
+The staging worker's reconcile pass (every 5 seconds by default) detects each
+change to the tree, installs capture on a new partition, and queues a
+correction that recomputes the groups routing to the partition it touched
+([ADR-0017](decisions/0017-partitioned-sources.md)). From the DDL until that
+correction drains, the **window** (at most one pass plus the correction), the
+definition reads `live` until the pass and then `backfilling`, with the
+partition in [`correcting`](status-reference.md#correcting), and its counts are
+wrong in one direction:
+
+| Operation | Direction | Avoiding the window |
+|---|---|---|
+| `ATTACH PARTITION` of a table that holds rows | Rows added: their groups are undercounted | Create the partition empty and move the rows with DML through the parent: about 4-5 s and 0.5-0.6 GB of WAL per 1M-row partition |
+| A new partition written to directly before the pass installs capture on it | Rows added: undercounted | Create the partition empty and write through the parent, at no cost |
+| `DETACH PARTITION` (for `CONCURRENTLY`, the correction starts once the detach completes) or `DROP` of a partition, routed by its recorded bound | Rows removed: overcounted | Delete the partition's rows with DML through the parent first |
+| `TRUNCATE` of a partition or of a middle partitioned table | Rows removed: overcounted | Delete the rows with DML through the parent first |
+| Groups that route to no current partition and no `DEFAULT` (the pass sweeps the bounds' complement) | Rows removed: overcounted | The operations above |
+
+A `TRUNCATE` of the parent clears the target as for a plain table. The cases
+that leave a target stale with no correction are in
+[known correctness gaps](known-correctness-gaps.md#a-merge-that-moves-a-row-to-another-partition)
+and the entries after it. What each operation costs and what to expect around
+it:
 
 * **A correction costs the work of the groups that route to the partition.**
   The correction of a dropped partition of 1,000,000 rows over 50,000 groups
