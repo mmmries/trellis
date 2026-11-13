@@ -65,7 +65,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -143,6 +143,33 @@ const RING_OLDEST_UNDRAINED_AGE_METRIC: &str = "trellis_ring_oldest_undrained_ag
 /// The ring bytes still to drain, labeled `source_table`
 /// ([`RingGauges::undrained_bytes`]).
 const RING_UNDRAINED_BYTES_METRIC: &str = "trellis_ring_undrained_bytes";
+
+/// The definitions by the status word `Trellis::status` reports, labeled
+/// `status` ([`StatusGauges::definitions`]).
+const DEFINITIONS_METRIC: &str = "trellis_definitions";
+
+/// The paused definitions by why, labeled `cause`
+/// ([`StatusGauges::paused_by`]).
+const PAUSED_DEFINITIONS_METRIC: &str = "trellis_paused_definitions";
+
+/// Source keys held in quarantine, all definitions together.
+const HELD_KEYS_METRIC: &str = "trellis_held_keys";
+
+/// Columns of a 1-1 target that are paused (`column_status` rows).
+const QUARANTINED_COLUMNS_METRIC: &str = "trellis_quarantined_columns";
+
+/// Open drain holdups: pages the drain keeps failing on with nothing charged
+/// or paused.
+const DRAIN_FAILURES_METRIC: &str = "trellis_drain_failures";
+
+/// What holds a table's capture back, labeled `kind` (`wait`, `failure`).
+const CAPTURE_HOLDUPS_METRIC: &str = "trellis_capture_holdups";
+
+/// 1 while this process holds the staging-worker lock, 0 while it stands by.
+const STAGING_LEADER_METRIC: &str = "trellis_staging_leader";
+
+/// Live drain workers in the worker registry.
+const DRAIN_WORKERS_METRIC: &str = "trellis_drain_workers";
 
 /// Worker time a Re-derive build spends in each of its statement
 /// classes, labeled `class` ([`BuildStatement`]). The `_sum` per class is
@@ -511,6 +538,45 @@ fn describe_metrics() {
          segment appended in order and within the skew of concurrent transactions otherwise."
     );
     metrics::describe_gauge!(
+        DEFINITIONS_METRIC,
+        "Count of definitions by the status word Trellis::status reports (waiting_to_backfill, \
+         backfilling, catching_up, live, quarantined, paused), read by the staging worker."
+    );
+    metrics::describe_gauge!(
+        PAUSED_DEFINITIONS_METRIC,
+        "Count of paused definitions by cause: operator (a PAUSE, with no record of why), \
+         capture, disruption or halt (the kind of the definition's capture_failure), \
+         backfill_failure (its build kept failing) or unknown."
+    );
+    metrics::describe_gauge!(
+        HELD_KEYS_METRIC,
+        "Count of source keys held in quarantine, all definitions together."
+    );
+    metrics::describe_gauge!(
+        QUARANTINED_COLUMNS_METRIC,
+        "Count of paused columns of 1-1 targets, all definitions together."
+    );
+    metrics::describe_gauge!(
+        DRAIN_FAILURES_METRIC,
+        "Count of open drain failures: segments whose page the drain keeps failing on, with \
+         nothing charged or paused."
+    );
+    metrics::describe_gauge!(
+        CAPTURE_HOLDUPS_METRIC,
+        "Count of tables whose capture install is held up, by kind: wait (a lock held by another \
+         session) or failure (the install or widen fails for another reason)."
+    );
+    metrics::describe_gauge!(
+        STAGING_LEADER_METRIC,
+        "1 while this process holds the staging-worker lock, 0 while its staging worker stands \
+         by. Unset in a process with no staging worker."
+    );
+    metrics::describe_gauge!(
+        DRAIN_WORKERS_METRIC,
+        "Count of live drain workers in the worker registry, as the staging worker last read \
+         it. Set only by the process that leads staging."
+    );
+    metrics::describe_gauge!(
         RING_UNDRAINED_BYTES_METRIC,
         metrics::Unit::Bytes,
         "Ring bytes of the segments still to drain, by source_table. Each undrained slot's size \
@@ -633,6 +699,100 @@ fn publish_ring_gauges(label: &str, ring: &RingGauges) {
     }
 }
 
+/// The staging worker's reading of what the instance's definitions and
+/// holdups are as of one housekeeping pass (`staging::status_gauges::read`).
+/// Every status and every cause is always present, a count of 0 where none
+/// applies, so a condition that cleared reads 0 rather than keeping its last
+/// value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StatusGauges {
+    /// Definitions by the status word `Trellis::status` reports.
+    pub(crate) definitions: BTreeMap<&'static str, u64>,
+    /// The paused ones, by cause.
+    pub(crate) paused_by: BTreeMap<&'static str, u64>,
+    /// Source keys held in quarantine.
+    pub(crate) held_keys: u64,
+    /// Paused columns of 1-1 targets.
+    pub(crate) quarantined_columns: u64,
+    /// Open drain holdups.
+    pub(crate) drain_failures: u64,
+    /// Tables whose capture install waits on a lock another session holds.
+    pub(crate) capture_waits: u64,
+    /// Tables whose capture install or widen fails for another reason.
+    pub(crate) capture_failures: u64,
+    /// Live drain workers in the worker registry.
+    pub(crate) drain_workers: u64,
+}
+
+/// Sets the status gauges from `reading`, refreshed on the staging worker's
+/// housekeeping pass next to [`set_ring_gauges`], and kept for
+/// [`refresh_instance_gauges`] likewise.
+pub(crate) fn set_status_gauges(reading: StatusGauges) {
+    ensure_installed();
+    let state = gauge_state(&instance_log::current());
+    let mut kept = state.status.lock().unwrap_or_else(PoisonError::into_inner);
+    publish_status_gauges(&instance(), &reading);
+    *kept = Some(reading);
+}
+
+fn publish_status_gauges(label: &str, status: &StatusGauges) {
+    for (word, count) in &status.definitions {
+        metrics::gauge!(DEFINITIONS_METRIC, INSTANCE_LABEL => label.to_string(), "status" => *word)
+            .set(*count as f64);
+    }
+    for (cause, count) in &status.paused_by {
+        metrics::gauge!(PAUSED_DEFINITIONS_METRIC, INSTANCE_LABEL => label.to_string(), "cause" => *cause)
+            .set(*count as f64);
+    }
+    metrics::gauge!(HELD_KEYS_METRIC, INSTANCE_LABEL => label.to_string())
+        .set(status.held_keys as f64);
+    metrics::gauge!(QUARANTINED_COLUMNS_METRIC, INSTANCE_LABEL => label.to_string())
+        .set(status.quarantined_columns as f64);
+    metrics::gauge!(DRAIN_FAILURES_METRIC, INSTANCE_LABEL => label.to_string())
+        .set(status.drain_failures as f64);
+    metrics::gauge!(CAPTURE_HOLDUPS_METRIC, INSTANCE_LABEL => label.to_string(), "kind" => "wait")
+        .set(status.capture_waits as f64);
+    metrics::gauge!(CAPTURE_HOLDUPS_METRIC, INSTANCE_LABEL => label.to_string(), "kind" => "failure")
+        .set(status.capture_failures as f64);
+    metrics::gauge!(DRAIN_WORKERS_METRIC, INSTANCE_LABEL => label.to_string())
+        .set(status.drain_workers as f64);
+}
+
+/// Reports whether this process leads the instance's staging worker: 1 while
+/// it holds the staging-worker lock, 0 while it stands by for it. Called by
+/// the staging worker's loop as it takes or loses the lock.
+///
+/// A process that stops leading also forgets what it read as leader (the
+/// segment counts, the ring and the status gauges), so they stop being set
+/// and expire, rather than keep reporting what the next leader reports
+/// afresh.
+pub(crate) fn set_staging_leader(leading: bool) {
+    ensure_installed();
+    let state = gauge_state(&instance_log::current());
+    state
+        .leader
+        .store(if leading { LEADER } else { STANDBY }, Ordering::Relaxed);
+    publish_staging_leader(&instance(), leading);
+    if !leading {
+        state
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        *state.ring.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *state.status.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// [`GaugeState::leader`]'s values.
+const LEADER: u8 = 2;
+const STANDBY: u8 = 1;
+
+fn publish_staging_leader(label: &str, leading: bool) {
+    metrics::gauge!(STAGING_LEADER_METRIC, INSTANCE_LABEL => label.to_string())
+        .set(f64::from(u8::from(leading)));
+}
+
 /// What an instance's gauges are set from. The gauges drop out of the
 /// recorder after [`GAUGE_IDLE_TIMEOUT`] unset, so a value that changes only
 /// on an event (a build chunk's longest duration) has to be kept here and set
@@ -646,6 +806,11 @@ struct GaugeState {
     segments: Mutex<BTreeMap<String, u64>>,
     /// The last ring reading, unset until the first.
     ring: Mutex<Option<RingGauges>>,
+    /// The last status reading, unset until the first.
+    status: Mutex<Option<StatusGauges>>,
+    /// Whether the staging worker leads: 0 until it reports, then
+    /// [`STANDBY`] or [`LEADER`].
+    leader: AtomicU8,
     /// Woken by each [`refresh_instance_gauges`] of the instance, for the
     /// test that pins the client's refresh task ([`refreshed`]).
     #[cfg(test)]
@@ -701,6 +866,18 @@ pub fn refresh_instance_gauges() {
         .as_ref()
     {
         publish_ring_gauges(&label, ring);
+    }
+    if let Some(status) = state
+        .status
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
+        publish_status_gauges(&label, status);
+    }
+    match state.leader.load(Ordering::Relaxed) {
+        0 => {}
+        leader => publish_staging_leader(&label, leader == LEADER),
     }
     #[cfg(test)]
     state.refreshed.notify_one();
@@ -1020,6 +1197,22 @@ mod tests {
         increment_changes_applied("t", 1);
         set_staging_segments("active", 1);
         set_ring_gauges(ring_reading(&[("public.t", 1)]));
+        set_status_gauges(status_reading());
+        set_staging_leader(true);
+    }
+
+    /// A reading with a distinct count in every series.
+    fn status_reading() -> StatusGauges {
+        StatusGauges {
+            definitions: BTreeMap::from([("live", 4), ("paused", 3), ("quarantined", 1)]),
+            paused_by: BTreeMap::from([("operator", 1), ("disruption", 2)]),
+            held_keys: 5,
+            quarantined_columns: 6,
+            drain_failures: 7,
+            capture_waits: 8,
+            capture_failures: 9,
+            drain_workers: 2,
+        }
     }
 
     fn ring_reading(tables: &[(&str, u64)]) -> RingGauges {
@@ -1084,6 +1277,162 @@ mod tests {
             assert_eq!(
                 sample(&rendered, RING_ROWS_METRIC, &[&label(instance)]),
                 Some(7.0)
+            );
+        });
+    }
+
+    /// The status gauges carry the reading, each status and cause under its
+    /// label; the next reading replaces every one, a condition that cleared
+    /// reading 0; and the refresh sets the last reading again.
+    #[test]
+    fn the_status_gauges_follow_the_last_reading() {
+        local(None, |render| {
+            let instance = "status_gauges/trellis";
+            let inst = name(instance);
+            let get = |rendered: &str, metric: &str, extra: &[&str]| {
+                let mut labels = vec![label(instance)];
+                labels.extend(extra.iter().map(|l| l.to_string()));
+                let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+                sample(rendered, metric, &labels)
+            };
+            instance_log::run_scoped(&inst, || set_status_gauges(status_reading()));
+            let rendered = render();
+            for (status, count) in [("live", 4.0), ("paused", 3.0), ("quarantined", 1.0)] {
+                assert_eq!(
+                    get(
+                        &rendered,
+                        DEFINITIONS_METRIC,
+                        &[&format!("status=\"{status}\"")]
+                    ),
+                    Some(count),
+                    "{rendered}"
+                );
+            }
+            for (cause, count) in [("operator", 1.0), ("disruption", 2.0)] {
+                assert_eq!(
+                    get(
+                        &rendered,
+                        PAUSED_DEFINITIONS_METRIC,
+                        &[&format!("cause=\"{cause}\"")]
+                    ),
+                    Some(count),
+                    "{rendered}"
+                );
+            }
+            for (metric, count) in [
+                (HELD_KEYS_METRIC, 5.0),
+                (QUARANTINED_COLUMNS_METRIC, 6.0),
+                (DRAIN_FAILURES_METRIC, 7.0),
+                (DRAIN_WORKERS_METRIC, 2.0),
+            ] {
+                assert_eq!(
+                    get(&rendered, metric, &[]),
+                    Some(count),
+                    "{metric}: {rendered}"
+                );
+            }
+            assert_eq!(
+                get(&rendered, CAPTURE_HOLDUPS_METRIC, &["kind=\"wait\""]),
+                Some(8.0)
+            );
+            assert_eq!(
+                get(&rendered, CAPTURE_HOLDUPS_METRIC, &["kind=\"failure\""]),
+                Some(9.0)
+            );
+
+            // The next reading: everything cleared but the paused count the
+            // operator holds.
+            let cleared = StatusGauges {
+                definitions: BTreeMap::from([("live", 0), ("paused", 1), ("quarantined", 0)]),
+                paused_by: BTreeMap::from([("operator", 1), ("disruption", 0)]),
+                ..StatusGauges::default()
+            };
+            instance_log::run_scoped(&inst, || {
+                set_status_gauges(cleared);
+                refresh_instance_gauges();
+            });
+            let rendered = render();
+            let zero_but = [
+                (DEFINITIONS_METRIC, "status=\"live\"", 0.0),
+                (DEFINITIONS_METRIC, "status=\"paused\"", 1.0),
+                (PAUSED_DEFINITIONS_METRIC, "cause=\"disruption\"", 0.0),
+                (PAUSED_DEFINITIONS_METRIC, "cause=\"operator\"", 1.0),
+                (CAPTURE_HOLDUPS_METRIC, "kind=\"wait\"", 0.0),
+            ];
+            for (metric, extra, count) in zero_but {
+                assert_eq!(get(&rendered, metric, &[extra]), Some(count), "{rendered}");
+            }
+            for metric in [
+                HELD_KEYS_METRIC,
+                QUARANTINED_COLUMNS_METRIC,
+                DRAIN_FAILURES_METRIC,
+                DRAIN_WORKERS_METRIC,
+            ] {
+                assert_eq!(
+                    get(&rendered, metric, &[]),
+                    Some(0.0),
+                    "{metric}: {rendered}"
+                );
+            }
+        });
+    }
+
+    /// A staging worker reports 1 as it takes the lock and 0 as it loses it;
+    /// a worker that has lost it forgets what it read as leader, so those
+    /// gauges drop out (the next leader reports them afresh) while the 0
+    /// stays, and a worker that leads keeps its gauges.
+    #[test]
+    fn a_process_that_stops_leading_reports_0_and_stops_setting_what_it_read() {
+        let timeout = Duration::from_millis(1);
+        local(Some(timeout), |render| {
+            let (leader, lost) = (name("leads/trellis"), name("lost/trellis"));
+            for instance in [&leader, &lost] {
+                instance_log::run_scoped(instance, || {
+                    set_staging_leader(true);
+                    set_staging_segments("active", 1);
+                    set_ring_gauges(ring_reading(&[]));
+                    set_status_gauges(status_reading());
+                });
+            }
+            let first = render();
+            for instance in ["leads/trellis", "lost/trellis"] {
+                assert_eq!(
+                    sample(&first, STAGING_LEADER_METRIC, &[&label(instance)]),
+                    Some(1.0),
+                    "{first}"
+                );
+            }
+
+            instance_log::run_scoped(&lost, || set_staging_leader(false));
+            std::thread::sleep(timeout * 5);
+            for instance in [&leader, &lost] {
+                instance_log::run_scoped(instance, refresh_instance_gauges);
+            }
+            let second = render();
+
+            let read = |instance: &str, metric: &str| sample(&second, metric, &[&label(instance)]);
+            for (metric, value) in [
+                (RING_ROWS_METRIC, 7.0),
+                (DRAIN_WORKERS_METRIC, 2.0),
+                (HELD_KEYS_METRIC, 5.0),
+            ] {
+                assert_eq!(
+                    read("leads/trellis", metric),
+                    Some(value),
+                    "{metric}: {second}"
+                );
+                assert_eq!(read("lost/trellis", metric), None, "{metric}: {second}");
+            }
+            assert_eq!(
+                sample(&second, STAGING_SEGMENTS_METRIC, &[&label("lost/trellis")]),
+                None,
+                "{second}"
+            );
+            assert_eq!(read("leads/trellis", STAGING_LEADER_METRIC), Some(1.0));
+            assert_eq!(
+                read("lost/trellis", STAGING_LEADER_METRIC),
+                Some(0.0),
+                "{second}"
             );
         });
     }
@@ -1207,6 +1556,14 @@ mod tests {
                 RING_BYTES_METRIC,
                 RING_OLDEST_UNDRAINED_AGE_METRIC,
                 RING_UNDRAINED_BYTES_METRIC,
+                DEFINITIONS_METRIC,
+                PAUSED_DEFINITIONS_METRIC,
+                HELD_KEYS_METRIC,
+                QUARANTINED_COLUMNS_METRIC,
+                DRAIN_FAILURES_METRIC,
+                CAPTURE_HOLDUPS_METRIC,
+                STAGING_LEADER_METRIC,
+                DRAIN_WORKERS_METRIC,
             ] {
                 assert!(
                     series

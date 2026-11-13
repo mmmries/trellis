@@ -184,16 +184,24 @@ pub async fn has_live_workers(
     // reads as rows of a release before it, each one a drain worker.
     let live: bool = client
         .query_one(
-            "select exists(select 1 from worker_registry w, lateral to_jsonb(w) j \
-             where w.last_seen > now() - (interval '1 second' * $1) \
-               and (j->>'version' is null \
-                    or ((j->>'drain')::boolean and not (j->>'standby')::boolean)))",
+            &format!("select exists(select 1 from worker_registry w {LIVE_DRAIN_WORKER_SQL})"),
             &[&ttl_secs],
         )
         .await?
         .get(0);
     Ok(live)
 }
+
+/// The join and filter that pick the live drain workers (the ones
+/// [`has_live_workers`] and the staging worker's `trellis_drain_workers` count) out of
+/// `worker_registry w`, with the TTL in seconds as `$1`. Read through
+/// `to_jsonb`, so a registry migration V9 hasn't reached yet reads as rows of a
+/// release before it, each one a drain worker.
+pub(crate) const LIVE_DRAIN_WORKER_SQL: &str = "\
+    cross join lateral to_jsonb(w) j \
+    where w.last_seen > now() - (interval '1 second' * $1) \
+      and (j->>'version' is null \
+           or ((j->>'drain')::boolean and not (j->>'standby')::boolean))";
 
 /// The `WITH ... DELETE` sweep behind [`reclaim_stale_workers`], mirroring
 /// `super::liveness`'s own `RECLAIM_STALE_SQL` shape — including the `for

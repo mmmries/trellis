@@ -1376,6 +1376,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         None => None,
     };
     let stop = async |database: Option<String>, session: Option<ProducerSession>| {
+        crate::metrics::set_staging_leader(false);
         if let Some(database) = &database {
             capture::reconcile::forget_instance(database, &schema);
         }
@@ -1401,6 +1402,15 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     // reconciliation pass at that point, but this makes the loop's own
     // cadence not depend on when it happens to first observe `Instant::now()`.
     let mut next_reconcile = Instant::now();
+    // What `trellis_staging_leader` was last set to, so it is set on a change
+    // and not on every tick.
+    let mut reported_leader: Option<bool> = None;
+    let report_leader = |reported: &mut Option<bool>, leading: bool| {
+        if *reported != Some(leading) {
+            *reported = Some(leading);
+            crate::metrics::set_staging_leader(leading);
+        }
+    };
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1418,6 +1428,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 );
                 release_singleton(session.take(), &process).await;
             }
+            report_leader(&mut reported_leader, false);
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     stop(database, session).await;
@@ -1465,6 +1476,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 }
             }
         }
+
+        report_leader(&mut reported_leader, session.is_some());
 
         if let Some(held) = session.as_mut() {
             let c = held.client_mut();
@@ -1552,6 +1565,18 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                             crate::metrics::set_staging_segments(state.as_sql(), count as u64);
                         }
                         crate::metrics::set_ring_gauges(reading.ring);
+                    }
+                    // The status and liveness gauges, read in the same pass:
+                    // two catalog reads and one statement of counts, with no
+                    // transaction either.
+                    let reading = staging::status_gauges::read(
+                        &*c,
+                        pool.floors(),
+                        staging::DEFAULT_RECLAIM_TTL,
+                    )
+                    .await;
+                    if let Ok(reading) = failures.check("status_gauges", reading) {
+                        crate::metrics::set_status_gauges(reading);
                     }
                 }
                 if !failed
@@ -4247,6 +4272,7 @@ mod maintenance_failure_tests {
             ("retire_drained_segments", Duration::ZERO, added),
             ("collect_tombstones", Duration::ZERO, added),
             ("ring_gauges", Duration::ZERO, added),
+            ("status_gauges", Duration::ZERO, added),
         ];
         for (task, contract, bound) in tasks {
             // Simulate a condition that arose the instant after a pass.

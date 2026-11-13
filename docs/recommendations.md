@@ -113,6 +113,11 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
   Trellis's schema. `ring_undrained_bytes` splits what is still to drain by
   source table, and `ring_oldest_undrained_age_seconds` says how far behind
   the drain is.
+* A write transaction left open anywhere on the server, another database
+  included, holds every target back until it ends: the next seal waits for it
+  ([sealing](staging-and-claiming/03-sealing-and-the-fence.md)). The
+  ring grows and `ring_oldest_undrained_age_seconds` climbs while it is open,
+  and both fall once it ends.
 
 ## `statement_timeout`
 
