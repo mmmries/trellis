@@ -513,6 +513,10 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
                     )
                     .await?
                     .get(0);
+                // Planted bug: collect under a fresh build. See `crate::plant`.
+                #[cfg(any(test, feature = "test-util"))]
+                let building =
+                    building && !crate::plant::fires(crate::plant::Plant::GbGcIgnoresBuild, true);
                 if building {
                     break;
                 }

@@ -3657,6 +3657,24 @@ impl GroupTargetPlan {
             ),
             None => Default::default(),
         };
+        // Planted bugs: a write-once build's enumeration (`!own`) without
+        // one branch. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let (hidden_filter, target_filter, image_filter) = {
+            use crate::plant::{Plant, fires};
+            let without = |plant, filter: String| {
+                if !own && fires(plant, true) {
+                    " where false".to_string()
+                } else {
+                    filter
+                }
+            };
+            (
+                without(Plant::GbBuildNoHiddenBranch, hidden_filter),
+                without(Plant::GbBuildNoTargetBranch, target_filter),
+                without(Plant::GbBuildNoRingBranch, image_filter),
+            )
+        };
         let images: Vec<String> = self
             .ring
             .iter()
@@ -3882,6 +3900,28 @@ impl GroupTargetPlan {
             Some(pause) => format!("{SNAPSHOT_AND_STAMP} from {pause}"),
             None => SNAPSHOT_AND_STAMP.to_string(),
         };
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+        let (mut ae, mut conflict) = (
+            self.group_match("a", "e"),
+            "do update set __n = excluded.__n where false",
+        );
+        // Planted bugs: the source's groups matched to the enumeration by
+        // `=`; the groups that have a row skipped, not locked. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            use crate::plant::{Plant, fires};
+            if fires(Plant::GbBuildNullKeyByEquality, true) {
+                ae = cols
+                    .iter()
+                    .map(|c| format!("a.{c} = e.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+            }
+            if fires(Plant::GbBuildStragglerUnlocked, true) {
+                conflict = "do nothing";
+            }
+        }
         format!(
             "with snap as materialized ({snap}), \
              a as ({fresh}), \
@@ -3890,7 +3930,7 @@ impl GroupTargetPlan {
              up as ( \
                  insert into {hidden} as u ({insert_cols}) \
                  select {values} from c, snap order by {keyed} \
-                 on conflict ({col_list}) do update set __n = excluded.__n where false \
+                 on conflict ({col_list}) {conflict} \
                  returning {returning} \
              ), \
              held as ( \
@@ -3902,7 +3942,6 @@ impl GroupTargetPlan {
             col_list = cols.join(", "),
             enumeration = self.rebuild_groups_select(None, "$1", false),
             c_cols = c_cols.join(", "),
-            ae = self.group_match("a", "e"),
             hidden = self.hidden_ident,
             insert_cols = insert_cols.join(", "),
             values = values.join(", "),

@@ -138,6 +138,57 @@ pub enum Plant {
     /// Pinned by `group_basis_rebuild`'s
     /// `a_page_that_commits_between_the_enumeration_and_the_locks`.
     GbBuildSnapshotBeforeLocks,
+    /// ADR-0002, "An aggregate's build is one absolute write per structure":
+    /// the zero-group GC (`staging::retire`'s `collect_zero_groups`)
+    /// collects a plain aggregate's zero groups under a fresh build. A zero
+    /// row pages made from a change the build's snapshot saw and one it
+    /// didn't is collected before the build's insert reaches its group: the
+    /// insert counts the first again and loses the second.
+    ///
+    /// Pinned by `group_basis_build`'s
+    /// `a_zero_group_made_inside_the_first_statement_needs_the_gc_skip` and
+    /// `the_zero_group_gc_skips_a_definition_under_a_fresh_build`.
+    GbGcIgnoresBuild,
+    /// ADR-0028 W1: a write-once build's first statement
+    /// (`staging::group_basis`'s `write_once_sql`) enumerates no hidden row.
+    /// A group a page made before the build's snapshot, whose source rows
+    /// are gone by it, is neither written nor locked, and keeps its stale
+    /// partials.
+    ///
+    /// Pinned by `group_basis_build`'s
+    /// `a_group_only_the_hidden_table_names_goes_to_zero`.
+    GbBuildNoHiddenBranch,
+    /// ADR-0028 W1: a write-once build's first statement enumerates no
+    /// visible target row, so a resume leaves a target row whose group no
+    /// source row, hidden row or undrained change names.
+    ///
+    /// Pinned by `group_basis_resume`'s
+    /// `target_rows_of_groups_the_source_lost_are_removed` and
+    /// `hand_edited_partials_and_target_rows_are_repaired`.
+    GbBuildNoTargetBranch,
+    /// ADR-0028 W1: a write-once build's first statement enumerates no old
+    /// image of an undrained change. A group whose last source row was
+    /// deleted before the snapshot, its change undrained, is not written:
+    /// the delete's page later lands on a fresh row with no basis and drives
+    /// it below zero.
+    ///
+    /// Pinned by `group_basis_build`'s `a_group_only_an_old_image_names`.
+    GbBuildNoRingBranch,
+    /// ADR-0028 W1: a write-once build's first statement matches the
+    /// source's groups to the enumeration by `=`, so the `NULL` group both
+    /// name is two candidate rows.
+    ///
+    /// Pinned by `group_basis_resume`'s
+    /// `the_null_group_of_the_target_and_the_source_is_one_group`.
+    GbBuildNullKeyByEquality,
+    /// ADR-0028 W1: a write-once build's first statement skips the groups
+    /// that have a hidden row (`on conflict do nothing`) instead of locking
+    /// them, so a page can apply to such a straggler while the second
+    /// statement rewrites it.
+    ///
+    /// Pinned by `group_basis_build`'s
+    /// `a_page_waits_on_a_straggler_the_first_statement_locked`.
+    GbBuildStragglerUnlocked,
     /// ADR-0019 JR1: a `JOIN` page takes no `J` lock on its keys
     /// (`staging::join`'s `write_locked` inserts only the missing `J` rows).
     /// Two pages that change one key from opposite sides without sharing a
@@ -730,6 +781,12 @@ impl Plant {
         Plant::GbFoldSidesPerKey,
         Plant::GbEarlyZeroGc,
         Plant::GbBuildSnapshotBeforeLocks,
+        Plant::GbGcIgnoresBuild,
+        Plant::GbBuildNoHiddenBranch,
+        Plant::GbBuildNoTargetBranch,
+        Plant::GbBuildNoRingBranch,
+        Plant::GbBuildNullKeyByEquality,
+        Plant::GbBuildStragglerUnlocked,
         Plant::JoinNoJLock,
         Plant::JoinOtherSideBeforeJ,
         Plant::JoinDropFlip,
@@ -802,6 +859,12 @@ impl Plant {
             Plant::GbFoldSidesPerKey => "gb_fold_sides_per_key",
             Plant::GbEarlyZeroGc => "gb_early_zero_gc",
             Plant::GbBuildSnapshotBeforeLocks => "gb_build_snapshot_before_locks",
+            Plant::GbGcIgnoresBuild => "gb_gc_ignores_build",
+            Plant::GbBuildNoHiddenBranch => "gb_build_no_hidden_branch",
+            Plant::GbBuildNoTargetBranch => "gb_build_no_target_branch",
+            Plant::GbBuildNoRingBranch => "gb_build_no_ring_branch",
+            Plant::GbBuildNullKeyByEquality => "gb_build_null_key_by_equality",
+            Plant::GbBuildStragglerUnlocked => "gb_build_straggler_unlocked",
             Plant::JoinNoJLock => "join_no_j_lock",
             Plant::JoinOtherSideBeforeJ => "join_other_side_before_j",
             Plant::JoinDropFlip => "join_drop_flip",
