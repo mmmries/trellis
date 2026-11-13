@@ -115,8 +115,8 @@ pub(crate) fn render_target_select_sql(
 ///
 /// # Errors
 ///
-/// [`TrellisError::Parse`] if the text doesn't parse under its grammar
-/// version, and [`TrellisError::TargetSelect`] if a target column is neither a
+/// [`TrellisError::Parse`](crate::TrellisError::Parse) if the text doesn't parse under its grammar
+/// version, and [`TrellisError::TargetSelect`](crate::TrellisError::TargetSelect) if a target column is neither a
 /// field nor a key column of the definition.
 pub fn target_select_sql<S: AsRef<str>>(
     definition: &str,

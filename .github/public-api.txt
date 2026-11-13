@@ -152,6 +152,7 @@ function TrellisError::code
 function ValidationError::code
 function migrate
 function statement_kind
+function target_select_sql
 struct BackfillFailure
 struct BelowCatalogFloor
 struct BlockingTrellis
