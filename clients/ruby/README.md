@@ -223,25 +223,24 @@ mount Trellis::Metrics::RackApp, at: "/metrics/trellis"
 
 It answers `GET` and `HEAD` and needs no Rack gem; in a `config.ru` it is
 `map("/metrics/trellis") { run Trellis::Metrics::RackApp }`. The mount is
-unauthenticated, like any Prometheus target.
+unauthenticated, like any Prometheus target, and names the database, catalog
+schema and transforms: keep it off a public port.
 
-**Scrape the process that runs the worker.** The series that matter (the
-`ring_*` gauges, the latency histograms, `changes_applied_total`) are set in
-the process that runs the staging and drain work (`staging: true`,
-`drain_threads` above 0). A web process whose handle does neither holds only
-`trellis_instance_up`. A worker with no web server (`bin/rails runner`, a
-script) has no route to mount, so run it under a Rack server (a `config.ru` that boots the environment and
-runs the app above, in the same process as the handle) or render the text
-from a route of your own. Under a forking server each worker process has its own
-registry holding only its own handles' series, so Prometheus scrapes each. A
-process forked while its parent had a handle running can't render the
-registry, as it can't connect: it raises `Trellis::ForkedHandleError` (see
-[Forking servers](#forking-servers)).
+**Scrape the process that runs the worker.** The `ring_*` and
+`staging_segments` gauges are set only in the process whose `staging: true`
+handle leads (one per instance; the others stand by), and the latency
+histograms and `changes_applied_total` only in processes with drain threads.
+A web process with neither holds `trellis_instance_up` and none of these. The
+gem can't yet serve a worker that runs no web server (`bin/rails runner`, a
+script). Under a forking server each worker process has its own registry, so
+Prometheus scrapes each. A process forked while its parent had a handle
+running can't render the registry: it raises `Trellis::ForkedHandleError`
+(see [Forking servers](#forking-servers)).
 
-To put Trellis's series on an exporter the app already has
-(`prometheus-client`, `prometheus_exporter`, Yabeda), serve
-`Trellis::Metrics.render_prometheus` after the exporter's own body from a
-route of your own.
+An app with an exporter of its own (`prometheus-client`,
+`prometheus_exporter`, Yabeda) can serve that body followed by
+`Trellis::Metrics.render_prometheus` from one route; the `trellis_` names
+don't collide.
 
 ### Logs
 

@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "rack/builder"
+require "rack/lint"
+require "minitest/mock"
 require "rack/mock_request"
 require "test_helper"
 
@@ -72,10 +74,21 @@ class MetricsTest < Minitest::Test
     assert_equal 404, scrape(app, path: "/elsewhere").status
   end
 
+  # A label value (a transform name) can hold non-ASCII text.
+  def test_the_rack_app_counts_the_body_in_bytes
+    Trellis::Metrics.stub(:render_prometheus, "trellis_changes_applied_total{transform=\"café\"} 1\n") do
+      response = scrape(Trellis::Metrics::RackApp)
+
+      assert_equal response.body.bytesize.to_s, response.headers["content-length"]
+      refute_equal response.body.length.to_s, response.headers["content-length"]
+    end
+  end
+
   private
 
+  # Rack::Lint fails the request on any breach of the Rack spec.
   def scrape(app, path: "/", method: "GET")
-    Rack::MockRequest.new(app).request(method, path)
+    Rack::MockRequest.new(Rack::Lint.new(app)).request(method, path)
   end
 
   def instance_up(schema)

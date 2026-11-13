@@ -13,20 +13,9 @@ module Trellis
   # running handle and 0 after its last one shuts down; the other gauges of a
   # stopped instance disappear after 60 seconds. See docs/observability.md.
   #
-  # The binding opens no port. Trellis::Metrics::RackApp serves the text from
-  # a route the app already has, in Rails
-  #
-  #   # config/routes.rb
-  #   mount Trellis::Metrics::RackApp, at: "/metrics/trellis"
-  #
-  # or in any Rack server.
-  #
-  # The series that matter (the ring gauges, the latency histograms, the
-  # applied counters) are set in the process that runs the staging and drain
-  # work (staging: true, drain_threads above 0). A process with neither holds
-  # only trellis_instance_up, so scrape the process that runs the worker. In a
-  # forking server each worker process has its own registry, holding only its
-  # own handles' series.
+  # The binding opens no port; Trellis::Metrics::RackApp serves the text from
+  # a route the app already has. Most series are set only in the process
+  # running the staging or drain work, so scrape that one (README, Metrics).
   #
   # A process forked while its parent had an engine running may have
   # inherited the registry's lock held, so rendering there raises
@@ -39,17 +28,12 @@ module Trellis
     end
 
     # A Rack app answering GET and HEAD with render_prometheus, in the
-    # content type Prometheus expects, at whatever path it is mounted. It
-    # needs no Rack gem: any server that calls an object with an environment
-    # Hash will do. It renders the registry of the process it runs in (see
-    # Metrics).
+    # content type Prometheus expects, at whatever path it is mounted; every
+    # other method is a 405. It needs no Rack gem. Unauthenticated, as a
+    # Prometheus target is: guard it if the port is public.
     #
     #   mount Trellis::Metrics::RackApp, at: "/metrics/trellis"   # Rails
     #   map("/metrics/trellis") { run Trellis::Metrics::RackApp } # config.ru
-    #
-    # Every other method is a 405. The mount is unauthenticated, as a
-    # Prometheus target is: put it behind the app's own constraint if the
-    # port is public.
     class RackApp
       CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
