@@ -584,8 +584,7 @@ anomalies sit on small or hot groups, where the check can't catch a wrong sum
 can still be far off. Applying each group's changes strictly in order was
 rejected because it serializes hot groups, giving up the out-of-order
 parallelism the group basis relies on. Readers that need consistency use
-`await_converged`; stronger consistency as an opt-in is
-[#1185](https://github.com/salesforce-misc/trellis/issues/1185).
+`await_converged`.
 
 ### Apply is one set-based statement per batch per target, and the batch is bounded
 
@@ -945,7 +944,7 @@ Each alternative below is recorded with the number that rejected it.
 | **Deferred probes**: marking a group and re-reading its extreme after the page commits. | Unmodelled, a second producer of absolute writes, and a window in which readers see a deleted extreme. |
 | **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep.** | The re-read is a full enumeration per build that scales with table size, not with what changed; I ran it at 100M, where it reaches `live` after 2,305 s and its drain then runs out of memory. Nothing can tell a table unchanged since the build from one changed and changed back, so the re-read could never be skipped. A 1-1 build is per-row work and its acceptance bar is linear time; an aggregate's build keeps the one-pass `GROUP BY` and drops the withholding, because its absolute write applies alongside pages from its first moment. |
 | **`catching_up` as a stored status with marker fences, generations and go-live catch-ups.** | Needed only by a build that skips changes. Every build applies from its first chunk, so there is nothing to catch up; `catching_up` is the reported state of a reader whose upstream isn't `live` ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)). |
-| **A chunked aggregate build under a chunk gate:** primary-key-range chunks (a hybrid above a size threshold), or key-range chunks, each adding its region's partials under the group locks, with a gate in every page path (a page locks the chunk rows its sides fall in, before the page row; a chunk that hasn't run skips the side, a done chunk refuses what its snapshot saw, a retired one applies it), retirement once the drained prefix passes the chunk's stamp, a recompute that counts only done or retired chunks, a `NULL`-key chunk, and a truncate page that resets the chunks. | It is the only option that bounds a fresh build on a large unpartitioned source, but a chunk is paid per (chunk, cell) pair: about 5–6x the build time and 12x the WAL on many-cell shapes, against one `GROUP BY` per structure at 2–12x less in my `JOIN` model (84 s against 412–509 s; 213 s against 1,258 s), and it leaves in-place rebuilds unbounded. Key-range chunks bound locks and rows but reread the heap about 2x per chunk, so not I/O. The gate adds a lock to every page and machinery to every truncate and recompute. A build is one absolute write per structure instead, and a large source is partitioned ([#1276](https://github.com/salesforce-misc/trellis/issues/1276) keeps the bounded alternatives open). |
+| **A chunked aggregate build under a chunk gate:** primary-key-range chunks (a hybrid above a size threshold), or key-range chunks, each adding its region's partials under the group locks, with a gate in every page path (a page locks the chunk rows its sides fall in, before the page row; a chunk that hasn't run skips the side, a done chunk refuses what its snapshot saw, a retired one applies it), retirement once the drained prefix passes the chunk's stamp, a recompute that counts only done or retired chunks, a `NULL`-key chunk, and a truncate page that resets the chunks. | It is the only option that bounds a fresh build on a large unpartitioned source, but a chunk is paid per (chunk, cell) pair: about 5–6x the build time and 12x the WAL on many-cell shapes, against one `GROUP BY` per structure at 2–12x less in my `JOIN` model (84 s against 412–509 s; 213 s against 1,258 s), and it leaves in-place rebuilds unbounded. Key-range chunks bound locks and rows but reread the heap about 2x per chunk, so not I/O. The gate adds a lock to every page and machinery to every truncate and recompute. A build is one absolute write per structure instead, and a large source is partitioned. |
 | **Bounding drain memory by running fewer workers.** | Each worker then holds more buckets; I measured that it bounds nothing. |
 | **Fixing the build's cost by chunk size.** | I ran 10x larger chunks and they left 2.0x the time and 3.7x the WAL. |
 | **Resolve every image-less trigger into an image at staging time**, so Phase 2 never reads live state. | Under trigger capture the only image-less change is a delete, and every other image-less producer is an enumeration this ADR replaces with Re-derive or a recompute under lock. What this leaves untouched on a 1-1 target is out-of-order parallel batches for one key, which needs `applied_lsn`, not images. A resolver on the seal path is itself a live read racing the drains. |
@@ -955,32 +954,30 @@ Each alternative below is recorded with the number that rejected it.
 ## Consequences and costs
 
 - **Capture is on the application's write path.** The cost is one ring
-  append per statement and about 2.9x the source row's WAL bytes on disk.
-  It is paid by the writer at commit, not by a background process later, so
-  it is visible and it cannot fall behind: there is no capture lag, only
-  drain lag. The write-heavy user gets a documented bulk-load pattern.
+  append per statement and about 2.9x the source row's WAL bytes on disk,
+  paid by the writer at commit, so it is visible and cannot fall behind:
+  there is no capture lag, only drain lag. The write-heavy user gets a
+  documented bulk-load pattern.
 - **Trellis runs inside every writer's transaction.** Every future change to
   the ring's shape, the seal, or maintenance inherits I6: a lock the
   application can queue behind is a bug, and a condition that fails the
-  application's statement is a bug. Both get a written rule and a test
-  ([validation 6](#validation-and-acceptance)).
+  application's statement is a bug. Both get a written rule and a test.
 - **Storage grows with the source only for 1-1 targets.** A 1-1 target
   carries a slim ledger of one row per source row; an aggregate target
   carries state per group (5 MB for 50k groups, whatever the source's
-  size). No full old row is ever staged (the ring carries the imaged columns
-  only) and `REPLICA IDENTITY FULL` is not required anywhere.
+  size). No full old row is ever staged and `REPLICA IDENTITY FULL` is not
+  required anywhere.
 - **An aggregate doesn't repair itself.** A change Trellis never saw leaves
   its groups wrong until `self_check` finds them and an operator rebuilds
   the definition, which at a billion rows is a full build
   ([A change Trellis never saw](#a-change-trellis-never-saw-stays-wrong-until-it-is-detected-and-repaired)).
 - **Readers before convergence see a weaker picture than a per-row ledger
-  gave.** The ledger counted each row at most once, so its counts were never
-  negative; the group basis can show impossible combinations between pages
+  gave**: the group basis can show impossible combinations between pages
   ([Readers](#readers-see-a-group-only-while-its-row-count-is-above-0)).
-- **The aggregate surface is narrow.** `COUNT`, `SUM`/`AVG` over
-  integers and `numeric`, and on a plain aggregate `MIN`/`MAX` over a
-  plain column with its index; every other aggregate is refused at define,
-  and a definition using one doesn't work until its family is added.
+- **The aggregate surface is narrow.** `COUNT`, `SUM`/`AVG` over integers and
+  `numeric`, and on a plain aggregate `MIN`/`MAX` over a plain column with
+  its index; every other aggregate is refused at define until its family is
+  added.
 - **`MIN`/`MAX` read the source on the hot path.** A page that retracts a
   group's extreme holds that group's lock across an index probe of the
   source, the drain role needs `SELECT` on the source without row-level
@@ -993,112 +990,47 @@ Each alternative below is recorded with the number that rejected it.
 - **The failure mode of a broken capture is loud, not silent.** A schema
   change to a read column never fails the statement (I6). A missing ring
   table or revoked privilege does, with a `CONTEXT` line naming the capture
-  function:
-  the application sees the fault at once, not after data is lost. An owner who disables, drops or recreates a
-  plain table's trigger, or replaces its function, pauses the table's readers
-  at the next pass; the silent-uncapture paths left are in
+  function, so the application sees the fault before data is lost. A
+  disabled, dropped or recreated trigger, or a replaced function, pauses the
+  table's readers at the next pass; the silent-uncapture paths left are in
   [known correctness gaps — Capture disrupted and restored between two passes](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes).
 - **Hosted compatibility** is core Postgres for everything required
   (statement triggers, transition tables, `SECURITY DEFINER`, the `TRIGGER`
-  privilege); no event trigger is needed.
-  No replication privilege, slot or publication is needed, and a
-  physical backup-and-restore carries the ring with the data. A logical dump
-  carries it too, and the restore discards it ([I2](#invariants)).
-- **Drain backpressure becomes the operator's number.** Capture can outrun
-  the drain by ~20x (1.9M rows/s against ~85k folded rows/s with the
-  ledger), and I measured the ring in the application's database at ~188 B per
-  captured row when nothing drains.
-  The bound on that growth is designed but not built:
-  - **Gauges** report the ring's rows and bytes, the age of its oldest
-    undrained row, and its undrained bytes per source table.
+  privilege): no event trigger, replication privilege, slot or publication.
+  A physical backup-and-restore carries the ring with the data; a logical
+  restore discards it ([I2](#invariants)).
+- **The ring's growth has two bounds.** Capture can outrun the drain by
+  ~20x (1.9M rows/s against ~85k folded rows/s with the ledger), and I
+  measured the ring at ~188 B per captured row when nothing drains. Gauges report the ring's rows and bytes, the age of its oldest
+  undrained row, and its undrained bytes per source table.
   - **A soft bound, `ring_warn_bytes`, is on by default.** Above it,
-    `self_check` and `status()` report a backlog warning, and the drain takes
-    priority over optional work, as a build already yields to it
-    ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)).
-    Nothing is paused.
-  - **A hard bound, `ring_max_bytes`, is opt-in and off by default.** At it,
-    capture pauses for the definitions whose source tables hold the most
-    undrained bytes, largest first, until the ring is back under the bound.
-    Their pause kind is `backpressure`, their triggers are dropped under the
-    `lock_timeout` fence (I6), and their ring rows are discarded. `status()`
-    shows them paused with the reason, and `RESUME` rebuilds them from the
-    source: they are stale until then, never silently wrong. No application
-    writer is slowed or failed, and no captured row is skipped while capture
-    is on.
-  - **No bound applies while every Trellis process is down.** The capture
-    triggers keep appending, and only the database's own disk alerts guard
-    the disk. On restart, the bounds are checked first. Sizing the disk for
-    an outage:
-    [recommendations — Ring sizing](../recommendations.md#ring-sizing).
-- **A 1-1 build is per-row work on every worker**, not one pass. The
-  acceptance bar is linear time with a per-row cost independent of table
-  size, checked at 100M ([validation 4](#validation-and-acceptance)). An
-  aggregate's build is one `GROUP BY` per structure, and holds the `xmin`
-  horizon for its transaction.
+    `self_check` and `status()` report a backlog warning and the drain takes
+    priority over optional work, as a build already yields to it. Nothing is
+    paused.
+  - **A hard bound, `ring_max_bytes`, is opt-in.** At it, capture pauses for
+    the definitions whose source tables hold the most undrained bytes,
+    largest first, until the ring is back under the bound: pause kind
+    `backpressure`, triggers dropped under the `lock_timeout` fence (I6),
+    ring rows discarded. They are stale until `RESUME` rebuilds them, never
+    silently wrong; no application writer is slowed or failed, and no
+    captured row is skipped while capture is on.
+  - **No bound applies while every Trellis process is down**: the triggers
+    keep appending, and only the database's disk alerts guard the disk. On
+    restart, the bounds are checked first
+    ([recommendations — Ring sizing](../recommendations.md#ring-sizing)).
+- **A 1-1 build is per-row work on every worker**, held to linear time with
+  a per-row cost independent of table size. An aggregate's build is one
+  `GROUP BY` per structure, and holds the `xmin` horizon for its
+  transaction.
 - **Registration latency does not depend on table size**, and no definition
   is `live` when registration returns: callers poll `Trellis::status` to
   `live`, then use a token
   ([embedding](../embedding.md#poll-to-live-dont-wait)).
 - **I took every number above on one box.** The capture-throughput
   experiments and the first four ledger experiments ran on tmpfs; the
-  disk-backed numbers are from a single NVMe with ~0.4 ms fsyncs and, for the
-  ledger experiments' disk tier, a box that was not always quiet.
-  Within-session ratios stand; absolute bars are restated in
-  [validation 5](#validation-and-acceptance).
-
-## Validation and acceptance
-
-Nothing below polls for convergence.
-
-1. **One deterministic interleaving test per scenario of the interleaving
-   experiment** (all seventeen) on the real engine, hand-driven with advisory
-   locks, plus one for each of the nine superseded problems in the inventory of
-   producer pairings that motivated this design.
-2. **One deterministic test per scenario of the group-basis model** that
-   applies to the engine: the read-after-lock and stale-basis cases, the
-   fold that straddles a basis, the image chains under nested writes and
-   cascades, the enumeration of a build over vacated groups, zero groups
-   and the GC racing a recompute, the truncate barrier's earlier side,
-   a build's absolute write against pages before, during and after each of
-   its steps, and the chained-source cases
-   ([Multi-hop](#multi-hop-a-targets-writes-reach-its-readers-through-the-mutation-seam)).
-   Each scenario the soak can't reach is the only evidence for its rule.
-3. **The generative concurrent tier** with planted violations (skip the
-   lock, compare LSN instead of visibility, delete tombstones early, fold
-   sides per key, collect zero groups early), each caught within the
-   nightly budget. **Merge gate.**
-4. **`build-under-load` at 100M** on the implementation branch, disk-backed,
-   under a 16 GB memory cap: oracle ok, memory bounded, WAL retention
-   bounded, time linear in N, per-row cost flat from 1M to 100M.
-   **Milestone exit for the build.**
-5. **A quiet-box, disk-backed benchmark round** with a checkpoint inside the
-   window and storage stated on every number: `fold-in-ratio`,
-   `group-contention` (400/4k/40k), `throughput-ramp`, `build-under-load`,
-   and the two capture benchmarks (statement against row triggers, and
-   scaling with writers, including the cost of the transition image a
-   re-read row carries), each with a same-session control on the
-   pre-change code: the group basis against the per-row ledger. The bars in
-   this ADR are restated from that round. **Milestone exit for the group
-   basis.**
-6. **Writer-coupling tests:** schema change of a read column under load
-   (writes succeed, definition pauses, regeneration restores capture); join
-   and drop under a 30 s open transaction (worst writer wait under 100 ms);
-   revoked privilege and disabled trigger (audit reports); `REPEATABLE
-   READ` and `SERIALIZABLE` writers straddling a seal (no lost rows).
-7. **Drain paging:** a segment several times the batch cap drains with peak
-   RSS bounded by the cap; a key whose changes straddle two segments, a
-   paged truncate segment, and a reclaim between two pages all converge.
-
-## Reusable material
-
-Prototype branches on the fork (mmmries/trellis) hold the ledger Apply
-experiments with their results and handoff notes, the chunked ledger build
-with `build-under-load` (the disk columns and the memory sampler), a
-trigger-capture variant of that build, and the trigger-capture spike (the
-capture SQL with the `new_only` and `skip_noop` shapes, and the phase-1
-harness). The fence mirror is already in `main`. The group-basis model is a
-SQL and Python harness against real Postgres, with its scenarios, soak
-matrix and negative controls, each re-runnable from one script.
+  disk-backed numbers are from a single NVMe with ~0.4 ms fsyncs, on a box
+  that was not always quiet. Within-session ratios stand; absolute numbers
+  are that box's.
 
 ## More information
 
