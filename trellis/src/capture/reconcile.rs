@@ -261,10 +261,6 @@ pub(crate) async fn reconcile_with_floors(
                 continue;
             }
         }
-        // A table that joined a partition or inheritance hierarchy
-        // after define, or was recreated as one, can't be captured: its
-        // readers pause, and its capture is left as it is.
-        //
         // ADR-0017, "The reconcile pass detects tree changes by two persisted
         // fingerprints": a partitioned root that is no partition and in no
         // inheritance hierarchy is not "in a hierarchy". The pass fingerprints
@@ -284,160 +280,13 @@ pub(crate) async fn reconcile_with_floors(
                 }
                 partitioned = Some(proceed);
             }
-            Ok(partitions::Begin::NotPartitioned) => {
-                match crate::staging::schema_change::pause_readers_in_hierarchy(
-                    client,
-                    &snapshot.catalog,
-                    table,
-                )
-                .await
-                {
-                    Ok(false) => {}
-                    Ok(true) => continue,
-                    Err(err) => {
-                        outcome.failed.push((table.clone(), err));
-                        continue;
-                    }
-                }
-            }
+            Ok(partitions::Begin::NotPartitioned) => {}
             Err(err) => {
                 outcome.failed.push((table.clone(), err));
                 continue;
             }
         }
-        // Row-level security that applies to Trellis's role filters
-        // every read of the table, and a subscription's changes to it
-        // are never captured, so its readers pause, whatever capture does.
-        match crate::staging::schema_change::pause_readers_of_unsupported(
-            client,
-            schema,
-            &snapshot.catalog,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // Capture triggers or functions changed outside Trellis pause
-        // the table's readers, and nothing is reinstalled until a resume.
-        match super::triggers::check(client, schema, &snapshot.catalog, table).await {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A definition that reads a column the table no longer has
-        // pauses before the table's functions are regenerated, whether or
-        // not a write has marked it yet. The next pass's catalog no longer
-        // counts it.
-        match crate::staging::schema_change::pause_readers_of_missing(
-            client,
-            schema,
-            &snapshot.catalog,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => {
-                // Neither waiting nor failing: the next pass decides afresh.
-                continue;
-            }
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A read column capture can't image (one dropped and added again as
-        // a virtual generated column, or another renamed onto its name)
-        // pauses its readers before the functions are regenerated: until
-        // then, an insert or a delete that reaches its image fails, and an
-        // update stages it as `NULL`. The next pass's
-        // catalog no longer counts them, so it regenerates the functions
-        // without the column.
-        match crate::staging::schema_change::pause_readers_of_uncapturable(
-            client,
-            &snapshot.catalog,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A 1-1 `JOIN` whose joined table no longer has a unique key
-        // within its `ON` columns (an index dropped) pauses: the table can
-        // take two rows on one join key now, which the target can't hold.
-        match crate::staging::schema_change::pause_joins_without_unique_key(
-            client,
-            instance,
-            &snapshot.catalog,
-            &drift,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A table keyed by a declared `KEY (...)` with no unique index
-        // backing it any more (dropped, or invalid) pauses every reader, with
-        // no grace: the table can take two rows with one key now.
-        match crate::staging::schema_change::pause_readers_of_unbacked_key(
-            client,
-            instance,
-            &snapshot.catalog,
-            &drift,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A `MIN`/`MAX` definition whose probe index has been missing or
-        // invalid on every check for its grace pauses.
-        match crate::staging::schema_change::pause_readers_of_missing_probe_index(
-            client,
-            instance,
-            &snapshot.catalog,
-            &drift,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A key column whose type or collation define would
-        // refuse now, a join pair that no longer matches, a type change that
-        // renders the stored keys differently, or a widening past a typed
-        // copy pauses the definitions it concerns. After the missing-column
-        // check, which owns a key column that's gone.
-        match crate::staging::schema_change::pause_readers_of_retyped(
+        let checked = pause_changed_readers(
             client,
             schema,
             floors,
@@ -445,21 +294,11 @@ pub(crate) async fn reconcile_with_floors(
             &snapshot.catalog,
             &drift,
             table,
-        )
-        .await
-        {
+            partitioned.is_none(),
+        );
+        match checked.await {
             Ok(false) => {}
-            Ok(true) => continue,
-            Err(err) => {
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A read column dropped and re-added, retyped, or
-        // its values rewritten in place, since the last pass. Its readers
-        // rebuild, or pause where their definition may no longer be valid.
-        match super::baseline::check(client, schema, floors, &snapshot.catalog, table).await {
-            Ok(false) => {}
+            // Neither waiting nor failing: the next pass decides afresh.
             Ok(true) => continue,
             Err(err) => {
                 outcome.failed.push((table.clone(), err));
@@ -560,29 +399,7 @@ pub(crate) async fn reconcile_with_floors(
         .collect();
     seam_fed.sort();
     for &table in &seam_fed {
-        match crate::staging::schema_change::pause_readers_of_unsupported(
-            client,
-            schema,
-            &snapshot.catalog,
-            table,
-        )
-        .await
-        {
-            Ok(false) => {}
-            Ok(true) => {
-                seam_held.insert(table.clone());
-                continue;
-            }
-            Err(err) => {
-                seam_held.insert(table.clone());
-                outcome.failed.push((table.clone(), err));
-                continue;
-            }
-        }
-        // A chained definition's key columns and typed copies
-        // are checked on its source target too, which a resume upstream can
-        // re-type.
-        match crate::staging::schema_change::pause_readers_of_retyped(
+        let checked = pause_changed_seam_readers(
             client,
             schema,
             floors,
@@ -590,9 +407,8 @@ pub(crate) async fn reconcile_with_floors(
             &snapshot.catalog,
             &drift,
             table,
-        )
-        .await
-        {
+        );
+        match checked.await {
             Ok(false) => {}
             Ok(true) => {
                 seam_held.insert(table.clone());
@@ -670,6 +486,113 @@ pub(crate) async fn reconcile_with_floors(
     let gated = super::gate::held_tables(&*client).await?;
     outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);
     Ok(outcome)
+}
+
+/// The checks that pause `table`'s readers before its capture is
+/// reconciled, in order: `true` once one has paused some (or held the
+/// table), and the rest wait for the next pass. `unpartitioned`: no
+/// partitioned root, whose tree [`partitions::begin`] checks instead.
+#[allow(clippy::too_many_arguments)]
+async fn pause_changed_readers(
+    client: &mut Client,
+    schema: &str,
+    floors: &crate::defs::floor::Floors,
+    instance: &str,
+    catalog: &CaptureCatalog,
+    drift: &crate::staging::drift_memo::Fingerprints,
+    table: &str,
+    unpartitioned: bool,
+) -> Result<bool, CaptureError> {
+    use crate::staging::schema_change as change;
+    // A table that joined a partition or inheritance hierarchy
+    // after define, or was recreated as one, can't be captured: its
+    // readers pause, and its capture is left as it is.
+    if unpartitioned && change::pause_readers_in_hierarchy(client, catalog, table).await? {
+        return Ok(true);
+    }
+    // Row-level security that applies to Trellis's role filters
+    // every read of the table, and a subscription's changes to it
+    // are never captured, so its readers pause, whatever capture does.
+    if change::pause_readers_of_unsupported(client, schema, catalog, table).await? {
+        return Ok(true);
+    }
+    // Capture triggers or functions changed outside Trellis pause
+    // the table's readers, and nothing is reinstalled until a resume.
+    if super::triggers::check(client, schema, catalog, table).await? {
+        return Ok(true);
+    }
+    // A definition that reads a column the table no longer has
+    // pauses before the table's functions are regenerated, whether or
+    // not a write has marked it yet. The next pass's catalog no longer
+    // counts it.
+    if change::pause_readers_of_missing(client, schema, catalog, table).await? {
+        return Ok(true);
+    }
+    // A read column capture can't image (one dropped and added again as
+    // a virtual generated column, or another renamed onto its name)
+    // pauses its readers before the functions are regenerated: until
+    // then, an insert or a delete that reaches its image fails, and an
+    // update stages it as `NULL`. The next pass's
+    // catalog no longer counts them, so it regenerates the functions
+    // without the column.
+    if change::pause_readers_of_uncapturable(client, catalog, table).await? {
+        return Ok(true);
+    }
+    // A 1-1 `JOIN` whose joined table no longer has a unique key
+    // within its `ON` columns (an index dropped) pauses: the table can
+    // take two rows on one join key now, which the target can't hold.
+    if change::pause_joins_without_unique_key(client, instance, catalog, drift, table).await? {
+        return Ok(true);
+    }
+    // A table keyed by a declared `KEY (...)` with no unique index
+    // backing it any more (dropped, or invalid) pauses every reader, with
+    // no grace: the table can take two rows with one key now.
+    if change::pause_readers_of_unbacked_key(client, instance, catalog, drift, table).await? {
+        return Ok(true);
+    }
+    // A `MIN`/`MAX` definition whose probe index has been missing or
+    // invalid on every check for its grace pauses.
+    if change::pause_readers_of_missing_probe_index(client, instance, catalog, drift, table).await?
+    {
+        return Ok(true);
+    }
+    // A key column whose type or collation define would
+    // refuse now, a join pair that no longer matches, a type change that
+    // renders the stored keys differently, or a widening past a typed
+    // copy pauses the definitions it concerns. After the missing-column
+    // check, which owns a key column that's gone.
+    if change::pause_readers_of_retyped(client, schema, floors, instance, catalog, drift, table)
+        .await?
+    {
+        return Ok(true);
+    }
+    // A read column dropped and re-added, retyped, or
+    // its values rewritten in place, since the last pass. Its readers
+    // rebuild, or pause where their definition may no longer be valid.
+    super::baseline::check(client, schema, floors, catalog, table).await
+}
+
+/// [`pause_changed_readers`] for `table`, another definition's target that
+/// no definition reads through capture: the seam feeds it, so only the
+/// checks of who reads and writes it and of its key columns and typed
+/// copies apply.
+async fn pause_changed_seam_readers(
+    client: &mut Client,
+    schema: &str,
+    floors: &crate::defs::floor::Floors,
+    instance: &str,
+    catalog: &CaptureCatalog,
+    drift: &crate::staging::drift_memo::Fingerprints,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    use crate::staging::schema_change as change;
+    if change::pause_readers_of_unsupported(client, schema, catalog, table).await? {
+        return Ok(true);
+    }
+    // A chained definition's key columns and typed copies
+    // are checked on its source target too, which a resume upstream can
+    // re-type.
+    change::pause_readers_of_retyped(client, schema, floors, instance, catalog, drift, table).await
 }
 
 /// The catalog one pass works from, read in one snapshot so the capture
