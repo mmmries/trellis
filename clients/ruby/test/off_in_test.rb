@@ -33,6 +33,9 @@ class OffInTest < Minitest::Test
     ActiveRecord.schema_format = :sql
     # Rails' load records itself in the app's own database.
     use_app_database
+    # The suite's app has Trellis on everywhere (support/rails_app.rb); these
+    # tests run the Railtie's default.
+    TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN
   end
 
   def teardown
@@ -48,10 +51,19 @@ class OffInTest < Minitest::Test
     super
   end
 
-  def test_trellis_is_on_everywhere_by_default
+  def test_trellis_is_off_in_the_test_environment_by_default
+    assert_equal %w[test], DEFAULT_OFF_IN
+    assert Trellis::Railtie.off_in?("test")
+    refute Trellis::Railtie.enabled?("test")
+    assert Trellis::Railtie.enabled?("development")
+    assert Trellis::Railtie.enabled?("production")
+  end
+
+  # An app that runs Trellis in its tests leaves `test` out of off_in.
+  def test_an_empty_off_in_turns_trellis_on_in_the_test_environment
+    TrellisTestApp.config.trellis.off_in = []
     refute Trellis::Railtie.off_in?("test")
-    assert Trellis.enabled?
-    assert Trellis::Railtie.enabled?("test")
+    in_environment("test") { assert Trellis.enabled? }
   end
 
   def test_off_in_names_environments_as_strings_or_symbols
@@ -64,14 +76,12 @@ class OffInTest < Minitest::Test
   end
 
   def test_enabled_follows_this_processs_rails_environment
-    TrellisTestApp.config.trellis.off_in = %w[test]
     in_environment("development") { assert Trellis.enabled? }
     in_environment("test") { refute Trellis.enabled? }
   end
 
   def test_connect_and_migrate_all_connect_nothing_in_an_off_environment
     TrellisTestApp.config.trellis.connect = { url: TestCluster.dsn }
-    TrellisTestApp.config.trellis.off_in = %w[test]
     in_environment("test") do
       _, warned = capture_io { assert_nil Trellis::Railtie.connect }
       assert_includes warned, "Trellis is off in the test environment (config.trellis.off_in)"
@@ -98,7 +108,6 @@ class OffInTest < Minitest::Test
     database = database("migr")
     ActiveRecord::Base.establish_connection(db_config(database))
     TrellisTestApp.config.trellis.connect = { url: dsn(database) }
-    TrellisTestApp.config.trellis.off_in = %w[test]
     klass = Class.new(ActiveRecord::Migration[8.1]) do
       include Trellis::Migration
 
@@ -138,6 +147,7 @@ class OffInTest < Minitest::Test
 
     on = database("on")
     TrellisTestApp.config.trellis.connect = { url: dsn(on) }
+    TrellisTestApp.config.trellis.off_in = [] # Trellis on in the test environment
     Tasks.load_schema(db_config(on), :sql, File.join(@dir, "structure.sql"))
     assert_includes tables(on, "trellis"), "transform_definitions"
     error = assert_raises(ActiveRecord::StatementInvalid) { check_foreign_keys(on) }
@@ -147,7 +157,7 @@ class OffInTest < Minitest::Test
 
     off = database("off")
     TrellisTestApp.config.trellis.connect = { url: dsn(off) }
-    TrellisTestApp.config.trellis.off_in = %w[test]
+    TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN
     Tasks.load_schema(db_config(off), :sql, File.join(@dir, "structure.sql"))
     assert_includes tables(off, "public"), "of_totals_#{@id}"
     assert_nil to_regclass(off, "trellis.transform_definitions")
@@ -165,7 +175,6 @@ class OffInTest < Minitest::Test
   def test_a_load_of_an_off_environments_database_from_another_environment_restores_nothing
     dump(source_database)
     test = database("envtest")
-    TrellisTestApp.config.trellis.off_in = %w[test]
     TrellisTestApp.config.trellis.connect = { url: dsn(database("envdev")) }
     Tasks.env = "development"
     Tasks.load_schema(db_config(test), :sql, File.join(@dir, "structure.sql"))
@@ -188,12 +197,13 @@ class OffInTest < Minitest::Test
     TrellisTestApp.config.trellis.connect = { url: dsn(name) }
     Tasks.env = "test" # `rails test`
 
+    TrellisTestApp.config.trellis.off_in = [] # Trellis on in the test environment
     error = assert_raises(Trellis::ValidationError) do
       ActiveRecord::TestDatabases.create_and_load_schema(0, env_name: "test")
     end
     assert_includes error.message, "config.trellis.dump_database"
 
-    TrellisTestApp.config.trellis.off_in = %w[test]
+    TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN
     ActiveRecord::TestDatabases.create_and_load_schema(0, env_name: "test")
     assert_includes tables("#{name}_0", "public"), "of_totals_#{@id}"
     assert_nil to_regclass("#{name}_0", "trellis.transform_definitions")
@@ -204,7 +214,6 @@ class OffInTest < Minitest::Test
   def test_a_dump_of_an_off_database_from_an_on_environment_is_skipped
     source = source_database
     TrellisTestApp.config.trellis.connect = { url: dsn(source) }
-    TrellisTestApp.config.trellis.off_in = %w[test]
     Tasks.env = "development"
     path = File.join(@dir, "structure.sql")
     File.write(path, "-- the development dump\n")
@@ -243,13 +252,16 @@ class OffInTest < Minitest::Test
     end
   end
 
-  # Dumps `database` as structure.sql, with Trellis on, and returns the file.
+  # Dumps `database` as structure.sql, with Trellis on (these databases are
+  # named "test"), and returns the file.
   def dump(database)
     TrellisTestApp.config.trellis.connect = { url: dsn(database) }
+    TrellisTestApp.config.trellis.off_in = []
     Tasks.dump_schema(db_config(database))
     File.read(File.join(@dir, "structure.sql"))
   ensure
     TrellisTestApp.config.trellis.connect = nil
+    TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN
   end
 
   def check_foreign_keys(database, **options)

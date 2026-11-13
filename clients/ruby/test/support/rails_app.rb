@@ -16,4 +16,13 @@ class TrellisTestApp < Rails::Application
   config.logger = Logger.new(nil)
 end
 
+# What the Railtie ships with (Trellis off in the test environment), before
+# the line below.
+DEFAULT_OFF_IN = TrellisTestApp.config.trellis.off_in.dup.freeze
+
+# This suite runs Trellis on in every environment: its schema, dump and
+# migration tests build databases under a "test" config name. Only
+# off_in_test.rb switches the default back on.
+TrellisTestApp.config.trellis.off_in = []
+
 ActiveRecord::Migration.verbose = false

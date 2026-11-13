@@ -34,14 +34,15 @@ module Trellis
   # the definitions in `structure.sql` (Trellis::SchemaDump). The database
   # they dump into is config.trellis.dump_database, "primary" by default.
   #
-  # `config.trellis.off_in` names the environments Trellis is off in
-  # (`%w[test]`: a test suite's transactions never commit, so it can't see
-  # a target change). It is read from any environment, so a `db:prepare` or
-  # `db:test:prepare` run from development leaves Trellis out of the test
-  # database too. There, nothing connects at boot, Railtie.connect and
-  # `trellis:migrate` do nothing, the schema load and dump hooks leave the
-  # target tables as plain ones, and the migration helpers refuse (or skip,
-  # migrating that database from an environment Trellis is on in).
+  # `config.trellis.off_in` names the environments Trellis is off in. The
+  # default is `%w[test]`: a test suite's transactions never commit, so it
+  # can't see a target change. `off_in = []` turns Trellis on in tests. It
+  # is read from any environment, so a `db:prepare` or `db:test:prepare` run
+  # from development leaves Trellis out of the test database too. There,
+  # nothing connects at boot, Railtie.connect and `trellis:migrate` do
+  # nothing, the schema load and dump hooks leave the target tables as plain
+  # ones, and the migration helpers refuse (or skip, migrating that database
+  # from an environment Trellis is on in).
   # Trellis.enabled? is the predicate; "Testing" in the README has the rest.
   #
   # When either is set, the app's handles connect in an after_initialize hook,
@@ -78,7 +79,7 @@ module Trellis
     config.trellis.instances = {}
     config.trellis.connect_on_boot = true
     config.trellis.dump_database = "primary"
-    config.trellis.off_in = []
+    config.trellis.off_in = %w[test]
 
     rake_tasks do
       namespace :trellis do
