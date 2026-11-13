@@ -320,7 +320,7 @@ class MigrationTest < Minitest::Test
     klass = "#{name}#{@id}"
     path = File.join(@dir, "#{version}_#{klass.gsub(/(?<!^)([A-Z])/, '_\1').downcase}.rb")
     File.write(path, <<~RUBY)
-      class #{klass} < ActiveRecord::Migration[8.1]
+      class #{klass} < ActiveRecord::Migration[#{ActiveRecord::Migration.current_version}]
         include Trellis::Migration
 
       #{body.gsub(/^/, '  ')}
