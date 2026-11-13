@@ -155,7 +155,7 @@ const PAUSED_DEFINITIONS_METRIC: &str = "trellis_paused_definitions";
 /// Source keys held in quarantine, all definitions together.
 const HELD_KEYS_METRIC: &str = "trellis_held_keys";
 
-/// Columns of a 1-1 target that are paused (`column_status` rows).
+/// Columns of a 1-1 target whose own fuse tripped.
 const QUARANTINED_COLUMNS_METRIC: &str = "trellis_quarantined_columns";
 
 /// Open drain holdups: pages the drain keeps failing on with nothing charged
@@ -554,7 +554,8 @@ fn describe_metrics() {
     );
     metrics::describe_gauge!(
         QUARANTINED_COLUMNS_METRIC,
-        "Count of paused columns of 1-1 targets, all definitions together."
+        "Count of columns of 1-1 targets whose own fuse tripped, all definitions together. A \
+         column an operator paused, or one a pause cascaded to, is not counted."
     );
     metrics::describe_gauge!(
         DRAIN_FAILURES_METRIC,
@@ -712,7 +713,7 @@ pub(crate) struct StatusGauges {
     pub(crate) paused_by: BTreeMap<&'static str, u64>,
     /// Source keys held in quarantine.
     pub(crate) held_keys: u64,
-    /// Paused columns of 1-1 targets.
+    /// Columns of 1-1 targets whose own fuse tripped.
     pub(crate) quarantined_columns: u64,
     /// Open drain holdups.
     pub(crate) drain_failures: u64,

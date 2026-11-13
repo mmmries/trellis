@@ -1566,14 +1566,26 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                         }
                         crate::metrics::set_ring_gauges(reading.ring);
                     }
-                    // The status and liveness gauges, read in the same pass:
-                    // two catalog reads and one statement of counts, with no
-                    // transaction either.
-                    let reading = staging::status_gauges::read(
-                        &*c,
-                        pool.floors(),
-                        staging::DEFAULT_RECLAIM_TTL,
-                    )
+                    // The status and liveness gauges, read in the same pass,
+                    // in one read-only snapshot so a definition resumed or
+                    // dropped between its reads isn't counted paused for an
+                    // `unknown` cause.
+                    let reading = async {
+                        let txn = c
+                            .build_transaction()
+                            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                            .read_only(true)
+                            .start()
+                            .await?;
+                        let reading = staging::status_gauges::read(
+                            &txn,
+                            pool.floors(),
+                            staging::DEFAULT_RECLAIM_TTL,
+                        )
+                        .await?;
+                        txn.commit().await?;
+                        Ok::<_, crate::defs::catalog::CatalogError>(reading)
+                    }
                     .await;
                     if let Ok(reading) = failures.check("status_gauges", reading) {
                         crate::metrics::set_status_gauges(reading);

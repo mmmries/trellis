@@ -1,5 +1,5 @@
 //! The status and liveness gauges: how many definitions are in each status,
-//! why the paused ones are, and the held keys, paused columns and holdups
+//! why the paused ones are, and the held keys, quarantined columns and holdups
 //! that don't change a definition's status word (`docs/observability.md`).
 //! Read on the staging worker's housekeeping pass, next to the ring's gauges
 //! ([`super::ring_gauges`]), so no hot path keeps a count.
@@ -89,7 +89,8 @@ pub(crate) async fn read(
         .query_one(
             &format!(
                 "select (select count(*) from poison), \
-                        (select count(*) from column_status), \
+                        (select count(*) from column_status \
+                         where local_fuse and last_error is not null), \
                         (select count(*) from drain_holdups), \
                         (select count(*) from capture_holdups where operation is not null), \
                         (select count(*) from capture_holdups where operation is null), \
@@ -233,7 +234,8 @@ mod tests {
 
     /// Every condition the gauges count, set up in a catalog: definitions in
     /// each status, paused by the operator, a disruption, a halt, another
-    /// capture failure and a failing build; held keys; a paused column; a
+    /// capture failure and a failing build; held keys; columns whose fuse
+    /// tripped, beside ones paused otherwise, which don't count; a
     /// drain holdup; a capture wait and a capture failure; a live worker and
     /// a stale one. The reading counts each, and clears each as its condition
     /// does: a resume, a drop, a released key and a worker that went quiet.
@@ -308,8 +310,13 @@ mod tests {
              insert into poison (transform_id, src_table, key, last_error) \
              select id, 'public.orders', k, 'refused' from transform_definitions, \
                     unnest(array['1', '2', '3']) k where target_table = 'public.live'; \
-             insert into column_status (transform_table, column_name) \
-             values ('live', 'total'), ('broken', 'total'); \
+             insert into column_status (transform_table, column_name, last_error, local_fuse, \
+                                        awaiting_capture) \
+             values ('live', 'total', 'division by zero', true, false), \
+                    ('broken', 'total', 'division by zero', true, false), \
+                    ('waiting', 'total', null, true, false), \
+                    ('building', 'total', 'upstream paused', false, false), \
+                    ('by_build', 'total', null, false, true); \
              insert into drain_holdups (seg_seq, buckets, tables, error, since, last_seen, \
                                         attempts) \
              select seg_seq, '{0}', '{public.orders}', 'permission denied', now(), now(), 4 \
@@ -487,8 +494,9 @@ mod tests {
         assert_eq!(get("trellis_drain_workers", &[]), Some(0.0));
     }
 
-    /// A `live` definition reading an upstream that is paused reports
-    /// `catching_up`, in the gauge as in the API (`reported_statuses`).
+    /// A `live` definition reading an upstream that is paused, or a paused
+    /// column of one, reports `catching_up`, in the gauge as in the API
+    /// (`reported_statuses`).
     #[tokio::test]
     async fn a_definition_reading_a_paused_upstream_counts_as_catching_up() {
         let cluster = testkit::TestCluster::start();
@@ -522,6 +530,21 @@ mod tests {
             .expect("read");
         assert_eq!(live.definitions["live"], 2, "{live:?}");
         assert_eq!(live.definitions["catching_up"], 0, "{live:?}");
+
+        // A paused column it reads holds it back too.
+        raw.batch_execute(
+            "insert into column_status (transform_table, column_name, local_fuse) \
+             values ('upstream', 'total', true)",
+        )
+        .await
+        .expect("pause the column");
+        let column = read(raw, &Floors::of_this_binary(), TTL)
+            .await
+            .expect("read");
+        assert_eq!(column.definitions["catching_up"], 1, "{column:?}");
+        raw.batch_execute("delete from column_status")
+            .await
+            .expect("resume the column");
 
         lifecycle::pause_transform(&pool, "upstream")
             .await

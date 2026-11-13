@@ -7316,6 +7316,11 @@ async fn column_dependents_via(
             }
             continue;
         }
+        // Only a reader of the upstream table can read its column: the others
+        // aren't parsed, which a large catalog would pay for on every scan.
+        if !reads_upstream {
+            continue;
+        }
         // A definition already persisted here is expected to always re-parse
         // (the same assumption every other read path in this module makes);
         // skip rather than fail this best-effort lineage scan on the

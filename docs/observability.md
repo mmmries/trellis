@@ -194,9 +194,10 @@ below, and the histograms above, also carries the `trellis_instance` label
     `definitions{status="paused"}`. A definition an operator paused that then
     meets a disruption counts as `capture`, as its `capture_failure` says.
   * `held_keys` is the source keys held in quarantine, every definition's
-    together, whatever its status. `quarantined_columns` is the paused columns
-    of 1-1 targets, whether the fuse tripped or an operator ran
-    `PAUSE TRANSFORM t.col`.
+    together, whatever its status. `quarantined_columns` is the columns of 1-1
+    targets whose own fuse tripped; a column an operator paused
+    (`PAUSE TRANSFORM t.col`) and the readers a pause cascades to aren't
+    counted.
   * `drain_failures` is the open [drain failures](status-reference.md#drain_failure),
     one per failing segment. `capture_holdups{kind}` is the tables whose
     capture install is held up: `wait` for a lock another session holds
@@ -223,6 +224,7 @@ the new leader's series side by side for up to 60 s.
 |---|---|
 | A definition stopped | `max by (trellis_instance) (trellis_paused_definitions{cause!="operator"}) > 0 or max by (trellis_instance) (trellis_definitions{status="quarantined"}) > 0` |
 | Keys are held | `max by (trellis_instance) (trellis_held_keys) > 0` |
+| A column's fuse tripped | `max by (trellis_instance) (trellis_quarantined_columns) > 0` |
 | The pipeline is behind | `max by (trellis_instance) (trellis_ring_oldest_undrained_age_seconds) > 60` |
 | No staging worker | `sum by (trellis_instance) (trellis_staging_leader) < 1 or absent(trellis_staging_leader)` |
 | No drain worker | `max by (trellis_instance) (trellis_drain_workers) < 1` |
