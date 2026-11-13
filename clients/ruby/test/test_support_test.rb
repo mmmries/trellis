@@ -18,7 +18,8 @@ class TestSupportTest < Minitest::Test
   include TrellisTestCase
 
   def teardown
-    ActiveRecord::Base.connection_pool.disconnect!
+    # A test may have defined no connection at all.
+    ActiveRecord::Base.connection_handler.connection_pool_list.each(&:disconnect!)
     super
   end
 
@@ -156,6 +157,8 @@ class TestSupportTest < Minitest::Test
 
       ActiveRecord::Base.transaction do
         connection.execute("insert into rf_orders values (1, 8, 2.50), (2, 8, 1.25), (3, 9, 4)")
+        # A row a test stubbed by hand, which the refresh replaces.
+        connection.execute("insert into rf_customer_counts values (7, 99, 99)")
         Trellis.stub(:enabled?, false) do
           assert_equal 2, Trellis::TestSupport.refresh_trellis_target("rf_doubled")
         end
@@ -215,6 +218,10 @@ class TestSupportTest < Minitest::Test
       def run_it(target) = refresh_trellis_target(target)
     end
     assert_includes klass.private_instance_methods, :refresh_trellis_target
+    # Its steps aren't the test's methods, which a test's own helper could replace.
+    refute_includes klass.private_instance_methods, :definitions
+    # The refusal comes first, with no ActiveRecord connection defined.
+    ActiveRecord::Base.connection_handler.remove_connection_pool("ActiveRecord::Base")
     error = Trellis.stub(:enabled?, true) { assert_raises(Trellis::ValidationError) { klass.new.run_it(:rf) } }
     assert_includes error.message, "rf"
   end
