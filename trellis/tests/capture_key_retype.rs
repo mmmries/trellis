@@ -19,6 +19,8 @@ use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 use trellis::{Trellis, TrellisError};
 
+#[path = "support/attver.rs"]
+mod attver;
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
@@ -3557,12 +3559,16 @@ async fn a_column_re_typed_and_back_between_passes_is_compared_again() {
     let mut raw = connect(db.dsn()).await;
     let (_trellis, settled) = settled(&db, &mut raw).await;
 
-    raw.batch_execute(
-        "alter table public.posts alter column kind type bigint; \
-         alter table public.posts alter column kind type integer;",
-    )
-    .await
-    .expect("there and back");
+    // Each retype moves the column's attribute version on a server that
+    // versions them, so the two rows differ only there (`support/attver.rs`).
+    let attver = attver::Attver::probe(&raw).await;
+    for statement in [
+        "alter table public.posts alter column kind type bigint",
+        "alter table public.posts alter column kind type integer",
+    ] {
+        raw.batch_execute(statement).await.expect("there and back");
+        attver.after(&raw, statement).await;
+    }
     capture_pass(&mut raw, &db.pool).await;
 
     for target in ["post_authors", "post_titles", "per_kind"] {
