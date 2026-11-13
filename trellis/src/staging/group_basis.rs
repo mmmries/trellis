@@ -5221,7 +5221,8 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
 /// aggregate's), for `target`'s group-basis definition, each read from the
 /// whole source. Planned with nested loops disabled, so a nested loop that
 /// matches the groups shows only where the match can't be hashed or merged;
-/// the lateral lookups of the hidden rows stay nested loops. It
+/// the lateral lookups of the hidden rows stay nested loops. The rebuild's
+/// is planned under its own settings too ([`REBUILD_PLAN_SETTINGS`]). It
 /// locks and writes nothing.
 #[cfg(any(test, feature = "internals"))]
 pub async fn explain_whole_source_reads(
@@ -5249,11 +5250,15 @@ pub async fn explain_whole_source_reads(
     ))
     .await?;
     let statements = [
-        plan.recompute_sql(None, Some(plan.source_row())),
-        plan.rebuild_sql(None, &RebuildRead::Source),
+        (plan.recompute_sql(None, Some(plan.source_row())), ""),
+        (
+            plan.rebuild_sql(None, &RebuildRead::Source),
+            REBUILD_PLAN_SETTINGS,
+        ),
     ];
     let mut plans = [String::new(), String::new()];
-    for (out, sql) in plans.iter_mut().zip(statements) {
+    for (out, (sql, settings)) in plans.iter_mut().zip(statements) {
+        txn.batch_execute(settings).await?;
         let rows = txn.query(&format!("explain {sql}"), &[]).await?;
         *out = rows
             .iter()

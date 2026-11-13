@@ -777,6 +777,44 @@ async fn a_partitioned_source_with_rows_is_refused() {
     );
 }
 
+/// A build writes the hidden rows in the order they are stored (ADR-0028
+/// W2): the lock statement inserts them in key order, and the replace's
+/// update, which is not HOT, appends each new version in the order it
+/// reaches the rows. So the built table, read in `ctid` order, is in key
+/// order. Over a source stored out of key order, with a `work_mem` small
+/// enough that a hash join of the replace spills into batches and hands the
+/// update its rows batch by batch.
+#[tokio::test]
+async fn a_build_updates_the_hidden_rows_in_their_stored_order() {
+    let mut d = Driver::start_with_database_defaults(
+        &[("work_mem", "64kB")],
+        "create table public.src (id integer primary key, g integer, v integer); \
+         create index on public.src (g)",
+        &columns(),
+        &[ONE],
+        &[SRC],
+    )
+    .await;
+    d.step(
+        "insert into public.src select i, ((i::bigint * 7919) % 20000)::int, i \
+         from generate_series(1, 20000) i",
+    )
+    .await;
+    define(&d).await;
+    run_build(&d).await;
+    assert_eq!(
+        d.rows(&format!(
+            "select count(*) filter (where g < before), count(*) from ( \
+             select g, lag(g) over (order by ctid) as before from {}) as x",
+            hidden(&d).await
+        ))
+        .await,
+        ["(0,20000)"],
+        "a hidden row stored after one of a greater key"
+    );
+    assert_oracle(&mut d).await;
+}
+
 /// The statements that read the whole source by one `GROUP BY` (a `JOIN`
 /// side's node-form recompute and a plain aggregate's rebuild) match its
 /// groups to the locked ones by a hash or merge join, never by a nested loop
@@ -785,7 +823,8 @@ async fn a_partitioned_source_with_rows_is_refused() {
 /// Planned with nested loops disabled, so a nested-loop match (a `Join
 /// Filter` tested on every pair) shows only where its condition can't be
 /// hashed or merged, whatever the table sizes; the lateral index probes of
-/// the hidden and visible rows stay nested loops with no filter. The match
+/// the hidden and visible rows stay nested loops with no filter. The
+/// rebuild runs with hash joins off, so its match is a merge join. The match
 /// still pairs `NULL` with `NULL`: the build writes every `NULL` group.
 #[tokio::test]
 async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
@@ -807,17 +846,18 @@ async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
     let plans = trellis::dev::staging::explain_whole_source_reads(d.pool(), "agg")
         .await
         .expect("explain");
-    for plan in plans {
+    for (plan, joins) in plans
+        .iter()
+        .zip([&["Hash Cond", "Merge Cond"][..], &["Merge Cond"]])
+    {
         assert!(
             !plan.contains("Join Filter"),
             "a join is a nested loop that tests every pair:\n{plan}"
         );
         assert!(
-            plan.lines().any(|line| {
-                (line.contains("Hash Cond") || line.contains("Merge Cond"))
-                    && line.contains("ARRAY[")
-            }),
-            "the groups are matched by a hash or merge join:\n{plan}"
+            plan.lines()
+                .any(|line| joins.iter().any(|j| line.contains(j)) && line.contains("ARRAY[")),
+            "the groups are matched by {joins:?}:\n{plan}"
         );
     }
 }
