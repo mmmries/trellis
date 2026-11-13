@@ -166,6 +166,17 @@ each recompute scans the source. Define requires the index anyway, for
 ([Keep the indexes a definition relies on](#keep-the-indexes-a-definition-relies-on)).
 An index you create or drop changes speed only, never results.
 
+## Benchmark aggregates over many concurrently written groups
+
+A page locks every group it touches until it commits, so drain workers whose
+pages share groups queue behind each other. On a disk-backed run of
+`benchmark group-contention` (8 writer threads, 16 cores), one `SUM`/`COUNT(*)`
+aggregate applied about 233k to 308k source rows/sec over 10 to 400 groups,
+190k to 200k over 4,000 and 75k to 90k over 40,000; throughput rises with
+writer threads up to about 8, then stays flat. Before relying on an aggregate
+with tens of thousands of groups written at once, run
+`benchmark group-contention --groups <n>` on your own storage.
+
 ## Index each `MIN`/`MAX` argument, and vacuum retention sources
 
 A `MIN` or `MAX` field ([type support](type-support.md#min-and-max))

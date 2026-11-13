@@ -33,6 +33,8 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
+use pipeline::columns;
+
 use std::collections::HashMap;
 use testkit::connect_raw;
 
@@ -81,13 +83,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
-}
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, ty)| (name.to_string(), *ty))
-        .collect()
 }
 
 fn sales_columns() -> HashMap<String, ValueType> {

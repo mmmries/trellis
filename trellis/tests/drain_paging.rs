@@ -12,7 +12,7 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::connect;
+use pipeline::{connect, numeric_columns};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -35,10 +35,7 @@ const GROUP_TOTALS: &str = "TRANSFORM grp_totals FROM items GROUP BY grp \
 const ITEM_COPY: &str = "TRANSFORM item_copy FROM items SELECT amount AS amount";
 
 fn source_columns() -> HashMap<String, ValueType> {
-    ["id", "grp", "amount"]
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
+    numeric_columns(&["id", "grp", "amount"])
 }
 
 /// Claims in a transaction of its own and commits it. `claim::claim` takes a

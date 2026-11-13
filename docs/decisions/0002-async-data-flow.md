@@ -585,7 +585,8 @@ image-less change names.
 - **Must (R1):** an absolute write locks its groups in a sorted statement
   first; the snapshot, the source `GROUP BY` over those groups, the new
   partials, the basis and the stamp are then one later statement
-  ([ADR-0028](0028-locking-and-writing.md), I1).
+  ([ADR-0028](0028-locking-and-writing.md), I1). A fresh build's insert of a
+  group that has no row is I1's one exception for a group.
 - **Must (R5):** the stamp's segment is read in the same statement as the
   snapshot, or after it, never before.
 - **Must (R6):** a recompute is never a single `UPDATE … FROM (GROUP BY)`
@@ -807,19 +808,29 @@ per leaf of a partitioned source. It is the ordinary group recompute applied
 to all of a structure's groups in one transaction, with pages applying from
 the build's first moment.
 
-- **Must:** the write runs, in one `READ COMMITTED` transaction:
-  1. **enumerate** the groups (R8's union, below);
-  2. **lock** every enumerated group in key order, in a statement of its own
-     (R6), creating the hidden rows of those that have none;
-  3. **take one snapshot** and run the `GROUP BY` of the structure's source
-     rows. The snapshot statement follows the lock statement in the same
-     transaction (R1): a snapshot taken before the locks lets a page that
-     applies in between be lost or counted twice. The snapshot may be a
-     statement of its own, a `CREATE TEMP TABLE … AS SELECT
-     pg_current_snapshot(), …, GROUP BY` that Postgres can aggregate in
-     parallel, if the write then reads that table;
-  4. **upsert** each enumerated group's absolute partials and visible row,
-     with that snapshot as the group's basis and its stamp per R5.
+- **Must:** a fresh build's write, and a resume's, runs in one `READ COMMITTED`
+  transaction:
+  1. **one statement takes the snapshot**, enumerates the groups (R8's union,
+     below, read in that snapshot), runs the `GROUP BY` of the structure's
+     source rows, and in key order **inserts each group that has no hidden
+     row** with its absolute partials, that snapshot as its basis and its
+     stamp per R5, and **locks each group that has one** without writing it.
+     This pass is the write's lock statement (R6, R7), and the insert from
+     its own read is [ADR-0028](0028-locking-and-writing.md)'s exception to
+     I1. The visible rows of the inserted groups are written by the same
+     statement;
+  2. **the groups that had a row** are all locked by then. One later statement
+     takes a new snapshot, runs the `GROUP BY` over those groups and replaces
+     their partials and visible rows, with that snapshot as their basis and
+     its stamp per R5 (R1). It never reuses the first snapshot: a page can
+     have applied to such a group after it.
+- **Must:** the zero-group GC collects nothing of a definition under a build,
+  from before the write's first snapshot to its commit. The insert of step 1
+  relies on "no row" meaning "no page has applied to the group".
+- **Must:** a build over a partitioned source runs these steps per leaf, the
+  enumeration routed to the leaf, with routing and reading resolved under one
+  set of settings. The remainder, and a leaf read through the root, take the
+  rebuild's two statements (below).
 - **Must:** a fresh build's write runs in the plan job, after its fence for
   a source that is another definition's target, and never walks the key. A
   fresh build whose hidden table is empty may skip R8's second heap pass.
@@ -856,10 +867,12 @@ the build's first moment.
   [ADR-0017](0017-partitioned-sources.md)'s group-key rule), each the
   ordinary group recompute applied to all of the structure's groups in one
   transaction: it locks the groups in key order in a statement of their
-  own (R6), runs the `GROUP BY` of the structure's source rows from one
-  snapshot, and **replaces**, not adds to, each group's hidden partials and
-  visible row, with that snapshot as the group's basis and its stamp per
-  R5. On a partitioned source the structures are the leaves of the source's
+  own (R6), creating the hidden rows of the few groups that have none, runs
+  the `GROUP BY` of the structure's source rows from one snapshot, and
+  **replaces**, not adds to, each group's hidden partials and visible row, in
+  key order, with that snapshot as the group's basis and its stamp per R5.
+  Every group has a row there, so the fresh build's insert from its read
+  would insert nothing. On a partitioned source the structures are the leaves of the source's
   recorded tree, in oid order, then a remainder: the groups of the target
   and the ring that route to no recorded leaf, read through the root, which
   zeroes each. Each is a transaction of its own, and the job's cursor holds
@@ -904,7 +917,11 @@ the build's first moment.
 deterministic scenario and soak run with pages applying throughout, and each
 rule above was necessary: moving the snapshot before the locks, leaving a
 `NULL`-key group unlocked, or writing groups outside the locked set each
-failed a scenario. I measured the group-basis build of a 10M-row
+failed a scenario. In my model of the fresh build's insert from its read, and
+in a prototype of it on the engine, the build was exact with pages applying
+throughout, per leaf as well; I measured a 10M-group fresh build at 82 s and
+5.9 GB of WAL against 1,535 s and 103 GB for a lock statement that creates
+zero rows and an update of every one, and 91 s against 144 s over 32 leaves. I measured the group-basis build of a 10M-row
 source at 0.28 s and 11 MB of WAL with one `GROUP BY` per partition,
 against 26–32 s and 5.0 GB for the per-row ledger's chunked build, and
 1.4–1.9 s at 100M against 370–380 s; the peak `xmin` hold was 0.3–0.5 s per
@@ -939,7 +956,9 @@ partition at 100M.
   `xstamp` too (Rx7). The stamp is set by an absolute write, and only by one:
   the newest segment holding a change its snapshot saw (R5). The `xstamp` is
   set the same way by an absolute write or a probe. A zero group
-  with no basis protects nothing and may go at once; a group with any
+  with no basis protects nothing and may go at once, except under a build,
+  where the GC collects nothing of the definition
+  ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)); a group with any
   non-zero partial is never collected, whatever its row count. The GC claims
   groups `FOR UPDATE SKIP LOCKED` in key order, so it never waits on a page
   or a recompute: a recompute that loses its group to the GC writes a fresh

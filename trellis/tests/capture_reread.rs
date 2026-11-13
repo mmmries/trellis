@@ -193,22 +193,23 @@ async fn spawn_held_writer(
 
 /// Waits until a backend is blocked on [`HOLD_LOCK`].
 async fn wait_for_holder(raw: &Client) {
-    for _ in 0..500 {
-        let waiting: bool = raw
-            .query_one(
+    testkit::wait_until(
+        "the writer to reach its application trigger",
+        // Generous: the writer only has to run one statement, but a loaded
+        // runner can be slow to schedule it.
+        Duration::from_secs(15),
+        async || {
+            raw.query_one(
                 "select exists (select 1 from pg_locks \
                  where locktype = 'advisory' and objid = $1::bigint::oid and not granted)",
                 &[&HOLD_LOCK],
             )
             .await
             .expect("pg_locks")
-            .get(0);
-        if waiting {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the writer never reached its application trigger");
+            .get(0)
+        },
+    )
+    .await;
 }
 
 /// The no-leak check at one isolation level: while the writer is held

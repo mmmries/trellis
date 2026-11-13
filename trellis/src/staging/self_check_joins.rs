@@ -267,35 +267,17 @@ pub(super) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
 /// Whether each of `args` is summed: some field takes its `SUM` or `AVG`,
 /// so its hidden tables keep its sum.
 fn summed(def: &TransformDef, args: &[Expr]) -> Vec<bool> {
-    fn walk(expr: &Expr, args: &[Expr], out: &mut [bool]) {
-        match expr {
-            Expr::FunctionCall { name, args: called } => {
-                let upper = name.to_ascii_uppercase();
-                if let ("SUM" | "AVG", [arg]) = (upper.as_str(), called.as_slice())
-                    && let Some(i) = args.iter().position(|a| a == arg)
-                {
-                    out[i] = true;
-                }
-                for arg in called {
-                    walk(arg, args, out);
-                }
-            }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                walk(lhs, args, out);
-                walk(rhs, args, out);
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, args, out),
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                for child in expr.logic_children() {
-                    walk(child, args, out);
-                }
-            }
-            _ => {}
-        }
-    }
     let mut out = vec![false; args.len()];
     for field in &def.fields {
-        walk(&field.expr, args, &mut out);
+        field.expr.walk(&mut |expr| {
+            if let Expr::FunctionCall { name, args: called } = expr
+                && let ("SUM" | "AVG", [arg]) =
+                    (name.to_ascii_uppercase().as_str(), called.as_slice())
+                && let Some(i) = args.iter().position(|a| a == arg)
+            {
+                out[i] = true;
+            }
+        });
     }
     out
 }

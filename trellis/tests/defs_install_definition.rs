@@ -17,7 +17,7 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::{connect_raw, settle, start_and_settle_builds};
+use pipeline::{columns, connect_raw, numeric_columns, settle, start_and_settle_builds};
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -98,20 +98,6 @@ fn composite_key(parts: &[&str]) -> String {
     parts.join("\u{1f}")
 }
 
-fn numeric(names: &[&str]) -> HashMap<String, ValueType> {
-    names
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect()
-}
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, ty)| (name.to_string(), *ty))
-        .collect()
-}
-
 // ---------------------------------------------------------------------
 // Fast-path success branch: a plain 1-1 definition.
 // ---------------------------------------------------------------------
@@ -130,7 +116,7 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
         .await
         .expect("seed source");
 
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
@@ -200,7 +186,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
             .expect("make custom.orders read as a seam-fed source");
     }
 
-    let cols = numeric(&["price"]);
+    let cols = numeric_columns(&["price"]);
     install_definition(
         &db.pool,
         "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
@@ -291,7 +277,7 @@ async fn install_definition_honors_an_explicitly_qualified_target_schema() {
         .await
         .expect("seed source and create the custom schema");
 
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     let def = install_definition(
         &db.pool,
         "TRANSFORM custom.t FROM s SELECT a + a AS x",
@@ -364,7 +350,7 @@ async fn install_definition_fast_path_ends_up_live() {
         .await
         .expect("seed source");
 
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     let def = install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a + a AS x",
@@ -445,7 +431,7 @@ async fn install_definition_refuses_fields_that_inline_past_the_budget() {
     let err = install_definition(
         &db.pool,
         &format!("TRANSFORM chain FROM s SELECT {}", chain.join(", ")),
-        &numeric(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -492,7 +478,7 @@ async fn install_definition_fast_path_builds_a_plain_cross_field_alias_chain() {
         .await
         .expect("seed source");
 
-    let cols = numeric(&["price", "tax"]);
+    let cols = numeric_columns(&["price", "tax"]);
     // `total` references `double_price`, itself a calculated field
     // (`price + price`). Substitution inlines it to `(price + price) + tax`,
     // so the build renders self-contained source SQL.
@@ -951,7 +937,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
     install_definition(
         &db.pool,
         "TRANSFORM custom.t FROM s SELECT a + a AS x",
-        &numeric(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -964,7 +950,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
     let def_b = install_definition(
         &db.pool,
         "TRANSFORM u FROM t SELECT x + x AS y",
-        &numeric(&["x"]),
+        &numeric_columns(&["x"]),
         "public",
     )
     .await
@@ -1030,7 +1016,7 @@ async fn registration_reads_no_source_rows() {
         async move {
             tokio::time::timeout(
                 Duration::from_secs(20),
-                install_definition(&pool, &text, &numeric(&["a"]), "public"),
+                install_definition(&pool, &text, &numeric_columns(&["a"]), "public"),
             )
             .await
             .unwrap_or_else(|_| panic!("registering {text:?} waited on the source's lock"))
@@ -1109,7 +1095,7 @@ async fn install_definition_refuses_a_target_name_that_already_exists() {
         )
         .await
         .expect("seed the source and the user's relations");
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
 
     for existing in ["users_table", "users_view"] {
         let err = install_definition(
@@ -1189,7 +1175,7 @@ async fn a_registration_that_fails_partway_leaves_no_target_and_can_be_retried()
         ))
         .await
         .expect("seed the source and the failing trigger");
-    let cols = numeric(&["a"]);
+    let cols = numeric_columns(&["a"]);
     let text = "TRANSFORM t FROM s SELECT a + a AS x";
 
     let err = install_definition(&db.pool, text, &cols, "public")
@@ -1251,7 +1237,7 @@ async fn a_registration_that_loses_a_create_race_is_refused_as_already_existing(
         install_definition(
             &pool,
             "TRANSFORM t FROM s SELECT a + a AS x",
-            &numeric(&["a"]),
+            &numeric_columns(&["a"]),
             "public",
         )
         .await
@@ -1311,7 +1297,7 @@ async fn a_cycle_closing_registration_reports_the_cycle_not_the_existing_target(
     install_definition(
         &db.pool,
         "TRANSFORM b FROM s SELECT a + a AS x",
-        &numeric(&["a"]),
+        &numeric_columns(&["a"]),
         "public",
     )
     .await
@@ -1328,7 +1314,7 @@ async fn a_cycle_closing_registration_reports_the_cycle_not_the_existing_target(
     let err = install_definition(
         &db.pool,
         "TRANSFORM s FROM b SELECT x AS a",
-        &numeric(&["x"]),
+        &numeric_columns(&["x"]),
         "public",
     )
     .await
@@ -1379,7 +1365,7 @@ async fn install_definition_rejects_a_field_named_after_a_primary_key_column() {
         "TRANSFORM t FROM s SELECT id AS id, a AS a",
         "TRANSFORM t FROM s SELECT a AS id",
     ] {
-        let err = install_definition(&db.pool, text, &numeric(&["id", "a"]), "public")
+        let err = install_definition(&db.pool, text, &numeric_columns(&["id", "a"]), "public")
             .await
             .expect_err("a field named after the key column is refused");
         assert!(
@@ -1416,7 +1402,7 @@ async fn install_definition_accepts_a_primary_key_column_under_another_name() {
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT id AS order_id, a AS a",
-        &numeric(&["id", "a"]),
+        &numeric_columns(&["id", "a"]),
         "public",
     )
     .await
@@ -1451,7 +1437,7 @@ async fn alter_transform_add_of_a_field_named_after_a_primary_key_column_is_reje
     install_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a AS a",
-        &numeric(&["id", "a"]),
+        &numeric_columns(&["id", "a"]),
         "public",
     )
     .await
@@ -1500,7 +1486,7 @@ async fn an_explicit_source_without_its_table_is_reported_missing_before_the_key
     let err = install_definition(
         &db.pool,
         "TRANSFORM t FROM custom.s SELECT a AS a",
-        &numeric(&["id", "a"]),
+        &numeric_columns(&["id", "a"]),
         "public",
     )
     .await

@@ -309,7 +309,7 @@ impl Coverage {
                     _ => "Case",
                 });
                 1 + expr
-                    .logic_children()
+                    .children()
                     .into_iter()
                     .map(|child| self.record_expr(child))
                     .max()
@@ -361,7 +361,7 @@ fn collect_aggregate_calls(
             collect_aggregate_calls(operand, key_space, out);
         }
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
+            for child in expr.children() {
                 collect_aggregate_calls(child, key_space, out);
             }
         }

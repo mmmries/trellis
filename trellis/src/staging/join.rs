@@ -394,31 +394,9 @@ fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Option<Expr> {
             Some(field) => substitute(def, &field.expr, depth + 1)?,
             None => expr.clone(),
         },
-        Expr::FunctionCall { name, args } => Expr::FunctionCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| substitute(def, a, depth))
-                .collect::<Option<Vec<_>>>()?,
-        },
-        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
-            op: *op,
-            lhs: Box::new(substitute(def, lhs, depth)?),
-            rhs: Box::new(substitute(def, rhs, depth)?),
-        },
-        Expr::Negate(operand) => Expr::Negate(Box::new(substitute(def, operand, depth)?)),
-        Expr::Cast {
-            expr: operand,
-            target,
-        } => Expr::Cast {
-            expr: Box::new(substitute(def, operand, depth)?),
-            target: *target,
-        },
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-            .map_logic_children(|child| substitute(def, child, depth).ok_or(()))
-            .expect("a logic node")
+        _ => expr
+            .try_map_children(|child| substitute(def, child, depth).ok_or(()))
             .ok()?,
-        other => other.clone(),
     })
 }
 

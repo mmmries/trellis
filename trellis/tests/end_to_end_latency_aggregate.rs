@@ -21,6 +21,8 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
+use pipeline::columns;
+
 use std::collections::HashMap;
 use testkit::connect_raw;
 
@@ -97,13 +99,6 @@ async fn drain(pool: &trellis::pool::Pool, seg_seq: i64) -> apply::ApplyOutcome 
     .await
     .expect("drain_once")
     .expect("drain_once must claim and drain something")
-}
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, ty)| (name.to_string(), *ty))
-        .collect()
 }
 
 fn sales_columns() -> HashMap<String, ValueType> {

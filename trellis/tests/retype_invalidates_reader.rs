@@ -162,25 +162,10 @@ async fn a_resume_that_retypes_a_column_pauses_the_readers_define_would_refuse()
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Polls (bounded) until some backend waits on a lock `pid` holds: the
+/// Waits (bounded) until some backend waits on a lock `pid` holds: the
 /// interleaving test's one wait for a lock-wait state, not for convergence.
 async fn wait_blocked_behind(raw: &Client, pid: i32) {
-    for _ in 0..600 {
-        let blocked: bool = raw
-            .query_one(
-                "select exists (select 1 from pg_catalog.pg_stat_activity \
-                 where $1 = any(pg_catalog.pg_blocking_pids(pid)))",
-                &[&pid],
-            )
-            .await
-            .expect("read lock waits")
-            .get(0);
-        if blocked {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("nothing blocked behind backend {pid} within 30s");
+    testkit::blocking::wait_blocked_behind(raw, pid, Duration::from_secs(60), || false).await;
 }
 
 /// Lock order: the re-type takes the readers' definition rows

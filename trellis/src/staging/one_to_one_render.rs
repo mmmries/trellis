@@ -159,31 +159,11 @@ impl OneToOneRender {
 
 /// Every source column a substituted expression reads.
 fn collect_columns(expr: &Expr, out: &mut BTreeSet<String>) {
-    match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+    expr.walk(&mut |e| {
+        if let Expr::Column(name) | Expr::SourceColumn { column: name, .. } = e {
             out.insert(name.clone());
         }
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => {}
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_columns(lhs, out);
-            collect_columns(rhs, out);
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => collect_columns(operand, out),
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_columns(arg, out);
-            }
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                collect_columns(child, out);
-            }
-        }
-    }
+    });
 }
 
 /// The `on conflict` clause of a 1-1 target upsert: the one place that

@@ -10,7 +10,7 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::definer;
+use pipeline::{columns, definer};
 
 use std::collections::HashMap;
 
@@ -44,13 +44,6 @@ async fn batch(pool: &trellis::pool::Pool, sql: &str) {
         .batch_execute(sql)
         .await
         .expect("set up tables");
-}
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, value_type)| (name.to_string(), *value_type))
-        .collect()
 }
 
 /// Unwraps `err` as [`ValidationError::NondeterministicKeyCollation`] and
