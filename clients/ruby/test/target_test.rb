@@ -82,7 +82,7 @@ class TargetTest < Minitest::Test
     ROWS.each { |row| @pg.exec_params("insert into tg_event_counts values ($1, $2, $3)", row) }
     @pg.exec("insert into tg_event_copies (id, kind, updated_at) values (10, 'click', '2000-01-01')")
     @off_in = TrellisTestApp.config.trellis.off_in
-    TrellisTestApp.config.trellis.off_in = %w[test]
+    TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN # the shipped default: off in test, on in development
   end
 
   def teardown

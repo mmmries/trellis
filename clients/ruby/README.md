@@ -520,8 +520,8 @@ Account.find(42).event_counts.sum(:n) # with has_many :event_counts on Account
 - **What it doesn't.** SQL sent through the connection (`execute`, fixture
   loads) and other database roles. That is the database's job:
   [grant application roles `SELECT` on targets](../../docs/recommendations.md#application-roles-read-targets-and-nothing-else).
-- **In tests.** Where Trellis is off (`config.trellis.off_in`, see
-  "Testing") the model writes like any other, with no setup. A suite that
+- **In tests.** Where Trellis is off (the `test` environment by default:
+  [Testing](#testing)) the model writes like any other, with no setup. A suite that
   runs Trellis writes a target in `Trellis::Target.allow_writes { ... }`.
 
 ### Upgrading the gem
