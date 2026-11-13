@@ -260,12 +260,12 @@ with `Content-Length` corrected and `HEAD` bodiless. Everything else passes
 through unchanged: other paths and statuses, bodies with a `Content-Encoding`
 or `Transfer-Encoding` (put `Rack::Deflater` outside the middleware), an
 empty registry, and a forked child that can't render it (the exporter's own
-series are still served). It does not dedupe: Prometheus rejects a scrape
-that declares a metric name twice, so don't name an app metric like one of the
-engine's `trellis_` series.
+series are still served). It does not dedupe, and the text format allows each
+metric name once, so don't name an app metric like one of the engine's
+`trellis_` series.
 
-`prometheus_exporter` serves no route in the app: its client sends the app's
-metrics to a separate server process, which can't see the engine's registry.
+`prometheus_exporter` serves no route in the app: its own server, usually a
+separate process, answers the scrape and can't see the engine's registry.
 Scrape the app through `Trellis::Metrics::RackApp` as a second target.
 
 ### Logs

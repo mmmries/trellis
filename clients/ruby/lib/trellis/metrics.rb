@@ -84,9 +84,8 @@ module Trellis
     # raises Trellis::ForkedHandleError there; the exporter's own series are
     # still served). HEAD is answered as the GET would be, without the body.
     #
-    # It does not dedupe: Prometheus rejects a scrape that declares one
-    # metric name twice, so an app metric named like one of the engine's
-    # trellis_* series breaks the scrape.
+    # It does not dedupe, and the text format allows each metric name once,
+    # so don't name an app metric like one of the engine's trellis_* series.
     class Middleware
       def initialize(app, path: "/metrics")
         @app = app
@@ -117,6 +116,10 @@ module Trellis
           Metrics.render_prometheus
         rescue ForkedHandleError
           return [status, headers, body]
+        rescue Exception
+          # The response is dropped, so close its body as the server would.
+          body.close if body.respond_to?(:close)
+          raise
         end
         return [status, headers, body] if trellis.empty?
 

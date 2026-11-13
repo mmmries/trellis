@@ -4,6 +4,7 @@ require "rack/builder"
 require "rack/lint"
 require "minitest/mock"
 require "rack/mock_request"
+require "action_dispatch"
 require "prometheus/client"
 require "prometheus/middleware/exporter"
 require "test_helper"
@@ -103,6 +104,23 @@ class MetricsMiddlewareTest < Minitest::Test
     end
   end
 
+  def test_another_success_status_passes_through
+    app = fake(206, { "content-type" => TEXT, "content-range" => "bytes 0-3/9" }, ["a 1\n"])
+    with_trellis("trellis_x 1\n") do
+      assert_equal "a 1\n", scrape(Trellis::Metrics::Middleware.new(app)).body
+    end
+  end
+
+  # A HEAD drops the body of a response it leaves alone too, so closes it.
+  def test_head_closes_the_body_it_drops_from_a_response_it_leaves_alone
+    body = ChunkedBody.new("{}")
+    app = fake(200, { "content-type" => "application/json" }, body)
+    with_trellis("trellis_x 1\n") do
+      assert_equal "", scrape(Trellis::Metrics::Middleware.new(app), method: "HEAD").body
+    end
+    assert_equal 1, body.closes
+  end
+
   def test_a_200_that_is_not_text_passes_through
     app = fake(200, { "content-type" => "application/json" }, ["{}"])
     with_trellis("trellis_x 1\n") do
@@ -182,11 +200,14 @@ class MetricsMiddlewareTest < Minitest::Test
     end
   end
 
-  def test_other_errors_are_not_swallowed
-    app = fake(200, { "content-type" => TEXT }, ["a 1\n"])
+  # The wrapped response is lost with the error, so its body is closed.
+  def test_other_errors_are_not_swallowed_and_the_body_is_closed
+    body = ChunkedBody.new("a 1\n")
+    app = fake(200, { "content-type" => TEXT }, body)
     Trellis::Metrics.stub(:render_prometheus, -> { raise "boom" }) do
       assert_raises(RuntimeError) { Trellis::Metrics::Middleware.new(app).call(env("/metrics")) }
     end
+    assert_equal 1, body.closes
   end
 
   # The exporter's bytes and the engine's (a transform name in a label) are
@@ -226,12 +247,47 @@ class MetricsMiddlewareTest < Minitest::Test
     end
   end
 
+  # The README's two Rails setups, through Rails' own middleware stack and
+  # router, with the Accept header a Prometheus server sends.
+  def test_it_is_inserted_before_the_exporter_in_a_rails_middleware_stack
+    stack = ActionDispatch::MiddlewareStack.new
+    stack.use Prometheus::Middleware::Exporter, registry: app_registry
+    stack.insert_before Prometheus::Middleware::Exporter, Trellis::Metrics::Middleware, path: "/metrics"
+    with_trellis("trellis_x 1\n") do
+      assert_equal "#{APP_TEXT}trellis_x 1\n", scrape(stack.build(->(_env) { [404, {}, []] })).body
+    end
+  end
+
+  def test_it_appends_to_an_exporter_mounted_as_a_rails_route
+    registry = app_registry
+    routes = ActionDispatch::Routing::RouteSet.new
+    routes.draw do
+      mount Prometheus::Middleware::Exporter.new(->(_env) { [404, {}, []] }, registry: registry, path: "/"),
+            at: "/metrics"
+    end
+    with_trellis("trellis_x 1\n") do
+      response = scrape(Trellis::Metrics::Middleware.new(routes))
+
+      assert_equal "#{APP_TEXT}trellis_x 1\n", response.body
+      assert_equal response.body.bytesize.to_s, response.headers["content-length"]
+    end
+  end
+
   private
 
-  def exporter_stack
+  APP_TEXT = "# TYPE app_jobs_total counter\n# HELP app_jobs_total Jobs.\napp_jobs_total 3.0\n"
+  PROMETHEUS_ACCEPT = "application/openmetrics-text;version=1.0.0;escaping=underscores;q=0.8," \
+                      "application/openmetrics-text;version=0.0.1;q=0.7," \
+                      "text/plain;version=1.0.0;escaping=underscores;q=0.6,text/plain;version=0.0.4;q=0.5,*/*;q=0.4"
+
+  def app_registry
     registry = Prometheus::Client::Registry.new
     registry.counter(:app_jobs_total, docstring: "Jobs.").increment(by: 3)
-    exporter = Prometheus::Middleware::Exporter.new(->(_env) { [404, {}, []] }, registry: registry)
+    registry
+  end
+
+  def exporter_stack
+    exporter = Prometheus::Middleware::Exporter.new(->(_env) { [404, {}, []] }, registry: app_registry)
     Trellis::Metrics::Middleware.new(exporter)
   end
 
@@ -256,6 +312,6 @@ class MetricsMiddlewareTest < Minitest::Test
 
   # Rack::Lint fails the request on any breach of the Rack spec.
   def scrape(app, path: "/metrics", method: "GET")
-    Rack::MockRequest.new(Rack::Lint.new(app)).request(method, path)
+    Rack::MockRequest.new(Rack::Lint.new(app)).request(method, path, "HTTP_ACCEPT" => PROMETHEUS_ACCEPT)
   end
 end
