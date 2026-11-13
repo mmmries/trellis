@@ -207,10 +207,14 @@ when "puma_hooks_named"
   Process.kill(:KILL, pid) if seen[:child].is_a?(String)
   Process.waitpid(pid)
   seen[:parent_connected] = [Trellis.connected?, reports.connected?]
-when "off_in", "off_in_elsewhere"
-  # config.trellis.off_in: Trellis is off in this app's own environment, or
-  # in another one only.
-  BootApp.config.trellis.off_in = [ARGV.fetch(0) == "off_in" ? Rails.env : "elsewhere"]
+when "off_in", "off_in_elsewhere", "default_off_in", "opt_in_off_in"
+  # config.trellis.off_in: Trellis is off in this app's own environment, in
+  # another one only, in the default (the test environment), or in none.
+  case ARGV.fetch(0)
+  when "off_in" then BootApp.config.trellis.off_in = [Rails.env]
+  when "off_in_elsewhere" then BootApp.config.trellis.off_in = ["elsewhere"]
+  when "opt_in_off_in" then BootApp.config.trellis.off_in = []
+  end
   stderr = $stderr
   $stderr = StringIO.new
   begin

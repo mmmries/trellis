@@ -364,7 +364,8 @@ With neither set, the Railtie does nothing. Two exceptions:
   migrates without starting the app. The migration helpers connect a handle
   of their own. A rake task of your own that calls Trellis calls
   `Trellis::Railtie.connect` first. It's the running task that counts:
-  `rails test` boots the app outside any task and connects, but tests run
+  `rails test` boots the app outside any task and connects (once Trellis is
+  on in the test environment: [Testing](#testing)), but tests run
   by a rake task (`bin/rails db:test:prepare test`, or plain `rake`) don't,
   so a test helper that needs the handles can call
   `Trellis::Railtie.connect if Trellis::Instance.connected.empty?`.
@@ -373,8 +374,8 @@ With neither set, the Railtie does nothing. Two exceptions:
   preloading Passenger, say). Connect in each child with
   `Trellis::Railtie.connect`.
 
-`config.trellis.off_in = %w[test]` turns all of this off in the environments
-it names: see [Testing](#testing).
+`config.trellis.off_in` turns all of this off in the environments it names
+(the `test` environment, by default): see [Testing](#testing).
 
 ### Forking servers
 
@@ -567,19 +568,15 @@ Outside Rails, `require "trellis/release_check"` and call
 
 ## Testing
 
-Trellis is off in tests. A transactional test (Rails' default) never
-commits, so capture never sees its writes and a target never changes,
-whether or not a worker runs. A target is an ordinary table a test fills
-itself:
+Trellis is off in the `test` environment by default. A transactional test
+(Rails' default) never commits, so capture never sees its writes and a target
+never changes, whether or not a worker runs. A target is an ordinary table a
+test fills itself.
 
-```ruby
-# config/application.rb
-config.trellis.off_in = %w[test]
-```
-
-`off_in` names the environments Trellis is off in (none by default). It is
-read from every environment, so `db:prepare` or `db:test:prepare` run from
-development leaves Trellis out of the test database too. Where it is off:
+`config.trellis.off_in` (`%w[test]` unless you set it) names the environments
+Trellis is off in. It is read from every environment, so `db:prepare` or
+`db:test:prepare` run from development leaves Trellis out of the test database
+too. Where it is off:
 
 - Nothing connects at boot. `Trellis::Railtie.connect` and `trellis:migrate`
   warn and do nothing.
@@ -603,8 +600,8 @@ EventCount.insert_all([{ kind: "click", n: 3 }])
 
 ### Running Trellis in tests
 
-Tests that need Trellis for real need it on in the test database, so leave
-`test` out of `off_in` (or switch it per run:
+Tests that need Trellis for real need it on in the test database. Set
+`config.trellis.off_in = []` (or switch it per run:
 `config.trellis.off_in = ENV["TRELLIS_TESTS"] ? [] : %w[test]`). Give the
 test environment's `config.trellis.connect` the workers (`staging: true,
 drain_threads: 1`), and take those tests out of the transaction:

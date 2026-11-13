@@ -94,6 +94,28 @@ class RailsTest < Minitest::Test
     assert_equal true, seen.fetch("connected")
   end
 
+  # The default is off in the test environment and on in the others; an app
+  # that wants Trellis in its tests sets off_in = [].
+  def test_trellis_is_off_in_the_test_environment_by_default
+    seen = boot("default_off_in", rails_env: "test")
+    assert_equal false, seen.fetch("enabled")
+    assert_equal false, seen.fetch("connected")
+    assert_equal "", seen.fetch("boot_warning")
+    assert_match "Trellis is off in the test environment (config.trellis.off_in)", seen.fetch("warning")
+  end
+
+  def test_trellis_is_on_in_other_environments_by_default
+    seen = boot("default_off_in", rails_env: "development")
+    assert_equal true, seen.fetch("enabled")
+    assert_equal true, seen.fetch("connected")
+  end
+
+  def test_an_empty_off_in_turns_trellis_on_in_the_test_environment
+    seen = boot("opt_in_off_in", rails_env: "test")
+    assert_equal true, seen.fetch("enabled")
+    assert_equal true, seen.fetch("connected")
+  end
+
   def test_trellis_migrate_migrates_nothing_when_trellis_is_off
     seen = boot("off_in_rake")
     assert_match "trellis:migrate migrates nothing", seen.fetch("warning")
@@ -175,9 +197,11 @@ class RailsTest < Minitest::Test
 
   private
 
-  def boot(scenario)
-    out = run_ruby("the #{scenario} scenario", { "TRELLIS_TEST_DSN" => TestCluster.dsn },
-                   BOOT_APP, scenario)
+  # The app's environment is development unless a scenario names one, so
+  # an ambient RAILS_ENV doesn't change what it sees.
+  def boot(scenario, rails_env: "development")
+    env = { "TRELLIS_TEST_DSN" => TestCluster.dsn, "RAILS_ENV" => rails_env, "RACK_ENV" => nil }
+    out = run_ruby("the #{scenario} scenario", env, BOOT_APP, scenario)
     JSON.parse(out.lines.last)
   end
 
