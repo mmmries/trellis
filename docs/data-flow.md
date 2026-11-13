@@ -166,9 +166,10 @@ ledger, so their build is **one absolute write per structure**
 ([ADR-0002](decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)).
 The plan job, in one transaction, locks every group, takes one snapshot, runs
 the `GROUP BY` of the source rows and writes each group's partials and target
-row from it. A plain aggregate over an unpartitioned source writes each group
-once: one statement inserts the groups that have no hidden row from its own
-snapshot and locks the rest, which a later statement rewrites from a new one
+row from it. A plain aggregate's fresh build or resume writes each group once,
+over an unpartitioned source or per leaf: one statement inserts the groups
+that have no hidden row from its own snapshot and locks the rest, which a later
+statement rewrites from a new one
 ([group basis](staging-and-claiming/group-basis.md#absolute-writes)). The
 definition applies from the moment the build starts, and a page waits only on
 the groups the build holds. Over a partitioned source, or a

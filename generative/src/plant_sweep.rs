@@ -123,7 +123,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::GbBuildNoTargetBranch
         | Plant::GbBuildNoRingBranch
         | Plant::GbBuildNullKeyByEquality
-        | Plant::GbBuildStragglerUnlocked => PlantPath::GroupBasis,
+        | Plant::GbBuildStragglerUnlocked
+        | Plant::GbBuildLeafUnrouted => PlantPath::GroupBasis,
         Plant::GbLsnNotVisibility | Plant::GbFoldSidesPerKey | Plant::GbEarlyZeroGc => {
             PlantPath::GroupBasisWriter
         }
