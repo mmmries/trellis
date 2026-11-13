@@ -38,8 +38,8 @@ mod star;
 
 use drain_driver::Driver;
 use schema_change::{
-    assert_retyping, assert_unpaused, column_type, failures, pass, paused_for, resume,
-    resume_refused, status, trellis, write,
+    assert_retyping, assert_unpaused, column_type, failures, pass, paused_for, paused_naming,
+    resume, resume_refused, status, trellis, write,
 };
 use star::{SHAPES, Shape, Star};
 use trellis::config::DEFAULT_SCHEMA;
@@ -341,15 +341,10 @@ async fn an_on_column_retyped_on_one_side_pauses_until_the_pair_matches_again() 
                 )
                 .await;
                 pass(&mut d).await;
-                // The failure names every `ON` column of the root, as the
-                // check reads them together.
-                let named: Vec<String> = if first.0 == "public.a" {
-                    shape.all().map(|p| format!("k{p}")).collect()
-                } else {
-                    vec!["k".to_string()]
-                };
-                let named: Vec<&str> = named.iter().map(String::as_str).collect();
-                let error = paused_for(&d, &target, first.0, &named).await;
+                // The failure names the table and the `ON` column that
+                // changed. At a star the root's other `ON` columns may be
+                // named with it.
+                let error = paused_naming(&d, &target, first.0, first.1).await;
                 assert!(
                     error.contains("don't match"),
                     "{} {}: {error}",

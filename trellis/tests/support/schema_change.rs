@@ -68,6 +68,31 @@ pub async fn column_type(d: &Driver, table: &str, column: &str) -> String {
 /// The reason `target` is paused with, asserting it is paused for a capture
 /// failure on `table` about `columns`.
 pub async fn paused_for(d: &Driver, target: &str, table: &str, columns: &[&str]) -> String {
+    let failure = capture_failure(d, target, table).await;
+    assert_eq!(
+        failure.columns,
+        columns.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+        "{target}: {}",
+        failure.error
+    );
+    failure.error
+}
+
+/// The reason `target` is paused with, asserting it is paused for a capture
+/// failure on `table` whose columns include `column`.
+pub async fn paused_naming(d: &Driver, target: &str, table: &str, column: &str) -> String {
+    let failure = capture_failure(d, target, table).await;
+    assert!(
+        failure.columns.iter().any(|c| c == column),
+        "{target}: {:?} lacks {column}: {}",
+        failure.columns,
+        failure.error
+    );
+    failure.error
+}
+
+/// `target`'s capture failure, asserting it is paused for one on `table`.
+async fn capture_failure(d: &Driver, target: &str, table: &str) -> trellis::CaptureFailure {
     let bare = target.split_once('.').map_or(target, |(_, bare)| bare);
     let reported = trellis(d)
         .await
@@ -85,13 +110,7 @@ pub async fn paused_for(d: &Driver, target: &str, table: &str, columns: &[&str])
         .capture_failure
         .unwrap_or_else(|| panic!("{target}'s reason is reported"));
     assert_eq!(failure.source_table, table, "{target}: {}", failure.error);
-    assert_eq!(
-        failure.columns,
-        columns.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-        "{target}: {}",
-        failure.error
-    );
-    failure.error
+    failure
 }
 
 /// Asserts `target` isn't paused and nothing is recorded against it.
