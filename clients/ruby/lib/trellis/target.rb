@@ -71,6 +71,20 @@ module Trellis
               "Trellis::Target.allow_writes; see #{DOCS}"
       end
 
+      # The ActiveRecord internals the guard overrides that this
+      # ActiveRecord lacks. They are :nodoc:, so a release may move one, and
+      # the guard would then let that write through: including the concern
+      # raises instead.
+      def missing_internals
+        records = %i[_insert_record _update_record _delete_record].reject do |write|
+          ActiveRecord::Base.respond_to?(write, true)
+        end
+        relations = RELATION_WRITES.reject { |write| ActiveRecord::Relation.method_defined?(write) }
+        delegation = [[ActiveRecord::Delegation, :delegated_classes], [ActiveRecord::Base, :relation_delegate_class]]
+                     .reject { |owner, method| owner.respond_to?(method, true) }.map(&:last)
+        records + relations + delegation
+      end
+
       # Every relation of `model` (Model.where, Model.all, association
       # scopes) is an instance of one of its relation classes.
       def guard_relations(model)
@@ -89,7 +103,16 @@ module Trellis
       end
     end
 
-    included { Target.guard_relations(self) }
+    included do
+      missing = Target.missing_internals
+      unless missing.empty?
+        raise NotImplementedError,
+              "Trellis::Target can't guard #{name} on ActiveRecord #{ActiveRecord.version}, which has no " \
+              "#{missing.join(", ")}: writes to it would go through unrefused"
+      end
+
+      Target.guard_relations(self)
+    end
 
     class_methods do
       # A subclass (single-table inheritance) gets relation classes of its

@@ -51,13 +51,13 @@ class TargetTest < Minitest::Test
         pg.exec("create table tg_accounts (id bigint primary key)")
         pg.exec("insert into tg_accounts values (1), (2)")
         pg.exec("create table tg_events (id bigint primary key, account_id bigint not null " \
-                "references tg_accounts (id), kind text not null)")
+                "references tg_accounts (id), kind text not null, at timestamp not null)")
         pg.close
         instance = Trellis::Instance.connect(url: dsn)
         instance.migrate
         instance.define("TRANSFORM tg_event_counts FROM tg_events GROUP BY account_id, kind " \
                         "WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
-        instance.define("TRANSFORM tg_event_copies FROM tg_events SELECT kind AS kind")
+        instance.define("TRANSFORM tg_event_copies FROM tg_events SELECT kind AS kind, at AS updated_at")
         instance.shutdown
         DATABASE
       end
@@ -80,7 +80,7 @@ class TargetTest < Minitest::Test
     @pg.exec("delete from tg_event_counts")
     @pg.exec("delete from tg_event_copies")
     ROWS.each { |row| @pg.exec_params("insert into tg_event_counts values ($1, $2, $3)", row) }
-    @pg.exec("insert into tg_event_copies values (10, 'click')")
+    @pg.exec("insert into tg_event_copies (id, kind, updated_at) values (10, 'click', '2000-01-01')")
     TrellisTestApp.config.trellis.off_in = %w[test]
   end
 
@@ -100,6 +100,8 @@ class TargetTest < Minitest::Test
     update_columns: -> { first.update_columns(n: 4) },
     update_column: -> { first.update_column(:n, 4) },
     increment!: -> { first.increment!(:n) },
+    decrement!: -> { first.decrement!(:n) },
+    touch: -> { EventCopy.find(10).touch },
     delete: -> { first.delete },
     destroy: -> { first.destroy },
     insert: -> { EventCount.insert({ account_id: 2, kind: "view", n: 1 }) },
@@ -115,7 +117,10 @@ class TargetTest < Minitest::Test
     delete_by: -> { EventCount.delete_by(account_id: 2) },
     destroy_all: -> { EventCount.where(account_id: 2).destroy_all },
     destroy_by: -> { EventCount.destroy_by(account_id: 2) },
+    find_or_create_by!: -> { EventCount.find_or_create_by!(account_id: 2, kind: "view") },
+    touch_all: -> { EventCopy.touch_all },
     association_create!: -> { Account.find(2).event_counts.create!(kind: "view", n: 1) },
+    association_push: -> { Account.find(2).event_counts << EventCount.new(kind: "view", n: 1) },
     association_delete_all: -> { Account.find(1).event_counts.delete_all },
     association_where_update_all: -> { Account.find(1).event_counts.where(kind: "view").update_all(n: 0) },
     subclass_update_all: -> { ClickCount.update_all(n: 0) },
@@ -165,6 +170,16 @@ class TargetTest < Minitest::Test
     end
   end
 
+  # The guard overrides ActiveRecord internals; an ActiveRecord that moved
+  # one refuses the include rather than leaving writes unguarded.
+  def test_an_activerecord_without_the_guarded_internals_refuses_the_include
+    assert_empty Trellis::Target.missing_internals
+    Trellis::Target.stub(:missing_internals, %i[_insert_record]) do
+      error = assert_raises(NotImplementedError) { Class.new(ActiveRecord::Base) { include Trellis::Target } }
+      assert_match(/ActiveRecord #{ActiveRecord.version}, which has no _insert_record/, error.message)
+    end
+  end
+
   def test_reads_work_where_trellis_is_on
     in_environment("development") do
       assert_equal 3, EventCount.count
@@ -211,7 +226,7 @@ class TargetTest < Minitest::Test
 
   def rows
     @pg.exec("select account_id::text, kind, n::text from tg_event_counts order by 1, 2").values +
-      @pg.exec("select id::text, kind, '' from tg_event_copies order by 1").values
+      @pg.exec("select id::text, kind, updated_at::text from tg_event_copies order by 1").values
   end
 
   def in_environment(name, &)

@@ -510,10 +510,12 @@ Account.find(42).event_counts.sum(:n) # with has_many :event_counts on Account
   source's primary key, which ActiveRecord finds itself. A group with no
   source rows has no row, so a missing row means zero.
 - **What it refuses.** Record writes (`save`, `create!`, `update`,
-  `update_columns`, `increment!`, `delete`, `destroy`) and bulk
+  `update_columns`, `increment!`, `touch`, `delete`, `destroy`) and bulk
   writes (`insert_all`, `upsert_all`, `update_all`, `update_counters`,
   `delete_all`, `destroy_all` and their variants) on the class, any scope
-  and any association. Reads are untouched.
+  and any association. So is an association option that writes the target
+  (`dependent:`, `counter_cache:`, `touch:`): leave those off, as Trellis
+  keeps the target's rows in step with the source. Reads are untouched.
 - **What it doesn't.** SQL sent through the connection (`execute`, fixture
   loads) and other database roles. That is the database's job:
   [grant application roles `SELECT` on targets](../../docs/recommendations.md#application-roles-read-targets-and-nothing-else).
