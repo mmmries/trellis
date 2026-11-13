@@ -60,6 +60,11 @@ module Parity
     # only Ruby has a call that asks whether there is one.
     "connected?" => "Ruby's module-held handle",
     "default_instance" => "Ruby's module-held default instance, for code that takes a Trellis::Instance",
+    # Elixir's bridge is a process started with the application and configured
+    # by `config :trellis_pg`; Ruby's is set on the module (test/log_bridge_test.rb).
+    "logger" => "Ruby's module-level log bridge setting",
+    "logger=" => "Ruby's module-level log bridge setting",
+    "log_level=" => "Ruby's module-level log bridge setting",
     # Its result is SQL text for a dump hook, not a flattened record, so the
     # shared fixture has nothing to shape; test/schema_dump_test.rb runs it.
     "dump_definitions_sql" => "SQL text for the schema-dump hook, tested by test/schema_dump_test.rb",

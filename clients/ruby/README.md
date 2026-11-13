@@ -228,6 +228,40 @@ scrapes). A process forked while its parent had a handle running can't
 render the registry, as it can't connect: it raises
 `Trellis::ForkedHandleError` (see [Forking servers](#forking-servers)).
 
+### Logs
+
+The engine logs through `tracing` and installs no subscriber of its own, so
+nothing reaches Ruby until the app sets a logger. A Ruby thread then drains
+the engine's lines into it every 100 ms (`Trellis::LogBridge`); the engine
+never calls into the VM:
+
+```ruby
+Trellis.logger = Logger.new($stderr) # before Trellis.connect, to catch connect's lines
+Trellis.log_level = :info            # optional: default is the logger's level now
+```
+
+In a Rails app the Railtie does this with `Rails.logger`; see
+[Logs in Rails](#logs-in-rails). Each line is one `Logger` call: the engine's
+level as the severity (`trace` as `DEBUG`), its Rust module as the progname,
+and the event's text, ending in its fields. Every line names its instance as
+`trellis_instance=<database>/<catalog schema>`, so instances in one process
+stay apart. The lines the docs promise (a halt, a standby, a takeover's
+migrations, an automatic rebuild) are among them
+([observability](../../docs/observability.md#logs-and-traces)).
+
+The engine drops events above the level before formatting them, so a later
+`Logger#level=` can make the logger stricter but can't bring back a level the
+bridge filtered: use `Trellis.log_level=`. A line can be dropped, and logging
+never blocks or crashes the engine: the queue holds 10,000 lines, and when it
+overflows the next drain logs one warning with the count. At exit the thread
+stops after the instances shut down and logs what is left.
+
+The thread doesn't survive `fork`. After the usual hooks (see
+[Forking servers](#forking-servers)), it starts again, with an empty queue,
+when a handle connects in the child. Each native library links its own
+`tracing`, so another extension's subscriber never sees these lines, and
+doesn't stop the bridge.
+
 ### Several instances
 
 A process can hold several Trellis instances, for different catalog schemas
@@ -372,6 +406,18 @@ With neither set, the Railtie does nothing. Two exceptions:
   server that forks without a hook to shut the handle down first (a
   preloading Passenger, say). Connect in each child with
   `Trellis::Railtie.connect`.
+
+### Logs in Rails
+
+The Railtie sends the engine's log lines to `Rails.logger`, at its level, as
+the app boots:
+
+```ruby
+config.trellis.log_level = :info   # :debug, :info, :warn or :error; default: Rails.logger's level
+config.trellis.log_bridge = false  # forward nothing
+```
+
+A `Trellis.logger =` in a `config/initializers` file replaces it.
 
 ### Forking servers
 
@@ -598,7 +644,7 @@ How the restore works, and what it refuses, is in
 ## Layout
 
 - `lib/`: the `Trellis` module and `Trellis::Instance`, its error classes and its `Data` values,
-  `Trellis::Metrics`,
+  `Trellis::Metrics`, `Trellis::LogBridge`,
   the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
   loaded only in an app that has Rails, and the test helpers
   (`trellis/test_support.rb`), loaded only when required.

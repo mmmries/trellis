@@ -173,6 +173,7 @@ module Trellis
                 "#{call_pool_wait_timeout_ms.inspect}"
         end
 
+        LogBridge.ensure_running
         handle = Native.connect(url, schema, target_schema, staging, drain_threads, worker_threads,
                                 max_call_pool_size, call_pool_wait_timeout_ms)
         instance = new(handle, schema)
@@ -238,6 +239,9 @@ module Trellis
         shutdown_all
       rescue Error => e
         warn "trellis: shutting down at exit failed: #{e.class}: #{e.message}"
+      ensure
+        # After the instances: their shutdown lines are the last ones.
+        LogBridge.stop_current
       end
     end
 

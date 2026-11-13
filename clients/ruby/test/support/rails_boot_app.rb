@@ -5,6 +5,7 @@
 # Prints one JSON line of what it saw.
 $LOAD_PATH.unshift File.expand_path("../../lib", __dir__)
 require "json"
+require "stringio"
 require "tmpdir"
 
 # An app without ActiveRecord: the bundle has the gem, so this shadows it
@@ -44,6 +45,20 @@ when "boot"
   # The Railtie requires the migration helpers as ActiveRecord loads.
   ActiveRecord::Base
   seen[:migration_after_active_record] = defined?(Trellis::Migration) ? true : false
+when "logger", "logger_level", "logger_off"
+  # The engine's log lines go to Rails.logger, unless the app opts out.
+  io = StringIO.new
+  BootApp.config.logger = Logger.new(io)
+  BootApp.config.trellis.log_level = :warn if ARGV.fetch(0) == "logger_level"
+  BootApp.config.trellis.log_bridge = false if ARGV.fetch(0) == "logger_off"
+  BootApp.initialize!
+  Trellis.apply("DROP TRANSFORM no_such_transform")
+  bridge = Trellis::LogBridge.current
+  bridge&.drain_once
+  seen[:connected] = Trellis.connected?
+  seen[:bridge] = !bridge.nil?
+  seen[:rails_logger] = bridge&.logger.equal?(Rails.logger)
+  seen[:logged] = io.string.lines.grep(/drop is a no-op.*trellis_instance=\S+\/\S+ transform=no_such_transform/).size
 when "unset"
   BootApp.config.trellis.connect = nil
   BootApp.initialize!

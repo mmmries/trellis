@@ -162,11 +162,13 @@ class ForkTest < Minitest::Test
   end
 
   # Every public method but connect, connected? and default_instance (which
-  # only returns the instance) goes through the handle,
+  # only returns the instance) and the log bridge's settings (which need no
+  # handle: see log_bridge_test.rb) goes through the handle,
   # so a method added to the module without a line in SURFACE (or, for
   # shutdown, its own case above) fails here rather than going unchecked.
   def test_the_surface_names_every_public_method_that_uses_the_handle
-    uses_handle = Trellis.singleton_methods.map(&:to_s) - %w[connect connected? default_instance]
+    uses_handle = Trellis.singleton_methods.map(&:to_s) -
+                  %w[connect connected? default_instance logger logger= log_level=]
     assert_equal uses_handle.sort, [*SURFACE.keys, "shutdown"].sort
   end
 

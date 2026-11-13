@@ -127,6 +127,24 @@ class RailsTest < Minitest::Test
     assert_equal [false, false], seen.fetch("parent_connected")
   end
 
+  # The Railtie forwards the engine's lines to Rails.logger by default, at
+  # config.trellis.log_level, and not at all with config.trellis.log_bridge
+  # = false.
+  def test_boot_forwards_the_engines_lines_to_rails_logger
+    assert_equal({ "connected" => true, "bridge" => true, "rails_logger" => true, "logged" => 1 },
+                 boot("logger").slice("connected", "bridge", "rails_logger", "logged"))
+  end
+
+  def test_config_trellis_log_level_filters_what_rails_logger_gets
+    seen = boot("logger_level")
+    assert_equal [true, 0], seen.values_at("bridge", "logged")
+  end
+
+  def test_config_trellis_log_bridge_false_installs_nothing
+    seen = boot("logger_off")
+    assert_equal [false, 0], seen.values_at("bridge", "logged")
+  end
+
   private
 
   def boot(scenario)

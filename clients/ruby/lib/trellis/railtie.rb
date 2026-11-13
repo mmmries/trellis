@@ -49,6 +49,11 @@ module Trellis
   # - config.trellis.connect_on_boot = false, for a server that forks with
   #   no hook to shut the handle down first (see below).
   #
+  # The engine's log lines go to Rails.logger (Trellis::LogBridge), at
+  # Rails.logger's level or config.trellis.log_level (:debug, :info, :warn,
+  # :error), unless config.trellis.log_bridge = false. Trellis.logger = in a
+  # config/initializers file sends them elsewhere.
+  #
   # A handle doesn't survive fork. A preforking server that
   # loads the app before forking (Puma's preload_app!, on by default with
   # more than one worker) must shut the boot handle down before it forks,
@@ -67,6 +72,8 @@ module Trellis
     config.trellis.instances = {}
     config.trellis.connect_on_boot = true
     config.trellis.dump_database = "primary"
+    config.trellis.log_bridge = true
+    config.trellis.log_level = nil
 
     rake_tasks do
       namespace :trellis do
@@ -75,6 +82,11 @@ module Trellis
           Trellis::Railtie.migrate_all
         end
       end
+    end
+
+    initializer "trellis.logger" do |app|
+      settings = app.config.trellis
+      Trellis::LogBridge.install(::Rails.logger, level: settings.log_level) if settings.log_bridge && ::Rails.logger
     end
 
     initializer "trellis.migration" do
