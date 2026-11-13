@@ -57,7 +57,6 @@ use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
 use crate::defs::join::Position;
 use crate::defs::model::StoredStatus;
-use crate::defs::validate::ValidationError;
 use crate::defs::{copies, key_types};
 use crate::pool::Pool;
 
@@ -999,8 +998,8 @@ pub(crate) async fn pause_readers_in_hierarchy(
 ///    for that use now ([`key_types::refusal`]): an `ALTER COLUMN ... TYPE
 ///    character(n)` on a join column, a nondeterministic `COLLATE` on a
 ///    `GROUP BY` column;
-/// 2. a `JOIN`'s `ON` pair no longer has one type and collation:
-///    one join column re-typed and the other not (yet);
+/// 2. a `JOIN`'s `ON` pair no longer has one type: one join column
+///    re-typed and the other not (yet), which the re-validation below finds;
 /// 3. one of its key columns changed type, since the definition was
 ///    accepted or last resumed, in a way that renders the values Trellis
 ///    already stored differently ([`key_types::renders_differently`]):
@@ -1159,44 +1158,6 @@ pub(crate) async fn pause_readers_of_retyped(
                 None => {
                     if !unrecorded.contains(&(reader.id, column.clone())) {
                         unrecorded.push((reader.id, column.clone()));
-                    }
-                }
-            }
-        }
-
-        // A JOIN's `ON` pairs, which define holds to one type
-        // (`text` and `varchar` are one) and collation each, never a
-        // modifier (ADR-0020), after a retype of this table's side
-        // (the side whose join column moved from its recorded type, so the
-        // failure names the table that changed). The whole definition
-        // pauses, and a resume revalidates both sides.
-        let join_key: Vec<String> = crate::defs::join::side_of_table(&reader.def, table)
-            .map(|side| crate::defs::join::join_key(&reader.def, side))
-            .unwrap_or_default();
-        let join_key_moved = join_key.iter().any(|column| {
-            matches!(
-                (recorded.get(&(reader.id, column.clone())), live.get(column)),
-                (Some((old, _)), Some(now)) if old != &now.ty()
-            )
-        });
-        if !reader.joined.is_empty() && join_key_moved {
-            let sides = crate::defs::catalog::JoinSides::read(
-                &*client,
-                reader.source.clone(),
-                reader.joined.clone(),
-            )
-            .await?;
-            if let Err(err @ ValidationError::JoinKeyTypeMismatch { .. }) =
-                crate::defs::validate::validate_join(
-                    &reader.def,
-                    &sides.from_columns,
-                    &sides.joined_column_maps(),
-                )
-            {
-                refused = true;
-                for column in &join_key {
-                    if !columns.contains(column) {
-                        flag(column, err.to_string(), &mut columns);
                     }
                 }
             }

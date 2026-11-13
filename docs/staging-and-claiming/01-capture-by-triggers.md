@@ -318,8 +318,8 @@ it regenerates anything, it pauses the definition, with its
 1. a key column now has a type or collation define would refuse for that use
    (a join column made `character(n)`, a nondeterministic `COLLATE` on a
    `GROUP BY` column);
-2. a `JOIN`'s `ON` pair no longer has one type and collation (one join
-   column re-typed to `bigint`, the other not yet);
+2. a `JOIN`'s `ON` pair no longer has one type (one join column re-typed to
+   `bigint`, the other not yet);
 3. a key column's type changed in a way that renders the values already
    stored differently: `timestamp` to `timestamptz`, `date` to `timestamp`,
    `text` to `uuid`, a narrower `numeric` scale or temporal precision (the
