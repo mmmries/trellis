@@ -3837,9 +3837,20 @@ impl GroupTargetPlan {
             );
         // `c`: each group of the `GROUP BY` or the enumeration, `NULL`
         // matching `NULL`, with its new partials and extremes.
+        // At the hidden table's collation, so the insert reaches the groups
+        // in its index's order (R7) whatever the source column's is.
         let mut c_cols: Vec<String> = cols
             .iter()
-            .map(|c| format!("case when a.__rn is null then e.{c} else a.{c} end as {c}"))
+            .enumerate()
+            .map(|(i, c)| {
+                let value = self.collations.coerce(
+                    &format!("case when a.__rn is null then e.{c} else a.{c} end"),
+                    i,
+                    Population::Source,
+                    Population::Hidden,
+                );
+                format!("{value} as {c}")
+            })
             .collect();
         c_cols.extend(self.shape.each_partial(|p| p.or_zero("a", "__r")));
         let mut insert_cols = cols.clone();
@@ -5201,9 +5212,22 @@ async fn write_once(
     let pause_sql = pause.as_ref().map(|pause| pause.sql.as_str());
     #[cfg(not(any(test, feature = "test-util")))]
     let pause_sql = None;
+    // A plain aggregate's hidden table is at the database's default
+    // collation ([`GroupCollations`]); the source's group columns may not be.
+    let source = column_collations(txn, &plan.source).await?;
+    let hidden: ColumnCollations = source
+        .keys()
+        .map(|c| (c.clone(), "pg_catalog.\"default\"".to_string()))
+        .collect();
+    let collated = plan.clone().with_collations(GroupCollations::of(
+        &plan.shape.group_cols,
+        Some(&source),
+        &hidden,
+        None,
+    ));
     let rows = txn
         .query(
-            &plan.write_once_sql(image_columns.as_deref(), pause_sql),
+            &collated.write_once_sql(image_columns.as_deref(), pause_sql),
             &[&plan.source],
         )
         .await?;

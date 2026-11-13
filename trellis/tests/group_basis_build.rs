@@ -1139,3 +1139,56 @@ async fn a_qualified_source_and_target_are_read_and_written_not_a_same_named_dec
         "the same-named public table is never written"
     );
 }
+
+/// A source group column of another collation than the hidden table's
+/// (`POSIX`, bytewise, against the database's ICU default): the build's
+/// first statement still inserts the groups in the hidden index's order,
+/// the order pages lock them in (R7).
+#[tokio::test]
+async fn a_build_over_a_re_collated_group_column_inserts_in_the_index_order() {
+    let columns = [("id", int4()), ("g", ValueType::Text), ("v", int4())];
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g text collate \"POSIX\", v integer)",
+        &columns,
+        &[ONE],
+        &[SRC],
+    )
+    .await;
+    d.step(
+        "insert into public.src select i, case when i % 2 = 0 then upper(md5(i::text)) \
+         else md5(i::text) end, i from generate_series(1, 2000) i",
+    )
+    .await;
+    trellis::defs::install_definition(
+        d.pool(),
+        AGG,
+        &columns
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t))
+            .collect(),
+        "public",
+    )
+    .await
+    .expect("define the aggregate");
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the build");
+    run_build(&d).await;
+    assert_eq!(
+        d.rows(&format!(
+            "select count(*) filter (where g < before), count(*) from ( \
+             select g, lag(g) over (order by ctid) as before from {}) as x",
+            hidden(&d).await
+        ))
+        .await,
+        ["(0,2000)"],
+        "a hidden row stored after one of a greater key"
+    );
+    d.settle().await;
+    assert_eq!(
+        d.rows("select g, total, n from public.agg order by g collate \"C\"")
+            .await,
+        d.rows("select g, sum(v), count(*) from public.src group by g order by g collate \"C\"")
+            .await
+    );
+}
