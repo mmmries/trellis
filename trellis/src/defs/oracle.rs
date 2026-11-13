@@ -162,6 +162,9 @@ fn select_sql(
     outputs: &[Output<'_>],
     as_text: bool,
 ) -> Result<String, TargetSelectError> {
+    // Every definition reads its whole source: a predicate other than `TRUE`
+    // has to be rendered here before it can be stored.
+    let super::ast::Predicate::True = def.predicate;
     let join = match &def.key_space {
         KeySpace::Join(join) | KeySpace::JoinOneToOne(join) => Some(join),
         KeySpace::OneToOne | KeySpace::Aggregate { .. } => None,
@@ -760,6 +763,11 @@ mod tests {
             (
                 "TRANSFORM t FROM s KEY (code) SELECT price AS price",
                 vec!["code", "price", "stray"],
+            ),
+            (
+                "TRANSFORM t FROM orders JOIN customers ON orders.customer_id = customers.id \
+                 GROUP BY customers.tier SELECT COUNT(*) AS n",
+                vec!["tier", "n", "stray"],
             ),
         ] {
             let err = target_select_sql(

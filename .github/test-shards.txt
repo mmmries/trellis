@@ -57,6 +57,7 @@ test:null_literal_key_spaces 13.1
 test:capture_missed_ddl 12.8
 test:defs_grammar_version 12.3
 test:join_one_to_one_quarantine 12.0
+test:target_select_parity 12.0
 test:self_check 11.8
 test:group_basis_numeric_scales 11.0
 test:partition_lifecycle_cells 10.8
