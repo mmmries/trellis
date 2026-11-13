@@ -64,6 +64,16 @@ module Trellis
   # ran before the failure in place, on both sides. Give a migration that
   # defines transforms little else to do.
   #
+  # == Environments Trellis is off in
+  #
+  # A database of an environment named in config.trellis.off_in (`%w[test]`)
+  # is built by loading the schema, which carries the targets as plain
+  # tables, not by a migration that defines one. Run in that environment, the
+  # three helpers raise ActiveRecord::MigrationError before running anything.
+  # Run from an environment Trellis is on in (`db:prepare` in development
+  # migrates the test database too), they do nothing and return nil: that
+  # database is reloaded from the new dump the next time it is prepared.
+  #
   # == up and down, not change
   #
   # ActiveRecord can reverse `create_table` on its own, but not a Trellis
@@ -145,6 +155,8 @@ module Trellis
     # does: Trellis.status. A read, so it runs whether or not a transaction
     # is open.
     def status(target_table)
+      return if off_database?("this status wasn't read: #{target_table}")
+
       Migration.with_handle { Trellis.status(target_table) }
     end
 
@@ -169,9 +181,31 @@ module Trellis
               "cannot reverse a Trellis statement: #{statement}. Undo a define in down with " \
               "PAUSE TRANSFORM and DROP TRANSFORM statements."
       end
+      return if off_database?("this statement wasn't applied: #{statement}")
+
       refuse_open_transaction!("this statement wasn't applied: #{statement}")
 
       say_with_time("#{helper}(#{statement.inspect})") { Migration.with_handle { yield } }
+    end
+
+    # Whether the migrating database belongs to an environment Trellis is off
+    # in, so `what` is skipped: raises when that is also the environment
+    # running the migration.
+    def off_database?(what)
+      return false unless defined?(Trellis::Railtie)
+
+      environment = connection.pool.db_config.env_name
+      return false unless Trellis::Railtie.off_in?(environment)
+
+      if Trellis::Railtie.off_in?(ActiveRecord::Tasks::DatabaseTasks.env)
+        raise ActiveRecord::MigrationError,
+              Trellis::Railtie.off_message("#{what}. Build this database by loading the schema " \
+                                           "(`bin/rails db:schema:load`, or `db:test:prepare`) rather than " \
+                                           "migrating it", environment)
+      end
+
+      say Trellis::Railtie.off_message("#{what}; the next schema load of this database brings it in", environment)
+      true
     end
 
     def refuse_open_transaction!(what)

@@ -868,7 +868,8 @@ The clients write and load the file themselves:
 * **Rails**, with `config.active_record.schema_format = :sql`: `db:migrate`'s
   dump and `db:schema:dump` write it for `config.trellis.connect` and
   `config.trellis.instances`, and `db:schema:load`, `db:prepare` and
-  `maintain_test_schema!` run `migrate` after loading it. A `schema.rb` can't
+  `maintain_test_schema!` run `migrate` after loading it (not in an environment
+  named in `config.trellis.off_in`, which gets plain tables). A `schema.rb` can't
   carry the definitions, so the hook refuses to dump one. See the
   [Ruby README](../clients/ruby/README.md#schema-dumps).
 * **Ecto**: `mix trellis.dump` writes it, running `pg_dump` itself since `mix

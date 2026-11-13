@@ -75,6 +75,52 @@ class RailsTest < Minitest::Test
     assert_equal({ "connected" => true }, boot("tasks_loaded_before_boot"))
   end
 
+  # config.trellis.off_in: nothing connects at boot in an environment Trellis
+  # is off in, Railtie.connect and trellis:migrate warn and do nothing, and
+  # Trellis.enabled? says so; another environment's entry changes nothing.
+  def test_boot_connects_nothing_when_trellis_is_off_in_the_environment
+    seen = boot("off_in")
+    assert_equal false, seen.fetch("enabled")
+    assert_equal false, seen.fetch("connected")
+    assert_equal "", seen.fetch("boot_warning")
+    assert_match "Trellis is off in the", seen.fetch("warning")
+    assert_match "(config.trellis.off_in): Trellis::Railtie.connect connects nothing", seen.fetch("warning")
+    assert_equal false, seen.fetch("connected_after_connect")
+  end
+
+  def test_boot_connects_when_trellis_is_off_only_in_another_environment
+    seen = boot("off_in_elsewhere")
+    assert_equal true, seen.fetch("enabled")
+    assert_equal true, seen.fetch("connected")
+  end
+
+  # The default is off in the test environment and on in the others; an app
+  # that wants Trellis in its tests sets off_in = [].
+  def test_trellis_is_off_in_the_test_environment_by_default
+    seen = boot("default_off_in", rails_env: "test")
+    assert_equal false, seen.fetch("enabled")
+    assert_equal false, seen.fetch("connected")
+    assert_equal "", seen.fetch("boot_warning")
+    assert_match "Trellis is off in the test environment (config.trellis.off_in)", seen.fetch("warning")
+  end
+
+  def test_trellis_is_on_in_other_environments_by_default
+    seen = boot("default_off_in", rails_env: "development")
+    assert_equal true, seen.fetch("enabled")
+    assert_equal true, seen.fetch("connected")
+  end
+
+  def test_an_empty_off_in_turns_trellis_on_in_the_test_environment
+    seen = boot("opt_in_off_in", rails_env: "test")
+    assert_equal true, seen.fetch("enabled")
+    assert_equal true, seen.fetch("connected")
+  end
+
+  def test_trellis_migrate_migrates_nothing_when_trellis_is_off
+    seen = boot("off_in_rake")
+    assert_match "trellis:migrate migrates nothing", seen.fetch("warning")
+  end
+
   # The documented Puma wiring: before_fork shuts the boot handle down, and
   # a worker connects its own.
   def test_the_documented_fork_hooks_give_each_worker_a_handle
@@ -145,6 +191,17 @@ class RailsTest < Minitest::Test
     assert_equal [false, 0], seen.values_at("bridge", "logged")
   end
 
+  # Trellis is off in an off_in environment: nothing connects, so no bridge.
+  def test_the_log_bridge_does_not_start_in_an_environment_trellis_is_off_in
+    seen = boot("logger_off_in")
+    assert_equal [false, false], seen.values_at("bridge", "connected")
+  end
+
+  def test_the_log_bridge_does_not_start_in_the_test_environment_by_default
+    seen = boot("logger_default_off_in", rails_env: "test")
+    assert_equal [false, false], seen.values_at("bridge", "connected")
+  end
+
   # `rails trellis:release_check` reads the app's own lockfile and every
   # database's migrations_paths, and never initializes the app, so a CI job
   # with no database can run it. Trellis::ReleaseCheck's own cases are in
@@ -169,9 +226,11 @@ class RailsTest < Minitest::Test
 
   private
 
-  def boot(scenario)
-    out = run_ruby("the #{scenario} scenario", { "TRELLIS_TEST_DSN" => TestCluster.dsn },
-                   BOOT_APP, scenario)
+  # The app's environment is development unless a scenario names one, so
+  # an ambient RAILS_ENV doesn't change what it sees.
+  def boot(scenario, rails_env: "development")
+    env = { "TRELLIS_TEST_DSN" => TestCluster.dsn, "RAILS_ENV" => rails_env, "RACK_ENV" => nil }
+    out = run_ruby("the #{scenario} scenario", env, BOOT_APP, scenario)
     JSON.parse(out.lines.last)
   end
 
