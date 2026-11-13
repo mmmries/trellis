@@ -447,7 +447,7 @@ fn hidden_tables_sql() -> String {
 /// its cost is the zero groups it walks, not the groups there are.
 ///
 /// **Against a build.** A plain aggregate under a fresh build or a resume is
-/// skipped ([`NOT_IN_FRESH_BUILD_SQL`]), as a ledger under a build is: the
+/// skipped ([`FRESH_BUILD_PENDING_SQL`]), as a ledger under a build is: the
 /// build inserts each group that has no hidden row from its own snapshot
 /// (`super::group_basis::rebuild`), which is right only if no row a page
 /// applied to is removed between that snapshot and the build's commit.
@@ -499,16 +499,22 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
             }
             if table.aggregate {
                 match txn
-                    .query_opt(
-                        NOT_IN_FRESH_BUILD_SQL,
-                        &[&table.definition_id, &crate::defs::chunk_queue::KIND_PLAN],
-                    )
+                    .execute(DEFINITION_KEY_SHARE_SQL, &[&table.definition_id])
                     .await
                 {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
+                    Ok(_) => {}
                     Err(err) if is_lock_not_available(&err) => break,
                     Err(err) => return Err(err.into()),
+                }
+                let building: bool = txn
+                    .query_one(
+                        FRESH_BUILD_PENDING_SQL,
+                        &[&table.definition_id, &crate::defs::chunk_queue::KIND_PLAN],
+                    )
+                    .await?
+                    .get(0);
+                if building {
+                    break;
                 }
             }
             // Planted bug: collect every zero group, whatever its
@@ -641,23 +647,31 @@ const NOT_BUILDING_SQL: &str = "\
     where id = $1 and status <> 'backfilling' and build is null \
     for key share nowait";
 
+/// Locks definition `$1`'s row `for key share`, without waiting: a plain
+/// aggregate's zero-group GC batch ([`collect_zero_groups`]) holds it until
+/// it commits, then reads [`FRESH_BUILD_PENDING_SQL`].
+const DEFINITION_KEY_SHARE_SQL: &str = "\
+    select 1 from transform_definitions where id = $1 for key share nowait";
+
 /// [`NOT_BUILDING_SQL`] for a plain aggregate's zero groups
-/// ([`collect_zero_groups`]): returns definition `$1`'s row unless its plan
-/// job (`$2`, `chunk_queue::KIND_PLAN`) is pending, which is a fresh build or a resume. A rebuild in place
-/// runs as a sweep job alone (`super::build::start_rebuilds`).
+/// ([`collect_zero_groups`]): whether definition `$1`'s plan job (`$2`,
+/// `chunk_queue::KIND_PLAN`) is pending, which is a fresh build or a
+/// resume. A rebuild in place runs as a sweep job alone
+/// (`super::build::start_rebuilds`).
 ///
 /// **Why the lock makes the skip enough.** A build's start inserts the plan
 /// job in the transaction that takes the definition's row `for update`
 /// (`super::build`'s `start`), and the job marks itself done in the
-/// transaction of its write, after which it commits. So a batch either
-/// committed before the start, before the write's first snapshot, or ran
-/// its check after the start committed and skipped until the write's commit.
-const NOT_IN_FRESH_BUILD_SQL: &str = "\
-    select 1 from transform_definitions d \
-    where id = $1 \
-      and not exists (select 1 from backfill_chunks c \
-                      where c.definition_id = d.id and c.kind = $2 and not c.done) \
-    for key share of d nowait";
+/// transaction of its write. This runs after [`DEFINITION_KEY_SHARE_SQL`],
+/// in a snapshot of its own, so a batch either holds the lock before the
+/// start takes it, and commits before the write's first snapshot, or sees
+/// the start's job and skips until the write's commit. One statement that
+/// locked and checked would read the job in the snapshot it took before
+/// the lock: a start committing between the two leaves the row's own
+/// columns to recheck, not the job.
+const FRESH_BUILD_PENDING_SQL: &str = "\
+    select exists (select 1 from backfill_chunks \
+                   where definition_id = $1 and kind = $2 and not done)";
 
 /// The plan settings a GC batch's statement runs under: no
 /// sequential scan and no bitmap scan, so the batch walks the ledger's
