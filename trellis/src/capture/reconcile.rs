@@ -177,6 +177,7 @@ pub async fn reconcile(
         schema,
         &crate::defs::floor::Floors::of_this_binary(),
         desired,
+        &Default::default(),
         deadline,
     )
     .await
@@ -184,11 +185,14 @@ pub async fn reconcile(
 
 /// [`reconcile`], with the definition floors the resumes it completes
 /// stamp (ADR-0024): the handle's, whose binary version a test may inject.
+/// The definitions and tables in `unusable` are left out of every step,
+/// their capture left as it is.
 pub(crate) async fn reconcile_with_floors(
     client: &mut Client,
     schema: &str,
     floors: &crate::defs::floor::Floors,
     desired: &[String],
+    unusable: &crate::staging::halt::Unusable,
     deadline: Instant,
 ) -> Result<PassOutcome, CaptureError> {
     // A definition paused by its upstream's re-type resumes once that
@@ -217,14 +221,21 @@ pub(crate) async fn reconcile_with_floors(
     // restore check too, and before the resumes below, so a resume finishing
     // in this pass is never one the relabel should have stopped. A failure
     // is retried by the next pass.
-    if let Err(err) = crate::staging::schema_change::pause_readers_of_relabelled(client).await {
+    if let Err(err) =
+        crate::staging::schema_change::pause_readers_of_relabelled(client, &unusable.definitions)
+            .await
+    {
         crate::instance_log::warn!(
             "the enum labels the definitions read could not be compared; retrying next pass: {err}"
         );
     }
     crate::staging::quarantine::resume_caused_definitions(client, schema, floors).await?;
     crate::staging::quarantine::finish_requested_resumes(client, schema, floors).await?;
-    let snapshot = read_snapshot(client, floors).await?;
+    let mut snapshot = read_snapshot(client, floors).await?;
+    snapshot
+        .catalog
+        .definitions
+        .retain(|reader| !unusable.definitions.contains(&reader.id));
     let installed = installed_tables(&*client, schema).await?;
     let database: String = client
         .query_typed_one("select pg_catalog.current_database()::text", &[])
@@ -238,7 +249,7 @@ pub(crate) async fn reconcile_with_floors(
         crate::staging::drift_memo::Fingerprints::read(&*client, schema, &snapshot.catalog).await?;
     let mut outcome = PassOutcome::default();
 
-    for table in desired {
+    for table in desired.iter().filter(|t| !unusable.tables.contains(*t)) {
         // A table some definition reads that is gone from its name
         // (dropped, renamed away, moved to another schema) pauses its readers;
         // a resume re-validates them against whatever is there then.
@@ -545,7 +556,7 @@ pub(crate) async fn reconcile_with_floors(
     let mut seam_fed: Vec<&String> = snapshot
         .targets
         .iter()
-        .filter(|t| !desired_set.contains(t))
+        .filter(|t| !desired_set.contains(t) && !unusable.tables.contains(*t))
         .collect();
     seam_fed.sort();
     for &table in &seam_fed {

@@ -1681,3 +1681,104 @@ async fn a_revoked_schema_usage_leaves_another_tables_redefined_key_checked() {
     assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
     it.trellis.shutdown().await.expect("shutdown");
 }
+
+/// The role loses `USAGE` on a source's schema, and nothing has written
+/// there since: the staging pass pauses the schema's readers with the
+/// reason and runs every step for the other tables, so a source defined
+/// afterwards in another schema gets its capture and flows, and a relabel
+/// of an enum another definition reads pauses it. After the grant a
+/// `RESUME` rebuilds the paused readers.
+#[tokio::test]
+async fn a_revoked_schema_usage_leaves_the_staging_pass_running_for_other_schemas() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create schema app; grant usage on schema app to rls_trellis; \
+             create table app.o (id int primary key, cid int, amount int); \
+             insert into app.o select i, 1 + i % 3, i from generate_series(1, 6) i; \
+             alter table app.o owner to rls_trellis; \
+             create type public.mood as enum ('calm', 'cross'); \
+             create table public.e (id int primary key, m public.mood); \
+             insert into public.e values (1, 'calm'); \
+             alter table public.e owner to rls_trellis;",
+        )
+        .await
+        .expect("a source in a schema of its own, and one reading an enum");
+    for ddl in [
+        "TRANSFORM o_copy FROM app.o SELECT amount AS amount",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+        "TRANSFORM e_copy FROM public.e SELECT m AS m",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+
+    it.admin
+        .batch_execute(
+            "revoke usage on schema app from rls_trellis; \
+             alter type public.mood rename value 'calm' to 'still'",
+        )
+        .await
+        .expect("revoke, and relabel the enum");
+    it.trellis
+        .apply("TRANSFORM p_copy FROM public.p SELECT name AS name")
+        .await
+        .expect("define over another schema");
+    trellis::client::reconcile_pass(&mut it.raw, &it.pool, SCHEMA)
+        .await
+        .expect("the pass leaves app.o out");
+    harness::settle_builds(&it.pool).await;
+    let failure = halted(&it.trellis, "o_copy").await;
+    assert_eq!(failure.source_table, "app.o");
+    assert!(
+        failure
+            .error
+            .contains("role rls_trellis lacks USAGE on schema app"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(
+        status(&it.trellis, "p_copy").await.status,
+        TransformStatus::Live
+    );
+    let e = status(&it.trellis, "e_copy").await;
+    assert_eq!(e.status, TransformStatus::Paused);
+    let failure = e.capture_failure.expect("the relabel is reported");
+    assert!(failure.error.contains("'still'"), "{failure:?}");
+    it.admin
+        .batch_execute("update public.p set name = 'moved' where id = 1")
+        .await
+        .expect("write the new source");
+    seal_and_drain(&mut it.raw, &it.pool).await.expect("drain");
+    let name: Option<String> = it
+        .admin
+        .query_one("select name from public.p_copy where id = 1", &[])
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(name.as_deref(), Some("moved"), "public.p is captured");
+    assert!(
+        it.trellis.apply("RESUME TRANSFORM o_copy").await.is_err(),
+        "a resume refuses while the schema is unusable"
+    );
+
+    it.admin
+        .batch_execute("grant usage on schema app to rls_trellis")
+        .await
+        .expect("grant USAGE back");
+    it.trellis
+        .apply("RESUME TRANSFORM o_copy")
+        .await
+        .expect("resume");
+    trellis::client::reconcile_pass(&mut it.raw, &it.pool, SCHEMA)
+        .await
+        .expect("pass");
+    harness::settle_builds(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "o_copy").await.status,
+        TransformStatus::Live
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}

@@ -1209,12 +1209,14 @@ async fn first_capture_pass(
     pool: &Pool,
 ) -> Result<(), ClientError> {
     let tables = defs::tables_to_capture(pool).await?;
+    let unusable = staging::halt::halt_unusable_schemas(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let outcome = capture::reconcile::reconcile_with_floors(
         session.client_mut(),
         config.schema(),
         pool.floors(),
         &tables,
+        &unusable,
         deadline,
     )
     .await
@@ -2050,12 +2052,16 @@ async fn reconcile_source_tables(
     schema: &str,
 ) -> Result<(), ReconcileError> {
     let desired = defs::tables_to_capture(pool).await?;
+    // The readers of a table in a schema the role can't use pause, and the
+    // pass leaves them out: any lookup of the table by name raises.
+    let unusable = staging::halt::halt_unusable_schemas(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let outcome = capture::reconcile::reconcile_with_floors(
         client,
         schema,
         pool.floors(),
         &desired,
+        &unusable,
         deadline,
     )
     .await?;

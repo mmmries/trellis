@@ -412,6 +412,73 @@ pub(crate) async fn schemas_usable(
     Ok(row.get(0))
 }
 
+/// What a staging pass leaves out because the role can't use a schema
+/// ([`halt_unusable_schemas`]).
+#[derive(Debug, Default)]
+pub(crate) struct Unusable {
+    /// Every definition, paused or not, that reads or writes a table in a
+    /// schema the role can't use.
+    pub(crate) definitions: Vec<i64>,
+    /// Every table those definitions read or write.
+    pub(crate) tables: HashSet<String>,
+}
+
+/// Pauses, with kind `halt`, every unfrozen definition that reads or writes
+/// a table in a schema the pool's role can't use ([`schemas_usable`]), and
+/// everything downstream of them, as the drain's halt does; and returns
+/// every such definition, for a staging pass to leave out: any lookup of
+/// those tables by name raises, and would fail the pass for every table.
+pub(crate) async fn halt_unusable_schemas(pool: &Pool) -> Result<Unusable, ApplyError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let catalog = load_catalog_for(&*txn, pool.floors()).await?;
+    let tables_of = |r: &crate::capture::columns::CaptureReader| {
+        let mut tables = r.joined.clone();
+        tables.extend([r.source.clone(), r.target.clone()]);
+        tables
+    };
+    let every: BTreeSet<String> = catalog.definitions.iter().flat_map(tables_of).collect();
+    if schemas_usable(&*txn, &Vec::from_iter(every.iter().cloned())).await? {
+        return Ok(Unusable::default());
+    }
+    let mut refused = BTreeSet::new();
+    for table in every {
+        if !schemas_usable(&*txn, std::slice::from_ref(&table)).await? {
+            refused.insert(table);
+        }
+    }
+    let mut unusable = Unusable::default();
+    for reader in &catalog.definitions {
+        let tables = tables_of(reader);
+        if tables.iter().any(|t| refused.contains(t)) {
+            unusable.definitions.push(reader.id);
+            unusable.tables.extend(tables);
+        }
+    }
+    for table in &refused {
+        let reason = missing_privileges(&*txn, table, &[])
+            .await?
+            .unwrap_or_else(|| format!("the role lacks USAGE on the schema of {table}"));
+        for seed in [
+            Seed::Tables(vec![table.clone()]),
+            Seed::Target(table.clone()),
+        ] {
+            let halted = "the staging pass halted";
+            pause_closure(
+                &txn,
+                pool.schema(),
+                pool.floors(),
+                Some(seed),
+                halted,
+                &reason,
+            )
+            .await?;
+        }
+    }
+    txn.commit().await?;
+    Ok(unusable)
+}
+
 /// The ids of the definitions in `unfrozen` that `seed` reaches: its
 /// readers (or writer), then every reader of each one's target, to a
 /// fixpoint. A frozen definition is left out and not followed, since it
