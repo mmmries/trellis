@@ -34,7 +34,7 @@
 //! without comparing.
 //!
 //! The `pin_…` tests are the pins of the 1-1 `JOIN`'s page plants
-//! (`join1_*`, #1396–#1398) from `join_one_to_one_interleavings`, and of its
+//! (`join1_*`, #1396–#1398) from `join_star_families`, and of its
 //! fan-out quarantine plants (#1513) from `join_one_to_one_quarantine`, with
 //! `a` a seam-fed 1-1 target joined on a non-key column: each of those
 //! plants fails at least one of them. S2 pins `seam_token_early`.
@@ -1283,8 +1283,8 @@ async fn s9_self_check_while_the_upstream_lags_reports_nothing_and_misses_nothin
 // ------------------------------------------- the plants' pins, `a` seam-fed
 
 // The ADR-0021 page plants (`join1_*` of #1396–#1398) are pinned by
-// `join_one_to_one_interleavings` and the star families on captured sides
-// (at the two-table shape). These are the same pins
+// the star families on captured sides (at the two-table shape). These are
+// the same pins
 // with `a` a 1-1 target of the captured `public.a`, joined on its non-key
 // `k`, and `b` captured: a change of `a` is applied by the upstream's page
 // and reaches the `JOIN` as its seam row, in a batch of its own, and the
@@ -1485,7 +1485,7 @@ async fn pin_total(d: &Driver, kind: Kind, id: i32) -> Option<i32> {
 }
 
 /// A connection that stands for a `b` page, as in
-/// `join_one_to_one_interleavings`: holds `J[key]` `FOR UPDATE` and rewrites
+/// `join_star_families`: holds `J[key]` `FOR UPDATE` and rewrites
 /// what a `b` change on the key rewrites, uncommitted, until
 /// [`PinBWriter::commit`].
 struct PinBWriter {
@@ -1525,7 +1525,7 @@ impl PinBWriter {
 
 /// Waits until some backend queues on a lock `pid` holds (`true`), or until
 /// `page` finishes without one having queued (`false`), as
-/// `join_one_to_one_interleavings`'s helper of the same name does.
+/// `support/star.rs`'s helper of the same name does.
 async fn queued_or_finished<T>(d: &Driver, pid: i32, page: &drain_driver::Running<T>) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {

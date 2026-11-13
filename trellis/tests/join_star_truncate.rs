@@ -1,6 +1,7 @@
 //! A `TRUNCATE` of any table of a star 1-1 `JOIN` (#1776, #1460 sub-step
 //! 3.10; #1375's T families, #1464's PP-T, PX4 to PX7, CX F5a/F5e and F5d,
-//! PS3 and XT1).
+//! PS3 and XT1), and the lock order of a truncate's page against a rebuild
+//! start of several definitions and against seal phase 1.
 //!
 //! A truncate's page takes the transform's lock row `FOR UPDATE`, so every
 //! other page of the star, at any position, queues on it; it empties the
@@ -501,6 +502,136 @@ async fn px7_a_truncate_of_a_joined_table_and_a_rebuild_start_take_the_definitio
         star::write(&d, &shape.sql("truncate {b}")).await;
         let truncate = d.seal().await;
         def_row_first(&mut d, star, truncate).await;
+    }
+}
+
+/// A `TRUNCATE` of the table under test, read by every star of the shape,
+/// whose ids run against their target names (the first defined sorts last:
+/// `jl` before `ji`, `jll` before `jii`), against a rebuild start of all of
+/// them, which takes their definitions' rows in id order and then their
+/// lock rows. The page takes every definition's row in id order before any
+/// lock row, so it queues on the first's holding nothing of any pair.
+/// Taking each definition's row as it reached that target, it would hold a
+/// later definition's row and lock row while it queued, and the start's next
+/// lock would close the cycle.
+#[tokio::test]
+async fn a_truncate_page_of_several_joins_takes_their_definition_rows_in_id_order() {
+    for shape in SHAPES {
+        let stars = shape.stars();
+        let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
+        let mut ids = Vec::new();
+        for star in &stars {
+            ids.push(star::definition_id(&d, *star).await);
+        }
+        let names: Vec<String> = stars.iter().map(|s| s.name()).collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]) && names.windows(2).all(|w| w[0] > w[1]),
+            "the first defined sorts last: {names:?} {ids:?}"
+        );
+        star::write(&d, &shape.sql("truncate {b}")).await;
+        let truncate = d.seal().await;
+        let mut start = d.user().await;
+        let txn = start.transaction().await.expect("begin");
+        let lock_definition = |id: i64| {
+            let txn = &txn;
+            async move {
+                txn.execute(
+                    "select 1 from transform_definitions where id = $1 for update",
+                    &[&id],
+                )
+                .await
+            }
+        };
+        lock_definition(ids[0])
+            .await
+            .expect("the first definition row");
+        let page = d.drain_frozen(truncate, "truncate", &[]).await;
+        let pid: i32 = txn
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        assert!(
+            star::queued_or_finished(&d, pid, &page).await,
+            "{shape:?}: the page didn't queue on the first definition row"
+        );
+        for id in &ids[1..] {
+            lock_definition(*id)
+                .await
+                .expect("the later definition rows, with no deadlock");
+        }
+        for id in ids.iter().rev() {
+            txn.execute(
+                &format!("select 1 from {DEFAULT_SCHEMA}.join1_{id}_l for update"),
+                &[],
+            )
+            .await
+            .expect("the lock rows, with no deadlock");
+        }
+        txn.commit().await.expect("commit the start");
+        page.finish().await;
+        let deadlocks = d.deadlocks_logged();
+        assert!(deadlocks.is_empty(), "{deadlocks:?}");
+        star::assert_rebuilt(&mut d, &stars).await;
+    }
+}
+
+/// A `TRUNCATE` page of the table under test against seal phase 1 sealing
+/// the segment after the truncate's. Phase 1 updates the truncate's segment
+/// row (its `seal_step2`) and then the segment pointer; the page marks its
+/// segment row drained and stamps the rebuild's segment under a share lock
+/// on the pointer. The page takes them in phase 1's order, its segment row
+/// first, so it queues on the row holding no lock on the pointer, and phase
+/// 1 goes on. Phase 1 is played by hand, once the page has claimed its
+/// segment.
+#[tokio::test]
+async fn a_truncate_page_takes_its_segment_row_before_the_segment_pointer() {
+    for shape in SHAPES {
+        let star = shape.stars()[0];
+        let target = star.target();
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        star::write(&d, &shape.sql("truncate {b}")).await;
+        let truncate = d.seal().await;
+        let mut page = d
+            .drain_frozen(
+                truncate,
+                "truncate",
+                &[(PausePoint::BeforeJoin1Recompute, &target)],
+            )
+            .await;
+        page.reached(PausePoint::BeforeJoin1Recompute).await;
+        let mut seal = d.user().await;
+        let txn = seal.transaction().await.expect("begin");
+        txn.execute(
+            &format!(
+                "update {DEFAULT_SCHEMA}.segments set seal_step2 = seal_step2 where seg_seq = $1"
+            ),
+            &[&truncate],
+        )
+        .await
+        .expect("the truncate's segment row");
+        d.release(&mut page, PausePoint::BeforeJoin1Recompute).await;
+        let pid: i32 = txn
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        assert!(
+            star::queued_or_finished(&d, pid, &page).await,
+            "{}: the page didn't queue on its segment row",
+            star.name()
+        );
+        txn.execute(
+            &format!("update {DEFAULT_SCHEMA}.segment_pointer set active_seq = active_seq"),
+            &[],
+        )
+        .await
+        .expect("the segment pointer, with no deadlock");
+        txn.rollback().await.expect("roll phase 1 back");
+        page.finish().await;
+        let deadlocks = d.deadlocks_logged();
+        assert!(deadlocks.is_empty(), "{deadlocks:?}");
+        star::assert_rebuilt(&mut d, &[star]).await;
     }
 }
 
