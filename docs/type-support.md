@@ -196,7 +196,7 @@ per value. So:
   blank-padding is a hazard, not a volatility one.
 
 What happens when a collation changes after define is in
-[capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-re-typed-key-column-or-an-outgrown-copy),
+[capture drift](staging-and-claiming/capture-drift.md#a-re-typed-key-column-or-an-outgrown-copy),
 and what that misses in
 [known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type).
 
@@ -503,28 +503,19 @@ rebuilds. A logical dump and restore gives every type a new OID: the restore
 pauses every definition, the pass compares none of their recorded OIDs, and
 `RESUME` records the new ones. `pg_upgrade` keeps them.
 
-Renaming a value (`ALTER TYPE … RENAME VALUE`) pauses every definition that
-reads a column of the type, whatever the place: passthrough, key, `GROUP BY`,
-`JOIN` column or an input to a calculated field. The columns Trellis created
-follow the new label, but Trellis also keeps values as label text (staged
-changes, held keys, a 1-1 ledger's keys), and that text names a label that
-no longer exists. Each definition records its enum values by their
-`pg_enum` OIDs, and the capture pass finds the one whose label changed;
-`capture_failure` names the old and new label. `RESUME` waits for the changes
-staged before the relabel to drain and rebuilds the target from the source,
-from empty for a target keyed by an enum source key
-([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)).
-Adding a value (`ADD VALUE`) changes no label and pauses nothing.
-
-Re-typing a column from one enum to another (`ALTER COLUMN … TYPE other_enum
-USING …`) pauses every definition that reads it the same way, whatever the
-place: no value of the old enum is a value of the new one, so no label
-Trellis kept for the column casts to it. `RESUME` re-types each column
-Trellis created of the old enum without casting a value (a key column's rows
-are deleted first, since its old keys can't be expressed in the new type),
-and rebuilds from the source, so the target reads `backfilling` until it
-converges. A re-type from an enum to `text` keeps each label as a value and
-is handled as any other re-type.
+Renaming a value (`ALTER TYPE … RENAME VALUE`), or re-typing a column from
+one enum to another (`ALTER COLUMN … TYPE other_enum USING …`), pauses every
+definition that reads the column, whatever the place: passthrough, key,
+`GROUP BY`, `JOIN` column or an input to a calculated field. Trellis keeps
+values as label text (staged changes, held keys, a 1-1 ledger's keys), and
+that text no longer names a value of the type. `capture_failure` names the old
+and new label or type. `RESUME` rebuilds the target from the source, from
+empty for a target keyed by an enum source key, so it reads `backfilling`
+until it converges. Adding a value (`ADD VALUE`) changes no label and pauses
+nothing. How the pass finds each and what `RESUME` waits for is
+[capture drift](staging-and-claiming/capture-drift.md#an-enum-value-relabelled).
+A re-type from an enum to `text` keeps each label as a value and is handled as
+any other re-type.
 
 ## `MIN` and `MAX`
 

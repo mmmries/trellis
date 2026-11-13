@@ -107,7 +107,7 @@ partition correction engine serves is corrected for that leaf alone
 ([ADR-0017](decisions/0017-partitioned-sources.md)); any other reader is
 re-read. Capture triggers disabled, dropped or recreated outside Trellis, and
 a database restored from a logical dump, pause the readers rather than re-read them
-([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)).
+([capture drift](staging-and-claiming/capture-drift.md#capture-changed-outside-trellis)).
 [`request_backfill`](operations.md#request_backfill) asks for the same re-read,
 repaired in the transaction that makes the call: each reader moves
 `live -> backfilling` and keeps applying while its

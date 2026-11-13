@@ -27,7 +27,7 @@ a row says so.
 |---|---|---|
 | (no `capture_failure`, and no `backfill_failure`) | An operator ran `PAUSE TRANSFORM` | `RESUME` when you're ready |
 | (no `capture_failure`; the error is on `backfill_failure`) | Its build kept failing in a way no retry gets past: a chunk failure that is neither transient nor narrowed to a key, on its fifth charged attempt, or an aggregate's build, which can't be narrowed to a key ([A build that keeps failing](observability.md#a-build-that-keeps-failing)) | Fix what the error names, then `RESUME` |
-| `column <columns> of <table>, which this definition reads, was renamed or dropped` | A source column it reads was renamed or dropped; capture now leaves it out ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)). The staging worker drops the reason once the column is back | Restore the column, then `RESUME`; or `DROP TRANSFORM` and define it again |
+| `column <columns> of <table>, which this definition reads, was renamed or dropped` | A source column it reads was renamed or dropped; capture now leaves it out ([capture drift](staging-and-claiming/capture-drift.md#a-renamed-or-dropped-column)). The staging worker drops the reason once the column is back | Restore the column, then `RESUME`; or `DROP TRANSFORM` and define it again |
 | `the primary key of <table> changed from (<columns>) to (<columns>)` | Its source's primary key was redefined, or another definition's resume re-recorded the table's key while this one ran. The staging worker drops the reason once the key is put back | `RESUME`, which rebuilds it over the new key, re-keying a 1-1 target in place first ([`PAUSE` and `RESUME`](#pause-and-resume)) |
 | `no valid unique index backs KEY (<columns>) on <table> any more` | The unique index backing a declared `KEY (…)` was dropped or made invalid, so the table can take two rows with one key. The staging worker drops the reason once an index backs it | Create the index the message names (build a replacement before dropping the old one), then `RESUME`. On a partitioned table, re-run `ALTER INDEX … ATTACH PARTITION` for a repaired leaf's index |
 | `no valid index on <table> has led with (<columns>) in that order for 5 minutes` | A `MIN`/`MAX` field's probe index was missing on every staging worker pass for 5 minutes ([`extreme_index_gaps`](status-reference.md#extreme_index_gaps)). The staging worker drops the reason once the index exists | Create the index the message names, then `RESUME` |
@@ -40,8 +40,8 @@ a row says so.
 | `<table> is replicated into by logical-replication subscription <subscription>` | A subscription replicates into a table it reads, and capture never sees the changes its apply worker applies | Stop replicating into the table, or drop the subscription, then `RESUME` |
 | `<table> is a partitioned table`, `<table> became a partition of <parent>`, or `… inherits from …` | A captured plain table joined a partition or inheritance hierarchy | Make it a plain table again, then `RESUME` |
 | `partitioned table <table> …` | A partitioned source stopped meeting the shape define accepts: its partition-key column, the leaf limit, the server version | Make the tree comply ([the refusal table](transforms.md#supported-sources-and-targets)), then `RESUME` |
-| `enum value '<old>' of type <type> was renamed to '<new>'`, or `column "<column>" of <table>, which this definition reads, changed type from enum <type> to enum <type>` | `ALTER TYPE … RENAME VALUE`, or a re-type to another enum, on a column it reads: the changes it staged and the keys it holds name the old label ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)). Every definition reading a column of the type pauses | `RESUME`, which waits for the changes staged before the relabel to drain, then rebuilds the target from the source |
-| `Trellis's capture of <table> was changed outside Trellis: …` | A capture trigger is gone, was dropped and created again, is disabled, is enabled in `ORIGIN` or `REPLICA` mode, or was altered; a capture function was replaced; or the table, or a partitioned root, was dropped and created again or swapped in by renames (on a partitioned source's node, "(on `<node>`)" follows each finding). Changes made meanwhile may be missing ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)). Its `kind` is `disruption` | Put the table back if it was a mistake, then `RESUME`, which reinstalls capture and rebuilds |
+| `enum value '<old>' of type <type> was renamed to '<new>'`, or `column "<column>" of <table>, which this definition reads, changed type from enum <type> to enum <type>` | `ALTER TYPE … RENAME VALUE`, or a re-type to another enum, on a column it reads: the changes it staged and the keys it holds name the old label ([capture drift](staging-and-claiming/capture-drift.md#an-enum-value-relabelled)). Every definition reading a column of the type pauses | `RESUME`, which waits for the changes staged before the relabel to drain, then rebuilds the target from the source |
+| `Trellis's capture of <table> was changed outside Trellis: …` | A capture trigger is gone, was dropped and created again, is disabled, is enabled in `ORIGIN` or `REPLICA` mode, or was altered; a capture function was replaced; or the table, or a partitioned root, was dropped and created again or swapped in by renames (on a partitioned source's node, "(on `<node>`)" follows each finding). Changes made meanwhile may be missing ([capture drift](staging-and-claiming/capture-drift.md#capture-changed-outside-trellis)). Its `kind` is `disruption` | Put the table back if it was a mistake, then `RESUME`, which reinstalls capture and rebuilds |
 | `the table <table> no longer exists at that name` | The table was dropped, renamed away, moved to another schema, or replaced by something that isn't a table. Its `kind` is `disruption` | Put a table there again, then `RESUME`, which re-validates against it (it refuses while the table is missing) |
 | `the database was restored from a logical dump` | Every definition, whatever its kind and source, pauses: the ordering state the dump brought belongs to the original database ([ADR-0002](decisions/0002-async-data-flow.md), [ADR-0017](decisions/0017-partitioned-sources.md)). Its `kind` is `disruption` (`capture` on one already paused) | `RESUME` each definition, which resets that state and rebuilds it ([After a restore or an upgrade](#runbooks)) |
 | `transform <target> reads <upstream>, whose transform the restore of the schema dump stored paused` | A [schema dump](embedding.md#schema-dumps) restore stored its upstream paused | `RESUME` the upstream, then this one |
@@ -320,31 +320,25 @@ it can find is the "Detected by" column of
 
 A statement that rewrites a read column's values without firing a trigger
 makes the staging worker's next reconcile pass rebuild every transform
-applying from the table, pausing none. `ALTER COLUMN … SET EXPRESSION` on a
-stored generated column (PostgreSQL 17 and later) is one: the transforms come
-back with the values of the new expression, and need nothing from you. So is a
-same-type `ALTER COLUMN … TYPE … USING`, except in the shapes
-[known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)
-lists. The pass logs a `WARN` naming the table, the cause and
-the transforms it rebuilt, and counts
+applying from the table, pausing none: a same-type `ALTER COLUMN … TYPE …
+USING`, or `ALTER COLUMN … SET EXPRESSION` on a stored generated column
+(PostgreSQL 17 and later), and nothing is needed from you
+([which changes, and which rebuild nothing](staging-and-claiming/capture-drift.md#what-rebuilds-what-pauses-and-whats-missed);
+the shapes it misses are in
+[known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)).
+The pass logs a `WARN` and counts
 [`capture_auto_rebuilds_total`](observability.md#metrics).
 
 Each rebuild is one full re-read of the table per transform applying from it,
 the same as a [`request_backfill`](#request_backfill) of the table: a few
 minutes at 100M rows (about 5 minutes with no writers, about 16 with eight
-writers at 2,000 writes a second, on our test machine). A `SET EXPRESSION`
-that changes no value rebuilds all the same: one to an expression written
-differently that computes the same values (`2 * img` for `img * 2`), or one
-that sets the expression the column already has.
-
-A rewrite that leaves every value as it was rebuilds nothing: `VACUUM FULL`,
-`CLUSTER`, and an `ADD COLUMN` with a volatile default such as
-`clock_timestamp()`. Neither does pg_repack, in table or index mode, on a
-source or a target: it keeps an equivalent valid index at every moment, so no
-index a transform relies on goes missing. Its table mode refuses an
-aggregate target whose group column can be `NULL` (the target has no primary
-key and no `NOT NULL` unique key); its index mode (`pg_repack -i`) works on
-it.
+writers at 2,000 writes a second, on our test machine). A rewrite that leaves
+every value as it was rebuilds nothing. Neither does pg_repack, in table or
+index mode, on a source or a target: it keeps an equivalent valid index at
+every moment, so no index a transform relies on goes missing. Its table mode
+refuses an aggregate target whose group column can be `NULL` (the target has
+no primary key and no `NOT NULL` unique key); its index mode (`pg_repack -i`)
+works on it.
 
 ## What a repair costs
 
@@ -364,18 +358,15 @@ it.
   Trellis's role or database, restart Trellis (the setting reaches only new
   connections) and `RESUME` again, or `DROP TRANSFORM` and define it again
   ([recommendations — `statement_timeout`](recommendations.md#statement_timeout)).
-* **A resume that re-types a target pauses the definitions chained off it,
-  and they rebuild one after another.** A definition reading the target whose
-  own columns were typed from the old type pauses, its `capture_failure`
-  naming the upstream resume, and the capture pass resumes it once the
-  upstream is `live` again. Its resume re-types its own target, which pauses
-  the next definition down, so a chain of depth k stays paused below the head
-  for k full rebuilds in a row. A definition resumed while an upstream isn't
-  `live` waits the same way, so a stack resumed at once rebuilds one level at
-  a time. A `PAUSE` of a waiting definition withdraws its resume. One whose
-  resume is refused once its upstream is live, because the schema changed
-  after the pause, stays paused with the refusal and isn't tried again:
-  resume it by hand once that's fixed, or drop it and define it again.
+* **A resume that re-types a target makes the definitions chained off it
+  rebuild one after another** ([paused definitions](#paused-definitions)), so
+  a chain of depth k stays paused below the head for k full rebuilds in a row.
+  A definition resumed while an upstream isn't `live` waits the same way, so a
+  stack resumed at once rebuilds one level at a time. A `PAUSE` of a waiting
+  definition withdraws its resume. One whose resume is refused once its
+  upstream is live, because the schema changed after the pause, stays paused
+  with the refusal and isn't tried again: resume it by hand once that's
+  fixed, or drop it and define it again.
 
 ## Encrypted connections
 

@@ -71,6 +71,7 @@ Each numbered step has its own document:
 | # | Stage | Document | The guarantee it owns |
 |---|---|---|---|
 | ① ② | Capture by triggers → staging | [01-capture-by-triggers.md](01-capture-by-triggers.md) | A change's ring rows commit in the writer's own transaction. |
+| ① ② | DDL that changes what capture sees | [capture-drift.md](capture-drift.md) | A column or trigger change is found and answered by a rebuild or a pause, never silently. |
 | — | The staging area's physical shape | [02-the-staging-ring.md](02-the-staging-ring.md) | Producers never block each other, and no hot-path row is ever updated. |
 | ③ | Sealing: making a batch immutable | [03-sealing-and-the-fence.md](03-sealing-and-the-fence.md) | Every staged row belongs to exactly one batch — none in two, none in zero. |
 | ④ | Claiming and the claim-time fold | [04-claiming-and-the-fold.md](04-claiming-and-the-fold.md) | Parallel workers partition a batch without a lock, and a key's changes collapse losslessly. |
@@ -111,7 +112,8 @@ high-volume ones be append-only and vacuum-free.
 
 [01](01-capture-by-triggers.md) → [02](02-the-staging-ring.md) →
 [03](03-sealing-and-the-fence.md) in order — the fence in 03 needs the append
-discipline in 02. [04](04-claiming-and-the-fold.md) and
+discipline in 02. [Capture drift](capture-drift.md) is 01's schema-change
+half. [04](04-claiming-and-the-fold.md) and
 [05](05-apply-and-exactly-once-deltas.md) are the worker half, read as a pair;
 [the group basis](group-basis.md) is 05's aggregate path, and
 [builds](builds.md) how a target is filled while it applies.
