@@ -145,7 +145,7 @@ lock and write, which also holds the rules for a build's bulk writes.
 |---|---|---|
 | **I0** | **One database.** Sources, the ring, every ledger, every group's state and every target live in one Postgres database, so one snapshot orders every commit Trellis will see. | Design premise, made exact by trigger capture: a ring row's transaction is the source commit's. |
 | **I1** | **Read after lock.** Every live read that feeds an absolute write happens after the writer holds the lock on the state it will write, and the snapshot it stores is taken in the same statement as the read; [ADR-0028](0028-locking-and-writing.md#i1-a-writer-reads-after-its-lock-under-read-committed) defines it. | In ADR-0028. |
-| **I2** | **Visibility-checked application.** A change is applied to a 1-1 row iff its transaction is not visible in the row's basis snapshot and its ring position is above the row's `applied_lsn`; a *side* (a group, a transaction) is applied to a group iff its transaction is not visible in the group's basis. Both refuse a change at or below the target's truncate floor ([Truncate](#truncate-ddl-drop)). Skipping is exact, never "maybe counted, re-derive". Ordering state belongs to this cluster, so a logical restore pauses every definition and its `RESUME` resets that state ([cleanup](../staging-and-claiming/06-cleanup-and-reclaim.md)). | In the interleaving experiment, skip-iff-visible alone fails three scenarios and stamping Apply's own snapshot two more, while visible-or-`applied_lsn` passes all seventeen; the group basis passes every one that applies to an aggregate on visibility alone, because its writes to a group commute. |
+| **I2** | **Visibility-checked application.** A change is applied to a 1-1 row iff its transaction is not visible in the row's basis snapshot and its ring position is above the row's `applied_lsn`; a *side* (a group, a transaction) is applied to a group iff its transaction is not visible in the group's basis (a group with no basis sees nothing); a group keeps no `applied_lsn`, because its sides commute and the page's claim and cursor, committed in the page's own transaction, apply each once. Both refuse a change at or below the target's truncate floor ([Truncate](#truncate-ddl-drop)). Skipping is exact, never "maybe counted, re-derive". Ordering state belongs to this cluster, so a logical restore pauses every definition and its `RESUME` resets that state ([cleanup](../staging-and-claiming/06-cleanup-and-reclaim.md)). | In the interleaving experiment, skip-iff-visible alone fails three scenarios and stamping Apply's own snapshot two more, while visible-or-`applied_lsn` passes all seventeen; the group basis passes every one that applies to an aggregate on visibility alone, because its writes to a group commute. |
 | **I3** | **Ordering state at the target's grain; group values are functions of sums.** A 1-1 row's ordering state is its ledger entry; a group's is its basis and stamp, and its partials are the sum of the sides applied since its last absolute write, which chain per row (R3). | In the interleaving experiment, eight workers creating the same groups at once, and a row passing through a group within one folded batch while that group rebuilds, both hold with groups as sums and no pre-lock or probe. |
 | **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry, and a zero group that has a basis, stay until the contiguous drained prefix passes their segment stamp ([Convergence and status](#convergence-and-status)). | In the interleaving experiment an older update resurrects a deleted row unless the tombstone is kept; in my group-basis model a GC that ignored the drained prefix was wrong in every soak run. |
 | **I5** | **One lock order, taken as one sorted batch (R7).** Every writer takes its locks in one order, each class in key order in one statement, never in a per-row loop. [ADR-0028](0028-locking-and-writing.md#i5-every-writer-takes-its-locks-in-one-order-each-class-in-one-sorted-statement) defines the order. | In ADR-0028. |
@@ -230,7 +230,8 @@ What it does there is one append. The mechanism is
   ordering argument.
 - **Cost to state.** On disk at 1,000 rows/commit with 16 writers the
   writer's throughput is 0.49x no-capture and the ring row is ~2.9x the
-  source row's WAL bytes. No synchronous capture can lose less than 25% at
+  source row's WAL bytes; the `WHEN` cut and the transition image a re-read
+  row carries for a group-basis reader are unmeasured. No synchronous capture can lose less than 25% at
   1,000 rows/commit, so the bar is: batched writes cost no more than one
   expression index's CPU per row; p99 commit latency at 1 row/commit rises by
   less than 2.5x on tmpfs and is unchanged on disk. A bulk-load pattern (drop
@@ -541,7 +542,8 @@ image-less change names.
   own ([per producer](../staging-and-claiming/group-basis.md#absolute-writes)).
 - A recompute holds its groups' locks for its whole `GROUP BY`: 1.3 ms for
   a 10k-row group, 9 ms at 100k and about 80 ms at 890k rows, with an index
-  whose leading column is the group key. A page of 5,000 changes to one
+  whose leading column is the group key; without one it scans the source,
+  and pages touching those groups wait for it. A page of 5,000 changes to one
   group holds the same lock for 18–28 ms.
 
 ### Readers see a group only while its row count is above 0
@@ -1029,7 +1031,7 @@ Each alternative below is recorded with the number that rejected it.
 - **I took every number above on one box.** The capture-throughput
   experiments and the first four ledger experiments ran on tmpfs; the
   disk-backed numbers are from a single NVMe with ~0.4 ms fsyncs, on a box
-  that was not always quiet. Within-session ratios stand; absolute numbers
+  that was not always quiet for the ledger experiments' disk tier. Within-session ratios stand; absolute numbers
   are that box's.
 
 ## More information

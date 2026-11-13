@@ -124,7 +124,8 @@ collects nothing of the definition from the build's start to its commit.
   ones, which is exact per group. A leaf of a tree that has changed since it
   was recorded is read through the root, and the change's own correction
   ([ADR-0017](../decisions/0017-partitioned-sources.md)) repairs what it
-  moved; a leaf whose routing text was never recorded halts the rebuild.
+  moved; a leaf whose routing text was never recorded halts the rebuild, so
+  no statement ever covers more than one leaf's groups.
 - **A resume** drops and recreates the hidden tables and writes every group
   again, keeping the target's rows.
 - **A rebuild of a `live` definition** (`request_backfill`, a capture

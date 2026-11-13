@@ -128,9 +128,9 @@ pub enum Plant {
     /// `r4_a_zero_group_with_a_basis_stays_until_the_prefix_passes_its_stamp`
     /// and `join_interleavings`'s `family13_…`.
     GbEarlyZeroGc,
-    /// ADR-0002, "A build or rebuild": a group-basis
-    /// rebuild reads the source's `GROUP BY` and takes its basis from a
-    /// snapshot taken before it locks its groups
+    /// ADR-0002, "An aggregate's build is one absolute write per
+    /// structure": a group-basis rebuild reads the source's `GROUP BY` and
+    /// takes its basis from a snapshot taken before it locks its groups
     /// (`staging::group_basis::rebuild`). A page that applies a change the
     /// snapshot didn't see and commits before the locks has its change
     /// overwritten by the absolute write, which never had it.
