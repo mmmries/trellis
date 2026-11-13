@@ -79,6 +79,7 @@ module Parity
     "Trellis::Railtie.instance_options" => "reads config.trellis.instances",
     "Trellis::Railtie.named_instance" => "an instance of config.trellis.instances",
     "Trellis::Railtie.migrate_all" => "`migrate` on each configured instance",
+    "Trellis::Railtie.release_check" => "Trellis::ReleaseCheck over the app's lockfile and migrations: git and files, no engine call",
     "Trellis::Railtie.with_handle" => "a handle of its own from config.trellis.connect (or a named instance), around a block",
     "Trellis::Migration.with_handle" => "Trellis::Railtie.with_handle, raising a migration's error"
   }.freeze

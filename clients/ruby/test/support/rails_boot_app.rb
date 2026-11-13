@@ -205,6 +205,72 @@ when "puma_hooks_named"
   Process.kill(:KILL, pid) if seen[:child].is_a?(String)
   Process.waitpid(pid)
   seen[:parent_connected] = [Trellis.connected?, reports.connected?]
+when "release_check"
+  # `rails trellis:release_check BASE=<ref>`, in an app that is a git
+  # repository of its own, whose second database keeps its migrations in a
+  # path of its own. The task has no `environment` prerequisite, so nothing
+  # here initializes the app.
+  require "rake"
+  require "open3"
+  require "stringio"
+  root = Dir.mktmpdir("release-check-app")
+  git = lambda do |*args|
+    out, status = Open3.capture2e("git", *args, chdir: root)
+    abort "git #{args.first} failed: #{out}" unless status.success?
+  end
+  lock = lambda do |version|
+    File.write(File.join(root, "Gemfile.lock"), "GEM\n  specs:\n    trellis-pg (#{version}-x86_64-linux)\n")
+  end
+  FileUtils.mkdir_p([File.join(root, "config"), File.join(root, "db/reports_migrate")])
+  File.write(File.join(root, "Gemfile"), "")
+  File.write(File.join(root, "config/database.yml"), <<~YAML)
+    production:
+      primary:
+        adapter: postgresql
+      reports:
+        adapter: postgresql
+        migrations_paths: db/reports_migrate
+  YAML
+  lock.call("0.2.0")
+  git.call("init", "--quiet", "--initial-branch=main")
+  git.call("add", "--all")
+  git.call("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "--message", "deployed")
+  File.write(File.join(root, "db/reports_migrate/20260201000000_define_order_totals.rb"),
+             "class DefineOrderTotals < ActiveRecord::Migration[8.1]\n  include Trellis::Migration\nend\n")
+  # As `bundle exec` has them in a real app: the app's own Gemfile and
+  # lockfile, not this suite's.
+  ENV["BUNDLE_GEMFILE"] = File.join(root, "Gemfile")
+  ENV["BUNDLE_LOCKFILE"] = File.join(root, "Gemfile.lock")
+  BootApp.config.root = root
+
+  Rake.with_application do |rake|
+    rake.init("rails", ["trellis:release_check"])
+    BootApp.load_tasks
+    task = Rake::Task["trellis:release_check"]
+    run = lambda do |base|
+      ENV["BASE"] = base
+      task.reenable
+      stdout = $stdout
+      stderr = $stderr
+      $stdout = StringIO.new
+      $stderr = StringIO.new
+      status = begin
+        task.invoke
+        0
+      rescue SystemExit => e
+        e.status
+      end
+      { status: status, stdout: $stdout.string, stderr: $stderr.string }
+    ensure
+      $stdout = stdout
+      $stderr = stderr
+    end
+    seen[:no_base] = run.call(nil)
+    seen[:unchanged_version] = run.call("main")
+    lock.call("0.3.0")
+    seen[:changed_version] = run.call("main")
+  end
+  seen[:initialized] = BootApp.initialized?
 else
   abort "unknown scenario: #{ARGV[0]}"
 end
