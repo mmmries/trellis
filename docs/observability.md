@@ -433,6 +433,11 @@ without them:
   It never stops the staging worker's pass: the other definitions' builds
   start. A start that fails transiently, or
   by losing its connection, is retried on the next pass instead.
+* **A schema the role can't use.** Each staging pass first halts the
+  definitions that read or write a table in a schema its role lacks `USAGE`
+  on, the same way, and leaves that schema's tables out of every step, their
+  capture as it is. The rest of the pass runs for every other table, a halted
+  `JOIN`'s tables in other schemas included.
 * **Resuming.** Fix the cause, then `RESUME TRANSFORM` each halted definition,
   in any order; each resume rebuilds that definition as for any pause, and
   clears its halt. A resume re-validates the definition as define would, so

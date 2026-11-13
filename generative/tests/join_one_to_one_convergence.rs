@@ -524,7 +524,7 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
         "it needs a page from before a TRUNCATE drained after the truncate's page, which \
          the barrier never lets the driver do (the pin claims it out of order by hand): \
          it fired in 9 of 24 cases and was caught in none; \
-         `join_one_to_one_interleavings` pins it",
+         `join_star_truncate` pins it",
     ),
 ];
 

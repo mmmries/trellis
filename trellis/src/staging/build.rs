@@ -689,26 +689,18 @@ async fn start(
     // The caller found any field awaiting capture ready, so it
     // applies from this commit, and the build's chunks write it.
     let dependents = release_awaiting_capture(&txn, &definition.def.target, None).await?;
-    txn.execute(
-        "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
-         select id, $2, fuse_rearmed_at, pg_current_xact_id() \
-         from transform_definitions where id = $1",
-        &[&definition.id, &chunk_queue::KIND_PLAN],
-    )
-    .await?;
-    if !empty {
+    let sweep = (!empty).then_some(chunk_queue::KIND_SWEEP);
+    for kind in std::iter::once(chunk_queue::KIND_PLAN).chain(sweep) {
         txn.execute(
             "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
              select id, $2, fuse_rearmed_at, pg_current_xact_id() \
              from transform_definitions where id = $1",
-            &[&definition.id, &chunk_queue::KIND_SWEEP],
+            &[&definition.id, &kind],
         )
         .await?;
     }
-    // The start's segment, last, so the share lock that keeps the
-    // active segment from sealing until this commits is held only for the
-    // commit. See this function's doc.
-    stamp_rebuild_seg(&txn, &[definition.id]).await?;
+    // The start's segment, last ([`BuildStarts::stamp`]).
+    BuildStarts(vec![definition.id]).stamp(&txn).await?;
     txn.commit().await?;
     crate::instance_log::info!(
         definition_id = definition.id,
@@ -787,17 +779,17 @@ pub(crate) async fn rebuildable(
 /// (`join_one_to_one`).
 ///
 /// The definition applies throughout, as it did before the call. The
-/// caller holds each definition's row `for update`, and calls
-/// [`stamp_rebuild_seg`] as the last statement before it commits.
+/// caller holds each definition's row `for update`, and stamps the returned
+/// [`BuildStarts`] last.
 ///
 /// From the commit the definition reads `backfilling`, so a caller that
 /// waits for `live` waits for the rebuild.
 pub(crate) async fn start_rebuilds(
     txn: &impl GenericClient,
-    ids: &[i64],
-) -> Result<(), tokio_postgres::Error> {
+    ids: Vec<i64>,
+) -> Result<BuildStarts, tokio_postgres::Error> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(BuildStarts::default());
     }
     let moved: Vec<i64> = txn
         .query(
@@ -842,63 +834,71 @@ pub(crate) async fn start_rebuilds(
             "transform status transition: re-derive rebuild started"
         );
     }
-    Ok(())
+    Ok(BuildStarts(ids))
 }
 
-/// Records the segment active at the commit of the rebuild
-/// [`start_rebuilds`] enqueued for `ids` as their `build_seg`, as
-/// [`start`] does for a build it starts. Last, so the share lock that keeps
-/// the active segment from sealing until the transaction commits is held
-/// only for the commit.
-///
-/// A 1-1 `JOIN` among `ids` has its pair's lock row taken `FOR UPDATE` first
-/// (ADR-0021's build start, as the #1375 model starts a build): a page holds
-/// it `FOR SHARE` from before it reads its key set until it commits, so the
-/// start waits out every page in flight on the definition, and a page that
-/// comes after reads the build's segment. Several are taken in the order a
-/// page takes them, by bare target name in byte order (the drain's
-/// `join1_targets`), so a page on two of them and the start never each hold
-/// one the other waits for.
-pub(crate) async fn stamp_rebuild_seg(
-    txn: &impl GenericClient,
-    ids: &[i64],
-) -> Result<(), tokio_postgres::Error> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let lock_rows = txn
-        .query(
-            &format!(
-                "select pg_catalog.quote_ident(n.nspname) || '.' \
-                        || pg_catalog.quote_ident(c.relname) \
-                 from transform_definitions d \
-                 join pg_catalog.pg_class c on c.relname = {lock} \
-                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-                 where d.id = any($1) \
-                   and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
-                                         where oid = 'transform_definitions'::regclass) \
-                 order by substr(d.target_table, strpos(d.target_table, '.') + 1) collate \"C\", \
-                          d.id",
-                lock = crate::defs::join_one_to_one::HiddenTable::TruncateLock.name_sql("d.id"),
-            ),
-            &[&ids],
-        )
-        .await?;
-    for row in lock_rows {
-        let lock: String = row.get(0);
+/// The definitions whose build a transaction started ([`start`],
+/// [`start_rebuilds`]), until [`BuildStarts::stamp`] records the segment
+/// active at its commit as their `build_seg`. A field build
+/// ([`start_field_build`]) stamps none: its definition applied every change
+/// before it started, and its chunks rewrite fields of rows that exist,
+/// never whether a key does.
+#[must_use = "stamp the started builds last, before the commit"]
+#[derive(Debug, Default)]
+pub(crate) struct BuildStarts(Vec<i64>);
+
+impl BuildStarts {
+    /// Records the segment active at the commit as the definitions'
+    /// `build_seg` (see [`start`]'s doc). Last, so the share lock that keeps
+    /// the active segment from sealing until the transaction commits is held
+    /// only for the commit.
+    ///
+    /// A 1-1 `JOIN` among them has its pair's lock row taken `FOR UPDATE` first
+    /// (ADR-0021's build start, as the #1375 model starts a build): a page holds
+    /// it `FOR SHARE` from before it reads its key set until it commits, so the
+    /// start waits out every page in flight on the definition, and a page that
+    /// comes after reads the build's segment. Several are taken in the order a
+    /// page takes them, by bare target name in byte order (the drain's
+    /// `join1_targets`), so a page on two of them and the start never each hold
+    /// one the other waits for.
+    pub(crate) async fn stamp(self, txn: &impl GenericClient) -> Result<(), tokio_postgres::Error> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        let lock_rows = txn
+            .query(
+                &format!(
+                    "select pg_catalog.quote_ident(n.nspname) || '.' \
+                            || pg_catalog.quote_ident(c.relname) \
+                     from transform_definitions d \
+                     join pg_catalog.pg_class c on c.relname = {lock} \
+                     join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                     where d.id = any($1) \
+                       and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
+                                             where oid = 'transform_definitions'::regclass) \
+                     order by substr(d.target_table, strpos(d.target_table, '.') + 1) collate \"C\", \
+                              d.id",
+                    lock = crate::defs::join_one_to_one::HiddenTable::TruncateLock.name_sql("d.id"),
+                ),
+                &[&self.0],
+            )
+            .await?;
+        for row in lock_rows {
+            let lock: String = row.get(0);
+            txn.execute(
+                &super::join::lock_row_sql(&lock, super::join::LockRowMode::Update),
+                &[],
+            )
+            .await?;
+        }
         txn.execute(
-            &super::join::lock_row_sql(&lock, super::join::LockRowMode::Update),
-            &[],
+            "update transform_definitions set build_seg = p.active_seq \
+             from (select active_seq from segment_pointer for share) p where id = any($1)",
+            &[&self.0],
         )
         .await?;
+        Ok(())
     }
-    txn.execute(
-        "update transform_definitions set build_seg = p.active_seq \
-         from (select active_seq from segment_pointer for share) p where id = any($1)",
-        &[&ids],
-    )
-    .await?;
-    Ok(())
 }
 
 /// Whether a definition read as `status` with `build` can take a field
@@ -2913,9 +2913,9 @@ async fn run_group_structure(
             .await
             .map_err(build_error)?
     } else {
-        Vec::new()
+        BuildStarts::default()
     };
-    stamp_rebuild_seg(&txn, &rebuilt).await?;
+    rebuilt.stamp(&txn).await?;
     txn.commit().await?;
     metrics::record_build_chunk(started.elapsed(), (written + deleted) as u64);
     Ok(Some((written, deleted)))

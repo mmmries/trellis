@@ -210,7 +210,7 @@ every pass retries and which clears once one succeeds. The staging worker
 records it in the catalog, so every process reports it. A definition an
 operator paused has none until one of these is seen.
 
-* **`kind`**: `halt` when the drain halted on it or its build couldn't start
+* **`kind`**: `halt` when the drain or the staging pass halted on it, or its build couldn't start
   ([observability — A halting failure](observability.md#a-halting-failure));
   `disruption` when Trellis's capture of a table it reads was changed outside
   Trellis, or the table is gone, or the database was restored from a logical

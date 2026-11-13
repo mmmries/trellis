@@ -243,8 +243,8 @@ pub enum Plant {
     /// the other table's copy, or of the same key, runs between the page's
     /// read of `M` and its target write.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
-    /// `an_a_page_holds_its_j_row_until_it_commits` and `join_star_families`'s
+    /// Pinned by `join_star_families`'s
+    /// `an_a_page_holds_its_j_row_until_it_commits` and
     /// `f3_an_a_move_races_a_b_update_of_its_new_key`. The R-entry lock
     /// (#1774) orders two mixed pages on one row without `J`, so
     /// `join_star_families`'s
@@ -257,7 +257,7 @@ pub enum Plant {
     ///
     /// A build chunk runs the same check on the entries it re-derives.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
+    /// Pinned by `join_star_families`'s
     /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`.
     /// In a chunk, `join_one_to_one_build`'s
     /// `c10_a_chunk_whose_entry_moved_off_its_key_set_retries` passes it: the
@@ -302,7 +302,7 @@ pub enum Plant {
     /// key set it locks, so a row moving off a key does so under no lock on
     /// it.
     ///
-    /// Pinned by `join_one_to_one_interleavings`'s
+    /// Pinned by `join_star_families`'s
     /// `a_row_moving_off_a_key_locks_the_key_it_leaves` (the `a` side) and
     /// `join_star_joined_families`'s
     /// `f4_a_joined_row_moving_off_a_key_locks_the_key_it_leaves` (the `b`

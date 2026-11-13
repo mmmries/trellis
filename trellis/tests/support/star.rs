@@ -722,7 +722,7 @@ pub async fn queued_or_finished<T>(d: &Driver, pid: i32, page: &drain_driver::Ru
 
 /// The end of a race whose second page didn't queue: it fails with what the
 /// page did, the target it left or the error it surfaced.
-async fn ran_through<T>(
+pub async fn ran_through<T>(
     d: &mut Driver,
     star: Star,
     result: Result<T, ApplyError>,

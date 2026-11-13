@@ -303,10 +303,10 @@ fn join_target(golden: &mut Golden, plan: &GroupTargetPlan) {
     golden.add("apply_sql images", &plan.apply_sql(Some(&images)));
     golden.add("upsert_hidden_build_sql", &plan.upsert_hidden_build_sql());
     golden.add("target_groups_sql", &plan.target_groups_sql());
-    golden.add("compare_held_sql", &plan.compare_held_sql(None));
+    golden.add("compare_held_sql", &plan.compare_held_sql(None, true));
     golden.add(
         "compare_held_sql images",
-        &plan.compare_held_sql(Some(&images)),
+        &plan.compare_held_sql(Some(&images), true),
     );
 }
 
@@ -383,7 +383,7 @@ pub(in crate::staging) fn structure(golden: &mut Golden, label: &str, plan: &Gro
     } else {
         golden.add(
             &format!("{label} compare_held_sql"),
-            &plan.compare_held_sql(None),
+            &plan.compare_held_sql(None, true),
         );
     }
     golden.add(&format!("{label} apply_sql"), &plan.apply_sql(None));

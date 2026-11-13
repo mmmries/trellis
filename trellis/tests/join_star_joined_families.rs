@@ -17,6 +17,9 @@
 //!   off a key locks the key it leaves; the two pages of a unique-key
 //!   hand-off race; an older Apply after a newer one; a new joined row's
 //!   insert and update applied out of order.
+//! - Joined pages otherwise: several changes to one row, two live `M`
+//!   entries on a key, Re-derives repairing uncaptured changes, a Re-derive
+//!   of a row with no entry, a page predating the build.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -388,5 +391,148 @@ async fn f15_a_new_joined_rows_insert_and_update_applied_out_of_order() {
                 star.name()
             );
         }
+    }
+}
+
+// ------------------------------------------------- joined pages, other
+
+/// A page with several changes to one joined row applies the newest, and
+/// its fan-out covers the key the row left as well as the one it ends on.
+#[tokio::test]
+async fn a_page_with_several_changes_to_one_joined_row_applies_the_newest() {
+    for shape in SHAPES {
+        let stars = shape.stars();
+        let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
+        for sql in [
+            "update {b} set k = 30, w = 150 where id = 1",
+            "update {b} set k = 50, w = 160 where id = 1",
+            "delete from {b} where id = 2",
+            "insert into {b} values (2, 10, 170, 'moved')",
+        ] {
+            star::write(&d, &shape.sql(sql)).await;
+        }
+        let batch = d.seal().await;
+        d.drain(batch, "w").await;
+        star::assert_oracle(&mut d, &stars).await;
+    }
+}
+
+/// Two live `M` entries on one key (a hand-off between joined rows applied
+/// out of order, #1397's): the recompute reads the one an Apply wrote over
+/// one only a build or Re-derive wrote (no applied position), as the #1375
+/// model orders them (`applied desc nulls last`). The second entry is
+/// written by hand, as a joined page would leave it.
+#[tokio::test]
+async fn the_newest_m_entry_on_a_key_is_the_applied_one() {
+    for shape in SHAPES {
+        let star = shape.stars()[0];
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        let m = star::m_table(&d, star, shape.at).await;
+        // Joined row 1 holds key 10 from the build, with no applied position.
+        d.ctl
+            .batch_execute(&format!(
+                "insert into {m} (__from_key, k, w, tag, __applied_lsn) \
+                 values ('9', 10, 5000, 'handed', '0/1')"
+            ))
+            .await
+            .expect("a second live M entry on key 10");
+        star::step(&mut d, "update public.a set x = 2 where id = 1").await;
+        assert_eq!(
+            total(&d, star, 1).await,
+            joined_total(shape, 2, 5000),
+            "{}",
+            star.name()
+        );
+    }
+}
+
+/// A Re-derive of joined rows repairs changes capture never saw: a `w`
+/// update on a key with an `a` row (its fan-out), a move onto a key, a
+/// delete, an insert onto a `NULL` key and one onto a key no `a` row has.
+#[tokio::test]
+async fn joined_rederives_repair_uncaptured_changes() {
+    for shape in SHAPES {
+        let stars = shape.stars();
+        let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
+        let b = shape.b();
+        for sql in [
+            "update {b} set w = 150 where id = 1",
+            "update {b} set k = 30, tag = 'thirty' where id = 3",
+            "delete from {b} where id = 2",
+            "insert into {b} values (4, null, 4000, 'none')",
+            "insert into {b} values (5, 50, 500, 'fifty')",
+        ] {
+            star::write_uncaptured(&d, &b, &shape.sql(sql)).await;
+        }
+        d.stage_recomputes(&b, &["1", "2", "3", "4", "5"]).await;
+        let batch = d.seal().await;
+        d.drain(batch, "rederive b").await;
+        star::assert_oracle(&mut d, &stars).await;
+    }
+}
+
+/// A Re-derive of a joined row with no `M` entry reads its live key before
+/// the `J` lock, so it commits on its first attempt, and its fan-out reaches
+/// the `a` row on the key.
+#[tokio::test]
+async fn a_joined_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            let b = shape.b();
+            star::write_uncaptured(
+                &d,
+                &b,
+                &shape.sql("insert into {b} values (4, 30, 300, 'thirty')"),
+            )
+            .await;
+            d.stage_recomputes(&b, &["4"]).await;
+            let batch = d.seal().await;
+            let moves = d.join_key_moves();
+            d.drain(batch, "rederive b").await;
+            assert_eq!(
+                d.join_key_moves(),
+                moves,
+                "{star:?}: no retry for a row the entry doesn't hold yet"
+            );
+            assert_eq!(
+                total(&d, star, 3).await,
+                joined_total(shape, 3, 300),
+                "{star:?}"
+            );
+            star::assert_oracle(&mut d, &[star]).await;
+        }
+    }
+}
+
+/// A page of joined-table changes whose segment predates the build
+/// re-derives its joined rows (the build-start rule), as a root page does:
+/// an update, a key move and a delete. Nothing pauses.
+#[tokio::test]
+async fn a_joined_page_that_predates_the_build_rederives() {
+    for shape in SHAPES {
+        let stars = shape.stars();
+        let mut d = star::start_unbuilt(&stars, A_ROWS, B_ROWS).await;
+        for sql in [
+            "update {b} set w = 111 where id = 1",
+            "update {b} set k = 30 where id = 3",
+            "delete from {b} where id = 2",
+        ] {
+            star::write(&d, &shape.sql(sql)).await;
+        }
+        trellis::staging::build::settle_builds(d.pool()).await;
+        star::assert_oracle(&mut d, &stars).await;
+        let status = d
+            .rows(
+                "select d.status::text, \
+                        (select f.error from capture_failures f where f.transform_id = d.id \
+                         order by f.error limit 1) \
+                 from transform_definitions d order by d.id",
+            )
+            .await;
+        assert!(
+            status.iter().all(|s| s.starts_with("(live,")),
+            "{shape:?}: {status:?}"
+        );
     }
 }

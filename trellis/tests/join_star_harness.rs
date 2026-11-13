@@ -9,7 +9,7 @@
 //! - Pins written once against "the joined table at `at`" and run at every
 //!   shape of [`SHAPES`]: the two-table JOIN and a star of three tables at
 //!   its last position.
-//!   - the build, then changes of `a` and of the table at `at`;
+//!   - the build, then changes of `a`, and changes of the table at `at`;
 //!   - C (#1375): a page on a build chunk's key queues behind the chunk;
 //!   - the chunked fan-out (#1405): a change past one chunk finishes in
 //!     chunks.
@@ -196,29 +196,78 @@ async fn every_star_builds_every_position() {
 
 // --------------------------------------------------------------------- pins
 
-/// The build fills the target, `R` and every `M` from the live tables, and
-/// changes of `a` and of the table at `at` apply: an insert, a non-key
-/// update, key moves onto and off a match and to `NULL`, a delete and a
-/// re-insert.
+/// The build fills the target, `R`, every `M` and `J` from the live tables,
+/// and changes of `a` apply: inserts on a matched key, an unmatched key and
+/// `NULL`, a non-key update, key moves onto and off a match, to `NULL` and
+/// from `NULL` onto a match, deletes and a re-insert of a deleted id.
 #[tokio::test]
-async fn the_build_and_changes_of_either_side_apply() {
+async fn the_build_fills_the_target_r_m_and_j_and_changes_of_a_apply() {
     for shape in shapes() {
         let stars = shape.stars();
         let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
         star::assert_oracle(&mut d, &stars).await;
+        let at = shape.at;
+        for star in &stars {
+            let name = star.name();
+            let rows = d.rows(&star.actual()).await;
+            match star.kind(at) {
+                Kind::Left => assert_eq!(rows.len(), 4, "{name}: LEFT keeps every a row"),
+                Kind::Inner => assert_eq!(rows.len(), 2, "{name}: INNER keeps the matched ones"),
+            }
+            let m = star::m_table(&d, *star, at).await;
+            let m = d.rows(&format!("select __from_key from {m}")).await;
+            assert_eq!(m.len(), 3, "{name}: {m:?}");
+            // `J` holds the non-null keys of both tables at `at`.
+            let id = star::definition_id(&d, *star).await;
+            let j = d
+                .rows(&format!(
+                    "select p{at}_k{at} from {}.join1_{id}_j where position = {at} order by 1",
+                    trellis::config::DEFAULT_SCHEMA
+                ))
+                .await;
+            assert_eq!(j, ["(10)", "(20)", "(30)", "(40)"], "{name}");
+        }
         for sql in [
             "insert into {a_ins} values (5, 10, 5, 'five'), (6, 99, 6, 'six'), \
              (7, null, 7, 'seven')",
             "update public.a set x = x + 10 where id = 1",
             "update public.a set {k} = 20 where id = 3",
+            "update public.a set {k} = 99 where id = 2",
             "update public.a set {k} = null where id = 1",
+            "update public.a set {k} = 40 where id = 4",
             "delete from public.a where id in (2, 5)",
             "insert into {a_ins} values (2, 10, 22, 'again')",
+        ] {
+            star::step(&mut d, &shape.sql(sql)).await;
+            star::assert_oracle(&mut d, &stars).await;
+        }
+    }
+}
+
+/// Changes of the table at `at` apply through `M` and the fan-out: an insert
+/// matching an `a` row, an update of a key with several `a` rows, a key move
+/// off and onto a key, a key to `NULL`, a delete and a re-insert.
+#[tokio::test]
+async fn changes_of_the_joined_table_apply() {
+    for shape in shapes() {
+        let stars = shape.stars();
+        let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
+        star::step(
+            &mut d,
+            &shape.sql("insert into {a_ins} values (5, 10, 5, 'five')"),
+        )
+        .await;
+        for sql in [
+            // Row 3's key 30 had no match.
             "insert into {b} values (4, 30, 300, 'thirty')",
+            // Rows 1 and 5 are on key 10.
             "update {b} set w = 111, tag = 'TEN' where id = 1",
+            // Off key 20 (row 2 loses its match), then onto it.
             "update {b} set k = 99 where id = 2",
+            "update {b} set k = 20 where id = 3",
             "update {b} set k = null where id = 4",
             "delete from {b} where id = 1",
+            "insert into {b} values (1, 10, 1000, 'back')",
         ] {
             star::step(&mut d, &shape.sql(sql)).await;
             star::assert_oracle(&mut d, &stars).await;
