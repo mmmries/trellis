@@ -247,7 +247,8 @@ template: a small TCP listener alongside the live pipeline answering each
 request with the rendered registry. The bindings expose the same render as
 `Trellis.Metrics.render_prometheus/0` (Elixir) and
 `Trellis::Metrics.render_prometheus` (Ruby), each for a route the host app
-already serves.
+already serves; Ruby also ships `Trellis::Metrics::RackApp`, a mountable Rack
+route.
 
 ### Retention: left to Prometheus, not Trellis
 
@@ -277,13 +278,16 @@ separates their lines in one stream. It is an event field rather than a span,
 so it reaches every subscriber, including ones that record events only
 (Elixir's `Logger`), and it adds no span to an OpenTelemetry trace.
 
-The crate never installs a subscriber; the embedder does. The Elixir binding
-does it on the host's behalf: `Trellis.LogBridge` installs one at application
-start that forwards events (not spans) to `Logger`. A host can opt out, but
-composing its own subscriber means building its own NIF around the crate:
-the global subscriber belongs to the copy of `tracing` linked into the NIF
-library, so one installed from another library never sees the engine's
-events (`clients/elixir/README.md`).
+The crate never installs a subscriber; the embedder does. The bindings do it
+on the host's behalf. Elixir's `Trellis.LogBridge` installs one at application
+start that forwards events (not spans) to `Logger`. Ruby's
+`Trellis::LogBridge` does the same once the app sets `Trellis.logger`, which
+the Rails integration sets to `Rails.logger`
+(`clients/ruby/README.md`). A host can opt out, but composing its own
+subscriber means building its own native library around the crate: the global
+subscriber belongs to the copy of `tracing` linked into that library, so one
+installed from another library never sees the engine's events
+(`clients/elixir/README.md`).
 
 ## Stops and waits
 

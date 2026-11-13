@@ -9,11 +9,14 @@
 //! matrix runs `RANGE`, `LIST` and `HASH` (and a `DEFAULT` beside the first
 //! two) over every accepted key type, about 50,000 comparisons per kind and
 //! type pair per run, with a seeded generator so a failure is the same
-//! failure next time.
+//! failure next time. Each comparison runs under the pinned settings and
+//! under the pinned path followed by a Trellis session's, which a leaf's
+//! write-once build routes under.
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
-use trellis::capture::partitions::{Key, pinned_settings};
+use trellis::capture::partitions::{Key, pinned_settings, pinned_then_session_path};
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::partition_correction::{Route, RouteColumn, route_predicate};
 
 async fn connect(cluster: &TestCluster) -> (testkit::TestDatabase, Client) {
@@ -236,8 +239,10 @@ async fn constraint_text(client: &mut Client, oid: i64) -> Option<String> {
 }
 
 /// The rows of `table` for which the route's verdict differs from the
-/// truth, which is "the row is in `leaf`": evaluated under the pinned
-/// settings, as the engine evaluates it.
+/// truth, which is "the row is in `leaf`", summed over the two settings the
+/// engine evaluates it under: the pinned settings, and the pinned path
+/// followed by a Trellis session's (a leaf's write-once build,
+/// `group_basis`'s `set_leaf_settings`).
 async fn disagreements(
     client: &mut Client,
     table: &str,
@@ -246,19 +251,28 @@ async fn disagreements(
     columns: &[RouteColumn],
 ) -> Result<i64, tokio_postgres::Error> {
     let predicate = route_predicate(route, columns);
-    let txn = client.transaction().await?;
-    txn.batch_execute(&pinned_settings()).await?;
-    let row = txn
-        .query_one(
-            &format!(
-                "select count(*) from public.{table} m \
-                 where ({predicate}) is distinct from (m.tableoid = '{leaf}'::regclass)"
-            ),
-            &[],
-        )
-        .await?;
-    txn.commit().await?;
-    Ok(row.get(0))
+    let combined = format!(
+        "set local search_path = {}",
+        pinned_then_session_path(DEFAULT_SCHEMA)
+    );
+    let mut wrong = 0;
+    for path in ["", combined.as_str()] {
+        let txn = client.transaction().await?;
+        txn.batch_execute(&pinned_settings()).await?;
+        txn.batch_execute(path).await?;
+        let row = txn
+            .query_one(
+                &format!(
+                    "select count(*) from public.{table} m \
+                     where ({predicate}) is distinct from (m.tableoid = '{leaf}'::regclass)"
+                ),
+                &[],
+            )
+            .await?;
+        txn.commit().await?;
+        wrong += row.get::<_, i64>(0);
+    }
+    Ok(wrong)
 }
 
 async fn count_in(client: &Client, leaf: &str) -> i64 {

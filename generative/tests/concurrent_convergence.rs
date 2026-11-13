@@ -1802,8 +1802,20 @@ const NO_ONE_TO_ONE_JOIN: &str = "it breaks the 1-1 JOIN path, which only the 1-
 const NO_CHAIN: &str = "it breaks a target's feed to a definition reading it, which only \
      the chained-reader tier (join_chained_convergence.rs) draws";
 
-/// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates and the
-/// `JOIN` plants, with their reasons.
+/// The plant of a fresh build's write-once form over a partitioned
+/// source's leaf (#1939), which no concurrent tier reaches: their tables are
+/// unpartitioned, and the partitioned properties run no sweep.
+/// `partition_group_basis_build`'s
+/// `a_leaf_build_leaves_another_leafs_groups_alone` gates it, checking a
+/// partitioned definition between its leaves' transactions.
+const LEAF_UNREACHED: (&str, &str) = (
+    "gb_build_leaf_unrouted",
+    "it breaks a fresh build over a partitioned source's leaf, and no sweep tier draws a \
+     partitioned source; its deterministic pin gates it",
+);
+
+/// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates, the
+/// `JOIN` plants and [`LEAF_UNREACHED`], with their reasons.
 fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut out: Vec<(&'static str, &'static str)> = listed.to_vec();
@@ -1815,6 +1827,7 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             plant_sweep::NO_EXTREMES,
         ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
+        .chain(std::iter::once(LEAF_UNREACHED))
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
             out.push((plant, why));

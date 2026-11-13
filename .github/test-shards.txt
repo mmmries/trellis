@@ -101,6 +101,7 @@ test:group_basis_numeric_nan 5.7
 test:cast_aliases 5.7
 test:retype_invalidates_reader 5.5
 test:group_basis_chained 5.4
+test:partition_group_basis_build 5.0
 test:join_star_schema_changes 4.9
 bin:benchmark 4.8
 test:defs_install_definition 4.8

@@ -132,7 +132,8 @@ Nothing in the binding uses it.
   stays `:queued`.
 - `Trellis::Metrics.render_prometheus`: the process-wide metrics registry as
   Prometheus text, for a `/metrics` route the app already serves (the
-  binding opens no port; see [Metrics](#metrics)). It needs no handle.
+  binding opens no port; `Trellis::Metrics::RackApp` is a mountable route;
+  see [Metrics](#metrics)). It needs no handle.
 
 ```ruby
 require "trellis/pg"
@@ -212,21 +213,98 @@ Prometheus's text format. Every series carries a `trellis_instance` label
 shuts down. The metrics themselves are listed in
 [`docs/observability.md`](../../docs/observability.md).
 
-The binding opens no port, so serve the text from a route of the app's own:
+The binding opens no port. `Trellis::Metrics::RackApp` is a Rack app that
+serves the text, so a Rails app mounts it:
 
 ```ruby
 # config/routes.rb
-get "/metrics", to: proc {
-  [200, { "content-type" => "text/plain; version=0.0.4" }, [Trellis::Metrics.render_prometheus]]
-}
+mount Trellis::Metrics::RackApp, at: "/metrics/trellis"
 ```
 
-Under a forking server each worker process has its own registry, holding
-only its own handles' series, so Prometheus scrapes each worker (or the
-worker handle, `staging: true`, runs in a process of its own that it
-scrapes). A process forked while its parent had a handle running can't
-render the registry, as it can't connect: it raises
-`Trellis::ForkedHandleError` (see [Forking servers](#forking-servers)).
+It answers `GET` and `HEAD` and needs no Rack gem; in a `config.ru` it is
+`map("/metrics/trellis") { run Trellis::Metrics::RackApp }`. The mount is
+unauthenticated, like any Prometheus target, and names the database, catalog
+schema and transforms: keep it off a public port.
+
+**Scrape the process that runs the worker.** The `ring_*` and
+`staging_segments` gauges are set only in the process whose `staging: true`
+handle leads (one per instance; the others stand by), and the latency
+histograms and `changes_applied_total` only in processes with drain threads.
+A web process with neither holds `trellis_instance_up` and none of these. The
+gem can't yet serve a worker that runs no web server (`bin/rails runner`, a
+script). Under a forking server each worker process has its own registry, so
+Prometheus scrapes each. A process forked while its parent had a handle
+running can't render the registry: it raises `Trellis::ForkedHandleError`
+(see [Forking servers](#forking-servers)).
+
+An app with an exporter of its own (`prometheus-client`,
+`prometheus_exporter`, Yabeda) can serve that body followed by
+`Trellis::Metrics.render_prometheus` from one route; the `trellis_` names
+don't collide.
+
+### Logs
+
+The engine logs through `tracing` and installs no subscriber of its own, so
+nothing reaches Ruby until the app sets a logger. A Ruby thread then drains
+the engine's lines into it every 100 ms (`Trellis::LogBridge`); the engine
+never calls into the VM:
+
+```ruby
+Trellis.logger = Logger.new($stderr) # before Trellis.connect, to catch connect's lines
+Trellis.log_level = :info            # optional: default is the logger's level now
+```
+
+In a Rails app the Railtie does this with `Rails.logger`; see
+[Logs in Rails](#logs-in-rails). Each line is one `Logger` call: the engine's
+level as the severity, its Rust module as the progname,
+and the event's text, ending in its fields. Every line names its instance as
+`trellis_instance=<database>/<catalog schema>`, so instances in one process
+stay apart. The lines the docs promise (a halt, a standby, a takeover's
+migrations, an automatic rebuild) are among them
+([observability](../../docs/observability.md#logs-and-traces)).
+
+The engine drops events above the level before formatting them, so a later
+`Logger#level=` can make the logger stricter but can't bring back a level the
+bridge filtered: use `Trellis.log_level=`. A line can be dropped, and logging
+never blocks or crashes the engine: the queue holds 10,000 lines, and when it
+overflows the next drain logs one warning with the count. At exit the thread
+stops after the instances shut down and logs what is left.
+
+The thread doesn't survive `fork`. After the usual hooks (see
+[Forking servers](#forking-servers)), it starts again, with an empty queue,
+when a handle connects in the child.
+
+### Logs
+
+The engine logs through `tracing` and installs no subscriber of its own, so
+nothing reaches Ruby until the app sets a logger. A Ruby thread then drains
+the engine's lines into it every 100 ms (`Trellis::LogBridge`); the engine
+never calls into the VM:
+
+```ruby
+Trellis.logger = Logger.new($stderr) # before Trellis.connect, to catch connect's lines
+Trellis.log_level = :info            # optional: default is the logger's level now
+```
+
+In a Rails app the Railtie does this with `Rails.logger`; see
+[Logs in Rails](#logs-in-rails). Each line is one `Logger` call: the engine's
+level as the severity, its Rust module as the progname,
+and the event's text, ending in its fields. Every line names its instance as
+`trellis_instance=<database>/<catalog schema>`, so instances in one process
+stay apart. The lines the docs promise (a halt, a standby, a takeover's
+migrations, an automatic rebuild) are among them
+([observability](../../docs/observability.md#logs-and-traces)).
+
+The engine drops events above the level before formatting them, so a later
+`Logger#level=` can make the logger stricter but can't bring back a level the
+bridge filtered: use `Trellis.log_level=`. A line can be dropped, and logging
+never blocks or crashes the engine: the queue holds 10,000 lines, and when it
+overflows the next drain logs one warning with the count. At exit the thread
+stops after the instances shut down and logs what is left.
+
+The thread doesn't survive `fork`. After the usual hooks (see
+[Forking servers](#forking-servers)), it starts again, with an empty queue,
+when a handle connects in the child.
 
 ### Several instances
 
@@ -376,6 +454,20 @@ With neither set, the Railtie does nothing. Two exceptions:
 
 `config.trellis.off_in` turns all of this off in the environments it names
 (the `test` environment, by default): see [Testing](#testing).
+
+### Logs in Rails
+
+The Railtie sends the engine's log lines to `Rails.logger`, at its level, as
+the app boots:
+
+```ruby
+config.trellis.log_level = :info   # :debug, :info, :warn or :error; default: Rails.logger's level
+config.trellis.log_bridge = false  # forward nothing
+```
+
+A `Trellis.logger =` in a `config/initializers` file replaces it. In an
+environment `config.trellis.off_in` names, nothing connects and the bridge
+isn't started.
 
 ### Forking servers
 
@@ -774,7 +866,7 @@ How the restore works, and what it refuses, is in
 ## Layout
 
 - `lib/`: the `Trellis` module and `Trellis::Instance`, its error classes and its `Data` values,
-  `Trellis::Metrics`,
+  `Trellis::Metrics`, `Trellis::LogBridge`,
   the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`,
   `trellis/target.rb`),
   loaded only in an app that has Rails, and the test helpers

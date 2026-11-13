@@ -61,17 +61,17 @@ use magnus::{
 };
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
-    DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, PlainApplied,
-    PlainBackfillFailure, PlainBelowCatalogFloor, PlainCaptureFailure, PlainCaptureWait,
-    PlainConfig, PlainCorrectingNode, PlainDefinitionStatus, PlainDefinitionSummary,
-    PlainDivergence, PlainDrainFailure, PlainError, PlainExtremeIndexGap, PlainFanOutWarning,
-    PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus, PlainOtherProcess,
-    PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage,
-    PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover,
-    SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names,
-    decode_cursor, decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, LOG_LEVELS,
+    PlainApplied, PlainBackfillFailure, PlainBelowCatalogFloor, PlainCaptureFailure,
+    PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
+    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainExtremeIndexGap,
+    PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
+    PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
+    PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
+    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
+    index_role_names, quarantine_state_names, require_transform_statement, self_check_mode,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -864,6 +864,7 @@ fn symbol_words() -> impl Iterator<Item = &'static str> {
         .chain(JOIN_BUILD_STEPS)
         .chain(JOIN_SIDES)
         .chain(JOIN_SIDE_PARTS)
+        .chain(LOG_LEVELS)
 }
 
 /// A hash from symbol keys to `fields`' values: the shape every record
@@ -1447,6 +1448,71 @@ fn render_prometheus(ruby: &Ruby) -> Result<String, Error> {
     Ok(trellis::Metrics::new().render_prometheus())
 }
 
+/// Every level symbol `take_log_records` can return.
+fn log_levels(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, LOG_LEVELS)
+}
+
+/// Installs `trellis-embed`'s log bridge as the global `tracing` subscriber
+/// of this library's own copy of `tracing`, if no call has yet, and sets the
+/// most verbose level it forwards (one of `trellis_embed::LOG_LEVEL_FILTERS`).
+/// Raises `Trellis::ConflictError` if another subscriber was installed
+/// first, and `Trellis::ValidationError` for an unknown level.
+///
+/// The bridge is pull-based: the engine's threads only append to its queue,
+/// and `take_log_records`, called from a Ruby thread, drains it. Nothing here
+/// calls into the VM from an engine thread. Installing registers `tracing`
+/// callsites behind locks the engine's threads take, so a process forked
+/// while its parent had an engine running raises `Trellis::ForkedHandleError`,
+/// as [`connect`] does.
+fn install_log_bridge(ruby: &Ruby, level: String) -> Result<(), Error> {
+    engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
+    let bridge = trellis_embed::install_log_bridge().map_err(|err| raise(ruby, err))?;
+    bridge.set_max_level(&level).map_err(|err| raise(ruby, err))
+}
+
+/// Changes the most verbose level the installed bridge forwards. Raises
+/// `Trellis::ValidationError` for an unknown level, or if the bridge isn't
+/// installed.
+fn set_log_level(ruby: &Ruby, level: String) -> Result<(), Error> {
+    engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
+    let bridge = trellis_embed::installed_log_bridge().ok_or_else(|| {
+        raise(
+            ruby,
+            PlainError::new(
+                ErrorCode::Validation,
+                "the log bridge is not installed: install it first",
+            ),
+        )
+    })?;
+    bridge.set_max_level(&level).map_err(|err| raise(ruby, err))
+}
+
+/// Up to `max` queued log records, oldest first, as `[level, target,
+/// message]` arrays (`level` a symbol), and how many were dropped on a full
+/// queue since the last call: `[records, dropped]`. Empty when the bridge
+/// isn't installed. It never waits, and a call is short, so it keeps the GVL.
+///
+/// A process forked while its parent had an engine running may have inherited
+/// the queue mid-push, so it raises `Trellis::ForkedHandleError` rather than
+/// risk a hang.
+fn take_log_records(ruby: &Ruby, max: usize) -> Result<(RArray, u64), Error> {
+    engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
+    let Some(bridge) = trellis_embed::installed_log_bridge() else {
+        return Ok((ruby.ary_new(), 0));
+    };
+    let batch = bridge.take(max);
+    let records = ruby.ary_new_capa(batch.records.len());
+    for record in batch.records {
+        let fields = ruby.ary_new_capa(3);
+        fields.push(word_symbol(ruby, record.level))?;
+        fields.push(ruby.str_new(&record.target))?;
+        fields.push(ruby.str_new(&record.message))?;
+        records.push(fields)?;
+    }
+    Ok((records, batch.dropped))
+}
+
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     // Interns every symbol a result can carry up front, from the closed
@@ -1472,6 +1538,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("join_side_parts", function!(join_side_parts, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
     native.define_module_function("render_prometheus", function!(render_prometheus, 0))?;
+    native.define_module_function("log_levels", function!(log_levels, 0))?;
+    native.define_module_function("install_log_bridge", function!(install_log_bridge, 1))?;
+    native.define_module_function("set_log_level", function!(set_log_level, 1))?;
+    native.define_module_function("take_log_records", function!(take_log_records, 1))?;
 
     let handle = native.define_class("Handle", ruby.class_object())?;
     handle.define_method("owner_pid", method!(Handle::owner_pid, 0))?;
