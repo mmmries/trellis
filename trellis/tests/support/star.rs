@@ -296,12 +296,6 @@ impl Star {
 
     /// The definition text.
     pub fn definition(self) -> String {
-        assert_eq!(self.kinds.len(), self.shape.positions, "{self:?}");
-        let joins: Vec<String> = self
-            .shape
-            .all()
-            .map(|p| format!("{} public.b{p} ON a.k{p} = b{p}.k", self.kind(p).word()))
-            .collect();
         let total: Vec<String> = self
             .shape
             .all()
@@ -312,18 +306,32 @@ impl Star {
             .all()
             .map(|p| format!(", b{p}.tag AS tag{p}"))
             .collect();
-        format!(
-            "TRANSFORM {} FROM public.a {} SELECT a.x{} AS total{}, a.y AS y",
-            self.name(),
-            joins.join(" "),
+        self.definition_with(&format!(
+            "a.x{} AS total{}, a.y AS y",
             total.concat(),
             tags.concat()
+        ))
+    }
+
+    /// The definition text with its own `SELECT` list: the star's `FROM` and
+    /// joins, then `select`.
+    pub fn definition_with(self, select: &str) -> String {
+        assert_eq!(self.kinds.len(), self.shape.positions, "{self:?}");
+        let joins: Vec<String> = self
+            .shape
+            .all()
+            .map(|p| format!("{} public.b{p} ON a.k{p} = b{p}.k", self.kind(p).word()))
+            .collect();
+        format!(
+            "TRANSFORM {} FROM public.a {} SELECT {select}",
+            self.name(),
+            joins.join(" ")
         )
     }
 
-    /// The target's rows as the live multi-join computes them, in the
-    /// target's column order.
-    pub fn expected(self) -> String {
+    /// The joins of the live query, each table aliased by its own name:
+    /// `left join public.b1 b1 on a.k1 = b1.k ...`.
+    pub fn live_joins(self) -> String {
         let joins: Vec<String> = self
             .shape
             .all()
@@ -334,6 +342,12 @@ impl Star {
                 )
             })
             .collect();
+        joins.join(" ")
+    }
+
+    /// The target's rows as the live multi-join computes them, in the
+    /// target's column order.
+    pub fn expected(self) -> String {
         let total: Vec<String> = self
             .shape
             .all()
@@ -344,7 +358,7 @@ impl Star {
             "select a.id, a.x{} as total{}, a.y from public.a a {}",
             total.concat(),
             tags.concat(),
-            joins.join(" ")
+            self.live_joins()
         )
     }
 
