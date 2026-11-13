@@ -697,18 +697,15 @@ any target has.
 ### Partitioned sources
 
 A declaratively partitioned table (`RANGE`, `LIST` or `HASH`, at any depth,
-with or without a `DEFAULT`) can be a source on PostgreSQL 15 or later, with up
-to 1,000 leaves. It can be the `FROM` of an aggregate, or either table of a
-`JOIN`. A target is always a plain table. Define accepts it when the group key
-holds every partition-key column at every level: an aggregate's `GROUP BY`, or
-a `JOIN` table's `GROUP BY` and `ON` columns from that table. Each group then
-lives in exactly one partition, so a change to the tree touches only the
-groups that route to one partition, and the catalog says which those are. A
-fact table partitioned on the column it joins by needs nothing more in its
-`GROUP BY`, while one partitioned on its own id is refused. Everything else is
-refused at define, or pauses a definition later, as the
-[refusal table](#refusals) lists
-([ADR-0017](decisions/0017-partitioned-sources.md)).
+with or without a `DEFAULT`) can be the `FROM` of an aggregate or either table
+of a `JOIN`, on PostgreSQL 15 or later, with up to 1,000 leaves, when the group
+key holds every partition-key column at every level: an aggregate's
+`GROUP BY`, or a `JOIN` table's `GROUP BY` and `ON` columns from that table.
+Each group then lives in one partition, so a fact table partitioned on the
+column it joins by needs nothing more, while one partitioned on its own id is
+refused ([the refusal table](#refusals),
+[ADR-0017](decisions/0017-partitioned-sources.md)). A target is always a plain
+table.
 
 ```text
 -- order_line_items is partitioned BY HASH (order_id)
@@ -719,39 +716,10 @@ SELECT
   SUM(amount) AS total_amount
 ```
 
-Every partition carries the capture triggers, so a write named on the parent or
-on any partition is counted once, and an `UPDATE` through the parent that moves
-a row to another partition counts as a delete and an insert. A write to a table
-that has left the tree counts for nothing.
-
-Partition maintenance needs no operator step. The staging worker's reconcile
-pass (every 5 seconds by default) detects each change to the tree, installs
-capture on a new partition, and queues a correction for the partition the
-change touched, which recomputes the groups that route to it (a `JOIN`
-recomputes the partitioned side's partials that route to it, and carries the
-change into its target). A `DEFAULT`
-whose siblings changed is corrected like a new partition. Until the pass sees
-the DDL, at most one pass, the definition still reads `live`; from then until
-the correction has drained it reads `backfilling`, with the partition in
-`correcting` ([Status](#status)). From the DDL to the end of the correction,
-the **window**, counts are wrong in one direction:
-
-| Operation | Window | Direction | Avoiding the window |
-|---|---|---|---|
-| `ATTACH PARTITION` of a table that holds rows | At most one pass, plus the correction of that partition. | Rows added: their groups are undercounted. | Create the partition empty and move the rows with DML through the parent: about 4-5 s and 0.5-0.6 GB of WAL per 1M-row partition. |
-| A new partition written to directly before the pass installs capture on it | At most one pass, plus the correction of that partition. | Rows added: undercounted. | Create the partition empty and write through the parent. That has no window and costs nothing. |
-| `DETACH PARTITION` (also `CONCURRENTLY`, whose correction starts once the detach completes) or `DROP` of a partition | At most one pass, plus the correction of that partition, routed by the partition's recorded bound. | Rows removed: their groups are overcounted. | Delete the partition's rows with DML through the parent first. |
-| `TRUNCATE` of a partition or of a middle partitioned table | At most one pass, plus the correction of that partition. | Rows removed: overcounted. | Delete the rows with DML through the parent first. |
-| Groups that route to no current partition, with no `DEFAULT` to take them (found by the pass's sweep of the bounds' complement) | At most one pass, plus the correction. | Rows removed: overcounted. | The operations above. |
-| `INSERT`, `UPDATE` and `DELETE` through the parent or straight to a partition, including an `UPDATE` that moves a row to another partition | None. | n/a | n/a |
-
-A `TRUNCATE` of the parent clears the target as it does for a plain table.
-The cases that leave a target stale with no correction are in
-[known correctness gaps](known-correctness-gaps.md#a-merge-that-moves-a-row-to-another-partition)
-and the entries after it.
-What a correction
-costs, and what a dump and restore, a `pg_upgrade` and pg_partman do, is in
-[operations — Partitioned sources](operations.md#partitioned-sources).
+Every partition carries the capture triggers, and partition maintenance needs
+no operator step: the staging worker's pass corrects the groups each change to
+the tree touched. What an operation does to the counts until then, and what it
+costs, is in [operations — Partitioned sources](operations.md#partitioned-sources).
 
 ## Granularity
 
