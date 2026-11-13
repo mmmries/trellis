@@ -1206,23 +1206,12 @@ upgrade pauses is in [upgrading](upgrading.md#upgrading).
 
 ## Floors
 
-Every stored definition also records its **floor**: the oldest Trellis
-release that can run it, the latest release any grammar construct, key space,
-option or hidden-table layout it uses arrived in, or any argument value
-(`EXTRACT` field, `DATE_TRUNC` unit, `AT TIME ZONE` zone), type rule (which
-operand types an operator, cast, function or aggregate takes) or key type (of
-a `GROUP BY` or `JOIN ... ON` key) define's validation admitted it by over its
-columns' types, or the type of a primary key or partition key it reads that
-define admitted. Define, `ALTER TRANSFORM` and a resume's rebuild record it
-from what the definition uses then, so an `ALTER` that removes the only newer
-construct lowers it; a pause never changes it. When a column it reads changes type, the staging worker's next capture
-pass validates it again over the new type: if it still validates, the floor
-is recorded again, and can go up or down; if it doesn't, the definition
-pauses ([Retype](#retype)). `status()` reports it as `floor`, and `trellis status` prints it as
-`floor=` on each definition's line. It is what to read before rolling an
-application back to an earlier Trellis release
-([upgrading — Rolling back](upgrading.md#rolling-back),
-[0024-compatibility-floors-and-rollback](decisions/0024-compatibility-floors-and-rollback.md)).
+Every stored definition also records its **floor**, the oldest Trellis release
+that can run it, reported as `floor` by `status()`. Define, `ALTER TRANSFORM`,
+a resume's rebuild and a [retype](#retype) record it again. What it counts is
+[0024-compatibility-floors-and-rollback](decisions/0024-compatibility-floors-and-rollback.md#recording-definition-floors);
+reading it before a rollback is
+[upgrading — Reading the floors](upgrading.md#reading-the-floors).
 
 ## Scope
 
