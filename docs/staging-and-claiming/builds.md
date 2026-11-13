@@ -67,6 +67,11 @@ while the definition was frozen) and each target row with no live entry (one
 added or re-keyed by hand). A resume whose source key columns, by name and in
 key order, are no longer the ones recorded is refused, since the target is
 keyed by them.
+A `request_backfill` of a live 1-1 definition makes the same move in the
+caller's transaction: `live -> backfilling` and one plan job and one sweep job,
+two rows whatever the table's size, so the call returns quickly and the
+definition keeps applying. A second request while a rebuild runs enqueues
+another plan and sweep.
 
 **Field builds.** An `ALTER TRANSFORM` that adds or changes fields, and a
 column resume, run chunks that take the keys' entry locks and rewrite just

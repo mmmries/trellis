@@ -701,7 +701,7 @@ SELECT
 ```
 
 Trellis keeps a copy of each table and a lock row per position and join key
-([data flow](data-flow.md#a-1-1-joins-hidden-state)); the joined tables need
+([the apply stage](staging-and-claiming/05-apply-and-exactly-once-deltas.md#a-1-1-joins-hidden-state)); the joined tables need
 no source index, and the target stays readable across a `RESUME`'s rebuild. A
 change of an `a` row rewrites its target row. A change of a joined row
 recomputes every `a` row on its join key, in chunks, and `status()` warns of a
