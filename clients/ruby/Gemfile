@@ -19,5 +19,6 @@ group :test do
   gem "activerecord", "~> 8.1"
   gem "minitest", "~> 5.25"
   gem "pg", "~> 1.6" # the tests' own connection to the testkit cluster
+  gem "prometheus-client", "~> 5.0" # the wrapped exporter in the Metrics::Middleware tests
   gem "railties", "~> 8.1"
 end
