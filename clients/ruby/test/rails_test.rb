@@ -75,6 +75,29 @@ class RailsTest < Minitest::Test
     assert_equal({ "connected" => true }, boot("tasks_loaded_before_boot"))
   end
 
+  # config.trellis.off_in: nothing connects at boot in an environment Trellis
+  # is off in, Railtie.connect and trellis:migrate warn and do nothing, and
+  # Trellis.enabled? says so; another environment's entry changes nothing.
+  def test_boot_connects_nothing_when_trellis_is_off_in_the_environment
+    seen = boot("off_in")
+    assert_equal false, seen.fetch("enabled")
+    assert_equal false, seen.fetch("connected")
+    assert_match "Trellis is off in the", seen.fetch("warning")
+    assert_match "(config.trellis.off_in): Trellis::Railtie.connect connects nothing", seen.fetch("warning")
+    assert_equal false, seen.fetch("connected_after_connect")
+  end
+
+  def test_boot_connects_when_trellis_is_off_only_in_another_environment
+    seen = boot("off_in_elsewhere")
+    assert_equal true, seen.fetch("enabled")
+    assert_equal true, seen.fetch("connected")
+  end
+
+  def test_trellis_migrate_migrates_nothing_when_trellis_is_off
+    seen = boot("off_in_rake")
+    assert_match "trellis:migrate migrates nothing", seen.fetch("warning")
+  end
+
   # The documented Puma wiring: before_fork shuts the boot handle down, and
   # a worker connects its own.
   def test_the_documented_fork_hooks_give_each_worker_a_handle

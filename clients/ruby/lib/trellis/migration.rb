@@ -64,6 +64,15 @@ module Trellis
   # ran before the failure in place, on both sides. Give a migration that
   # defines transforms little else to do.
   #
+  # == Environments Trellis is off in
+  #
+  # In an environment named in config.trellis.off_in (`%w[test]`), the
+  # three helpers raise ActiveRecord::MigrationError before running anything:
+  # the database there is built by loading the schema, which carries the
+  # targets as plain tables, not by running a migration that defines one. The
+  # environment is the migrating connection's own, so a `db:prepare` in
+  # development that migrates the test database is refused too.
+  #
   # == up and down, not change
   #
   # ActiveRecord can reverse `create_table` on its own, but not a Trellis
@@ -145,6 +154,7 @@ module Trellis
     # does: Trellis.status. A read, so it runs whether or not a transaction
     # is open.
     def status(target_table)
+      refuse_when_off!("this status wasn't read: #{target_table}")
       Migration.with_handle { Trellis.status(target_table) }
     end
 
@@ -169,9 +179,22 @@ module Trellis
               "cannot reverse a Trellis statement: #{statement}. Undo a define in down with " \
               "PAUSE TRANSFORM and DROP TRANSFORM statements."
       end
+      refuse_when_off!("this statement wasn't applied: #{statement}")
       refuse_open_transaction!("this statement wasn't applied: #{statement}")
 
       say_with_time("#{helper}(#{statement.inspect})") { Migration.with_handle { yield } }
+    end
+
+    def refuse_when_off!(what)
+      return unless defined?(Trellis::Railtie)
+
+      environment = connection.pool.db_config.env_name
+      return unless Trellis::Railtie.off_in?(environment)
+
+      raise ActiveRecord::MigrationError,
+            Trellis::Railtie.off_message("#{what}. Build this database by loading the schema " \
+                                         "(`bin/rails db:schema:load`, or `db:test:prepare`) rather than " \
+                                         "migrating it", environment)
     end
 
     def refuse_open_transaction!(what)

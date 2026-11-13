@@ -59,6 +59,7 @@ module Parity
     # The handle lives in the module here and in a variable in Elixir, so
     # only Ruby has a call that asks whether there is one.
     "connected?" => "Ruby's module-held handle",
+    "enabled?" => "Ruby's Rails integration: whether config.trellis.off_in leaves Trellis on in this environment",
     "default_instance" => "Ruby's module-held default instance, for code that takes a Trellis::Instance",
     # Its result is SQL text for a dump hook, not a flattened record, so the
     # shared fixture has nothing to shape; test/schema_dump_test.rb runs it.
@@ -76,9 +77,12 @@ module Parity
   RAILS_ONLY = {
     "Trellis::Railtie.connect" => "`connect` with config.trellis.connect's and config.trellis.instances' options",
     "Trellis::Railtie.connect_options" => "reads config.trellis.connect",
+    "Trellis::Railtie.enabled?" => "whether config.trellis.off_in leaves Trellis on in an environment",
     "Trellis::Railtie.instance_options" => "reads config.trellis.instances",
     "Trellis::Railtie.named_instance" => "an instance of config.trellis.instances",
     "Trellis::Railtie.migrate_all" => "`migrate` on each configured instance",
+    "Trellis::Railtie.off_in?" => "whether config.trellis.off_in names an environment",
+    "Trellis::Railtie.off_message" => "the sentence a refusal or warning gives for an off environment",
     "Trellis::Railtie.release_check" => "Trellis::ReleaseCheck over the app's lockfile and migrations: git and files, no engine call",
     "Trellis::Railtie.with_handle" => "a handle of its own from config.trellis.connect (or a named instance), around a block",
     "Trellis::Migration.with_handle" => "Trellis::Railtie.with_handle, raising a migration's error"

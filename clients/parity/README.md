@@ -132,8 +132,8 @@ runs check the same shapes.
 The Ruby suite checks its Rails integration the same way. Each migration
 helper (`Trellis::Migration#define`, `#apply` and `#status`) has to be the
 fixture operation of the same name. Its other public calls
-(`Trellis::Railtie.connect`, `.connect_options`, `.instance_options`,
-`.named_instance`, `.migrate_all`, `.release_check` and `.with_handle`, and
+(`Trellis::Railtie.connect`, `.connect_options`, `.enabled?`, `.instance_options`,
+`.named_instance`, `.migrate_all`, `.off_in?`, `.off_message`, `.release_check` and `.with_handle`, and
 `Trellis::Migration.with_handle`) are Rails-only, and `Parity::RAILS_ONLY`
 lists each with its reason. A call added to either module fails the suite
 until it's listed. `Trellis::Instance` has exactly the fixture's operations
