@@ -173,6 +173,35 @@ class RailsTest < Minitest::Test
     assert_equal [false, false], seen.fetch("parent_connected")
   end
 
+  # The Railtie forwards the engine's lines to Rails.logger by default, at
+  # config.trellis.log_level, and not at all with config.trellis.log_bridge
+  # = false.
+  def test_boot_forwards_the_engines_lines_to_rails_logger
+    assert_equal({ "connected" => true, "bridge" => true, "rails_logger" => true, "logged" => 1 },
+                 boot("logger").slice("connected", "bridge", "rails_logger", "logged"))
+  end
+
+  def test_config_trellis_log_level_filters_what_rails_logger_gets
+    seen = boot("logger_level")
+    assert_equal [true, 0], seen.values_at("bridge", "logged")
+  end
+
+  def test_config_trellis_log_bridge_false_installs_nothing
+    seen = boot("logger_off")
+    assert_equal [false, 0], seen.values_at("bridge", "logged")
+  end
+
+  # Trellis is off in an off_in environment: nothing connects, so no bridge.
+  def test_the_log_bridge_does_not_start_in_an_environment_trellis_is_off_in
+    seen = boot("logger_off_in")
+    assert_equal [false, false], seen.values_at("bridge", "connected")
+  end
+
+  def test_the_log_bridge_does_not_start_in_the_test_environment_by_default
+    seen = boot("logger_default_off_in", rails_env: "test")
+    assert_equal [false, false], seen.values_at("bridge", "connected")
+  end
+
   # `rails trellis:release_check` reads the app's own lockfile and every
   # database's migrations_paths, and never initializes the app, so a CI job
   # with no database can run it. Trellis::ReleaseCheck's own cases are in

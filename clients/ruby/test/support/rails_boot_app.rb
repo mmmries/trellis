@@ -45,6 +45,27 @@ when "boot"
   # The Railtie requires the migration helpers as ActiveRecord loads.
   ActiveRecord::Base
   seen[:migration_after_active_record] = defined?(Trellis::Migration) ? true : false
+when "logger", "logger_level", "logger_off"
+  # The engine's log lines go to Rails.logger, unless the app opts out.
+  io = StringIO.new
+  BootApp.config.logger = Logger.new(io)
+  BootApp.config.trellis.log_level = :warn if ARGV.fetch(0) == "logger_level"
+  BootApp.config.trellis.log_bridge = false if ARGV.fetch(0) == "logger_off"
+  BootApp.initialize!
+  Trellis.apply("DROP TRANSFORM no_such_transform")
+  bridge = Trellis::LogBridge.current
+  bridge&.drain_once
+  seen[:connected] = Trellis.connected?
+  seen[:bridge] = !bridge.nil?
+  seen[:rails_logger] = bridge&.logger.equal?(Rails.logger)
+  seen[:logged] = io.string.lines.grep(/drop is a no-op.*trellis_instance=\S+\/\S+ transform=no_such_transform/).size
+when "logger_off_in", "logger_default_off_in"
+  # Trellis is off in this environment (named, or the test default): no
+  # bridge starts.
+  BootApp.config.trellis.off_in = [Rails.env] if ARGV.fetch(0) == "logger_off_in"
+  BootApp.initialize!
+  seen[:bridge] = !Trellis::LogBridge.current.nil?
+  seen[:connected] = Trellis.connected?
 when "unset"
   BootApp.config.trellis.connect = nil
   BootApp.initialize!

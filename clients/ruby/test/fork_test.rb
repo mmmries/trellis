@@ -109,11 +109,13 @@ class ForkTest < Minitest::Test
       child: Trellis::ForkedHandleError
       child: connect Trellis::ForkedHandleError, forked while running: true
       child: render_prometheus Trellis::ForkedHandleError
+      child: log_level= Trellis::ForkedHandleError
       child: connected? false
       child exit: 0
       worker: own handle status nil
       worker: connected? true
       worker: metrics name its instance true
+      worker: logs its own lines true
       worker exit: 0
       parent: status nil
     OUT
@@ -161,13 +163,15 @@ class ForkTest < Minitest::Test
     server&.close
   end
 
-  # Every public method but connect, connected?, default_instance (which
-  # only returns the instance) and enabled? (which reads the app's config)
+  # Every public method but connect, connected? and default_instance (which
+  # only returns the instance), enabled? (which reads the app's config) and
+  # the log bridge's settings (which need no handle: see log_bridge_test.rb)
   # goes through the handle, so a method added to the module without a line
   # in SURFACE (or, for shutdown, its own case above) fails here rather than
   # going unchecked.
   def test_the_surface_names_every_public_method_that_uses_the_handle
-    uses_handle = Trellis.singleton_methods.map(&:to_s) - %w[connect connected? default_instance enabled?]
+    uses_handle = Trellis.singleton_methods.map(&:to_s) -
+                  %w[connect connected? default_instance enabled? logger logger= log_level=]
     assert_equal uses_handle.sort, [*SURFACE.keys, "shutdown"].sort
   end
 

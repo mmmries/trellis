@@ -6,15 +6,19 @@
 # freed as Ruby exits.
 
 require "trellis/pg"
+require_relative "recording_logger"
 
 $stdout.sync = true
 dsn = ARGV.fetch(0)
+# Set before connecting, as the Railtie does at boot.
+logger = RecordingLogger.new
+Trellis.logger = logger
 Trellis.connect(url: dsn)
 
 # Forked while the parent's handle is running: the child can neither use the
-# handle it inherited, connect its own, nor render the metrics registry (whose
-# lock it may have inherited held). It exits holding the inherited handle,
-# which is left alone.
+# handle it inherited, connect its own, nor render the metrics registry or
+# touch the log bridge (whose locks it may have inherited held). It exits
+# holding the inherited handle, which is left alone, and logs nothing.
 child = fork do
   begin
     Trellis.status("no_such_target")
@@ -36,6 +40,12 @@ child = fork do
   rescue Trellis::ForkedHandleError => e
     puts "child: render_prometheus #{e.class}"
   end
+  begin
+    Trellis.log_level = :info
+    puts "child: log_level= returned"
+  rescue Trellis::ForkedHandleError => e
+    puts "child: log_level= #{e.class}"
+  end
   puts "child: connected? #{Trellis.connected?}"
 end
 Process.wait(child)
@@ -50,6 +60,9 @@ worker = fork do
   puts "worker: connected? #{Trellis.connected?}"
   puts "worker: metrics name its instance " \
        "#{Trellis::Metrics.render_prometheus.include?('trellis_instance_up{trellis_instance=')}"
+  Trellis.apply("DROP TRANSFORM worker_marker")
+  Trellis::LogBridge.current.drain_once
+  puts "worker: logs its own lines #{!logger.matching(/worker_marker/).empty?}"
   # Exits without shutting down: the at_exit hook does it.
 end
 Process.wait(worker)

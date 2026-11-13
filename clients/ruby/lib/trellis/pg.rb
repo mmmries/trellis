@@ -23,6 +23,7 @@ else
   require_relative "trellis_ruby"
 end
 
+require_relative "log_bridge"
 require_relative "instance"
 require_relative "metrics"
 
@@ -51,6 +52,8 @@ require_relative "metrics"
 #   has_live_staging_worker?, watermark_token, await_converged, self_check,
 #   self_check_job.
 # - Metrics: Trellis::Metrics.render_prometheus, which needs no handle.
+# - Logs: Trellis.logger=, which sends the engine's log lines to a Logger
+#   (Trellis::LogBridge); needs no handle either.
 #
 #   # A deploy's migration step: the defaults run nothing in the background.
 #   Trellis.connect(url: "host=localhost dbname=app")
@@ -111,6 +114,32 @@ module Trellis
     def connected?
       default = @default
       !default.nil? && default.connected?
+    end
+
+    # The Logger the engine's log lines go to, or nil (the default: they are
+    # dropped). See Trellis::LogBridge.
+    def logger
+      LogBridge.current&.logger
+    end
+
+    # Sends the engine's log lines to `logger`, from a Ruby thread
+    # (Trellis::LogBridge), or to nowhere if it is nil. The most verbose
+    # level forwarded is the logger's own level now. Set it before connecting,
+    # to catch connect's own lines. The Rails integration sets it to
+    # Rails.logger. Raises ConflictError if another tracing subscriber was
+    # installed in this extension's native library first.
+    #
+    #   Trellis.logger = Logger.new($stderr)
+    def logger=(logger)
+      LogBridge.install(logger)
+    end
+
+    # Changes the most verbose level forwarded to Trellis.logger: a Logger level
+    # (:debug, :info, :warn, :error, or a Logger severity). Raises
+    # ValidationError if there is no logger.
+    def log_level=(level)
+      bridge = LogBridge.current or raise ValidationError, "Trellis.logger is not set: set it first"
+      bridge.level = level
     end
 
     # The default instance Trellis.connect opened, for code that takes an
