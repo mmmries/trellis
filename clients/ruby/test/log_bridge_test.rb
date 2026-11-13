@@ -74,9 +74,13 @@ class LogBridgeTest < Minitest::Test
     assert_raises(Trellis::ValidationError) { Trellis::LogBridge.new(Object.new) }
   end
 
-  # Every level the extension can send maps to a Logger severity.
+  # Every level the extension can send maps to the Logger severity of its
+  # name, and trace to DEBUG.
   def test_every_engine_level_has_a_severity
+    require "logger"
     assert_equal Trellis::LogBridge::SEVERITIES.keys.sort, Trellis::Native.log_levels.sort
+    assert_equal({ error: Logger::ERROR, warn: Logger::WARN, info: Logger::INFO, debug: Logger::DEBUG,
+                   trace: Logger::DEBUG }, Trellis::LogBridge::SEVERITIES)
   end
 
   def test_a_full_queue_is_reported_as_one_warning
@@ -134,6 +138,10 @@ class LogBridgeTest < Minitest::Test
   def test_a_forked_child_logs_after_it_connects
     logger = RecordingLogger.new
     Trellis.logger = logger
+    bridge = Trellis::LogBridge.current
+    # Only this test drains the parent's queue from here, so parent_marker
+    # is still queued when the child forks.
+    bridge.instance_variable_get(:@thread).kill.join
     Trellis.connect(url: TestCluster.dsn)
     Trellis.apply("DROP TRANSFORM parent_marker")
     Trellis.shutdown
@@ -141,11 +149,11 @@ class LogBridgeTest < Minitest::Test
 
     child = fork do
       out_r.close
-      seen = { before: Trellis::LogBridge.current.running? }
+      seen = { before: bridge.running? }
       Trellis.connect(url: TestCluster.dsn)
-      seen[:after] = Trellis::LogBridge.current.running?
+      seen[:after] = bridge.running?
       Trellis.apply("DROP TRANSFORM child_marker")
-      Trellis::LogBridge.current.drain_once
+      bridge.drain_once
       seen[:lines] = logger.lines.map(&:message)
       out_w.puts JSON.generate(seen)
       Trellis.shutdown
@@ -165,8 +173,25 @@ class LogBridgeTest < Minitest::Test
     assert seen.fetch("lines").any? { |m| m.match?(drop_line("child_marker")) }, report
     refute(seen.fetch("lines").any? { |m| m.include?("parent_marker") },
            "the child logged a line its parent queued: #{report}")
+    bridge.drain_once
+    assert_equal 1, logger.matching(drop_line("parent_marker")).size, "the parent logs its own line"
   ensure
     out_r&.close
+  end
+
+  def test_a_logger_that_raises_can_be_replaced
+    logger = Class.new(RecordingLogger) do
+      def add(*)
+        raise IOError, "closed stream"
+      end
+    end.new
+    Trellis.logger = logger
+    replacement = RecordingLogger.new
+    _, err = capture_io do
+      Trellis::Native.stub(:take_log_records, [[[:info, "a", "x"]], 0]) { Trellis.logger = replacement }
+    end
+    assert_includes err, "IOError: closed stream"
+    assert_same replacement, Trellis.logger
   end
 
   # What a process logs just before it exits still arrives: the bridge stops

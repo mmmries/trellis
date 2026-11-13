@@ -242,7 +242,7 @@ Trellis.log_level = :info            # optional: default is the logger's level n
 
 In a Rails app the Railtie does this with `Rails.logger`; see
 [Logs in Rails](#logs-in-rails). Each line is one `Logger` call: the engine's
-level as the severity (`trace` as `DEBUG`), its Rust module as the progname,
+level as the severity, its Rust module as the progname,
 and the event's text, ending in its fields. Every line names its instance as
 `trellis_instance=<database>/<catalog schema>`, so instances in one process
 stay apart. The lines the docs promise (a halt, a standby, a takeover's
@@ -258,9 +258,7 @@ stops after the instances shut down and logs what is left.
 
 The thread doesn't survive `fork`. After the usual hooks (see
 [Forking servers](#forking-servers)), it starts again, with an empty queue,
-when a handle connects in the child. Each native library links its own
-`tracing`, so another extension's subscriber never sees these lines, and
-doesn't stop the bridge.
+when a handle connects in the child.
 
 ### Several instances
 

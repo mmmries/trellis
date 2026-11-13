@@ -1,44 +1,12 @@
 # frozen_string_literal: true
 
 module Trellis
-  # Forwards the engine's log lines to a Logger.
-  #
-  # The Rust engine logs through the tracing facade and never installs a
-  # subscriber itself (docs/decisions/0009-observability-decisions.md,
-  # decision 3). Trellis.logger= installs one in this extension's native
-  # library and starts a Ruby thread that drains what it queues into the
-  # Logger every 100 ms. The engine's threads only append to a bounded queue:
-  # nothing in the extension calls into the Ruby VM from them.
-  #
-  #   Trellis.logger = Logger.new($stderr)
-  #
-  # In a Rails app the Railtie does this with Rails.logger (see
-  # config.trellis.log_level and config.trellis.log_bridge).
-  #
-  # Each line is one Logger call: severity from the engine's level (its
-  # trace is DEBUG), the emitting Rust module as progname, and the event's
-  # text, which ends in its fields as name=value pairs. Every line names its
-  # instance, as trellis_instance=<database>/<catalog schema>, so instances in
-  # one process stay apart.
-  #
-  # The most verbose level forwarded is the Logger's own level when the bridge
-  # starts. The engine drops events above it before formatting them, so a later
-  # Logger#level= can make the Logger stricter but can't bring back a
-  # level the bridge filtered: change it with Trellis.log_level=.
-  #
-  # A line can be dropped; logging never blocks or crashes the engine. The
-  # queue holds 10,000 lines. If it fills because the thread is down or
-  # falling behind, new lines are dropped and counted, and the next drain
-  # logs one warning with the count.
-  #
-  # The thread doesn't survive fork. Shut instances down before forking
-  # (Trellis::Instance.shutdown_all), as for any handle; the thread starts
-  # again, with an empty queue, when a handle connects in the child. At exit,
-  # after the instances shut down, the thread stops and drains what is left.
-  #
-  # tracing's global subscriber lives in the native library that links it, and
-  # this one links its own copy, so a subscriber another extension installs
-  # never sees the engine's lines, and doesn't stop this bridge.
+  # Forwards the engine's log lines to a Logger: Trellis.logger= installs
+  # trellis-embed's pull-based tracing subscriber in this extension's native
+  # library, and a Ruby thread drains its bounded queue into the Logger every
+  # 100 ms. Engine threads only append to the queue; nothing calls into the
+  # VM from them. Levels, drops, fork and exit behaviour: "Logs" in the
+  # README.
   class LogBridge
     # Seconds between drains.
     INTERVAL = 0.1
@@ -202,7 +170,7 @@ module Trellis
         # Already finished.
       end
       thread.join
-      drain_once
+      drain_safely
     end
 
     private

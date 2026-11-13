@@ -109,11 +109,13 @@ class ForkTest < Minitest::Test
       child: Trellis::ForkedHandleError
       child: connect Trellis::ForkedHandleError, forked while running: true
       child: render_prometheus Trellis::ForkedHandleError
+      child: log_level= Trellis::ForkedHandleError
       child: connected? false
       child exit: 0
       worker: own handle status nil
       worker: connected? true
       worker: metrics name its instance true
+      worker: logs its own lines true
       worker exit: 0
       parent: status nil
     OUT
