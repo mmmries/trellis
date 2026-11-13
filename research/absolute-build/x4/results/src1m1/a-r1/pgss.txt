@@ -1,0 +1,15 @@
+1|5245|1000000|451143136|4|556|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $2) as __seg), a
+1|375|1|0|0|0|select (select count(*) from (select * from hi_totals except all select * from plain_ins) x) + (select count(*) from (select * from plain_in
+1|129|0|0|0|0|insert into pg_temp."trellis_group_recompute_2_e9deaf206fb77feb" ("grp_hi") select "grp_hi" from "trellis"."agg_2" h where not (exists (sele
+75|30|300|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exist
+1|17|1|0|0|0|select exists (select $1 from (select ((t."grp_hi")::bigint) as "grp_hi" from "public"."warm" t) as __route where ("grp_hi" is null or "grp_
+77|6|77|0|0|0|select pid from pg_locks where locktype = $2 and granted and objsubid = $3 and database = (select oid from pg_database where datname = curre
+75|5|0|0|0|0|set timezone_abbreviations to $1
+75|4|0|0|0|0|set timezone to $1
+73|3|73|0|0|0|with cols as ( select array_agg(a.attname::text) as names, array_agg(a.attnum) as attnums, array_agg(a.attcollation::oid) as collations from
+72|3|72|0|0|0|select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, d.join_table, array(select j.table_name from (select $4 as posi
+77|2|77|0|0|0|select w.worker_id, j->>$2, coalesce((j->>$3)::boolean, $4), (j->>$5)::int4, w.last_seen > now() - (interval $6 * $1) from "trellis".worker_
+36|2|72|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_atte
+309|2|309|54|0|0|select to_regclass($1) is not null
+269|1|269|0|0|0|select set_config($1, case when kept between $2 and $3 then kept::text else $4 end, $5) from (select (extract($6 from current_setting($7)::i
+2|1|0|16418|2|0|insert into definition_types (transform_id, type_oid, type_name) select $1, k.type_oid, k.type_name from definition_key_types k where k.tran

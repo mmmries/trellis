@@ -1,0 +1,440 @@
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T155435-g-sweep  lane g  #1870  sweep  since 2026-11-12T15:54:35-08:00  expect 7200s
+  MUTATE_TREE=trellis-rev1870-mut python3 -I local_docs/pr/1870-d-mutate.py (25 mutations x lib defs::/staging:: + 23 suites)
+logbook: the box is reserved:
+20261112T155435-g-sweep  lane g  #1870  sweep  since 2026-11-12T15:54:35-08:00  expect 7200s
+  MUTATE_TREE=trellis-rev1870-mut python3 -I local_docs/pr/1870-d-mutate.py (25 mutations x lib defs::/staging:: + 23 suites)
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+[17:46:04] X4 logbook id: 20261112T174604-r-bench
+[17:46:04] build cli
+   Compiling trellis-cli v0.2.0 (/home/mike/code/trellis-lane-r/cli)
+    Finished `release` profile [optimized] target(s) in 59.30s
+[17:47:04] ./setup_cluster.sh
+cluster up at /home/mike/code/trellis-lane-r/target/research-pg-x4 port 54874
+[17:47:05] ./template.sh src1m32 1000000 32
+NOTICE:  database "src1m32" does not exist, skipping
+registered transform public.warm
+template src1m32 ready
+[17:47:32] ./template.sh src1m1 1000000 1
+NOTICE:  database "src1m1" does not exist, skipping
+registered transform public.warm
+template src1m1 ready
+[17:47:58] ./run.sh src1m32 src1m32 1 today
+NOTICE:  database "x4_src1m32_today_r1" does not exist, skipping
+src1m32	today	1	1.000710901	16.334908962	939852560	269008896	0
+[17:48:22] ./run.sh src1m32 src1m32 1 a
+NOTICE:  database "x4_src1m32_a_r1" does not exist, skipping
+src1m32	a	1	.840731435	11.781452419	454682368	139583488	0
+[17:48:40] ./run.sh src1m1 src1m1 1 today
+NOTICE:  database "x4_src1m1_today_r1" does not exist, skipping
+src1m1	today	1	.842878909	16.936294547	1011366560	268992512	0
+[17:49:04] ./run.sh src1m1 src1m1 1 a
+NOTICE:  database "x4_src1m1_a_r1" does not exist, skipping
+src1m1	a	1	.826581578	9.345473767	518107288	139583488	0
+[17:49:20] ./run.sh src1m32 src1m32 2 today
+NOTICE:  database "x4_src1m32_today_r2" does not exist, skipping
+src1m32	today	2	.845774360	16.357258314	858762200	269000704	0
+[17:49:43] ./run.sh src1m32 src1m32 2 a
+NOTICE:  database "x4_src1m32_a_r2" does not exist, skipping
+src1m32	a	2	.833031697	11.793834605	518254184	139583488	0
+[17:50:02] ./run.sh src1m1 src1m1 2 today
+NOTICE:  database "x4_src1m1_today_r2" does not exist, skipping
+src1m1	today	2	.905420098	16.661778388	1011486456	268992512	0
+[17:50:26] ./run.sh src1m1 src1m1 2 a
+NOTICE:  database "x4_src1m1_a_r2" does not exist, skipping
+src1m1	a	2	1.130157619	9.342345840	454488640	139583488	0
+[17:50:43] ./template.sh src10m32 10000000 32
+NOTICE:  database "src10m32" does not exist, skipping
+registered transform public.warm
+template src10m32 ready
+[18:13:14] ./run.sh src10m32 src10m32 1 a
+NOTICE:  database "x4_src10m32_a_r1" does not exist, skipping
+src10m32	a	1	8.622072588	90.695396311	6044437192	1395269632	0
+[18:15:16] ./run.sh src10m32 src10m32 1 today
+NOTICE:  database "x4_src10m32_today_r1" does not exist, skipping
+src10m32	today	1	8.881765007	144.226422882	10488572392	2682363904	0
+20261112T174604-r-bench	done	bench	r	1917	research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1	2026-11-12T17:46:04-08:00	2026-11-12T18:18:12-08:00	1928	12000000	ok	3600	X4: fresh build of a plain aggregate over a partitioned source, per leaf, today's three statements vs candidate A per leaf (TRELLIS_X4_LEAF_TODAY switch, one binary at the X4 commit); 1M/1M over 32 leaves and over 1 leaf x2 reps, 10M/10M over 32 leaves x1; see research/absolute-build/x4/X4-results.md. rows = seeded posts through capture (estimate)
+[18:18:12] X4 finished 20261112T174604-r-bench outcome=ok
+[18:18:12] X6 logbook id: 20261112T181812-r-sweep
+[18:18:12] build generative
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.66s
+  Executable tests/concurrent_convergence.rs (target/debug/deps/concurrent_convergence-9cb2696e90d88b3d)
+[18:18:36] sweep mid_burst
+[18:28:56] sweep mid_burst rc=101
+[18:28:56] sweep steady_load
+[18:36:47] sweep steady_load rc=101
+[18:36:47] property_partitioned_hot_keys_converge_under_concurrent_drains plant=none
+[18:37:01] property_partitioned_hot_keys_converge_under_concurrent_drains plant=none rc=0
+[18:37:01] property_a_partitioned_source_converges_under_the_concurrent_backend plant=none
+[18:37:48] property_a_partitioned_source_converges_under_the_concurrent_backend plant=none rc=0
+[18:37:48] property_partitioned_hot_keys_converge_under_concurrent_drains plant=ab_leaf_unrouted
+[18:38:01] property_partitioned_hot_keys_converge_under_concurrent_drains plant=ab_leaf_unrouted rc=0
+[18:38:01] property_a_partitioned_source_converges_under_the_concurrent_backend plant=ab_leaf_unrouted
+[18:38:46] property_a_partitioned_source_converges_under_the_concurrent_backend plant=ab_leaf_unrouted rc=0
+20261112T181812-r-sweep	done	sweep	r	1917	research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted	2026-11-12T18:18:12-08:00	2026-11-12T18:38:46-08:00	1234	416000	miss	7200	X6: candidate A prototype's plants (ab_*) + gb_build_snapshot_before_locks + gb_early_zero_gc, concurrent tier sweep mid_burst + steady_load at 2 seeds x 6 cases, plus the partitioned properties unplanted and with ab_leaf_unrouted; see research/absolute-build/x6/X6-results.md. rows estimate (2000/case)
+[18:38:46] X6 finished 20261112T181812-r-sweep outcome=miss

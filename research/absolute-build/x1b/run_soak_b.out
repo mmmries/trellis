@@ -1,0 +1,627 @@
+reserving at 2026-11-12T15:11:49-08:00
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T151045-r-bench  lane r  #1917  bench  since 2026-11-12T15:10:45-08:00  expect 7200s
+  research/absolute-build/x5/run_x5.sh: X5 plain-aggregate fresh build under concurrent writes (0/1k/10k row changes/s), base 54cfddb2 vs write-once prototype b3b7856c, s2_agg+s2_agg_hi 1M x2, no-index 1M, s2_agg_hi 10M proto
+logbook: the box is reserved:
+20261112T155435-g-sweep  lane g  #1870  sweep  since 2026-11-12T15:54:35-08:00  expect 7200s
+  MUTATE_TREE=trellis-rev1870-mut python3 -I local_docs/pr/1870-d-mutate.py (25 mutations x lib defs::/staging:: + 23 suites)
+logbook: the box is reserved:
+20261112T155435-g-sweep  lane g  #1870  sweep  since 2026-11-12T15:54:35-08:00  expect 7200s
+  MUTATE_TREE=trellis-rev1870-mut python3 -I local_docs/pr/1870-d-mutate.py (25 mutations x lib defs::/staging:: + 23 suites)
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T155614-b-sweep  lane b  #1858  sweep  since 2026-11-12T15:56:14-08:00  expect 7200s
+  target/s3-1858/driver.sh: timings (5 binaries x before/after x 2 rounds, cores 0-5), then 23 join1 plants + none x before/after x 5 binaries
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T173226-c-repro  lane c  #1857  repro  since 2026-11-12T17:32:26-08:00  expect 1800s
+  10x the 11 test binaries with converted waits (#1857 slice 3 review)
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T174604-r-bench  lane r  #1917  bench  since 2026-11-12T17:46:04-08:00  expect 3600s
+  research/absolute-build/x4 (run_x6.sh part 1): X4 per-leaf fresh build, today vs candidate A per leaf, 1M rows/1M groups over 32 leaves and 1 leaf x2 reps, 10M/10M over 32 leaves x1
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+logbook: the box is reserved:
+20261112T181812-r-sweep  lane r  #1917  sweep  since 2026-11-12T18:18:12-08:00  expect 7200s
+  research/absolute-build/x6/run_x6.sh part 2: GENERATIVE_PLANT_SEEDS=2 GENERATIVE_PLANT_CASES=6 GENERATIVE_PLANTS=ab_gc_ignores_build,ab_enum_no_hidden,ab_enum_no_target,ab_enum_no_ring,ab_stragglers_from_s1,gb_build_snapshot_before_locks,gb_early_zero_gc planted_bugs_are_caught (concurrent_convergence) tiers mid_burst, steady_load (35 min cap each); then property_partitioned_hot_keys / property_a_partitioned_source PROPTEST_CASES=16 unplanted and TRELLIS_TEST_PLANT=ab_leaf_unrouted
+20261112T183905-r-soak
+LOGBOOK_ID 20261112T183905-r-soak at 2026-11-12T18:39:05-08:00
+matrix rc=0
+20261112T183905-r-soak	done	soak	r	1917	x1b correctness-model soak (pre-enumeration, leaves, per-leaf B, resume): python3 soak.py matrix soak_b.jsonl --plan x1b --duration 20 --parallel 8 (research/absolute-build/x1b)	2026-11-12T18:39:05-08:00	2026-11-12T19:07:55-08:00	1730	1089472	ok	7200	X1b soak, 20 s runs, appliers 2/4/8: A-preRHS 60r 0div 0dl; A-preRHS-nogc 30r 2div 0dl; L-A-preRHS 90r 0div 0dl; A-s2each 15r 0div 0dl; A-notarget+T 30r 2div 5dl; L-A-nogc 30r 2div 0dl; L-A-preRHS+T 30r 0div 4dl; L-A 60r 0div 0dl; L-Bdef 45r 0div 0dl; A 15r 0div 0dl; L-A-preRHS-span 30r 0div 0dl; L-B 60r 0div 0dl; A-preRH 30r 1div 0dl; L-N 30r 30div 0dl; L-A-preRH 30r 0div 0dl; A-x+T 30r 0div 7dl; A-s2probe 15r 0div 0dl; L-B+T 15r 0div 1dl; A-s2gb 15r 0div 0dl; A-preRHS-late 15r 0div 0dl
+FINISHED 20261112T183905-r-soak ok rows=1089472 at 2026-11-12T19:07:55-08:00

@@ -1,0 +1,159 @@
+p1_moveout_undrained               A-x                exact              0.6s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2), (7, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               A-preRH            wrong              0.3s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ["h after build = [(7, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               A-preRHS           exact              0.3s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2), (7, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               A-preRHS-late      exact              0.4s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2), (7, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               A-preRHS-nogc      exact              0.4s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2), (7, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               L-A                exact              0.2s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               L-A-preRHS         exact              0.3s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               L-A-preRH          wrong              0.3s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ['h after build = []'], 'stragglers': 0}
+p1_moveout_undrained               L-A-preRHS-span    exact              0.2s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               L-A-nogc           exact              0.2s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               L-B                exact              0.2s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               L-Bdef             exact              0.8s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1_moveout_undrained               L-N                exact              0.8s {'notes': ["h after build = [(2, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         A-x                exact              0.6s {'notes': ["h after build = [(1, 1, Decimal('3'), True, 2), (None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         A-preRH            wrong              0.3s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', None, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ["h after build = [(1, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         A-preRHS           exact              0.2s {'notes': ["h after build = [(1, 1, Decimal('3'), True, 2), (None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         A-preRHS-late      exact              0.2s {'notes': ["h after build = [(1, 1, Decimal('3'), True, 2), (None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         A-preRHS-nogc      exact              0.1s {'notes': ["h after build = [(1, 1, Decimal('3'), True, 2), (None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         L-A                exact              0.1s {'notes': ["h after build = [(None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         L-A-preRHS         exact              0.8s {'notes': ["h after build = [(None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         L-A-preRH          wrong              0.1s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', None, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ['h after build = []'], 'stragglers': 0}
+p1n_moveout_undrained_null         L-A-preRHS-span    exact              0.1s {'notes': ["h after build = [(None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         L-A-nogc           exact              0.0s {'notes': ["h after build = [(None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         L-B                exact              0.5s {'notes': ["h after build = [(None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         L-Bdef             exact              0.0s {'notes': ["h after build = [(None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p1n_moveout_undrained_null         L-N                exact              0.1s {'notes': ["h after build = [(None, 0, Decimal('0'), True, 2)]"], 'stragglers': 0}
+p2_moveout_drained_before_s1       A-x                exact              0.1s {'notes': [], 'stragglers': 2}
+p2_moveout_drained_before_s1       A-preRH            wrong              0.1s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -1, Decimal('-3'))], 'deadlocks': [], 'notes': [], 'stragglers': 1}
+p2_moveout_drained_before_s1       A-preRHS           exact              0.2s {'notes': [], 'stragglers': 2}
+p2_moveout_drained_before_s1       A-preRHS-late      exact              0.2s {'notes': [], 'stragglers': 2}
+p2_moveout_drained_before_s1       A-preRHS-nogc      exact              0.1s {'notes': [], 'stragglers': 2}
+p2_moveout_drained_before_s1       L-A                exact              0.1s {'notes': [], 'stragglers': 1}
+p2_moveout_drained_before_s1       L-A-preRHS         exact              0.1s {'notes': [], 'stragglers': 1}
+p2_moveout_drained_before_s1       L-A-preRH          wrong              0.1s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -1, Decimal('-3'))], 'deadlocks': [], 'notes': [], 'stragglers': 0}
+p2_moveout_drained_before_s1       L-A-preRHS-span    exact              0.2s {'notes': [], 'stragglers': 1}
+p2_moveout_drained_before_s1       L-A-nogc           exact              0.1s {'notes': [], 'stragglers': 1}
+p2_moveout_drained_before_s1       L-B                exact              0.1s {'notes': [], 'stragglers': 0}
+p2_moveout_drained_before_s1       L-Bdef             exact              0.1s {'notes': [], 'stragglers': 0}
+p2_moveout_drained_before_s1       L-N                exact              0.1s {'notes': [], 'stragglers': 0}
+p3_moveout_drain_in_flight         A-x                exact              0.4s {'notes': ['build advisory at read:N'], 'stragglers': 2}
+p3_moveout_drain_in_flight         A-preRH            wrong              0.4s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ['build advisory at read:N'], 'stragglers': 1}
+p3_moveout_drain_in_flight         A-preRHS           exact              0.4s {'notes': ['build advisory at read:N'], 'stragglers': 2}
+p3_moveout_drain_in_flight         A-preRHS-late      exact              0.4s {'notes': ['build advisory at read:N'], 'stragglers': 2}
+p3_moveout_drain_in_flight         A-preRHS-nogc      exact              0.4s {'notes': ['build advisory at read:N'], 'stragglers': 2}
+p3_moveout_drain_in_flight         L-A                exact              0.4s {'notes': ['build advisory at read:2'], 'stragglers': 1}
+p3_moveout_drain_in_flight         L-A-preRHS         exact              0.4s {'notes': ['build advisory at read:2'], 'stragglers': 1}
+p3_moveout_drain_in_flight         L-A-preRH          wrong              0.4s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ['build done at read:2'], 'stragglers': 0}
+p3_moveout_drain_in_flight         L-A-preRHS-span    exact              0.4s {'notes': ['build advisory at read:2'], 'stragglers': 1}
+p3_moveout_drain_in_flight         L-A-nogc           exact              0.4s {'notes': ['build advisory at read:2'], 'stragglers': 1}
+p3_moveout_drain_in_flight         L-B                exact              0.4s {'notes': ['build advisory at read:2'], 'stragglers': 0}
+p3_moveout_drain_in_flight         L-Bdef             exact              0.3s {'notes': ['build advisory at read:2'], 'stragglers': 0}
+p3_moveout_drain_in_flight         L-N                exact              0.4s {'notes': ['build advisory at read:2'], 'stragglers': 0}
+p4_group_created_between           A-x                exact              0.0s {'notes': [], 'stragglers': 2}
+p4_group_created_between           A-preRH            exact              0.0s {'notes': [], 'stragglers': 1}
+p4_group_created_between           A-preRHS           exact              0.0s {'notes': [], 'stragglers': 1}
+p4_group_created_between           A-preRHS-late      exact              0.0s {'notes': [], 'stragglers': 1}
+p4_group_created_between           A-preRHS-nogc      exact              0.0s {'notes': [], 'stragglers': 1}
+p4_group_created_between           L-A                exact              0.0s {'notes': [], 'stragglers': 2}
+p4_group_created_between           L-A-preRHS         exact              0.0s {'notes': [], 'stragglers': 1}
+p4_group_created_between           L-A-preRH          exact              0.0s {'notes': [], 'stragglers': 1}
+p4_group_created_between           L-A-preRHS-span    exact              0.0s {'notes': [], 'stragglers': 1}
+p4_group_created_between           L-A-nogc           exact              0.0s {'notes': [], 'stragglers': 2}
+p4_group_created_between           L-B                exact              0.0s {'notes': [], 'stragglers': 0}
+p4_group_created_between           L-Bdef             exact              0.0s {'notes': [], 'stragglers': 0}
+p4_group_created_between           L-N                exact              0.0s {'notes': [], 'stragglers': 0}
+p5_emptied_between                 A-x                exact              0.0s {'notes': []}
+p5_emptied_between                 A-preRH            wrong              0.0s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -2, Decimal('-7'))], 'deadlocks': [], 'notes': []}
+p5_emptied_between                 A-preRHS           exact              0.0s {'notes': []}
+p5_emptied_between                 A-preRHS-late      exact              0.0s {'notes': []}
+p5_emptied_between                 A-preRHS-nogc      exact              0.0s {'notes': []}
+p5_emptied_between                 L-A                exact              0.0s {'notes': []}
+p5_emptied_between                 L-A-preRHS         exact              0.0s {'notes': []}
+p5_emptied_between                 L-A-preRH          wrong              0.0s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -2, Decimal('-7'))], 'deadlocks': [], 'notes': []}
+p5_emptied_between                 L-A-preRHS-span    exact              0.0s {'notes': []}
+p5_emptied_between                 L-A-nogc           exact              0.0s {'notes': []}
+p5_emptied_between                 L-B                exact              0.0s {'notes': []}
+p5_emptied_between                 L-Bdef             exact              0.0s {'notes': []}
+p5_emptied_between                 L-N                exact              0.0s {'notes': []}
+p5d_emptied_between_drained        A-x                exact              0.0s {'notes': []}
+p5d_emptied_between_drained        A-preRH            wrong              0.0s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -2, Decimal('-7'))], 'deadlocks': [], 'notes': []}
+p5d_emptied_between_drained        A-preRHS           exact              0.0s {'notes': []}
+p5d_emptied_between_drained        A-preRHS-late      exact              0.0s {'notes': []}
+p5d_emptied_between_drained        A-preRHS-nogc      exact              0.0s {'notes': []}
+p5d_emptied_between_drained        L-A                exact              0.1s {'notes': []}
+p5d_emptied_between_drained        L-A-preRHS         exact              0.0s {'notes': []}
+p5d_emptied_between_drained        L-A-preRH          wrong              0.1s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, -2, Decimal('-7'))], 'deadlocks': [], 'notes': []}
+p5d_emptied_between_drained        L-A-preRHS-span    exact              0.0s {'notes': []}
+p5d_emptied_between_drained        L-A-nogc           exact              0.0s {'notes': []}
+p5d_emptied_between_drained        L-B                exact              0.0s {'notes': []}
+p5d_emptied_between_drained        L-Bdef             exact              0.0s {'notes': []}
+p5d_emptied_between_drained        L-N                exact              0.0s {'notes': []}
+p6_gc_between_e_and_s1             A-x                exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build advisory', 'page done']}
+p6_gc_between_e_and_s1             A-preRH            exact              0.1s {'notes': ['gc deleted/skipped (0, 3); build advisory', 'page done']}
+p6_gc_between_e_and_s1             A-preRHS           exact              0.1s {'notes': ['gc deleted/skipped (0, 3); build advisory', 'page done']}
+p6_gc_between_e_and_s1             A-preRHS-late      exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build advisory', 'page done']}
+p6_gc_between_e_and_s1             A-preRHS-nogc      exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build advisory', 'page done']}
+p6_gc_between_e_and_s1             L-A                exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build done', 'page done']}
+p6_gc_between_e_and_s1             L-A-preRHS         exact              0.1s {'notes': ['gc deleted/skipped (0, 3); build advisory', 'page done']}
+p6_gc_between_e_and_s1             L-A-preRH          exact              0.1s {'notes': ['gc deleted/skipped (0, 3); build advisory', 'page done']}
+p6_gc_between_e_and_s1             L-A-preRHS-span    exact              0.1s {'notes': ['gc deleted/skipped (0, 3); build advisory', 'page done']}
+p6_gc_between_e_and_s1             L-A-nogc           exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build done', 'page done']}
+p6_gc_between_e_and_s1             L-B                exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build done', 'page done']}
+p6_gc_between_e_and_s1             L-Bdef             exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build done', 'page done']}
+p6_gc_between_e_and_s1             L-N                exact              0.1s {'notes': ['gc deleted/skipped (1, 0); build done', 'page done']}
+p7_s3_after_s1                     A-x                exact              0.1s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     A-preRH            exact              0.1s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     A-preRHS           exact              0.1s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     A-preRHS-late      exact              0.0s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     A-preRHS-nogc      wrong              0.1s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+p7_s3_after_s1                     L-A                exact              0.0s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     L-A-preRHS         exact              0.0s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     L-A-preRH          exact              0.1s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     L-A-preRHS-span    exact              0.1s {'notes': ['page done', 'gc deleted 0, skipped 3']}
+p7_s3_after_s1                     L-A-nogc           wrong              0.0s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+p7_s3_after_s1                     L-B                exact              0.1s {'notes': ['page advisory', 'gc deleted 0, skipped 0']}
+p7_s3_after_s1                     L-Bdef             exact              0.1s {'notes': ['page advisory', 'gc deleted 0, skipped 0']}
+p7_s3_after_s1                     L-N                wrong              0.1s {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+p8_move_out_and_back               A-x                exact              0.0s {'notes': []}
+p8_move_out_and_back               A-preRH            wrong              0.1s {'outcome': 'wrong', 'divergence': [('missing_or_wrong_in_h', 2, 1, Decimal('3'))], 'deadlocks': [], 'notes': []}
+p8_move_out_and_back               A-preRHS           exact              0.1s {'notes': []}
+p8_move_out_and_back               A-preRHS-late      exact              0.1s {'notes': []}
+p8_move_out_and_back               A-preRHS-nogc      exact              0.0s {'notes': []}
+p8_move_out_and_back               L-A                exact              0.1s {'notes': []}
+p8_move_out_and_back               L-A-preRHS         exact              0.1s {'notes': []}
+p8_move_out_and_back               L-A-preRH          wrong              0.1s {'outcome': 'wrong', 'divergence': [('missing_or_wrong_in_h', 2, 1, Decimal('3'))], 'deadlocks': [], 'notes': []}
+p8_move_out_and_back               L-A-preRHS-span    exact              0.1s {'notes': []}
+p8_move_out_and_back               L-A-nogc           exact              0.1s {'notes': []}
+p8_move_out_and_back               L-B                exact              0.1s {'notes': []}
+p8_move_out_and_back               L-Bdef             exact              0.1s {'notes': []}
+p8_move_out_and_back               L-N                exact              0.0s {'notes': []}
+p9_build_rollback_with_pre         A-x                exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         A-preRH            exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         A-preRHS           exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         A-preRHS-late      exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         A-preRHS-nogc      exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-A                exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-A-preRHS         exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-A-preRH          exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-A-preRHS-span    exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-A-nogc           exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-B                exact              0.1s {'notes': ['page advisory', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-Bdef             exact              0.1s {'notes': ['page advisory', 'build ended by cancel: QueryCanceled']}
+p9_build_rollback_with_pre         L-N                exact              0.1s {'notes': ['page transactionid', 'build ended by cancel: QueryCanceled']}
+
+### pre
+
+| scenario | A-x | A-preRH | A-preRHS | A-preRHS-late | A-preRHS-nogc | L-A | L-A-preRHS | L-A-preRH | L-A-preRHS-span | L-A-nogc | L-B | L-Bdef | L-N |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| p1_moveout_undrained | exact | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact |
+| p1n_moveout_undrained_null | exact | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact |
+| p2_moveout_drained_before_s1 | exact | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact |
+| p3_moveout_drain_in_flight | exact | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact |
+| p4_group_created_between | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| p5_emptied_between | exact | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact |
+| p5d_emptied_between_drained | exact | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact |
+| p6_gc_between_e_and_s1 | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| p7_s3_after_s1 | exact | exact | exact | exact | wrong | exact | exact | exact | exact | wrong | exact | exact | wrong |
+| p8_move_out_and_back | exact | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact |
+| p9_build_rollback_with_pre | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |

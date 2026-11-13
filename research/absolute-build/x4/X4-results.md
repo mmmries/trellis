@@ -157,7 +157,29 @@ The "vacated across E and S1" test of option (b) does not apply: (b) was not imp
 
 ## Measurements
 
-(filled in below)
+Logbook `20261112T174604-r-bench` (ok). One release binary at the X4 commit; `TRELLIS_X4_LEAF_TODAY=1` selects
+today's leaf path. Postgres 18.6 scratch cluster with X3's settings. Fresh build of the 1M-group / 10M-group
+aggregate (one group per row) over a hash-partitioned source, define to `live`. Every target equals the plain
+`INSERT … SELECT` (`EXCEPT ALL` both ways: 0 rows). 2 reps at 1M (both shown), 1 rep at 10M.
+
+| source | path | plain s | build s | x plain | WAL | hidden table |
+|---|---|---|---|---|---|---|
+| 1M rows, 32 leaves | today | 0.8–1.0 | 16.3 / 16.4 | 18x | 859–940 MB | 269 MB |
+| 1M rows, 32 leaves | A per leaf | 0.8 | 11.8 / 11.8 | 14x | 455–518 MB | 140 MB |
+| 1M rows, 1 leaf | today | 0.8–0.9 | 16.9 / 16.7 | 19x | 1,011 MB | 269 MB |
+| 1M rows, 1 leaf | A per leaf | 0.8–1.1 | 9.3 / 9.3 | 10x | 454–518 MB | 140 MB |
+| 10M rows, 32 leaves | today | 8.9 | 144.2 | 16.2x | 10.5 GB | 2.7 GB |
+| 10M rows, 32 leaves | A per leaf | 8.6 | 90.7 | 10.5x | 6.0 GB | 1.4 GB |
+
+- A per leaf cuts the build by 28 % (32 leaves) to 44 % (1 leaf) at 1M and by 37 % at 10M, and roughly halves the WAL
+  and the hidden table.
+- Partitioning already avoids the collapse the unpartitioned build shows at 10M groups (1,535 s in E5): each leaf's
+  hidden rows stay small enough to update in place. So A's gain per leaf is the double write, not the order effect.
+- The ~5.5 s define-to-live floor (X3) is inside every 1M number. At 10M, A per leaf (90.7 s) is slower than A over
+  the unpartitioned source (81.7 s in X3): 32 transactions, and each leaf's rows also pass the routed enumeration.
+  Not broken down further.
+- The 1M/10M sources were loaded through capture with a warm definition (the loader waits until the warm aggregate
+  has counted every row), so the ring was drained before each measured build.
 
 ## What remains open
 

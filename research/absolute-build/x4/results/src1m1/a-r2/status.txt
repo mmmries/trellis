@@ -1,0 +1,6 @@
+Transform definitions:
+  target=public.warm status=live floor=0.2.0 created_at=2026-11-13 01:47:32 UTC
+  target=public.hi_totals status=live floor=0.2.0 created_at=2026-11-13 01:50:33 UTC
+
+Quarantined source rows: none
+

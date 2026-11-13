@@ -1,0 +1,15 @@
+32|6621|1000000|451143188|4|0|with snap as materialized (select pg_catalog.pg_current_snapshot() as __snap, coalesce((select max(seg_seq) from segments), $2) as __seg), a
+1|972|0|0|0|0|insert into pg_temp."trellis_group_recompute_2_e9deaf206fb77feb" ("grp_hi") select "grp_hi" from "trellis"."agg_2" h where not (exists (sele
+1|402|1|0|0|0|select (select count(*) from (select * from hi_totals except all select * from plain_ins) x) + (select count(*) from (select * from plain_in
+93|37|372|0|0|0|select pg_catalog.set_config(w.name, w.setting, $1) from (values ($2, $3), ($4, $5), ($6, $7), ($8, $9)) as w(name, setting) where not exist
+1|25|1|0|0|0|select exists (select $1 from (select ((t."grp_hi")::bigint) as "grp_hi" from "public"."warm" t) as __route where ("grp_hi" is null or "grp_
+95|8|95|0|0|0|select pid from pg_locks where locktype = $2 and granted and objsubid = $3 and database = (select oid from pg_database where datname = curre
+93|6|0|0|0|0|set timezone_abbreviations to $1
+75|5|116|0|0|0|with recorded as ( select coalesce($3::text[], ( select k.key_columns from defini
+93|5|0|0|0|0|set timezone to $1
+91|4|91|0|0|0|with cols as ( select array_agg(a.attname::text) as names, array_agg(a.attnum) as attnums, array_agg(a.attcollation::oid) as collations from
+3|4|320|0|0|0|with recursive tree(relid, relkind) as ( select c.oid, c.relkind from pg_catalog.pg_class c where c.oid = pg_catalog.to_regclass($1) union a
+90|4|90|0|0|0|select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, d.join_table, array(select j.table_name from (select $4 as posi
+32|2|32|2584|0|0|update backfill_chunks set lo = $2 where id = $1
+45|2|90|0|0|0|select d.id, d.target_table, d.created_at, d.source_table, bcf.attempts as chunk_attempts, bcf.last_error as chunk_last_error, bcf.next_atte
+381|2|381|0|0|0|select to_regclass($1) is not null

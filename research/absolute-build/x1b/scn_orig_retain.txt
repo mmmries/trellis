@@ -1,0 +1,403 @@
+s1_absent_group_post_s1            T0        exact            
+s1_absent_group_post_s1            A         exact            
+s1_absent_group_post_s1            A-gc      exact            
+s1_absent_group_post_s1            A-2pass   exact            
+s1_absent_group_post_s1            A-noenum  exact            
+s1_absent_group_post_s1            B         exact            
+s1_absent_group_post_s1            N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, 1, Decimal('10')), ('missing_or_wrong_in_h', 2, 2, Decimal('15'))], 'deadlocks': [], 'notes': ['page done while build stalled'], 'stragglers': 0}
+s1_absent_group_post_s1            T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, 1, Decimal('10')), ('missing_or_wrong_in_h', 2, 2, Decimal('15'))], 'deadlocks': [], 'notes': ['page done while build stalled'], 'stragglers': 0}
+s1_absent_group_post_s1            B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 2, 1, Decimal('10')), ('missing_or_wrong_in_h', 2, 2, Decimal('15'))], 'deadlocks': [], 'notes': ['page done while build stalled'], 'stragglers': 0}
+s1_absent_group_post_s1            A-x       exact            
+s1_absent_group_post_s1            A-newimg  exact            
+s1_absent_group_post_s1            A-preRH   exact            
+s1_absent_group_post_s1            A-preRHS  exact            
+s1_absent_group_post_s1            A-preRHS-late exact            
+s1_absent_group_post_s1            A-preRHS-nogc exact            
+s1_absent_group_post_s1            A-s2gb    exact            
+s1_absent_group_post_s1            A-s2probe exact            
+s1_absent_group_post_s1            A-s2each  exact            
+s1_absent_group_post_s1            B-x       exact            
+s1n_absent_null_group              T0        exact            
+s1n_absent_null_group              A         exact            
+s1n_absent_null_group              A-gc      exact            
+s1n_absent_null_group              A-2pass   exact            
+s1n_absent_null_group              A-noenum  exact            
+s1n_absent_null_group              B         exact            
+s1n_absent_null_group              N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', None, 1, Decimal('10')), ('missing_or_wrong_in_h', None, 2, Decimal('15'))], 'deadlocks': [], 'notes': ['page done while build stalled'], 'stragglers': 0}
+s1n_absent_null_group              T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', None, 1, Decimal('10')), ('missing_or_wrong_in_h', None, 2, Decimal('15'))], 'deadlocks': [], 'notes': ['page done while build stalled'], 'stragglers': 0}
+s1n_absent_null_group              B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', None, 1, Decimal('10')), ('missing_or_wrong_in_h', None, 2, Decimal('15'))], 'deadlocks': [], 'notes': ['page done while build stalled'], 'stragglers': 0}
+s1n_absent_null_group              A-x       exact            
+s1n_absent_null_group              A-newimg  exact            
+s1n_absent_null_group              A-preRH   exact            
+s1n_absent_null_group              A-preRHS  exact            
+s1n_absent_null_group              A-preRHS-late exact            
+s1n_absent_null_group              A-preRHS-nogc exact            
+s1n_absent_null_group              A-s2gb    exact            
+s1n_absent_null_group              A-s2probe exact            
+s1n_absent_null_group              A-s2each  exact            
+s1n_absent_null_group              B-x       exact            
+s2_blocked_page_refuses_seen       T0        exact            
+s2_blocked_page_refuses_seen       A         exact            
+s2_blocked_page_refuses_seen       A-gc      exact            
+s2_blocked_page_refuses_seen       A-2pass   exact            
+s2_blocked_page_refuses_seen       A-noenum  exact            
+s2_blocked_page_refuses_seen       B         exact            
+s2_blocked_page_refuses_seen       N         exact            
+s2_blocked_page_refuses_seen       T0-early  exact            
+s2_blocked_page_refuses_seen       B-early   exact            
+s2_blocked_page_refuses_seen       A-x       exact            
+s2_blocked_page_refuses_seen       A-newimg  exact            
+s2_blocked_page_refuses_seen       A-preRH   exact            
+s2_blocked_page_refuses_seen       A-preRHS  exact            
+s2_blocked_page_refuses_seen       A-preRHS-late exact            
+s2_blocked_page_refuses_seen       A-preRHS-nogc exact            
+s2_blocked_page_refuses_seen       A-s2gb    exact            
+s2_blocked_page_refuses_seen       A-s2probe exact            
+s2_blocked_page_refuses_seen       A-s2each  exact            
+s2_blocked_page_refuses_seen       B-x       exact            
+s3_gc_counterexample               T0        exact            
+s3_gc_counterexample               A         exact            
+s3_gc_counterexample               A-gc      wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+s3_gc_counterexample               A-2pass   exact            
+s3_gc_counterexample               A-noenum  exact            
+s3_gc_counterexample               B         exact            
+s3_gc_counterexample               N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+s3_gc_counterexample               T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+s3_gc_counterexample               B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+s3_gc_counterexample               A-x       exact            
+s3_gc_counterexample               A-newimg  exact            
+s3_gc_counterexample               A-preRH   exact            
+s3_gc_counterexample               A-preRHS  exact            
+s3_gc_counterexample               A-preRHS-late exact            
+s3_gc_counterexample               A-preRHS-nogc wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 4, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['page done', 'gc deleted 1, skipped 0'], 'gc_deleted': 1}
+s3_gc_counterexample               A-s2gb    exact            
+s3_gc_counterexample               A-s2probe exact            
+s3_gc_counterexample               A-s2each  exact            
+s3_gc_counterexample               B-x       exact            
+s4a_vacated_drained                T0        exact            
+s4a_vacated_drained                A         exact            
+s4a_vacated_drained                A-gc      exact            
+s4a_vacated_drained                A-2pass   exact            
+s4a_vacated_drained                A-noenum  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 6, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ["h before build = [(6, -1, Decimal('-3'), False, None), (7, 1, Decimal('3'), False, None)]"]}
+s4a_vacated_drained                B         exact            
+s4a_vacated_drained                N         exact            
+s4a_vacated_drained                T0-early  exact            
+s4a_vacated_drained                B-early   exact            
+s4a_vacated_drained                A-x       exact            
+s4a_vacated_drained                A-newimg  exact            
+s4a_vacated_drained                A-preRH   exact            
+s4a_vacated_drained                A-preRHS  exact            
+s4a_vacated_drained                A-preRHS-late exact            
+s4a_vacated_drained                A-preRHS-nogc exact            
+s4a_vacated_drained                A-s2gb    exact            
+s4a_vacated_drained                A-s2probe exact            
+s4a_vacated_drained                A-s2each  exact            
+s4a_vacated_drained                B-x       exact            
+s4b_vacated_undrained              T0        exact            
+s4b_vacated_undrained              A         exact            
+s4b_vacated_undrained              A-gc      exact            
+s4b_vacated_undrained              A-2pass   exact            
+s4b_vacated_undrained              A-noenum  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 6, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ["h after build = [(7, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+s4b_vacated_undrained              B         exact            
+s4b_vacated_undrained              N         exact            
+s4b_vacated_undrained              T0-early  exact            
+s4b_vacated_undrained              B-early   exact            
+s4b_vacated_undrained              A-x       exact            
+s4b_vacated_undrained              A-newimg  exact            
+s4b_vacated_undrained              A-preRH   exact            
+s4b_vacated_undrained              A-preRHS  exact            
+s4b_vacated_undrained              A-preRHS-late exact            
+s4b_vacated_undrained              A-preRHS-nogc exact            
+s4b_vacated_undrained              A-s2gb    exact            
+s4b_vacated_undrained              A-s2probe exact            
+s4b_vacated_undrained              A-s2each  exact            
+s4b_vacated_undrained              B-x       exact            
+s4bn_vacated_null                  T0        exact            
+s4bn_vacated_null                  A         exact            
+s4bn_vacated_null                  A-gc      exact            
+s4bn_vacated_null                  A-2pass   exact            
+s4bn_vacated_null                  A-noenum  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', None, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ["h after build = [(1, 1, Decimal('3'), True, 2)]"], 'stragglers': 0}
+s4bn_vacated_null                  B         exact            
+s4bn_vacated_null                  N         exact            
+s4bn_vacated_null                  T0-early  exact            
+s4bn_vacated_null                  B-early   exact            
+s4bn_vacated_null                  A-x       exact            
+s4bn_vacated_null                  A-newimg  exact            
+s4bn_vacated_null                  A-preRH   exact            
+s4bn_vacated_null                  A-preRHS  exact            
+s4bn_vacated_null                  A-preRHS-late exact            
+s4bn_vacated_null                  A-preRHS-nogc exact            
+s4bn_vacated_null                  A-s2gb    exact            
+s4bn_vacated_null                  A-s2probe exact            
+s4bn_vacated_null                  A-s2each  exact            
+s4bn_vacated_null                  B-x       exact            
+s4c_vacated_drain_in_flight        T0        exact            
+s4c_vacated_drain_in_flight        A         exact            
+s4c_vacated_drain_in_flight        A-gc      exact            
+s4c_vacated_drain_in_flight        A-2pass   exact            
+s4c_vacated_drain_in_flight        A-noenum  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 12, -1, Decimal('-3'))], 'deadlocks': [], 'notes': ['build advisory']}
+s4c_vacated_drain_in_flight        B         exact            
+s4c_vacated_drain_in_flight        N         exact            
+s4c_vacated_drain_in_flight        T0-early  exact            
+s4c_vacated_drain_in_flight        B-early   exact            
+s4c_vacated_drain_in_flight        A-x       exact            
+s4c_vacated_drain_in_flight        A-newimg  exact            
+s4c_vacated_drain_in_flight        A-preRH   exact            
+s4c_vacated_drain_in_flight        A-preRHS  exact            
+s4c_vacated_drain_in_flight        A-preRHS-late exact            
+s4c_vacated_drain_in_flight        A-preRHS-nogc exact            
+s4c_vacated_drain_in_flight        A-s2gb    exact            
+s4c_vacated_drain_in_flight        A-s2probe exact            
+s4c_vacated_drain_in_flight        A-s2each  exact            
+s4c_vacated_drain_in_flight        B-x       exact            
+s5a_key_ordered_wait               T0        exact            
+s5a_key_ordered_wait               A         exact            
+s5a_key_ordered_wait               A-gc      exact            
+s5a_key_ordered_wait               A-2pass   exact            
+s5a_key_ordered_wait               A-noenum  exact            
+s5a_key_ordered_wait               B         exact            
+s5a_key_ordered_wait               N         exact            
+s5a_key_ordered_wait               T0-early  exact            
+s5a_key_ordered_wait               B-early   exact            
+s5a_key_ordered_wait               A-x       exact            
+s5a_key_ordered_wait               A-newimg  exact            
+s5a_key_ordered_wait               A-preRH   exact            
+s5a_key_ordered_wait               A-preRHS  exact            
+s5a_key_ordered_wait               A-preRHS-late exact            
+s5a_key_ordered_wait               A-preRHS-nogc exact            
+s5a_key_ordered_wait               A-s2gb    exact            
+s5a_key_ordered_wait               A-s2probe exact            
+s5a_key_ordered_wait               A-s2each  exact            
+s5a_key_ordered_wait               B-x       exact            
+s5b_two_pass_deadlock              T0        exact            
+s5b_two_pass_deadlock              A         exact            
+s5b_two_pass_deadlock              A-gc      exact            
+s5b_two_pass_deadlock              A-2pass   exact+deadlock   {'outcome': 'exact', 'divergence': [], 'deadlocks': ['page'], 'notes': ['build advisory at pass2:N', 'page transactionid']}
+s5b_two_pass_deadlock              A-noenum  exact            
+s5b_two_pass_deadlock              B         exact            
+s5b_two_pass_deadlock              N         exact            
+s5b_two_pass_deadlock              T0-early  exact            
+s5b_two_pass_deadlock              B-early   exact            
+s5b_two_pass_deadlock              A-x       exact            
+s5b_two_pass_deadlock              A-newimg  exact            
+s5b_two_pass_deadlock              A-preRH   exact            
+s5b_two_pass_deadlock              A-preRHS  exact            
+s5b_two_pass_deadlock              A-preRHS-late exact            
+s5b_two_pass_deadlock              A-preRHS-nogc exact            
+s5b_two_pass_deadlock              A-s2gb    exact            
+s5b_two_pass_deadlock              A-s2probe exact            
+s5b_two_pass_deadlock              A-s2each  exact            
+s5b_two_pass_deadlock              B-x       exact            
+s7_build_rollback                  T0        exact            
+s7_build_rollback                  A         exact            
+s7_build_rollback                  A-gc      exact            
+s7_build_rollback                  A-2pass   exact            
+s7_build_rollback                  A-noenum  exact            
+s7_build_rollback                  B         exact            
+s7_build_rollback                  N         exact            
+s7_build_rollback                  T0-early  exact            
+s7_build_rollback                  B-early   exact            
+s7_build_rollback                  A-x       exact            
+s7_build_rollback                  A-newimg  exact            
+s7_build_rollback                  A-preRH   exact            
+s7_build_rollback                  A-preRHS  exact            
+s7_build_rollback                  A-preRHS-late exact            
+s7_build_rollback                  A-preRHS-nogc exact            
+s7_build_rollback                  A-s2gb    exact            
+s7_build_rollback                  A-s2probe exact            
+s7_build_rollback                  A-s2each  exact            
+s7_build_rollback                  B-x       exact            
+s8_rebuild_in_place                T0        exact            
+s8_rebuild_in_place                A         exact            
+s8_rebuild_in_place                A-gc      exact            
+s8_rebuild_in_place                A-2pass   exact            
+s8_rebuild_in_place                A-noenum  exact            
+s8_rebuild_in_place                B         exact            
+s8_rebuild_in_place                N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 1, 2, Decimal('11')), ('missing_or_wrong_in_h', 1, 4, Decimal('23')), ('extra_or_wrong_in_h', 2, 1, Decimal('3')), ('extra_or_wrong_in_h', 3, 1, Decimal('4')), ('missing_or_wrong_in_h', 3, 2, Decimal('7')), ('extra_or_wrong_in_h', None, 1, Decimal('1'))], 'deadlocks': [], 'notes': ['page done'], 'enumerated': 4, 'stragglers': 0}
+s8_rebuild_in_place                T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 1, 2, Decimal('11')), ('missing_or_wrong_in_h', 1, 4, Decimal('23')), ('extra_or_wrong_in_h', 2, 1, Decimal('3')), ('extra_or_wrong_in_h', 3, 1, Decimal('4')), ('missing_or_wrong_in_h', 3, 2, Decimal('7')), ('extra_or_wrong_in_h', None, 1, Decimal('1'))], 'deadlocks': [], 'notes': ['page done'], 'enumerated': 4, 'stragglers': 0}
+s8_rebuild_in_place                B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 1, 2, Decimal('11')), ('missing_or_wrong_in_h', 1, 4, Decimal('23')), ('extra_or_wrong_in_h', 2, 1, Decimal('3')), ('extra_or_wrong_in_h', 3, 1, Decimal('4')), ('missing_or_wrong_in_h', 3, 2, Decimal('7')), ('extra_or_wrong_in_h', None, 1, Decimal('1'))], 'deadlocks': [], 'notes': ['page done'], 'enumerated': 4, 'stragglers': 0}
+s8_rebuild_in_place                A-x       exact            
+s8_rebuild_in_place                A-newimg  exact            
+s8_rebuild_in_place                A-preRH   exact            
+s8_rebuild_in_place                A-preRHS  exact            
+s8_rebuild_in_place                A-preRHS-late exact            
+s8_rebuild_in_place                A-preRHS-nogc exact            
+s8_rebuild_in_place                A-s2gb    exact            
+s8_rebuild_in_place                A-s2probe exact            
+s8_rebuild_in_place                A-s2each  exact            
+s8_rebuild_in_place                B-x       exact            
+s8c_rebuild_corrupted              T0        exact            
+s8c_rebuild_corrupted              A         exact            
+s8c_rebuild_corrupted              A-gc      exact            
+s8c_rebuild_corrupted              A-2pass   exact            
+s8c_rebuild_corrupted              A-noenum  exact            
+s8c_rebuild_corrupted              B         exact            
+s8c_rebuild_corrupted              N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 1, 2, Decimal('11')), ('missing_or_wrong_in_h', 1, 4, Decimal('23')), ('extra_or_wrong_in_h', 2, 1, Decimal('3')), ('extra_or_wrong_in_h', 3, 1, Decimal('4')), ('missing_or_wrong_in_h', 3, 2, Decimal('7')), ('extra_or_wrong_in_h', None, 1, Decimal('1'))], 'deadlocks': [], 'notes': ['page done'], 'enumerated': 4, 'stragglers': 0}
+s8c_rebuild_corrupted              T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 1, 2, Decimal('11')), ('missing_or_wrong_in_h', 1, 4, Decimal('23')), ('extra_or_wrong_in_h', 2, 1, Decimal('3')), ('extra_or_wrong_in_h', 3, 1, Decimal('4')), ('missing_or_wrong_in_h', 3, 2, Decimal('7')), ('extra_or_wrong_in_h', None, 1, Decimal('1'))], 'deadlocks': [], 'notes': ['page done'], 'enumerated': 4, 'stragglers': 0}
+s8c_rebuild_corrupted              B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 1, 2, Decimal('11')), ('missing_or_wrong_in_h', 1, 4, Decimal('23')), ('extra_or_wrong_in_h', 2, 1, Decimal('3')), ('extra_or_wrong_in_h', 3, 1, Decimal('4')), ('missing_or_wrong_in_h', 3, 2, Decimal('7')), ('extra_or_wrong_in_h', None, 1, Decimal('1'))], 'deadlocks': [], 'notes': ['page done'], 'enumerated': 4, 'stragglers': 0}
+s8c_rebuild_corrupted              A-x       exact            
+s8c_rebuild_corrupted              A-newimg  exact            
+s8c_rebuild_corrupted              A-preRH   exact            
+s8c_rebuild_corrupted              A-preRHS  exact            
+s8c_rebuild_corrupted              A-preRHS-late exact            
+s8c_rebuild_corrupted              A-preRHS-nogc exact            
+s8c_rebuild_corrupted              A-s2gb    exact            
+s8c_rebuild_corrupted              A-s2probe exact            
+s8c_rebuild_corrupted              A-s2each  exact            
+s8c_rebuild_corrupted              B-x       exact            
+s9_page_claimed_before_s1          T0        exact            
+s9_page_claimed_before_s1          A         exact            
+s9_page_claimed_before_s1          A-gc      exact            
+s9_page_claimed_before_s1          A-2pass   exact            
+s9_page_claimed_before_s1          A-noenum  exact            
+s9_page_claimed_before_s1          B         exact            
+s9_page_claimed_before_s1          N         exact            
+s9_page_claimed_before_s1          T0-early  exact            
+s9_page_claimed_before_s1          B-early   exact            
+s9_page_claimed_before_s1          A-x       exact            
+s9_page_claimed_before_s1          A-newimg  exact            
+s9_page_claimed_before_s1          A-preRH   exact            
+s9_page_claimed_before_s1          A-preRHS  exact            
+s9_page_claimed_before_s1          A-preRHS-late exact            
+s9_page_claimed_before_s1          A-preRHS-nogc exact            
+s9_page_claimed_before_s1          A-s2gb    exact            
+s9_page_claimed_before_s1          A-s2probe exact            
+s9_page_claimed_before_s1          A-s2each  exact            
+s9_page_claimed_before_s1          B-x       exact            
+s11_gc_prefix_soundness            T0        exact            
+s11_gc_prefix_soundness            A         exact            
+s11_gc_prefix_soundness            A-gc      exact            
+s11_gc_prefix_soundness            A-2pass   exact            
+s11_gc_prefix_soundness            A-noenum  exact            
+s11_gc_prefix_soundness            B         exact            
+s11_gc_prefix_soundness            N         exact            
+s11_gc_prefix_soundness            T0-early  exact            
+s11_gc_prefix_soundness            B-early   exact            
+s11_gc_prefix_soundness            A-x       exact            
+s11_gc_prefix_soundness            A-newimg  exact            
+s11_gc_prefix_soundness            A-preRH   exact            
+s11_gc_prefix_soundness            A-preRHS  exact            
+s11_gc_prefix_soundness            A-preRHS-late exact            
+s11_gc_prefix_soundness            A-preRHS-nogc exact            
+s11_gc_prefix_soundness            A-s2gb    exact            
+s11_gc_prefix_soundness            A-s2probe exact            
+s11_gc_prefix_soundness            A-s2each  exact            
+s11_gc_prefix_soundness            B-x       exact            
+s11n_gc_prefix_naive               T0        wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-gc      wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-2pass   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-noenum  exact            
+s11n_gc_prefix_naive               B         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-x       wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-newimg  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-preRH   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-preRHS  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-preRHS-late wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-preRHS-nogc wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-s2gb    wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-s2probe wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               A-s2each  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s11n_gc_prefix_naive               B-x       wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 13, -1, Decimal('-1'))], 'deadlocks': [], 'notes': ['prefix while W open = 2', "h = [(13, 0, Decimal('0'), True, 2)]", 'naive gc deleted 1']}
+s14_commit_order_differs           T0        exact            
+s14_commit_order_differs           A         exact            
+s14_commit_order_differs           A-gc      exact            
+s14_commit_order_differs           A-2pass   exact            
+s14_commit_order_differs           A-noenum  exact            
+s14_commit_order_differs           B         exact            
+s14_commit_order_differs           N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 15, 1, Decimal('2')), ('missing_or_wrong_in_h', 15, 2, Decimal('3'))], 'deadlocks': [], 'notes': ['page done'], 'stragglers': 0}
+s14_commit_order_differs           T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 15, 1, Decimal('2')), ('missing_or_wrong_in_h', 15, 2, Decimal('3'))], 'deadlocks': [], 'notes': ['page done'], 'stragglers': 0}
+s14_commit_order_differs           B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 15, 1, Decimal('2')), ('missing_or_wrong_in_h', 15, 2, Decimal('3'))], 'deadlocks': [], 'notes': ['page done'], 'stragglers': 0}
+s14_commit_order_differs           A-x       exact            
+s14_commit_order_differs           A-newimg  exact            
+s14_commit_order_differs           A-preRH   exact            
+s14_commit_order_differs           A-preRHS  exact            
+s14_commit_order_differs           A-preRHS-late exact            
+s14_commit_order_differs           A-preRHS-nogc exact            
+s14_commit_order_differs           A-s2gb    exact            
+s14_commit_order_differs           A-s2probe exact            
+s14_commit_order_differs           A-s2each  exact            
+s14_commit_order_differs           B-x       exact            
+s15_gc_mid_txn_when_build_starts   T0        exact            
+s15_gc_mid_txn_when_build_starts   A         exact            
+s15_gc_mid_txn_when_build_starts   A-gc      wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 16, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['build advisory at read (S1 taken)', 'page done', 'gc txn deleted 1'], 'build_waited_for_gc': False}
+s15_gc_mid_txn_when_build_starts   A-2pass   exact            
+s15_gc_mid_txn_when_build_starts   A-noenum  exact            
+s15_gc_mid_txn_when_build_starts   B         exact            
+s15_gc_mid_txn_when_build_starts   N         wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 16, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['build advisory at read (S1 taken)', 'page done', 'gc txn deleted 1'], 'build_waited_for_gc': False}
+s15_gc_mid_txn_when_build_starts   T0-early  wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 16, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['build advisory at read (S1 taken)', 'page done', 'gc txn deleted 1'], 'build_waited_for_gc': False}
+s15_gc_mid_txn_when_build_starts   B-early   wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 16, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['build advisory at read (S1 taken)', 'page done', 'gc txn deleted 1'], 'build_waited_for_gc': False}
+s15_gc_mid_txn_when_build_starts   A-x       exact            
+s15_gc_mid_txn_when_build_starts   A-newimg  exact            
+s15_gc_mid_txn_when_build_starts   A-preRH   exact            
+s15_gc_mid_txn_when_build_starts   A-preRHS  exact            
+s15_gc_mid_txn_when_build_starts   A-preRHS-late exact            
+s15_gc_mid_txn_when_build_starts   A-preRHS-nogc wrong            {'outcome': 'wrong', 'divergence': [('extra_or_wrong_in_h', 16, 1, Decimal('7'))], 'deadlocks': [], 'notes': ['build advisory at read (S1 taken)', 'page done', 'gc txn deleted 1'], 'build_waited_for_gc': False}
+s15_gc_mid_txn_when_build_starts   A-s2gb    exact            
+s15_gc_mid_txn_when_build_starts   A-s2probe exact            
+s15_gc_mid_txn_when_build_starts   A-s2each  exact            
+s15_gc_mid_txn_when_build_starts   B-x       exact            
+s16_page_blocked_on_straggler      T0        exact            
+s16_page_blocked_on_straggler      A         exact            
+s16_page_blocked_on_straggler      A-gc      exact            
+s16_page_blocked_on_straggler      A-2pass   exact            
+s16_page_blocked_on_straggler      A-noenum  exact            
+s16_page_blocked_on_straggler      B         exact            
+s16_page_blocked_on_straggler      N         exact            
+s16_page_blocked_on_straggler      T0-early  exact            
+s16_page_blocked_on_straggler      B-early   exact            
+s16_page_blocked_on_straggler      A-x       exact            
+s16_page_blocked_on_straggler      A-newimg  exact            
+s16_page_blocked_on_straggler      A-preRH   exact            
+s16_page_blocked_on_straggler      A-preRHS  exact            
+s16_page_blocked_on_straggler      A-preRHS-late exact            
+s16_page_blocked_on_straggler      A-preRHS-nogc exact            
+s16_page_blocked_on_straggler      A-s2gb    exact            
+s16_page_blocked_on_straggler      A-s2probe exact            
+s16_page_blocked_on_straggler      A-s2each  exact            
+s16_page_blocked_on_straggler      B-x       exact            
+s18_hidden_truncate_vs_s1          T0        exact            
+s18_hidden_truncate_vs_s1          A         exact            
+s18_hidden_truncate_vs_s1          A-gc      exact            
+s18_hidden_truncate_vs_s1          A-2pass   exact            
+s18_hidden_truncate_vs_s1          A-noenum  exact            
+s18_hidden_truncate_vs_s1          B         exact            
+s18_hidden_truncate_vs_s1          N         exact            
+s18_hidden_truncate_vs_s1          T0-early  exact            
+s18_hidden_truncate_vs_s1          B-early   exact            
+s18_hidden_truncate_vs_s1          A-x       exact            
+s18_hidden_truncate_vs_s1          A-newimg  exact            
+s18_hidden_truncate_vs_s1          A-preRH   exact            
+s18_hidden_truncate_vs_s1          A-preRHS  exact            
+s18_hidden_truncate_vs_s1          A-preRHS-late exact            
+s18_hidden_truncate_vs_s1          A-preRHS-nogc exact            
+s18_hidden_truncate_vs_s1          A-s2gb    exact            
+s18_hidden_truncate_vs_s1          A-s2probe exact            
+s18_hidden_truncate_vs_s1          A-s2each  exact            
+s18_hidden_truncate_vs_s1          B-x       exact            
+
+| scenario | T0 | A | A-gc | A-2pass | A-noenum | B | N | T0-early | B-early | A-x | A-newimg | A-preRH | A-preRHS | A-preRHS-late | A-preRHS-nogc | A-s2gb | A-s2probe | A-s2each | B-x |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| s1_absent_group_post_s1 | exact | exact | exact | exact | exact | exact | wrong | wrong | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s1n_absent_null_group | exact | exact | exact | exact | exact | exact | wrong | wrong | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s2_blocked_page_refuses_seen | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s3_gc_counterexample | exact | exact | wrong | exact | exact | exact | wrong | wrong | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact |
+| s4a_vacated_drained | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s4b_vacated_undrained | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s4bn_vacated_null | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s4c_vacated_drain_in_flight | exact | exact | exact | exact | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s5a_key_ordered_wait | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s5b_two_pass_deadlock | exact | exact | exact | exact+deadlock | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s7_build_rollback | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s8_rebuild_in_place | exact | exact | exact | exact | exact | exact | wrong | wrong | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s8c_rebuild_corrupted | exact | exact | exact | exact | exact | exact | wrong | wrong | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s9_page_claimed_before_s1 | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s11_gc_prefix_soundness | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s11n_gc_prefix_naive | wrong | wrong | wrong | wrong | exact | wrong | wrong | wrong | wrong | wrong | wrong | wrong | wrong | wrong | wrong | wrong | wrong | wrong | wrong |
+| s14_commit_order_differs | exact | exact | exact | exact | exact | exact | wrong | wrong | wrong | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s15_gc_mid_txn_when_build_starts | exact | exact | wrong | exact | exact | exact | wrong | wrong | wrong | exact | exact | exact | exact | exact | wrong | exact | exact | exact | exact |
+| s16_page_blocked_on_straggler | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
+| s18_hidden_truncate_vs_s1 | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact | exact |
