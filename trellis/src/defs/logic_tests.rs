@@ -463,8 +463,7 @@ fn a_column_name_or_unreserved_keyword_is_still_a_column() {
     ] {
         for text in [word.to_string(), format!("{word} + 1")] {
             let def = parse_text(&text).unwrap_or_else(|e| panic!("`{text}` should parse: {e}"));
-            let mut columns = Vec::new();
-            super::validate::collect_columns(&def.fields[0].expr, &mut columns);
+            let columns = def.fields[0].expr.columns();
             assert_eq!(columns, [word], "`{text}`: {:?}", def.fields[0].expr);
         }
     }

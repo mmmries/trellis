@@ -515,14 +515,23 @@ pub enum Expr {
 }
 
 impl Expr {
-    /// The direct subexpressions of a [`Expr::Not`], [`Expr::IsNull`] or
-    /// [`Expr::Case`] node, in source order (a `CASE`'s conditions and
-    /// results interleaved, then its `ELSE`), and none for any other node.
-    /// The three nodes have no per-site meaning in most tree walks, so those
-    /// walks recurse through this.
-    pub fn logic_children(&self) -> Vec<&Expr> {
+    /// The direct subexpressions, in source order (a `CASE`'s conditions and
+    /// results interleaved, then its `ELSE`); none for a leaf.
+    pub fn children(&self) -> Vec<&Expr> {
         match self {
-            Expr::Not(operand) | Expr::IsNull { expr: operand, .. } => vec![operand],
+            Expr::Column(_)
+            | Expr::SourceColumn { .. }
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. }
+            | Expr::BooleanLiteral(_)
+            | Expr::Null => Vec::new(),
+            Expr::BinaryOp { lhs, rhs, .. } => vec![lhs, rhs],
+            Expr::FunctionCall { args, .. } => args.iter().collect(),
+            Expr::Negate(operand)
+            | Expr::Cast { expr: operand, .. }
+            | Expr::Not(operand)
+            | Expr::IsNull { expr: operand, .. } => vec![operand],
             Expr::Case {
                 branches,
                 otherwise,
@@ -531,42 +540,78 @@ impl Expr {
                 .flat_map(|(condition, result)| [condition, result])
                 .chain(otherwise.as_deref())
                 .collect(),
-            _ => Vec::new(),
         }
     }
 
-    /// Rebuilds a [`Expr::Not`], [`Expr::IsNull`] or [`Expr::Case`] node with
-    /// `f` applied to each direct subexpression (the same order as
-    /// [`Expr::logic_children`]); `None` for any other node.
-    pub fn map_logic_children<E>(
+    /// This node rebuilt with `f` applied to each of its
+    /// [`children`](Expr::children), in the same order; a leaf is cloned.
+    pub fn try_map_children<E>(
         &self,
         mut f: impl FnMut(&Expr) -> Result<Expr, E>,
-    ) -> Option<Result<Expr, E>> {
-        Some(match self {
-            Expr::Not(operand) => f(operand).map(|e| Expr::Not(Box::new(e))),
-            Expr::IsNull { expr, negated } => f(expr).map(|e| Expr::IsNull {
-                expr: Box::new(e),
+    ) -> Result<Expr, E> {
+        Ok(match self {
+            Expr::Column(_)
+            | Expr::SourceColumn { .. }
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. }
+            | Expr::BooleanLiteral(_)
+            | Expr::Null => self.clone(),
+            Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
+                op: *op,
+                lhs: Box::new(f(lhs)?),
+                rhs: Box::new(f(rhs)?),
+            },
+            Expr::FunctionCall { name, args } => Expr::FunctionCall {
+                name: name.clone(),
+                args: args.iter().map(&mut f).collect::<Result<_, _>>()?,
+            },
+            Expr::Negate(operand) => Expr::Negate(Box::new(f(operand)?)),
+            Expr::Cast { expr, target } => Expr::Cast {
+                expr: Box::new(f(expr)?),
+                target: *target,
+            },
+            Expr::Not(operand) => Expr::Not(Box::new(f(operand)?)),
+            Expr::IsNull { expr, negated } => Expr::IsNull {
+                expr: Box::new(f(expr)?),
                 negated: *negated,
-            }),
+            },
             Expr::Case {
                 branches,
                 otherwise,
-            } => (|| {
-                let mut rebuilt = Vec::with_capacity(branches.len());
-                for (condition, result) in branches {
-                    rebuilt.push((f(condition)?, f(result)?));
-                }
-                let otherwise = match otherwise {
+            } => Expr::Case {
+                branches: branches
+                    .iter()
+                    .map(|(condition, result)| Ok((f(condition)?, f(result)?)))
+                    .collect::<Result<_, _>>()?,
+                otherwise: match otherwise {
                     Some(e) => Some(Box::new(f(e)?)),
                     None => None,
-                };
-                Ok(Expr::Case {
-                    branches: rebuilt,
-                    otherwise,
-                })
-            })(),
-            _ => return None,
+                },
+            },
         })
+    }
+
+    /// Calls `f` on this node, then on each node below it: depth first, in
+    /// source order.
+    pub fn walk<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        f(self);
+        for child in self.children() {
+            child.walk(f);
+        }
+    }
+
+    /// The bare names this expression reads ([`Expr::Column`]), in source
+    /// order. A [`Expr::SourceColumn`] always reads the source, so it is not
+    /// one of them.
+    pub fn columns(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        self.walk(&mut |e| {
+            if let Expr::Column(name) = e {
+                out.push(name.as_str());
+            }
+        });
+        out
     }
 }
 

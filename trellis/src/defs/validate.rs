@@ -628,19 +628,18 @@ fn collect_refusing_calls(
     fields_by_name: &HashMap<&str, &FieldDef>,
     out: &mut Vec<CollationRefusingRead>,
 ) {
+    let aggregate_scope;
+    let mut fields_by_name = fields_by_name;
     match expr {
         Expr::FunctionCall { name, args } => {
             // An aggregate's argument reads source columns, not aggregate
             // fields (see `aggregate_field_names`).
-            let aggregate_scope;
-            let fields_by_name = if super::registry::lookup_aggregate_function(name).is_some() {
+            if super::registry::is_aggregate_name(name) {
                 let aggregates =
                     aggregate_field_names(fields_by_name.iter().map(|(n, f)| (*n, &f.expr)));
                 aggregate_scope = without_aggregate_fields(fields_by_name, &aggregates);
-                &aggregate_scope
-            } else {
-                fields_by_name
-            };
+                fields_by_name = &aggregate_scope;
+            }
             if name == "NULLIF" {
                 let operands: Vec<&Expr> = args.iter().collect();
                 collect_text_comparison("NULLIF", &operands, field, fields_by_name, out);
@@ -662,38 +661,20 @@ fn collect_refusing_calls(
                         }),
                 );
             }
-            for arg in args {
-                collect_refusing_calls(arg, field, fields_by_name, out);
-            }
         }
-        Expr::BinaryOp { op, lhs, rhs } => {
-            if op.is_comparison() && !op.is_ordering() {
-                collect_text_comparison(
-                    super::registry::operator_spec(*op).symbol,
-                    &[lhs, rhs],
-                    field,
-                    fields_by_name,
-                    out,
-                );
-            }
-            collect_refusing_calls(lhs, field, fields_by_name, out);
-            collect_refusing_calls(rhs, field, fields_by_name, out);
+        Expr::BinaryOp { op, lhs, rhs } if op.is_comparison() && !op.is_ordering() => {
+            collect_text_comparison(
+                super::registry::operator_spec(*op).symbol,
+                &[lhs, rhs],
+                field,
+                fields_by_name,
+                out,
+            );
         }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            collect_refusing_calls(operand, field, fields_by_name, out);
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                collect_refusing_calls(child, field, fields_by_name, out);
-            }
-        }
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => {}
+        _ => {}
+    }
+    for child in expr.children() {
+        collect_refusing_calls(child, field, fields_by_name, out);
     }
 }
 
@@ -813,28 +794,11 @@ fn collect_text_columns<'a>(
             }),
             column.clone(),
         )),
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_text_columns(arg, field, fields_by_name, visited, out);
-            }
-        }
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_text_columns(lhs, field, fields_by_name, visited, out);
-            collect_text_columns(rhs, field, fields_by_name, visited, out);
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            collect_text_columns(operand, field, fields_by_name, visited, out);
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
+        _ => {
+            for child in expr.children() {
                 collect_text_columns(child, field, fields_by_name, visited, out);
             }
         }
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => {}
     }
 }
 
@@ -2172,29 +2136,8 @@ fn check_aggregate_calls(
     columns: &HashMap<String, JoinColumnInfo>,
 ) -> Result<(), ValidationError> {
     match expr {
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            check_aggregate_calls(lhs, columns)?;
-            check_aggregate_calls(rhs, columns)
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            check_aggregate_calls(operand, columns)
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                check_aggregate_calls(child, columns)?;
-            }
-            Ok(())
-        }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args } if super::registry::is_aggregate_name(name) => {
             let upper = name.to_ascii_uppercase();
-            if !(is_deferred_aggregate_name(&upper)
-                || super::registry::AGGREGATE_FUNCTIONS.contains(&upper.as_str()))
-            {
-                for arg in args {
-                    check_aggregate_calls(arg, columns)?;
-                }
-                return Ok(());
-            }
             check_aggregate_admitted(&upper, AggregateScope::Plain, None)?;
             let [arg] = args.as_slice() else {
                 return Ok(());
@@ -2206,7 +2149,10 @@ fn check_aggregate_calls(
             };
             check_aggregate_argument(&upper, AggregateScope::Plain, arg, value_type, columns)
         }
-        _ => Ok(()),
+        _ => expr
+            .children()
+            .into_iter()
+            .try_for_each(|child| check_aggregate_calls(child, columns)),
     }
 }
 
@@ -2626,59 +2572,8 @@ fn check_join_field_expr<'a>(
         | Expr::BooleanLiteral(_)
         | Expr::Null
         | Expr::TypedLiteral { .. } => Ok(()),
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            check_join_field_expr(
-                lhs,
-                field,
-                resolve,
-                in_aggregate.as_deref_mut(),
-                root,
-                joined,
-                aggregates,
-            )?;
-            check_join_field_expr(rhs, field, resolve, in_aggregate, root, joined, aggregates)
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => check_join_field_expr(
-            operand,
-            field,
-            resolve,
-            in_aggregate,
-            root,
-            joined,
-            aggregates,
-        ),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                check_join_field_expr(
-                    child,
-                    field,
-                    resolve,
-                    in_aggregate.as_deref_mut(),
-                    root,
-                    joined,
-                    aggregates,
-                )?;
-            }
-            Ok(())
-        }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args } if super::registry::is_aggregate_name(name) => {
             let upper = name.to_ascii_uppercase();
-            let is_aggregate = is_deferred_aggregate_name(&upper)
-                || super::registry::AGGREGATE_FUNCTIONS.contains(&upper.as_str());
-            if !is_aggregate {
-                for arg in args {
-                    check_join_field_expr(
-                        arg,
-                        field,
-                        resolve,
-                        in_aggregate.as_deref_mut(),
-                        root,
-                        joined,
-                        aggregates,
-                    )?;
-                }
-                return Ok(());
-            }
             if in_aggregate.is_some() {
                 return Err(shape("an aggregate can't be nested in another aggregate"));
             }
@@ -2718,6 +2613,26 @@ fn check_join_field_expr<'a>(
             let columns = side_columns(side, root, joined);
             let value_type = infer_expr_type_in(field, arg, &ColumnTypes::Live(columns))?;
             check_aggregate_argument(&upper, AggregateScope::Join, arg, value_type, columns)
+        }
+        Expr::FunctionCall { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::Negate(_)
+        | Expr::Cast { .. }
+        | Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::Case { .. } => {
+            for child in expr.children() {
+                check_join_field_expr(
+                    child,
+                    field,
+                    resolve,
+                    in_aggregate.as_deref_mut(),
+                    root,
+                    joined,
+                    aggregates,
+                )?;
+            }
+            Ok(())
         }
     }
 }
@@ -2785,26 +2700,22 @@ pub(crate) fn validate_qualified_columns(
                 }
                 Ok(())
             }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                walk(lhs, field, def, source_columns, source_schema)?;
-                walk(rhs, field, def, source_columns, source_schema)
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-                walk(operand, field, def, source_columns, source_schema)
-            }
-            Expr::FunctionCall { args, .. } => args
-                .iter()
-                .try_for_each(|arg| walk(arg, field, def, source_columns, source_schema)),
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-                .logic_children()
-                .into_iter()
-                .try_for_each(|child| walk(child, field, def, source_columns, source_schema)),
             Expr::Column(_)
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
             | Expr::BooleanLiteral(_)
             | Expr::Null
             | Expr::TypedLiteral { .. } => Ok(()),
+            Expr::BinaryOp { .. }
+            | Expr::FunctionCall { .. }
+            | Expr::Negate(_)
+            | Expr::Cast { .. }
+            | Expr::Not(_)
+            | Expr::IsNull { .. }
+            | Expr::Case { .. } => expr
+                .children()
+                .into_iter()
+                .try_for_each(|child| walk(child, field, def, source_columns, source_schema)),
         }
     }
     def.fields
@@ -2840,56 +2751,24 @@ fn reject_ambiguous_names(
     }
     let aggregates = aggregate_field_names(def.fields.iter().map(|f| (f.name.as_str(), &f.expr)));
 
-    fn first_ambiguous<'a>(
-        expr: &'a Expr,
-        reader: &str,
-        in_aggregate_arg: bool,
-        shadowing: &HashMap<&str, &FieldDef>,
-        aggregates: &HashSet<&str>,
-    ) -> Option<&'a str> {
-        match expr {
-            Expr::Column(name) => {
-                let is_shadowed = name != reader && shadowing.contains_key(name.as_str());
-                let reads_source_by_695 = in_aggregate_arg && aggregates.contains(name.as_str());
-                (is_shadowed && !reads_source_by_695).then_some(name.as_str())
-            }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                first_ambiguous(lhs, reader, in_aggregate_arg, shadowing, aggregates).or_else(
-                    || first_ambiguous(rhs, reader, in_aggregate_arg, shadowing, aggregates),
-                )
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-                first_ambiguous(operand, reader, in_aggregate_arg, shadowing, aggregates)
-            }
-            Expr::FunctionCall { name, args } => {
-                let in_arg =
-                    in_aggregate_arg || super::registry::lookup_aggregate_function(name).is_some();
-                args.iter()
-                    .find_map(|arg| first_ambiguous(arg, reader, in_arg, shadowing, aggregates))
-            }
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                expr.logic_children().into_iter().find_map(|child| {
-                    first_ambiguous(child, reader, in_aggregate_arg, shadowing, aggregates)
-                })
-            }
-            Expr::SourceColumn { .. }
-            | Expr::NumberLiteral(_)
-            | Expr::StringLiteral(_)
-            | Expr::BooleanLiteral(_)
-            | Expr::Null
-            | Expr::TypedLiteral { .. } => None,
-        }
-    }
-
     for reader in &def.fields {
-        if let Some(name) =
-            first_ambiguous(&reader.expr, &reader.name, false, &shadowing, &aggregates)
+        let mut reads = Vec::new();
+        collect_reads(
+            &reader.expr,
+            &aggregates,
+            false,
+            &mut reads,
+            &mut Vec::new(),
+        );
+        if let Some(name) = reads
+            .iter()
+            .find(|name| **name != reader.name && shadowing.contains_key(name.as_str()))
         {
             return Err(ValidationError::AmbiguousColumnReference(Box::new(
                 AmbiguousColumnReference {
                     field: reader.name.clone(),
                     name: name.to_string(),
-                    shadowing_expr: render_field_expr(&shadowing[name].expr),
+                    shadowing_expr: render_field_expr(&shadowing[name.as_str()].expr),
                     source_table: def.source.clone(),
                     source_schema: def.explicit_source_schema.clone(),
                 },
@@ -3022,53 +2901,25 @@ fn validate_aggregate_field_expr(
         | Expr::BooleanLiteral(_)
         | Expr::Null
         | Expr::TypedLiteral { .. } => Ok(()),
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            validate_aggregate_field_expr(
-                lhs,
-                field_name,
-                group_by,
-                source_columns,
-                in_aggregate_call,
-            )?;
-            validate_aggregate_field_expr(
-                rhs,
-                field_name,
-                group_by,
-                source_columns,
-                in_aggregate_call,
-            )
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => validate_aggregate_field_expr(
-            operand,
-            field_name,
-            group_by,
-            source_columns,
-            in_aggregate_call,
-        ),
-        Expr::FunctionCall { name, args } => {
-            let is_aggregate_call = super::registry::lookup_aggregate_function(name).is_some();
-            for arg in args {
-                validate_aggregate_field_expr(
-                    arg,
-                    field_name,
-                    group_by,
-                    source_columns,
-                    in_aggregate_call || is_aggregate_call,
-                )?;
-            }
-            Ok(())
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
+        Expr::BinaryOp { .. }
+        | Expr::FunctionCall { .. }
+        | Expr::Negate(_)
+        | Expr::Cast { .. }
+        | Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::Case { .. } => {
+            let in_aggregate_call = in_aggregate_call
+                || matches!(expr, Expr::FunctionCall { name, .. }
+                    if super::registry::is_aggregate_name(name));
+            expr.children().into_iter().try_for_each(|child| {
                 validate_aggregate_field_expr(
                     child,
                     field_name,
                     group_by,
                     source_columns,
                     in_aggregate_call,
-                )?;
-            }
-            Ok(())
+                )
+            })
         }
     }
 }
@@ -3084,54 +2935,13 @@ fn expr_is_group_by_key_passthrough(expr: &Expr, key: &str) -> bool {
     expr.reads_source_column(key)
 }
 
-pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
-    match expr {
-        Expr::Column(name) => out.push(name.clone()),
-        // Always a source column, never a read of a field.
-        Expr::SourceColumn { .. } => {}
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => {}
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_columns(lhs, out);
-            collect_columns(rhs, out);
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => collect_columns(operand, out),
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_columns(arg, out);
-            }
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                collect_columns(child, out);
-            }
-        }
-    }
-}
-
 /// Whether `expr` contains an aggregate call (`SUM`, `COUNT`, ...).
 fn has_aggregate_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::FunctionCall { name, args } => {
-            super::registry::lookup_aggregate_function(name).is_some()
-                || args.iter().any(has_aggregate_call)
-        }
-        Expr::BinaryOp { lhs, rhs, .. } => has_aggregate_call(lhs) || has_aggregate_call(rhs),
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_aggregate_call(operand),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            expr.logic_children().into_iter().any(has_aggregate_call)
-        }
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => false,
-    }
+    let mut found = false;
+    expr.walk(&mut |e| {
+        found |= matches!(e, Expr::FunctionCall { name, .. } if super::registry::is_aggregate_name(name));
+    });
+    found
 }
 
 /// The names of the calculated fields whose value is an aggregate: the ones
@@ -3159,11 +2969,10 @@ pub(crate) fn aggregate_field_names<'a>(
             if aggregates.contains(name) {
                 continue;
             }
-            let mut reads = Vec::new();
-            collect_columns(expr, &mut reads);
-            if reads
-                .iter()
-                .any(|read| read != name && aggregates.contains(read.as_str()))
+            if expr
+                .columns()
+                .into_iter()
+                .any(|read| read != *name && aggregates.contains(read))
             {
                 aggregates.insert(name);
                 grew = true;
@@ -3188,7 +2997,7 @@ pub(crate) fn without_aggregate_fields<'a, V: Copy>(
         .collect()
 }
 
-/// [`collect_columns`] split by what each column name resolves to. `fields`
+/// [`Expr::columns`] split by what each column name resolves to. `fields`
 /// gets the names read as another calculated field or as a source column
 /// (the caller tells them apart); `aggregate_args` gets the names that sit
 /// in an aggregate's argument and match an aggregate field, which resolve to
@@ -3205,37 +3014,14 @@ pub(crate) fn collect_reads(
             aggregate_args.push(name.clone());
         }
         Expr::Column(name) => fields.push(name.clone()),
-        // Always a source column, never a field; `validate`
-        // checks it names one through `validate_qualified_columns`.
-        Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => {}
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_reads(lhs, aggregates, in_aggregate_arg, fields, aggregate_args);
-            collect_reads(rhs, aggregates, in_aggregate_arg, fields, aggregate_args);
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            collect_reads(
-                operand,
-                aggregates,
-                in_aggregate_arg,
-                fields,
-                aggregate_args,
-            );
-        }
-        Expr::FunctionCall { name, args } => {
-            let in_arg =
-                in_aggregate_arg || super::registry::lookup_aggregate_function(name).is_some();
-            for arg in args {
-                collect_reads(arg, aggregates, in_arg, fields, aggregate_args);
-            }
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                collect_reads(child, aggregates, in_aggregate_arg, fields, aggregate_args);
+        // A `SourceColumn` is never a field; `validate` checks it names a
+        // source column through `validate_qualified_columns`.
+        _ => {
+            let in_arg = in_aggregate_arg
+                || matches!(expr, Expr::FunctionCall { name, .. }
+                    if super::registry::is_aggregate_name(name));
+            for child in expr.children() {
+                collect_reads(child, aggregates, in_arg, fields, aggregate_args);
             }
         }
     }
@@ -4977,40 +4763,16 @@ fn validate_regexp_pattern(field_name: &str, pattern_arg: &Expr) -> Result<(), V
 /// Postgres judge each one (`CatalogError::InvalidRegexPattern`); a
 /// non-literal pattern is [`validate`]'s refusal.
 pub(crate) fn regexp_pattern_literals(def: &TransformDef) -> Vec<(String, String)> {
-    fn walk(expr: &Expr, field: &str, out: &mut Vec<(String, String)>) {
-        match expr {
-            Expr::FunctionCall { name, args } => {
-                if name == "REGEXP_COUNT"
-                    && let Some(Expr::StringLiteral(pattern)) = args.get(1)
-                {
-                    out.push((field.to_string(), pattern.clone()));
-                }
-                for arg in args {
-                    walk(arg, field, out);
-                }
-            }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                walk(lhs, field, out);
-                walk(rhs, field, out);
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, field, out),
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                for child in expr.logic_children() {
-                    walk(child, field, out);
-                }
-            }
-            Expr::Column(_)
-            | Expr::SourceColumn { .. }
-            | Expr::NumberLiteral(_)
-            | Expr::StringLiteral(_)
-            | Expr::BooleanLiteral(_)
-            | Expr::Null
-            | Expr::TypedLiteral { .. } => {}
-        }
-    }
     let mut out = Vec::new();
     for field in &def.fields {
-        walk(&field.expr, &field.name, &mut out);
+        field.expr.walk(&mut |expr| {
+            if let Expr::FunctionCall { name, args } = expr
+                && name == "REGEXP_COUNT"
+                && let Some(Expr::StringLiteral(pattern)) = args.get(1)
+            {
+                out.push((field.name.clone(), pattern.clone()));
+            }
+        });
     }
     let mut seen = HashSet::new();
     out.retain(|entry| seen.insert(entry.clone()));
@@ -5037,25 +4799,8 @@ fn column_depths_in(expr: &Expr, depth: usize, out: &mut HashMap<String, usize>)
             *level = (*level).max(depth);
             depth
         }
-        Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => depth,
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            column_depths_in(lhs, depth + 1, out).max(column_depths_in(rhs, depth + 1, out))
-        }
-        Expr::FunctionCall { args, .. } => args
-            .iter()
-            .map(|arg| column_depths_in(arg, depth + 1, out))
-            .max()
-            .unwrap_or(depth),
-        Expr::Negate(inner) | Expr::Cast { expr: inner, .. } => {
-            column_depths_in(inner, depth + 1, out)
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-            .logic_children()
+        _ => expr
+            .children()
             .into_iter()
             .map(|child| column_depths_in(child, depth + 1, out))
             .max()

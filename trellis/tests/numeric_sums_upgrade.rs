@@ -40,24 +40,23 @@ async fn running(db: &testkit::TestDatabase) -> Trellis {
 }
 
 async fn wait_for(trellis: &Trellis, targets: &[&str], status: TransformStatus) {
+    // One budget for all the targets.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     for target in targets {
-        loop {
-            let now = trellis
-                .status(target)
-                .await
-                .expect("status")
-                .expect("defined")
-                .status;
-            if now == status {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{target} never reached {status:?}: {now:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        testkit::wait_for(
+            format!("{target} reaches {status:?}"),
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            async || {
+                let now = trellis
+                    .status(target)
+                    .await
+                    .expect("status")
+                    .expect("defined")
+                    .status;
+                if now == status { Ok(()) } else { Err(now) }
+            },
+        )
+        .await;
     }
 }
 

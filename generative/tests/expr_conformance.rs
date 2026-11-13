@@ -1314,7 +1314,7 @@ fn constant_keyword_instances(rule: &expr_gen::Rule) -> Vec<Expr> {
             Expr::BinaryOp { lhs, rhs, .. } => column_slots(lhs) + column_slots(rhs),
             Expr::FunctionCall { args, .. } => args.iter().map(column_slots).sum(),
             Expr::Negate(e) | Expr::Cast { expr: e, .. } => column_slots(e),
-            _ => expr.logic_children().into_iter().map(column_slots).sum(),
+            _ => expr.children().into_iter().map(column_slots).sum(),
         }
     }
     /// `expr` with its `slot`th column (in [`column_slots`] order) replaced
@@ -1355,10 +1355,9 @@ fn constant_keyword_instances(rule: &expr_gen::Rule) -> Vec<Expr> {
                 expr: Box::new(replace(e, slot, with)?),
                 target: *target,
             },
-            _ => match expr.map_logic_children(|c| replace(c, slot, with).ok_or(())) {
-                Some(rebuilt) => rebuilt.ok()?,
-                None => expr.clone(),
-            },
+            _ => expr
+                .try_map_children(|c| replace(c, slot, with).ok_or(()))
+                .ok()?,
         })
     }
     let only_columns = |e: &Expr| {
@@ -1374,7 +1373,7 @@ fn constant_keyword_instances(rule: &expr_gen::Rule) -> Vec<Expr> {
                         || matches!(a, Expr::StringLiteral(_) | Expr::NumberLiteral(_))
                 }),
                 Expr::Negate(x) | Expr::Cast { expr: x, .. } => leaves_are_columns(x),
-                _ => e.logic_children().into_iter().all(leaves_are_columns),
+                _ => e.children().into_iter().all(leaves_are_columns),
             }
         }
         leaves_are_columns(e)
@@ -2125,7 +2124,7 @@ fn the_generator_reaches_every_registry_entry() {
                     }
                     .to_string(),
                 );
-                for child in expr.logic_children() {
+                for child in expr.children() {
                     walk(child, seen, depth + 1, deepest);
                 }
             }

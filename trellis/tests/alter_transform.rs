@@ -68,26 +68,6 @@ use trellis::{
     Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
 
-/// Polls `predicate` until it holds or `timeout` elapses, then panics with
-/// `message` — the same no-bare-sleep discipline every other integration
-/// suite in this directory follows.
-async fn poll_until<F>(timeout: Duration, message: &str, mut predicate: F)
-where
-    F: AsyncFnMut() -> bool,
-{
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if predicate().await {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out after {timeout:?}: {message}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// The live pipeline: capture, ring maintenance, and drain workers — what
 /// a plain (non-aggregate) 1-1 transform needs to actually reach `live`, and
 /// what keeps applying change events while a test's own `ALTER TRANSFORM`
@@ -132,9 +112,9 @@ async fn persisted_definition_version(raw: &Client, target: &str) -> i64 {
 }
 
 async fn wait_for_live(raw: &Client, target: &str) {
-    poll_until(
-        Duration::from_secs(60),
+    testkit::wait_until(
         "the chunked 1-1 target must finish its initial backfill",
+        Duration::from_secs(60),
         async || persisted_status(raw, target).await.as_deref() == Some("live"),
     )
     .await;
@@ -1475,9 +1455,9 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
         ),
         "no pause outlives the dropped column"
     );
-    poll_until(
-        Duration::from_secs(30),
+    testkit::wait_until(
         "the re-added field goes live once its capture images `b`",
+        Duration::from_secs(30),
         async || column_pause_state(&raw, "order_calc", "b").await.is_none(),
     )
     .await;
@@ -1651,9 +1631,9 @@ async fn an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock() {
         })
     };
 
-    poll_until(
-        Duration::from_secs(30),
+    testkit::wait_until(
         "the ALTER must block on the version fence row",
+        Duration::from_secs(30),
         async || {
             raw.query_one(
                 "select count(*) from pg_stat_activity \
@@ -2279,9 +2259,9 @@ async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resum
         .await
         .expect("stop the define-only facade");
     let trellis = running(db.dsn()).await;
-    poll_until(
-        Duration::from_secs(60),
+    testkit::wait_until(
         "the capture pass pauses reading_calc for the retyped x",
+        Duration::from_secs(60),
         async || persisted_status(&raw, "reading_calc").await.as_deref() == Some("paused"),
     )
     .await;

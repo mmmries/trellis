@@ -81,8 +81,9 @@ zero partials, a `J` row) and locks the rows that exist, in the class's sorted
 order: one sorted `insert … on conflict do nothing` and one sorted
 `select … for update`, or one statement that does both. Placeholder inserts
 follow the lock order too, so no two transactions take two rows of a class in
-opposite orders. W3 below is the case where the insert carries the write as
-well.
+opposite orders. The insert carries the write as well in two cases: W3 below,
+and a fresh aggregate build, whose lock statement inserts an absent group with
+its final values (I1).
 
 ### I1: A writer reads after its lock, under `READ COMMITTED`
 
@@ -106,8 +107,10 @@ snapshot, taken before the lock. Every session Trellis opens sets
 database's or role's default, and a transaction that needs one snapshot for
 several reads asks for its level explicitly.
 
-One write reads first: a 1-1 build chunk's insert of the entry of a key that
-has none, from a read in the same statement. Its uniqueness check comes after
+Two writes read first, each the insert of a row that doesn't exist yet, from a
+read in the same statement.
+
+The first is a 1-1 build chunk's insert of the entry of a key that has none. Its uniqueness check comes after
 the read, and finding no entry there means no Apply has written the key since
 the read's snapshot, because the tombstone GC, the one thing that removes an
 entry an Apply wrote, skips a ledger under a build (I4). A page deletes only a
@@ -116,10 +119,30 @@ truncate commits before the chunk's first read, which holds the source's lock,
 so it empties no change the snapshot doesn't see. A key that has an entry by
 then is locked and read afresh.
 
+The second is a fresh aggregate build's insert of a group that has no row
+([ADR-0002](0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)).
+One statement takes the snapshot, reads the groups and their partials, and in
+key order inserts each absent group with its final values and that snapshot as
+its basis, and locks each group that has a row without writing it. That one
+pass is the build's lock statement (I5). Finding no row at the uniqueness check
+means no page has applied a change to the group, because nothing removes a
+group's row between the build's snapshot and its commit: the zero-group GC
+collects nothing of a definition under a build, and the build's read holds the
+source's lock against a truncate. A page that reaches the group later waits on
+the uncommitted row, then reads the basis. A group that has a row by then is
+locked by the same pass and read afresh in a later statement, as the rule
+requires. Inserting the absent groups and locking the others in two passes
+takes the locks out of key order and is not allowed.
+
 In my interleaving experiment (seventeen hand-driven scenarios of Apply racing
 a Re-derive and other producers), the scenarios where a stalled Re-derive
 meets a change to the same key, committed before or after its snapshot, hold,
-and Apply demonstrably blocks on the entry lock. In a snapshot-timing
+and Apply demonstrably blocks on the entry lock. In my model of the aggregate build
+(twenty hand-driven scenarios and 165 soak runs of this form, with pages, the
+GC and repeated builds running), the insert from the read was exact with no
+deadlock; letting the GC collect under a build, dropping a part of the
+enumeration, or rewriting the groups that had a row from the first snapshot
+were each wrong, and the two-pass form deadlocked in every run. In a snapshot-timing
 experiment I measured a snapshot taken in a separate statement differing from
 the read's in 99.7% of samples under load; the stored basis is the full
 `pg_snapshot`, not `xmin`/`xmax`. In my group-basis model a page that read a
@@ -197,11 +220,10 @@ check that turns a delta for an unlocked row into an error
 ([ADR-0019](0019-join-transforms.md)) can't fire in the build. It stays for
 pages, whose lock set is computed separately from what they write.
 
-W1 and W3 are settled for writes that add a delta. A 1-1 build chunk meets W1
-another way: it inserts the entry of a key that has none from its read (I1).
-An aggregate's build writes absolute values it read after taking its locks,
-and keeps its lock statement and its write as two statements, both in W2's
-order; how that write can write each row once is an open research question.
+W3 is for writes that add a delta. An absolute write meets W1 another way: a
+1-1 build chunk and a fresh aggregate build insert a row that doesn't exist
+from their own read (I1). A row that exists is locked, read afresh and updated
+once, in W2's order; that is all of a rebuild in place.
 
 ### The goal for a build is twice the cost of its plain query
 

@@ -126,7 +126,7 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
             collect_column_types(operand, source, out);
         }
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
+            for child in expr.children() {
                 collect_column_types(child, source, out);
             }
         }

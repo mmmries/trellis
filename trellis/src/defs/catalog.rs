@@ -7399,34 +7399,12 @@ fn expr_references_column(
     upstream_table: &str,
     upstream_column: &str,
 ) -> bool {
-    match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
-            def_source == upstream_table && name == upstream_column
-        }
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            expr_references_column(lhs, def_source, upstream_table, upstream_column)
-                || expr_references_column(rhs, def_source, upstream_table, upstream_column)
-        }
-        Expr::FunctionCall { args, .. } => args
-            .iter()
-            .any(|arg| expr_references_column(arg, def_source, upstream_table, upstream_column)),
-        Expr::Negate(operand) => {
-            expr_references_column(operand, def_source, upstream_table, upstream_column)
-        }
-        Expr::Cast { expr, .. } => {
-            expr_references_column(expr, def_source, upstream_table, upstream_column)
-        }
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => false,
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            expr.logic_children().into_iter().any(|child| {
-                expr_references_column(child, def_source, upstream_table, upstream_column)
-            })
-        }
-    }
+    let mut reads = false;
+    expr.walk(&mut |e| {
+        reads |= matches!(e, Expr::Column(name) | Expr::SourceColumn { column: name, .. }
+            if def_source == upstream_table && name == upstream_column);
+    });
+    reads
 }
 
 #[cfg(test)]
