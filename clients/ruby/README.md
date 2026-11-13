@@ -369,6 +369,10 @@ default one included.
 gem loads no Rails code and requires no gem at all; `activerecord` and
 `railties` are only ever the app's own dependencies.
 
+Rails 8.0 and later are supported. Rails 7.2 is expected to work, but CI
+doesn't run it and it carries no promise. `Trellis::Target` refuses the
+include with a clear error on a Rails without the internals it guards (7.1).
+
 ### Configuration and boot
 
 The Rails integration reads `Trellis.connect`'s options from one place,
@@ -711,24 +715,27 @@ end
 
 Two more things need care with Trellis on in the test database:
 
-- **Rails' fixture foreign-key check** resolves every foreign key without
+- **Rails 8.1's fixture foreign-key check** resolves every foreign key without
   Trellis's schema and fails with `PG::UndefinedTable`. Set
   `config.active_record.verify_foreign_keys_for_fixtures = false`, or
-  `schema_search_path: "public,trellis"` on the test database.
+  `schema_search_path: "public,trellis"` on the test database. Rails 8.0
+  doesn't need either.
 - **`parallelize(workers: n)`** loads the schema into one database per
-  worker (`<name>_<i>`), so each worker's `config.trellis.connect` has to
-  name its own, and the handle does not survive the fork. Register the hooks
-  before `require "rails/test_help"`, which is what runs the schema load:
+  worker (`<name>_<i>` on Rails 8.1, `<name>-<i>` on 8.0), so each worker's
+  `config.trellis.connect` has to name its own, and the handle does not
+  survive the fork. Connect after the fork, not at boot
+  (`config.trellis.connect_on_boot = false`), and register the hook before
+  `require "rails/test_help"`, which is what runs the schema load:
 
   ```ruby
   # test/test_helper.rb
   require "active_support/testing/parallelization"
 
-  ActiveSupport::Testing::Parallelization.before_fork_hook { Trellis::Instance.shutdown_all }
   ActiveSupport::Testing::Parallelization.after_fork_hook do |worker|
     trellis = Rails.application.config.trellis
     uri = URI.parse(trellis.connect.fetch(:url))
-    uri.path = "#{uri.path}_#{worker}"
+    suffix = ActiveRecord.version >= Gem::Version.new("8.1") ? "_" : "-"
+    uri.path = "#{uri.path}#{suffix}#{worker}"
     trellis.connect = trellis.connect.merge(url: uri.to_s)
   end
 
@@ -736,7 +743,10 @@ Two more things need care with Trellis on in the test database:
 
   class ActiveSupport::TestCase
     parallelize(workers: 2)
-    parallelize_setup { Trellis::Railtie.connect } # after the schema load
+    # In a worker, after the schema load; in the one process of a run below
+    # Rails' parallelization threshold, the first test. Declare it before any
+    # setup that needs the handle (`resume_capture_disruptions`).
+    setup { Trellis::Railtie.connect if Trellis::Instance.connected.empty? }
   end
   ```
 
