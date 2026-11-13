@@ -20,8 +20,8 @@ application does, it does through these — and every definition-changing operat
 enters through a single grammar-driven entrypoint on them (see below).
 
 **Tier 2 — composable primitives.** An embedder may reach these directly: `Config`,
-`migrate`, `Metrics`, `Error`/`ErrorCode`, `statement_kind`, and `otel`
-(behind the `otlp` feature). They are public and stable, re-exported at the crate
+`migrate`, `Metrics`, `Error`/`ErrorCode`, `statement_kind`, `target_select_sql`, and
+`otel` (behind the `otlp` feature). They are public and stable, re-exported at the crate
 root, and documented as deliberate building blocks rather than incidental leaks. The
 modules that define them are private: the crate root is the whole surface, and
 `.github/public-api.txt` lists it, checked in CI.

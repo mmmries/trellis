@@ -658,6 +658,31 @@ over the target ("Targets as models") writes here:
 EventCount.insert_all([{ kind: "click", n: 3 }])
 ```
 
+For the real numbers, `refresh_trellis_target` fills a target from its
+definition, on the test's connection and inside its transaction:
+
+```ruby
+require "trellis/test_support"
+
+class EventCountTest < ActiveSupport::TestCase
+  include Trellis::TestSupport
+
+  test "counts clicks" do
+    3.times { Event.create!(kind: "click") }
+    refresh_trellis_target :event_counts # DELETE, then INSERT ... SELECT
+    assert_equal 3, EventCount.find_by!(kind: "click").n
+  end
+end
+```
+
+It computes the target from its sources as they stand, as a fresh build
+would, with the `SELECT` the engine renders from the definition the schema
+load left in `trellis.restore_queue`. It doesn't exercise capture, the drain
+or any pause. A chained target refreshes its upstream first. A source the
+definition names without a schema resolves on the test's `search_path`. It
+raises `Trellis::ValidationError` where Trellis is on, since the engine
+maintains the target there (`trellis_on: true` writes anyway).
+
 ### Running Trellis in tests
 
 Tests that need Trellis for real need it on in the test database. Set

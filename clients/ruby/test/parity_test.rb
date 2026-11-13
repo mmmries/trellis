@@ -3,6 +3,7 @@
 require "test_helper"
 require_relative "support/parity"
 require_relative "support/rails_app"
+require "trellis/test_support"
 
 # The cross-language parity suite: clients/parity/cases.json,
 # a script of (operation, input, expected shape) steps that the Elixir suite
@@ -19,6 +20,11 @@ class ParityTest < Minitest::Test
   def test_every_live_step_returns_its_expected_shape
     TestCluster.private_cluster do |cluster|
       pg = TestCluster.pg(cluster)
+      # refresh_target's connection, the one a Rails test has.
+      ActiveRecord::Base.establish_connection(
+        adapter: "postgresql", host: cluster.fetch("host"), port: cluster.fetch("port"),
+        username: cluster.fetch("user"), database: cluster.fetch("dbname")
+      )
       saved = {}
       Parity.fixture.fetch("live").each_with_index do |step, index|
         run_step(step, index, pg:, cluster:, saved:)
@@ -26,6 +32,7 @@ class ParityTest < Minitest::Test
     ensure
       # Before the private cluster goes away under it.
       Trellis.shutdown
+      ActiveRecord::Base.connection_pool.disconnect!
       pg&.close
     end
   end
@@ -119,6 +126,7 @@ class ParityTest < Minitest::Test
     case op
     when "sql" then step.fetch("args").each { |sql| pg.exec(sql) }
     when "now" then saved[step.fetch("save")] = Time.now.utc.floor(6)
+    when "refresh_target" then step.fetch("args").each { |target| assert_refresh_matches(target, what) }
     else
       args = Parity.argument(step.fetch("args", []), saved:, cluster:)
       opts = Parity.argument(step.fetch("opts", {}), saved:, cluster:)
@@ -129,6 +137,23 @@ class ParityTest < Minitest::Test
                 call.call.tap { |result| assert_shape(step.fetch("expect"), result, saved, what) }
               end
       saved[step["save"]] = value if step.key?("save")
+    end
+  end
+
+  # Trellis::TestSupport#refresh_trellis_target over `target`, in a
+  # transaction rolled back after, leaves exactly the rows (as values) the
+  # engine maintains in it. Trellis is on here, hence trellis_on: true.
+  def assert_refresh_matches(target, what)
+    connection = ActiveRecord::Base.lease_connection
+    ActiveRecord::Base.transaction do
+      connection.execute("create temp table parity_maintained on commit drop as table #{target}")
+      refute_equal 0, connection.select_value("select count(*) from parity_maintained"), "#{what}: #{target} is empty"
+      Trellis::TestSupport.refresh_trellis_target(target, trellis_on: true)
+      missing = connection.select_rows("table parity_maintained except all table #{target}")
+      extra = connection.select_rows("table #{target} except all table parity_maintained")
+      assert_equal [[], []], [missing, extra],
+                   "#{what}: #{target}'s refresh lacks the first rows the engine maintains and adds the second"
+      raise ActiveRecord::Rollback
     end
   end
 

@@ -139,6 +139,10 @@ defmodule Trellis.Native do
   def join_side_parts, do: :erlang.nif_error(:nif_not_loaded)
   def log_levels, do: :erlang.nif_error(:nif_not_loaded)
   def render_prometheus, do: :erlang.nif_error(:nif_not_loaded)
+
+  def target_select_sql(_text, _grammar_version, _target_columns),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   def install_log_bridge(_level), do: :erlang.nif_error(:nif_not_loaded)
   def take_log_records(_max), do: :erlang.nif_error(:nif_not_loaded)
 end

@@ -1348,6 +1348,21 @@ fn statement_kinds() -> NifReply<Vec<&'static str>> {
         .collect())
 }
 
+/// The `SELECT` that computes the whole target of the stored definition
+/// `text` (written under grammar `grammar_version`), one output column per
+/// entry of `target_columns` in that order: `trellis::target_select_sql`. It
+/// needs no handle and reads no database. A `parse` error for text that
+/// doesn't parse, `validation` for a column the definition computes nothing
+/// for.
+#[rustler::nif(schedule = "DirtyIo")]
+fn target_select_sql(
+    text: String,
+    grammar_version: i32,
+    target_columns: Vec<String>,
+) -> NifReply<String> {
+    trellis::target_select_sql(&text, grammar_version, &target_columns).map_err(plain)
+}
+
 /// The process-wide metrics registry in Prometheus text exposition format:
 /// `trellis::Metrics::render_prometheus`, the registry every handle in this
 /// OS process records into. On a dirty CPU scheduler: see the module docs.

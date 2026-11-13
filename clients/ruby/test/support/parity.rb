@@ -94,7 +94,7 @@ module Parity
   }.freeze
 
   # The fixture's own steps, which drive the test rather than the binding.
-  HARNESS_OPS = %w[sql now].freeze
+  HARNESS_OPS = %w[sql now refresh_target].freeze
 
   # How long an `until` step polls before failing.
   UNTIL_SECONDS = 30

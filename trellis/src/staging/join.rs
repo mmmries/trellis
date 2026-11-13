@@ -382,7 +382,7 @@ pub(crate) struct JoinTargetPlan {
 /// field's expression, side-qualified columns kept (a `GROUP BY` key's
 /// field stays a reference, which reads the target group's column). `None`
 /// past a depth no accepted definition reaches (define refuses a cycle).
-fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Option<Expr> {
+pub(crate) fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Option<Expr> {
     if depth > def.fields.len() {
         return None;
     }

@@ -3195,6 +3195,16 @@ pub enum TrellisError {
     /// working meanwhile. Retry once the other version's processes have
     /// stopped. [`ErrorCode::VersionHandover`].
     OtherVersionLive(crate::handover::OtherVersionLive),
+    /// [`crate::target_select_sql`] can't render the `SELECT` of the
+    /// transform of `target`: the target has a column the definition
+    /// computes no value for, or its fields can't be inlined (which define
+    /// refuses). [`ErrorCode::Validation`].
+    TargetSelect {
+        /// The definition's target, as written.
+        target: String,
+        /// Why, naming the column.
+        reason: String,
+    },
 }
 
 impl TrellisError {
@@ -3216,9 +3226,9 @@ impl TrellisError {
             // A backfill request against an unpublished table is a rejected
             // call given the connection's current state — same category as
             // any other invalid-configuration error.
-            TrellisError::TableNotCaptured { .. } | TrellisError::AmbiguousSourceTable { .. } => {
-                ErrorCode::Validation
-            }
+            TrellisError::TableNotCaptured { .. }
+            | TrellisError::AmbiguousSourceTable { .. }
+            | TrellisError::TargetSelect { .. } => ErrorCode::Validation,
             TrellisError::SourceTableNotFound(_) => ErrorCode::NotFound,
             // Same category as `ClientError`'s equivalent thread-lifecycle
             // variants — an embedder can't do anything about these beyond
@@ -3329,6 +3339,9 @@ impl std::fmt::Display for TrellisError {
                 budget.as_secs_f64()
             ),
             TrellisError::OtherVersionLive(seen) => write!(f, "refused: {seen}"),
+            TrellisError::TargetSelect { target, reason } => {
+                write!(f, "can't render the SELECT of transform {target}: {reason}")
+            }
             TrellisError::MigrationsPending { pending, error } => {
                 write!(
                     f,
@@ -3354,7 +3367,8 @@ impl std::error::Error for TrellisError {
             | TrellisError::BlockingThreadGone
             | TrellisError::CancelledByShutdown
             | TrellisError::CalledFromAsyncContext
-            | TrellisError::CallTimeout { .. } => None,
+            | TrellisError::CallTimeout { .. }
+            | TrellisError::TargetSelect { .. } => None,
             TrellisError::BlockingSpawn(err) => Some(err),
             TrellisError::Apply(err) => Some(err),
             TrellisError::TransformNotFound(_) | TrellisError::ColumnNotFound { .. } => None,

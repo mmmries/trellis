@@ -169,6 +169,10 @@ defmodule Trellis.ParityTest do
       "now" ->
         Map.put(saved, step["save"], DateTime.utc_now())
 
+      "refresh_target" ->
+        Enum.each(step["args"], &assert_refresh_matches(pg, &1, what))
+        saved
+
       _ ->
         args = Parity.argument(Map.get(step, "args", []), saved, cluster)
         opts = Parity.argument(Map.get(step, "opts", %{}), saved, cluster)
@@ -258,6 +262,47 @@ defmodule Trellis.ParityTest do
         do: {:done, result},
         else: {:waiting, result}
     end)
+  end
+
+  # `target` refilled from its definition's SELECT (`trellis::target_select_sql`),
+  # in a transaction rolled back after, holds exactly the rows (as values)
+  # the engine maintains in it.
+  defp assert_refresh_matches(pg, target, what) do
+    {:error, :rolled_back} =
+      Postgrex.transaction(pg, fn conn ->
+        query = &Postgrex.query!(conn, &1, &2).rows
+
+        query.("create temp table parity_maintained on commit drop as table #{target}", [])
+        assert [[count]] = query.("select count(*) from parity_maintained", [])
+        assert count > 0, "#{what}: #{target} is empty"
+
+        [[text, version]] =
+          query.(
+            "select definition_text, grammar_version from trellis.transform_definitions " <>
+              "where target_table = 'public.' || $1",
+            [target]
+          )
+
+        columns =
+          query.(
+            "select attname::text from pg_attribute where attrelid = to_regclass($1::text) " <>
+              "and attnum > 0 and not attisdropped order by attnum",
+            [target]
+          )
+          |> List.flatten()
+
+        {:ok, select} = Trellis.Native.target_select_sql(text, version, columns)
+        column_list = Enum.map_join(columns, ", ", &~s("#{&1}"))
+        query.("delete from #{target}", [])
+        query.("insert into #{target} (#{column_list}) #{select}", [])
+        missing = query.("table parity_maintained except all table #{target}", [])
+        extra = query.("table #{target} except all table parity_maintained", [])
+
+        assert {missing, extra} == {[], []},
+               "#{what}: #{target}'s refresh lacks the first rows the engine maintains and adds the second"
+
+        Postgrex.rollback(conn, :rolled_back)
+      end)
   end
 
   defp canonical(op, result), do: Parity.canonical_result(op, result)
