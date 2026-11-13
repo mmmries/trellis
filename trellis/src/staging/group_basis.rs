@@ -3846,7 +3846,28 @@ impl GroupTargetPlan {
     /// and not written goes into [`Self::recomputed`] for the rebuild's
     /// statement. `$1` is the ring's name for the source; `pause` is a test's
     /// pause inside the statement (`super::interleave::pause_in_statement`).
-    fn write_once_sql(&self, image_columns: Option<&[String]>, pause: Option<&str>) -> String {
+    ///
+    /// With `leaf` (a leaf of a tree as recorded, [`RebuildScope::read_node`])
+    /// the `GROUP BY` reads the leaf, and the enumeration names only the
+    /// groups the leaf's route predicates route to it; the caller runs it
+    /// under [`set_leaf_settings`].
+    fn write_once_sql(
+        &self,
+        image_columns: Option<&[String]>,
+        leaf: Option<&RebuildScope>,
+        pause: Option<&str>,
+    ) -> String {
+        let from = leaf
+            .and_then(|leaf| leaf.node.as_deref())
+            .unwrap_or(&self.source_row);
+        // Planted bug: a leaf's enumeration not routed to the leaf. See
+        // `crate::plant`.
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+        let mut routed = leaf;
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(crate::plant::Plant::GbBuildLeafUnrouted, leaf.is_some()) {
+            routed = None;
+        }
         let cols = quoted(&self.shape.group_cols);
         let extremes = self.shape.extremes();
         // Planted bug: the write leaves the extremes and their basis as they
@@ -3943,9 +3964,9 @@ impl GroupTargetPlan {
                  select {keyed} from c where not exists (select from up where {uc}) \
              ), \
              {tail}",
-            fresh = self.fresh_select(&self.group_values(), &self.source_row, false),
+            fresh = self.fresh_select(&self.group_values(), from, false),
             col_list = cols.join(", "),
-            enumeration = self.rebuild_groups_select(None, "$1", false),
+            enumeration = self.rebuild_groups_select(routed, "$1", false),
             c_cols = c_cols.join(", "),
             hidden = self.hidden_ident,
             insert_cols = insert_cols.join(", "),
@@ -3960,16 +3981,16 @@ impl GroupTargetPlan {
 
     /// Planted bug `gb_build_snapshot_before_locks` (`crate::plant`):
     /// creates `early`, a temporary table holding [`Self::rebuild_sql`]'s
-    /// `GROUP BY` of the whole source and its snapshot and stamp, all from
-    /// this one statement's snapshot (one row of `NULL`s past the snapshot
-    /// when the source is empty).
+    /// `GROUP BY` of `from` (the source, or a leaf) and its snapshot and
+    /// stamp, all from this one statement's snapshot (one row of `NULL`s
+    /// past the snapshot when it is empty).
     #[cfg(any(test, feature = "test-util"))]
-    fn planted_early_read_sql(&self, early: &str) -> String {
+    fn planted_early_read_sql(&self, early: &str, from: &str) -> String {
         format!(
             "create temporary table {early} on commit drop as \
              with snap as materialized ({SNAPSHOT_AND_STAMP}) \
              select snap.*, a.* from snap left join ({fresh}) as a on true",
-            fresh = self.fresh_select(&self.group_values(), &self.source_row, false),
+            fresh = self.fresh_select(&self.group_values(), from, false),
         )
     }
 
@@ -4720,6 +4741,112 @@ pub(super) async fn restore_settings(
     Ok(())
 }
 
+/// Whether a leaf's write-once first statement may run under
+/// [`set_leaf_settings`]: the session's `DateStyle` and `TimeZone` are the
+/// pinned values, its `search_path` is `catalog_schema` alone (as
+/// `crate::pool` sets it), and none of the objects that argument excludes
+/// exists: an operator in `catalog_schema`, a function there named like one
+/// in `pg_catalog`, or a relation or type in this session's temporary
+/// schema named like one in `pg_catalog`. Otherwise the leaf takes the
+/// rebuild's three statements.
+async fn leaf_settings_agree(
+    txn: &Transaction<'_>,
+    catalog_schema: &str,
+) -> Result<bool, ApplyError> {
+    use crate::capture::partitions::{PINNED_DATESTYLE, PINNED_TIMEZONE};
+    Ok(txn
+        .query_one(
+            "select current_setting('datestyle') = $1 \
+                and current_setting('timezone') = $2 \
+                and current_setting('search_path') = pg_catalog.quote_ident($3) \
+                and not exists (select from pg_catalog.pg_operator o \
+                                join pg_catalog.pg_namespace n on n.oid = o.oprnamespace \
+                                where n.nspname = $3) \
+                and not exists (select from pg_catalog.pg_proc p \
+                                join pg_catalog.pg_namespace n on n.oid = p.pronamespace \
+                                where n.nspname = $3 \
+                                  and exists (select from pg_catalog.pg_proc c \
+                                              where c.proname = p.proname \
+                                                and c.pronamespace = \
+                                                    'pg_catalog'::pg_catalog.regnamespace)) \
+                and not exists (select from pg_catalog.pg_class t \
+                                where t.relnamespace = pg_catalog.pg_my_temp_schema() \
+                                  and exists (select from pg_catalog.pg_class c \
+                                              where c.relname = t.relname \
+                                                and c.relnamespace = \
+                                                    'pg_catalog'::pg_catalog.regnamespace)) \
+                and not exists (select from pg_catalog.pg_type t \
+                                where t.typnamespace = pg_catalog.pg_my_temp_schema() \
+                                  and exists (select from pg_catalog.pg_type c \
+                                              where c.typname = t.typname \
+                                                and c.typnamespace = \
+                                                    'pg_catalog'::pg_catalog.regnamespace))",
+            &[&PINNED_DATESTYLE, &PINNED_TIMEZONE, &catalog_schema],
+        )
+        .await?
+        .get(0))
+}
+
+/// Sets a leaf's write-once first statement's settings ([`pin_settings`],
+/// then `search_path` =
+/// [`crate::capture::partitions::pinned_then_session_path`] of the
+/// session's path) and returns what [`restore_settings`] restores. The
+/// caller has checked [`leaf_settings_agree`].
+///
+/// The statement routes (the leaf's route predicates, over a text recorded
+/// under the pinned settings) and reads (the leaf's `GROUP BY`, Trellis's
+/// tables, the writes) under one set of settings. Under these, every name
+/// in the routing resolves as under the pinned settings, and every name in
+/// the reading as under the session's:
+///
+/// - **Settings.** `DateStyle` and `TimeZone` are equal in all three. Every
+///   other setting is the session's in all three (the pinned `lock_timeout`
+///   is put back).
+/// - **Paths.** Pinned `P = pg_catalog, pg_temp`, session `S = "<schema>"`,
+///   these `C = pg_catalog, pg_temp, "<schema>"`. Postgres searches an
+///   unlisted `pg_catalog` first, an unlisted `pg_temp` first for relations
+///   and types, and `pg_temp` never for other objects. So relations and
+///   types search `P: catalog, temp`, `S: temp, catalog, schema`,
+///   `C: catalog, temp, schema`; functions, operators, collations and the
+///   rest `P: catalog`, and `S` and `C: catalog, schema`.
+/// - **Relations, types, collations** resolve to the first match. `P` is a
+///   prefix of `C`, so whatever `P` resolves, `C` resolves alike. `C` and
+///   `S` differ only in the order of `pg_temp` and `pg_catalog`, which
+///   matters only for a name both hold, and none does (checked).
+/// - **Functions and operators** resolve by overload resolution over every
+///   listed schema's candidates, where a later schema's better match wins.
+///   `C` and `S` list the same schemas. `C` adds `"<schema>"`'s candidates
+///   to `P`'s, and `"<schema>"` has no operator and no function named like
+///   one in `pg_catalog`, where `P` finds all of its (checked).
+/// - **Casts, column defaults, partition bounds and domain checks** are
+///   stored by oid and resolve no name.
+/// - **The recorded text** is deparsed under `P`
+///   (`crate::capture::partitions`), which qualifies each object `P` would
+///   not find, and a qualified name doesn't use the path.
+///
+/// One difference remains: a name `P` doesn't resolve can resolve under `C`
+/// to an object of `"<schema>"`. The text names none. Only user code that
+/// the routing runs and that resolves names at run time with no path of its
+/// own (a SQL function in a user operator class or domain check) could, by
+/// naming Trellis's catalog by bare name, and under `P` that raises. That
+/// is user code reading Trellis's internals, which `P` already lets reach
+/// Trellis's temporary tables the same way.
+///
+/// The values are `set_config(…, true)`, as `SET LOCAL`: put back after the
+/// statement, or dropped with the transaction if the statement fails, since
+/// the leaf's transaction takes no savepoint around it.
+async fn set_leaf_settings(txn: &Transaction<'_>) -> Result<[String; 4], ApplyError> {
+    let saved = pin_settings(txn).await?;
+    txn.execute(
+        "select pg_catalog.set_config('search_path', $1, true)",
+        &[&crate::capture::partitions::pinned_then_session_path(
+            &saved[0],
+        )],
+    )
+    .await?;
+    Ok(saved)
+}
+
 /// A JOIN build's enumeration of one side's cells (`super::join::build`,
 /// ADR-0002's R8): every cell the side's hidden table holds, every cell of
 /// its table's rows, and the cell of every old image of the ring's changes
@@ -5135,8 +5262,9 @@ enum RebuildRead {
 /// build is one absolute write per structure"), in the
 /// caller's `READ COMMITTED` transaction, which
 /// commits it: one absolute write of every group, in three statements. A
-/// `fresh` build or resume of a plain aggregate over an unpartitioned
-/// source takes [`write_once`] instead.
+/// `fresh` build or resume of a plain aggregate takes [`write_once`]
+/// instead over an unpartitioned source, and over a leaf of a tree as
+/// recorded when [`leaf_settings_agree`] holds.
 ///
 /// 1. **Enumerate** ([`GroupTargetPlan::rebuild_groups_sql`], R8): the
 ///    target's own groups, the source's, and those named by the old images
@@ -5165,6 +5293,7 @@ enum RebuildRead {
 /// visible rows it wrote and deleted.
 pub(crate) async fn rebuild(
     txn: &Transaction<'_>,
+    catalog_schema: &str,
     plan: &GroupTargetPlan,
     scope: Option<&RebuildScope>,
     fresh: bool,
@@ -5172,8 +5301,20 @@ pub(crate) async fn rebuild(
 ) -> Result<(usize, usize), ApplyError> {
     txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
         .await?;
-    if fresh && scope.is_none() && matches!(plan.writer, Writer::Aggregate) {
-        return write_once(txn, plan, mutations).await;
+    if fresh && matches!(plan.writer, Writer::Aggregate) {
+        match scope {
+            None => return write_once(txn, plan, None, mutations).await,
+            Some(
+                leaf @ RebuildScope {
+                    node: Some(_),
+                    read_node: true,
+                    ..
+                },
+            ) if leaf_settings_agree(txn, catalog_schema).await? => {
+                return write_once(txn, plan, Some(leaf), mutations).await;
+            }
+            Some(_) => {}
+        }
     }
     let session = if scope.is_some() {
         Some(pin_settings(txn).await?)
@@ -5190,7 +5331,7 @@ pub(crate) async fn rebuild(
         let early = "pg_temp.trellis_planted_early_read".to_string();
         txn.batch_execute(&format!(
             "drop table if exists {early}; {}",
-            plan.planted_early_read_sql(&early)
+            plan.planted_early_read_sql(&early, &plan.source_row)
         ))
         .await?;
         Some(early)
@@ -5252,29 +5393,36 @@ pub(crate) async fn rebuild(
 const STRAGGLER_PROBE_SHARE: f64 = 0.1;
 
 /// [`rebuild`]'s write-once form: a fresh build or a resume of a plain
-/// aggregate over an unpartitioned source, which writes each group once
+/// aggregate over an unpartitioned source, or over one `leaf` of a
+/// partitioned source's tree as recorded, which writes each group once
 /// (ADR-0002, ADR-0028 W1). The zero-group GC collects nothing of the
 /// definition from the build's start to its commit
 /// (`super::retire::collect_zero_groups`), so a group with no hidden row at
 /// the insert's uniqueness check is one no page has applied to.
 ///
 /// 1. One statement ([`GroupTargetPlan::write_once_sql`]) takes the
-///    snapshot, reads the source's groups and the enumeration, inserts each
-///    group that has no hidden row with its final values, and locks each
-///    that has one: a group a page made or applied to since the build
-///    started, a **straggler**.
+///    snapshot, reads the source's (the leaf's) groups and the enumeration
+///    (routed to the leaf), inserts each group that has no hidden row with
+///    its final values, and locks each that has one: a group a page made or
+///    applied to since the build started, a **straggler**. A leaf's runs
+///    under [`set_leaf_settings`].
 /// 2. If there are stragglers, the rebuild's replace
 ///    ([`GroupTargetPlan::rebuild_sql`]) rewrites them from a snapshot of its
 ///    own, never the first: a page may have applied to one after it. It
-///    reads them by an index probe each when they are at most
+///    runs under the session's settings, and reads them by an index probe
+///    of the source (the root) each when they are at most
 ///    [`STRAGGLER_PROBE_SHARE`] of the groups and the source has an index on
 ///    the group columns (`crate::defs::source_index::has_index`), else by one
-///    `GROUP BY` of the source.
+///    `GROUP BY` of the source (the leaf).
+///
+/// A leaf's transaction touches only the groups its scope routes to it.
 async fn write_once(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
+    leaf: Option<&RebuildScope>,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
+    let node = leaf.and_then(|leaf| leaf.node.as_deref());
     // Planted bug: rewrite the stragglers from a snapshot taken before the
     // groups were locked. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -5282,7 +5430,7 @@ async fn write_once(
         let early = "pg_temp.trellis_planted_early_read".to_string();
         txn.batch_execute(&format!(
             "drop table if exists {early}; {}",
-            plan.planted_early_read_sql(&early)
+            plan.planted_early_read_sql(&early, node.unwrap_or(&plan.source_row))
         ))
         .await?;
         Some(early)
@@ -5325,12 +5473,19 @@ async fn write_once(
         &hidden,
         None,
     ));
+    let session = match leaf {
+        Some(_) => Some(set_leaf_settings(txn).await?),
+        None => None,
+    };
     let rows = txn
         .query(
-            &collated.write_once_sql(image_columns.as_deref(), pause_sql),
+            &collated.write_once_sql(image_columns.as_deref(), leaf, pause_sql),
             &[&plan.source],
         )
         .await?;
+    if let Some(session) = session {
+        restore_settings(txn, &session).await?;
+    }
     #[cfg(any(test, feature = "test-util"))]
     if let Some(pause) = pause {
         pause.end(txn).await?;
@@ -5359,7 +5514,9 @@ async fn write_once(
     {
         RebuildRead::Probe
     } else {
-        RebuildRead::Source
+        node.map_or(RebuildRead::Source, |node| {
+            RebuildRead::Node(node.to_string())
+        })
     };
     #[cfg(any(test, feature = "test-util"))]
     let read = match early {
@@ -5397,7 +5554,7 @@ pub(crate) async fn rebuild_definition(
         return Ok(None);
     };
     let mut mutations = TargetMutations::new();
-    let counts = rebuild(txn, &plan, scope, fresh, &mut mutations).await?;
+    let counts = rebuild(txn, catalog_schema, &plan, scope, fresh, &mut mutations).await?;
     mutations.flush(txn).await?;
     Ok(Some(counts))
 }
@@ -5620,7 +5777,7 @@ pub async fn explain_whole_source_reads(
             plan.rebuild_sql(None, &RebuildRead::Source),
             REBUILD_PLAN_SETTINGS,
         ),
-        (plan.write_once_sql(None, None), REBUILD_PLAN_RESET),
+        (plan.write_once_sql(None, None, None), REBUILD_PLAN_RESET),
     ];
     let mut plans = [String::new(), String::new(), String::new()];
     for (out, (sql, settings)) in plans.iter_mut().zip(statements) {
@@ -7006,5 +7163,76 @@ mod tests {
                 .expect("stored scales"),
             scales
         );
+    }
+
+    /// A leaf's first statement takes the combined settings only in a
+    /// session set as Trellis sets its own, with none of the objects their
+    /// argument excludes ([`set_leaf_settings`]); each of those turns the
+    /// leaf back to the rebuild's three statements. The combined settings
+    /// are gone again after [`restore_settings`], and after a failed
+    /// statement's rollback.
+    #[tokio::test]
+    async fn a_leaf_takes_the_combined_settings_only_where_their_argument_holds() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "create schema if not exists trellis; \
+                 create function trellis.trellis_test_wake() returns void \
+                     language sql as ''; \
+                 {}; {}",
+                crate::pool::search_path_sql("trellis"),
+                crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
+            ))
+            .await
+            .expect("a session as Trellis sets its own");
+        let agree = async |client: &mut tokio_postgres::Client, change: &str| -> bool {
+            let txn = client.transaction().await.expect("begin");
+            txn.batch_execute(change).await.expect("change");
+            let agree = leaf_settings_agree(&txn, "trellis").await.expect("check");
+            txn.rollback().await.expect("rollback");
+            agree
+        };
+        assert!(agree(&mut client, "").await, "Trellis's own session");
+        for change in [
+            "set local datestyle = 'German, DMY'",
+            "set local timezone = 'America/Los_Angeles'",
+            "set local search_path = trellis, public",
+            "create function trellis.lower(text) returns text language sql as 'select $1'",
+            "create operator trellis.=== (leftarg = integer, rightarg = integer, \
+                 function = pg_catalog.int4eq)",
+            "create temporary table int4 (x integer)",
+            "create temporary table pg_class (x integer)",
+        ] {
+            assert!(!agree(&mut client, change).await, "{change}");
+        }
+
+        let path = async |txn: &Transaction<'_>| -> String {
+            txn.query_one("select current_setting('search_path')", &[])
+                .await
+                .expect("path")
+                .get(0)
+        };
+        let txn = client.transaction().await.expect("begin");
+        let saved = set_leaf_settings(&txn).await.expect("set");
+        assert_eq!(path(&txn).await, "pg_catalog, pg_temp, trellis");
+        restore_settings(&txn, &saved).await.expect("restore");
+        assert_eq!(path(&txn).await, "trellis");
+        set_leaf_settings(&txn).await.expect("set");
+        assert!(txn.batch_execute("select 1 / 0").await.is_err());
+        txn.rollback().await.expect("rollback");
+        let txn = client.transaction().await.expect("begin");
+        assert_eq!(
+            path(&txn).await,
+            "trellis",
+            "the failed statement's rollback"
+        );
+        txn.rollback().await.expect("rollback");
     }
 }

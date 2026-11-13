@@ -201,6 +201,19 @@ pub enum Plant {
     /// mid-burst sweeps (logbook `20261113T071500-c-sweep`): it needs a page
     /// to commit between the second statement's snapshot and its update.
     GbBuildStragglerUnlocked,
+    /// ADR-0002, "An aggregate's build is one absolute write per structure":
+    /// a leaf's write-once first statement enumerates the hidden rows,
+    /// visible rows and old images of every group, not only those the leaf's
+    /// scope routes to it. Another leaf's group that has a hidden row is
+    /// locked as a straggler and rewritten from this leaf's rows, which hold
+    /// none of it, so between the leaves' transactions it reads zero.
+    ///
+    /// Pinned by `partition_group_basis_build`'s
+    /// `a_leaf_build_leaves_another_leafs_groups_alone`.
+    ///
+    /// No generative sweep tier reaches it: none builds over a partitioned
+    /// source.
+    GbBuildLeafUnrouted,
     /// ADR-0019 JR1: a `JOIN` page takes no `J` lock on its keys
     /// (`staging::join`'s `write_locked` inserts only the missing `J` rows).
     /// Two pages that change one key from opposite sides without sharing a
@@ -799,6 +812,7 @@ impl Plant {
         Plant::GbBuildNoRingBranch,
         Plant::GbBuildNullKeyByEquality,
         Plant::GbBuildStragglerUnlocked,
+        Plant::GbBuildLeafUnrouted,
         Plant::JoinNoJLock,
         Plant::JoinOtherSideBeforeJ,
         Plant::JoinDropFlip,
@@ -877,6 +891,7 @@ impl Plant {
             Plant::GbBuildNoRingBranch => "gb_build_no_ring_branch",
             Plant::GbBuildNullKeyByEquality => "gb_build_null_key_by_equality",
             Plant::GbBuildStragglerUnlocked => "gb_build_straggler_unlocked",
+            Plant::GbBuildLeafUnrouted => "gb_build_leaf_unrouted",
             Plant::JoinNoJLock => "join_no_j_lock",
             Plant::JoinOtherSideBeforeJ => "join_other_side_before_j",
             Plant::JoinDropFlip => "join_drop_flip",
