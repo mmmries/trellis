@@ -1502,8 +1502,12 @@ pub(crate) async fn pause_readers_of_retyped(
 /// A definition paused by a logical restore is left out: its OIDs are the
 /// original database's, and its resume records them afresh. No other
 /// operation changes `pg_enum.enumlabel`, and `pg_upgrade` keeps both OIDs
-/// and labels. Returns whether it paused any definition.
-pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<bool, CaptureError> {
+/// and labels. So is each of `excluded`, whose tables the role can't look
+/// up (`staging::halt::Unusable`). Returns whether it paused any definition.
+pub(crate) async fn pause_readers_of_relabelled(
+    client: &mut Client,
+    excluded: &[i64],
+) -> Result<bool, CaptureError> {
     let not_restored = "not exists (select 1 from capture_failures f \
                         where f.transform_id = v.transform_id and f.restored)";
     // Every recorded value of a type its definition reads now whose label
@@ -1519,7 +1523,8 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
              join pg_catalog.pg_type t on t.oid = v.type_oid \
              join pg_catalog.pg_namespace n on n.oid = t.typnamespace \
              join transform_definitions d on d.id = v.transform_id \
-             where e.enumlabel::text <> v.label and {not_restored} {ids} \
+             where e.enumlabel::text <> v.label and {not_restored} \
+               and r.transform_id <> all($1) {ids} \
              order by v.transform_id, e.enumsortorder",
             read = key_types::READ_ENUM_TYPES,
         )
@@ -1531,7 +1536,7 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
             "select v.transform_id, d.source_table, v.tbl, v.col, v.kind, v.was, v.now \
              from ({RETYPED_ENUM_COLUMNS}) v \
              join transform_definitions d on d.id = v.transform_id \
-             where {not_restored} {ids} \
+             where {not_restored} and v.transform_id <> all($1) {ids} \
              order by v.transform_id, v.tbl, v.col, v.kind"
         )
     };
@@ -1539,7 +1544,7 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
     for sql in [relabelled(""), retyped("")] {
         candidates.extend(
             client
-                .query(&sql, &[])
+                .query(&sql, &[&excluded])
                 .await?
                 .into_iter()
                 .map(|row| row.get::<_, i64>(0)),
@@ -1558,10 +1563,16 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
         )
         .await?;
         let found = txn
-            .query(&relabelled("and v.transform_id = any($1)"), &[&candidates])
+            .query(
+                &relabelled("and v.transform_id = any($2)"),
+                &[&excluded, &candidates],
+            )
             .await?;
         let found_retyped = txn
-            .query(&retyped("and v.transform_id = any($1)"), &[&candidates])
+            .query(
+                &retyped("and v.transform_id = any($2)"),
+                &[&excluded, &candidates],
+            )
             .await?;
         let lsn: crate::PgLsn = txn
             .query_one("select pg_catalog.pg_current_wal_insert_lsn()", &[])
@@ -1628,12 +1639,12 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
         .execute(
             &format!(
                 "delete from definition_enum_values v \
-                 where {not_restored} and not exists ( \
-                     select 1 from ({read}) r \
-                     where r.transform_id = v.transform_id and r.type_oid = v.type_oid)",
+                 where {not_restored} and v.transform_id <> all($1) and not exists ( \
+                     select 1 from ({read}) r where r.transform_id <> all($1) \
+                     and r.transform_id = v.transform_id and r.type_oid = v.type_oid)",
                 read = key_types::READ_ENUM_TYPES,
             ),
-            &[],
+            &[&excluded],
         )
         .await?;
     client
@@ -1645,10 +1656,11 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
                  join pg_catalog.pg_enum e on e.enumtypid = r.type_oid \
                  where not exists (select 1 from capture_failures f \
                                    where f.transform_id = r.transform_id and f.restored) \
+                   and r.transform_id <> all($1) \
                  on conflict (transform_id, value_oid) do nothing",
                 read = key_types::READ_ENUM_TYPES,
             ),
-            &[],
+            &[&excluded],
         )
         .await?;
     Ok(paused)

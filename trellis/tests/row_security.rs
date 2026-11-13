@@ -29,6 +29,68 @@ mod pipeline;
 
 use pipeline::{capture_pass, connect_with};
 
+/// Every `WARN` or `ERROR` event, by the thread that logged it: each test
+/// steps its passes on its own thread, so it reads only its own.
+mod warned {
+    use std::sync::{Mutex, Once};
+    use std::thread::ThreadId;
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    static EVENTS: Mutex<Vec<(ThreadId, String)>> = Mutex::new(Vec::new());
+
+    struct Fields(String);
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?} ", field.name()));
+        }
+    }
+
+    struct Recorder;
+
+    impl<S: tracing::Subscriber> Layer<S> for Recorder {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() <= tracing::Level::WARN {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                let thread = std::thread::current().id();
+                EVENTS.lock().unwrap().push((thread, fields.0));
+            }
+        }
+    }
+
+    /// Installs the recorder, once for the binary.
+    pub fn install() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Recorder))
+                .expect("install the recorder");
+        });
+    }
+
+    /// Forgets the events this thread logged.
+    pub fn take() -> Vec<String> {
+        let thread = std::thread::current().id();
+        let mut events = EVENTS.lock().unwrap();
+        let (mine, others) = std::mem::take(&mut *events)
+            .into_iter()
+            .partition(|(t, _)| *t == thread);
+        *events = others;
+        mine.into_iter().map(|(_, event)| event).collect()
+    }
+
+    /// The events this thread logged since its last [`take`] that read as
+    /// a privilege refusal.
+    pub fn refusals() -> Vec<String> {
+        take()
+            .into_iter()
+            .filter(|event| event.contains("permission denied"))
+            .collect()
+    }
+}
+
 const SCHEMA: &str = trellis::config::DEFAULT_SCHEMA;
 
 /// The table settings the matrix runs through.
@@ -1679,5 +1741,214 @@ async fn a_revoked_schema_usage_leaves_another_tables_redefined_key_checked() {
         "{failure:?}"
     );
     assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The role loses `USAGE` on a source's schema, and nothing has written
+/// there since: the staging pass pauses the schema's readers with the
+/// reason and runs every step for the other tables, so a source defined
+/// afterwards in another schema gets its capture and flows, and a relabel
+/// of an enum another definition reads pauses it. After the grant a
+/// `RESUME` rebuilds the paused readers.
+#[tokio::test]
+async fn a_revoked_schema_usage_leaves_the_staging_pass_running_for_other_schemas() {
+    warned::install();
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create schema app; grant usage on schema app to rls_trellis; \
+             create table app.o (id int primary key, cid int, amount int); \
+             insert into app.o select i, 1 + i % 3, i from generate_series(1, 6) i; \
+             alter table app.o owner to rls_trellis; \
+             create type public.mood as enum ('calm', 'cross'); \
+             create table public.e (id int primary key, m public.mood); \
+             insert into public.e values (1, 'calm'); \
+             alter table public.e owner to rls_trellis;",
+        )
+        .await
+        .expect("a source in a schema of its own, and one reading an enum");
+    for ddl in [
+        "TRANSFORM o_copy FROM app.o SELECT amount AS amount",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+        "TRANSFORM e_copy FROM public.e SELECT m AS m",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+
+    it.admin
+        .batch_execute(
+            "revoke usage on schema app from rls_trellis; \
+             alter type public.mood rename value 'calm' to 'still'",
+        )
+        .await
+        .expect("revoke, and relabel the enum");
+    it.trellis
+        .apply("TRANSFORM p_copy FROM public.p SELECT name AS name")
+        .await
+        .expect("define over another schema");
+    warned::take();
+    trellis::client::reconcile_pass(&mut it.raw, &it.pool, SCHEMA)
+        .await
+        .expect("the pass leaves app.o out");
+    assert_eq!(
+        warned::refusals(),
+        Vec::<String>::new(),
+        "nothing else fails"
+    );
+    harness::settle_builds(&it.pool).await;
+    let failure = halted(&it.trellis, "o_copy").await;
+    assert_eq!(failure.source_table, "app.o");
+    assert!(
+        failure
+            .error
+            .contains("role rls_trellis lacks USAGE on schema app"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(
+        status(&it.trellis, "p_copy").await.status,
+        TransformStatus::Live
+    );
+    let e = status(&it.trellis, "e_copy").await;
+    assert_eq!(e.status, TransformStatus::Paused);
+    let failure = e.capture_failure.expect("the relabel is reported");
+    assert!(failure.error.contains("'still'"), "{failure:?}");
+    it.admin
+        .batch_execute("update public.p set name = 'moved' where id = 1")
+        .await
+        .expect("write the new source");
+    seal_and_drain(&mut it.raw, &it.pool).await.expect("drain");
+    let name: Option<String> = it
+        .admin
+        .query_one("select name from public.p_copy where id = 1", &[])
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(name.as_deref(), Some("moved"), "public.p is captured");
+    assert!(
+        it.trellis.apply("RESUME TRANSFORM o_copy").await.is_err(),
+        "a resume refuses while the schema is unusable"
+    );
+
+    it.admin
+        .batch_execute("grant usage on schema app to rls_trellis")
+        .await
+        .expect("grant USAGE back");
+    it.trellis
+        .apply("RESUME TRANSFORM o_copy")
+        .await
+        .expect("resume");
+    trellis::client::reconcile_pass(&mut it.raw, &it.pool, SCHEMA)
+        .await
+        .expect("pass");
+    harness::settle_builds(&it.pool).await;
+    assert_eq!(
+        status(&it.trellis, "o_copy").await.status,
+        TransformStatus::Live
+    );
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `JOIN` reads a table in a schema the role lost `USAGE` on and one in a
+/// schema it can use, and another definition writes a target there: the
+/// staging pass halts both and leaves out only the unusable tables, logging
+/// nothing, so a reader of the usable one defined afterwards gets its capture
+/// widened and its build started. The unusable table keeps its capture, and
+/// after the grant a `RESUME` rebuilds the join.
+#[tokio::test]
+async fn a_revoked_schema_usage_leaves_a_joins_usable_table_in_the_staging_pass() {
+    warned::install();
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create schema app; grant usage, create on schema app to rls_trellis; \
+             create table app.x (id int primary key, name text); \
+             insert into app.x select i, 'x' || i from generate_series(1, 3) i; \
+             alter table app.x owner to rls_trellis; \
+             alter table public.c add column note text",
+        )
+        .await
+        .expect("a joined table in a schema of its own");
+    for ddl in [
+        "TRANSFORM j FROM public.c JOIN app.x ON c.pid = x.id GROUP BY x.name \
+         WITHOUT SOURCE INDEX SELECT x.name AS name, SUM(c.amount) AS amount",
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+        "TRANSFORM app.c_into FROM public.c SELECT amount AS amount",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+
+    it.admin
+        .batch_execute("revoke usage on schema app from rls_trellis")
+        .await
+        .expect("revoke");
+    it.trellis
+        .apply("TRANSFORM c_note FROM public.c SELECT note AS note")
+        .await
+        .expect("define a reader of a column nothing captures yet");
+    warned::take();
+    trellis::client::reconcile_pass(&mut it.raw, &it.pool, SCHEMA)
+        .await
+        .expect("the pass leaves app.x and app.c_into out");
+    assert_eq!(
+        warned::refusals(),
+        Vec::<String>::new(),
+        "nothing else fails"
+    );
+    assert_eq!(halted(&it.trellis, "j").await.source_table, "app.x");
+    assert_eq!(
+        halted(&it.trellis, "app.c_into").await.source_table,
+        "app.c_into"
+    );
+    assert_eq!(
+        status(&it.trellis, "c_note").await.status,
+        TransformStatus::Backfilling,
+        "public.c's capture is widened and c_note's build starts"
+    );
+    let triggers: i64 = it
+        .admin
+        .query_one(
+            "select count(*) from pg_catalog.pg_trigger \
+             where tgrelid = 'app.x'::regclass and not tgisinternal",
+            &[],
+        )
+        .await
+        .expect("count app.x's triggers")
+        .get(0);
+    assert_eq!(triggers, 5, "app.x keeps its capture");
+
+    it.admin
+        .batch_execute("grant usage on schema app to rls_trellis")
+        .await
+        .expect("grant USAGE back");
+    it.trellis
+        .apply("RESUME TRANSFORM j")
+        .await
+        .expect("resume");
+    trellis::client::reconcile_pass(&mut it.raw, &it.pool, SCHEMA)
+        .await
+        .expect("pass");
+    harness::settle_builds(&it.pool).await;
+    it.admin
+        .batch_execute("update public.c set amount = 1000 where id = 3")
+        .await
+        .expect("write the joined source");
+    seal_and_drain(&mut it.raw, &it.pool).await.expect("drain");
+    let totals: String = it
+        .admin
+        .query_one(
+            "select string_agg(name || ':' || amount, ',' order by name) from public.j",
+            &[],
+        )
+        .await
+        .expect("read the join")
+        .get(0);
+    assert_eq!(totals, "x1:1006,x2:5,x3:7");
     it.trellis.shutdown().await.expect("shutdown");
 }
