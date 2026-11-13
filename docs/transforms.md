@@ -755,58 +755,39 @@ costs, and what a dump and restore, a `pg_upgrade` and pg_partman do, is in
 
 ## Granularity
 
-Granularity determines the target's primary-key space — what a single target row
-represents relative to its source row(s). The grammar has four: 1-1, aggregate, join aggregate and 1-1 `JOIN`.
+Granularity is the target's key space: what one target row stands for. There
+are four: 1-1, aggregate, join aggregate and 1-1 `JOIN`. Every target is
+eventually consistent: a value read before `await_converged` may be
+inconsistent, and an aggregate's small or hot group can briefly show a
+combination no source state produces; after it, values are exact
+([Reading derived data](data-flow.md#reading-derived-data)). The state that
+keeps an aggregate or a `JOIN` exact lives in hidden tables in Trellis's
+catalog schema, named by the transform's internal id, which readers get no
+grant on.
 
 ### 1-1
 
-Exactly one target row per source row, inheriting the source's identity: its
-primary key or the `KEY (…)` the definition names, or, when the source's key is nullable (an aggregate or `JOIN`
-target's grouping columns), a `UNIQUE NULLS NOT DISTINCT` constraint over the
-same columns, so a group whose key has a `NULL` part has its row here too.
-Insertion/deletion maps 1-1. Always a single source table: a target with one
-row per row of one table and columns of a second is a [1-1 `JOIN`](#1-1-join),
-and one with a row per group of a join is a [join aggregate](#join-aggregate).
-
-The target always carries the source's key columns, so a field can't
-reuse a key column's name ([expressions — Refusals](expressions.md#refusals)).
+One target row per source row, keyed by the source's key: its primary key or
+the `KEY (…)` the definition names, or, over an aggregate or `JOIN` target
+whose group key can be `NULL`, a `UNIQUE NULLS NOT DISTINCT` constraint over
+the same columns. The target carries the key columns, so a field can't reuse a
+key column's name ([expressions — Refusals](expressions.md#refusals)). It
+reads one table: one row per row of a table with columns of a second is a
+[1-1 `JOIN`](#1-1-join), and one row per group of a join a
+[join aggregate](#join-aggregate).
 
 ### Aggregate (`GROUP BY`)
 
-Each distinct combination of grouping values produces one target row, matching
-the equivalent `GROUP BY` query against the source. The primary key is the tuple
-of grouping columns; many source rows can map to one target row, and adding,
-removing, or changing a source row can insert, delete, or update a target row.
-
-Grouping-key columns may be referenced directly; any other source column must be
-wrapped in exactly one aggregate: `COUNT(*)`, which counts the rows in the
-group, `COUNT(<expr>)`, which counts the rows where `<expr>` isn't null, and
-`SUM` and `AVG` over `smallint`, `integer`, `bigint` or `numeric`. An
-argument may be a column or an expression over the row (`SUM(qty + 1)`), and a
-field may compose aggregates (`COALESCE(SUM(amount), 0) + COUNT(*)`). These are
-the aggregates Trellis keeps exact from each change alone, without reading the
-source again. `MIN` and `MAX` over a plain column of a number, date or time
-type are kept too: a deletion that removes a group's extreme re-reads the
-group's next one from the source, through an index on the `GROUP BY` columns
-then the argument, which define requires
-([type support](type-support.md#min-and-max)). Every other aggregate is refused
-at define, named by its family
-([Supported sources and targets](#supported-sources-and-targets)). Result
-types match Postgres's: `COUNT` is `bigint`, `SUM` over `smallint` or `integer`
-is `bigint`, `SUM` over `bigint` or `numeric`, and `AVG`, are `numeric`, and
-`MIN` and `MAX` have their argument's type. A `SUM` over a `numeric` shows the
-scale Postgres's `sum()` shows, the largest among the group's current values
-(`1.5` and `2.000` sum to `3.500`, and to `1.5` once `2.000` leaves), and an
-`AVG` the value Postgres's `avg()` gives; `NaN`, `Infinity` and `-Infinity`
-count as they do in Postgres ([type support](type-support.md#numeric-and-floating-point)).
-
-Each key becomes a target column named after its bare column, and keys can't be
-aliased. The target holds exactly the declared columns: the state that keeps
-it exact (each group's row count and running sums) lives in a table Trellis
-keeps in its own catalog schema, named by the transform's internal id, which
-readers get no grant on. A group has a row in the target only while it has
-rows in the source. Name limits are in
-[expressions — Refusals](expressions.md#refusals).
+One target row per distinct combination of grouping values, matching the
+equivalent `GROUP BY` query, and only while the group has source rows. Each key
+becomes a target column named after its bare column, and keys can't be
+aliased. A field selects a key, or composes aggregates with literals,
+operators and functions (`COALESCE(SUM(amount), 0) + COUNT(*)`). The
+aggregates are `COUNT(*)`, `COUNT(<expr>)`, `SUM` and `AVG` over `smallint`,
+`integer`, `bigint` or `numeric`, each over a column or an expression of the
+row, and `MIN` and `MAX` of a plain column; every other is
+[refused](#refusals). Result types, `numeric` scales and the special values are
+Postgres's ([type support](type-support.md#numeric-and-floating-point)).
 
 ```
 TRANSFORM order_totals FROM order_line_items GROUP BY order_id
@@ -817,40 +798,17 @@ SELECT
   AVG(amount) AS avg_amount
 ```
 
-**Throughput falls as more distinct groups receive writes at once.** A page
-locks every group it touches until it commits, so drain workers whose pages
-share groups queue behind each other for those rows. On a disk-backed
-benchmark (`benchmark group-contention`, 8 writer threads on a 16-core box), a
-single `SUM`/`COUNT(*)` aggregate applied about 233k to 308k source rows/sec
-over 10 to 400 groups, 190k to 200k over 4,000 and 75k to 90k over 40,000.
-Throughput rises with writer threads up to about 8 (about 70k rows/sec with
-one, 230k with eight) and stays flat beyond that. If you're planning an
-aggregate with tens of thousands of groups written concurrently, benchmark it
-on your own storage first (`benchmark group-contention --groups <n>`).
-
-Values read before `await_converged` may be inconsistent, and are exact after
-it; on small or hot groups that can include a combination no source state
-produces, such as a negative `COUNT(x)`. See
-[Reading derived data](data-flow.md#reading-derived-data).
+Throughput falls as more distinct groups receive writes at once
+([recommendations](recommendations.md#benchmark-aggregates-over-many-concurrently-written-groups)).
 
 ### Join aggregate
 
 An aggregate over the join of two tables (`FROM a [LEFT|INNER] JOIN b ON …
-GROUP BY …`). Its target holds one row per group: a column per `GROUP BY` key
-and per field, and nothing else. The state that keeps it exact lives in tables
-Trellis keeps in its own catalog schema, named by the transform's internal id,
-which readers get no grant on. Define registers it and creates its target, and
-Trellis builds it from both tables, then applies every change captured on
-either. Its aggregates are a plain aggregate's, each argument reading one
-table's columns.
-[Supported sources and targets](#supported-sources-and-targets) lists the
-checks.
-
-Every column is written with its table, `<table>.<column>`, in `ON`,
-`GROUP BY` and fields alike. Either table may be given an alias, with or
-without `AS`, and is then named by its alias alone, as in Postgres: its
-columns are written `<alias>.<column>`, and its own name no longer qualifies
-them.
+GROUP BY …`), with one target row per group: a column per key and per field.
+Its aggregates are a plain aggregate's except `MIN` and `MAX`, each argument
+reading one table's columns. Every column is written `<table>.<column>`, or
+`<alias>.<column>` for an aliased table, which its own name then no longer
+qualifies, as in Postgres. Each table is captured and checked as a `FROM` is.
 
 ```text
 TRANSFORM sales_by_tier FROM shop.orders AS o JOIN customers c
@@ -859,22 +817,12 @@ GROUP BY c.tier
 SELECT c.tier AS tier, SUM(o.amount) AS total
 ```
 
-Both tables are read the way a `FROM` is: each is captured, and a column the
-transform reads that either table loses, or a key column either retypes,
-pauses the whole transform on the staging worker's next pass, naming that
-table. `RESUME` checks both tables again.
-
-The same read contract applies: before `await_converged` a small or hot group
-can show a combination no source state produces, and after it values are exact
-([Reading derived data](data-flow.md#reading-derived-data)).
-
 ### 1-1 `JOIN`
 
-A `JOIN` with no `GROUP BY` (`FROM a [LEFT|INNER] JOIN b ON … SELECT …`)
-keeps one target row per row of `a`, with the columns of the row of `b` it
-joins to ([ADR-0021](decisions/0021-one-to-one-join-transforms.md)). It is for
-a value computed from both tables that a reader queries and indexes without
-repeating the join:
+A `JOIN` with no `GROUP BY` keeps one target row per row of `a`, with the
+columns of the row of `b` it joins to
+([ADR-0021](decisions/0021-one-to-one-join-transforms.md)): a value computed
+from both tables that a reader queries and indexes without repeating the join.
 
 ```text
 TRANSFORM order_view FROM orders LEFT JOIN customers
@@ -884,18 +832,20 @@ SELECT
   orders.amount * COALESCE(customers.discount, 1) AS discounted
 ```
 
-The target is keyed by `a`'s key (its primary key, or its `KEY (…)`), whose columns it carries as a 1-1
-target does, and holds them and the declared fields. `LEFT` keeps an `a` row
-with no matching `b` row, with `NULL` for every `b` column; `INNER` (or a bare
-`JOIN`) leaves it out until a `b` row on its key arrives. `b`'s `ON` columns
-are unique, so an `a` row joins at most one row of `b`: they contain `b`'s
-primary key, a unique constraint or unique index, or the group key of an
-aggregate or `JOIN` target. The `ON` follows a join aggregate's rules: `AND`ed
-equalities between a column of each table, of one type and collation.
+The target is keyed by `a`'s key, whose columns it carries as a 1-1 target
+does. `LEFT` keeps an `a` row with no match, with `NULL` for every `b` column;
+`INNER` (or a bare `JOIN`) leaves it out until a match arrives. `b`'s `ON`
+columns contain a unique key of `b`, so an `a` row joins at most one row. A
+field is any expression a 1-1 field admits over columns of either table,
+written as in a join aggregate; it has no aggregate and reads no other field.
+Each row is recomputed from its current inputs, so no aggregate restriction
+applies.
 
-A 1-1 `JOIN` may join up to four tables to `a`, a **star**: each `JOIN` clause
-joins one more table at the next **position** (1 for the first joined table),
-each on its own unique key, and its `ON` reads `a` and that table only:
+A **star** joins up to four tables to `a`, each `JOIN` clause one more
+**position** (1 for the first), each `LEFT` or `INNER` on its own, on its own
+unique key, with an `ON` that reads `a` and that table only. The two-table
+`JOIN` is a star with one position, and what is said of `b` holds at every
+position.
 
 ```text
 TRANSFORM order_view FROM orders
@@ -906,65 +856,19 @@ SELECT
   regions.name AS region
 ```
 
-Each position is `LEFT` or `INNER` on its own: the target has a row for an `a`
-row only where every `INNER` position has a match, with `NULL` for the columns
-of a `LEFT` position that has none. The two-table `JOIN` is a star with one
-position, and everything below holds at every position: what is said of `b`
-holds of the table joined at each position.
-
-A field is any expression a 1-1 field admits, floats and text included, over
-columns of either table, each written `<table>.<column>` (or
-`<alias>.<column>`, as for a join aggregate); there is no
-aggregate, and a field doesn't read another field. Each row is recomputed
-from its current inputs rather than maintained by deltas, so none of an
-aggregate's restrictions on its arguments apply. Either table may be another
-transform's target, read through that target's change feed as for a join
-aggregate. [Supported sources and targets](#supported-sources-and-targets)
-lists the checks.
-
-Trellis keeps a copy of each table (`R` for `a`, an `M` for the table at each
-position) and a lock row per position and join key (`J`) in its own catalog
-schema ([data flow](data-flow.md#a-1-1-joins-hidden-state)), named by the transform's
-internal id, which readers get no grant on. The joined tables need no source
-index. Define registers the transform, creates its target and builds it from
-both tables in chunks of `a`'s primary key, and the target stays readable
-across a `RESUME`'s rebuild. Then:
-
-- A change of an `a` row rewrites its target row.
-- A change of a `b` row recomputes every `a` row on its join key at its
-  position. Its page
-  recomputes the keys whose rows fit one chunk of 10,000, and leaves each other
-  key to chunks of 10,000 rows, each its own transaction, which the drain
-  workers run after their segments. An `a` write on the key waits for one
-  chunk at most, and a watermark token past the `b` change converges once the
-  last chunk commits. `status()` warns, per position, when a join key holds
-  more than 250,000 `a` rows, a key whose `b` change takes seconds to reach
-  every row ([status reference](status-reference.md#join)).
-- A `TRUNCATE` of `a` empties the target. One of a joined table, at any
-  position, starts a rebuild, so the transform reads `backfilling`, and a row
-  keeps the joined columns it held (an `INNER` row stays) until the rebuild
-  reaches it. One statement that truncates several of the tables is one
-  rebuild. A joined table that is another transform's target is never
-  truncated: a `TRUNCATE` of that transform's source arrives as a delete of
-  every row.
-- A row whose field Postgres can't compute (an overflow, a division by zero)
-  is held in quarantine on its first failure, and the page applies the rest.
-  A row held by a joined table's change says so in its error
-  (`sample_quarantined`): the table, its position and the row's join key there.
-  A page whose changes fail on more rows of `a` than its bisection can name,
-  or such a chunk of a joined table's fan-out, pauses the transform and
-  everything downstream of it, with a `capture_failure` of kind `halt`.
-
-A schema change of any of its tables pauses the whole transform as it does a
-join aggregate. `self_check` compares the target, every copy and the uniqueness
-of each joined table's join key.
-The same read contract applies: a value read before `await_converged` may be
-inconsistent, and is exact after it
-([Reading derived data](data-flow.md#reading-derived-data)).
-
-A joined table that is edited often, or that has few distinct keys, fans each
-edit out over many target rows; see [Join small, often-edited tables at query
-time](recommendations.md#join-small-often-edited-tables-at-query-time).
+Trellis keeps a copy of each table and a lock row per position and join key
+([data flow](data-flow.md#a-1-1-joins-hidden-state)); the joined tables need
+no source index, and the target stays readable across a `RESUME`'s rebuild. A
+change of an `a` row rewrites its target row. A change of a joined row
+recomputes every `a` row on its join key, in chunks, and `status()` warns of a
+key with many rows ([status reference](status-reference.md#join)). A
+`TRUNCATE` of `a` empties the target; one of a joined table rebuilds it. A row
+whose field Postgres can't compute is held in quarantine, and the page
+applies the rest
+([ADR-0021](decisions/0021-one-to-one-join-transforms.md#a-row-a-page-fails-to-write-is-held-in-the-page)).
+A joined table that is edited often, or has few distinct keys, fans each edit
+out over many rows
+([recommendations](recommendations.md#join-small-often-edited-tables-at-query-time)).
 
 ## Calculated Fields
 
