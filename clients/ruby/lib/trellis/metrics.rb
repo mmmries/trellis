@@ -13,17 +13,9 @@ module Trellis
   # running handle and 0 after its last one shuts down; the other gauges of a
   # stopped instance disappear after 60 seconds. See docs/observability.md.
   #
-  # The binding opens no port. Serve the text from a route the app already
-  # has, for example in Rails:
-  #
-  #   # config/routes.rb
-  #   get "/metrics", to: proc {
-  #     [200, { "content-type" => "text/plain; version=0.0.4" }, [Trellis::Metrics.render_prometheus]]
-  #   }
-  #
-  # In a forking server each worker process has its own registry, holding
-  # only its own handles' series, so scrape every worker (or run the worker
-  # handle, staging: true, in a process of its own and scrape that).
+  # The binding opens no port; Trellis::Metrics::RackApp serves the text from
+  # a route the app already has. Most series are set only in the process
+  # running the staging or drain work, so scrape that one (README, Metrics).
   #
   # A process forked while its parent had an engine running may have
   # inherited the registry's lock held, so rendering there raises
@@ -33,6 +25,39 @@ module Trellis
     # each series' samples.
     def self.render_prometheus
       Native.render_prometheus
+    end
+
+    # A Rack app answering GET and HEAD with render_prometheus, in the
+    # content type Prometheus expects, at whatever path it is mounted; every
+    # other method is a 405. It needs no Rack gem. Unauthenticated, as a
+    # Prometheus target is: guard it if the port is public.
+    #
+    #   mount Trellis::Metrics::RackApp, at: "/metrics/trellis"   # Rails
+    #   map("/metrics/trellis") { run Trellis::Metrics::RackApp } # config.ru
+    class RackApp
+      CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+      def self.call(env)
+        new.call(env)
+      end
+
+      def call(env)
+        case env["REQUEST_METHOD"]
+        when "GET"
+          body = Metrics.render_prometheus
+          [200, headers(body), [body]]
+        when "HEAD"
+          [200, headers(Metrics.render_prometheus), []]
+        else
+          [405, { "allow" => "GET, HEAD", "content-length" => "0" }, []]
+        end
+      end
+
+      private
+
+      def headers(body)
+        { "content-type" => CONTENT_TYPE, "content-length" => body.bytesize.to_s }
+      end
     end
   end
 end

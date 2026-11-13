@@ -247,7 +247,8 @@ template: a small TCP listener alongside the live pipeline answering each
 request with the rendered registry. The bindings expose the same render as
 `Trellis.Metrics.render_prometheus/0` (Elixir) and
 `Trellis::Metrics.render_prometheus` (Ruby), each for a route the host app
-already serves.
+already serves; Ruby also ships `Trellis::Metrics::RackApp`, a mountable Rack
+route.
 
 ### Retention: left to Prometheus, not Trellis
 
