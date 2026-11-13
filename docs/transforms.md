@@ -5,9 +5,10 @@ more source tables. Its definition is two separately-chosen pieces: the
 **granularity** of the target's primary-key space, and the
 [**calculated fields**](expressions.md) that populate its non-key columns.
 
-Trellis maintains these tables **incrementally** as source data changes, trading
-spikey read load for a steady write load that keeps the table cheap to read (see
-the README for fuller motivation).
+Trellis maintains these tables **incrementally** as source data changes. This
+document is the logical model: how changes propagate is
+[data-flow](data-flow.md), and why asynchronously is
+[0002-async-data-flow](decisions/0002-async-data-flow.md).
 
 ## Statements
 
@@ -1085,20 +1086,11 @@ primary key, so it is read that way only with a `KEY (…)` naming its group key
 
 ## Status
 
-Every defined transform carries an observable **status**, one of six words:
-
-* **`waiting_to_backfill`**: defined, but its source's existing rows not yet read.
-* **`backfilling`**: its target is being built, or rebuilt.
-* **`catching_up`**: maintained, but reading an upstream (or an upstream column) that isn't `live`.
-* **`live`**: the steady state, where a watermark token guarantees read-your-writes.
-* **`quarantined`**: frozen because too many of its keys failed to apply.
-* **`paused`**: frozen by `PAUSE TRANSFORM`, or by Trellis because it can't keep the target correct.
-
-The [status reference](status-reference.md) defines each word and every field
-of the status. [Operations](operations.md#when-a-definition-needs-you) lists
-every reason a transform stops and what to do, and
-[embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)
-has the polling pattern.
+A transform's status is one of `waiting_to_backfill`, `backfilling`,
+`catching_up`, `live`, `quarantined` or `paused`: the
+[status reference](status-reference.md) defines each, and
+[operations](operations.md#when-a-definition-needs-you) says what to do when
+one stops.
 
 ## Changing a definition
 
@@ -1212,10 +1204,3 @@ a resume's rebuild and a [retype](#retype) record it again. What it counts is
 [0024-compatibility-floors-and-rollback](decisions/0024-compatibility-floors-and-rollback.md#recording-definition-floors);
 reading it before a rollback is
 [upgrading — Reading the floors](upgrading.md#reading-the-floors).
-
-## Scope
-
-This document describes the logical model only, not the physical storage or
-timing of derived data; see [data-flow](data-flow.md) for how changes propagate
-and [0002-async-data-flow](decisions/0002-async-data-flow.md) for why that flow
-is asynchronous.
