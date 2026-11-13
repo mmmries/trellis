@@ -486,7 +486,7 @@ them:
     its own comment hashes): replaced by a widen.
 - **Pauses, until a deliberate `RESUME`:**
   - capture changed outside Trellis, on a plain table or a partitioned source
-    (the next section);
+    ([above](#capture-changed-outside-trellis));
   - a read column renamed or dropped, or the primary key redefined, by a
     marker, the pass or a drain page;
   - a read column that is now a virtual generated column (dropped and added

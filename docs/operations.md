@@ -333,7 +333,8 @@ Each rebuild is one full re-read of the table per transform applying from it,
 the same as a [`request_backfill`](#request_backfill) of the table: a few
 minutes at 100M rows (about 5 minutes with no writers, about 16 with eight
 writers at 2,000 writes a second, on our test machine). A rewrite that leaves
-every value as it was rebuilds nothing. Neither does pg_repack, in table or
+every value as it was rebuilds nothing: `VACUUM FULL`, `CLUSTER`, an
+`ADD COLUMN` with a volatile default. Neither does pg_repack, in table or
 index mode, on a source or a target: it keeps an equivalent valid index at
 every moment, so no index a transform relies on goes missing. Its table mode
 refuses an aggregate target whose group column can be `NULL` (the target has

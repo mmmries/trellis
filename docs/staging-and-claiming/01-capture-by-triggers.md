@@ -219,9 +219,8 @@ its readers: [capture drift](capture-drift.md#capture-changed-outside-trellis).
 
 ### What rebuilds, what pauses, and what's missed
 
-The response to each kind of change no trigger sees is tabled in
+The response to each kind of change no trigger sees is summarized in
 [capture drift](capture-drift.md#what-rebuilds-what-pauses-and-whats-missed).
-
 
 ## Nested writes to the same key
 

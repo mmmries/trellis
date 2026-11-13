@@ -92,7 +92,7 @@ while every rule holds.
 
 The staging worker's reconcile pass compares each captured table's catalog
 with what it recorded, and rebuilds or pauses the readers when a read column
-changed ([capture by triggers — What rebuilds, what pauses, and what's
+changed ([capture drift — What rebuilds, what pauses, and what's
 missed](staging-and-claiming/capture-drift.md#what-rebuilds-what-pauses-and-whats-missed)).
 These changes look like routine maintenance to it.
 
@@ -192,7 +192,7 @@ dropped again, or a virtual generated column (PostgreSQL 18) renamed onto it
 and back. A pass that runs while the other column has the name rebuilds the
 readers, as for a column dropped and added again, or, for a virtual column,
 pauses them
-([capture by triggers — What rebuilds, what pauses, and what's
+([capture drift — What rebuilds, what pauses, and what's
 missed](staging-and-claiming/capture-drift.md#what-rebuilds-what-pauses-and-whats-missed)).
 
 **What goes wrong:** the capture function finds the columns it images by
