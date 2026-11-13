@@ -5,6 +5,7 @@
 # Prints one JSON line of what it saw.
 $LOAD_PATH.unshift File.expand_path("../../lib", __dir__)
 require "json"
+require "stringio"
 require "tmpdir"
 
 # An app without ActiveRecord: the bundle has the gem, so this shadows it
@@ -205,6 +206,50 @@ when "puma_hooks_named"
   Process.kill(:KILL, pid) if seen[:child].is_a?(String)
   Process.waitpid(pid)
   seen[:parent_connected] = [Trellis.connected?, reports.connected?]
+when "off_in", "off_in_elsewhere", "default_off_in", "opt_in_off_in"
+  # config.trellis.off_in: Trellis is off in this app's own environment, in
+  # another one only, in the default (the test environment), or in none.
+  case ARGV.fetch(0)
+  when "off_in" then BootApp.config.trellis.off_in = [Rails.env]
+  when "off_in_elsewhere" then BootApp.config.trellis.off_in = ["elsewhere"]
+  when "opt_in_off_in" then BootApp.config.trellis.off_in = []
+  end
+  stderr = $stderr
+  $stderr = StringIO.new
+  begin
+    BootApp.initialize!
+    seen[:boot_warning] = $stderr.string
+    $stderr = StringIO.new
+    seen[:enabled] = Trellis.enabled?
+    seen[:connected] = Trellis.connected?
+    Trellis::Railtie.connect
+    seen[:warning] = $stderr.string
+  rescue Trellis::ValidationError => e
+    seen[:warning] = e.message
+  ensure
+    $stderr = stderr
+  end
+  seen[:connected_after_connect] = Trellis.connected?
+when "off_in_rake"
+  # `rails trellis:migrate` in an off environment migrates nothing.
+  BootApp.config.trellis.off_in = [Rails.env]
+  require "rake"
+  Rake.with_application do |rake|
+    rake.init("rails", ["probe"])
+    BootApp.load_tasks
+    Rake::Task["environment"].enhance { BootApp.initialize! }
+    Rake::Task.define_task(probe: :environment) do
+      stderr = $stderr
+      $stderr = StringIO.new
+      begin
+        Rake::Task["trellis:migrate"].invoke
+        seen[:warning] = $stderr.string
+      ensure
+        $stderr = stderr
+      end
+    end
+    rake.top_level
+  end
 when "release_check"
   # `rails trellis:release_check BASE=<ref>`, in an app that is a git
   # repository of its own, whose second database keeps its migrations in a

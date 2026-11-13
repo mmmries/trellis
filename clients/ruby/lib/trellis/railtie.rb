@@ -34,8 +34,19 @@ module Trellis
   # the definitions in `structure.sql` (Trellis::SchemaDump). The database
   # they dump into is config.trellis.dump_database, "primary" by default.
   #
+  # `config.trellis.off_in` names the environments Trellis is off in. The
+  # default is `%w[test]`: a test suite's transactions never commit, so it
+  # can't see a target change. `off_in = []` turns Trellis on in tests. It
+  # is read from any environment, so a `db:prepare` or `db:test:prepare` run
+  # from development leaves Trellis out of the test database too. There,
+  # nothing connects at boot, Railtie.connect and `trellis:migrate` do
+  # nothing, the schema load and dump hooks leave the target tables as plain
+  # ones, and the migration helpers refuse (or skip, migrating that database
+  # from an environment Trellis is on in).
+  # Trellis.enabled? is the predicate; "Testing" in the README has the rest.
+  #
   # When either is set, the app's handles connect in an after_initialize hook,
-  # except in these two cases:
+  # except in these cases:
   #
   # - An app booted by a rake task (`rails db:migrate`, `rails db:create`,
   #   ...): like Ecto, which migrates without starting the app, those get no
@@ -46,6 +57,7 @@ module Trellis
   #   `rails test` loads the tasks to run test:prepare, then boots the app
   #   outside any task, so it gets its handle (but `bin/rails db:test:prepare
   #   test` boots it inside the first task, so it doesn't).
+  # - Trellis is off in this environment (config.trellis.off_in).
   # - config.trellis.connect_on_boot = false, for a server that forks with
   #   no hook to shut the handle down first (see below).
   #
@@ -67,6 +79,7 @@ module Trellis
     config.trellis.instances = {}
     config.trellis.connect_on_boot = true
     config.trellis.dump_database = "primary"
+    config.trellis.off_in = %w[test]
 
     rake_tasks do
       namespace :trellis do
@@ -102,13 +115,16 @@ module Trellis
       # instance from config.trellis.connect (when set), and each of
       # config.trellis.instances. In a forked worker (Puma's
       # before_worker_boot, Unicorn's after_fork, Passenger's
-      # starting_worker_process), or a rake task of your own. Raises
+      # starting_worker_process), or a rake task of your own. Warns and
+      # connects nothing in an environment Trellis is off in. Raises
       # ValidationError if neither is set, or if a named instance is already
       # connected (as Trellis.connect does for the default one), and whatever
       # Trellis.connect and Trellis::Instance.connect raise; the instances
       # this call had connected are shut down first, so a failure leaves
       # nothing half connected.
       def connect
+        return skipped("Trellis::Railtie.connect connects nothing") unless enabled?
+
         default = connect_options
         named = instance_options
         if default.nil? && named.empty?
@@ -194,6 +210,8 @@ module Trellis
       # config.trellis.instances, each as with_handle does. Raises
       # ValidationError if neither is set.
       def migrate_all
+        return skipped("trellis:migrate migrates nothing") unless enabled?
+
         default = connect_options
         named = instance_options
         if default.nil? && named.empty?
@@ -220,6 +238,24 @@ module Trellis
         puts result.message
       rescue ReleaseCheck::Error => e
         abort "trellis:release_check: #{e.message}"
+      end
+
+      # Whether Trellis is off in `environment`, however it is spelled.
+      def off_in?(environment)
+        off_in.include?(environment.to_s)
+      end
+
+      # Whether Trellis is on in `environment` (this process's, by default):
+      # false when config.trellis.off_in names it. Trellis.enabled? is the
+      # shortcut for code that doesn't need the Railtie.
+      def enabled?(environment = ::Rails.env)
+        !off_in?(environment)
+      end
+
+      # A sentence saying Trellis is off in `environment`, and `what` that
+      # means was not done.
+      def off_message(what, environment = ::Rails.env)
+        "Trellis is off in the #{environment} environment (config.trellis.off_in): #{what}"
       end
 
       # config.trellis.connect, as Trellis.connect's keyword options, or nil
@@ -250,6 +286,14 @@ module Trellis
       end
 
       private
+
+      # The environments config.trellis.off_in names, as strings; empty when
+      # it isn't set (or there's no Rails app).
+      def off_in
+        app = ::Rails.respond_to?(:application) && ::Rails.application or return []
+
+        Array(app.config.trellis.off_in).map(&:to_s)
+      end
 
       # Where the app keeps migrations: db/migrate, and the migrations_paths
       # of every database in config/database.yml, read without connecting.
@@ -304,6 +348,11 @@ module Trellis
         Trellis.default_instance
       end
 
+      def skipped(what)
+        warn "trellis: #{off_message(what)}"
+        nil
+      end
+
       def ignoring_errors
         yield
       rescue StandardError => e
@@ -325,7 +374,7 @@ module Trellis
     private
 
     def boot
-      return if rake_running?
+      return if rake_running? || !self.class.enabled?
 
       settings = ::Rails.application.config.trellis
       return unless settings.connect_on_boot && (settings.connect || !self.class.instance_options.empty?)
