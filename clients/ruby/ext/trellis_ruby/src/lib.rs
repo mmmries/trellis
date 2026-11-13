@@ -1434,6 +1434,22 @@ fn statement_kinds() -> Vec<&'static str> {
         .collect()
 }
 
+/// The `SELECT` that computes the whole target of the stored definition
+/// `text` (written under grammar `grammar_version`), one output column per
+/// entry of `target_columns` in that order: `trellis::target_select_sql`. It
+/// needs no handle and reads no database. Raises `Trellis::ParseError` for
+/// text that doesn't parse and `Trellis::ValidationError` for a column the
+/// definition computes nothing for.
+fn target_select_sql(
+    ruby: &Ruby,
+    text: String,
+    grammar_version: i32,
+    target_columns: Vec<String>,
+) -> Result<String, Error> {
+    trellis::target_select_sql(&text, grammar_version, &target_columns)
+        .map_err(|err| raise(ruby, PlainError::from(err)))
+}
+
 /// The process-wide metrics registry in Prometheus text exposition format:
 /// `trellis::Metrics::render_prometheus`, the series of every handle in this
 /// process. It needs no handle.
@@ -1538,6 +1554,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("join_side_parts", function!(join_side_parts, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
     native.define_module_function("render_prometheus", function!(render_prometheus, 0))?;
+    native.define_module_function("target_select_sql", function!(target_select_sql, 3))?;
     native.define_module_function("log_levels", function!(log_levels, 0))?;
     native.define_module_function("install_log_bridge", function!(install_log_bridge, 1))?;
     native.define_module_function("set_log_level", function!(set_log_level, 1))?;

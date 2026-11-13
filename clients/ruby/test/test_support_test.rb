@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "minitest/mock"
 require "test_helper"
 require "trellis/test_support"
 require_relative "support/rails_app"
@@ -141,7 +142,125 @@ class TestSupportTest < Minitest::Test
     with_instance { assert_equal [], klass.new.run_it }
   end
 
+  # Where Trellis is off, a schema load leaves the definitions in the
+  # restore queue and the targets as plain tables. The helper fills a target
+  # from the test's own uncommitted rows, and a chained one refreshes its
+  # upstream first; the test's rollback takes it all back.
+  def test_refresh_trellis_target_fills_a_target_from_uncommitted_rows_and_rolls_back
+    with_restore_queue do |schema, connection|
+      queue("public.rf_orders", "public.rf_customer_counts",
+            "TRANSFORM rf_customer_counts FROM rf_orders GROUP BY customer_id " \
+            "SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total", schema:)
+      queue("public.rf_customer_counts", "public.rf_doubled",
+            "TRANSFORM rf_doubled FROM rf_customer_counts SELECT n * 2 AS doubled", schema:)
+
+      ActiveRecord::Base.transaction do
+        connection.execute("insert into rf_orders values (1, 8, 2.50), (2, 8, 1.25), (3, 9, 4)")
+        Trellis.stub(:enabled?, false) do
+          assert_equal 2, Trellis::TestSupport.refresh_trellis_target("rf_doubled")
+        end
+        assert_equal [[8, 2, "3.75"], [9, 1, "4"]],
+                     connection.select_rows("select customer_id, n, total::text from rf_customer_counts " \
+                                            "order by customer_id")
+        assert_equal [[8, 4], [9, 2]], connection.select_rows("select customer_id, doubled from rf_doubled " \
+                                                             "order by customer_id")
+        raise ActiveRecord::Rollback
+      end
+      assert_equal 0, connection.select_value("select count(*) from rf_customer_counts")
+      assert_equal 0, connection.select_value("select count(*) from rf_orders")
+    end
+  end
+
+  def test_refresh_trellis_target_names_what_it_could_not_find
+    with_restore_queue do |schema, _connection|
+      queue("public.rf_orders", "public.rf_customer_counts",
+            "TRANSFORM rf_customer_counts FROM rf_orders GROUP BY customer_id SELECT COUNT(*) AS n", schema:)
+      Trellis.stub(:enabled?, false) do
+        error = assert_raises(Trellis::NotFoundError) { Trellis::TestSupport.refresh_trellis_target(:rf_nowhere) }
+        assert_includes error.message, "rf_nowhere"
+        assert_includes error.message, "#{schema}.restore_queue"
+
+        # The target has a column the definition computes nothing for.
+        error = assert_raises(Trellis::ValidationError) do
+          Trellis::TestSupport.refresh_trellis_target("public.rf_customer_counts")
+        end
+        assert_includes error.message, '"total"'
+      end
+    end
+  end
+
+  # Where Trellis is on, the engine maintains the target: the helper refuses
+  # unless told to write anyway.
+  def test_refresh_trellis_target_refuses_where_trellis_is_on_unless_told
+    with_restore_queue do |schema, connection|
+      queue("public.rf_orders", "public.rf_doubled_orders",
+            "TRANSFORM rf_doubled_orders FROM rf_orders SELECT amount * 2 AS doubled", schema:)
+      connection.execute("create table rf_doubled_orders (id integer primary key, doubled numeric)")
+      connection.execute("insert into rf_orders values (1, 8, 2.50)")
+
+      assert Trellis.enabled?
+      error = assert_raises(Trellis::ValidationError) do
+        Trellis::TestSupport.refresh_trellis_target("rf_doubled_orders")
+      end
+      assert_includes error.message, "Trellis is on here"
+      assert_equal 1, Trellis::TestSupport.refresh_trellis_target("rf_doubled_orders", trellis_on: true)
+      assert_equal [[1, "5.00"]], connection.select_rows("select id, doubled::text from rf_doubled_orders")
+    end
+  end
+
+  def test_refresh_trellis_target_is_callable_as_a_method_of_a_test_that_includes_it
+    klass = Class.new do
+      include Trellis::TestSupport
+
+      def run_it(target) = refresh_trellis_target(target)
+    end
+    assert_includes klass.private_instance_methods, :refresh_trellis_target
+    error = Trellis.stub(:enabled?, true) { assert_raises(Trellis::ValidationError) { klass.new.run_it(:rf) } }
+    assert_includes error.message, "rf"
+  end
+
   private
+
+  # A database of its own on the shared cluster, the way an off
+  # environment's schema load leaves it: sources, targets as plain tables, and
+  # a restore queue in a Trellis schema config.trellis.connect names.
+  def with_restore_queue
+    admin = TestCluster.pg
+    database = "rf_#{Process.pid}_#{name.hash.abs}"
+    admin.exec("create database #{database}")
+    schema = "rf_trellis"
+    info = TestCluster.info
+    TrellisTestApp.config.trellis.connect = { url: TestCluster.dsn, schema: }
+    ActiveRecord::Base.establish_connection(
+      adapter: "postgresql", host: info.fetch("host"), port: info.fetch("port"),
+      username: info.fetch("user"), database:
+    )
+    connection = ActiveRecord::Base.lease_connection
+    connection.execute("create table rf_orders (id integer primary key, customer_id integer, amount numeric)")
+    connection.execute("create table rf_customer_counts (customer_id integer, n bigint, total numeric, " \
+                       "unique nulls not distinct (customer_id))")
+    connection.execute("create table rf_doubled (customer_id integer, doubled bigint, " \
+                       "unique nulls not distinct (customer_id))")
+    connection.execute("create schema #{schema}")
+    connection.execute("create table #{schema}.restore_queue (ordinal integer primary key, " \
+                       "source_table text not null, target_table text not null, join_table text, " \
+                       "definition_text text not null, grammar_version integer not null, " \
+                       "floor_version text not null)")
+    yield schema, connection
+  ensure
+    TrellisTestApp.config.trellis.connect = nil
+    ActiveRecord::Base.connection_pool.disconnect!
+    admin&.exec("drop database if exists #{database} with (force)")
+    admin&.close
+  end
+
+  def queue(source, target, text, schema:)
+    connection = ActiveRecord::Base.lease_connection
+    ordinal = connection.select_value("select count(*) + 1 from #{schema}.restore_queue")
+    values = [ordinal, source, target].map { |value| connection.quote(value) }.join(", ")
+    connection.execute("insert into #{schema}.restore_queue values (#{values}, null, " \
+                       "#{connection.quote(text)}, 2, '0.2.0')")
+  end
 
   # A private cluster with a connected instance running both workers, and
   # ActiveRecord connected to it.

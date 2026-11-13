@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
-require_relative "error"
-require_relative "instance"
+require_relative "pg"
 
 module Trellis
   # Helpers for a test suite that loads fixtures or bulk data into tables
@@ -34,6 +33,13 @@ module Trellis
   #
   # The call is cheap when nothing was disrupted (one catalog read per
   # captured table), so running it before every test is fine.
+  #
+  # Where Trellis is off (config.trellis.off_in), refresh_trellis_target fills
+  # a target from its definition's own query, inside the test's transaction:
+  #
+  #   3.times { Event.create!(account: accounts(:one)) }
+  #   refresh_trellis_target :event_counts
+  #   assert_equal 3, accounts(:one).event_count.events_count
   module TestSupport
     # Raised when a RESUME is refused or a resumed definition pauses again.
     # `refused` maps each such target (as "schema.table") to the reason: the
@@ -51,6 +57,9 @@ module Trellis
     end
 
     POLL_SECONDS = 0.05
+    # The schema Trellis keeps an instance's tables in, unless its connect
+    # options name another.
+    DEFAULT_SCHEMA = "trellis"
     # How a CaptureFailure's error starts while a resume is still under way.
     RESUMING = "resuming:"
 
@@ -109,6 +118,160 @@ module Trellis
         status = instance.status(definition.target_table)
         definition.target_table if status&.capture_failure&.kind == :disruption
       end
+    end
+
+    # Fills `target` (a table name, "schema.table", or a model class) from
+    # its definition, as a fresh build would compute it from the tables it
+    # reads as they stand: `DELETE FROM` the target, then `INSERT INTO` it
+    # the rows of the SELECT the engine renders from the definition
+    # (Trellis::Native.target_select_sql). It runs on `connection`, the
+    # test's own, so it sees the test's uncommitted rows and rolls back with
+    # the test. It doesn't exercise capture, the drain or any pause. A table
+    # the definition names without a schema resolves on the connection's
+    # search_path. Returns the number of rows written.
+    #
+    # The definition is the one the schema load left in the restore queue
+    # (`trellis.restore_queue`, or the schema config.trellis.connect or
+    # config.trellis.instances names). A definition that reads another
+    # transform's target refreshes that target first.
+    #
+    # Raises Trellis::NotFoundError when the target has no definition, and
+    # Trellis::ValidationError when Trellis is on in this environment
+    # (Trellis.enabled?), where the engine maintains the target and would
+    # overwrite what this writes. `trellis_on: true` writes anyway, reading
+    # the definition from the instance's catalog when there is no queue.
+    def refresh_trellis_target(target, connection: active_record_connection, trellis_on: false)
+      if Trellis.enabled? && !trellis_on
+        raise ValidationError,
+              "refresh_trellis_target fills a target where Trellis is off (config.trellis.off_in), and " \
+              "Trellis is on here: the engine maintains #{target_name(target)}. Pass trellis_on: true " \
+              "to write it anyway"
+      end
+
+      definitions = recorded_definitions(connection)
+      refresh_target(connection, find_definition(definitions, target_name(target)), definitions, [])
+    end
+
+    # Refreshes each target `definition` reads that has a definition of its
+    # own, then `definition`'s. `path` holds the targets being refreshed
+    # below, which a stored definition can't read back.
+    def refresh_target(connection, definition, definitions, path)
+      target = definition.fetch(:target)
+      definition.fetch(:reads).each do |table|
+        upstream = definitions.find { |d| d.fetch(:target) == table }
+        refresh_target(connection, upstream, definitions, path + [target]) if upstream && !path.include?(table)
+      end
+
+      schema, table = target.split(".", 2)
+      quoted = "#{connection.quote_column_name(schema)}.#{connection.quote_column_name(table)}"
+      columns = connection.select_values(
+        "select a.attname::text from pg_catalog.pg_attribute a " \
+        "where a.attrelid = pg_catalog.to_regclass(#{connection.quote(quoted)}) " \
+        "and a.attnum > 0 and not a.attisdropped order by a.attnum"
+      )
+      raise NotFoundError, "the target #{target} of a recorded definition is no table" if columns.empty?
+
+      select = Trellis::Native.target_select_sql(definition.fetch(:text), definition.fetch(:grammar_version),
+                                                 columns)
+      column_list = columns.map { |column| connection.quote_column_name(column) }.join(", ")
+      connection.exec_update("delete from #{quoted}")
+      connection.exec_update("insert into #{quoted} (#{column_list}) #{select}")
+    end
+
+    # Every definition recorded in the database, as hashes of :target and
+    # :reads ("schema.table" names, as the dump resolved them), :text and
+    # :grammar_version: a schema load's restore queue where there is one,
+    # and otherwise an instance's catalog.
+    def recorded_definitions(connection)
+      trellis_schemas.flat_map do |schema|
+        quoted = connection.quote_column_name(schema)
+        if regclass?(connection, "#{quoted}.restore_queue")
+          queued_definitions(connection, quoted)
+        elsif regclass?(connection, "#{quoted}.transform_definitions")
+          cataloged_definitions(connection, quoted)
+        else
+          []
+        end
+      end
+    end
+
+    def queued_definitions(connection, quoted_schema)
+      queue = "#{quoted_schema}.restore_queue"
+      # A dump with a definition that joins more than two tables has one more
+      # column (trellis::dump::RESTORE_QUEUE).
+      later = connection.select_value(
+        "select count(*) from pg_catalog.pg_attribute where attrelid = '#{queue}'::regclass " \
+        "and attname = 'later_join_tables' and not attisdropped"
+      ).to_i.positive? ? "later_join_tables" : "'{}'::text[]"
+      definitions(connection, "select target_table, source_table, " \
+                              "array_remove(array[join_table], null) || #{later}, definition_text, " \
+                              "grammar_version from #{queue}")
+    end
+
+    def cataloged_definitions(connection, quoted_schema)
+      definitions(connection, "select d.target_table, d.source_table, " \
+                              "array(select j.table_name from (select 1 as position, d.join_table as table_name " \
+                              "where d.join_table is not null union all select f.position, f.table_name " \
+                              "from #{quoted_schema}.definition_join_tables f where f.transform_id = d.id) j " \
+                              "order by j.position), d.definition_text, d.grammar_version " \
+                              "from #{quoted_schema}.transform_definitions d")
+    end
+
+    def definitions(connection, sql)
+      connection.select_rows("select target_table, source_table || joined, definition_text, grammar_version " \
+                             "from (#{sql}) as d(target_table, source_table, joined, definition_text, " \
+                             "grammar_version)").map do |target, reads, text, version|
+        { target:, reads: decode_text_array(connection, reads), text:, grammar_version: Integer(version) }
+      end
+    end
+
+    # The definition of `name` ("table" or "schema.table") among `definitions`.
+    def find_definition(definitions, name)
+      matches = definitions.select do |definition|
+        target = definition.fetch(:target)
+        name.include?(".") ? target == name : target.split(".", 2).last == name
+      end
+      case matches.size
+      when 1 then matches.first
+      when 0
+        raise NotFoundError,
+              "no Trellis definition is recorded for the target #{name}: refresh_trellis_target reads " \
+              "the definitions the schema load left in #{trellis_schemas.map { |s| "#{s}.restore_queue" }.join(', ')}"
+      else
+        raise ValidationError,
+              "#{name} names more than one target (#{matches.map { |d| d.fetch(:target) }.join(', ')}): " \
+              "qualify it as schema.table"
+      end
+    end
+
+    # The schemas Trellis keeps its tables in: each configured instance's.
+    def trellis_schemas
+      options = []
+      if defined?(Trellis::Railtie)
+        options << Trellis::Railtie.connect_options
+        options.concat(Trellis::Railtie.instance_options.values)
+      end
+      schemas = options.compact.map { |option| option.fetch(:schema, DEFAULT_SCHEMA).to_s }
+      schemas.empty? ? [DEFAULT_SCHEMA] : schemas.uniq
+    end
+
+    def target_name(target)
+      target.respond_to?(:table_name) ? target.table_name.to_s : target.to_s
+    end
+
+    def regclass?(connection, name)
+      !connection.select_value("select pg_catalog.to_regclass(#{connection.quote(name)})::text").nil?
+    end
+
+    def decode_text_array(connection, value)
+      return value if value.is_a?(Array)
+
+      connection.select_values("select unnest(#{connection.quote(value)}::text[])")
+    end
+
+    def active_record_connection
+      base = ::ActiveRecord::Base
+      base.respond_to?(:lease_connection) ? base.lease_connection : base.connection
     end
 
     # Waits for `target` to be :live. A resumed definition that pauses

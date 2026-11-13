@@ -31,6 +31,8 @@
 //! - [`statement_kind`] names which form a statement is ([`StatementKind`])
 //!   without applying it, using `apply`'s own parser — the check a binding
 //!   makes before handing a statement to `apply`.
+//! - [`target_select_sql`] renders a stored definition as the `SELECT` that
+//!   computes its whole target, for a test that runs with Trellis off.
 //! - [`Metrics`] is a facade over the `metrics`/`metrics-exporter-prometheus`
 //!   in-process registry and its Prometheus text
 //!   exposition ([`Trellis::metrics`]) — see
@@ -274,3 +276,9 @@ pub use tokio_postgres::types::PgLsn;
 // handing it to `apply`. It is `apply`'s own parser, not a copy
 // of its dispatch rule.
 pub use defs::{StatementKind, statement_kind};
+
+// --- Tier 2: a definition's whole-target SELECT ---------------------------
+// Pure on the text, like `statement_kind`: what a test with Trellis off fills
+// a target with. It is the engine's own rendering of the definition, not a
+// second implementation in a binding.
+pub use defs::oracle::target_select_sql;
