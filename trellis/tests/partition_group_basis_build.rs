@@ -312,7 +312,7 @@ async fn a_leaf_build_under_other_database_defaults_routes_exactly() {
                create operator public.>= (leftarg = date, rightarg = date, \
                    procedure = public.reversed_ge)";
     let date = ValueType::Other(trellis::defs::pg_type::PgType::Date);
-    let cols = vec![("id", int4()), ("g", date.clone()), ("v", int4())];
+    let cols = vec![("id", int4()), ("g", date), ("v", int4())];
     let mut d = Driver::start_with_database_defaults(
         &[
             ("datestyle", "German, DMY"),
