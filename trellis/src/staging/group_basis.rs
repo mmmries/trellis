@@ -3954,7 +3954,7 @@ impl GroupTargetPlan {
             returning = returning.join(", "),
             recomputed = self.recomputed,
             uc = self.group_match("up", "c"),
-            tail = self.held_tail_sql(image_columns),
+            tail = self.held_tail_sql(image_columns, false),
         )
     }
 
