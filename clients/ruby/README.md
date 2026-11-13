@@ -487,6 +487,40 @@ instance and every instance of `config.trellis.instances`. Neither it nor
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
 
+### Targets as models
+
+Only Trellis writes a target. Declare a model over one with
+`Trellis::Target`, and every ActiveRecord write to it raises
+`Trellis::ReadOnlyTarget` (an `ActiveRecord::ReadOnlyRecord`) naming the
+target:
+
+```ruby
+class EventCount < ApplicationRecord
+  include Trellis::Target
+  self.primary_key = [:account_id, :kind] # the GROUP BY key
+  belongs_to :account
+end
+
+EventCount.find([42, "click"]).n
+Account.find(42).event_counts.sum(:n) # with has_many :event_counts on Account
+```
+
+- **Key.** A `GROUP BY` target has no primary key, only a unique constraint
+  on its group key: declare that as `primary_key`. A 1-1 target carries its
+  source's primary key, which ActiveRecord finds itself. A group with no
+  source rows has no row, so a missing row means zero.
+- **What it refuses.** Record writes (`save`, `create!`, `update`,
+  `update_columns`, `increment!`, `delete`, `destroy`) and bulk
+  writes (`insert_all`, `upsert_all`, `update_all`, `update_counters`,
+  `delete_all`, `destroy_all` and their variants) on the class, any scope
+  and any association. Reads are untouched.
+- **What it doesn't.** SQL sent through the connection (`execute`, fixture
+  loads) and other database roles. That is the database's job:
+  [grant application roles `SELECT` on targets](../../docs/recommendations.md#application-roles-read-targets-and-nothing-else).
+- **In tests.** Where Trellis is off (`config.trellis.off_in`, see
+  "Testing") the model writes like any other, with no setup. A suite that
+  runs Trellis writes a target in `Trellis::Target.allow_writes { ... }`.
+
 ### Upgrading the gem
 
 A release that changes `trellis-pg`'s version can't also define, alter,
@@ -558,8 +592,8 @@ development leaves Trellis out of the test database too. Where it is off:
 - `Trellis.enabled?` is false, for code that builds on Trellis (it is true
   without Rails). `Trellis.connect` itself is not gated.
 
-Stub a target's rows by hand, as the transform would write them. A missing
-row means zero:
+Stub a target's rows by hand, as the transform would write them; a model
+over the target ("Targets as models") writes here:
 
 ```ruby
 EventCount.insert_all([{ kind: "click", n: 3 }])
@@ -742,7 +776,8 @@ How the restore works, and what it refuses, is in
 
 - `lib/`: the `Trellis` module and `Trellis::Instance`, its error classes and its `Data` values,
   `Trellis::Metrics`,
-  the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
+  the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`,
+  `trellis/target.rb`),
   loaded only in an app that has Rails, and the test helpers
   (`trellis/test_support.rb`) and the release check
   (`trellis/release_check.rb`), each loaded only when required.

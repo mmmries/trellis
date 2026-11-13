@@ -100,6 +100,7 @@ module Trellis
       ActiveSupport.on_load(:active_record) do
         require "trellis/migration"
         require "trellis/schema_dump"
+        require "trellis/target"
       end
     end
 
