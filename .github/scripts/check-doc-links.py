@@ -10,6 +10,7 @@ Checks, over tracked files only:
 
 Run: python3 .github/scripts/check-doc-links.py   (tests: test_check_doc_links.py)
 """
+import html
 import os
 import re
 import subprocess
@@ -20,8 +21,8 @@ SOURCE_EXTS = (".rs", ".rb", ".ex", ".exs")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$")
 CODE_SPAN = re.compile(r"(`+)(.+?)\1")
-INLINE_LINK = re.compile(r"\]\(\s*(<[^>]*>|[^)\s]*(?:\([^)\s]*\)[^)\s]*)*)")
-REF_DEF = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^>]*>|\S+)")
+INLINE_LINK = re.compile(r"\]\(\s*(<[^>]*>|[^()\s]*(?:\([^()\s]*\)[^()\s]*)*)")
+REF_DEF = re.compile(r"^ {0,3}\[[^\]^][^\]]*\]:\s*(<[^>]*>|\S+)")  # not a [^footnote]
 EXPLICIT_ANCHOR = re.compile(r"""<a\s[^>]*?\b(?:id|name)=["']([^"']+)["']""")
 SCHEME = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|//)")
 SOURCE_REF = re.compile(r"(?<![\w/.~-])((?:\.\.?/)*(?:[\w.-]+/)*[\w.-]+\.md)#([\w%-]+)")
@@ -46,10 +47,15 @@ def slug(heading):
     """GitHub's anchor for heading text, before the duplicate suffix."""
     t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", heading)  # links, images
     t = re.sub(r"\[([^\]]*)\]\[[^\]]*\]", r"\1", t)  # reference links
-    t = CODE_SPAN.sub(lambda m: m.group(2).strip(), t)
-    t = re.sub(r"<[^>]+>", "", t)  # inline HTML
-    t = re.sub(r"(?<![\w*])_+([^_]+?)_+(?!\w)", r"\1", t)  # _emphasis_ (underscores in words stay)
-    t = re.sub(r"[^\w\- ]", "", t.lower())
+    text = []
+    for i, p in enumerate(CODE_SPAN.split(t)):  # text, backticks, code contents, text, ...
+        if i % 3 == 0:
+            p = re.sub(r"<[^>]+>", "", p)  # inline HTML
+            p = re.sub(r"(?<![\w*])_+([^_]+?)_+(?!\w)", r"\1", p)  # _emphasis_ (underscores in words stay)
+            text.append(html.unescape(p))
+        elif i % 3 == 2:
+            text.append(p.strip())  # code renders verbatim
+    t = re.sub(r"[^\w\- ]", "", "".join(text).lower())
     return t.replace(" ", "-")
 
 
@@ -57,7 +63,7 @@ def anchors(text):
     """The set of fragments a link into this Markdown text can use."""
     found, seen = set(), {}
     for _, line in lines_outside_fences(text):
-        found.update(a.lower() for a in EXPLICIT_ANCHOR.findall(line))
+        found.update(EXPLICIT_ANCHOR.findall(line))
         m = HEADING.match(line)
         if m:
             s = slug(m.group(1))
@@ -72,7 +78,7 @@ def split_target(raw):
     if raw.startswith("<") and raw.endswith(">"):
         raw = raw[1:-1]
     path, _, frag = raw.partition("#")
-    return unquote(path.split("?")[0]), unquote(frag).lower()
+    return unquote(path.split("?")[0]), unquote(frag)
 
 
 def md_targets(text):
@@ -128,7 +134,7 @@ def check(root, files):
                     path = m.group(1)
                     if path.startswith("."):
                         path = os.path.join(os.path.dirname(src), path)
-                    resolve(src, "/" + os.path.normpath(path), m.group(2).lower(), n, m.group(1))
+                    resolve(src, "/" + os.path.normpath(path), unquote(m.group(2)), n, m.group(1))
     return problems
 
 

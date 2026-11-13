@@ -38,6 +38,12 @@ class Anchors(unittest.TestCase):
             {"plain-heading", "code-and-emphasis-a-link", "snake_case--punctuation-v12", "trailing-hashes"},
         )
 
+    def test_code_spans_render_verbatim_and_entities_decode(self):
+        self.assertEqual(
+            links.anchors("# `Vec<T>`\n# `__init__` and _em_\n# a &amp; b\n"),
+            {"vect", "__init__-and-em", "a--b"},
+        )
+
     def test_duplicates_get_numeric_suffixes(self):
         self.assertEqual(links.anchors("# Dup\n# Dup\n# Dup\n"), {"dup", "dup-1", "dup-2"})
 
@@ -77,6 +83,13 @@ class Check(unittest.TestCase):
                 "docs/a.md:2: broken anchor: no heading '#nope2' in docs/a.md",
             ],
         )
+
+    def test_fragments_are_case_sensitive(self):
+        self.assertEqual(len(run({"a.md": "# Top\n[x](#Top)\n"})), 1)
+
+    def test_footnotes_and_parenthesized_paths(self):
+        tree = {"a.md": "x[^1] [p](b(1).md) [q](c(1).md)\n\n[^1]: See the doc\n", "b(1).md": ""}
+        self.assertEqual(run(tree), ["a.md:1: broken link: c(1).md does not exist"])
 
     def test_link_to_a_fenced_heading_is_broken(self):
         self.assertEqual(len(run({"a.md": "[x](#comment)\n```\n# comment\n```\n"})), 1)
