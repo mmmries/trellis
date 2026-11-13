@@ -366,7 +366,7 @@ fn single_migration_cases() -> Vec<Case> {
             "grant select (a) on public.{t} to public",
             Expect::Nothing,
         ),
-        // R1: a narrowed modifier. Every definition is still valid, and the
+        // Identity or type: a narrowed modifier. Every definition is still valid, and the
         // passthrough's copy holds every value, so the readers
         // rebuild. Versioned attributes add R3b for `n`, the read column
         // after `v`, so a `value_rewrite` is counted too (and named here, as
@@ -383,7 +383,7 @@ fn single_migration_cases() -> Vec<Case> {
             "alter table public.{t} alter column g type bigint",
             Expect::Statuses(TransformStatus::Backfilling, TransformStatus::Paused),
         ),
-        // R1: a narrower scale renders the stored values with another number
+        // Identity or type: a narrower scale renders the stored values with another number
         // of fractional digits (`1.50` as `1.5`): the readers of the column
         // rebuild; `s` doesn't read `n`.
         (
@@ -525,7 +525,7 @@ async fn paired_migrations_rebuild_and_pause_nothing_part_2() {
 /// The study's controls, and R3b's documented residue.
 fn real_change_cases() -> Vec<Case> {
     vec![
-        // R1: dropped and re-added with the same type; every definition is
+        // Identity or type: dropped and re-added with the same type; every definition is
         // still valid, so the readers rebuild.
         (
             "C1",
@@ -533,7 +533,7 @@ fn real_change_cases() -> Vec<Case> {
              alter table public.{t} add column a int; commit",
             Expect::Rebuilt("column_changed"),
         ),
-        // A pure widening R1 leaves alone; the copy-type check pauses both readers, whose
+        // A pure widening the identity-or-type check leaves alone; the copy-type check pauses both readers, whose
         // copies of `b` it outgrew. A reader with no such copy misses the
         // values (docs/known-correctness-gaps.md). Versioned attributes also
         // make the read columns after `b` an R3b rewrite, a rebuild counted
@@ -740,7 +740,7 @@ async fn a_same_type_rewrite_rebuilds_its_readers_to_the_new_values() {
     assert_eq!(auto_rebuilds("public.w", "value_rewrite"), 1);
 }
 
-/// R1 by the validity rule, on readers with no typed copy of the column: a
+/// An identity or type change, by the validity rule, on readers with no typed copy of the column: a
 /// change define still accepts rebuilds (a `SUM` argument's scale, a column
 /// dropped and re-added as the same type); one it refuses, or one that
 /// changes the type a definition evaluates the column as, pauses with a
