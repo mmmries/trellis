@@ -603,8 +603,12 @@ this fleet may be silently stuck," not as a transient blip to retry past.
 ### Definitions that stopped
 
 The worker checks say the fleet is running; they can't say a definition has
-stopped while every other one keeps converging. Poll these on the same timer,
-from `definitions()` and `status(target)`; the
+stopped while every other one keeps converging. Alert on the
+[metrics](observability.md#alerting) first: `paused_definitions{cause}` tells
+an operator's pause from a stop, and `held_keys`, `drain_failures` and
+`capture_holdups` count what leaves the status word as it was. Without a
+Prometheus, or to find which definition, poll these on the same timer, from
+`definitions()` and `status(target)`; the
 [status reference](status-reference.md) has each with its binding types and
 an example:
 

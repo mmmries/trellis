@@ -175,8 +175,68 @@ below, and the histograms above, also carries the `trellis_instance` label
     drains. A table whose rows have all drained reads 0 for one read, then its
     series expires. The split shows which tables hold the backlog.
 
-Backfill progress is deliberately *not* a metric — it's the transform's
-[lifecycle status](status-reference.md), a small enumerable state.
+* `definitions{status}`, `paused_definitions{cause}`, `held_keys`,
+  `quarantined_columns`, `drain_failures` and `capture_holdups{kind}` — what a
+  definition's [status](status-reference.md) reports, in a form Prometheus can
+  alert on. The staging worker reads them in the same 5 s housekeeping pass,
+  from the catalog in one snapshot: the statuses `definitions()` reports, why
+  each paused definition paused, and one statement of counts. Nothing is
+  counted on the hot path, and no label names a definition, a table or a key.
+  * `definitions{status}` counts definitions by each of the six status words,
+    `catching_up` derived as `status()` derives it. Every word is always set,
+    0 where no definition has it.
+  * `paused_definitions{cause}` splits the `paused` count by cause, so an
+    operator's `PAUSE` is told apart from a stop: `operator` (a pause with no
+    record of why), `capture`, `disruption` and `halt` (the kind of the
+    definition's [`capture_failure`](status-reference.md#capture_failure)),
+    `backfill_failure` (its build kept failing) and `unknown`. They add up to
+    `definitions{status="paused"}`. A definition an operator paused that then
+    meets a disruption counts as `capture`, as its `capture_failure` says.
+  * `held_keys` is the source keys held in quarantine, every definition's
+    together, whatever its status. `quarantined_columns` is the columns of 1-1
+    targets whose own fuse tripped; a column an operator paused
+    (`PAUSE TRANSFORM t.col`) and the readers a pause cascades to aren't
+    counted.
+  * `drain_failures` is the open [drain failures](status-reference.md#drain_failure),
+    one per failing segment. `capture_holdups{kind}` is the tables whose
+    capture install is held up: `wait` for a lock another session holds
+    ([`capture_wait`](status-reference.md#capture_wait)), `failure` when the
+    install or widen fails for another reason. Neither changes a status word.
+  * `staging_leader` is 1 in the process that holds the staging-worker lock and
+    0 in one that stands by for it. `drain_workers` is the live drain workers in
+    the worker registry, the count `has_live_drain_workers` tests.
+
+  Only the process that leads staging sets all of these. A standby sets
+  `staging_leader` 0 and nothing else, and a process with no staging worker (a
+  web handle) sets none. A process that stops leading stops setting them, so
+  they expire like any gauge ([below](#several-instances-in-one-process)).
+
+Backfill progress, how far through its build a definition is, is deliberately
+*not* a metric: it's the transform's [lifecycle status](status-reference.md).
+
+### Alerting
+
+Aggregate with `max by (trellis_instance)`: a leader change leaves the old and
+the new leader's series side by side for up to 60 s.
+
+| Alert | Expression |
+|---|---|
+| A definition stopped | `max by (trellis_instance) (trellis_paused_definitions{cause!="operator"}) > 0 or max by (trellis_instance) (trellis_definitions{status="quarantined"}) > 0` |
+| Keys are held | `max by (trellis_instance) (trellis_held_keys) > 0` |
+| A column's fuse tripped | `max by (trellis_instance) (trellis_quarantined_columns) > 0` |
+| The pipeline is behind | `max by (trellis_instance) (trellis_ring_oldest_undrained_age_seconds) > 60` |
+| No staging worker | `sum by (trellis_instance) (trellis_staging_leader) < 1 or absent(trellis_staging_leader)` |
+| No drain worker | `max by (trellis_instance) (trellis_drain_workers) < 1` |
+
+A stopped definition is invisible to the ring gauges: its writes are still
+captured and drained, or not read at all, so `ring_*` and `changes_applied_total`
+look like a quiet system.
+
+"No worker anywhere" is the absence of the series, or a scrape target that is
+down: only a process running a staging worker sets them, so `absent(...)` and
+`up == 0` on the worker's job are the alerts for it. A fleet whose staging
+worker runs in one process has no `drain_workers` series while that process is
+down; the no-staging-worker alert is the one that fires.
 
 ### Several instances in one process
 
@@ -197,13 +257,14 @@ registry:
 
 * **Counters and histograms** stay at their last value. Their rate is 0, which
   is true.
-* **Gauges** (`staging_segments`, the `ring_*` gauges, `build_chunk_seconds_max`) disappear once
+* **Gauges** (`staging_segments`, the `ring_*` gauges, the status and liveness gauges, `build_chunk_seconds_max`) disappear once
   nothing has set them for 60 seconds. A handle's background client (`staging`
   or `drain_threads`) sets each of its instance's gauges again every 300 ms
   (`maintenance_interval`), to its last known value, so a gauge expires only
   once no client of its instance runs in the process. A running instance whose
-  staging worker cannot read the ring keeps reporting the last segment counts
-  and ring gauges it read.
+  staging worker cannot read the ring keeps reporting the last segment counts,
+  ring gauges and status gauges it read. A process that stops leading staging
+  stops setting them, so a standby never reports what the leader reports.
 * **`trellis_instance_up{trellis_instance}`** is 1 while at least one handle of
   the instance runs in this process, and 0 once the last one has shut down or been
   dropped. It never expires, so it keeps reporting 0. Alert on

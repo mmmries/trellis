@@ -113,6 +113,7 @@ mod self_check_keyset;
 mod self_check_ring;
 pub mod session;
 pub mod state;
+pub(crate) mod status_gauges;
 pub(crate) mod target_mutations;
 pub mod worker_registry;
 

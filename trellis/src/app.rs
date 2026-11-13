@@ -2326,7 +2326,7 @@ const CHUNK_FAILURE_COLUMNS: &str = "bcf.attempts as chunk_attempts, \
 /// The definition's current build chunk that has failed, if any, aliased
 /// `bcf` for [`CHUNK_FAILURE_COLUMNS`]: the one that has failed most,
 /// leaving out finished chunks and those of a build a resume superseded.
-const CHUNK_FAILURE_JOIN: &str = "left join lateral ( \
+pub(crate) const CHUNK_FAILURE_JOIN: &str = "left join lateral ( \
          select bc.attempts, bc.last_error, bc.next_attempt_at from backfill_chunks bc \
          where bc.definition_id = d.id and not bc.done and bc.last_error is not null \
            and bc.fuse_rearmed_at is not distinct from d.fuse_rearmed_at \
@@ -2742,7 +2742,7 @@ impl CaptureFailureKind {
 
     /// The kind `capture_failures.kind` stores, or
     /// [`CaptureFailureKind::Unknown`] for a word a newer release wrote.
-    fn from_persisted(kind: &str) -> Self {
+    pub(crate) fn from_persisted(kind: &str) -> Self {
         Self::STORED
             .into_iter()
             .find(|stored| stored.as_str() == kind)
