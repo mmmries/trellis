@@ -47,6 +47,13 @@ module Trellis
   #   that database: the instances' options with the database's host, port,
   #   name, user and password from its config.
   #
+  # None of this applies to a database of an environment named in
+  # config.trellis.off_in (`%w[test]`): its load creates the target tables as
+  # plain tables and restores nothing, and its dump is Rails' own. A dump of
+  # such a database run from an environment Trellis is on in (`db:prepare` in
+  # development also dumps the test database) is skipped, since the file is
+  # that environment's.
+  #
   # A load that doesn't go through Rails (`psql -f structure.sql`) is followed
   # by `rails trellis:migrate`.
   #
@@ -88,9 +95,25 @@ module Trellis
       end
 
       # Whether Trellis's definitions belong in the dump of db_config: Trellis
-      # is configured, and db_config is the database config.trellis.dump_database
-      # names.
+      # is configured and on in db_config's environment, and db_config is
+      # the database config.trellis.dump_database names.
       def applies?(db_config)
+        configured_for?(db_config) && !Railtie.off_in?(db_config.env_name)
+      end
+
+      # Whether a dump of db_config is left undone: db_config belongs to an
+      # environment Trellis is off in, and the environment running the task is
+      # one it is on in. The dump file is the running environment's, and
+      # a dump of the off database would overwrite it with one that has no
+      # definitions.
+      def skip_dump?(db_config)
+        configured_for?(db_config) && Railtie.off_in?(db_config.env_name) &&
+          !Railtie.off_in?(::ActiveRecord::Tasks::DatabaseTasks.env)
+      end
+
+      # Whether Trellis is configured, and db_config is the database
+      # config.trellis.dump_database names.
+      def configured_for?(db_config)
         return false unless Railtie.connect_options || !Railtie.instance_options.empty?
 
         db_config.name == dump_database
@@ -353,6 +376,7 @@ module Trellis
       # versions to ActiveRecord.schema_format: the default is left to Rails'
       # own signature, which an unconfigured database goes straight to.
       def dump_schema(db_config, *args)
+        return nil if SchemaDump.skip_dump?(db_config)
         return super unless SchemaDump.applies?(db_config) && db_config.schema_dump
 
         format = SchemaDump.format_of(db_config, args)

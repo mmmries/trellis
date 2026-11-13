@@ -100,6 +100,14 @@ module Trellis
       nil
     end
 
+    # Whether Trellis is on in this process's Rails environment: false when
+    # the app's config.trellis.off_in names it (`%w[test]`, so a test suite
+    # runs without Trellis). Always true without Rails. Code that builds on
+    # Trellis, such as a test helper that fills a target, branches on it.
+    def enabled?
+      !defined?(Trellis::Railtie) || Trellis::Railtie.enabled?
+    end
+
     # Whether this process's default instance is connected. False before
     # connect, after shutdown, and in a forked child that hasn't connected
     # its own.

@@ -410,7 +410,8 @@ With neither set, the Railtie does nothing. Two exceptions:
   migrates without starting the app. The migration helpers connect a handle
   of their own. A rake task of your own that calls Trellis calls
   `Trellis::Railtie.connect` first. It's the running task that counts:
-  `rails test` boots the app outside any task and connects, but tests run
+  `rails test` boots the app outside any task and connects (once Trellis is
+  on in the test environment: [Testing](#testing)), but tests run
   by a rake task (`bin/rails db:test:prepare test`, or plain `rake`) don't,
   so a test helper that needs the handles can call
   `Trellis::Railtie.connect if Trellis::Instance.connected.empty?`.
@@ -418,6 +419,9 @@ With neither set, the Railtie does nothing. Two exceptions:
   server that forks without a hook to shut the handle down first (a
   preloading Passenger, say). Connect in each child with
   `Trellis::Railtie.connect`.
+
+`config.trellis.off_in` turns all of this off in the environments it names
+(the `test` environment, by default): see [Testing](#testing).
 
 ### Logs in Rails
 
@@ -429,7 +433,9 @@ config.trellis.log_level = :info   # :debug, :info, :warn or :error; default: Ra
 config.trellis.log_bridge = false  # forward nothing
 ```
 
-A `Trellis.logger =` in a `config/initializers` file replaces it.
+A `Trellis.logger =` in a `config/initializers` file replaces it. In an
+environment `config.trellis.off_in` names, nothing connects and the bridge
+isn't started.
 
 ### Forking servers
 
@@ -584,10 +590,99 @@ Outside Rails, `require "trellis/release_check"` and call
 `Trellis::ReleaseCheck.call(root:, base:)`, which returns a result with
 `ok?` and `message`.
 
-## Fixtures and bulk loads in tests
+## Testing
 
-Rails fixtures load with `disable_referential_integrity`, which disables
-every trigger on the loaded tables, Trellis's capture triggers included, and
+Trellis is off in the `test` environment by default. A transactional test
+(Rails' default) never commits, so capture never sees its writes and a target
+never changes, whether or not a worker runs. A target is an ordinary table a
+test fills itself.
+
+`config.trellis.off_in` (`%w[test]` unless you set it) names the environments
+Trellis is off in. It is read from every environment, so `db:prepare` or
+`db:test:prepare` run from development leaves Trellis out of the test database
+too. Where it is off:
+
+- Nothing connects at boot. `Trellis::Railtie.connect` and `trellis:migrate`
+  warn and do nothing.
+- A schema load creates the targets as the plain tables `structure.sql`
+  carries, with no capture triggers and nothing restored (the definitions
+  stay unread in `trellis.restore_queue`). Rails' fixture foreign-key check
+  passes, and the per-worker databases of `parallelize` load.
+- `define`, `apply` and `status` in a migration raise
+  `ActiveRecord::MigrationError`: build the database by loading the schema.
+  Migrating it from development (`db:prepare`) skips them, and the next
+  `rails test` reloads it from the new dump.
+- `Trellis.enabled?` is false, for code that builds on Trellis (it is true
+  without Rails). `Trellis.connect` itself is not gated.
+
+Stub a target's rows by hand, as the transform would write them. A missing
+row means zero:
+
+```ruby
+EventCount.insert_all([{ kind: "click", n: 3 }])
+```
+
+### Running Trellis in tests
+
+Tests that need Trellis for real need it on in the test database. Set
+`config.trellis.off_in = []` (or switch it per run:
+`config.trellis.off_in = ENV["TRELLIS_TESTS"] ? [] : %w[test]`). Give the
+test environment's `config.trellis.connect` the workers (`staging: true,
+drain_threads: 1`), and take those tests out of the transaction:
+
+```ruby
+require "trellis/test_support"
+
+class EventCountTest < ActiveSupport::TestCase
+  include Trellis::TestSupport
+  self.use_transactional_tests = false # capture reads committed rows only
+
+  setup { resume_capture_disruptions } # the fixture load paused capture (below)
+  teardown { Event.delete_all } # plain DELETEs; a table swap or disabled triggers pause capture
+
+  test "counts clicks" do
+    3.times { Event.create!(kind: "click") }
+    Trellis.await_converged(Trellis.watermark_token, timeout_ms: 30_000)
+    assert_equal 3, EventCount.find_by!(kind: "click").n
+  end
+end
+```
+
+Two more things need care with Trellis on in the test database:
+
+- **Rails' fixture foreign-key check** resolves every foreign key without
+  Trellis's schema and fails with `PG::UndefinedTable`. Set
+  `config.active_record.verify_foreign_keys_for_fixtures = false`, or
+  `schema_search_path: "public,trellis"` on the test database.
+- **`parallelize(workers: n)`** loads the schema into one database per
+  worker (`<name>_<i>`), so each worker's `config.trellis.connect` has to
+  name its own, and the handle does not survive the fork. Register the hooks
+  before `require "rails/test_help"`, which is what runs the schema load:
+
+  ```ruby
+  # test/test_helper.rb
+  require "active_support/testing/parallelization"
+
+  ActiveSupport::Testing::Parallelization.before_fork_hook { Trellis::Instance.shutdown_all }
+  ActiveSupport::Testing::Parallelization.after_fork_hook do |worker|
+    trellis = Rails.application.config.trellis
+    uri = URI.parse(trellis.connect.fetch(:url))
+    uri.path = "#{uri.path}_#{worker}"
+    trellis.connect = trellis.connect.merge(url: uri.to_s)
+  end
+
+  require "rails/test_help"
+
+  class ActiveSupport::TestCase
+    parallelize(workers: 2)
+    parallelize_setup { Trellis::Railtie.connect } # after the schema load
+  end
+  ```
+
+### Fixtures and bulk loads
+
+With Trellis on in the test database, Rails fixtures load with
+`disable_referential_integrity`, which disables every trigger on the loaded tables, Trellis's capture triggers included, and
 ends with `ENABLE TRIGGER ALL`. The rows it wrote never reached a target, so
 Trellis pauses every definition that reads the table (`status.capture_failure`
 has `kind: :disruption`) instead of letting a test read silently wrong data,
@@ -669,6 +764,11 @@ How the restore works, and what it refuses, is in
   the test config's database, and its host, port, user, password and other
   libpq keywords (`sslmode`, `sslrootcert`, ...) where it names a non-blank
   value (its `url` when it has one).
+- A database of an environment named in `config.trellis.off_in` loads as
+  plain tables and is dumped as Rails does. `db:prepare` in development
+  skips the dump of such a test database, which would overwrite
+  development's `structure.sql` with one that has no definitions
+  ([Testing](#testing)).
 - The hook adds each instance's exclusions (its Trellis schema, its ledgers)
   to the flags Rails passes `pg_dump`, and its `target_schema` to the
   `--schema` flags when Rails passes any. `pg_dump` can't leave out one
