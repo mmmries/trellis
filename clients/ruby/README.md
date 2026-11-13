@@ -274,38 +274,6 @@ The thread doesn't survive `fork`. After the usual hooks (see
 [Forking servers](#forking-servers)), it starts again, with an empty queue,
 when a handle connects in the child.
 
-### Logs
-
-The engine logs through `tracing` and installs no subscriber of its own, so
-nothing reaches Ruby until the app sets a logger. A Ruby thread then drains
-the engine's lines into it every 100 ms (`Trellis::LogBridge`); the engine
-never calls into the VM:
-
-```ruby
-Trellis.logger = Logger.new($stderr) # before Trellis.connect, to catch connect's lines
-Trellis.log_level = :info            # optional: default is the logger's level now
-```
-
-In a Rails app the Railtie does this with `Rails.logger`; see
-[Logs in Rails](#logs-in-rails). Each line is one `Logger` call: the engine's
-level as the severity, its Rust module as the progname,
-and the event's text, ending in its fields. Every line names its instance as
-`trellis_instance=<database>/<catalog schema>`, so instances in one process
-stay apart. The lines the docs promise (a halt, a standby, a takeover's
-migrations, an automatic rebuild) are among them
-([observability](../../docs/observability.md#logs-and-traces)).
-
-The engine drops events above the level before formatting them, so a later
-`Logger#level=` can make the logger stricter but can't bring back a level the
-bridge filtered: use `Trellis.log_level=`. A line can be dropped, and logging
-never blocks or crashes the engine: the queue holds 10,000 lines, and when it
-overflows the next drain logs one warning with the count. At exit the thread
-stops after the instances shut down and logs what is left.
-
-The thread doesn't survive `fork`. After the usual hooks (see
-[Forking servers](#forking-servers)), it starts again, with an empty queue,
-when a handle connects in the child.
-
 ### Several instances
 
 A process can hold several Trellis instances, for different catalog schemas
