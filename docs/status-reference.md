@@ -92,10 +92,9 @@ A `live` transform comes back here for a rebuild after:
   transform `backfilling` in the same transaction; until that pass, at most
   one pass after the DDL, it still reads `live`. It goes back to `live` once
   the correction's keys are re-derived and folded into its target, as at the
-  end of a Re-derive build. Until a group that routes to the partition is
-  corrected, rows an `ATTACH` added aren't counted in it yet, and rows a
-  `DROP`, `DETACH` or `TRUNCATE` removed still are; groups of other partitions
-  are exact. The correction's progress is persisted, so a restart resumes it
+  end of a Re-derive build. Meanwhile its counts are wrong as
+  [operations — Partitioned sources](operations.md#partitioned-sources) says,
+  and groups of other partitions are exact. The correction's progress is persisted, so a restart resumes it
   and the transform still reads `backfilling`. [`correcting`](#correcting)
   lists the partitions.
 
