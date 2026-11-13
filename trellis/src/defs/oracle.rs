@@ -79,9 +79,9 @@ enum Output<'a> {
 /// ([`super::backfill::substituted_field_exprs`]), so a field reading
 /// another renders as a self-contained expression.
 ///
-/// Each value has the type Postgres gives the expression, the one the
-/// statements that write the target compute, so an `INSERT` lands it by the
-/// same assignment cast they do. A `JOIN`'s columns are qualified by their
+/// Each value has the type Postgres gives its expression, so an `INSERT`
+/// lands it by the assignment cast the statements that write the target rely
+/// on. A `JOIN`'s columns are qualified by their
 /// tables' names, which the `FROM` clause names unaliased.
 pub(crate) fn render_target_select_sql(
     def: &TransformDef,
@@ -99,14 +99,15 @@ pub(crate) fn render_target_select_sql(
 /// write, without capture, the drain or any pause. A test that runs with
 /// Trellis off fills a target with it (`DELETE FROM <target>`, then
 /// `INSERT INTO <target> <select>`), on its own connection and inside its own
-/// transaction (`docs/embedding.md`, testing).
+/// transaction, as the Ruby client's `Trellis::TestSupport#refresh_trellis_target`
+/// does.
 ///
 /// `definition` is the `TRANSFORM` statement as Trellis stores it, written
 /// under grammar `grammar_version` (ADR-0018), and `target_columns` the
 /// target table's columns in table order. The `SELECT` has one output column
-/// per target column, in that order, each typed as the statements that write
-/// the target compute it, so an `INSERT` lands every value by the assignment
-/// cast those statements rely on.
+/// per target column, in that order, each with the type Postgres gives its
+/// expression, so an `INSERT` lands every value in its column by the
+/// assignment cast the statements that write the target rely on.
 ///
 /// It reads no database: the text is parsed with `apply`'s own parser and
 /// rendered as the engine renders its writes. A table the definition names
@@ -115,9 +116,10 @@ pub(crate) fn render_target_select_sql(
 ///
 /// # Errors
 ///
-/// [`TrellisError::Parse`](crate::TrellisError::Parse) if the text doesn't parse under its grammar
-/// version, and [`TrellisError::TargetSelect`](crate::TrellisError::TargetSelect) if a target column is neither a
-/// field nor a key column of the definition.
+/// [`TrellisError::Parse`](crate::TrellisError::Parse) if the text doesn't
+/// parse under its grammar version, and
+/// [`TrellisError::TargetSelect`](crate::TrellisError::TargetSelect) if a
+/// target column is neither a field nor a key column of the definition.
 pub fn target_select_sql<S: AsRef<str>>(
     definition: &str,
     grammar_version: i32,
