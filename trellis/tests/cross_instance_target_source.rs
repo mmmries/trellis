@@ -12,6 +12,10 @@
 //! These tests drive both instances' catalogs directly and never wait for a
 //! live pipeline to converge.
 
+#[path = "support/pipeline.rs"]
+mod pipeline;
+
+use pipeline::columns;
 use std::collections::HashMap;
 
 use testkit::TestCluster;
@@ -27,13 +31,6 @@ const INSTANCE_B: &str = "instance_b";
 
 async fn connect_raw(dsn: &str, schema: &str) -> Client {
     testkit::connect_with(dsn, &format!("set search_path to {schema}, public")).await
-}
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, ty)| (name.to_string(), *ty))
-        .collect()
 }
 
 fn sales_columns() -> HashMap<String, ValueType> {

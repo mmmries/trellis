@@ -18,9 +18,12 @@
 
 #[path = "support/pipeline.rs"]
 mod pipeline;
+#[path = "support/wait_live.rs"]
+mod wait_live;
 
 use pipeline::{connect, definer};
 use std::time::{Duration, Instant};
+use wait_live::wait_for_live;
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
@@ -53,23 +56,6 @@ async fn status(trellis: &Trellis, target: &str) -> TransformStatus {
         .status
 }
 
-/// Polls `Trellis::status` until `target` reports `live`, the operator's
-/// signal of steady state.
-async fn wait_for_live(trellis: &Trellis, target: &str) {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let current = status(trellis, target).await;
-        if current == TransformStatus::Live {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{target} never reported live (last: {current:?})"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// Takes a watermark token now and awaits it: read-your-writes for every
 /// commit before this call.
 async fn converge(trellis: &Trellis) {
@@ -83,27 +69,18 @@ async fn converge(trellis: &Trellis) {
 /// Waits until some backend is blocked on advisory lock `key`: the held
 /// build (or chunk) has read its source and is parked before its write.
 async fn wait_until_held(raw: &Client, key: i64) {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let held: bool = raw
-            .query_one(
-                "select exists (select 1 from pg_locks \
-                 where locktype = 'advisory' and objid = $1::bigint::oid and not granted \
-                   and database = (select oid from pg_database where datname = current_database()))",
-                &[&key],
-            )
-            .await
-            .expect("read pg_locks")
-            .get(0);
-        if held {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the build never reached its hold"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    testkit::wait_until("the build to reach its hold", TIMEOUT, async || {
+        raw.query_one(
+            "select exists (select 1 from pg_locks \
+             where locktype = 'advisory' and objid = $1::bigint::oid and not granted \
+               and database = (select oid from pg_database where datname = current_database()))",
+            &[&key],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0)
+    })
+    .await;
 }
 
 /// `public.sales`, seeded with `sku = 'a'` totalling 12.

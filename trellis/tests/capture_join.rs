@@ -647,20 +647,6 @@ async fn spawn_writer(
     (pid, task)
 }
 
-/// Polls `check` every 50 ms until it holds or `within` runs out. Used only
-/// by the two end-to-end tests, which run a real client.
-async fn eventually<F, Fut>(within: Duration, what: &str, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + within;
-    while !check().await {
-        assert!(Instant::now() < deadline, "{what}: not within {within:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// A3 end to end through reconcile: a join, then a drop, each while a
 /// writer transaction on the table stays open. Another writer keeps writing
 /// the table meanwhile, and no one transaction blocks it for long: each of
@@ -702,9 +688,9 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
     // (1 s) plus a reconcile interval after the join is defined, and a loaded
     // box can stretch that past the hold window. The holder is still open, so
     // the report is certain to appear: wait for it rather than for a window.
-    eventually(
-        Duration::from_secs(30),
+    testkit::wait_until(
         "the join's wait is reported",
+        Duration::from_secs(30),
         || async {
             trellis
                 .status("tu")
@@ -722,7 +708,7 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
         .batch_execute("commit")
         .await
         .expect("end the holder");
-    eventually(Duration::from_secs(30), "tu goes live", || async {
+    testkit::wait_until("tu goes live", Duration::from_secs(30), || async {
         status(&raw, "tu").await == TransformStatus::Live
     })
     .await;
@@ -766,9 +752,9 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
         .batch_execute("commit")
         .await
         .expect("end the holder");
-    eventually(
-        Duration::from_secs(30),
+    testkit::wait_until(
         "the capture is uninstalled",
+        Duration::from_secs(30),
         // Read while the worker may be committing the uninstall: `installed`
         // reads every event in one statement, so it never sees half of it
         // (`captured_columns` fails on a partial install).
@@ -814,9 +800,9 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
         .expect("define c_totals");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");
     for target in ["c_named", "c_totals"] {
-        eventually(
-            Duration::from_secs(30),
+        testkit::wait_until(
             "the definitions go live",
+            Duration::from_secs(30),
             || async { status(&raw, target).await == TransformStatus::Live },
         )
         .await;
@@ -915,7 +901,7 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
         .await
         .expect("define");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");
-    eventually(Duration::from_secs(30), "by_grp goes live", || async {
+    testkit::wait_until("by_grp goes live", Duration::from_secs(30), || async {
         status(&raw, "by_grp").await == TransformStatus::Live
     })
     .await;
@@ -1095,7 +1081,7 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
         .await
         .expect("define");
     let client = trellis::Client::start(db.dsn(), quick_options()).expect("start the client");
-    eventually(Duration::from_secs(30), "tu goes live", || async {
+    testkit::wait_until("tu goes live", Duration::from_secs(30), || async {
         status(&raw, "tu").await == TransformStatus::Live
     })
     .await;

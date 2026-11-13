@@ -29,7 +29,7 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::{connect_raw, settle, start_and_settle_builds};
+use pipeline::{columns, connect_raw, settle, start_and_settle_builds};
 
 use std::collections::HashMap;
 
@@ -78,13 +78,6 @@ async fn stage_cdc(
         )
         .await
         .unwrap_or_else(|e| panic!("stage cdc {key:?} into {table} failed: {e}"));
-}
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, ty)| (name.to_string(), *ty))
-        .collect()
 }
 
 fn orders_columns() -> HashMap<String, ValueType> {

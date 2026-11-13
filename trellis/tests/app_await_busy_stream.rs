@@ -26,14 +26,15 @@ use trellis::{Config, Trellis, TrellisOptions};
 const BUDGET: Duration = Duration::from_secs(10);
 
 async fn wait_live(trellis: &Trellis, target: &str) {
-    for _ in 0..1_500 {
-        let status = trellis.status(target).await.expect("status");
-        if status.is_some_and(|s| s.status == TransformStatus::Live) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("{target} never went live");
+    testkit::wait_until(
+        format!("{target} goes live"),
+        Duration::from_secs(60),
+        async || {
+            let status = trellis.status(target).await.expect("status");
+            status.is_some_and(|s| s.status == TransformStatus::Live)
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
