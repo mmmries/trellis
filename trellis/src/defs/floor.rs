@@ -519,7 +519,7 @@ impl Used {
     }
 
     fn expr(&mut self, expr: &Expr) {
-        match expr {
+        expr.walk(&mut |node| match node {
             Expr::Column(_) => self.add(Feature::Expr(ExprNode::Column)),
             Expr::NumberLiteral(_) => self.add(Feature::Expr(ExprNode::NumberLiteral)),
             Expr::StringLiteral(_) => self.add(Feature::Expr(ExprNode::StringLiteral)),
@@ -534,50 +534,23 @@ impl Used {
                 table: _,
                 column: _,
             } => self.add(Feature::Expr(ExprNode::SourceColumn)),
-            Expr::BinaryOp { op, lhs, rhs } => {
-                self.add(Feature::Operator(*op));
-                self.expr(lhs);
-                self.expr(rhs);
-            }
-            Expr::FunctionCall { name, args } => {
-                match function_name(name) {
-                    Some(name) => self.add(Feature::Function(name)),
-                    None => self.unknown = true,
-                }
-                for arg in args {
-                    self.expr(arg);
-                }
-            }
-            Expr::Negate(operand) => {
-                self.add(Feature::Expr(ExprNode::Negate));
-                self.expr(operand);
-            }
-            Expr::Cast { expr, target } => {
-                self.add(Feature::CastTarget(*target));
-                self.expr(expr);
-            }
-            Expr::Not(operand) => {
-                self.add(Feature::Expr(ExprNode::Not));
-                self.expr(operand);
-            }
-            Expr::IsNull { expr, negated: _ } => {
-                self.add(Feature::Expr(ExprNode::IsNull));
-                self.expr(expr);
-            }
+            Expr::BinaryOp { op, lhs: _, rhs: _ } => self.add(Feature::Operator(*op)),
+            Expr::FunctionCall { name, args: _ } => match function_name(name) {
+                Some(name) => self.add(Feature::Function(name)),
+                None => self.unknown = true,
+            },
+            Expr::Negate(_) => self.add(Feature::Expr(ExprNode::Negate)),
+            Expr::Cast { expr: _, target } => self.add(Feature::CastTarget(*target)),
+            Expr::Not(_) => self.add(Feature::Expr(ExprNode::Not)),
+            Expr::IsNull {
+                expr: _,
+                negated: _,
+            } => self.add(Feature::Expr(ExprNode::IsNull)),
             Expr::Case {
-                branches,
-                otherwise,
-            } => {
-                self.add(Feature::Expr(ExprNode::Case));
-                for (condition, result) in branches {
-                    self.expr(condition);
-                    self.expr(result);
-                }
-                if let Some(otherwise) = otherwise {
-                    self.expr(otherwise);
-                }
-            }
-        }
+                branches: _,
+                otherwise: _,
+            } => self.add(Feature::Expr(ExprNode::Case)),
+        });
     }
 }
 

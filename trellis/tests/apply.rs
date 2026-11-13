@@ -15,7 +15,7 @@ mod sql_recompute;
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use pipeline::{connect_raw, numeric_columns};
+use pipeline::{columns, connect_raw, numeric_columns};
 use std::collections::HashMap;
 
 use sql_recompute::recompute;
@@ -26,13 +26,6 @@ use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, Transfor
 use trellis::defs::{PgType, create_definition, create_target_table, source_primary_key};
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::{SegmentState, TRUNCATE_SENTINEL_KEY, claim, fold};
-
-fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
-    pairs
-        .iter()
-        .map(|(name, ty)| (name.to_string(), *ty))
-        .collect()
-}
 
 async fn segment_state(client: &Client, seg_seq: i64) -> SegmentState {
     let state: String = client

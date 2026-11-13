@@ -706,46 +706,16 @@ fn expr_reads(
     source_columns: &HashMap<String, ValueType>,
     out: &mut Vec<(String, String)>,
 ) {
-    let read = match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. }
-            if source_columns.contains_key(name) =>
+    expr.walk(&mut |e| {
+        if let Expr::Column(name) | Expr::SourceColumn { column: name, .. } = e
+            && source_columns.contains_key(name)
         {
-            Some((source.to_string(), name.clone()))
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                expr_reads(arg, source, source_columns, out);
+            let read = (source.to_string(), name.clone());
+            if !out.contains(&read) {
+                out.push(read);
             }
-            None
         }
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            expr_reads(lhs, source, source_columns, out);
-            expr_reads(rhs, source, source_columns, out);
-            None
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            expr_reads(operand, source, source_columns, out);
-            None
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                expr_reads(child, source, source_columns, out);
-            }
-            None
-        }
-        Expr::Column(_)
-        | Expr::SourceColumn { .. }
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => None,
-    };
-    if let Some(read) = read
-        && !out.contains(&read)
-    {
-        out.push(read);
-    }
+    });
 }
 
 /// A column type: its OID and modifier, its `schema.typname` and modifier

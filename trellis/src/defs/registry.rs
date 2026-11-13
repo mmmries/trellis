@@ -1226,6 +1226,13 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
     "STRING_AGG",
 ];
 
+/// Whether `name` (in any case) names an aggregate, admitted or not.
+pub fn is_aggregate_name(name: &str) -> bool {
+    AGGREGATE_FUNCTIONS
+        .iter()
+        .any(|aggregate| aggregate.eq_ignore_ascii_case(name))
+}
+
 /// The aggregate functions the grammar parses, each entry's `arg_types`
 /// length its arity, which [`super::parser`] enforces. `COUNT`, `SUM` and
 /// `AVG` are the ones an [`super::ast::KeySpace::Aggregate`] or `JOIN`

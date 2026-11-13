@@ -45,12 +45,10 @@ pub(super) fn apply_predicate_without(no_visibility: bool, no_position: bool) ->
 /// through its key's index, and the statement costs the keys it is given
 /// rather than the ledger's size. [`ENTRY_PLAN_RESET`] puts them back after
 /// the statement. They pin the entry lock ([`lock_statement`]) and a 1-1
-/// page's entry update (`super::one_to_one_ledger::update_entries`). They also pin every read
-/// of a source by a batch's keys (`super::apply::live_rows_query`), the
-/// endpoint feed's re-read of a target by its keys
-/// (`super::target_mutations::read_new_images`) and a composite-key 1-1
-/// target's pre-lock (`super::apply::lock_composite_keys`), which a table's
-/// lagging statistics price the same way.
+/// page's entry update (`super::one_to_one_ledger::update_entries`). They also
+/// pin the keyset reads of a source or target by a batch's keys, and the 1-1
+/// apply's pre-locks and single-column delete (`super::keyset`), which a
+/// table's lagging statistics price the same way.
 ///
 /// Left to itself, the planner read the whole ledger for a page's few
 /// thousand keys whenever it priced that cheaper, which it does while a

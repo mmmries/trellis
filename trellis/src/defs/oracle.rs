@@ -182,7 +182,7 @@ fn collect_columns(
     field_names: &HashSet<&str>,
     out: &mut HashSet<String>,
 ) {
-    match expr {
+    expr.walk(&mut |e| match e {
         Expr::Column(name) => {
             let is_self_passthrough = name == field_name;
             if is_self_passthrough || !field_names.contains(name.as_str()) {
@@ -192,29 +192,8 @@ fn collect_columns(
         Expr::SourceColumn { column, .. } => {
             out.insert(column.clone());
         }
-        Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => {}
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            collect_columns(lhs, field_name, field_names, out);
-            collect_columns(rhs, field_name, field_names, out);
-        }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-            collect_columns(operand, field_name, field_names, out);
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_columns(arg, field_name, field_names, out);
-            }
-        }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                collect_columns(child, field_name, field_names, out);
-            }
-        }
-    }
+        _ => {}
+    });
 }
 
 /// Renders a calculated-field expression back to the equivalent Postgres

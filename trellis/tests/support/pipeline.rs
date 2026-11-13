@@ -398,6 +398,14 @@ pub fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
         .collect()
 }
 
+/// Each `(name, type)` pair as a column map.
+pub fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
+    pairs
+        .iter()
+        .map(|(name, ty)| (name.to_string(), *ty))
+        .collect()
+}
+
 /// `sql`'s rows, each rendered as a row literal, `(1,25,2)`.
 pub async fn rows(client: &Client, sql: &str) -> Vec<String> {
     client

@@ -293,38 +293,20 @@ pub(crate) fn expr_reads(def: &TransformDef, expr: &Expr, side: Side, column: &s
 }
 
 fn walk_columns(expr: &Expr, visit: &mut impl FnMut(&QualifiedColumn)) {
-    match expr {
-        Expr::SourceColumn {
+    expr.walk(&mut |e| {
+        if let Expr::SourceColumn {
             schema,
             table,
             column,
-        } => visit(&QualifiedColumn {
-            schema: schema.clone(),
-            table: table.clone(),
-            column: column.clone(),
-        }),
-        Expr::BinaryOp { lhs, rhs, .. } => {
-            walk_columns(lhs, visit);
-            walk_columns(rhs, visit);
+        } = e
+        {
+            visit(&QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: column.clone(),
+            });
         }
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk_columns(operand, visit),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            for child in expr.logic_children() {
-                walk_columns(child, visit);
-            }
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                walk_columns(arg, visit);
-            }
-        }
-        Expr::Column(_)
-        | Expr::NumberLiteral(_)
-        | Expr::StringLiteral(_)
-        | Expr::BooleanLiteral(_)
-        | Expr::Null
-        | Expr::TypedLiteral { .. } => {}
-    }
+    });
 }
 
 /// Whether `name` (uppercased) is an aggregate a `JOIN` admits.
@@ -353,24 +335,11 @@ pub(crate) fn side_arguments(def: &TransformDef, side: Side) -> Vec<Expr> {
                     out.push(arg.clone());
                 }
             }
-            Expr::FunctionCall { args, .. } => {
-                for arg in args {
-                    collect(arg, def, join, side, out);
-                }
-            }
-            Expr::BinaryOp { lhs, rhs, .. } => {
-                collect(lhs, def, join, side, out);
-                collect(rhs, def, join, side, out);
-            }
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
-                collect(operand, def, join, side, out);
-            }
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                for child in expr.logic_children() {
+            _ => {
+                for child in expr.children() {
                     collect(child, def, join, side, out);
                 }
             }
-            _ => {}
         }
     }
     let mut out = Vec::new();

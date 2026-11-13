@@ -16,14 +16,12 @@
 #[path = "support/pipeline.rs"]
 mod pipeline;
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 use testkit::connect_raw;
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::ValueType;
 use trellis::defs::{create_aggregate_target_table, create_definition, parse};
 use trellis::staging::apply::{self, DrainHooks};
 use trellis::staging::{HeartbeatDaemon, HeartbeatDaemonConfig, SegmentState, claim, liveness};
@@ -100,20 +98,6 @@ async fn backdate_claims(client: &Client, seg_seq: i64) {
 /// hang. Only ever a bound on a hang: no test asserts the daemon got there
 /// quickly.
 const HANG: Duration = Duration::from_secs(30);
-
-/// Polls `probe` every 10ms until it holds, panicking with `what` after
-/// [`HANG`].
-async fn wait_until<F, Fut>(what: &str, mut probe: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + HANG;
-    while !probe().await {
-        assert!(Instant::now() < deadline, "timed out waiting: {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
 
 #[tokio::test]
 async fn reclaim_frees_a_stale_claim_and_a_fresh_claim_picks_it_up() {
@@ -200,18 +184,22 @@ async fn a_daemon_heartbeat_survives_a_bulk_drain_that_outlives_the_ttl() {
     // the only thing that can bring `daemon_seg`'s claim back within the TTL.
     backdate_claims(&client, daemon_seg).await;
     backdate_claims(&client, plain_seg).await;
-    wait_until("the daemon to refresh its backdated claim", || async {
-        client
-            .query_one(
-                "select bool_and(claimed_at >= now() - (interval '1 second' * $3)) \
+    testkit::wait_until(
+        "the daemon to refresh its backdated claim",
+        HANG,
+        || async {
+            client
+                .query_one(
+                    "select bool_and(claimed_at >= now() - (interval '1 second' * $3)) \
                  from seg_claims where seg_seq = $1 and claimed_by = $2",
-                &[&daemon_seg, &"bulk-worker", &ttl.as_secs_f64()],
-            )
-            .await
-            .expect("read the daemon-tracked claim")
-            .get::<_, Option<bool>>(0)
-            .unwrap_or(false)
-    })
+                    &[&daemon_seg, &"bulk-worker", &ttl.as_secs_f64()],
+                )
+                .await
+                .expect("read the daemon-tracked claim")
+                .get::<_, Option<bool>>(0)
+                .unwrap_or(false)
+        },
+    )
     .await;
 
     let reclaimed = liveness::reclaim_stale(&client, ttl)
@@ -397,8 +385,9 @@ async fn daemon_closes_its_connection_after_idle_timeout_with_no_registered_clai
     );
 
     daemon.register(seg_seq, "worker").await;
-    wait_until(
+    testkit::wait_until(
         "the daemon to open a connection for a claim that outlived one interval",
+        HANG,
         || async { daemon.is_connected() },
     )
     .await;
@@ -410,8 +399,9 @@ async fn daemon_closes_its_connection_after_idle_timeout_with_no_registered_clai
     // late the daemon's ticks run.
     let deregistered_at = Instant::now();
     daemon.deregister(seg_seq, "worker").await;
-    wait_until(
+    testkit::wait_until(
         "the daemon to close its connection once idle for longer than idle_timeout",
+        HANG,
         || async { !daemon.is_connected() },
     )
     .await;
@@ -449,10 +439,7 @@ async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_sta
         )
         .await
         .expect("create items");
-    let columns: HashMap<String, ValueType> = ["id", "grp", "amount"]
-        .iter()
-        .map(|n| (n.to_string(), ValueType::Numeric))
-        .collect();
+    let columns = pipeline::numeric_columns(&["id", "grp", "amount"]);
     let def = parse(GROUP_TOTALS).expect("parse");
     create_definition(&db.pool, GROUP_TOTALS, &columns)
         .await
@@ -518,17 +505,21 @@ async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_sta
 
     // Waiting on a precondition, not on convergence: the page's apply
     // transaction has begun and is parked on the lock.
-    wait_until("the page's apply to block on the target lock", || async {
-        client
-            .query_one(
-                "select exists (select 1 from pg_stat_activity \
+    testkit::wait_until(
+        "the page's apply to block on the target lock",
+        HANG,
+        || async {
+            client
+                .query_one(
+                    "select exists (select 1 from pg_stat_activity \
                  where datname = current_database() and wait_event_type = 'Lock')",
-                &[],
-            )
-            .await
-            .expect("read pg_stat_activity")
-            .get::<_, bool>(0)
-    })
+                    &[],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get::<_, bool>(0)
+        },
+    )
     .await;
     // Let the blocked transaction age visibly before releasing it.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -629,8 +620,9 @@ async fn a_daemon_keeps_its_claimants_drainer_row_fresh_through_a_long_drain() {
                 .get::<_, bool>(0)
         }
     };
-    wait_until(
+    testkit::wait_until(
         "the daemon to refresh the busy worker's drainer row",
+        HANG,
         || live("busy-worker"),
     )
     .await;

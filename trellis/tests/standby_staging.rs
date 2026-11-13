@@ -57,20 +57,14 @@ async fn lock_holders(raw: &tokio_postgres::Client) -> Vec<i32> {
 
 /// Polls `lock_holders` until it reads a single backend that is not `not`.
 async fn wait_for_new_leader(raw: &tokio_postgres::Client, not: &[i32]) -> i32 {
-    let deadline = tokio::time::Instant::now() + TAKEOVER_WAIT;
-    loop {
+    testkit::wait_for("a new leader holds the lock", TAKEOVER_WAIT, async || {
         let holders = lock_holders(raw).await;
-        if let [pid] = holders[..]
-            && !not.contains(&pid)
-        {
-            return pid;
+        match holders[..] {
+            [pid] if !not.contains(&pid) => Ok(pid),
+            _ => Err(holders),
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no new leader within {TAKEOVER_WAIT:?}; holders: {holders:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    })
+    .await
 }
 
 /// The second `staging: true` connect returns a working handle instead of a
