@@ -33,6 +33,9 @@ class BootApp < Rails::Application
   config.eager_load = false
   config.logger = Logger.new(nil)
   config.secret_key_base = "test"
+  # Without load_defaults, Rails 8.0 warns while booting about 8.1's `to_time`
+  # behavior (8.1 has it and deprecates the setting).
+  config.active_support.to_time_preserves_timezone = :zone if Rails.gem_version < Gem::Version.new("8.1")
   config.trellis.connect = { "url" => ENV.fetch("TRELLIS_TEST_DSN"), "target_schema" => "boot_targets" }
 end
 

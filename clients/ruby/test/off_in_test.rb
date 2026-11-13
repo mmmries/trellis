@@ -45,7 +45,7 @@ class OffInTest < Minitest::Test
     Tasks.env = @saved.fetch(:env)
     ActiveRecord.schema_format = @saved.fetch(:schema_format)
     ActiveRecord::Base.configurations = @saved.fetch(:configurations)
-    @databases.each { |name| @admin.exec("drop database if exists #{name} with (force)") }
+    @databases.each { |name| @admin.exec("drop database if exists #{@admin.escape_identifier(name)} with (force)") }
     @admin.close
     FileUtils.rm_rf(@dir)
     super
@@ -108,7 +108,7 @@ class OffInTest < Minitest::Test
     database = database("migr")
     ActiveRecord::Base.establish_connection(db_config(database))
     TrellisTestApp.config.trellis.connect = { url: dsn(database) }
-    klass = Class.new(ActiveRecord::Migration[8.1]) do
+    klass = Class.new(ActiveRecord::Migration[ActiveRecord::Migration.current_version]) do
       include Trellis::Migration
 
       disable_ddl_transaction!
@@ -150,8 +150,11 @@ class OffInTest < Minitest::Test
     TrellisTestApp.config.trellis.off_in = [] # Trellis on in the test environment
     Tasks.load_schema(db_config(on), :sql, File.join(@dir, "structure.sql"))
     assert_includes tables(on, "trellis"), "transform_definitions"
-    error = assert_raises(ActiveRecord::StatementInvalid) { check_foreign_keys(on) }
-    assert_match(/does not exist/, error.message)
+    if ActiveRecord.version >= Gem::Version.new("8.1")
+      # 8.1's check casts `conrelid::regclass` unqualified; 8.0's doesn't.
+      error = assert_raises(ActiveRecord::StatementInvalid) { check_foreign_keys(on) }
+      assert_match(/does not exist/, error.message)
+    end
     # The other way out, with Trellis on: Trellis's schema on the search path.
     check_foreign_keys(on, schema_search_path: "public,trellis")
 
@@ -182,13 +185,15 @@ class OffInTest < Minitest::Test
     assert_includes tables(test, "public"), "of_totals_#{@id}"
   end
 
-  # `parallelize(workers: n)` makes a database per worker (`<name>_<i>`) and
-  # loads the schema into it in each forked worker. config.trellis.connect
-  # names the one database, so with Trellis on the load is refused.
+  # `parallelize(workers: n)` makes a database per worker (`<name>_<i>`, or
+  # `<name>-<i>` before Rails 8.1) and loads the schema into it in each forked
+  # worker. config.trellis.connect names the one database, so with Trellis on
+  # the load is refused.
   def test_a_parallel_worker_database_loads_when_trellis_is_off
     dump(source_database)
     name = "of_app_#{@id}_#{Process.pid}"
-    @databases << "#{name}_0"
+    worker = "#{name}#{ActiveRecord.version >= Gem::Version.new("8.1") ? "_" : "-"}0"
+    @databases << worker
     info = TestCluster.info
     base = { "adapter" => "postgresql", "host" => info.fetch("host"), "port" => info.fetch("port"),
              "username" => info.fetch("user"), "schema_search_path" => "public", "database" => name }
@@ -205,8 +210,8 @@ class OffInTest < Minitest::Test
 
     TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN
     ActiveRecord::TestDatabases.create_and_load_schema(0, env_name: "test")
-    assert_includes tables("#{name}_0", "public"), "of_totals_#{@id}"
-    assert_nil to_regclass("#{name}_0", "trellis.transform_definitions")
+    assert_includes tables(worker, "public"), "of_totals_#{@id}"
+    assert_nil to_regclass(worker, "trellis.transform_definitions")
   end
 
   # The dump file is the environment Trellis is on in: a `db:prepare` there
@@ -257,7 +262,10 @@ class OffInTest < Minitest::Test
   def dump(database)
     TrellisTestApp.config.trellis.connect = { url: dsn(database) }
     TrellisTestApp.config.trellis.off_in = []
-    Tasks.dump_schema(db_config(database))
+    # On the database's own pool, as Rails' callers dump: 8.0's dump_schema
+    # reads schema_migrations from the current one.
+    config = db_config(database)
+    Tasks.with_temporary_connection(config) { Tasks.dump_schema(config) }
     File.read(File.join(@dir, "structure.sql"))
   ensure
     TrellisTestApp.config.trellis.connect = nil
