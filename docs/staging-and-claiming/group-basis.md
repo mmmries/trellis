@@ -54,7 +54,20 @@ newest segment, runs the source's `GROUP BY` over the groups and replaces their
 partials, extremes, bases, stamps and visible rows (R1, R5, R6, Rx6). A build
 updates the hidden rows in the order they are stored
 ([W2](../decisions/0028-locking-and-writing.md#w2-a-bulk-write-writes-in-the-destinations-order)).
-Pages keep applying, against the new bases once it commits. What each covers (R8):
+Pages keep applying, against the new bases once it commits.
+
+A plain aggregate's fresh build or resume over an unpartitioned source writes
+each group once
+([ADR-0002](../decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)):
+its first statement takes the snapshot, reads the source's `GROUP BY` and the
+enumeration below, and in key order inserts each group with no hidden row with
+its final values and locks each that has one. Those groups, which a page made
+or applied to since the build started, are then rewritten by the replace above
+from a new snapshot, reading the source by an index probe per group when they
+are few and the source has an index on the group columns, else by one
+`GROUP BY`.
+
+What each covers (R8):
 
 - **Build or rebuild**, the plan job's whole build
   ([data flow](../data-flow.md#an-aggregates-or-a-joins-build)): the target's

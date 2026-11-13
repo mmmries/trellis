@@ -147,7 +147,9 @@
 //! has enumerated its groups, before it locks them, [`PausePoint::AfterRebuildLock`] for
 //! the definition's target once it has locked its groups, before the
 //! statement that takes its snapshot, and [`PausePoint::BeforeRebuildCommit`]
-//! after its last write, before it commits. Over a partitioned
+//! after its last write, before it commits. A fresh build's write-once
+//! form also fires [`PausePoint::InsideBuildWrite`] inside its first
+//! statement ([`pause_in_statement`]). Over a partitioned
 //! source the job is a transaction per leaf, and each fires
 //! [`PausePoint::BeforeRebuildCommit`] (an armed point fires once, at the
 //! first); between two of them it fires [`PausePoint::BetweenRebuildStructures`].
@@ -443,13 +445,21 @@ pub enum PausePoint {
     /// covers, before the statement that locks them, for the definition's
     /// target (`super::group_basis::rebuild`). No group is locked
     /// here: a page of any of them applies now, and a group a page creates
-    /// is not enumerated.
+    /// is not enumerated. A fresh build's write-once form fires it before
+    /// its first statement, which enumerates and locks.
     AfterRebuildEnumerate,
+    /// Inside a fresh build's first statement in its write-once form, for
+    /// the definition's target (`super::group_basis::rebuild`): its
+    /// snapshot is taken, and its insert has inserted or locked no group
+    /// yet. A page that commits now is missed by the snapshot, and the
+    /// insert finds the row it made. Fired by [`pause_in_statement`].
+    InsideBuildWrite,
     /// After a group-basis build or rebuild has locked every group it covers, before
     /// the statement that takes its snapshot and replaces them, for the
     /// definition's target (`super::group_basis::rebuild`). Pages of
     /// those groups queue on their locks here; a group a page creates now
-    /// isn't locked.
+    /// isn't locked. In a fresh build's write-once form, after its first
+    /// statement: every group it enumerated is written or locked.
     AfterRebuildLock,
     /// After a group-basis rebuild has replaced every group and marked its
     /// job done, just before it commits, for the definition's target
@@ -873,6 +883,66 @@ pub(crate) async fn pause_at<C: GenericClient>(
         )
         .await?;
     Ok(())
+}
+
+/// A pause inside one statement ([`pause_in_statement`]): `sql` is a
+/// `FROM` item for the statement to read where it should wait.
+pub(crate) struct InStatement {
+    pub(crate) sql: String,
+    lock_timeout: String,
+}
+
+/// [`pause_at`] inside the statement `client` runs next: unless `point` is
+/// armed for `target`, `None`. When it is, reports [`Reached`] and returns
+/// a `FROM` item that waits on the pause lock wherever the statement reads
+/// it. The test, once it sees the backend blocked, knows the statement's
+/// snapshot is taken. [`InStatement::end`] after the statement.
+pub(crate) async fn pause_in_statement<C: GenericClient>(
+    client: &C,
+    point: PausePoint,
+    target: &str,
+) -> Result<Option<InStatement>, tokio_postgres::Error> {
+    let Some(arming) = SCOPE
+        .try_with(|scope| scope.take(point, target))
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let row = client
+        .query_one(
+            "select pg_backend_pid(), current_setting('lock_timeout')",
+            &[],
+        )
+        .await?;
+    let (backend_pid, lock_timeout): (i32, String) = (row.get(0), row.get(1));
+    client
+        .execute("select set_config('lock_timeout', '0', true)", &[])
+        .await?;
+    let _ = arming.reached.send(Reached { point, backend_pid });
+    Ok(Some(InStatement {
+        sql: format!(
+            "(select pg_catalog.pg_advisory_xact_lock_shared({})) as __pause",
+            arming.lock_key
+        ),
+        lock_timeout,
+    }))
+}
+
+impl InStatement {
+    /// Gives the session its lock timeout back.
+    pub(crate) async fn end<C: GenericClient>(
+        self,
+        client: &C,
+    ) -> Result<(), tokio_postgres::Error> {
+        client
+            .execute(
+                "select set_config('lock_timeout', $1, true)",
+                &[&self.lock_timeout],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 /// [`pause_at`] for a point between transactions: it waits by polling the
