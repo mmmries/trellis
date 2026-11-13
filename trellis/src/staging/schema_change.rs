@@ -998,8 +998,8 @@ pub(crate) async fn pause_readers_in_hierarchy(
 ///    for that use now ([`key_types::refusal`]): an `ALTER COLUMN ... TYPE
 ///    character(n)` on a join column, a nondeterministic `COLLATE` on a
 ///    `GROUP BY` column;
-/// 2. a `JOIN`'s `ON` pair no longer has one type and collation:
-///    one join column re-typed and the other not (yet);
+/// 2. a `JOIN`'s `ON` pair no longer has one type: one join column
+///    re-typed and the other not (yet), which the re-validation below finds;
 /// 3. one of its key columns changed type, since the definition was
 ///    accepted or last resumed, in a way that renders the values Trellis
 ///    already stored differently ([`key_types::renders_differently`]):

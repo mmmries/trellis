@@ -123,16 +123,20 @@ async fn status_lists_every_positions_m() {
 /// An `ON` column retyped on one side pauses the star naming only the
 /// retyped column of that table (at a star `a` has an `ON` column per
 /// position, and the other positions' did not change), and the reason names
-/// the pair once.
+/// the pair once. Widened (which also outgrows Trellis's copies) or narrowed
+/// (which only the pair's mismatch pauses).
 #[tokio::test]
 async fn a_retyped_on_column_is_named_alone_and_its_reason_said_once() {
-    for shape in [Shape::TWO, Shape::new(2, 1), Shape::new(2, 2)] {
+    for (ty, shape) in ["bigint", "smallint"]
+        .into_iter()
+        .flat_map(|ty| [Shape::TWO, Shape::new(2, 1), Shape::new(2, 2)].map(|shape| (ty, shape)))
+    {
         for (table, column) in [("public.a", shape.k()), (shape.b().as_str(), "k".into())] {
             let star = shape.stars()[0];
             let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
             star::write(
                 &d,
-                &format!("alter table {table} alter column {column} type bigint"),
+                &format!("alter table {table} alter column {column} type {ty}"),
             )
             .await;
             let pool = d.pool().clone();
@@ -151,7 +155,7 @@ async fn a_retyped_on_column_is_named_alone_and_its_reason_said_once() {
             .expect("the definition exists")
             .capture_failure
             .expect("the retype pauses the star");
-            let name = format!("{shape:?} {table}.{column}");
+            let name = format!("{ty} {shape:?} {table}.{column}");
             assert_eq!(failure.source_table, table, "{name}: {}", failure.error);
             assert_eq!(failure.columns, [column], "{name}: {}", failure.error);
             assert_eq!(
