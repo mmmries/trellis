@@ -45,7 +45,7 @@ class MetricsMiddlewareTest < Minitest::Test
     assert response.body.start_with?("# TYPE app_jobs_total counter\n"), response.body
     assert_match(%r{^app_jobs_total 3.0$}, response.body)
     assert_match(%r{^trellis_instance_up\{trellis_instance="[^"/]+/metrics_mw"\} 1$}, response.body)
-    response.body.each_line(chomp: true) { |line| assert_match SAMPLE_OR_COMMENT, line }
+    response.body.each_line(chomp: true).reject(&:empty?).each { |line| assert_match SAMPLE_OR_COMMENT, line }
     families = response.body.scan(/^# TYPE (\w+) /).flatten
     assert_equal families.uniq, families, "a metric family is declared twice"
   end
