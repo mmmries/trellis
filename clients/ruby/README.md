@@ -131,9 +131,9 @@ Nothing in the binding uses it.
   transform was dropped. With no drain worker anywhere in the fleet a job
   stays `:queued`.
 - `Trellis::Metrics.render_prometheus`: the process-wide metrics registry as
-  Prometheus text, for a `/metrics` route the app already serves (the
-  binding opens no port; `Trellis::Metrics::RackApp` is a mountable route;
-  see [Metrics](#metrics)). It needs no handle.
+  Prometheus text (the binding opens no port; `Trellis::Metrics::RackApp` is a
+  mountable route and `Trellis::Metrics::Middleware` appends it to an
+  exporter's; see [Metrics](#metrics)). It needs no handle.
 
 ```ruby
 require "trellis/pg"
@@ -214,7 +214,7 @@ shuts down. The metrics themselves are listed in
 [`docs/observability.md`](../../docs/observability.md).
 
 The binding opens no port. `Trellis::Metrics::RackApp` is a Rack app that
-serves the text, so a Rails app mounts it:
+serves the text from a route of its own, so a Rails app mounts it:
 
 ```ruby
 # config/routes.rb
@@ -237,10 +237,36 @@ Prometheus scrapes each. A process forked while its parent had a handle
 running can't render the registry: it raises `Trellis::ForkedHandleError`
 (see [Forking servers](#forking-servers)).
 
-An app with an exporter of its own (`prometheus-client`,
-`prometheus_exporter`, Yabeda) can serve that body followed by
-`Trellis::Metrics.render_prometheus` from one route; the `trellis_` names
-don't collide.
+An app that already serves `/metrics` from `prometheus-client` or Yabeda (its
+exporter is `prometheus-client`'s) adds the Trellis series to that route
+rather than mounting a second one. `Trellis::Metrics::Middleware` wraps the
+exporter and appends `render_prometheus` to its response:
+
+```ruby
+# config/application.rb: outside the exporter, so before it
+config.middleware.insert_before Prometheus::Middleware::Exporter,
+                                Trellis::Metrics::Middleware, path: "/metrics"
+```
+
+In a `config.ru` it is `use Trellis::Metrics::Middleware, path: "/metrics"`
+above the exporter's `use`. For an exporter mounted as a route (Yabeda's
+`mount Yabeda::Prometheus::Exporter, at: "/metrics"`), `config.middleware.use
+Trellis::Metrics::Middleware, path: "/metrics"` does it, as the middleware
+matches the request path before the router.
+
+A `GET` or `HEAD` of `path` (default `/metrics`) answered 200 with an
+uncompressed `text/plain` body gets the Trellis text after the exporter's,
+with `Content-Length` corrected and `HEAD` bodiless. Everything else passes
+through unchanged: other paths and statuses, bodies with a `Content-Encoding`
+or `Transfer-Encoding` (put `Rack::Deflater` outside the middleware), an
+empty registry, and a forked child that can't render it (the exporter's own
+series are still served). It does not dedupe: Prometheus rejects a scrape
+that declares a metric name twice, so don't name an app metric like one of the
+engine's `trellis_` series.
+
+`prometheus_exporter` serves no route in the app: its client sends the app's
+metrics to a separate server process, which can't see the engine's registry.
+Scrape the app through `Trellis::Metrics::RackApp` as a second target.
 
 ### Logs
 
