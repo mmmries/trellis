@@ -7209,6 +7209,8 @@ mod tests {
                  function = pg_catalog.int4eq)",
             "create temporary table int4 (x integer)",
             "create temporary table pg_class (x integer)",
+            // A relation with no row type, which only `pg_class` lists.
+            "create temporary sequence pg_am",
         ] {
             assert!(!agree(&mut client, change).await, "{change}");
         }

@@ -346,3 +346,23 @@ async fn a_leaf_build_under_other_database_defaults_routes_exactly() {
     assert_eq!(have.len(), 300);
     assert_eq!(have, want, "agg2 (left) differs from the oracle (right)");
 }
+
+/// The tree changed after the record: the second leaf (groups 5 and 6) is
+/// detached, so its rows are no longer the source's. A leaf of a changed
+/// tree takes the rebuild's three statements and reads its groups through
+/// the root, where groups 5 and 6 have no row; a leaf's `GROUP BY`, the
+/// write-once form's, would write them from the detached table.
+#[tokio::test]
+async fn a_leaf_of_a_changed_tree_reads_through_the_root() {
+    let d = seeded(ROWS).await;
+    d.write("alter table public.items detach partition public.items_p1")
+        .await;
+    define(&d, columns()).await;
+    build_frozen(&d, &[]).await.finish().await;
+    assert_eq!(partials(&d, 5).await, ["(0,0,0,t)"], "no row in the source");
+    assert_eq!(partials(&d, 6).await, ["(0,0,0,t)"], "no row in the source");
+    assert_eq!(
+        d.rows("select g from public.agg2 where g in (5, 6)").await,
+        Vec::<String>::new()
+    );
+}
