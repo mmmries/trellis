@@ -1200,9 +1200,8 @@ async fn attempt(
         )
         .await?
         .get(0);
-    // The definitions an install rebuilds, for the build segment
-    // below.
-    let mut rebuilt = Vec::new();
+    // The definitions an install rebuilds, stamped below.
+    let mut rebuilt = crate::staging::build::BuildStarts::default();
     // An install that only adds nodes new to a captured root's tree leaves the
     // functions as they are, so no row staged by an older body is in flight.
     let records_gate = matches!(
@@ -1375,7 +1374,7 @@ async fn attempt(
     }
     // Last, so the share lock on the active segment is held only for the
     // commit, not for the table lock's wait.
-    crate::staging::build::stamp_rebuild_seg(&txn, &rebuilt).await?;
+    rebuilt.stamp(&txn).await?;
     txn.commit().await?;
     Ok(())
 }

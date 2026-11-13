@@ -1530,7 +1530,7 @@ impl Trellis {
                 IntakeError::Catalog(err) => TrellisError::Catalog(*err),
                 err => TrellisError::Client(ClientError::Intake(err)),
             })?;
-            crate::staging::build::stamp_rebuild_seg(&*txn, &rebuilt).await?;
+            rebuilt.stamp(&*txn).await?;
             txn.commit().await?;
             Ok(())
         }))

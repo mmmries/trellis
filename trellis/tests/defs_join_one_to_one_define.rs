@@ -5,7 +5,7 @@
 //! 1-1 or an aggregate JOIN without saying so.
 //!
 //! The pages of either side, the build and a `TRUNCATE` of either side run
-//! (`join_one_to_one_interleavings` and `join_one_to_one_build` cover them).
+//! (the `join_star_*` families and `join_one_to_one_build` cover them).
 //! Every test is stepped by hand: no staging worker runs, and nothing polls
 //! for convergence.
 

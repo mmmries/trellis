@@ -14,8 +14,14 @@
 //! - **R** (R1–R19, root Re-derives): a Re-derive of `a` against a change
 //!   of its row, of its key's joined row, a move onto its key, a stale
 //!   Apply, and a move after its unlocked read.
-//! - **F** (#1371 F1–F5, F7, F12, root writers): an `a` insert, move or
-//!   delete against a change of the joined table on its key.
+//! - **F** (#1371 F1–F5, F7, F12, F13, root writers): an `a` insert, move or
+//!   delete against a change of the joined table on its key, and F13's
+//!   fan-out past one keyset batch.
+//! - **J locks**: a root page against a writer holding `J` at `at`; a key
+//!   that moved under the page; the join-key retry budget.
+//! - Root pages otherwise: several changes to one row, a page predating the
+//!   build, a field overflow, Re-derives of both tables in one page, a
+//!   Re-derive that changes nothing, and the fan-out's plan.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -713,6 +719,420 @@ async fn two_root_pages_on_a_new_row_queue_on_the_placeholder() {
                 blocked,
                 "{}: the older page queued on the placeholder",
                 star.name()
+            );
+        }
+    }
+}
+
+// ------------------------------------------------- a root page's J locks
+
+/// A connection that stands for a page of the joined table at `at`: holds
+/// `J[key]` there `FOR UPDATE` and rewrites what a change of its row on the
+/// key rewrites, uncommitted, until [`BWriter::commit`].
+struct BWriter {
+    client: tokio_postgres::Client,
+    pid: i32,
+}
+
+impl BWriter {
+    /// Locks `J[key]` at `at`, then sets `w` on the joined row of the key
+    /// and on its `M` entry, and rewrites the target rows of the `a` rows on
+    /// the key (the fan-out).
+    async fn start(d: &Driver, star: Star, key: i32, w: i32) -> Self {
+        let shape = star.shape;
+        let client = d.user().await;
+        let pid: i32 = client
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let id = star::definition_id(d, star).await;
+        let m = star::m_table(d, star, shape.at).await;
+        client
+            .batch_execute(&shape.sql(&format!(
+                "begin; \
+                 select 1 from {schema}.join1_{id}_j where position = {at} and p{at}_{{k}} = {key} \
+                     for update; \
+                 update {{b}} set w = {w} where k = {key}; \
+                 update {m} set w = {w} where k = {key}; \
+                 update {target} t set total = a.x + {w} + {idle} from public.a a \
+                     where a.id = t.id and a.{{k}} = {key}",
+                schema = trellis::config::DEFAULT_SCHEMA,
+                at = shape.at,
+                target = star.target(),
+                idle = shape.idle_total(),
+            )))
+            .await
+            .expect("a joined-table writer");
+        BWriter { client, pid }
+    }
+
+    async fn commit(self) {
+        self.client.batch_execute("commit").await.expect("commit");
+    }
+}
+
+/// A root page against a [`BWriter`] on `key`: the page drains `sql`, must
+/// queue behind the writer, and the target is the live join once both
+/// commit.
+async fn root_page_behind_a_joined_writer(key: i32, w: i32, sql: &str) {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            let b = BWriter::start(&d, star, key, w).await;
+            star::write(&d, &shape.sql(sql)).await;
+            let batch = d.seal().await;
+            let moves = d.join_key_moves();
+            let drain = d.drain_frozen(batch, "page", &[]).await;
+            let blocked = star::queued_or_finished(&d, b.pid, &drain).await;
+            b.commit().await;
+            let result = drain.finish_result().await;
+            if !blocked {
+                star::ran_through(&mut d, star, result, moves).await;
+            }
+            result.expect("the page");
+            star::assert_oracle(&mut d, &[star]).await;
+        }
+    }
+}
+
+/// A root page on a key a joined-table writer holds queues on `J` and reads
+/// `M` only once it has the lock (`rd_mearly`): the new row is `x + the
+/// writer's w`. Planted `join1_no_j_lock` leaves the page running through,
+/// and the row it wrote keeps the old `w`.
+#[tokio::test]
+async fn an_a_page_holds_its_j_row_until_it_commits() {
+    root_page_behind_a_joined_writer(10, 999, "insert into {a_ins} values (5, 10, 5, 'five')")
+        .await;
+}
+
+/// A root page whose row moves off a key locks the key it leaves
+/// (`join1_old_key_unlocked`): `R`'s held key is in the set.
+#[tokio::test]
+async fn a_row_moving_off_a_key_locks_the_key_it_leaves() {
+    root_page_behind_a_joined_writer(10, 555, "update public.a set {k} = 20 where id = 1").await;
+}
+
+/// The key an `R` entry holds moved after the page read its key set: the page
+/// rolls back and its retry locks the new key too (`join1_no_recheck`). The
+/// joined-table writer holds the key the row moved to, so the retry queues
+/// on it.
+#[tokio::test]
+async fn a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            let target = star.target();
+            // Row 2 is on key 20. Two changes: 20 -> 40, then 40 -> 10.
+            star::write(&d, &shape.sql("update public.a set {k} = 40 where id = 2")).await;
+            let first = d.seal().await;
+            star::write(&d, &shape.sql("update public.a set {k} = 10 where id = 2")).await;
+            let second = d.seal().await;
+            let moves = d.join_key_moves();
+            // The later change's page reads its key set while `R` still
+            // holds 20.
+            let mut late = d
+                .drain_frozen(second, "late", &[(PausePoint::BeforeJoin1Lock, &target)])
+                .await;
+            late.reached(PausePoint::BeforeJoin1Lock).await;
+            // The earlier change moves `R` to 40, and a writer takes J[40].
+            d.drain(first, "early").await;
+            let b = BWriter::start(&d, star, 40, 777).await;
+            d.release(&mut late, PausePoint::BeforeJoin1Lock).await;
+            d.wait_blocked_behind(b.pid).await;
+            assert_eq!(
+                d.join_key_moves(),
+                moves + 1,
+                "{}: the page rolled back once on the moved key",
+                star.name()
+            );
+            b.commit().await;
+            late.finish().await;
+            star::assert_oracle(&mut d, &[star]).await;
+        }
+    }
+}
+
+/// A key that moves on every attempt surfaces after the join-key budget
+/// ([`trellis::dev::interleave::force_join_key_moves`]); fewer moves retry
+/// to a commit.
+#[tokio::test]
+async fn a_hot_moving_key_exhausts_the_budget_and_surfaces() {
+    for shape in SHAPES {
+        let star = shape.stars()[0];
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        star::write(&d, "update public.a set x = 77 where id = 1").await;
+        let batch = d.seal().await;
+        let moves = d.join_key_moves();
+        d.force_join_key_moves(1_000);
+        let result = d
+            .drain_frozen(batch, "hot", &[])
+            .await
+            .finish_result()
+            .await;
+        d.force_join_key_moves(0);
+        assert!(
+            matches!(result, Err(ref e) if e.to_string().contains("join key")),
+            "{}: {result:?}",
+            star.name()
+        );
+        assert_eq!(
+            d.join_key_moves() - moves,
+            21,
+            "{}: the budget is 20 retries after the first attempt",
+            star.name()
+        );
+        // Three moves retry to a commit.
+        let moves = d.join_key_moves();
+        d.force_join_key_moves(3);
+        d.drain(batch, "hot").await;
+        assert_eq!(d.join_key_moves() - moves, 3, "{}", star.name());
+        star::assert_oracle(&mut d, &[star]).await;
+    }
+}
+
+// ------------------------------------------------------ root pages, other
+
+/// A page with several changes to one root row applies the newest.
+#[tokio::test]
+async fn a_page_with_several_changes_to_one_row_applies_the_newest() {
+    for shape in SHAPES {
+        let stars = shape.stars();
+        let mut d = star::start(&stars, A_ROWS, B_ROWS).await;
+        for sql in [
+            "update public.a set {k} = 20, x = 50 where id = 1",
+            "update public.a set {k} = 10, x = 60 where id = 1",
+            "delete from public.a where id = 2",
+            "insert into {a_ins} values (2, 40, 70, 'back')",
+        ] {
+            star::write(&d, &shape.sql(sql)).await;
+        }
+        let batch = d.seal().await;
+        d.drain(batch, "w").await;
+        star::assert_oracle(&mut d, &stars).await;
+    }
+}
+
+/// A root page whose segment predates the build re-derives its keys rather
+/// than applying their changes (the build-start rule): the Apply of a change
+/// that the build's read already saw must not put an older image over it.
+#[tokio::test]
+async fn a_page_that_predates_the_build_rederives() {
+    for shape in SHAPES {
+        let stars = shape.stars();
+        let mut d = star::start_unbuilt(&stars, A_ROWS, B_ROWS).await;
+        // Two changes to row 1 land in the ring after the builds started.
+        star::write(&d, "update public.a set x = 11 where id = 1").await;
+        star::write(&d, "update public.a set x = 12 where id = 1").await;
+        trellis::staging::build::settle_builds(d.pool()).await;
+        star::assert_oracle(&mut d, &stars).await;
+    }
+}
+
+/// A field that overflows for one row fails the page's statement with a data
+/// exception; the drain isolates the row (it is held, like any 1-1 key whose
+/// value a field cannot compute) and the page's other rows apply.
+#[tokio::test]
+async fn a_row_whose_field_overflows_is_isolated_and_the_rest_apply() {
+    for shape in SHAPES {
+        let star = shape.stars()[0];
+        let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+        star::write(
+            &d,
+            &shape.sql("insert into {a_ins} values (5, 10, 2147483647, 'big'), (6, 20, 6, 'six')"),
+        )
+        .await;
+        let batch = d.seal().await;
+        // The orchestrating drain, which isolates a failing record. A failing
+        // record is charged a death per drain until the threshold evicts it.
+        let mut drained = false;
+        for _ in 0..12 {
+            if trellis::staging::apply::drain_once(d.pool(), batch, "page", 1, "j1_wake")
+                .await
+                .is_ok()
+            {
+                drained = true;
+                break;
+            }
+        }
+        let name = star.name();
+        assert!(drained, "{name}: the page drains once the row is evicted");
+        assert_eq!(
+            total(&d, star, 6).await,
+            joined_total(shape, 6, 200),
+            "{name}"
+        );
+        assert_eq!(
+            total(&d, star, 5).await,
+            None,
+            "{name}: the overflowing row is held"
+        );
+        let held = d
+            .rows("select src_table, key from poison order by key")
+            .await;
+        assert_eq!(held, ["(public.a,5)"], "{name}");
+    }
+}
+
+/// A page re-deriving rows of both tables reads each table in its own
+/// statement, and each read's snapshot is the basis of its own table's
+/// entries only. Changes of both rows that commit between the `a` read and
+/// the joined read are in the joined read's row and snapshot but not the
+/// `a` read's: drained after the page, the `a` change applies and the
+/// joined change is refused, its row being in `M` already.
+#[tokio::test]
+async fn changes_between_the_two_reads_of_a_page_rederiving_both_tables_apply() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            let target = star.target();
+            d.stage_recomputes("public.a", &["1"]).await;
+            d.stage_recomputes(&shape.b(), &["1"]).await;
+            let rederive = d.seal().await;
+            // The `a` read's pause point carries the target's label, the
+            // joined read's `M`'s, so the page stops between its two reads.
+            let mut page = d
+                .drain_frozen(
+                    rederive,
+                    "rederive both",
+                    &[(PausePoint::AfterRederiveRead, &target)],
+                )
+                .await;
+            page.reached(PausePoint::AfterRederiveRead).await;
+            star::write(
+                &d,
+                &shape.sql(
+                    "update public.a set x = 7 where id = 1; update {b} set w = 700 where id = 1",
+                ),
+            )
+            .await;
+            let change = d.seal().await;
+            d.release(&mut page, PausePoint::AfterRederiveRead).await;
+            page.finish().await;
+            assert_eq!(
+                total(&d, star, 1).await,
+                joined_total(shape, 1, 700),
+                "{star:?}: the a read predates both changes, the joined read follows them"
+            );
+            d.drain(change, "change").await;
+            assert_eq!(
+                total(&d, star, 1).await,
+                joined_total(shape, 7, 700),
+                "{star:?}"
+            );
+            star::assert_oracle(&mut d, &[star]).await;
+        }
+    }
+}
+
+/// A Re-derive of rows of either table that finds them as their entries hold
+/// them writes no target row: its fan-out recomputes the joined row's key,
+/// and the upsert leaves each row whose fields are unchanged as it is.
+#[tokio::test]
+async fn a_rederive_that_changes_nothing_writes_no_target_row() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            let versions = format!("select id, xmin::text from {} order by id", star.target());
+            let before = d.rows(&versions).await;
+            d.stage_recomputes(&shape.b(), &["1", "2", "3"]).await;
+            d.stage_recomputes("public.a", &["1", "2", "3", "4"]).await;
+            let batch = d.seal().await;
+            d.drain(batch, "rederive").await;
+            assert_eq!(d.rows(&versions).await, before, "{star:?}");
+            star::assert_oracle(&mut d, &[star]).await;
+        }
+    }
+}
+
+// ----------------------------------------------------------- the fan-out
+
+/// F13: a fan-out past one keyset batch (25,000 `a` rows on key 10, three
+/// batches of 10,000) ‖ an `a` page moving a row onto the key. Either page
+/// frozen at its commit holds `J[10]` and the other queues. At the two-table
+/// shape only: the idle positions' tables hold keys for 200 rows.
+#[tokio::test]
+async fn f13_a_fan_out_of_several_batches_races_an_a_move_onto_its_key() {
+    let a_rows = format!(
+        "{A_ROWS}, {}",
+        (100..25_100)
+            .map(|id| format!("({id}, 10, {id}, 'many')"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    star::family(
+        Shape::TWO,
+        &a_rows,
+        B_ROWS,
+        "update public.a set {k} = 10 where id = 2",
+        "update {b} set w = 999 where id = 1",
+    )
+    .await;
+}
+
+/// A batch of a fan-out drives its upsert: each entry is a probe of `R`'s
+/// primary key, so the batch costs the same whatever `R`'s size, and never a
+/// pass over all of `R` (#1580). Seeded with a hot key of 10,000 rows among
+/// 30,000 and analyzed, so the plan is chosen on cost: as a plain join of the
+/// batch to `R`, the planner hashes the whole of `R` here, once per batch.
+#[tokio::test]
+async fn a_fan_out_batch_probes_r_by_its_key_and_never_scans_it_whole() {
+    for shape in SHAPES {
+        let stars = shape.stars();
+        let seed = format!(
+            "{}; {}",
+            shape.seed("", B_ROWS),
+            shape.sql(
+                "insert into {a_ins} \
+                 select g, case when g <= 10000 then 10 else 20 + g % 50 end, g, 'many' \
+                 from generate_series(1, 30000) g"
+            )
+        );
+        let d = star::start_seeded(&stars, &seed).await;
+        let keys: Vec<String> = d
+            .ctl
+            .query(
+                &shape.sql(
+                    "select id::text from public.a where {k} = 10 order by id::text collate \"C\"",
+                ),
+                &[],
+            )
+            .await
+            .expect("the hot key's rows")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        assert_eq!(keys.len(), 10_000);
+        for star in stars {
+            let r = star::r_table(&d, star).await;
+            let m = star::m_table(&d, star, shape.at).await;
+            let bare = r.rsplit('.').next().expect("R's name").to_string();
+            // Statistics, so the plan does not depend on whether autovacuum
+            // has analyzed the tables yet.
+            d.ctl
+                .batch_execute(&format!(
+                    "analyze {r}; analyze {m}; analyze {}",
+                    star.target()
+                ))
+                .await
+                .expect("analyze");
+            let plan = trellis::staging::one_to_one_join_explain_target_write(
+                d.pool(),
+                &star.target(),
+                &keys,
+            )
+            .await
+            .expect("explain the batch's upsert");
+            let name = star.name();
+            assert!(
+                !plan.contains(&format!("Seq Scan on {bare} ")),
+                "{name}: the batch does not scan R whole:\n{plan}"
+            );
+            assert!(
+                plan.contains(&format!("Index Scan using {bare}_pkey on {bare} "))
+                    || plan.contains(&format!("Bitmap Index Scan on {bare}_pkey ")),
+                "{name}: each entry is a probe of R's primary key:\n{plan}"
             );
         }
     }
