@@ -884,7 +884,7 @@ pub(crate) async fn check(
             false,
         )
         .await?;
-        crate::staging::build::stamp_rebuild_seg(&txn, &rebuilt).await?;
+        rebuilt.stamp(&txn).await?;
     }
     write(&txn, table, &found.rewrite).await?;
     delete(&txn, table, &found.gone).await?;

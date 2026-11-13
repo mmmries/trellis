@@ -17,6 +17,7 @@
 use tokio_postgres::GenericClient;
 
 use super::error::IntakeError;
+use crate::staging::build::{self, BuildStarts};
 
 /// Rebuilds the readers of `definition_id`'s *target* table, which a build of
 /// the definition just rewrote outside the target-mutation seam
@@ -27,13 +28,11 @@ use super::error::IntakeError;
 ///
 /// A reader is every applying definition that reads the target
 /// ([`crate::defs::catalog::applying_readers`]). A no-op for a target nothing
-/// reads. Returns the rebuilt definitions' ids; the caller calls
-/// [`crate::staging::build::stamp_rebuild_seg`] with them as the last
-/// statement before it commits.
+/// reads. The caller stamps the returned [`BuildStarts`] last.
 pub(crate) async fn park_target_catchup_if_read(
     client: &impl GenericClient,
     definition_id: i64,
-) -> Result<Vec<i64>, IntakeError> {
+) -> Result<BuildStarts, IntakeError> {
     let target: String = client
         .query_one(
             "select target_table from transform_definitions where id = $1",
@@ -48,10 +47,7 @@ pub(crate) async fn park_target_catchup_if_read(
 /// Rebuilds the readers of each of `tables` that may be missing changes to
 /// it: a table whose capture triggers are installed (`capture::install`), and
 /// an explicit re-backfill ([`crate::Trellis::request_backfill`]).
-/// Returns the rebuilt definitions' ids, for the caller to pass to
-/// [`crate::staging::build::stamp_rebuild_seg`] as the last statement before
-/// it commits, so the share lock on the active segment is held only for the
-/// commit.
+/// The caller stamps the returned [`BuildStarts`] last.
 ///
 /// `new_nodes` says the install only added nodes new to a captured
 /// partitioned root's recorded tree (`capture::install::adds_only_new_nodes`).
@@ -65,8 +61,8 @@ pub(crate) async fn park_table_catch_ups(
     floors: &crate::defs::floor::Floors,
     tables: &[String],
     new_nodes: bool,
-) -> Result<Vec<i64>, IntakeError> {
-    let mut readers = crate::staging::build::rebuild_candidates(client, tables).await?;
+) -> Result<BuildStarts, IntakeError> {
+    let mut readers = build::rebuild_candidates(client, tables).await?;
     if new_nodes {
         let mut corrected = Vec::new();
         for &id in &readers {
@@ -82,16 +78,16 @@ pub(crate) async fn park_table_catch_ups(
     rebuild(client, readers).await
 }
 
-/// Rebuilds `readers` ([`crate::staging::build::start_rebuilds`]) under their
+/// Rebuilds `readers` ([`build::start_rebuilds`]) under their
 /// row locks, taken in id order.
 async fn rebuild(
     client: &impl GenericClient,
     mut readers: Vec<i64>,
-) -> Result<Vec<i64>, IntakeError> {
+) -> Result<BuildStarts, IntakeError> {
     readers.sort_unstable();
     readers.dedup();
     if readers.is_empty() {
-        return Ok(readers);
+        return Ok(BuildStarts::default());
     }
     client
         .execute(
@@ -99,9 +95,8 @@ async fn rebuild(
             &[&readers],
         )
         .await?;
-    let rebuilt = crate::staging::build::rebuildable(client, &readers).await?;
-    crate::staging::build::start_rebuilds(client, &rebuilt).await?;
-    Ok(rebuilt)
+    let rebuilt = build::rebuildable(client, &readers).await?;
+    Ok(build::start_rebuilds(client, rebuilt).await?)
 }
 
 /// Whether the partition correction engine corrects `definition` for a node
@@ -109,7 +104,7 @@ async fn rebuild(
 /// `new_nodes`): a `JOIN` reading the table as either side, whose node
 /// correction recomputes the side's cells that route to the node;
 /// or an aggregate over the table that the engine re-derives
-/// ([`crate::staging::build::corrected_on_partitioned_source`]).
+/// ([`build::corrected_on_partitioned_source`]).
 async fn corrected_by_new_node(
     client: &impl GenericClient,
     definition: &crate::defs::model::Definition,
@@ -123,5 +118,5 @@ async fn corrected_by_new_node(
                 .any(|joined| tables.contains(joined)));
     }
     Ok(tables.contains(&definition.source_table)
-        && crate::staging::build::corrected_on_partitioned_source(definition))
+        && build::corrected_on_partitioned_source(definition))
 }

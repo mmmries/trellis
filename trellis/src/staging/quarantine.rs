@@ -3694,11 +3694,11 @@ pub(crate) async fn resume_pairs(
         }
         // A 1-1 `JOIN` has no field build: it is rebuilt in place, which
         // writes every field that isn't paused, under the definition row
-        // taken above and then its lock row ([`super::build::stamp_rebuild_seg`],
+        // taken above and then its lock row ([`super::build::BuildStarts::stamp`],
         // last), as a rebuild's start takes them.
         if join1 && !unbuilt {
-            super::build::start_rebuilds(&*txn, &[def.id]).await?;
-            super::build::stamp_rebuild_seg(&*txn, &[def.id]).await?;
+            let started = super::build::start_rebuilds(&*txn, vec![def.id]).await?;
+            started.stamp(&*txn).await?;
         }
         txn.commit().await?;
         resumed.extend(released.into_iter().map(|field| (t.clone(), field)));
