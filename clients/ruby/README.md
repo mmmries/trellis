@@ -528,6 +528,48 @@ instance and every instance of `config.trellis.instances`. Neither it nor
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
 
+### Upgrading the gem
+
+A release that changes `trellis-pg`'s version can't also define, alter,
+pause, resume or drop a transform. While a worker of the old version runs,
+those statements refuse with `Trellis::VersionHandoverError`
+([rolling deploys](../../docs/embedding.md#rolling-deploys)), so a deploy
+that migrates before the old worker stops fails at its first Trellis
+migration. Ship the version change by itself, and the migrations in the next
+release.
+
+`rails trellis:release_check` fails a build that combines the two:
+
+```sh
+bin/rails trellis:release_check BASE=origin/main
+```
+
+It compares the working tree with its merge base against `BASE`, and exits 1
+when `trellis-pg`'s version in the lockfile changed and a migration added
+since then mentions `Trellis`. It reads git and files only: it needs no
+database and doesn't initialize the app.
+
+- **On a pull request**, `BASE` is the branch it targets. The job needs the
+  history back to the merge base, which a shallow clone lacks:
+
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+  # ... install Ruby and the app's gems ...
+  - run: bin/rails trellis:release_check BASE=origin/${{ github.base_ref }}
+  ```
+- **For a release of several merged pull requests**, `BASE` is the last
+  deployed ref: a version change and a migration that merged separately
+  still deploy together.
+- It reads `db/migrate` and each database's `migrations_paths`, and sees
+  migrations only. A state-changing call from a script or a console is in no
+  file it reads; the engine still refuses it.
+
+Outside Rails, `require "trellis/release_check"` and call
+`Trellis::ReleaseCheck.call(root:, base:)`, which returns a result with
+`ok?` and `message`.
+
 ## Fixtures and bulk loads in tests
 
 Rails fixtures load with `disable_referential_integrity`, which disables
@@ -645,7 +687,8 @@ How the restore works, and what it refuses, is in
   `Trellis::Metrics`, `Trellis::LogBridge`,
   the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
   loaded only in an app that has Rails, and the test helpers
-  (`trellis/test_support.rb`), loaded only when required.
+  (`trellis/test_support.rb`) and the release check
+  (`trellis/release_check.rb`), each loaded only when required.
 - `ext/trellis_ruby/`: the extension crate, a member of the repository's
   Cargo workspace, and the `extconf.rb` that builds it with rb-sys.
   Plain-data conversion and error codes come from `clients/embed`

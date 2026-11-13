@@ -81,6 +81,13 @@ module Trellis
         task migrate: :environment do
           Trellis::Railtie.migrate_all
         end
+
+        # No :environment: the check reads git and files, so it runs in a CI
+        # job with no database and none of the app's initializers.
+        desc "Fail if this release changes trellis-pg's version and adds a Trellis migration (BASE=<git ref>)"
+        task :release_check do
+          Trellis::Railtie.release_check(ENV.fetch("BASE", nil))
+        end
       end
     end
 
@@ -211,6 +218,22 @@ module Trellis
         nil
       end
 
+      # Runs Trellis::ReleaseCheck for this app against the git ref `base`,
+      # over every migrations path the app has (db/migrate, and each
+      # database's migrations_paths): prints its verdict, and exits 1 when
+      # the release both changes trellis-pg's version and adds a Trellis
+      # migration, or when the check can't run. What `rails
+      # trellis:release_check BASE=<ref>` runs.
+      def release_check(base)
+        require "trellis/release_check"
+        result = ReleaseCheck.call(root: ::Rails.root, base: base,
+                                   migrations_paths: migrations_paths, lockfile: lockfile)
+        abort result.message unless result.ok?
+        puts result.message
+      rescue ReleaseCheck::Error => e
+        abort "trellis:release_check: #{e.message}"
+      end
+
       # config.trellis.connect, as Trellis.connect's keyword options, or nil
       # when it isn't set (or there's no Rails app).
       def connect_options
@@ -239,6 +262,34 @@ module Trellis
       end
 
       private
+
+      # Where the app keeps migrations: db/migrate, and the migrations_paths
+      # of every database in config/database.yml, read without connecting.
+      # An app whose database config can't be read here (no database.yml, a
+      # missing environment variable) is checked on db/migrate alone.
+      def migrations_paths
+        app = ::Rails.application
+        collect = lambda do |node|
+          next [] unless node.is_a?(Hash)
+
+          node.flat_map { |key, value| key.to_s == "migrations_paths" ? Array(value) : collect.call(value) }
+        end
+        configured = begin
+          collect.call(app.config.database_configuration)
+        rescue StandardError
+          []
+        end
+        (app.paths["db/migrate"].to_a + configured).map(&:to_s).uniq
+      end
+
+      # The lockfile Bundler resolved the app with (it follows BUNDLE_GEMFILE,
+      # and a gems.rb has a gems.locked), or Gemfile.lock in an app that
+      # isn't running under Bundler.
+      def lockfile
+        defined?(::Bundler) ? ::Bundler.default_lockfile : "Gemfile.lock"
+      rescue StandardError
+        "Gemfile.lock"
+      end
 
       def keyword_options(what, options)
         unless options.respond_to?(:to_h)

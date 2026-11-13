@@ -145,6 +145,28 @@ class RailsTest < Minitest::Test
     assert_equal [false, 0], seen.values_at("bridge", "logged")
   end
 
+  # `rails trellis:release_check` reads the app's own lockfile and every
+  # database's migrations_paths, and never initializes the app, so a CI job
+  # with no database can run it. Trellis::ReleaseCheck's own cases are in
+  # release_check_test.rb.
+  def test_the_release_check_task_checks_the_app_without_initializing_it
+    seen = boot("release_check")
+    assert_equal false, seen.fetch("initialized")
+
+    no_base = seen.fetch("no_base")
+    assert_equal 1, no_base.fetch("status")
+    assert_match "trellis:release_check: set BASE to the git ref", no_base.fetch("stderr")
+
+    unchanged = seen.fetch("unchanged_version")
+    assert_equal 0, unchanged.fetch("status"), unchanged.fetch("stderr")
+    assert_match "ok (trellis-pg 0.2.0, unchanged; 1 Trellis migration(s) added", unchanged.fetch("stdout")
+
+    changed = seen.fetch("changed_version")
+    assert_equal 1, changed.fetch("status")
+    assert_match "changes trellis-pg from 0.2.0 to 0.3.0 and adds Trellis migrations:", changed.fetch("stderr")
+    assert_match "  db/reports_migrate/20260201000000_define_order_totals.rb", changed.fetch("stderr")
+  end
+
   private
 
   def boot(scenario)
