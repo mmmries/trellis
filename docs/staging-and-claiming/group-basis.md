@@ -56,8 +56,7 @@ updates the hidden rows in the order they are stored
 ([W2](../decisions/0028-locking-and-writing.md#w2-a-bulk-write-writes-in-the-destinations-order)).
 Pages keep applying, against the new bases once it commits.
 
-A plain aggregate's fresh build or resume over an unpartitioned source writes
-each group once
+A plain aggregate's fresh build or resume writes each group once
 ([ADR-0002](../decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)):
 its first statement takes the snapshot, reads the source's `GROUP BY` and the
 enumeration below, and in key order inserts each group with no hidden row with
@@ -66,6 +65,16 @@ or applied to since the build started, are then rewritten by the replace above
 from a new snapshot, reading the source by an index probe per group when they
 are few and the source has an index on the group columns, else by one
 `GROUP BY`.
+
+Over a partitioned source, each leaf of a tree as recorded is written this
+way: the `GROUP BY` reads the leaf and the enumeration is routed to it. That
+statement routes and reads under one set of settings, the pinned ones with the
+session's path after them (`pg_catalog, pg_temp, "<schema>"`), which resolves
+each name of the routing as the pinned settings do and each name of the read
+as the session's do. The argument, and the conditions it checks before each
+leaf, are on `group_basis::set_leaf_settings`; where they fail, the leaf takes
+the three statements above, as the remainder and a leaf read through the root
+always do.
 
 What each covers (R8):
 

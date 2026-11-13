@@ -1196,14 +1196,32 @@ pub(crate) async fn read_tree_once(
     Ok(Some((tree, version, live)))
 }
 
+/// The `search_path` of [`pinned_settings`].
+pub const PINNED_SEARCH_PATH: &str = "pg_catalog, pg_temp";
+/// The `DateStyle` of [`pinned_settings`], as `current_setting` shows it.
+/// Every Trellis session sets the same (`crate::pool`'s
+/// `DETERMINISTIC_TEXT_OUTPUT_GUCS`).
+pub const PINNED_DATESTYLE: &str = "ISO, YMD";
+/// The `TimeZone` of [`pinned_settings`], as `current_setting` shows it.
+/// Every Trellis session sets the same.
+pub const PINNED_TIMEZONE: &str = "UTC";
+
 /// The `SET LOCAL`s of every catalog read of a node's bound.
 pub fn pinned_settings() -> String {
     format!(
         "set local lock_timeout = '{FETCH_LOCK_TIMEOUT}'; \
-         set local search_path = pg_catalog, pg_temp; \
-         set local datestyle = 'ISO, YMD'; \
-         set local timezone = 'UTC'"
+         set local search_path = {PINNED_SEARCH_PATH}; \
+         set local datestyle = '{PINNED_DATESTYLE}'; \
+         set local timezone = '{PINNED_TIMEZONE}'"
     )
+}
+
+/// The `search_path` under which one statement both routes by a recorded
+/// text and reads as the session does (`crate::staging::group_basis`'s
+/// `write_once` over a leaf): [`PINNED_SEARCH_PATH`], then `session`, the
+/// session's own path as `current_setting` shows it.
+pub fn pinned_then_session_path(session: &str) -> String {
+    format!("{PINNED_SEARCH_PATH}, {session}")
 }
 
 /// Reads the live tree's recorded form: the `pg_inherits` rows and the key
