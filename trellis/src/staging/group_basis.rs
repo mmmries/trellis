@@ -126,7 +126,10 @@
 //! index ([`collect_zero_groups_sql`]). It never waits on a page: a page
 //! holds the locks of every group it applies to from its lock statement to
 //! its commit. A page whose lock statement meets a group the GC is deleting
-//! waits for the GC's commit and inserts the group afresh. Pages only make
+//! waits for the GC's commit and inserts the group afresh. It collects
+//! nothing of a plain aggregate under a fresh build or a resume, from the
+//! build's start to its commit: the build inserts a group with no hidden
+//! row from its own snapshot (see "A build or rebuild"). Pages only make
 //! `__zero` change when a group empties or refills, so an update that keeps
 //! a group non-zero changes no indexed column and stays HOT.
 //!

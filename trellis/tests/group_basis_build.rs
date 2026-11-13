@@ -577,6 +577,33 @@ async fn a_group_only_the_hidden_table_names_goes_to_zero() {
     assert_oracle(&mut d).await;
 }
 
+/// The zero-group GC collects nothing of a definition under a fresh build,
+/// from the build's start to its commit, and collects again after it: the
+/// build inserts each group that has no hidden row from its own snapshot.
+#[tokio::test]
+async fn the_zero_group_gc_skips_a_definition_under_a_fresh_build() {
+    let mut d = seeded("(1, 1, 10)").await;
+    define(&d).await;
+    d.step("insert into public.src values (2, 9, 3)").await;
+    d.step("delete from public.src where id = 2").await;
+    assert_eq!(partials(&d, 9).await, ["(0,0,0,f)"], "a zero row, no basis");
+    d.collect_tombstones().await;
+    assert_eq!(
+        partials(&d, 9).await,
+        ["(0,0,0,f)"],
+        "skipped under the build"
+    );
+    run_build(&d).await;
+    d.settle().await;
+    d.collect_tombstones().await;
+    assert_eq!(
+        partials(&d, 9).await,
+        Vec::<String>::new(),
+        "collected once live"
+    );
+    assert_oracle(&mut d).await;
+}
+
 /// A plan job whose session dies frozen before its commit leaves nothing:
 /// its claim is released, it runs again whole, and the rerun is exact, a
 /// change committed while the first attempt held its locks included.
