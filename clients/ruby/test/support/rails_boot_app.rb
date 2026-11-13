@@ -42,9 +42,10 @@ when "boot"
   BootApp.initialize!
   seen[:connected] = Trellis.connected?
   seen[:target_schema] = Trellis.config.target_schema
-  # The Railtie requires the migration helpers as ActiveRecord loads.
+  # The Railtie requires the migration helpers and Trellis::Target as
+  # ActiveRecord loads.
   ActiveRecord::Base
-  seen[:migration_after_active_record] = defined?(Trellis::Migration) ? true : false
+  seen[:migration_after_active_record] = defined?(Trellis::Migration) && defined?(Trellis::Target) ? true : false
 when "logger", "logger_level", "logger_off"
   # The engine's log lines go to Rails.logger, unless the app opts out.
   io = StringIO.new
