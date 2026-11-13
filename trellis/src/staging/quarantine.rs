@@ -4515,7 +4515,8 @@ async fn complete_resume(
     crate::defs::lifecycle::start_over(txn, id).await?;
     // The rebuild casts each source value through its live type,
     // and the capture pass compares the key columns against what it builds
-    // from.
+    // from. Define records the same facts in its row's insert
+    // (`create_definition_inner`), so it shares only the key types' call.
     catalog::record_source_columns(txn, id, &revalidated.source_columns).await?;
     if let Some(sides) = &revalidated.join {
         catalog::record_join_columns(txn, id, &sides.joined_value_types()).await?;
@@ -4593,32 +4594,18 @@ async fn complete_resume(
     )
     .await?;
 
-    // A JOIN's hidden tables are fully derived, so the resume drops and
-    // recreates them, at the shape define would give them now, rather than
-    // check them. The visible target is kept. After the wait above, for the
-    // same reason as the group table below: a chunk that passed its fence
-    // before the pause commits first, rather than this `ACCESS EXCLUSIVE`
-    // waiting inside the resume while it holds the definition row.
-    if let Some(sides) = &revalidated.join {
-        catalog::recreate_hidden_tables(txn, schema, id, &definition.def, sides).await?;
-    }
-
-    // A group-basis aggregate's partials are fully derived, so the
-    // resume drops and recreates them at the shape define would give them
-    // now (a re-typed `GROUP BY` column included), and its build writes
-    // every group afresh. The visible target is kept: the build's absolute
-    // write replaces the rows of the groups the source still has and
-    // removes the others. After the wait above, so a build or rebuild that
-    // passed its fence before the pause commits first and is overwritten,
-    // rather than this `ACCESS EXCLUSIVE` waiting inside the resume while it
-    // holds the definition row.
-    if let Some(mut shape) = super::group_basis::route(&definition.def, &revalidated.source_columns)
-    {
-        // The rebuild writes the new table from the source as it is now, so
-        // each `numeric` sum's reference scale is its column's now.
-        shape.declare_scales(txn, &definition.source_table).await?;
-        catalog::recreate_group_table(txn, schema, id, &shape).await?;
-    }
+    // A JOIN's hidden tables and a group-basis aggregate's partials are
+    // fully derived, so the resume drops and recreates them at the shape
+    // define would give them now (a re-typed column included), rather than
+    // check them, and its build writes every row afresh. The visible target
+    // is kept: the build's absolute write replaces the rows the source still
+    // has and removes the others. After the wait above, so a build or
+    // rebuild that passed its fence before the pause commits first and is
+    // overwritten, rather than this `ACCESS EXCLUSIVE` waiting inside the
+    // resume while it holds the definition row.
+    let (def, columns) = (&definition.def, &revalidated.source_columns);
+    let (from, join) = (&definition.source_table, revalidated.join.as_ref());
+    catalog::create_hidden_tables(txn, schema, id, def, from, columns, join, true).await?;
     // ADR-0024: the rebuild writes this release's layout, so the floor is
     // this release's for the definition as it stands.
     crate::defs::floor::stamp(txn, floors, id, &definition.def).await?;

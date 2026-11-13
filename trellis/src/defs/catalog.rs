@@ -3935,54 +3935,23 @@ async fn create_definition_inner(
     insert_further_joined(&*txn, id, &further).await?;
     super::key_types::record_definition(&*txn, id, &def, &qualified_source, &joined_tables, false)
         .await?;
-    // A JOIN's hidden tables, in the catalog schema,
-    // named by this definition's id, created empty with its row.
-    if let Some(sides) = &join_sides {
-        let ddl = if super::join::is_one_to_one(&def) {
-            super::join_one_to_one::hidden_tables_ddl(
-                pool.schema(),
-                id,
-                &def,
-                &sides.from_columns,
-                &sides.joined_column_maps(),
-            )
-        } else {
-            super::join::hidden_tables_ddl(
-                pool.schema(),
-                id,
-                &def,
-                &sides.from_columns,
-                &sides.first_joined().columns,
-            )
-        };
-        txn.batch_execute(&ddl).await?;
-    }
     // An aggregate outside the admitted set is refused by
     // family, whatever its arguments' types were when `validate` ran.
     check_aggregate_admitted(&*txn, &def, &qualified_source).await?;
-    // An aggregate on the group basis keeps its
-    // partials in a hidden table in the catalog schema, named by this
-    // definition's id, created empty with its row. A JOIN's key space is
-    // never an aggregate's, so it never routes here.
-    let shape = crate::staging::group_basis::route(&def, source_columns);
-    // Define's refusals and the routing agree: every aggregate define
-    // accepts is on the group basis.
-    debug_assert!(
-        shape.is_some() || !matches!(def.key_space, KeySpace::Aggregate { .. }),
-        "an admitted aggregate the group basis doesn't route: {}",
-        def.target
-    );
-    if let Some(mut shape) = shape {
-        // Each `numeric` sum's reference scale is the one its column declares
-        // now, recorded with the hidden table.
-        shape.declare_scales(&*txn, &qualified_source).await?;
-        txn.batch_execute(&crate::staging::group_basis::hidden_table_ddl(
-            pool.schema(),
-            id,
-            &shape,
-        ))
-        .await?;
-    }
+    // A JOIN's or a group-basis aggregate's hidden tables, created empty
+    // with its row.
+    let (schema, join) = (pool.schema(), join_sides.as_ref());
+    create_hidden_tables(
+        &txn,
+        schema,
+        id,
+        &def,
+        &qualified_source,
+        source_columns,
+        join,
+        false,
+    )
+    .await?;
 
     // A field reading a column paused now is paused at birth, so
     // the build this registration starts leaves it out rather than writing
@@ -5309,61 +5278,63 @@ async fn revalidate_join(
     })
 }
 
-/// Drops group-basis definition `id`'s hidden partials table from `schema`,
-/// the catalog schema, and creates it again, empty, at the shape `shape`
-/// gives it: a resume's, since its partials are fully derived. The
-/// shape is what define would give it now, so a `GROUP BY` column re-typed
-/// while the definition was paused resumes over correctly typed partials.
-pub(crate) async fn recreate_group_table(
-    txn: &tokio_postgres::Transaction<'_>,
-    schema: &str,
-    id: i64,
-    shape: &crate::staging::group_basis::GroupShape,
-) -> Result<(), CatalogError> {
-    txn.batch_execute(&format!(
-        "{};\n{}",
-        crate::staging::group_basis::drop_hidden_table_sql(schema, id),
-        crate::staging::group_basis::hidden_table_ddl(schema, id, shape)
-    ))
-    .await?;
-    Ok(())
-}
-
-/// Drops `JOIN` definition `id`'s hidden tables from `schema`, the catalog
-/// schema, and creates them again, empty, at the shape `sides` gives them:
-/// a resume's, since they're fully derived.
-pub(crate) async fn recreate_hidden_tables(
+/// Creates definition `id`'s hidden tables in `schema`, the catalog
+/// schema, empty, named by its id, at the shape define gives them now: a
+/// `JOIN`'s from `join`, its sides; a group-basis aggregate's from its
+/// route over `source_columns`, each `numeric` sum's reference scale the one
+/// its column of `source_table` declares now. Returns whether it has any:
+/// no other definition does.
+///
+/// `replace` drops them first: a resume's or a rebuild afresh, since they
+/// are fully derived. So a column re-typed while the definition was paused
+/// resumes over correctly typed tables.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_hidden_tables(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
     id: i64,
     def: &TransformDef,
-    sides: &JoinSides,
-) -> Result<(), CatalogError> {
-    let (drop, create) = if super::join::is_one_to_one(def) {
-        (
-            super::join_one_to_one::drop_hidden_tables_sql(schema, id),
-            super::join_one_to_one::hidden_tables_ddl(
-                schema,
-                id,
-                def,
-                &sides.from_columns,
-                &sides.joined_column_maps(),
-            ),
-        )
+    source_table: &str,
+    source_columns: &HashMap<String, ValueType>,
+    join: Option<&JoinSides>,
+    replace: bool,
+) -> Result<bool, CatalogError> {
+    use crate::staging::group_basis;
+    let (drop, create) = if let Some(sides) = join {
+        let from = &sides.from_columns;
+        if super::join::is_one_to_one(def) {
+            let joined = sides.joined_column_maps();
+            let create = super::join_one_to_one::hidden_tables_ddl(schema, id, def, from, &joined);
+            (
+                super::join_one_to_one::drop_hidden_tables_sql(schema, id),
+                create,
+            )
+        } else {
+            let joined = &sides.first_joined().columns;
+            let create = super::join::hidden_tables_ddl(schema, id, def, from, joined);
+            (super::join::drop_hidden_tables_sql(schema, id), create)
+        }
+    } else if let Some(mut shape) = group_basis::route(def, source_columns) {
+        shape.declare_scales(txn, source_table).await?;
+        let create = group_basis::hidden_table_ddl(schema, id, &shape);
+        (group_basis::drop_hidden_table_sql(schema, id), create)
     } else {
-        (
-            super::join::drop_hidden_tables_sql(schema, id),
-            super::join::hidden_tables_ddl(
-                schema,
-                id,
-                def,
-                &sides.from_columns,
-                &sides.first_joined().columns,
-            ),
-        )
+        // Define's refusals and the routing agree: every aggregate define
+        // accepts is on the group basis.
+        debug_assert!(
+            replace || !matches!(def.key_space, KeySpace::Aggregate { .. }),
+            "an admitted aggregate the group basis doesn't route: {}",
+            def.target
+        );
+        return Ok(false);
     };
-    txn.batch_execute(&format!("{drop};\n{create}")).await?;
-    Ok(())
+    let sql = if replace {
+        format!("{drop};\n{create}")
+    } else {
+        create
+    };
+    txn.batch_execute(&sql).await?;
+    Ok(true)
 }
 
 /// Every joined table of every `JOIN` definition, by position, as one
@@ -5716,7 +5687,7 @@ pub(crate) async fn check_target_table(
 /// it are what define would create now: a 1-1 target's ledger exists
 /// ([`check_ledger_table`]). An aggregate or a `JOIN` keeps only hidden
 /// tables that are fully derived: the resume drops and recreates them
-/// ([`recreate_group_table`]), so there's nothing to check.
+/// ([`create_hidden_tables`]), so there's nothing to check.
 pub(crate) async fn check_owned_tables(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,

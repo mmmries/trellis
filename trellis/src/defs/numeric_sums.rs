@@ -124,27 +124,31 @@ async fn build_afresh(
     definition: &crate::defs::model::Definition,
 ) -> Result<(), crate::Error> {
     let id = definition.id;
-    if crate::staging::join::applies(&definition.def) {
+    let (def, from) = (&definition.def, &definition.source_table);
+    let sides = if crate::staging::join::applies(def) {
         let Some(joined) = super::catalog::join_table_of(txn, id)
             .await
             .map_err(failed)?
         else {
             return Ok(());
         };
-        let sides =
-            super::catalog::JoinSides::read(txn, definition.source_table.clone(), vec![joined])
-                .await
-                .map_err(failed)?;
-        super::catalog::recreate_hidden_tables(txn, schema, id, &definition.def, &sides)
-            .await
-            .map_err(failed)?;
-    } else if let Some(mut shape) = group_basis::route(&definition.def, &definition.source_columns)
-    {
-        shape.declare_scales(txn, &definition.source_table).await?;
-        super::catalog::recreate_group_table(txn, schema, id, &shape)
-            .await
-            .map_err(failed)?;
+        let sides = super::catalog::JoinSides::read(txn, from.clone(), vec![joined]);
+        Some(sides.await.map_err(failed)?)
     } else {
+        None
+    };
+    let columns = &definition.source_columns;
+    let created = super::catalog::create_hidden_tables(
+        txn,
+        schema,
+        id,
+        def,
+        from,
+        columns,
+        sides.as_ref(),
+        true,
+    );
+    if !created.await.map_err(failed)? {
         return Ok(());
     }
     // As a resume does: a build or rebuild the definition had queued is
