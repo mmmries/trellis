@@ -294,13 +294,14 @@ it and the table is `FORCE ROW LEVEL SECURITY`; a superuser is exempt. Every
 Trellis connection runs with `row_security = off`, so a read or write the
 policies would filter fails rather than skipping rows.
 
-Define checks a source or target for the role that owns the ring, including
-policies DDL around the target's creation applies (an event trigger forcing
-RLS on every new table), and a table that is another transform's target for
-the defining role. A `MIN`/`MAX` aggregate's source is also checked for the
-ring owner's `SELECT` (`ExtremeSourceNotReadable`), at define and on a
-whole-transform `RESUME`: a drain logs in as that role and re-reads a group's
-extreme from the source; the remedy is `GRANT SELECT`.
+Define checks a source for the role that owns the ring, and a table that is
+another transform's target for the defining role. It creates the target as
+the defining role, which so owns it, and checks it for that role too: that
+fires only when DDL around the creation (an event trigger) forces RLS on it or
+hands it to another owner. A `MIN`/`MAX` aggregate's source is also checked
+for the ring owner's `SELECT` (`ExtremeSourceNotReadable`), at define and on a
+whole-transform `RESUME`: a drain logs in as that role or a member of it and
+re-reads a group's extreme from the source; the remedy is `GRANT SELECT`.
 
 After define, a refused build chunk pauses its transform after its charged
 retries, with the error on `backfill_failure`
@@ -363,7 +364,8 @@ counts the columns earlier edits dropped (Postgres counts them until the table
 is created again): if they filled the limit, drop the transform and define it
 again. Define doesn't refuse the smaller limits an aggregate meets first: from
 about 270 distinct summed arguments its statements exceed Postgres's
-1,664-entry target list
+1,664-entry target list, so its build pauses or its changed groups are
+quarantined with Postgres's error
 ([#1518](https://github.com/salesforce-misc/trellis/issues/1518)), and from
 about 500 a hidden row can outgrow a heap page
 ([#1516](https://github.com/salesforce-misc/trellis/issues/1516)).
@@ -436,11 +438,13 @@ A [1-1 `JOIN`](#1-1-join) is refused when:
 - it reads a column that starts with `__` (`OneToOneJoinUnsupported`);
 - a side is partitioned (`PartitionedSource`);
 - the `ON` names one column in two terms (`JoinOnRepeatedColumn`);
-- the `ON` reads two columns of `a` whose names share their first 60 bytes;
+- the `ON` reads two columns of `a` whose names share their first 60 bytes
+  (rename one);
 - `b` is another transform's 1-1 target, joined on columns that leave out part
   of that target's primary key: Trellis orders changes per primary-key value
   only, so only that key is unique at every instant while the upstream drains
-  (an `a` that is a 1-1 target may be joined on any columns);
+  (join on its whole key, or join the table that transform reads; an `a` that
+  is a 1-1 target may be joined on any columns);
 - it says `WITHOUT SOURCE INDEX` (a parse error).
 
 `b`'s `ON` columns contain a unique key of `b` when they hold its primary key,
