@@ -1195,28 +1195,14 @@ capture records it before its build starts.
 
 ## Grammar versions
 
-Every stored definition records the grammar version it was written in. A
-breaking release that changes what accepted text means bumps that version and
-keeps reading the older one under its old rules, so an upgrade never
-re-interprets a stored definition. Each major version reads every grammar
-version the previous two majors wrote. A transform written under an older
-version than that is paused until you drop it and define it again, and a version
-newer than the binary knows, from a downgrade, is refused. A release that
-refuses a form Postgres rejects or reads differently keeps the version: a
-transform whose stored text uses that form is paused when the upgraded binary
-attaches, its `capture_failure` naming the refusal, until you drop it and
-define it again; the other transforms keep running. A stored definition
-can be rewritten to the current version without a rebuild. Text is stamped
-with the oldest version that reads it the same, so a definition with no
-quoted name, no upper-case letter in a name and no `TRUE`, `FALSE` or `NULL`
-literal is grammar 1 whichever release wrote it. Grammar 2 reads
-[names](expressions.md#names) as Postgres does; a grammar-1 definition, written by 0.1.x,
-keeps its names' case, as if each were quoted, and `ALTER TRANSFORM` stores it
-quoted (`SUM("Amount")`). Grammar 1 had no `TRUE`, `FALSE` or `NULL` literal:
-a bare one, in any case, named a column or calculated field, and a grammar-1
-definition keeps reading that name (`COALESCE(null, a)` reads the column
-`"null"`). The rules are in
-[0018-grammar-versioning](decisions/0018-grammar-versioning.md).
+Every stored definition records the grammar version it was written in, so an
+upgrade never re-interprets it: a release that changes what accepted text
+means bumps the version and keeps reading older text under its old rules.
+Grammar 2 reads [names](expressions.md#names) as Postgres does; a grammar-1
+definition, written by 0.1.x, keeps its names' case and reads a bare `TRUE`,
+`FALSE` or `NULL` as a name. The rules, and which versions a release reads,
+are [0018-grammar-versioning](decisions/0018-grammar-versioning.md); what an
+upgrade pauses is in [upgrading](upgrading.md#upgrading).
 
 ## Floors
 
