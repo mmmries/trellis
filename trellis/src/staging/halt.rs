@@ -419,7 +419,9 @@ pub(crate) struct Unusable {
     /// Every definition, paused or not, that reads or writes a table in a
     /// schema the role can't use.
     pub(crate) definitions: Vec<i64>,
-    /// Every table those definitions read or write.
+    /// The tables a definition reads or writes in a schema the role can't
+    /// use. Its tables in other schemas stay in the pass, for their other
+    /// readers.
     pub(crate) tables: HashSet<String>,
 }
 
@@ -447,14 +449,16 @@ pub(crate) async fn halt_unusable_schemas(pool: &Pool) -> Result<Unusable, Apply
             refused.insert(table);
         }
     }
-    let mut unusable = Unusable::default();
-    for reader in &catalog.definitions {
-        let tables = tables_of(reader);
-        if tables.iter().any(|t| refused.contains(t)) {
-            unusable.definitions.push(reader.id);
-            unusable.tables.extend(tables);
-        }
-    }
+    let unusable = Unusable {
+        definitions: catalog
+            .definitions
+            .iter()
+            .filter(|reader| tables_of(reader).iter().any(|t| refused.contains(t)))
+            .map(|reader| reader.id)
+            .collect(),
+        tables: refused.iter().cloned().collect(),
+    };
+    let mut paused = Vec::new();
     for table in &refused {
         let reason = missing_privileges(&*txn, table, &[])
             .await?
@@ -464,18 +468,28 @@ pub(crate) async fn halt_unusable_schemas(pool: &Pool) -> Result<Unusable, Apply
             Seed::Target(table.clone()),
         ] {
             let halted = "the staging pass halted";
-            pause_closure(
-                &txn,
-                pool.schema(),
-                pool.floors(),
-                Some(seed),
-                halted,
-                &reason,
-            )
-            .await?;
+            paused.extend(
+                pause_closure(
+                    &txn,
+                    pool.schema(),
+                    pool.floors(),
+                    Some(seed),
+                    halted,
+                    &reason,
+                )
+                .await?,
+            );
         }
     }
     txn.commit().await?;
+    if !paused.is_empty() {
+        crate::instance_log::error!(
+            paused = ?paused,
+            refused = ?refused,
+            "the staging pass halted every definition reading or writing a table in a schema \
+             its role lacks USAGE on; paused them until resumed, and leaving those tables out"
+        );
+    }
     Ok(unusable)
 }
 
