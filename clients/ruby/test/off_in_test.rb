@@ -262,7 +262,10 @@ class OffInTest < Minitest::Test
   def dump(database)
     TrellisTestApp.config.trellis.connect = { url: dsn(database) }
     TrellisTestApp.config.trellis.off_in = []
-    Tasks.dump_schema(db_config(database))
+    # On the database's own pool, as Rails' callers dump: 8.0's dump_schema
+    # reads schema_migrations from the current one.
+    config = db_config(database)
+    Tasks.with_temporary_connection(config) { Tasks.dump_schema(config) }
     File.read(File.join(@dir, "structure.sql"))
   ensure
     TrellisTestApp.config.trellis.connect = nil

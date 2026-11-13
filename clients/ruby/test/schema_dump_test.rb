@@ -54,7 +54,7 @@ class SchemaDumpTest < Minitest::Test
     # No format argument, as db:prepare's dump calls it: the format is the
     # app's config.active_record.schema_format.
     ActiveRecord.schema_format = :sql
-    Tasks.dump_schema(db_config(source))
+    rails_dump(db_config(source))
     structure = File.read(File.join(@dir, "structure.sql"))
     assert_includes structure, "CREATE TABLE public.sd_totals_#{@id}"
     assert_includes structure, "CREATE TABLE public.sd_orders_#{@id}"
@@ -108,7 +108,7 @@ class SchemaDumpTest < Minitest::Test
     test = database("env_test")
     define_in(development)
     ActiveRecord.schema_format = :sql
-    Tasks.dump_schema(db_config(development))
+    rails_dump(db_config(development))
 
     info = TestCluster.info
     base = { "adapter" => "postgresql", "host" => info.fetch("host"), "port" => info.fetch("port"),
@@ -432,6 +432,10 @@ class SchemaDumpTest < Minitest::Test
              username: info.fetch("user"), schema_search_path: "public" }
     ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary", hash)
   end
+
+  # A dump on the database's own pool, as Rails' callers run it: 8.0's
+  # dump_schema reads schema_migrations from the current one.
+  def rails_dump(config) = Tasks.with_temporary_connection(config) { Tasks.dump_schema(config) }
 
   # The database restores what define_in defined: both definitions, unbuilt,
   # the 1-1 target's ledger rebuilt by the restore, the targets empty.
