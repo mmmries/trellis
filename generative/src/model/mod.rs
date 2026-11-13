@@ -473,7 +473,8 @@ pub struct SteadyLoad {
     pub pace_from_start: bool,
     /// The longest stall a page or a build chunk takes at its entry-lock
     /// step (`trellis::dev::interleave::set_stall`), all run long, so some
-    /// pages are slow next to others, as a busy worker's are.
+    /// pages are slow next to others, as a busy worker's are. A fresh
+    /// build's write-once first statement sleeps up to it too.
     pub stall: std::time::Duration,
     /// Whether the stall also holds a group-basis aggregate's page before
     /// its group lock (`trellis::dev::interleave::set_group_lock_stall`), so

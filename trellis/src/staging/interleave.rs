@@ -190,7 +190,11 @@
 //! enumeration and its lock statement ([`PausePoint::AfterRebuildEnumerate`],
 //! a busy build worker), where a page that commits is seen by a snapshot
 //! taken after the locks and missed by one taken before them (the
-//! `gb_build_snapshot_before_locks` plant).
+//! `gb_build_snapshot_before_locks` plant). A fresh build's write-once form
+//! also sleeps inside its first statement ([`PausePoint::InsideBuildWrite`],
+//! a uniform draw up to the stall), after its snapshot and before its
+//! insert, so pages apply to groups the snapshot missed: the stragglers its
+//! second statement rewrites.
 //!
 //! A commit stall ([`set_commit_stall`]) does the same at
 //! [`PausePoint::BeforeCommit`], between a page's last write and its
@@ -696,7 +700,8 @@ pub(crate) async fn fan_out_chunk_lock_timeout<C: GenericClient>(
 static STALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
 
 /// Sets the longest stall a page or a build chunk takes at its entry-lock
-/// step, or clears it with `None`. See the module doc's "Stalls".
+/// step, and a fresh build inside its first statement, or clears it with
+/// `None`. See the module doc's "Stalls".
 pub fn set_stall(max: Option<Duration>) {
     let micros = max.map_or(0, |max| u64::try_from(max.as_micros()).unwrap_or(u64::MAX));
     STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
@@ -889,11 +894,13 @@ pub(crate) async fn pause_at<C: GenericClient>(
 /// `FROM` item for the statement to read where it should wait.
 pub(crate) struct InStatement {
     pub(crate) sql: String,
-    lock_timeout: String,
+    lock_timeout: Option<String>,
 }
 
 /// [`pause_at`] inside the statement `client` runs next: unless `point` is
-/// armed for `target`, `None`. When it is, reports [`Reached`] and returns
+/// armed for `target`, `None`, or the stall at
+/// [`PausePoint::InsideBuildWrite`] (see the module doc's "Stalls"). When
+/// it is armed, reports [`Reached`] and returns
 /// a `FROM` item that waits on the pause lock wherever the statement reads
 /// it. The test, once it sees the backend blocked, knows the statement's
 /// snapshot is taken. [`InStatement::end`] after the statement.
@@ -907,7 +914,16 @@ pub(crate) async fn pause_in_statement<C: GenericClient>(
         .ok()
         .flatten()
     else {
-        return Ok(None);
+        // The stall, as a sleep inside the statement: a uniform draw, since
+        // it comes once per build and the window is for pages to drain into.
+        let max = STALL_MAX_MICROS.load(Ordering::Relaxed);
+        return Ok((max > 0 && point == PausePoint::InsideBuildWrite).then(|| {
+            let seconds = (unit() * max as f64) / 1e6;
+            InStatement {
+                sql: format!("(select pg_catalog.pg_sleep({seconds})) as __pause"),
+                lock_timeout: None,
+            }
+        }));
     };
     let row = client
         .query_one(
@@ -925,22 +941,24 @@ pub(crate) async fn pause_in_statement<C: GenericClient>(
             "(select pg_catalog.pg_advisory_xact_lock_shared({})) as __pause",
             arming.lock_key
         ),
-        lock_timeout,
+        lock_timeout: Some(lock_timeout),
     }))
 }
 
 impl InStatement {
-    /// Gives the session its lock timeout back.
+    /// Gives the session its lock timeout back, after an armed pause.
     pub(crate) async fn end<C: GenericClient>(
         self,
         client: &C,
     ) -> Result<(), tokio_postgres::Error> {
-        client
-            .execute(
-                "select set_config('lock_timeout', $1, true)",
-                &[&self.lock_timeout],
-            )
-            .await?;
+        if let Some(lock_timeout) = self.lock_timeout {
+            client
+                .execute(
+                    "select set_config('lock_timeout', $1, true)",
+                    &[&lock_timeout],
+                )
+                .await?;
+        }
         Ok(())
     }
 }
