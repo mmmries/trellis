@@ -176,13 +176,12 @@ below, and the histograms above, also carries the `trellis_instance` label
     series expires. The split shows which tables hold the backlog.
 
 * `definitions{status}`, `paused_definitions{cause}`, `held_keys`,
-  `quarantined_columns`, `drain_failures` and `capture_holdups{kind}` — the
-  state a definition's [status](status-reference.md) reports and Prometheus can
-  alert on, so the metrics are a complete alerting surface beside the `status`
-  API. The staging worker reads them in the same 5 s housekeeping pass, from
-  the catalog: the statuses `definitions()` reports, one query of why each
-  paused definition paused, and one statement of counts. Nothing is counted on
-  the hot path, and no label names a definition, a table or a key.
+  `quarantined_columns`, `drain_failures` and `capture_holdups{kind}` — what a
+  definition's [status](status-reference.md) reports, in a form Prometheus can
+  alert on. The staging worker reads them in the same 5 s housekeeping pass,
+  from the catalog in one snapshot: the statuses `definitions()` reports, why
+  each paused definition paused, and one statement of counts. Nothing is
+  counted on the hot path, and no label names a definition, a table or a key.
   * `definitions{status}` counts definitions by each of the six status words,
     `catching_up` derived as `status()` derives it. Every word is always set,
     0 where no definition has it.

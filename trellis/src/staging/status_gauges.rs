@@ -494,6 +494,45 @@ mod tests {
         assert_eq!(get("trellis_drain_workers", &[]), Some(0.0));
     }
 
+    /// A pause this release can't read the cause of counts as `unknown`: a
+    /// `capture_failures` kind a newer release wrote, and a status word one
+    /// wrote, which this release reports `paused`.
+    #[tokio::test]
+    async fn a_cause_or_status_a_newer_release_wrote_counts_as_unknown() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = Pool::new(&config).expect("pool");
+        let conn = db.pool.get().await.expect("connection");
+        let raw: &tokio_postgres::Client = &conn;
+        raw.batch_execute(
+            "create table public.orders (id bigint primary key, price numeric, tax numeric)",
+        )
+        .await
+        .expect("source");
+        define(&pool, raw, "newer_kind").await;
+        define(&pool, raw, "newer_status").await;
+        raw.batch_execute(
+            "alter table transform_definitions drop constraint transform_definitions_status_check; \
+             alter table capture_failures drop constraint capture_failures_kind_check; \
+             update transform_definitions set status = 'paused' \
+             where target_table = 'public.newer_kind'; \
+             insert into capture_failures (transform_id, source_table, columns, error, kind) \
+             select id, 'public.orders', '{}', 'a newer cause', 'newer' \
+             from transform_definitions where target_table = 'public.newer_kind'; \
+             update transform_definitions set status = 'newer' \
+             where target_table = 'public.newer_status'",
+        )
+        .await
+        .expect("write what a newer release would");
+        let reading = read(raw, &Floors::of_this_binary(), TTL)
+            .await
+            .expect("read");
+        assert_eq!(reading.definitions["paused"], 2, "{reading:?}");
+        assert_eq!(reading.paused_by["unknown"], 2, "{reading:?}");
+        assert_eq!(reading.paused_by["operator"], 0, "{reading:?}");
+    }
+
     /// A `live` definition reading an upstream that is paused, or a paused
     /// column of one, reports `catching_up`, in the gauge as in the API
     /// (`reported_statuses`).

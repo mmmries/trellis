@@ -4510,6 +4510,59 @@ mod maintenance_failure_tests {
         tokio::join!(maintenance_loop(config, shutdown_rx), watcher);
     }
 
+    /// A staging worker standing by for another version (ADR-0023) reports
+    /// `trellis_staging_leader` 0 before it waits, though it led before.
+    #[tokio::test]
+    async fn a_worker_standing_by_reports_it_does_not_lead() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let schema = "no_trellis_here";
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
+        )
+        .expect("build a same-crate pool");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_active_tx, active_rx) = watch::channel(false);
+        let config = MaintenanceConfig {
+            dsn: db.dsn().to_string(),
+            schema: schema.to_string(),
+            process: BackgroundProcess::for_test(pool.clone(), schema).await,
+            active: active_rx,
+            pool,
+            standby: true,
+            session: None,
+            wake_channel: "wake".to_string(),
+            interval: Duration::from_millis(20),
+            housekeeping_interval: Duration::from_secs(5),
+            reclaim_ttl: Duration::from_secs(30),
+            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
+            reconcile_interval: Duration::from_secs(3600),
+            held_key_retry: None,
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
+        };
+        let instance: Arc<str> = Arc::from("standby_leader_gauge/trellis");
+        let leader = || {
+            let wanted = "trellis_instance=\"standby_leader_gauge/trellis\"";
+            crate::metrics::Metrics::new()
+                .render_prometheus()
+                .lines()
+                .find(|line| line.starts_with("trellis_staging_leader{") && line.contains(wanted))
+                .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        };
+        crate::instance_log::run_scoped(&instance, || crate::metrics::set_staging_leader(true));
+        assert_eq!(leader(), Some(1.0));
+        // One poll runs the loop to its wait for the version to change.
+        let mut lp = std::pin::pin!(crate::instance_log::scoped(
+            instance.clone(),
+            maintenance_loop(config, shutdown_rx)
+        ));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(lp.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(leader(), Some(0.0));
+        shutdown_tx.send(true).expect("signal shutdown");
+        lp.await;
+    }
+
     /// A full ring whose oldest segment a dead drain worker still claims:
     /// retirement cannot free a slot until that claim is reclaimed, and only
     /// the housekeeping pass reclaims it. A refused seal (`RingFull`) is
