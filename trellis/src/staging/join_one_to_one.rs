@@ -1481,7 +1481,7 @@ fn fan_lock_groups(shape: &JoinShape, inline: &PageKeys, root: bool) -> (Vec<Pag
 /// page truncates `b` for [`start_rebuilds`]. A rebuild's start takes every
 /// definition's row it rebuilds `FOR UPDATE`, in id order, before it takes
 /// their lock rows (`crate::intake::catch_up`,
-/// `super::build::stamp_rebuild_seg`): a page that held one target's lock row
+/// `super::build::BuildStarts::stamp`): a page that held one target's lock row
 /// while it queued on a definition's row would close a cycle with a start.
 ///
 /// - A page that truncates `b` takes its definition's row `FOR UPDATE`.
@@ -1639,9 +1639,8 @@ pub(crate) async fn start_rebuilds(txn: &Transaction<'_>, ids: &[i64]) -> Result
         return Ok(());
     }
     let ids = super::build::rebuildable(txn, ids).await?;
-    super::build::start_rebuilds(txn, &ids).await?;
-    super::build::stamp_rebuild_seg(txn, &ids).await?;
-    Ok(())
+    let started = super::build::start_rebuilds(txn, ids).await?;
+    Ok(started.stamp(txn).await?)
 }
 
 /// The live join key of each of `keys`' rows of `side`'s table (whose
