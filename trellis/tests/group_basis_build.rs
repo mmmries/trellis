@@ -303,6 +303,39 @@ async fn pages_between_the_enumeration_and_the_lock() {
     assert_oracle(&mut d).await;
 }
 
+/// A group a page made after the build's start (a straggler) is locked by
+/// the build's first statement, not written: a page of it drained before the
+/// second statement waits for the build's commit, then applies only the
+/// change the second statement's snapshot missed. A first statement that
+/// left the row unlocked would let the page apply between the two.
+#[tokio::test]
+async fn a_page_waits_on_a_straggler_the_first_statement_locked() {
+    let mut d = seeded("(1, 1, 10)").await;
+    define(&d).await;
+    d.step("insert into public.src values (2, 9, 4)").await;
+    assert_eq!(partials(&d, 9).await, ["(1,1,4,f)"]);
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    let locked = building.reached(PausePoint::AfterRebuildLock).await;
+    d.write("insert into public.src values (3, 9, 6)").await;
+    let during = d.seal().await;
+    let page = d.drain_frozen(during, "during", &[]).await;
+    d.wait_blocked_behind(locked.backend_pid).await;
+    assert!(
+        !page.is_finished(),
+        "the page waits on the straggler's lock"
+    );
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    assert_finished(&d).await;
+    page.finish().await;
+    assert_eq!(
+        partials(&d, 9).await,
+        ["(2,2,10,t)"],
+        "rewritten from the second snapshot, which saw the change: refused"
+    );
+    assert_oracle(&mut d).await;
+}
+
 /// A page that creates a group after the locks, while the build holds the
 /// rest: the build's snapshot sees the group's row, but the build never
 /// locked the group and leaves it to its pages.
