@@ -4154,8 +4154,14 @@ impl GroupTargetPlan {
     /// the target holds ([`Self::held_tail_sql`]). That repairs a visible row
     /// that disagrees with the partials, and removes one whose group has no
     /// partial left, which a delta alone never reaches. A build reads every
-    /// group, so both reads are hash joins on [`Self::group_match`].
-    pub(super) fn compare_held_sql(&self, image_columns: Option<&[String]>) -> String {
+    /// group, so it reads `T` by a hash join on [`Self::group_match`], and
+    /// the target too where `bulk_target` (see
+    /// [`target_holds_hidden_group_types`]).
+    pub(super) fn compare_held_sql(
+        &self,
+        image_columns: Option<&[String]>,
+        bulk_target: bool,
+    ) -> String {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let up_groups: Vec<String> = cols.iter().map(|c| format!("rg.{c}")).collect();
@@ -4173,7 +4179,7 @@ impl GroupTargetPlan {
             up_values = up_values.join(", "),
             hidden = self.hidden_ident,
             matched = self.group_match("x", "rg"),
-            tail = self.held_tail_sql(image_columns, true),
+            tail = self.held_tail_sql(image_columns, bulk_target),
         )
     }
 
@@ -4643,6 +4649,34 @@ pub(super) async fn upsert_join_build_groups(
     Ok(())
 }
 
+/// Whether the target holds each group column at `T`'s type, which a hash
+/// join of the two on [`GroupTargetPlan::group_match`] needs: array equality
+/// coerces no element type. A resume creates `T` again at the source's live
+/// types, and re-types no target column whose source moved within the string
+/// family (`varchar` to `text`, `defs::copies`), so the two can differ. The
+/// compare then reads the target by a lookup per group, which coerces.
+async fn target_holds_hidden_group_types(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+) -> Result<bool, tokio_postgres::Error> {
+    let row = txn
+        .query_one(
+            "select not exists ( \
+                 select from pg_catalog.pg_attribute h \
+                 join pg_catalog.pg_attribute t on t.attname = h.attname \
+                 where h.attrelid = pg_catalog.to_regclass($1) \
+                   and t.attrelid = pg_catalog.to_regclass($2) \
+                   and h.attname::text = any($3) and h.atttypid <> t.atttypid)",
+            &[
+                &plan.hidden_ident,
+                &plan.target_ident,
+                &plan.shape.group_cols,
+            ],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 /// A JOIN build's visible write of `T`, after [`upsert_join_build_groups`]:
 /// replaces every group's visible row by comparing what its partials give
 /// with the row the target holds ([`GroupTargetPlan::compare_held_sql`]).
@@ -4654,9 +4688,13 @@ pub(super) async fn compare_join_build_groups(
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    let bulk_target = target_holds_hidden_group_types(txn, plan).await?;
     txn.batch_execute(BULK_PLAN_SETTINGS).await?;
     let rows = txn
-        .query(&plan.compare_held_sql(image_columns.as_deref()), &[])
+        .query(
+            &plan.compare_held_sql(image_columns.as_deref(), bulk_target),
+            &[],
+        )
         .await?;
     txn.batch_execute(BULK_PLAN_RESET).await?;
     let (_, written, deleted) = written_groups(plan, rows, mutations);

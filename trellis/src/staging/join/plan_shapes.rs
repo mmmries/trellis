@@ -103,7 +103,7 @@ async fn a_join_builds_statements_over_every_cell_keep_their_plans() {
 
     // The compare reads `T` and the target by hash joins, not a lookup per
     // group.
-    let compare = explain(&txn, &plan.t.compare_held_sql(None)).await;
+    let compare = explain(&txn, &plan.t.compare_held_sql(None, true)).await;
     let cur = section(&compare, "CTE cur", "CTE written");
     assert_eq!(cur.matches("Hash Cond: ((ARRAY[").count(), 2, "{compare}");
     for node in ["Nested Loop", "Index Scan", "Index Only Scan"] {

@@ -3,6 +3,7 @@
 //! its readers were paused. The resume recreates the hidden tables these
 //! keep and rebuilds from the tables now at the names; a change staged
 //! under the old key before the drop is never decoded against the new one.
+//! And a `JOIN` whose `GROUP BY` key moved from `varchar` to `text` while paused.
 //!
 //! Every pass, build and drain is stepped by hand. Nothing polls for convergence.
 
@@ -149,4 +150,41 @@ async fn a_join_resumes_onto_tables_recreated_with_wider_keys() {
         rows(&raw, JOINED_ACTUAL).await,
         rows(&raw, JOINED_ORACLE).await
     );
+}
+
+/// A `JOIN` grouped by a `varchar(5)` column that becomes `text` while it is
+/// paused. The resume creates `T` again at `text` and keeps the target's
+/// `varchar` (one string family), so the build compares two tables whose
+/// group columns differ in type: it matches every held row, rewrites none it
+/// needn't, and deletes the row of a group the paused writes emptied.
+#[tokio::test]
+async fn a_join_resumes_after_its_varchar_group_key_becomes_text() {
+    let cluster = TestCluster::start();
+    let source = "create table public.a (id int primary key, g varchar(5), k int, x int); \
+         create table public.b (id int primary key, k int, y int); \
+         create index on public.a (k); create index on public.b (k); \
+         insert into public.a select i, case when i % 4 = 0 then null else 'g' || (i % 3) end, \
+             i % 5, i from generate_series(1, 40) i; \
+         insert into public.b select i, i % 5, i from generate_series(1, 10) i";
+    let definition = "TRANSFORM by_g FROM public.a LEFT JOIN public.b ON a.k = b.k \
+         GROUP BY a.g WITHOUT SOURCE INDEX SELECT a.g AS g, COUNT(*) AS n, SUM(b.y) AS sy";
+    let actual = "select g::text, n::text, sy::text from public.by_g order by 1";
+    let oracle = "select a.g::text, count(*)::text, sum(b.y)::text \
+         from public.a a left join public.b b on a.k = b.k group by a.g order by 1";
+    let (db, mut raw, trellis) = setup(&cluster, source, &[definition]).await;
+    trellis.apply("PAUSE TRANSFORM by_g").await.unwrap();
+    raw.batch_execute(
+        "alter table public.a alter column g type text; \
+         delete from public.a where g = 'g2'; update public.a set x = 0 where g = 'g1'",
+    )
+    .await
+    .unwrap();
+    trellis.apply("RESUME TRANSFORM by_g").await.unwrap();
+    bring_live(&mut raw, &db.pool, &trellis, &["by_g"]).await;
+    assert_eq!(rows(&raw, actual).await, rows(&raw, oracle).await);
+    raw.batch_execute("insert into public.a values (41, 'a-longer-group', 1, 1)")
+        .await
+        .unwrap();
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(rows(&raw, actual).await, rows(&raw, oracle).await);
 }
