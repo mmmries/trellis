@@ -81,11 +81,12 @@ class TargetTest < Minitest::Test
     @pg.exec("delete from tg_event_copies")
     ROWS.each { |row| @pg.exec_params("insert into tg_event_counts values ($1, $2, $3)", row) }
     @pg.exec("insert into tg_event_copies (id, kind, updated_at) values (10, 'click', '2000-01-01')")
+    @off_in = TrellisTestApp.config.trellis.off_in
     TrellisTestApp.config.trellis.off_in = %w[test]
   end
 
   def teardown
-    TrellisTestApp.config.trellis.off_in = []
+    TrellisTestApp.config.trellis.off_in = @off_in
     @pg&.close
     ActiveRecord::Base.connection_pool.disconnect!
     super
