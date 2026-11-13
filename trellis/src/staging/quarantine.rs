@@ -5488,12 +5488,8 @@ async fn pause_refused_readers(
             first.table,
             retyped.join(", "),
         );
-        let reason = super::pause_message::PauseReason::Capture {
-            table: first.table.clone(),
-            columns: names.clone(),
-            text: error,
-            caused_by: None,
-        };
+        let reason =
+            super::pause_message::PauseReason::capture_of(&first.table, names.clone(), error);
         match crate::defs::lifecycle::pause(txn, reader.id, &reason).await {
             Ok(_) => {}
             Err(catalog::CatalogError::Db(err)) => return Err(err),

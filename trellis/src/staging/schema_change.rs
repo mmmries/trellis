@@ -284,6 +284,25 @@ async fn pause(
     Ok(())
 }
 
+/// A detector's pauses of `table`'s readers, each definition for its reason
+/// ([`crate::defs::lifecycle::pause`]), in one transaction. Returns `true`,
+/// the detector's answer once it pauses any: the caller leaves the table
+/// for the next pass.
+async fn pause_all(
+    client: &mut Client,
+    table: &str,
+    pauses: impl IntoIterator<Item = (i64, PauseReason)>,
+) -> Result<bool, CaptureError> {
+    let txn = client.transaction().await?;
+    for (id, reason) in pauses {
+        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
 /// The staging worker's capture pass's side of a schema change: pauses,
 /// before [`crate::capture::columns::capture_spec`] regenerates `table`'s
 /// functions, every definition that isn't paused yet and reads a column
@@ -444,20 +463,13 @@ pub(crate) async fn pause_readers_of_uncapturable(
     if pauses.is_empty() {
         return Ok(false);
     }
-    let txn = client.transaction().await?;
-    for pause in &pauses {
-        let reason = PauseReason::Capture {
-            table: table.to_string(),
-            columns: pause.columns.clone(),
-            text: pause.error.clone(),
-            caused_by: None,
-        };
-        if crate::defs::lifecycle::pause(&txn, pause.id, &reason).await? {
-            crate::instance_log::warn!(transform_id = pause.id, table = %table, "definition paused: {reason}");
-        }
-    }
-    txn.commit().await?;
-    Ok(true)
+    let pauses = pauses.into_iter().map(|pause| {
+        (
+            pause.id,
+            PauseReason::capture_of(table, pause.columns, pause.error),
+        )
+    });
+    pause_all(client, table, pauses).await
 }
 
 /// One definition [`pause_readers_of_uncapturable`] pauses: the columns of
@@ -599,20 +611,11 @@ pub(crate) async fn pause_joins_without_unique_key(
     if gone.is_empty() {
         return Ok(false);
     }
-    let txn = client.transaction().await?;
-    for (id, on) in gone {
-        let reason = PauseReason::Capture {
-            table: table.to_string(),
-            text: unique_key_gone_error(table, &on),
-            columns: on,
-            caused_by: None,
-        };
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
-        }
-    }
-    txn.commit().await?;
-    Ok(true)
+    let pauses = gone.into_iter().map(|(id, on)| {
+        let text = unique_key_gone_error(table, &on);
+        (id, PauseReason::capture_of(table, on, text))
+    });
+    pause_all(client, table, pauses).await
 }
 
 /// The `capture_failure` sentence for a 1-1 `JOIN` paused because `table`,
@@ -705,14 +708,12 @@ pub(crate) async fn pause_readers_of_unbacked_key(
         partitioned,
         nullable,
     };
-    let txn = client.transaction().await?;
-    for id in readers {
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
-        }
-    }
-    txn.commit().await?;
-    Ok(true)
+    pause_all(
+        client,
+        table,
+        readers.into_iter().map(|id| (id, reason.clone())),
+    )
+    .await
 }
 
 /// What the message of an unbacked `KEY` needs to know of `table`: whether
@@ -844,15 +845,10 @@ pub(crate) async fn pause_readers_of_missing_probe_index(
         )
         .await?
         .get(0);
-    let txn = client.transaction().await?;
-    for (id, index) in passed {
-        let reason = PauseReason::MissingProbeIndex { index, partitioned };
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
-        }
-    }
-    txn.commit().await?;
-    Ok(true)
+    let pauses = passed
+        .into_iter()
+        .map(|(id, index)| (id, PauseReason::MissingProbeIndex { index, partitioned }));
+    pause_all(client, table, pauses).await
 }
 
 /// The staging worker's capture pass's check for a table Trellis can't read
@@ -934,15 +930,10 @@ pub(crate) async fn pause_readers_of_unsupported(
     if pauses.is_empty() {
         return Ok(false);
     }
-    let txn = client.transaction().await?;
-    for (id, error) in pauses {
-        let reason = PauseReason::capture(table, error);
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
-        }
-    }
-    txn.commit().await?;
-    Ok(true)
+    let pauses = pauses
+        .into_iter()
+        .map(|(id, error)| (id, PauseReason::capture(table, error)));
+    pause_all(client, table, pauses).await
 }
 
 /// The staging worker's capture pass's check for a captured table in a
@@ -978,14 +969,12 @@ pub(crate) async fn pause_readers_in_hierarchy(
         return Ok(true);
     }
     let reason = PauseReason::capture(table, hierarchy_error(&found));
-    let txn = client.transaction().await?;
-    for id in readers {
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
-        }
-    }
-    txn.commit().await?;
-    Ok(true)
+    pause_all(
+        client,
+        table,
+        readers.into_iter().map(|id| (id, reason.clone())),
+    )
+    .await
 }
 
 /// The staging worker's capture pass's check of the types and collations
