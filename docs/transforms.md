@@ -972,25 +972,16 @@ A field's formula, its names and its refusals are in [expressions](expressions.m
 
 ## Chaining and cycle detection
 
-Calculated columns may reference each other, letting users build derivations out
-of small named steps (a `margin` column defined in terms of `revenue` and `cost`).
-Transforms also chain: a target table may itself be a source for another —
-aggregated or joined. Trellis builds a
-dependency graph spanning columns within a table and tables across chained
-transforms, and computes in dependency order.
-
-A transform can only chain off a target once that target's own transform is
-`live`. Defining it while the upstream is still building (for example, a plain
-1-1 target whose chunked backfill hasn't finished) is refused with
-`TransformNotLive`. Each write to a target reaches the transforms reading it inside the
-same transaction as the write; Trellis never installs capture triggers on a
-target. That in-transaction hand-off
-is why an aggregate target, which has no primary key, can be chained off at all.
-It does not cross into another instance.
-
-**Cycles are rejected at definition time across the whole graph.** A definition
-that would introduce a cycle, directly or transitively, is invalid and rejected
-before it runs, keeping the computation order well-defined.
+A field may read another field of its transform, and a target may be another
+transform's source, aggregated or joined, once that transform is `live`
+(`TransformNotLive` otherwise). Each write to a target reaches its readers in
+the write's own transaction, never through capture triggers, which is why an
+aggregate target can be chained off at all; the hand-off doesn't cross into
+another instance
+([data flow](data-flow.md#writing-to-calculated-tables-and-chaining)).
+Trellis computes in dependency order over one graph of fields and tables, and
+refuses at define any definition that would close a cycle in it, directly or
+transitively.
 
 ## Target tables are Trellis-owned
 
