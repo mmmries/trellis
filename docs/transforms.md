@@ -994,96 +994,53 @@ before it runs, keeping the computation order well-defined.
 
 ## Target tables are Trellis-owned
 
-A target is materialized as a plain table in the target schema, and reading it
-is the whole point: query it, join it, index it, grant it to whoever needs it.
-Its contents and shape, though, belong to Trellis
-([0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md)).
-Trellis is its only writer and doesn't guard it
-([ADR-0027](decisions/0027-operating-principles.md), rule 5): whether a change
-made behind its back reaches anything chained off the table is undefined
-([known correctness gaps — Rows written into a target, a hidden table or Trellis's schema](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
-Treat a target as read-only, and specifically:
+A target is a plain table in the target schema: query it, join it, index it,
+grant it. Its contents and shape belong to Trellis
+([0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md)),
+its only writer, which doesn't guard it
+([ADR-0027](decisions/0027-operating-principles.md), rule 5). So don't write
+its rows, add, drop, rename or retype its columns, change its key constraint,
+or `TRUNCATE` or `DROP` it: an edited row stays wrong until something
+recomputes it, `self_check` reports the divergence without repairing it, and
+whether the edit reaches a transform chained off the table is undefined
+([known correctness gaps](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)).
+`PAUSE` then `RESUME` rebuilds it
+([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)); a field
+changes through [`ALTER TRANSFORM`](#changing-a-definition), and the table
+goes with `DROP TRANSFORM`. Row-level security on a target is fine while the
+role that writes it is exempt
+([the row-security entry](#row-level-security-on-a-role-trellis-runs-as)).
+While a transform is `backfilling`, its target is partial
+([status reference](status-reference.md#backfilling)).
 
-* **Do not insert, update or delete rows.** An edited row stays wrong until the
-  next event that recomputes it, and a row added or re-keyed by hand stays
-  until a rebuild. `self_check`
-  ([0013](decisions/0013-self-check-production-recompute-audit.md)) reports the
-  divergence; it does not repair it. `PAUSE` then `RESUME` rebuilds the table
-  from source and deletes the rows the source doesn't back
-  ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)).
-* **Do not add, drop, rename or retype columns.** Trellis addresses its columns
-  by name and type. Redefining the transform is how a column changes
-  ([Changing a definition](#changing-a-definition)).
-* **Do not change the key constraints.** A 1-1 target's key (its primary key,
-  or its unique constraint over a nullable-keyed source) and an aggregate
-  target's unique grouping constraint are how Trellis addresses a row when it
-  upserts or deletes it.
-* **Do not `TRUNCATE` or `DROP` the table yourself.** `DROP TRANSFORM` removes
-  the table and its definition together, and refuses while another definition
-  still chains off it. A hand `TRUNCATE` leaves the table empty until the
-  transform is paused and resumed. A resume refuses while the table is
-  missing, and the repair is `DROP TRANSFORM` and defining it again.
-* **Don't let row-level security apply to the role that writes it.**
-  Trellis writes a target as the role each worker connects as, with
-  `row_security = off`, so a write that policies applying to that role would
-  filter is refused rather than skipping rows.
-  Trellis creates the target as the role that defines it, so that role owns
-  it and is exempt unless the table is `FORCE ROW LEVEL SECURITY`. Enabling
-  row-level security on a target for your application's readers is fine as
-  long as the workers run as the table's owner (or a member of it) or have
-  `BYPASSRLS`. Those readers see their policies on their own connections;
-  Trellis keeps its connections, which run with `row_security = off`, to
-  itself. See
-  [Supported sources and targets](#supported-sources-and-targets) for what
-  happens when that stops holding. A definition is also refused if
-  DDL around its target's creation, such as an event trigger that forces
-  row-level security on every new table, makes the policies apply to the
-  defining role.
-* **Expect a partial table while `backfilling`, and after `RESUME`.** The
-  [status](#status) says when the table is complete; a reader that needs
-  completeness checks it.
+Indexes, grants, constraints, triggers, rules and foreign keys are yours to
+add, to a target define created or adopted; `DROP TRANSFORM` takes them with
+the table. What they do to Trellis's writes:
 
-Indexes, and grants to other roles, are yours to add, to a target define
-created or one it adopted (`ADOPT EXISTING TABLE`). They live and die with the
-table, so `DROP TRANSFORM` takes them with it. So are unique indexes,
-constraints, triggers, rules and foreign keys, with these outcomes:
-
-* A unique index, constraint or trigger that refuses a row Trellis writes,
-  whether it checks the statement or is deferred to the commit, fails that
-  row's key like any value its target refuses: the key ends up held in
-  quarantine, enough held keys trip the fuse and the definition reads
-  `quarantined`, and rows that fail only together hold their page back as a
-  `drain_failure` (see [Status](#status)). An aggregate's or a `JOIN`'s
-  build writes its rows together, so a refusal there pauses the build with
-  a `backfill_failure` naming it instead. A unique index on a column other
-  than the key is the likely case: changes to different keys apply in any
-  order, so two rows can hold one value for a moment even when the source
-  never does, and the index refuses one of them.
-* Another table's foreign key referencing the target fails Trellis's deletes
-  of a referenced row: the key whose row is still referenced is held. A
-  source `TRUNCATE` deletes every row of the target, and while one of them
-  is referenced that page is held back as a `drain_failure` until the
-  referencing rows are gone. Two statements fail with the database's error
-  while the foreign key exists, and leave the transform as it was: `DROP
-  TRANSFORM`, and the `RESUME` that empties a 1-1 target keyed by an enum
-  column with `TRUNCATE` after one of the enum's values is relabelled. Drop
-  the foreign key first.
-* Postgres refuses `INSERT … ON CONFLICT`, which Trellis writes rows with,
-  on a table with an `INSERT` or `UPDATE` rule, and refuses the deletes
-  Trellis runs (`DELETE … RETURNING`, some inside a `WITH`) on a table with
-  most `DELETE` rules, `DO INSTEAD NOTHING` among them. Such a rule fails
-  those writes: a build pauses with a `backfill_failure`, and each key a
+* A unique index, constraint or trigger that refuses a row Trellis writes
+  fails that row's key like any value the target refuses: the key is held
+  ([`held_keys`](status-reference.md#held_keys)), rows that fail only together
+  hold their page as a `drain_failure`, and an aggregate's or a `JOIN`'s build
+  pauses with a `backfill_failure`. A unique index off the key is the likely
+  case: changes to different keys apply in any order, so two rows can hold one
+  value for a moment though the source never does.
+* Another table's foreign key referencing the target holds the key of a
+  referenced row Trellis deletes, and a source `TRUNCATE`'s page while any row
+  is referenced. `DROP TRANSFORM`, and the `RESUME` that empties a 1-1 target
+  keyed by a relabelled enum, fail with the database's error while it exists:
+  drop it first.
+* An `INSERT` or `UPDATE` rule, or most `DELETE` rules (`DO INSTEAD NOTHING`
+  among them), make Postgres refuse the `INSERT … ON CONFLICT` and
+  `DELETE … RETURNING` Trellis writes with: a build pauses, and each key a
   change reaches is held.
 * A trigger or rule that changes or drops the rows Trellis writes leaves the
-  target wrong without a refusal: the
+  target wrong without a refusal, the
   [known correctness gap](known-correctness-gaps.md#rows-written-into-a-target-a-hidden-table-or-trelliss-schema)
   of rows written into a target.
 
-Another Trellis instance may read
-a 1-1 target keyed by a primary key as a source, exactly as it would any table
-with a primary key. An aggregate target, and a 1-1 target over one, has no
-primary key, so it is read that way only with a `KEY (…)` naming its group key
-(see [Supported sources and targets](#supported-sources-and-targets)).
+Another Trellis instance may read a 1-1 target keyed by a primary key as a
+source. An aggregate target, and a 1-1 target over one, needs a `KEY (…)`
+naming its group key ([the refusal table](#refusals)).
 
 ## Status
 
