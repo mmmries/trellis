@@ -126,7 +126,10 @@
 //! index ([`collect_zero_groups_sql`]). It never waits on a page: a page
 //! holds the locks of every group it applies to from its lock statement to
 //! its commit. A page whose lock statement meets a group the GC is deleting
-//! waits for the GC's commit and inserts the group afresh. Pages only make
+//! waits for the GC's commit and inserts the group afresh. It collects
+//! nothing of a plain aggregate under a fresh build or a resume, from the
+//! build's start to its commit: the build inserts a group with no hidden
+//! row from its own snapshot (see "A build or rebuild"). Pages only make
 //! `__zero` change when a group empties or refills, so an update that keeps
 //! a group non-zero changes no indexed column and stays HOT.
 //!
@@ -266,7 +269,9 @@
 //! images name; R8) in key order, then one statement runs the source's
 //! `GROUP BY` from its snapshot and replaces each group's partials, basis,
 //! stamp and visible row. Pages keep applying, against the new bases once it
-//! commits; readers see the old values until then. It runs as the rebuild's
+//! commits; readers see the old values until then. A plain aggregate's
+//! fresh build or resume over an unpartitioned source writes each group once
+//! instead ([`write_once`]). It runs as the rebuild's
 //! one job (`super::build`'s sweep job, which a group-basis definition's
 //! rebuild is alone), and a fresh build's is its plan job, after the plan's
 //! fence for a source that is another definition's target.
@@ -3634,13 +3639,20 @@ impl GroupTargetPlan {
             "insert into {} ({}) {}",
             self.recomputed,
             quoted(&self.shape.group_cols).join(", "),
-            self.rebuild_groups_select(scope, "$1")
+            self.rebuild_groups_select(scope, "$1", true)
         )
     }
 
     /// The `select` of [`Self::rebuild_groups_sql`]: `source` is the SQL of
-    /// the ring's name for the source (`src_table`).
-    fn rebuild_groups_select(&self, scope: Option<&RebuildScope>, source: &str) -> String {
+    /// the ring's name for the source (`src_table`). Without `own`, it leaves
+    /// out the groups of the source's (or leaf's) own rows, which a write
+    /// that reads them by its `GROUP BY` has already.
+    fn rebuild_groups_select(
+        &self,
+        scope: Option<&RebuildScope>,
+        source: &str,
+        own: bool,
+    ) -> String {
         let cols = quoted(&self.shape.group_cols).join(", ");
         let (hidden_filter, target_filter, image_filter) = match scope {
             Some(scope) => (
@@ -3649,6 +3661,24 @@ impl GroupTargetPlan {
                 format!(" where {}", scope.images),
             ),
             None => Default::default(),
+        };
+        // Planted bugs: a write-once build's enumeration (`!own`) without
+        // one branch. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let (hidden_filter, target_filter, image_filter) = {
+            use crate::plant::{Plant, fires};
+            let without = |plant, filter: String| {
+                if !own && fires(plant, true) {
+                    " where false".to_string()
+                } else {
+                    filter
+                }
+            };
+            (
+                without(Plant::GbBuildNoHiddenBranch, hidden_filter),
+                without(Plant::GbBuildNoTargetBranch, target_filter),
+                without(Plant::GbBuildNoRingBranch, image_filter),
+            )
         };
         let images: Vec<String> = self
             .ring
@@ -3681,6 +3711,7 @@ impl GroupTargetPlan {
         // A leaf's own rows; the whole source for an unpartitioned rebuild;
         // none for the remainder, whose groups have no row of their own.
         let own = match scope {
+            _ if !own => String::new(),
             None => format!(
                 " union all select distinct {values} from {src} s{filter}",
                 values = self.group_values().join(", "),
@@ -3799,6 +3830,131 @@ impl GroupTargetPlan {
             BY_CTID,
             &returning.join(", "),
             &self.held_tail_sql(image_columns, false),
+        )
+    }
+
+    /// The first statement of a fresh build's write-once form ([`rebuild`]):
+    /// takes the snapshot and the stamp, runs the source's `GROUP BY` and
+    /// enumerates the groups the hidden table, the target and the ring's old
+    /// images name (R8; the source's own are the `GROUP BY`'s), all in that
+    /// snapshot. In key order, one `insert … on conflict do update … where
+    /// false` then inserts each group that has no hidden row with its
+    /// partials and extremes (zero for a group with no source row, R4), the
+    /// snapshot as its basis and the stamp (R5, Rx6), and locks each group
+    /// that has one without writing it (I5). The visible rows of the inserted
+    /// groups are written as [`Self::rebuild_sql`]'s are; each group locked
+    /// and not written goes into [`Self::recomputed`] for the rebuild's
+    /// statement. `$1` is the ring's name for the source; `pause` is a test's
+    /// pause inside the statement (`super::interleave::pause_in_statement`).
+    fn write_once_sql(&self, image_columns: Option<&[String]>, pause: Option<&str>) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let extremes = self.shape.extremes();
+        // Planted bug: the write leaves the extremes and their basis as they
+        // were, here `NULL`. See `crate::plant`.
+        let keep = false;
+        #[cfg(any(test, feature = "test-util"))]
+        let keep = keep
+            || crate::plant::fires(
+                crate::plant::Plant::GbxAbsoluteWriteKeepsExtremes,
+                !extremes.is_empty(),
+            );
+        // `c`: each group of the `GROUP BY` or the enumeration, `NULL`
+        // matching `NULL`, with its new partials and extremes.
+        // At the hidden table's collation, so the insert reaches the groups
+        // in its index's order (R7) whatever the source column's is.
+        let mut c_cols: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let value = self.collations.coerce(
+                    &format!("case when a.__rn is null then e.{c} else a.{c} end"),
+                    i,
+                    Population::Source,
+                    Population::Hidden,
+                );
+                format!("{value} as {c}")
+            })
+            .collect();
+        c_cols.extend(self.shape.each_partial(|p| p.or_zero("a", "__r")));
+        let mut insert_cols = cols.clone();
+        insert_cols.extend(self.shape.each_partial(|p| p.hidden()));
+        let mut values: Vec<String> = cols.iter().map(|c| format!("c.{c}")).collect();
+        values.extend(self.shape.each_partial(|p| format!("c.{}", p.name("__r"))));
+        let mut returning: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        returning.extend(
+            self.shape
+                .each_partial(|p| format!("u.{} as {}", p.hidden(), p.name("__n"))),
+        );
+        for x in &extremes {
+            let fresh = x.named("__r");
+            c_cols.push(format!("a.{fresh} as {fresh}"));
+            if !keep {
+                insert_cols.push(x.column());
+                values.push(format!("c.{fresh}"));
+            }
+            returning.push(format!("u.{} as {}", x.column(), x.named("__n")));
+        }
+        insert_cols.extend(["__basis", "__stamp"].map(String::from));
+        values.extend(["snap.__snap", "snap.__seg"].map(String::from));
+        if !keep && !extremes.is_empty() {
+            insert_cols.extend(["__xbasis", "__xstamp"].map(String::from));
+            values.extend(["snap.__snap", "snap.__seg"].map(String::from));
+        }
+        let keyed: Vec<String> = cols.iter().map(|c| format!("c.{c}")).collect();
+        let snap = match pause {
+            Some(pause) => format!("{SNAPSHOT_AND_STAMP} from {pause}"),
+            None => SNAPSHOT_AND_STAMP.to_string(),
+        };
+        #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
+        let (mut ae, mut conflict) = (
+            self.group_match("a", "e"),
+            "do update set __n = excluded.__n where false",
+        );
+        // Planted bugs: the source's groups matched to the enumeration by
+        // `=`; the groups that have a row skipped, not locked. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            use crate::plant::{Plant, fires};
+            if fires(Plant::GbBuildNullKeyByEquality, true) {
+                ae = cols
+                    .iter()
+                    .map(|c| format!("a.{c} = e.{c}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+            }
+            if fires(Plant::GbBuildStragglerUnlocked, true) {
+                conflict = "do nothing";
+            }
+        }
+        format!(
+            "with snap as materialized ({snap}), \
+             a as ({fresh}), \
+             e as (select distinct {col_list} from ({enumeration}) as e0), \
+             c as (select {c_cols} from a full join e on {ae}), \
+             up as ( \
+                 insert into {hidden} as u ({insert_cols}) \
+                 select {values} from c, snap order by {keyed} \
+                 on conflict ({col_list}) {conflict} \
+                 returning {returning} \
+             ), \
+             held as ( \
+                 insert into {recomputed} ({col_list}) \
+                 select {keyed} from c where not exists (select from up where {uc}) \
+             ), \
+             {tail}",
+            fresh = self.fresh_select(&self.group_values(), &self.source_row, false),
+            col_list = cols.join(", "),
+            enumeration = self.rebuild_groups_select(None, "$1", false),
+            c_cols = c_cols.join(", "),
+            hidden = self.hidden_ident,
+            insert_cols = insert_cols.join(", "),
+            values = values.join(", "),
+            keyed = keyed.join(", "),
+            returning = returning.join(", "),
+            recomputed = self.recomputed,
+            uc = self.group_match("up", "c"),
+            tail = self.held_tail_sql(image_columns, false),
         )
     }
 
@@ -4587,7 +4743,7 @@ pub(super) async fn enumerate_cells(
     txn.batch_execute(&format!(
         "create temp table {} on commit drop as {}",
         cells.trim_start_matches("pg_temp."),
-        plan.rebuild_groups_select(scope, &crate::pool::quote_literal(&plan.source))
+        plan.rebuild_groups_select(scope, &crate::pool::quote_literal(&plan.source), true)
     ))
     .await?;
     if let Some(saved) = saved {
@@ -4978,7 +5134,9 @@ enum RebuildRead {
 /// A build or rebuild of a group-basis target (ADR-0002, "An aggregate's
 /// build is one absolute write per structure"), in the
 /// caller's `READ COMMITTED` transaction, which
-/// commits it: one absolute write of every group, in three statements.
+/// commits it: one absolute write of every group, in three statements. A
+/// `fresh` build or resume of a plain aggregate over an unpartitioned
+/// source takes [`write_once`] instead.
 ///
 /// 1. **Enumerate** ([`GroupTargetPlan::rebuild_groups_sql`], R8): the
 ///    target's own groups, the source's, and those named by the old images
@@ -5009,10 +5167,14 @@ pub(crate) async fn rebuild(
     txn: &Transaction<'_>,
     plan: &GroupTargetPlan,
     scope: Option<&RebuildScope>,
+    fresh: bool,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     txn.batch_execute(&format!("{}; {}", plan.staged_ddl(), plan.recomputed_ddl()))
         .await?;
+    if fresh && scope.is_none() && matches!(plan.writer, Writer::Aggregate) {
+        return write_once(txn, plan, mutations).await;
+    }
     let session = if scope.is_some() {
         Some(pin_settings(txn).await?)
     } else {
@@ -5080,21 +5242,162 @@ pub(crate) async fn rebuild(
     Ok((written, deleted))
 }
 
+/// The share of a write-once build's groups at or below which its second
+/// statement reads the stragglers by one index probe of the source each,
+/// rather than by one `GROUP BY` of the source ([`write_once`]). Over 1M
+/// source rows with the source cached, the two reads broke even at about
+/// 40% of the groups, at one and at ten rows per group, and the probes took
+/// a fifth to a third of the `GROUP BY`'s time at 10%. The margin is for
+/// probes that read the source from disk.
+const STRAGGLER_PROBE_SHARE: f64 = 0.1;
+
+/// [`rebuild`]'s write-once form: a fresh build or a resume of a plain
+/// aggregate over an unpartitioned source, which writes each group once
+/// (ADR-0002, ADR-0028 W1). The zero-group GC collects nothing of the
+/// definition from the build's start to its commit
+/// (`super::retire::collect_zero_groups`), so a group with no hidden row at
+/// the insert's uniqueness check is one no page has applied to.
+///
+/// 1. One statement ([`GroupTargetPlan::write_once_sql`]) takes the
+///    snapshot, reads the source's groups and the enumeration, inserts each
+///    group that has no hidden row with its final values, and locks each
+///    that has one: a group a page made or applied to since the build
+///    started, a **straggler**.
+/// 2. If there are stragglers, the rebuild's replace
+///    ([`GroupTargetPlan::rebuild_sql`]) rewrites them from a snapshot of its
+///    own, never the first: a page may have applied to one after it. It
+///    reads them by an index probe each when they are at most
+///    [`STRAGGLER_PROBE_SHARE`] of the groups and the source has an index on
+///    the group columns (`crate::defs::source_index::has_index`), else by one
+///    `GROUP BY` of the source.
+async fn write_once(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    // Planted bug: rewrite the stragglers from a snapshot taken before the
+    // groups were locked. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let early = if crate::plant::armed() == Some(crate::plant::Plant::GbBuildSnapshotBeforeLocks) {
+        let early = "pg_temp.trellis_planted_early_read".to_string();
+        txn.batch_execute(&format!(
+            "drop table if exists {early}; {}",
+            plan.planted_early_read_sql(&early)
+        ))
+        .await?;
+        Some(early)
+    } else {
+        None
+    };
+    // Test-only pause point: before the first statement, which enumerates
+    // and locks. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterRebuildEnumerate,
+        &plan.target,
+    )
+    .await?;
+    let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    // Test-only pause point inside the first statement. See
+    // `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    let pause = super::interleave::pause_in_statement(
+        txn,
+        super::interleave::PausePoint::InsideBuildWrite,
+        &plan.target,
+    )
+    .await?;
+    #[cfg(any(test, feature = "test-util"))]
+    let pause_sql = pause.as_ref().map(|pause| pause.sql.as_str());
+    #[cfg(not(any(test, feature = "test-util")))]
+    let pause_sql = None;
+    // A plain aggregate's hidden table is at the database's default
+    // collation ([`GroupCollations`]); the source's group columns may not be.
+    let source = column_collations(txn, &plan.source).await?;
+    let hidden: ColumnCollations = source
+        .keys()
+        .map(|c| (c.clone(), "pg_catalog.\"default\"".to_string()))
+        .collect();
+    let collated = plan.clone().with_collations(GroupCollations::of(
+        &plan.shape.group_cols,
+        Some(&source),
+        &hidden,
+        None,
+    ));
+    let rows = txn
+        .query(
+            &collated.write_once_sql(image_columns.as_deref(), pause_sql),
+            &[&plan.source],
+        )
+        .await?;
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(pause) = pause {
+        pause.end(txn).await?;
+    }
+    let inserted = rows.len();
+    let (_, mut written, mut deleted) = written_groups(plan, rows, mutations);
+    // Test-only pause point: every group is written or locked, and the
+    // second statement's snapshot is not yet taken. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterRebuildLock,
+        &plan.target,
+    )
+    .await?;
+    let stragglers: i64 = txn
+        .query_one(&format!("select count(*) from {}", plan.recomputed), &[])
+        .await?
+        .get(0);
+    if stragglers == 0 {
+        return Ok((written, deleted));
+    }
+    let few = stragglers as f64 <= STRAGGLER_PROBE_SHARE * (inserted as f64 + stragglers as f64);
+    let read = if few
+        && crate::defs::source_index::has_index(txn, &plan.source, &plan.shape.group_cols).await?
+    {
+        RebuildRead::Probe
+    } else {
+        RebuildRead::Source
+    };
+    #[cfg(any(test, feature = "test-util"))]
+    let read = match early {
+        Some(early)
+            if crate::plant::fires(crate::plant::Plant::GbBuildSnapshotBeforeLocks, true) =>
+        {
+            RebuildRead::Early(early)
+        }
+        _ => read,
+    };
+    txn.batch_execute(REBUILD_PLAN_SETTINGS).await?;
+    let rows = txn
+        .query(&plan.rebuild_sql(image_columns.as_deref(), &read), &[])
+        .await?;
+    txn.batch_execute(REBUILD_PLAN_RESET).await?;
+    let (_, w, d) = written_groups(plan, rows, mutations);
+    written += w;
+    deleted += d;
+    Ok((written, deleted))
+}
+
 /// [`rebuild`] of `definition`'s target in `txn`, then the seam's rows for
 /// every visible row that changed. Returns `None` when the group basis
 /// doesn't take `definition`, and does nothing then; otherwise the visible
-/// rows written and deleted.
+/// rows written and deleted. `fresh`: a fresh build or a resume, not a
+/// rebuild in place.
 pub(crate) async fn rebuild_definition(
     txn: &Transaction<'_>,
     catalog_schema: &str,
     definition: &crate::defs::model::Definition,
     scope: Option<&RebuildScope>,
+    fresh: bool,
 ) -> Result<Option<(usize, usize)>, ApplyError> {
     let Some(plan) = plan_of(txn, catalog_schema, definition).await? else {
         return Ok(None);
     };
     let mut mutations = TargetMutations::new();
-    let counts = rebuild(txn, &plan, scope, &mut mutations).await?;
+    let counts = rebuild(txn, &plan, scope, fresh, &mut mutations).await?;
     mutations.flush(txn).await?;
     Ok(Some(counts))
 }
@@ -5275,21 +5578,22 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
         .join("\n"))
 }
 
-/// The plans of the two statements that read a whole source (or node) by
-/// one `GROUP BY` and match its groups to the locked ones: the node form of
+/// The plans of the three statements that read a whole source (or node) by
+/// one `GROUP BY` and match its groups to others: the node form of
 /// [`GroupTargetPlan::recompute_sql`] (a `JOIN` side's build, `RESUME` and
-/// rebuild) and [`GroupTargetPlan::rebuild_sql`]'s source read (a plain
-/// aggregate's), for `target`'s group-basis definition, each read from the
-/// whole source. Planned with nested loops disabled, so a nested loop that
-/// matches the groups shows only where the match can't be hashed or merged;
-/// the lateral lookups of the hidden rows stay nested loops. The rebuild's
-/// is planned under its own settings too ([`REBUILD_PLAN_SETTINGS`]). It
-/// locks and writes nothing.
+/// rebuild), [`GroupTargetPlan::rebuild_sql`]'s source read (a plain
+/// aggregate's) and [`GroupTargetPlan::write_once_sql`] (a plain
+/// aggregate's fresh build), for `target`'s group-basis definition, each
+/// read from the whole source. Planned with nested loops disabled, so a
+/// nested loop that matches the groups shows only where the match can't be
+/// hashed or merged; the lateral lookups of the hidden rows stay nested
+/// loops. The rebuild's is planned under its own settings too
+/// ([`REBUILD_PLAN_SETTINGS`]). It locks and writes nothing.
 #[cfg(any(test, feature = "internals"))]
 pub async fn explain_whole_source_reads(
     pool: &crate::pool::Pool,
     target: &str,
-) -> Result<[String; 2], ApplyError> {
+) -> Result<[String; 3], ApplyError> {
     let Some(definition) = crate::defs::catalog::definition_by_target(pool, target).await? else {
         return Err(ApplyError::TransformNotFound {
             transform: target.to_string(),
@@ -5316,11 +5620,17 @@ pub async fn explain_whole_source_reads(
             plan.rebuild_sql(None, &RebuildRead::Source),
             REBUILD_PLAN_SETTINGS,
         ),
+        (plan.write_once_sql(None, None), REBUILD_PLAN_RESET),
     ];
-    let mut plans = [String::new(), String::new()];
+    let mut plans = [String::new(), String::new(), String::new()];
     for (out, (sql, settings)) in plans.iter_mut().zip(statements) {
         txn.batch_execute(settings).await?;
-        let rows = txn.query(&format!("explain {sql}"), &[]).await?;
+        let explain = format!("explain {sql}");
+        let rows = if sql.contains("$1") {
+            txn.query(&explain, &[&plan.source]).await?
+        } else {
+            txn.query(&explain, &[]).await?
+        };
         *out = rows
             .iter()
             .map(|row| row.get::<_, String>(0))

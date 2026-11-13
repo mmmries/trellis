@@ -116,7 +116,14 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         Plant::StaleOneToOneWrite | Plant::EarlyTombstoneGc | Plant::ChunkWithoutEntryLock => {
             PlantPath::OneToOne
         }
-        Plant::GbSkipGroupLock | Plant::GbBuildSnapshotBeforeLocks => PlantPath::GroupBasis,
+        Plant::GbSkipGroupLock
+        | Plant::GbBuildSnapshotBeforeLocks
+        | Plant::GbGcIgnoresBuild
+        | Plant::GbBuildNoHiddenBranch
+        | Plant::GbBuildNoTargetBranch
+        | Plant::GbBuildNoRingBranch
+        | Plant::GbBuildNullKeyByEquality
+        | Plant::GbBuildStragglerUnlocked => PlantPath::GroupBasis,
         Plant::GbLsnNotVisibility | Plant::GbFoldSidesPerKey | Plant::GbEarlyZeroGc => {
             PlantPath::GroupBasisWriter
         }

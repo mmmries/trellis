@@ -396,8 +396,9 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
 /// `M` and `T` (`crate::defs::join::HiddenTable`), schema-qualified and
 /// quoted, with the quoted key columns of its zero-group index, or `NULL`
 /// while it has none valid, whether it has a basis column (`T` has
-/// none), and whether it has its extremes' basis (`__xbasis`: an aggregate
-/// with `MIN`/`MAX`). A `JOIN`'s `J` rows are never collected (ADR-0019).
+/// none), whether it has its extremes' basis (`__xbasis`: an aggregate
+/// with `MIN`/`MAX`), its definition's id, and whether it is a plain
+/// aggregate's. A `JOIN`'s `J` rows are never collected (ADR-0019).
 fn hidden_tables_sql() -> String {
     use crate::defs::join::HiddenTable;
     format!(
@@ -413,7 +414,8 @@ fn hidden_tables_sql() -> String {
                           and not a.attisdropped), \
                 exists (select 1 from pg_catalog.pg_attribute a \
                         where a.attrelid = c.oid and a.attname = '__xbasis' \
-                          and not a.attisdropped) \
+                          and not a.attisdropped), \
+                d.id, c.relname = {agg} \
          from transform_definitions d \
          join pg_catalog.pg_class c on c.relname in ({agg}, {p}, {m}, {t}) \
           and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
@@ -442,22 +444,42 @@ fn hidden_tables_sql() -> String {
 /// table), claims its rows `for update skip locked` in key order, so it
 /// never waits on a page or a recompute, and runs under
 /// [`GC_PLAN_SETTINGS`], so it walks the partial `where __zero` index and
-/// its cost is the zero groups it walks, not the groups there are. Unlike a
-/// ledger's tombstones, it doesn't skip a definition under a build: a build
-/// or recompute locks its groups before its snapshot (R1), so one that
-/// loses a group to the GC inserts it afresh and writes its own basis. A
-/// `JOIN` build holds its keyed cells by `J` alone, so the GC may delete one
-/// under its write, which then inserts the cell afresh with its basis
-/// (`super::group_basis`'s `join_build_sql`).
+/// its cost is the zero groups it walks, not the groups there are.
+///
+/// **Against a build.** A plain aggregate under a fresh build or a resume is
+/// skipped ([`FRESH_BUILD_PENDING_SQL`]), as a ledger under a build is: the
+/// build inserts each group that has no hidden row from its own snapshot
+/// (`super::group_basis::rebuild`), which is right only if no row a page
+/// applied to is removed between that snapshot and the build's commit.
+/// Everything else is collected under a build. A rebuild in place, a
+/// recompute and a page lock their groups before their snapshot (R1), so
+/// one that loses a group to the GC inserts it afresh and writes its own
+/// basis. A `JOIN` build holds its keyed cells by `J` alone, so the GC may
+/// delete one under its write, which then inserts the cell afresh with its
+/// basis (`super::group_basis`'s `join_build_sql`).
 async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, StagingError> {
-    let tables: Vec<(String, Option<String>, bool, bool)> = client
+    let tables: Vec<ZeroGroupTable> = client
         .query(&hidden_tables_sql(), &[])
         .await?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .map(|row| ZeroGroupTable {
+            hidden: row.get(0),
+            group_cols: row.get(1),
+            basis: row.get(2),
+            xbasis: row.get(3),
+            definition_id: row.get(4),
+            aggregate: row.get(5),
+        })
         .collect();
     let mut collected = 0;
-    for (hidden, group_cols, basis, xbasis) in &tables {
+    for table in &tables {
+        let ZeroGroupTable {
+            hidden,
+            group_cols,
+            basis,
+            xbasis,
+            ..
+        } = table;
         let Some(group_cols) = group_cols else {
             continue;
         };
@@ -474,6 +496,30 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
                     break;
                 }
                 return Err(err.into());
+            }
+            if table.aggregate {
+                match txn
+                    .execute(DEFINITION_KEY_SHARE_SQL, &[&table.definition_id])
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) if is_lock_not_available(&err) => break,
+                    Err(err) => return Err(err.into()),
+                }
+                let building: bool = txn
+                    .query_one(
+                        FRESH_BUILD_PENDING_SQL,
+                        &[&table.definition_id, &crate::defs::chunk_queue::KIND_PLAN],
+                    )
+                    .await?
+                    .get(0);
+                // Planted bug: collect under a fresh build. See `crate::plant`.
+                #[cfg(any(test, feature = "test-util"))]
+                let building =
+                    building && !crate::plant::fires(crate::plant::Plant::GbGcIgnoresBuild, true);
+                if building {
+                    break;
+                }
             }
             // Planted bug: collect every zero group, whatever its
             // basis and stamp. See `crate::plant`.
@@ -507,6 +553,16 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
         }
     }
     Ok(collected)
+}
+
+/// A table [`collect_zero_groups`] reads, a row of [`hidden_tables_sql`].
+struct ZeroGroupTable {
+    hidden: String,
+    group_cols: Option<String>,
+    basis: bool,
+    xbasis: bool,
+    definition_id: i64,
+    aggregate: bool,
 }
 
 /// Planted bug `gb_early_zero_gc` (`crate::plant`): one zero-group GC
@@ -594,6 +650,32 @@ const NOT_BUILDING_SQL: &str = "\
     select 1 from transform_definitions \
     where id = $1 and status <> 'backfilling' and build is null \
     for key share nowait";
+
+/// Locks definition `$1`'s row `for key share`, without waiting: a plain
+/// aggregate's zero-group GC batch ([`collect_zero_groups`]) holds it until
+/// it commits, then reads [`FRESH_BUILD_PENDING_SQL`].
+const DEFINITION_KEY_SHARE_SQL: &str = "\
+    select 1 from transform_definitions where id = $1 for key share nowait";
+
+/// [`NOT_BUILDING_SQL`] for a plain aggregate's zero groups
+/// ([`collect_zero_groups`]): whether definition `$1`'s plan job (`$2`,
+/// `chunk_queue::KIND_PLAN`) is pending, which is a fresh build or a
+/// resume. A rebuild in place runs as a sweep job alone
+/// (`super::build::start_rebuilds`).
+///
+/// **Why the lock makes the skip enough.** A build's start inserts the plan
+/// job in the transaction that takes the definition's row `for update`
+/// (`super::build`'s `start`), and the job marks itself done in the
+/// transaction of its write. This runs after [`DEFINITION_KEY_SHARE_SQL`],
+/// in a snapshot of its own, so a batch either holds the lock before the
+/// start takes it, and commits before the write's first snapshot, or sees
+/// the start's job and skips until the write's commit. One statement that
+/// locked and checked would read the job in the snapshot it took before
+/// the lock: a start committing between the two leaves the row's own
+/// columns to recheck, not the job.
+const FRESH_BUILD_PENDING_SQL: &str = "\
+    select exists (select 1 from backfill_chunks \
+                   where definition_id = $1 and kind = $2 and not done)";
 
 /// The plan settings a GC batch's statement runs under: no
 /// sequential scan and no bitmap scan, so the batch walks the ledger's

@@ -1,9 +1,11 @@
 //! A fresh build of a group-basis aggregate over a source that already has
 //! rows (ADR-0002 "An aggregate's build is one absolute
 //! write per structure"): the plan job, after its seam fence,
-//! runs one absolute write of every group the enumeration union names (R8)
-//! in key order, from one snapshot taken after the locks, while pages apply
-//! from the build's first moment. An unpartitioned source.
+//! writes every group the enumeration union names (R8) once, in key order:
+//! one statement inserts each group with no hidden row from its own
+//! snapshot and locks the rest, which a later statement rewrites from a new
+//! one, while pages apply from the build's first moment. An unpartitioned
+//! source.
 //!
 //! The source is seeded and captured by an unrelated 1-1 definition, then
 //! the aggregate is defined over it, so its build starts over rows. Every
@@ -194,9 +196,10 @@ async fn a_build_over_a_seeded_source_writes_every_group() {
 
 /// Changes from before the build, during it and after it. One committed
 /// before the definition was defined and drained after the build is refused
-/// by its group's basis (the build's snapshot saw it); a page of a locked
-/// group, drained while the build holds the lock, waits for the commit and
-/// is refused too; a change after the build applies as a delta.
+/// by its group's basis (the build's snapshot saw it); a page of a group the
+/// build has written, drained while the build holds it, waits for the
+/// commit and applies its change once (the snapshot didn't see it); a
+/// change after the build applies as a delta.
 #[tokio::test]
 async fn changes_before_during_and_after_a_build() {
     let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
@@ -218,7 +221,7 @@ async fn changes_before_during_and_after_a_build() {
     assert_eq!(
         partials(&d, 2).await,
         ["(1,1,100,t)"],
-        "the waiting page's change was in the build's snapshot, and refused"
+        "the waiting page's change applies once, on the build's basis"
     );
 
     d.drain(before, "before").await;
@@ -237,28 +240,29 @@ async fn changes_before_during_and_after_a_build() {
     assert_oracle(&mut d).await;
 }
 
-/// The window between the enumeration and the lock statement: nothing is
-/// locked, so pages apply, and each change must count once. Frozen there:
+/// The window before the build's first statement, which enumerates and
+/// locks: nothing is locked, so pages apply, and each change must count
+/// once. Frozen there:
 ///
-/// - a change to an enumerated group whose page drains (it creates the
-///   group's hidden row, on a `NULL` basis, which the build's absolute write
-///   then overwrites from a snapshot that saw the change);
+/// - changes whose pages drain, to a group of the source, to the `NULL`
+///   group and to a group they create (each creates the group's hidden row,
+///   on a `NULL` basis): the first statement finds the rows, locks them,
+///   and the second overwrites them from a snapshot that saw the changes;
 /// - a change whose page waits until after the build (refused: its basis is
-///   the build's snapshot);
-/// - a page that creates a group the enumeration didn't name (left to its
-///   pages: the build doesn't write a group it hasn't locked).
+///   the build's snapshot).
 ///
-/// A build whose snapshot came before its locks fails this: the first loses
-/// the change, the second applies it twice.
+/// A build that rewrote them from a snapshot taken before its locks fails
+/// this: it loses the drained changes.
 #[tokio::test]
 async fn pages_between_the_enumeration_and_the_lock() {
-    let mut d = seeded("(1, 1, 10), (2, 2, 5), (3, 3, 1)").await;
+    let mut d = seeded("(1, 1, 10), (2, 2, 5), (3, 3, 1), (7, null, 5)").await;
     define(&d).await;
 
     let mut building = build_frozen(&d, &[PausePoint::AfterRebuildEnumerate]).await;
     building.reached(PausePoint::AfterRebuildEnumerate).await;
-    d.step("insert into public.src values (4, 1, 1), (5, 9, 4)")
+    d.step("insert into public.src values (4, 1, 1), (5, 9, 4), (6, null, 2)")
         .await;
+    assert_eq!(null_partials(&d).await, ["(1,1,2,f)"]);
     assert_eq!(
         partials(&d, 1).await,
         ["(1,1,1,f)"],
@@ -280,8 +284,13 @@ async fn pages_between_the_enumeration_and_the_lock() {
     );
     assert_eq!(
         partials(&d, 9).await,
-        ["(1,1,4,f)"],
-        "the build didn't write a group it hadn't enumerated"
+        ["(1,1,4,t)"],
+        "named by its hidden row, locked and rewritten"
+    );
+    assert_eq!(
+        null_partials(&d).await,
+        ["(2,2,7,t)"],
+        "a source group and a hidden row, matched as one"
     );
 
     let undrained = d.seal().await;
@@ -290,6 +299,66 @@ async fn pages_between_the_enumeration_and_the_lock() {
         partials(&d, 2).await,
         ["(1,1,6,t)"],
         "a change the build's snapshot saw is refused"
+    );
+    assert_oracle(&mut d).await;
+}
+
+/// A group a page made after the build's start (a straggler) is locked by
+/// the build's first statement, not written: a page of it drained before the
+/// second statement waits for the build's commit, then applies only the
+/// change the second statement's snapshot missed. A first statement that
+/// left the row unlocked would let the page apply between the two.
+#[tokio::test]
+async fn a_page_waits_on_a_straggler_the_first_statement_locked() {
+    let mut d = seeded("(1, 1, 10)").await;
+    define(&d).await;
+    d.step("insert into public.src values (2, 9, 4)").await;
+    assert_eq!(partials(&d, 9).await, ["(1,1,4,f)"]);
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    let locked = building.reached(PausePoint::AfterRebuildLock).await;
+    d.write("insert into public.src values (3, 9, 6)").await;
+    let during = d.seal().await;
+    let page = d.drain_frozen(during, "during", &[]).await;
+    d.wait_blocked_behind(locked.backend_pid).await;
+    assert!(
+        !page.is_finished(),
+        "the page waits on the straggler's lock"
+    );
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    assert_finished(&d).await;
+    page.finish().await;
+    assert_eq!(
+        partials(&d, 9).await,
+        ["(2,2,10,t)"],
+        "rewritten from the second snapshot, which saw the change: refused"
+    );
+    assert_oracle(&mut d).await;
+}
+
+/// The groups the build's first statement inserted, the `NULL` one
+/// included, are written once: none goes on to the second statement, which
+/// would rewrite it from a later snapshot. Here no group is a straggler,
+/// so every group keeps the first statement's basis though a transaction
+/// commits between the two.
+#[tokio::test]
+async fn an_inserted_group_is_not_rewritten_by_the_second_statement() {
+    let mut d = seeded("(1, 1, 10), (2, null, 5)").await;
+    define(&d).await;
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    building.reached(PausePoint::AfterRebuildLock).await;
+    d.rows("select pg_current_xact_id()").await;
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    assert_finished(&d).await;
+    assert_eq!(
+        d.rows(&format!(
+            "select count(distinct __basis::text), count(*) from {}",
+            hidden(&d).await
+        ))
+        .await,
+        ["(1,2)"],
+        "one basis, the first statement's"
     );
     assert_oracle(&mut d).await;
 }
@@ -577,6 +646,173 @@ async fn a_group_only_the_hidden_table_names_goes_to_zero() {
     assert_oracle(&mut d).await;
 }
 
+/// The hidden partials of the `NULL` group: `(n, count, sum, has basis)`.
+async fn null_partials(d: &Driver) -> Vec<String> {
+    d.rows(&format!(
+        "select __n, __count_1, __sum_1, __basis is not null from {} where g is null",
+        hidden(d).await
+    ))
+    .await
+}
+
+/// Freezes the build inside its first statement, once its snapshot is
+/// taken and before its insert has reached any group.
+async fn build_inside_its_write(d: &Driver) -> Running<()> {
+    let mut building = build_frozen(d, &[PausePoint::InsideBuildWrite]).await;
+    building.reached(PausePoint::InsideBuildWrite).await;
+    d.wait_blocked(1).await;
+    building
+}
+
+/// A page creates a group's hidden row after the first statement's
+/// snapshot and before its insert reaches the group, applying a change the
+/// snapshot didn't see. The insert finds the row and only locks it, and the
+/// second statement rewrites the group from a snapshot that sees the
+/// change. Writing the group from the first snapshot would lose it. Over
+/// 300 other groups, so the one straggler is read by an index probe when
+/// the source has an index on `g` (`indexed`), and by one `GROUP BY`
+/// otherwise.
+async fn a_page_creates_a_group_inside_the_first_statement(g: Option<i32>, indexed: bool) {
+    let lit = g.map_or("null".to_string(), |g| g.to_string());
+    let mut d = seeded(&format!("(1, {lit}, 1)")).await;
+    d.step("insert into public.src select i, i, 1 from generate_series(100, 399) i")
+        .await;
+    if !indexed {
+        d.write("drop index public.src_g_idx").await;
+    }
+    define(&d).await;
+    let building = build_inside_its_write(&d).await;
+    d.write(&format!("insert into public.src values (2, {lit}, 100)"))
+        .await;
+    let after = d.seal().await;
+    d.drain(after, "after").await;
+    let group = async |d: &Driver| match g {
+        Some(g) => partials(d, g).await,
+        None => null_partials(d).await,
+    };
+    assert_eq!(group(&d).await, ["(1,1,100,f)"], "the page made the row");
+    let mut building = building;
+    d.release(&mut building, PausePoint::InsideBuildWrite).await;
+    building.finish().await;
+    assert_finished(&d).await;
+    assert_eq!(
+        group(&d).await,
+        ["(2,2,101,t)"],
+        "locked, and rewritten from the second snapshot"
+    );
+    assert_eq!(partials(&d, 100).await, ["(1,1,1,t)"]);
+    assert_oracle(&mut d).await;
+    assert_eq!(d.deadlocks_logged(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_page_creates_a_group_inside_the_first_statement_read_by_probe() {
+    a_page_creates_a_group_inside_the_first_statement(Some(9), true).await;
+}
+
+#[tokio::test]
+async fn a_page_creates_a_group_inside_the_first_statement_read_by_group_by() {
+    a_page_creates_a_group_inside_the_first_statement(Some(9), false).await;
+}
+
+#[tokio::test]
+async fn a_page_creates_the_null_group_inside_the_first_statement() {
+    a_page_creates_a_group_inside_the_first_statement(None, true).await;
+}
+
+/// A page blocked on a row the first statement inserted (uncommitted):
+/// after the build's commit it reads the build's basis, applies the change
+/// committed after the build's snapshot once, and a change the snapshot saw,
+/// drained after the build, is refused.
+#[tokio::test]
+async fn a_page_blocked_on_an_inserted_row_applies_only_what_the_snapshot_missed() {
+    let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
+    d.write("insert into public.src values (3, 1, 1)").await;
+    let before = d.seal().await;
+    define(&d).await;
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    let written = building.reached(PausePoint::AfterRebuildLock).await;
+    assert_eq!(partials(&d, 1).await, Vec::<String>::new(), "uncommitted");
+    d.write("insert into public.src values (4, 1, 7)").await;
+    let during = d.seal().await;
+    let page = d.drain_frozen(during, "during", &[]).await;
+    d.wait_blocked_behind(written.backend_pid).await;
+    assert!(!page.is_finished(), "the page waits on the inserted row");
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    assert_finished(&d).await;
+    page.finish().await;
+    assert_eq!(partials(&d, 1).await, ["(3,3,18,t)"]);
+    d.drain(before, "before").await;
+    assert_eq!(partials(&d, 1).await, ["(3,3,18,t)"], "refused");
+    assert_oracle(&mut d).await;
+}
+
+/// The counterexample the zero-group GC's skip under a build exists for: a
+/// change before the build's snapshot and one after it, both drained by a
+/// page while the first statement waits, leave group 9 a zero row on no
+/// basis. The GC leaves it, the insert only locks it, and the second
+/// statement rewrites it to zero. Had a GC collected it (here by the delete
+/// a GC with no skip runs), the insert would write group 9 from the first
+/// snapshot, with the earlier change, and nothing would retract it.
+#[tokio::test]
+async fn a_zero_group_made_inside_the_first_statement_needs_the_gc_skip() {
+    for collected_by_hand in [false, true] {
+        let mut d = seeded("(1, 5, 10)").await;
+        define(&d).await;
+        d.write("insert into public.src values (2, 9, 3)").await;
+        let mut building = build_inside_its_write(&d).await;
+        d.write("delete from public.src where id = 2").await;
+        let both = d.seal().await;
+        d.drain(both, "both").await;
+        assert_eq!(partials(&d, 9).await, ["(0,0,0,f)"], "a zero row, no basis");
+        d.collect_tombstones().await;
+        assert_eq!(partials(&d, 9).await, ["(0,0,0,f)"], "the GC skipped it");
+        if collected_by_hand {
+            d.write(&format!("delete from {} where g = 9", hidden(&d).await))
+                .await;
+        }
+        d.release(&mut building, PausePoint::InsideBuildWrite).await;
+        building.finish().await;
+        assert_finished(&d).await;
+        if collected_by_hand {
+            assert_eq!(partials(&d, 9).await, ["(1,1,3,t)"], "the first snapshot's");
+            d.settle().await;
+            assert_eq!(d.rows(ACTUAL).await, ["(5,10,1)", "(9,3,1)"], "wrong");
+        } else {
+            assert_eq!(partials(&d, 9).await, ["(0,0,0,t)"], "rewritten to zero");
+            assert_oracle(&mut d).await;
+        }
+    }
+}
+
+/// The zero-group GC collects nothing of a definition under a fresh build,
+/// from the build's start to its commit, and collects again after it: the
+/// build inserts each group that has no hidden row from its own snapshot.
+#[tokio::test]
+async fn the_zero_group_gc_skips_a_definition_under_a_fresh_build() {
+    let mut d = seeded("(1, 1, 10)").await;
+    define(&d).await;
+    d.step("insert into public.src values (2, 9, 3)").await;
+    d.step("delete from public.src where id = 2").await;
+    assert_eq!(partials(&d, 9).await, ["(0,0,0,f)"], "a zero row, no basis");
+    d.collect_tombstones().await;
+    assert_eq!(
+        partials(&d, 9).await,
+        ["(0,0,0,f)"],
+        "skipped under the build"
+    );
+    run_build(&d).await;
+    d.settle().await;
+    d.collect_tombstones().await;
+    assert_eq!(
+        partials(&d, 9).await,
+        Vec::<String>::new(),
+        "collected once live"
+    );
+    assert_oracle(&mut d).await;
+}
+
 /// A plan job whose session dies frozen before its commit leaves nothing:
 /// its claim is released, it runs again whole, and the rerun is exact, a
 /// change committed while the first attempt held its locks included.
@@ -816,8 +1052,9 @@ async fn a_build_updates_the_hidden_rows_in_their_stored_order() {
 }
 
 /// The statements that read the whole source by one `GROUP BY` (a `JOIN`
-/// side's node-form recompute and a plain aggregate's rebuild) match its
-/// groups to the locked ones by a hash or merge join, never by a nested loop
+/// side's node-form recompute, a plain aggregate's rebuild and its fresh
+/// build's first statement) match its groups to others by a hash or merge
+/// join, never by a nested loop
 /// that rescans the `GROUP BY`'s result once per group: on a two-column
 /// group with hundreds of thousands of cells that loop is quadratic.
 /// Planned with nested loops disabled, so a nested-loop match (a `Join
@@ -846,10 +1083,11 @@ async fn the_whole_source_reads_match_groups_by_hash_or_merge() {
     let plans = trellis::dev::staging::explain_whole_source_reads(d.pool(), "agg")
         .await
         .expect("explain");
-    for (plan, joins) in plans
-        .iter()
-        .zip([&["Hash Cond", "Merge Cond"][..], &["Merge Cond"]])
-    {
+    for (plan, joins) in plans.iter().zip([
+        &["Hash Cond", "Merge Cond"][..],
+        &["Merge Cond"],
+        &["Hash Cond", "Merge Cond"],
+    ]) {
         assert!(
             !plan.contains("Join Filter"),
             "a join is a nested loop that tests every pair:\n{plan}"
@@ -962,5 +1200,58 @@ async fn a_qualified_source_and_target_are_read_and_written_not_a_same_named_dec
         d.rows("select count(*) from public.order_summary").await,
         ["(0)"],
         "the same-named public table is never written"
+    );
+}
+
+/// A source group column of another collation than the hidden table's
+/// (`POSIX`, bytewise, against the database's ICU default): the build's
+/// first statement still inserts the groups in the hidden index's order,
+/// the order pages lock them in (R7).
+#[tokio::test]
+async fn a_build_over_a_re_collated_group_column_inserts_in_the_index_order() {
+    let columns = [("id", int4()), ("g", ValueType::Text), ("v", int4())];
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g text collate \"POSIX\", v integer)",
+        &columns,
+        &[ONE],
+        &[SRC],
+    )
+    .await;
+    d.step(
+        "insert into public.src select i, case when i % 2 = 0 then upper(md5(i::text)) \
+         else md5(i::text) end, i from generate_series(1, 2000) i",
+    )
+    .await;
+    trellis::defs::install_definition(
+        d.pool(),
+        AGG,
+        &columns
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t))
+            .collect(),
+        "public",
+    )
+    .await
+    .expect("define the aggregate");
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the build");
+    run_build(&d).await;
+    assert_eq!(
+        d.rows(&format!(
+            "select count(*) filter (where g < before), count(*) from ( \
+             select g, lag(g) over (order by ctid) as before from {}) as x",
+            hidden(&d).await
+        ))
+        .await,
+        ["(0,2000)"],
+        "a hidden row stored after one of a greater key"
+    );
+    d.settle().await;
+    assert_eq!(
+        d.rows("select g, total, n from public.agg order by g collate \"C\"")
+            .await,
+        d.rows("select g, sum(v), count(*) from public.src group by g order by g collate \"C\"")
+            .await
     );
 }

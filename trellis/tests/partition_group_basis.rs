@@ -2603,7 +2603,10 @@ async fn a_resume_rebuilds_a_partitioned_source_per_leaf() {
     }
 }
 
-/// A second aggregate defined over the seeded source builds per leaf.
+/// A second aggregate defined over the seeded source builds per leaf: when
+/// the first leaf's transaction has committed, its hidden table holds that
+/// leaf's groups alone (the write-once form, which reads the whole source,
+/// is for an unpartitioned one).
 #[tokio::test]
 async fn a_fresh_build_over_a_partitioned_source_with_rows_goes_per_leaf() {
     let mut fx = Fx::start(&tree("range"), SEED).await;
@@ -2622,6 +2625,44 @@ async fn a_fresh_build_over_a_partitioned_source_with_rows_goes_per_leaf() {
     trellis::intake::harness::start_registered_builds(fx.d.pool())
         .await
         .expect("start its build");
+    let mut building =
+        fx.d.run_frozen(
+            &[(PausePoint::BetweenRebuildStructures, "public.agg2")],
+            |pool| async move {
+                let claimed = chunk_queue::claim_chunks_of(
+                    &**pool.get().await.expect("pool"),
+                    "build",
+                    1,
+                    &[chunk_queue::KIND_PLAN],
+                )
+                .await
+                .expect("claim the plan job");
+                assert_eq!(claimed.len(), 1, "one plan job to claim");
+                build::run_claimed(&pool, &claimed[0], "build", &REBUILD_OPTIONS).await;
+                Ok(())
+            },
+        )
+        .await;
+    building.reached(PausePoint::BetweenRebuildStructures).await;
+    let id: i64 =
+        fx.d.ctl
+            .query_one(
+                "select id from transform_definitions where target_table = 'public.agg2'",
+                &[],
+            )
+            .await
+            .expect("id")
+            .get(0);
+    let hidden = format!("{DEFAULT_SCHEMA}.agg_{id}");
+    assert_eq!(
+        fx.d.rows(&format!("select g from {hidden} order by g"))
+            .await,
+        ["(0)", "(1)", "(2)", "(3)"],
+        "the first leaf's groups alone"
+    );
+    fx.d.release(&mut building, PausePoint::BetweenRebuildStructures)
+        .await;
+    building.finish().await;
     build::settle_builds(fx.d.pool()).await;
     fx.d.settle().await;
     assert_eq!(

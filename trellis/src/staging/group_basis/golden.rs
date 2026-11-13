@@ -188,6 +188,11 @@ fn aggregate(golden: &mut Golden, plan: &GroupTargetPlan) {
         "rebuild_sql probe",
         &plan.rebuild_sql(None, &RebuildRead::Probe),
     );
+    golden.add("write_once_sql", &plan.write_once_sql(None, None));
+    golden.add(
+        "write_once_sql images",
+        &plan.write_once_sql(Some(&images), None),
+    );
 }
 
 #[test]

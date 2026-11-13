@@ -147,7 +147,9 @@
 //! has enumerated its groups, before it locks them, [`PausePoint::AfterRebuildLock`] for
 //! the definition's target once it has locked its groups, before the
 //! statement that takes its snapshot, and [`PausePoint::BeforeRebuildCommit`]
-//! after its last write, before it commits. Over a partitioned
+//! after its last write, before it commits. A fresh build's write-once
+//! form also fires [`PausePoint::InsideBuildWrite`] inside its first
+//! statement ([`pause_in_statement`]). Over a partitioned
 //! source the job is a transaction per leaf, and each fires
 //! [`PausePoint::BeforeRebuildCommit`] (an armed point fires once, at the
 //! first); between two of them it fires [`PausePoint::BetweenRebuildStructures`].
@@ -188,7 +190,11 @@
 //! enumeration and its lock statement ([`PausePoint::AfterRebuildEnumerate`],
 //! a busy build worker), where a page that commits is seen by a snapshot
 //! taken after the locks and missed by one taken before them (the
-//! `gb_build_snapshot_before_locks` plant).
+//! `gb_build_snapshot_before_locks` plant). A fresh build's write-once form
+//! also sleeps inside its first statement ([`PausePoint::InsideBuildWrite`],
+//! a uniform draw up to the stall), after its snapshot and before its
+//! insert, so pages apply to groups the snapshot missed: the stragglers its
+//! second statement rewrites.
 //!
 //! A commit stall ([`set_commit_stall`]) does the same at
 //! [`PausePoint::BeforeCommit`], between a page's last write and its
@@ -443,13 +449,21 @@ pub enum PausePoint {
     /// covers, before the statement that locks them, for the definition's
     /// target (`super::group_basis::rebuild`). No group is locked
     /// here: a page of any of them applies now, and a group a page creates
-    /// is not enumerated.
+    /// is not enumerated. A fresh build's write-once form fires it before
+    /// its first statement, which enumerates and locks.
     AfterRebuildEnumerate,
+    /// Inside a fresh build's first statement in its write-once form, for
+    /// the definition's target (`super::group_basis::rebuild`): its
+    /// snapshot is taken, and its insert has inserted or locked no group
+    /// yet. A page that commits now is missed by the snapshot, and the
+    /// insert finds the row it made. Fired by [`pause_in_statement`].
+    InsideBuildWrite,
     /// After a group-basis build or rebuild has locked every group it covers, before
     /// the statement that takes its snapshot and replaces them, for the
     /// definition's target (`super::group_basis::rebuild`). Pages of
     /// those groups queue on their locks here; a group a page creates now
-    /// isn't locked.
+    /// isn't locked. In a fresh build's write-once form, after its first
+    /// statement: every group it enumerated is written or locked.
     AfterRebuildLock,
     /// After a group-basis rebuild has replaced every group and marked its
     /// job done, just before it commits, for the definition's target
@@ -686,7 +700,8 @@ pub(crate) async fn fan_out_chunk_lock_timeout<C: GenericClient>(
 static STALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
 
 /// Sets the longest stall a page or a build chunk takes at its entry-lock
-/// step, or clears it with `None`. See the module doc's "Stalls".
+/// step, and a fresh build inside its first statement, or clears it with
+/// `None`. See the module doc's "Stalls".
 pub fn set_stall(max: Option<Duration>) {
     let micros = max.map_or(0, |max| u64::try_from(max.as_micros()).unwrap_or(u64::MAX));
     STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
@@ -873,6 +888,79 @@ pub(crate) async fn pause_at<C: GenericClient>(
         )
         .await?;
     Ok(())
+}
+
+/// A pause inside one statement ([`pause_in_statement`]): `sql` is a
+/// `FROM` item for the statement to read where it should wait.
+pub(crate) struct InStatement {
+    pub(crate) sql: String,
+    lock_timeout: Option<String>,
+}
+
+/// [`pause_at`] inside the statement `client` runs next: unless `point` is
+/// armed for `target`, `None`, or the stall at
+/// [`PausePoint::InsideBuildWrite`] (see the module doc's "Stalls"). When
+/// it is armed, reports [`Reached`] and returns
+/// a `FROM` item that waits on the pause lock wherever the statement reads
+/// it. The test, once it sees the backend blocked, knows the statement's
+/// snapshot is taken. [`InStatement::end`] after the statement.
+pub(crate) async fn pause_in_statement<C: GenericClient>(
+    client: &C,
+    point: PausePoint,
+    target: &str,
+) -> Result<Option<InStatement>, tokio_postgres::Error> {
+    let Some(arming) = SCOPE
+        .try_with(|scope| scope.take(point, target))
+        .ok()
+        .flatten()
+    else {
+        // The stall, as a sleep inside the statement: a uniform draw, since
+        // it comes once per build and the window is for pages to drain into.
+        let max = STALL_MAX_MICROS.load(Ordering::Relaxed);
+        return Ok((max > 0 && point == PausePoint::InsideBuildWrite).then(|| {
+            let seconds = (unit() * max as f64) / 1e6;
+            InStatement {
+                sql: format!("(select pg_catalog.pg_sleep({seconds})) as __pause"),
+                lock_timeout: None,
+            }
+        }));
+    };
+    let row = client
+        .query_one(
+            "select pg_backend_pid(), current_setting('lock_timeout')",
+            &[],
+        )
+        .await?;
+    let (backend_pid, lock_timeout): (i32, String) = (row.get(0), row.get(1));
+    client
+        .execute("select set_config('lock_timeout', '0', true)", &[])
+        .await?;
+    let _ = arming.reached.send(Reached { point, backend_pid });
+    Ok(Some(InStatement {
+        sql: format!(
+            "(select pg_catalog.pg_advisory_xact_lock_shared({})) as __pause",
+            arming.lock_key
+        ),
+        lock_timeout: Some(lock_timeout),
+    }))
+}
+
+impl InStatement {
+    /// Gives the session its lock timeout back, after an armed pause.
+    pub(crate) async fn end<C: GenericClient>(
+        self,
+        client: &C,
+    ) -> Result<(), tokio_postgres::Error> {
+        if let Some(lock_timeout) = self.lock_timeout {
+            client
+                .execute(
+                    "select set_config('lock_timeout', $1, true)",
+                    &[&lock_timeout],
+                )
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 /// [`pause_at`] for a point between transactions: it waits by polling the

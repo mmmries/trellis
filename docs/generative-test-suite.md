@@ -354,7 +354,8 @@ beside them run on every `cargo test`.
   connections, also over a partitioned source; mid-burst re-reads, pauses, resumes and installs while change
   capture for the same keys is in flight; cooling keys whose last write lands
   mid-burst; and sweep-only steady-load and cooling-backfill tiers that stall
-  pages and build chunks at their entry-lock step (the stall is process-wide, so
+  pages and build chunks at their entry-lock step, and a fresh build inside its
+  first statement so pages make stragglers (the stall is process-wide, so
   they run only in the planted-bug sweep, §6).
 - **Non-idempotent delta convergence** (the aggregate slice of the above).
   Byte-identical convergence to a from-scratch `GROUP BY` oracle under aggregate

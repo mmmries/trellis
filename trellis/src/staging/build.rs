@@ -2867,10 +2867,16 @@ async fn run_group_structure(
             .await
             .map_err(build_error)?
     } else {
-        super::group_basis::rebuild_definition(&txn, pool.schema(), definition, scope.as_ref())
-            .await
-            .map_err(build_error)?
-            .unwrap_or((0, 0))
+        super::group_basis::rebuild_definition(
+            &txn,
+            pool.schema(),
+            definition,
+            scope.as_ref(),
+            readers == ReadersOnCommit::Park,
+        )
+        .await
+        .map_err(build_error)?
+        .unwrap_or((0, 0))
     };
     let advances = match structure {
         Structure::Partitioned { last: false, .. } => cursor.is_some(),

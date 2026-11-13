@@ -140,6 +140,27 @@ async fn assert_finished(d: &Driver) {
     );
 }
 
+/// A rebuild in place locks its groups before its snapshot, so the
+/// zero-group GC keeps collecting while one is pending.
+#[tokio::test]
+async fn the_zero_group_gc_collects_under_a_rebuild_in_place() {
+    let mut d = start().await;
+    d.step("insert into public.src values (1, 1, 10)").await;
+    request_rebuild(&d).await;
+    d.step("insert into public.src values (2, 9, 3)").await;
+    d.step("delete from public.src where id = 2").await;
+    assert_eq!(partials(&d, 9).await, ["(0,0,0,f)"]);
+    d.settle().await;
+    d.collect_tombstones().await;
+    assert_eq!(
+        partials(&d, 9).await,
+        Vec::<String>::new(),
+        "collected under the rebuild"
+    );
+    rebuild(&d).await;
+    assert_oracle(&mut d).await;
+}
+
 /// A rebuild repairs every kind of damage to the target's groups in place:
 /// wrong partials (and the visible row that follows them), a visible row
 /// that disagrees with its partials, a visible row with no group, and a
