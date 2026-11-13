@@ -106,5 +106,6 @@ or a probe saw may not have drained. The maintenance loop's tombstone pass
 locked`, so it never waits on a page; a page that meets one being deleted waits
 and inserts it afresh. It skips an aggregate under a fresh build or a resume,
 from the build's start to its commit
-([ADR-0002](../decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)). A source `TRUNCATE` empties the hidden table, extremes
-included (Rx8; [05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-group-basis)).
+([ADR-0002](../decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)).
+A source `TRUNCATE` empties the hidden table, extremes included (Rx8;
+[05](05-apply-and-exactly-once-deltas.md#aggregate-groups-the-group-basis)).

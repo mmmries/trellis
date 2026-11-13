@@ -169,8 +169,9 @@ the `GROUP BY` of the source rows and writes each group's partials and target
 row from it. A plain aggregate over an unpartitioned source writes each group
 once: one statement inserts the groups that have no hidden row from its own
 snapshot and locks the rest, which a later statement rewrites from a new one
-([group basis](staging-and-claiming/group-basis.md#absolute-writes)). The definition applies from the moment the build starts, and a
-page waits only on the groups the build holds. Over a partitioned source, or a
+([group basis](staging-and-claiming/group-basis.md#absolute-writes)). The
+definition applies from the moment the build starts, and a page waits only on
+the groups the build holds. Over a partitioned source, or a
 partitioned table of a `JOIN`, the write is one transaction per leaf of the
 recorded tree, then one for the groups that route to no leaf, so no
 transaction holds more than one leaf's groups. A write that fails on the

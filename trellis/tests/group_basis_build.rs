@@ -1,9 +1,11 @@
 //! A fresh build of a group-basis aggregate over a source that already has
 //! rows (ADR-0002 "An aggregate's build is one absolute
 //! write per structure"): the plan job, after its seam fence,
-//! runs one absolute write of every group the enumeration union names (R8)
-//! in key order, from one snapshot taken after the locks, while pages apply
-//! from the build's first moment. An unpartitioned source.
+//! writes every group the enumeration union names (R8) once, in key order:
+//! one statement inserts each group with no hidden row from its own
+//! snapshot and locks the rest, which a later statement rewrites from a new
+//! one, while pages apply from the build's first moment. An unpartitioned
+//! source.
 //!
 //! The source is seeded and captured by an unrelated 1-1 definition, then
 //! the aggregate is defined over it, so its build starts over rows. Every
@@ -194,9 +196,10 @@ async fn a_build_over_a_seeded_source_writes_every_group() {
 
 /// Changes from before the build, during it and after it. One committed
 /// before the definition was defined and drained after the build is refused
-/// by its group's basis (the build's snapshot saw it); a page of a locked
-/// group, drained while the build holds the lock, waits for the commit and
-/// is refused too; a change after the build applies as a delta.
+/// by its group's basis (the build's snapshot saw it); a page of a group the
+/// build has written, drained while the build holds it, waits for the
+/// commit and applies its change once (the snapshot didn't see it); a
+/// change after the build applies as a delta.
 #[tokio::test]
 async fn changes_before_during_and_after_a_build() {
     let mut d = seeded("(1, 1, 10), (2, 2, 5)").await;
