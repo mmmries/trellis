@@ -239,7 +239,11 @@ image; Phase 3 settles each 1-1 target's records in one pass:
 4. **The target rows** of exactly those keys are upserted or deleted. The
    upsert evaluates the fields over each key's image or read row, cast back
    to the source columns' types and collations
-   (`staging::one_to_one_render`), so a value that fails a field (a data
+   (`staging::one_to_one_render`). The row is a jsonb object of the source
+   columns' `::text` renderings, read back under the same pinned output
+   settings it was written with; a field reading another by alias reads its
+   substituted expression, a number literal carries the type define inferred
+   for it, and a paused field is left out. A value that fails a field (a data
    exception, SQLSTATE class 22) fails the page, which isolation bisects
    ([06](06-cleanup-and-reclaim.md#quarantine-when-a-change-deterministically-kills-its-worker)).
 
@@ -568,6 +572,29 @@ Two termination mechanisms:
 
 An absolute round ceiling survives as defence-in-depth, catching runaways the hop
 bound cannot (e.g. an unbounded stream of fresh source changes). It is not the contract, so its message stays hedged: exceeding it is *not* necessarily a cycle.
+
+A target with an aggregate or `JOIN` reader stages exact images: the old
+image is the writer's own read under its lock (a delete's from its
+`RETURNING`), the new image a re-read by key. An upstream's own builds write
+through the seam too, at a resume and in a rebuild in place alike. A 1-1
+`RESUME` build stages, as every 1-1 writer does, the row its target held as
+the prior image, so its readers follow it without a rebuild. A group-basis
+`RESUME` build rebuilds its readers all the same: it starts from partials the
+resume emptied while its target keeps the earlier rows, so the images it and
+its pages stage meanwhile can carry prior values that match no row the
+readers hold. A rebuild in place of a `live` definition rebuilds nothing,
+because its hidden state matches its target. The readers' rebuild is started
+once, in the transaction that completes the whole build: on a partitioned
+source the remainder's, after the last leaf's, and for a `JOIN` the final `T`
+step's. Further hops need nothing: a reader's visible rows always match its
+own partials.
+
+That transaction, readers rebuilt or not, also asks for a retry of every key
+the target's direct readers hold, which the staging worker makes after it
+commits, with the automatic retry's semantics: a key held for a failure the
+upstream caused while it was rebuilt applies, and one whose failure persists
+is held again on its first failure. A paused or quarantined reader keeps its
+keys ([ADR-0003](../decisions/0003-quarantine-storage-and-api.md#retry-policy)).
 
 ## Suppressing no-op writes
 
