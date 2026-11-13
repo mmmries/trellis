@@ -184,7 +184,9 @@ collation on a bound only when it differs from the type's, so every comparison
 runs under its own level's collation, even when the levels of one tree differ.
 Every fetch and evaluation runs under `search_path = pg_catalog, pg_temp`,
 `DateStyle ISO, YMD` and `TimeZone UTC`, in short transactions under a short
-`lock_timeout` that retry on a lock timeout.
+`lock_timeout` that retry on a lock timeout. A statement that also reads the
+source (ADR-0002) may append the session's search path to that one, only where
+every name resolves as it does under the pinned path alone.
 
 The catalog loses a leaf's bound when it is dropped or detached, so the pass
 records it while it can. With the cast I found 0 disagreements in about 3.4M
