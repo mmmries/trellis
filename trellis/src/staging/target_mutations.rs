@@ -129,6 +129,7 @@
 //! reader would keep the older state (the `seam_token_early` plant). So no
 //! writer takes a row lock on a target after reading the token.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
@@ -137,12 +138,11 @@ use tokio_postgres::types::{PgLsn, ToSql};
 
 use super::append::{self, CdcOp, StagedChange};
 use super::apply::{
-    ApplyError, MAX_HOP_GEN, bounds_keyset_by_array, earliest_src_changed, live_row_columns,
-    pk_keyset_col, row_as_text_jsonb_sql,
+    ApplyError, MAX_HOP_GEN, earliest_src_changed, live_row_columns, row_as_text_jsonb_sql,
 };
 use super::fold::earliest_origin;
+use super::keyset::{ArmSql, Keyset};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::pool::quote_ident;
 
 /// One changed key's accumulated state — see [`TargetMutations::record`].
 #[derive(Debug, Clone)]
@@ -607,9 +607,8 @@ struct NewImage {
 /// holds the deleted row's lock, so nothing else can have re-created it).
 ///
 /// An aggregate target's key can carry a NULL grouping component (the
-/// encoding `ddl::split_pk_key` decodes). See
-/// [`new_images_query`] for how those keys are matched without giving up
-/// the index. Presence is read off `t.ctid`, since a key column can itself be
+/// encoding `ddl::split_pk_key` decodes), matched as [`super::keyset`]
+/// describes. Presence is read off `t.ctid`, since a key column can itself be
 /// NULL on a row that exists.
 async fn read_new_images(
     txn: &Transaction<'_>,
@@ -621,7 +620,12 @@ async fn read_new_images(
     if keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let query = new_images_query(target, image_columns, feed, keys)?;
+    let query = new_images_query(
+        target,
+        image_columns,
+        &feed.key_columns,
+        keys.keys().map(String::as_str),
+    )?;
     let rows = super::ledger::query_by_entry_key(txn, &query.sql, &query.params()).await?;
     Ok(rows
         .into_iter()
@@ -630,129 +634,60 @@ async fn read_new_images(
 }
 
 /// [`read_new_images`]' statement and the arrays it binds.
-struct NewImagesQuery<'a> {
-    sql: String,
-    arms: Vec<NullPatternArm<'a>>,
-}
-
-/// The keys of one [`read_new_images`] call whose identity is `NULL` in
-/// exactly the same columns, bound as one `union all` arm.
-#[derive(Default)]
-struct NullPatternArm<'a> {
-    keys: Vec<&'a str>,
-    /// One array per identity column that is not `NULL` in this pattern, in
-    /// column order. A `NULL` column binds nothing: the arm matches it with
-    /// `is null`.
-    parts: Vec<Vec<String>>,
+pub(super) struct NewImagesQuery<'a> {
+    pub(super) sql: String,
+    keyset: Keyset<&'a str, Cow<'a, str>>,
 }
 
 impl NewImagesQuery<'_> {
     /// The bind parameters, in the order `sql` numbers them.
     fn params(&self) -> Vec<&(dyn ToSql + Sync)> {
-        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
-        for arm in &self.arms {
-            params.push(&arm.keys);
-            for part in &arm.parts {
-                params.push(part);
-            }
-        }
-        params
+        self.keyset
+            .arms
+            .values()
+            .flat_map(|arm| std::iter::once(&arm.keys as _).chain(arm.params()))
+            .collect()
     }
 }
 
 /// Builds [`read_new_images`]' statement: one `union all` arm per pattern of
-/// `NULL` identity columns present among `keys`, usually just
-/// one. Within an arm a `NULL` column matches with `t.<col> is null` and
-/// every other column with `=`, so each arm probes the target's index.
-///
-/// Matching a whole batch with `is not distinct from` on any column one of
-/// its keys binds a NULL for is correct but not
-/// indexable: on a 500k-group aggregate target, a 500-key batch with one
-/// NULL group took 8.5s against 0.4ms without it.
-///
-/// A single-column identity's non-`NULL` arm also restricts the column to
-/// its array (`t.<col> = any(<array>)`), which the match already implies,
-/// so the target's side of whatever join the planner picks is bounded by
-/// the batch. A condition in a left join's `on` that names only the
-/// target filters the target's scan. Without it, a target analyzed while
-/// small and grown since was read in full: at 1M rows, a 5,000-key batch
-/// hashed a sequential scan of the target, 102 ms against 31 ms through the
-/// index. [`read_new_images`] also runs it under `ENTRY_PLAN_SETTINGS` (no
-/// sequential scan): PostgreSQL 16, unlike 17, still scanned a 400k-row
-/// target and filtered it by the bound.
-///
-/// A composite identity is never restricted this way: see
-/// [`bounds_keyset_by_array`] for why one `= any` per column is worse
-/// than the scan it avoids.
-fn new_images_query<'a>(
+/// `NULL` identity columns among `keys` ([`super::keyset`]), usually just
+/// one, each a left join from the keys to the target on
+/// [`ArmSql::bounded_matches`]. A condition in
+/// a left join's `on` that names only the target filters the target's scan.
+pub(super) fn new_images_query<'a>(
     target: &str,
     image_columns: &[String],
-    feed: &ImageFeed,
-    keys: &'a BTreeMap<String, KeyMutation>,
+    pk: &[PrimaryKeyColumn],
+    keys: impl IntoIterator<Item = &'a str>,
 ) -> Result<NewImagesQuery<'a>, ApplyError> {
-    let pk = &feed.key_columns;
-    // `pattern[i]`: identity column `i` is NULL.
-    let mut arms: BTreeMap<Vec<bool>, NullPatternArm<'a>> = BTreeMap::new();
-    for key in keys.keys() {
-        let decoded = ddl::split_pk_key(pk, target, key)?;
-        let pattern: Vec<bool> = decoded.iter().map(Option::is_none).collect();
-        let arm = arms
-            .entry(pattern)
-            .or_insert_with_key(|pattern| NullPatternArm {
-                parts: vec![Vec::new(); pattern.iter().filter(|null| !**null).count()],
-                ..NullPatternArm::default()
-            });
-        arm.keys.push(key);
-        for (column, part) in arm.parts.iter_mut().zip(decoded.into_iter().flatten()) {
-            column.push(part.into_owned());
-        }
-    }
-
+    let keyset: Keyset<&'a str, Cow<'a, str>> = keys
+        .into_iter()
+        .map(|key| Ok((key, ddl::split_pk_key(pk, target, key)?)))
+        .collect::<Result<_, ApplyError>>()?;
     let image = row_as_text_jsonb_sql("t", image_columns);
     let target_ident = ddl::qualified_target_table_ident(target);
-    let mut next_param = 1;
-    let mut param = || {
-        let placeholder = format!("${next_param}");
-        next_param += 1;
-        placeholder
-    };
-    let selects: Vec<String> = arms
-        .keys()
-        .map(|pattern| {
-            let mut arrays = vec![format!("{}::text[]", param())];
-            let mut aliases = vec!["key".to_string()];
-            let mut matched = Vec::with_capacity(pk.len());
-            let mut bounds = Vec::new();
-            for (i, (column, &null)) in pk.iter().zip(pattern).enumerate() {
-                let col = quote_ident(&column.name);
-                if null {
-                    matched.push(format!("t.{col} is null"));
-                } else {
-                    let array = format!("{}::text[]::{}[]", param(), column.data_type);
-                    if bounds_keyset_by_array(pk) {
-                        bounds.push(format!("t.{col} = any({array})"));
-                    }
-                    arrays.push(array);
-                    aliases.push(pk_keyset_col(i));
-                    matched.push(format!("t.{col} = k.{}", pk_keyset_col(i)));
-                }
-            }
-            matched.extend(bounds);
+    let mut start = 1;
+    let selects: Vec<String> = keyset
+        .arms
+        .iter()
+        .map(|(pattern, arm)| {
+            let sql = ArmSql::new(pk, pattern, "k", start + 1).with_keys(start);
+            start += 1 + arm.parts.len();
             format!(
                 "select k.key, \
                         case when t.ctid is null then null \
                              else ({image})::text end \
-                 from unnest({}) as k({}) \
+                 from {} \
                  left join {target_ident} t on {}",
-                arrays.join(", "),
-                aliases.join(", "),
-                matched.join(" and "),
+                sql.relation().expect("the keys' array"),
+                sql.bounded_matches("t"),
             )
         })
         .collect();
     Ok(NewImagesQuery {
         sql: selects.join(" union all "),
-        arms: arms.into_values().collect(),
+        keyset,
     })
 }
 
@@ -1146,7 +1081,7 @@ mod tests {
                 .expect("identity");
             let columns = live_row_columns(&txn, table).await.expect("columns");
             let key_sql = ddl::pk_key_sql_expr(&key_columns, Some("t"));
-            let keys: BTreeMap<String, KeyMutation> = txn
+            let keys: Vec<String> = txn
                 .query(
                     &format!(
                         "select {key_sql} from {table} t where {batch} \
@@ -1157,23 +1092,18 @@ mod tests {
                 .await
                 .expect("keys")
                 .into_iter()
-                .map(|row| {
-                    (
-                        row.get(0),
-                        KeyMutation {
-                            prior_image: None,
-                            hop_gen: 0,
-                            src_changed: None,
-                            origin_lsn: None,
-                        },
-                    )
-                })
+                .map(|row| row.get(0))
                 .collect();
-            let feed = ImageFeed { key_columns };
-            let query = new_images_query(table, &columns, &feed, &keys).expect("query");
+            let query = new_images_query(
+                table,
+                &columns,
+                &key_columns,
+                keys.iter().map(String::as_str),
+            )
+            .expect("query");
             assert_eq!(keys.len(), 500);
             assert_eq!(
-                query.arms.len(),
+                query.keyset.arms.len(),
                 if table == "public.single" { 2 } else { 3 },
                 "{table}: one arm per NULL pattern in the batch"
             );
@@ -1301,9 +1231,15 @@ mod tests {
                 .collect();
             assert_eq!(keys.len(), 5000);
             let feed = ImageFeed { key_columns };
-            let query = new_images_query(table, &columns, &feed, &keys).expect("query");
+            let query = new_images_query(
+                table,
+                &columns,
+                &feed.key_columns,
+                keys.keys().map(String::as_str),
+            )
+            .expect("query");
             assert_eq!(
-                query.arms.len(),
+                query.keyset.arms.len(),
                 patterns,
                 "{table}: one arm per NULL pattern"
             );

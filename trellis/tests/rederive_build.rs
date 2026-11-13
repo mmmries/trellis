@@ -924,6 +924,49 @@ async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
     );
 }
 
+/// The sweep's source read renders its fields over the source's bare column
+/// names beside the keys' `unnest(...)` relation, so a source column named
+/// like one of that relation's columns (`c0`) must not make the read
+/// ambiguous.
+#[tokio::test]
+async fn a_one_to_one_sweep_reads_a_source_column_named_like_a_key_part() {
+    let int8 = ValueType::Integer(trellis::integer::IntWidth::Int8);
+    let mut f = Fixture::custom(
+        "create table public.src (id bigint primary key, c0 bigint); \
+         insert into public.src select i, i * 10 from generate_series(1, 30) i",
+        [("id".to_string(), int8), ("c0".to_string(), int8)],
+        &["TRANSFORM one FROM public.src SELECT c0 + c0 AS dbl"],
+    )
+    .await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.src where id = 5")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+    f.pass().await;
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep' and not done")
+            .await,
+        1,
+        "the rebuild enqueues its sweep"
+    );
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.rows("select (id, dbl)::text from public.one order by id")
+            .await,
+        f.rows("select (id, c0 + c0)::text from public.src order by id")
+            .await,
+        "the sweep removed the deleted key's row"
+    );
+}
+
 /// Migration V15 restarts a 1-1 sweep a release before the tagged cursors
 /// left in flight with a bare key of the tagged shape: read as the `ledger`
 /// tag, this one would resume past every key, the one deleted while paused

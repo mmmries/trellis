@@ -52,6 +52,7 @@
 //! a pause bumps it, so a pause that returns has no write of the column
 //! still to land.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -63,6 +64,7 @@ use crate::metrics::{self, BuildStatement};
 use crate::pool::{Pool, quote_ident};
 
 use super::super::apply::ApplyError;
+use super::super::keyset::{ArmSql, Keyset};
 use super::super::one_to_one_ledger::{self, EntryChange};
 use super::super::target_mutations::TargetMutations;
 use super::orphans::{self, OrphanCursor, OrphanWalk};
@@ -654,35 +656,18 @@ async fn rederive_keys(
 
     // The source and the target are read by their typed key columns, so
     // each is one index probe per key: `$1` is the keys' `text[]`, `$2..`
-    // one `text[]` per key column. A key with a `NULL` part (a source keyed
-    // by a nullable unique index) is matched by `is null` on
-    // that column, which the index serves where `is not distinct from`
-    // can't, so the keys are re-derived a statement per `NULL` pattern
-    // (`pattern[i]`: part `i` is `NULL`), each binding only its non-`NULL`
-    // columns.
-    let mut patterns: std::collections::BTreeMap<Vec<bool>, PatternKeys<'_>> =
-        std::collections::BTreeMap::new();
-    for key in &key_refs {
-        let split = ddl::split_pk_key(&plan.pk, &plan.source_table, key)?;
-        let pattern: Vec<bool> = split.iter().map(Option::is_none).collect();
-        let (pattern_keys, parts) = patterns.entry(pattern).or_insert_with_key(|pattern| {
-            (
-                Vec::new(),
-                vec![Vec::new(); pattern.iter().filter(|null| !**null).count()],
-            )
-        });
-        pattern_keys.push(key);
-        for (column, part) in parts.iter_mut().zip(split.into_iter().flatten()) {
-            column.push(part.into_owned());
-        }
-    }
-    for (pattern, (pattern_keys, parts)) in &patterns {
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![pattern_keys];
-        for part in parts {
-            params.push(part);
-        }
-        let pick = sweep_pick(plan, pattern);
-        let done = rederive(txn, plan, None, &pick, &params, pattern_keys.len()).await?;
+    // one `text[]` per non-`NULL` key column, a statement per `NULL` pattern
+    // (`super::super::keyset`).
+    let keyset: Keyset<&str, Cow<'_, str>> = key_refs
+        .iter()
+        .map(|&key| Ok((key, ddl::split_pk_key(&plan.pk, &plan.source_table, key)?)))
+        .collect::<Result<_, ApplyError>>()?;
+    for (pattern, arm) in &keyset.arms {
+        let params: Vec<_> = std::iter::once(&arm.keys as _)
+            .chain(arm.params())
+            .collect();
+        let pick = sweep_pick(&plan.pk, pattern);
+        let done = rederive(txn, plan, None, &pick, &params, arm.keys.len()).await?;
         outcome.keys += done.keys;
         outcome.written += done.written;
         outcome.deleted += done.deleted;
@@ -690,54 +675,22 @@ async fn rederive_keys(
     Ok(outcome)
 }
 
-/// One `NULL` pattern's keys in a sweep batch: the keys, and their
-/// non-`NULL` parts, one array per such column in key order.
-type PatternKeys<'a> = (Vec<&'a str>, Vec<Vec<String>>);
-
-/// How a sweep batch picks the rows of its keys of one `NULL` pattern
-/// (`pattern[i]`: part `i` is `NULL`): by `is null` on a `NULL` part's
-/// column, and on the others by a keyset of their typed parts (`$2..`, one
-/// `text[]` per non-`NULL` column, in key order), `$1` being the keys.
-fn sweep_pick(plan: &OneToOnePlan, pattern: &[bool]) -> Pick {
-    let mut arrays = Vec::new();
-    let mut columns = Vec::new();
-    let mut matched: Vec<(String, Option<String>)> = Vec::new();
-    for (column, null) in plan.pk.iter().zip(pattern) {
-        let ident = quote_ident(&column.name);
-        if *null {
-            matched.push((ident, None));
-        } else {
-            let alias = format!("__trellis_p{}", arrays.len());
-            arrays.push(format!(
-                "${}::text[]::{}[]",
-                arrays.len() + 2,
-                column.data_type
-            ));
-            matched.push((ident, Some(alias.clone())));
-            columns.push(alias);
-        }
-    }
-    let on = |alias: &str| -> String {
-        matched
-            .iter()
-            .map(|(ident, part)| match part {
-                Some(part) => format!("{alias}.{ident} = u.{part}"),
-                None => format!("{alias}.{ident} is null"),
-            })
-            .collect::<Vec<_>>()
-            .join(" and ")
+/// How a sweep batch picks the rows of its keys of one `NULL` pattern: `$1`
+/// is the keys, `$2..` the arm's parts. The parts are named `__trellis_p<n>`,
+/// not `c<i>`: the source read's fields are rendered over the source's bare
+/// column names, which a user column named like a part would make ambiguous.
+pub(in crate::staging) fn sweep_pick(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> Pick {
+    let arm = ArmSql::named(pk, pattern, "u", 2, |_, n| format!("__trellis_p{n}"));
+    let (src_from, target_where) = match arm.relation() {
+        Some(keys) => (
+            format!("join {keys} on {}", arm.matches("s")),
+            format!("exists (select 1 from {keys} where {})", arm.matches("t")),
+        ),
+        None => (format!("where {}", arm.matches("s")), arm.matches("t")),
     };
-    if arrays.is_empty() {
-        return Pick {
-            src_from: format!("where {}", on("s")),
-            target_where: on("t"),
-            keys: "$1".to_string(),
-        };
-    }
-    let typed = format!("unnest({}) as u({})", arrays.join(", "), columns.join(", "));
     Pick {
-        src_from: format!("join {typed} on {}", on("s")),
-        target_where: format!("exists (select 1 from {typed} where {})", on("t")),
+        src_from,
+        target_where,
         keys: "$1".to_string(),
     }
 }
@@ -792,13 +745,13 @@ async fn lock_chunk_entries(
 
 /// How a chunk or a sweep batch picks its keys' rows in
 /// [`rederive_statement`].
-struct Pick {
+pub(in crate::staging) struct Pick {
     /// What follows `from <source> s` in the source read: the join and
     /// filter that pick the locked keys' rows.
-    src_from: String,
+    pub(in crate::staging) src_from: String,
     /// A predicate over the target aliased `t` that picks the locked keys'
     /// target rows.
-    target_where: String,
+    pub(in crate::staging) target_where: String,
     /// The locked keys' `text[]` parameter.
     keys: String,
 }
