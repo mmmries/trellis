@@ -690,82 +690,45 @@ built by the same operation apply uses, over chunks of the source, while
 applying: Re-derive per row for a 1-1 target, and one absolute write per
 structure for an aggregate
 ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)).
+The steps are in [builds](../staging-and-claiming/builds.md).
 
-- **Must:** registration writes the definition and its ledger or group-state
-  tables. Once
-  capture covers it, the staging worker starts its build in one transaction
-  that moves it to `backfilling` and enqueues a plan job, and the definition
-  is **applying from that commit** (registration does no more than register). The plan job enqueues the chunk plan
-  (primary-key ranges over the source, discovered by `max()` over `LIMIT` so
-  every row falls in exactly one range) in batches, on a drain worker. Every
-  drain worker claims chunks. A chunk
-  is one short transaction. One statement takes the snapshot, reads the
-  range and inserts, in key order, the entry and target row of every key
-  that has none, written from that read. Then the chunk locks the other
-  keys' entries in key order, and one more statement takes a snapshot,
-  reads them and replaces their entries and rows. "No entry" means "not yet
-  written": a captured change for a key whose chunk has not run applies as
-  an insert of NEW, a delete of one records a tombstone, and the chunk's
-  insert then finds that entry and leaves it to the locked Re-derive, which
-  replaces it under a snapshot that includes that commit, so the row ends
-  up written once.
-  The insert's snapshot is taken before its uniqueness check, so the insert
-  relies on "no entry" meaning "no Apply since the snapshot". The tombstone
-  GC is the one thing that removes an entry an Apply wrote, and it skips a
-  definition under a build (I4); a page's deleted placeholder holds no
-  applied change (I1).
-  There is no go-live re-read, no orphan sweep and no catch-up: nothing was
-  skipped. Batches drain out of order, so a change committed
-  before the start can drain after it while a later change to the same key
-  drained before it, unapplied. Its image is then stale, and a key deleted
-  that way has no row for a chunk to find. The start records the segment
-  active at its commit (seal phase 1 can't move it until the start commits),
-  every change committed before the start is in a batch at or below it, and
-  a 1-1 target's page re-derives rather than applies the keys of such a
-  batch. An aggregate's sides commute, so it needs no such rule. *Evidence:*
-  in four 10M-row runs of a chunked-build prototype under 2,000 writes/s the
-  oracle matched, with 196–361k changes correctly skipped by chunk bases and 0
-  in-progress ids.
-- **A source that is another definition's target takes a per-build fence.**
-  Such a source is fed by the mutation seam ([Multi-hop](#multi-hop-a-targets-writes-reach-its-readers-through-the-mutation-seam)),
-  not by capture. A seam writer decides inside its own apply transaction
-  whether a definition applies, so one that decided before the build's start
-  committed can commit after a chunk's snapshot, and neither the chunk nor
-  the ring carries its write. The plan job's first act is a fence, the id of
-  a transaction begun after the start commit,
-  and it plans no chunk until the oldest running transaction began
-  after it. A group-basis build, and a JOIN build either of whose tables is
-  another definition's target, waits on the same fence before its one
-  transaction. That covers a writer only if it held its transaction id when it
-  checked, so the seam's check takes the id first, in a statement of its
-  own. Only a seam-fed build waits, and only on older transactions;
-  `status` names the fence (`BuildWait::Fence`). The seam stays, so this
-  fence stays. *Evidence:* a test freezes an upstream writer after its reader
-  check and starts the downstream: without the fence the downstream misses the
-  writer's row.
-  A source that is an aggregate's target is keyed by its nullable `GROUP BY`
-  columns, and a key with a `NULL` part is in no chunk's range (the range is
-  a row comparison). A 1-1 reader's plan job stages an image-less
-  `Recompute` for each such key when its walk ends, which a page re-derives
-  under the entry lock. Those rows can still be in the ring when the build
-  flips `live`; their origin is unknown, so a token taken after the flip
-  waits for them, as for any seam row. An aggregate reader's build covers
-  such rows itself
-  ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)).
-- **Every definition has a build.** The chunked build serves a 1-1
-  definition on a captured source or on another definition's target. Define
-  refuses a definition whose fields inline into more than a build can render
-  (a chain of fields that each read the previous one more than once).
+- **Must:** the definition is **applying from the commit that starts its
+  build**; registration does no more than register. Nothing is skipped, so
+  there is no go-live re-read, no orphan sweep and no catch-up. A change
+  committed before the start that drains after it is in a batch at or below
+  the start's segment, whose keys a 1-1 page re-derives rather than applies.
+  *Evidence:* in four 10M-row runs of a chunked-build prototype under 2,000
+  writes/s the oracle matched, with 196–361k changes correctly skipped by
+  chunk bases and 0 in-progress ids.
+- **Must:** a chunk is one short transaction. One statement takes the
+  snapshot, reads the range and inserts, in key order, the entry and target
+  row of every key that has none, written from that read. Then the chunk
+  locks the other keys' entries in key order, and one more statement takes a
+  snapshot, reads them and replaces their entries and rows. The insert's
+  snapshot is taken before its uniqueness check, so the insert relies on "no
+  entry" meaning "no Apply since the snapshot". The tombstone GC is the one
+  thing that removes an entry an Apply wrote, and it skips a definition under
+  a build (I4); a page's deleted placeholder holds no applied change (I1).
+- **Must:** a source that is another definition's target takes a per-build
+  fence. A seam writer decides inside its own apply transaction whether a
+  definition applies, so one that decided before the build's start can
+  commit after a chunk's snapshot, and neither the chunk nor the ring carries
+  its write. The build plans no chunk, and a group-basis or `JOIN` build
+  writes nothing, until every transaction older than the fence has ended;
+  `status` names the fence. The seam stays, so this fence stays. *Evidence:*
+  a test freezes an upstream writer after its reader check and starts the
+  downstream: without the fence the downstream misses the writer's row.
+- **Every definition has a build.** Define refuses a definition whose fields
+  inline into more than a build can render (a chain of fields that each read
+  the previous one more than once).
 - **Must (I7):** chunk transactions are short (one range, under
   `lock_timeout`), and a captured-change batch never waits inside its
   transaction for a chunk's lock.
 - **Must (backpressure):** build work yields to sealing and to the drain of
-  captured changes. A worker claims a chunk only when the ring's undrained
-  backlog is under a bound, and the sealer is never refused for the duration
-  of a build. *Evidence:*
-  in my 10M chunked-build runs without backpressure the seal was refused for
-  the whole build, with a tail of 90–213 s after `live`; in the 100M run a
-  6.09M-row segment sat undrained.
+  captured changes, and the sealer is never refused for the duration of a
+  build. *Evidence:* in my 10M chunked-build runs without backpressure the
+  seal was refused for the whole build, with a tail of 90–213 s after `live`;
+  in the 100M run a 6.09M-row segment sat undrained.
 - **Must (acceptance):** per-row build cost is independent of table size;
   a build of N rows runs in bounded memory and bounded WAL retention, in
   time linear in N, and converges to the oracle at 100M under load.
@@ -773,23 +736,16 @@ structure for an aggregate
   rows between 1M and 10M, and the chunk rate fell from 0.96 to 0.4/s at
   100M.
 - **Should:** the peak `xmin` hold during a 1-1 build is one chunk's
-  duration, not the build's (270–658 s at 10M in the prototype). An
-  aggregate's is the build's transaction
-  ([An aggregate's build](#an-aggregates-build-is-one-absolute-write-per-structure)).
-- **Chunks are a durable, claimable work queue on drain threads**, not an
-  in-call loop, and the failure contract is: a chunk is heartbeated and
-  reclaimed like a sealed segment, a crashed worker's chunk is re-run
-  (Re-derive is idempotent), a failing chunk backs off with its error on
-  `Trellis::status` and never starves other work, a resume supersedes held
-  chunks through the claim fence so no stale write lands after it,
-  and no definition is ever `backfilling` without a chunk row driving it
-  forward. A staging worker is still required for anything to
-  seal; drain threads are required for anything to build.
+  duration, not the build's (270–658 s at 10M in the prototype).
+- **Must:** chunks are a durable, claimable work queue on drain threads, not
+  an in-call loop. A crashed worker's chunk is re-run, a failing chunk
+  reports its error on `Trellis::status` and never starves other work, no
+  stale chunk write lands after a resume, and no definition is ever
+  `backfilling` without a chunk row driving it forward.
 - **Cost to state.** At 10M with the prototype's shape (group locks inside
   chunks), define-to-live was 2.0–3.2x the one-pass build's and WAL 3.7–5.1x.
   The implementation's 10M build converges in 65 s against the old path's
-  791 s; the acceptance bullet above stays the bar
-  ([validation 4](#validation-and-acceptance)).
+  791 s; the acceptance bullet above stays the bar.
 
 | Build at 10M rows, 8 workers, 2,000 writes/s, disk | define → `live` | WAL | oracle | tail after `live` |
 |---|---|---|---|---|
@@ -802,130 +758,65 @@ structure for an aggregate
 ### An aggregate's build is one absolute write per structure
 
 An aggregate's build keeps no per-row entries and needs no delta table,
-merger or chunk. A fresh build, and a rebuild in place of a `live`
-definition, are **one absolute write per structure**: one per source, or one
-per leaf of a partitioned source. It is the ordinary group recompute applied
-to all of a structure's groups in one transaction, with pages applying from
-the build's first moment.
+merger or chunk. A fresh build, a resume's, and a rebuild in place of a
+`live` definition are **one absolute write per structure**: one per source,
+or one per leaf of a partitioned source. It is the ordinary group recompute
+applied to all of a structure's groups in one `READ COMMITTED` transaction,
+with pages applying from the build's first moment
+([builds](../staging-and-claiming/builds.md#an-aggregates-or-a-joins-build)).
 
-- **Must:** a fresh build's write, and a resume's, runs in one `READ COMMITTED`
-  transaction:
-  1. **one statement takes the snapshot**, enumerates the groups (R8's union,
-     below, read in that snapshot), runs the `GROUP BY` of the structure's
-     source rows, and in key order **inserts each group that has no hidden
-     row** with its absolute partials, that snapshot as its basis and its
-     stamp per R5, and **locks each group that has one** without writing it.
-     This pass is the write's lock statement (R6, R7), and the insert from
-     its own read is [ADR-0028](0028-locking-and-writing.md)'s exception to
-     I1. The visible rows of the inserted groups are written by the same
-     statement;
-  2. **the groups that had a row** are all locked by then. One later statement
-     takes a new snapshot, runs the `GROUP BY` over those groups and replaces
-     their partials and visible rows, with that snapshot as their basis and
-     its stamp per R5 (R1). It never reuses the first snapshot: a page can
-     have applied to such a group after it.
+- **Must:** a fresh build's or a resume's first statement takes the
+  snapshot, enumerates the groups (R8), and in key order inserts each group
+  that has no hidden row from that read and locks each group that has one.
+  That pass is the write's lock statement (R6, R7), and the insert from its
+  own read is [ADR-0028](0028-locking-and-writing.md)'s exception to I1. The
+  groups that had a row are rewritten by a later statement from a new
+  snapshot (R1, R5), never the first: a page can have applied to such a group
+  after it.
 - **Must:** the zero-group GC collects nothing of a definition under a build,
-  from before the write's first snapshot to its commit. The insert of step 1
-  relies on "no row" meaning "no page has applied to the group".
-- **Must:** a build over a partitioned source runs these steps per leaf, the
-  enumeration routed to the leaf, with routing and reading resolved under one
-  set of settings. The remainder, and a leaf read through the root, take the
-  rebuild's two statements (below).
-- **Must:** a fresh build's write runs in the plan job, after its fence for
-  a source that is another definition's target, and never walks the key. A
-  fresh build whose hidden table is empty may skip R8's second heap pass.
+  from before the write's first snapshot to its commit. The insert relies on
+  "no row" meaning "no page has applied to the group".
 - **Must:** the write touches only the groups it enumerated and locked. A
   group first seen after the enumeration belongs to its pages, which apply
-  each of its changes once.
-- **Must:** pages apply from the build's first moment; a page waits only on
-  the groups the build holds.
+  each of its changes once. Pages apply from the build's first moment and
+  wait only on the groups the build holds.
 - **Must:** a source truncate has no build state to reset. A truncate's page
   wipes a build that committed before it, and the barrier (R9) re-applies
   what follows.
-- **Should:** the build's `xmin` hold is its transaction, not one statement:
-  an open transaction with an xid holds the vacuum horizon until it commits.
-  On an unpartitioned source that is the whole source; on a partitioned
-  source one leaf at a time.
-- **Accepted cost.** On an unpartitioned source the build's lock window,
-  `xmin` hold and ring-retirement stall grow with the source. On a `JOIN`
-  over an unpartitioned 100M-row fact table, the engine's fresh build held
-  `xmin` for 23.0 s grouped by a dimension attribute, and for 932 s with
-  15.9 GB of WAL grouped by day and attribute (#1113's benchmark;
-  [#1346](https://github.com/salesforce-misc/trellis/issues/1346) tracks the
-  second against my `JOIN` model's 84 s). For that window the source's drain
-  waits on the groups the build holds. A partitioned source is bounded per
-  leaf: in my group-basis model the peak `xmin` hold was 0.3–0.5 s per
-  partition for a 100M-row source in 32 partitions.
 - **Must:** a rebuild over a target that already has groups recomputes
-  every group in place, without pausing the definition. That is
-  `request_backfill`, a capture re-install, and the automatic rebuilds
-  (`capture_auto_rebuilds_total`). A `RESUME` keeps the target too: its
-  build is the fresh build's write (above), over the groups the target
-  kept. It is one absolute write per structure (one per source, or
-  one per partition on a partitioned source, each group routing to one
-  partition under
-  [ADR-0017](0017-partitioned-sources.md)'s group-key rule), each the
-  ordinary group recompute applied to all of the structure's groups in one
-  transaction: it locks the groups in key order in a statement of their
-  own (R6), creating the hidden rows of the few groups that have none, runs
-  the `GROUP BY` of the structure's source rows from one snapshot, and
-  **replaces**, not adds to, each group's hidden partials and visible row, in
-  key order, with that snapshot as the group's basis and its stamp per R5.
-  Every group has a row there, so the fresh build's insert from its read
-  would insert nothing. On a partitioned source the structures are the leaves of the source's
-  recorded tree, in oid order, then a remainder: the groups of the target
-  and the ring that route to no recorded leaf, read through the root, which
-  zeroes each. Each is a transaction of its own, and the job's cursor holds
-  the last leaf committed, so a job that dies resumes after it. A page between
-  two transactions sees the earlier leaves' new bases and the later leaves'
-  old ones, which is exact per group. A leaf of a tree that has changed since
-  it was recorded is read through the root, one probe per group, and the
-  change's own correction (ADR-0017) repairs what it moved. A leaf whose
-  routing text was never recorded halts the rebuild: no statement ever covers
-  more than one leaf's groups. A `JOIN` definition's rebuild with a
-  partitioned side that has rows runs per side and leaf in the same way: each
-  unpartitioned side whole, then each partitioned side's leaves in oid order
-  and its remainder, then a final `T` step, the job's cursor holding
-  `side:oid` for the last step committed
-  ([ADR-0019](0019-join-transforms.md)).
-- **Must:** the groups a rebuild covers are the enumeration union (R8): the
-  source's groups, the groups named by old images of undrained ring
-  changes, and the target's own groups. A group with no source rows goes to
-  zero and is collected under R4; its visible row is removed in the same
-  transaction. A group the enumeration doesn't see (its first change
-  commits after it) is not locked, and the rebuild leaves it to its pages,
-  which apply each of its changes once.
-- **Must:** pages keep applying during a rebuild. A change the snapshot saw
-  is refused by its group's basis, a later one applies as a delta, and a
-  page touching a locked group waits for the statement to commit. Readers
-  see the old values until a structure's statement commits, then the new
-  ones: the target never empties and no group shows a partial build. The
-  status reads `backfilling` from the call, or from the pass that starts an
-  automatic rebuild, until every structure has committed, then `live`.
-  *Cost:* pages of a structure's groups, in practice its source's drain,
-  wait while its statement runs. That grows with an unpartitioned source and
-  is one partition's worth at a time on a partitioned one: in my group-basis
-  model, one `GROUP BY` per partition built a 100M-row source in 32
-  partitions in 1.4–1.9 s in all. No ring segment retires while the
-  statement's transaction is open, so once the ring's slots fill no segment
-  seals and every source's drain waits for the commit too; writers aren't
-  held back, and the active segment grows meanwhile. Clearing the target and building
-  fresh would show readers an empty, then filling target, and a shadow
-  build and swap would make pages write to both states; both are rejected.
+  every group in place, without pausing the definition: it locks the groups
+  in key order in a statement of its own (R6), then **replaces**, not adds
+  to, each group's partials and visible row from one snapshot. It covers the
+  enumeration union (R8); a group with no source rows goes to zero and is
+  collected under R4. Readers see the old values until a structure's
+  statement commits, then the new ones: the target never empties and no
+  group shows a partial build. Clearing the target and building fresh would
+  show readers an empty, then filling target, and a shadow build and swap
+  would make pages write to both states; both are rejected.
+- **Should:** the build's `xmin` hold is its transaction: the whole source
+  when unpartitioned, one leaf at a time when partitioned.
+- **Accepted cost.** On an unpartitioned source the build's lock window,
+  `xmin` hold and ring-retirement stall grow with the source, and the
+  source's drain waits on the groups the build holds. On a `JOIN` over an
+  unpartitioned 100M-row fact table, the engine's fresh build held `xmin` for
+  23.0 s grouped by a dimension attribute, and for 932 s with 15.9 GB of WAL
+  grouped by day and attribute, against 84 s in my `JOIN` model. A
+  partitioned source is bounded per leaf: in my group-basis model the peak
+  `xmin` hold was 0.3–0.5 s per partition for a 100M-row source in 32
+  partitions.
 
 *Evidence:* the build-path model (PostgreSQL 15 and 18) was exact in every
 deterministic scenario and soak run with pages applying throughout, and each
 rule above was necessary: moving the snapshot before the locks, leaving a
 `NULL`-key group unlocked, or writing groups outside the locked set each
-failed a scenario. In my model of the fresh build's insert from its read, and
-in a prototype of it on the engine, the build was exact with pages applying
-throughout, per leaf as well; I measured a 10M-group fresh build at 82 s and
-5.9 GB of WAL against 1,535 s and 103 GB for a lock statement that creates
-zero rows and an update of every one, and 91 s against 144 s over 32 leaves. I measured the group-basis build of a 10M-row
-source at 0.28 s and 11 MB of WAL with one `GROUP BY` per partition,
-against 26–32 s and 5.0 GB for the per-row ledger's chunked build, and
-1.4–1.9 s at 100M against 370–380 s; the peak `xmin` hold was 0.3–0.5 s per
-partition at 100M.
+failed a scenario. The fresh build's insert from its read was exact in my
+model and in a prototype on the engine, per leaf as well; I measured a
+10M-group fresh build at 82 s and 5.9 GB of WAL against 1,535 s and 103 GB
+for a lock statement that creates zero rows and an update of every one, and
+91 s against 144 s over 32 leaves. The group-basis build of a 10M-row source
+took 0.28 s and 11 MB of WAL with one `GROUP BY` per partition, against
+26–32 s and 5.0 GB for the per-row ledger's chunked build, and 1.4–1.9 s at
+100M against 370–380 s.
 
 ## Convergence and status
 

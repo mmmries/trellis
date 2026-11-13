@@ -255,11 +255,6 @@ Nothing has to be re-read for a hot key: an Apply is judged by its own
 position, so a key whose source changes faster than a batch drains still
 gets each batch's newest image.
 
-`ALTER TRANSFORM`'s field rebuild and a column resume are field builds
-(`staging::build`): background chunks that lock a range of keys'
-entries as a page does and rewrite just the changed columns of their target
-rows from one snapshot, leaving the entries as they are.
-
 ### The ledger
 
 ADR-0002 gives every 1-1 target a per-key ledger. Apply maintains it
@@ -285,12 +280,8 @@ A 1-1 target's ledger holds only the key and the ordering state, because the
 target row holds the values. It is keyed by `__from_key` and indexes its
 tombstones by `__applied_seg` (the tombstone GC's index, below).
 
-A plain 1-1 target is built by Re-derive (`staging::build`), on a captured
-source or on another definition's target alike: the build applies from its
-start and re-derives the source in chunks, each inserting the entries its keys
-don't have yet and locking the others as a page does, and stamping them as a
-Re-derive does. An aggregate or a `JOIN` is built by its plan job's one
-absolute write instead ([the group basis](group-basis.md#absolute-writes)).
+A 1-1 target's build, and a field build, lock and stamp entries as a page
+does ([builds](builds.md)).
 
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
@@ -372,7 +363,7 @@ on the 1-1 ledger's ordering state and each in one sorted statement; then it
 rewrites the target row of each changed `FROM` row, and of the other rows on a
 joined key the page changed.
 Both are built by their plan job's one absolute write
-([data flow](../data-flow.md#an-aggregates-or-a-joins-build)).
+([builds](builds.md#an-aggregates-or-a-joins-build)).
 
 ## The delta model
 

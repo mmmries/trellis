@@ -113,7 +113,8 @@ high-volume ones be append-only and vacuum-free.
 [03](03-sealing-and-the-fence.md) in order — the fence in 03 needs the append
 discipline in 02. [04](04-claiming-and-the-fold.md) and
 [05](05-apply-and-exactly-once-deltas.md) are the worker half, read as a pair;
-[the group basis](group-basis.md) is 05's aggregate path.
+[the group basis](group-basis.md) is 05's aggregate path, and
+[builds](builds.md) how a target is filled while it applies.
 [06](06-cleanup-and-reclaim.md) and [07](07-convergence-and-await.md) are the
 operational half; read 07 before designing any read-your-writes predicate — it
 is the easiest part of the design to get silently wrong.
