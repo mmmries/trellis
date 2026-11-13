@@ -336,6 +336,33 @@ async fn a_page_waits_on_a_straggler_the_first_statement_locked() {
     assert_oracle(&mut d).await;
 }
 
+/// The groups the build's first statement inserted, the `NULL` one
+/// included, are written once: none goes on to the second statement, which
+/// would rewrite it from a later snapshot. Here no group is a straggler,
+/// so every group keeps the first statement's basis though a transaction
+/// commits between the two.
+#[tokio::test]
+async fn an_inserted_group_is_not_rewritten_by_the_second_statement() {
+    let mut d = seeded("(1, 1, 10), (2, null, 5)").await;
+    define(&d).await;
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    building.reached(PausePoint::AfterRebuildLock).await;
+    d.rows("select pg_current_xact_id()").await;
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    assert_finished(&d).await;
+    assert_eq!(
+        d.rows(&format!(
+            "select count(distinct __basis::text), count(*) from {}",
+            hidden(&d).await
+        ))
+        .await,
+        ["(1,2)"],
+        "one basis, the first statement's"
+    );
+    assert_oracle(&mut d).await;
+}
+
 /// A page that creates a group after the locks, while the build holds the
 /// rest: the build's snapshot sees the group's row, but the build never
 /// locked the group and leaves it to its pages.

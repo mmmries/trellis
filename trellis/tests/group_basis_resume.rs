@@ -375,6 +375,21 @@ async fn target_rows_of_groups_the_source_lost_are_removed() {
     assert_oracle(&mut d).await;
 }
 
+/// The `NULL` group in both the target the resume keeps and the source is
+/// one group: the build's first statement matches the two `NULL`s (a match
+/// that isn't `NULL`-safe inserts the group twice, and the second insert
+/// fails the build).
+#[tokio::test]
+async fn the_null_group_of_the_target_and_the_source_is_one_group() {
+    let mut d = start("(1, 1, 10), (2, null, 7)").await;
+    pause(&d).await;
+    d.write("insert into public.src values (3, null, 4)").await;
+    resume(&mut d).await;
+    run_build(&d).await;
+    assert_eq!(d.rows(ACTUAL).await, ["(1,10,1)", "(,11,2)"]);
+    assert_oracle(&mut d).await;
+}
+
 /// A `GROUP BY` column re-typed while paused: the partials are recreated at
 /// the new type (it used to resume over the old one), so a first page with a
 /// value past the old type's range applies.
