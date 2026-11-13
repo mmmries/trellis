@@ -1678,14 +1678,53 @@ const NO_ABSOLUTE_WRITE_UNDER_LOAD: &[(&str, &str)] = &[
 /// `family13_…`) gate it.
 const EARLY_ZERO_GC_MISS: &str = "gb_early_zero_gc";
 
-/// The steady-load tier's known misses with the group basis on.
-const STEADY_LOAD_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS, EARLY_ZERO_GC_MISS];
+/// The plants of a fresh build's write-once form (#1938) that no tier
+/// catches, each pinned by deterministic tests (`trellis/src/plant.rs`).
+/// Each fired in 48 of 48 cases of the steady-load and mid-burst tiers and
+/// was caught in none (logbook `20261113T071500-c-sweep`):
+///
+/// - `gb_gc_ignores_build` needs the zero-group GC, which runs every
+///   housekeeping interval (5 s), to collect a zero row inside the build's
+///   first statement.
+/// - `gb_build_no_hidden_branch` needs a group whose only name is its
+///   hidden row: a page made it after the build started and its rows' last
+///   change drained and had its segment retired before the snapshot. The
+///   ring branch names it until then.
+/// - `gb_build_straggler_unlocked` needs a page to commit on a straggler
+///   between the second statement's snapshot and its update, inside one
+///   statement.
+const WRITE_ONCE_UNREACHED: &[&str] = &[
+    "gb_gc_ignores_build",
+    "gb_build_no_hidden_branch",
+    "gb_build_straggler_unlocked",
+];
+
+/// Why the mid-burst tier doesn't run the [`WRITE_ONCE_UNREACHED`] plants.
+const WRITE_ONCE_UNREACHED_WHY: &str = "no tier reaches its window (0 of 48 in the \
+     steady-load and mid-burst tiers); the steady-load tier runs it as a known miss and \
+     its deterministic pins gate it";
+
+/// The steady-load tier's known misses with the group basis on: those
+/// above, the [`WRITE_ONCE_UNREACHED`] plants, and
+/// `gb_build_no_target_branch`, caught in 1 of 48 (a resume's target row
+/// the source lost; the mid-burst tier gates it, 17 of 48). With its stall
+/// inside a fresh build's first statement the tier catches
+/// `gb_build_no_ring_branch` in 9 of 48 cases, `gb_build_null_key_by_equality`
+/// in 4 and `gb_build_snapshot_before_locks` in 30 (logbook
+/// `20261113T071500-c-sweep`).
+const STEADY_LOAD_MISSES: &[&str] = &[
+    STALE_ONE_TO_ONE_MISS,
+    EARLY_ZERO_GC_MISS,
+    "gb_build_no_target_branch",
+    WRITE_ONCE_UNREACHED[0],
+    WRITE_ONCE_UNREACHED[1],
+    WRITE_ONCE_UNREACHED[2],
+];
 
 /// The plants of a fresh build's write-once form (#1938): its first
 /// statement's enumeration, `NULL` match and lock, and the zero-group GC's
 /// skip under it. Only a build or resume that runs among writes can be
-/// caught on them; the steady-load tier's stall sleeps inside the first
-/// statement (`PausePoint::InsideBuildWrite`) so pages apply during it.
+/// caught on them.
 const WRITE_ONCE_BUILD: &[&str] = &[
     "gb_gc_ignores_build",
     "gb_build_no_hidden_branch",
@@ -1709,9 +1748,12 @@ fn with_write_once(
 /// [`WRITE_ONCE_BUILD`] plants.
 const NO_FRESH_BUILD_UNDER_LOAD: &str = "it breaks a fresh build's write-once form, and the \
      tier builds only before the first writes (a backfill is a rebuild in place, which \
-     keeps the rebuild's form); the steady-load tier gates it";
+     keeps the rebuild's form); the steady-load and mid-burst tiers run it";
 
-/// The mid-burst tier's group-basis plants it doesn't gate.
+/// The mid-burst tier's group-basis plants it doesn't gate. It gates
+/// `gb_build_no_target_branch` (17 of 48) and
+/// `gb_build_null_key_by_equality` (10 of 48; logbook
+/// `20261113T071500-c-sweep`).
 const MID_BURST_GROUP_BASIS: &[(&str, &str)] = &[
     (
         "gb_build_snapshot_before_locks",
@@ -1722,6 +1764,12 @@ const MID_BURST_GROUP_BASIS: &[(&str, &str)] = &[
     (
         "gb_early_zero_gc",
         "it fired in 0 of 48 cases; the steady-load tier runs it as a known miss",
+    ),
+    (
+        "gb_build_no_ring_branch",
+        "it fired in 48 of 48 cases and was caught in none: the vacated group's \
+         delete has to be undrained at the build's snapshot, and the tier holds no \
+         page back; the steady-load tier gates it (9 of 48)",
     ),
 ];
 
@@ -1887,7 +1935,17 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             SweepTier {
                 name: "mid_burst",
                 known_misses: HOT_KEY_BASED_MISSES,
-                not_gated: not_gated(&[MID_BURST_NOT_GATED, MID_BURST_GROUP_BASIS].concat()),
+                not_gated: not_gated(
+                    &[
+                        MID_BURST_NOT_GATED,
+                        MID_BURST_GROUP_BASIS,
+                        &WRITE_ONCE_UNREACHED
+                            .iter()
+                            .map(|plant| (*plant, WRITE_ONCE_UNREACHED_WHY))
+                            .collect::<Vec<_>>(),
+                    ]
+                    .concat(),
+                ),
             },
             mid_burst_case().boxed(),
         ),

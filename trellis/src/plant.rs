@@ -148,6 +148,10 @@ pub enum Plant {
     /// Pinned by `group_basis_build`'s
     /// `a_zero_group_made_inside_the_first_statement_needs_the_gc_skip` and
     /// `the_zero_group_gc_skips_a_definition_under_a_fresh_build`.
+    ///
+    /// No generative tier reaches it: 0 of 48 cases each in the steady-load and
+    /// mid-burst sweeps (logbook `20261113T071500-c-sweep`): it needs the GC
+    /// to run inside the first statement.
     GbGcIgnoresBuild,
     /// ADR-0028 W1: a write-once build's first statement
     /// (`staging::group_basis`'s `write_once_sql`) enumerates no hidden row.
@@ -157,6 +161,10 @@ pub enum Plant {
     ///
     /// Pinned by `group_basis_build`'s
     /// `a_group_only_the_hidden_table_names_goes_to_zero`.
+    ///
+    /// No generative tier reaches it: 0 of 48 cases each in the steady-load and
+    /// mid-burst sweeps (logbook `20261113T071500-c-sweep`): it needs the
+    /// group's last change drained and its segment retired before the snapshot.
     GbBuildNoHiddenBranch,
     /// ADR-0028 W1: a write-once build's first statement enumerates no
     /// visible target row, so a resume leaves a target row whose group no
@@ -188,6 +196,10 @@ pub enum Plant {
     ///
     /// Pinned by `group_basis_build`'s
     /// `a_page_waits_on_a_straggler_the_first_statement_locked`.
+    ///
+    /// No generative tier reaches it: 0 of 48 cases each in the steady-load and
+    /// mid-burst sweeps (logbook `20261113T071500-c-sweep`): it needs a page
+    /// to commit between the second statement's snapshot and its update.
     GbBuildStragglerUnlocked,
     /// ADR-0019 JR1: a `JOIN` page takes no `J` lock on its keys
     /// (`staging::join`'s `write_locked` inserts only the missing `J` rows).
