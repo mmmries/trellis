@@ -1397,9 +1397,11 @@ pub(crate) async fn install_definition_restoring(
     // expressions the validator checks, so an invalid definition reaching DDL
     // first surfaces whatever incidental error inference happens to hit —
     // masking the real validation error — and, worse, can leave a target table
-    // behind for a definition that is then rejected. `create_definition`/
-    // `create_definition_without_backfill` validate again below; that repeat is
-    // cheap and keeps those entry points safe when called directly.
+    // behind for a definition that is then rejected. This pass exists to
+    // render that DDL outside the transaction, so it can't fold into
+    // `create_definition_inner`: its refusals come in their own order (an
+    // unkeyed source before a table cycle), which that transaction's
+    // authoritative repeats keep.
     //
     // A 1-1 field named after a source primary key column is
     // refused ahead of `validate`, so it gets that error rather than
@@ -1424,7 +1426,7 @@ pub(crate) async fn install_definition_restoring(
         )
         .await?;
     }
-    validate_for_define(pool, &def, source_columns).await?;
+    let join_sides = validate_for_define(pool, &def, source_columns).await?;
 
     // An explicit `TRANSFORM <schema>.<target>` spelling overrides
     // `target_schema` (`Config::target_schema`, or this function's own
@@ -1469,7 +1471,9 @@ pub(crate) async fn install_definition_restoring(
             // partial key holds its partition key). The target holds only
             // the declared columns; its hidden tables are created with the
             // definition row, named by its id.
-            let sides = JoinSides::resolve(pool, &def).await?;
+            let sides = join_sides
+                .as_ref()
+                .expect("resolved by validate_for_define");
             for joined in sides.joined_tables() {
                 reject_non_live_upstream(&**pool.get().await?, joined, restore).await?;
             }
@@ -1487,7 +1491,9 @@ pub(crate) async fn install_definition_restoring(
             // The target is keyed by `a`'s primary key, as a 1-1 target is;
             // `b` is held to the source rules too. Hidden tables are created
             // with the definition row, as an aggregate JOIN's are.
-            let sides = JoinSides::resolve(pool, &def).await?;
+            let sides = join_sides
+                .as_ref()
+                .expect("resolved by validate_for_define");
             for joined in sides.joined_tables() {
                 reject_non_live_upstream(&**pool.get().await?, joined, restore).await?;
             }
@@ -3387,7 +3393,12 @@ async fn create_definition_inner(
     restoring: Option<&Restoring<'_>>,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse_for_define(source_text, restoring)?;
-    validate_for_define(pool, &def, source_columns).await?;
+    // The test fixtures' validation. `install_definition` ran the same call
+    // before it rendered `target_ddl`; the transaction's checks of the live
+    // tables below are the authoritative ones either way.
+    if target_ddl.is_none() {
+        validate_for_define(pool, &def, source_columns).await?;
+    }
 
     let bare_schemas = bare_name_schemas(pool);
     let mut client = pool.get().await?;
@@ -4640,13 +4651,14 @@ fn validate_with_source(
 /// ambiguous-name refusal; a definition that fails some other
 /// way, or passes, never resolves it here.
 ///
-/// A `JOIN` definition is checked against both tables' live columns instead
-/// ([`JoinSides::resolve`], [`super::validate::validate_join`]).
+/// A `JOIN` definition is checked against its tables' live columns instead
+/// ([`JoinSides::resolve`], [`super::validate::validate_join`]), and its
+/// tables are returned as resolved.
 async fn validate_for_define(
     pool: &Pool,
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-) -> Result<(), CatalogError> {
+) -> Result<Option<JoinSides>, CatalogError> {
     if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = &def.key_space {
         let sides = JoinSides::resolve(pool, def).await?;
         super::validate::validate_join(def, &sides.from_columns, &sides.joined_column_maps())?;
@@ -4661,7 +4673,7 @@ async fn validate_for_define(
             )
             .await?;
         }
-        return Ok(());
+        return Ok(Some(sides));
     }
     match validate(def, source_columns) {
         Err(err @ ValidationError::AmbiguousColumnReference(_)) => {
@@ -4689,7 +4701,7 @@ async fn validate_for_define(
             };
             Err(err.into())
         }
-        result => Ok(result?),
+        result => Ok(result.map(|()| None)?),
     }
 }
 
