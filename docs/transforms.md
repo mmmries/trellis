@@ -83,20 +83,16 @@ What an expression may contain is refused in [its own table](expressions.md#refu
 ### After define
 
 A condition define refuses can still arise later, through DDL on a table the
-definition reads. What Trellis does then depends on what the rule reads, so
-the table's "After define" column names one of the classes below, or reads
-n/a where the condition matters only at define (a name taken, an upstream not
-yet `live`). A pause is
-not a loss: the definition keeps its last values, `status()`'s
-[`capture_failure`](status-reference.md#capture_failure) gives the reason, and
-`RESUME` rebuilds the target from source once the cause is fixed. Every
-`RESUME` first runs define's validation against the schema as it is then, and
-while define would refuse, it refuses with define's error
+definition reads. The table's "After define" column names what Trellis does
+then, one of the classes below, or reads n/a where the condition matters only
+at define (a name taken, an upstream not yet `live`). A paused definition
+keeps its last values, with the reason in
+[`capture_failure`](status-reference.md#capture_failure); every `RESUME` first
+runs define's validation and refuses with define's error while it would
 ([ADR-0027](decisions/0027-operating-principles.md), rule 4). Each reason's
-repair is in [operations — Paused definitions](operations.md#paused-definitions).
-What a resume checks and changes is in
-[`PAUSE` and `RESUME`](operations.md#pause-and-resume). Other ways a source
-can drift are in [known correctness gaps](known-correctness-gaps.md).
+repair is in [operations — Paused definitions](operations.md#paused-definitions),
+and other ways a source can drift are in
+[known correctness gaps](known-correctness-gaps.md).
 
 #### Text
 
