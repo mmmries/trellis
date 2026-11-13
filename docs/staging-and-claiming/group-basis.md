@@ -51,8 +51,10 @@ Each changed visible row reaches the target-mutation seam with its prior image.
 
 One sorted lock statement, then one statement that takes the snapshot and
 newest segment, runs the source's `GROUP BY` over the groups and replaces their
-partials, extremes, bases, stamps and visible rows (R1, R5, R6, Rx6). Pages keep
-applying, against the new bases once it commits. What each covers (R8):
+partials, extremes, bases, stamps and visible rows (R1, R5, R6, Rx6). A build
+updates the hidden rows in the order they are stored
+([W2](../decisions/0028-locking-and-writing.md#w2-a-bulk-write-writes-in-the-destinations-order)).
+Pages keep applying, against the new bases once it commits. What each covers (R8):
 
 - **Build or rebuild**, the plan job's whole build
   ([data flow](../data-flow.md#an-aggregates-or-a-joins-build)): the target's

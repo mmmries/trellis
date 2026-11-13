@@ -79,7 +79,7 @@ fn shape_of(text: &str, scale: Option<i32>) -> GroupShape {
 
 /// The group identity of a target over `shape`: its `GROUP BY` columns,
 /// nullable, as an aggregate target's are.
-fn identity(shape: &GroupShape) -> Vec<PrimaryKeyColumn> {
+pub(super) fn identity(shape: &GroupShape) -> Vec<PrimaryKeyColumn> {
     shape
         .group_cols
         .iter()
