@@ -44,8 +44,9 @@ DROP   TRANSFORM <transform>
   `JOIN` with `GROUP BY` a join aggregate, `JOIN` alone a 1-1 `JOIN` (more
   than one `JOIN`: a star).
 - `ADOPT EXISTING TABLE` builds into an existing empty table instead of
-  creating one, and `KEY (...)` keys a table by those columns instead of its
-  primary key ([details](#changing-a-definition)).
+  creating one ([details](#a-target-whose-name-is-taken)), and `KEY (...)`
+  keys a table by those columns instead of its primary key
+  ([details](#the-key-a-transform-keys-each-table-by)).
 - Aliases are for a `JOIN` only. There every column, in `ON`, `GROUP BY` and
   the fields, is written `<side>.<column>`, and `ON` takes only equalities
   joined by `AND`.
@@ -55,9 +56,9 @@ DROP   TRANSFORM <transform>
   a target column.
 - `WHERE` takes only `TRUE`: every source row participates
   ([#804](https://github.com/salesforce-misc/trellis/issues/804)).
-- `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table.
-  `<name>.<field>` pauses or resumes one field of the transform named `<name>`
-  ([addressing](#changing-a-definition)).
+- `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
+  `<name>.<field>` pauses or resumes one field
+  ([Changing a definition](#changing-a-definition)).
 
 What a definition may read is the [refusal table](#refusals); why the
 statement has this shape is
@@ -1094,96 +1095,37 @@ one stops.
 
 ## Changing a definition
 
-Every definition-changing operation is one of the [statements](#statements),
-run through `apply`.
+Every change is one of the [statements](#statements), run through `apply`,
+which only registers it: no statement reads source rows, and the build runs in
+the background.
 
-**Adopting an existing target.** `ADOPT EXISTING TABLE` after the target
-builds the transform into a table of the target's name that already exists,
-instead of creating it: for example a table restored from a schema dump. The
-table must be empty and shaped exactly as define would create it, and anything
-else is refused (the target row of
-[Supported sources and targets](#supported-sources-and-targets)). Every key
-space takes it. Once defined, the target is Trellis's like any other: `DROP
-TRANSFORM` drops it, and the rest of
-[Target tables are Trellis-owned](#target-tables-are-trellis-owned) applies.
-A definition that writes it carries the release that added it as its
-[floor](#floors).
+**Addressing.** A transform is named by its target table, bare
+(`widget_prices`) or schema-qualified as define returns it
+(`public.widget_prices`); a qualified name must match exactly. The statements
+and the `Trellis` methods that name a transform (`status`,
+`quarantine_status`, `sample_quarantined`, `release_key`, `self_check`) take
+either form. `PAUSE` and `RESUME` also take `<transform>.<field>`, with the
+bare transform name, for one calculated field. That reading wins when an
+address reads both ways: `a.b` is field `b` of transform `a` when `a` declares
+a field `b`, and otherwise the transform registered as `a.b` (name that one
+bare when it collides). `DROP TRANSFORM a.b` refuses an address whose `a` is a
+transform and that names no transform itself: dropping a field is
+`ALTER TRANSFORM a DROP b`.
 
-**Naming a source's key.** `KEY (<column>, …)` directly after a `FROM` or
-`JOIN` table, before its alias (`FROM orders KEY (customer_id, id) AS o`),
-names the columns Trellis keys that table by, in the order written, instead of
-its primary key. A table with no primary key needs one. Every key space takes
-it, on either table of a `JOIN`. The key must be backed by a unique index over
-exactly those columns, and every transform reading the table names the same
-key ([the key entry](#the-key-a-transform-keys-each-table-by)).
-The rendered definition, and so a schema dump, carries it. A definition that
-writes it carries the release that added it as its [floor](#floors).
-
-**Addressing.** A transform is named by its target table, bare (`widget_prices`)
-or schema-qualified as `define` returns it (`public.widget_prices`); `ALTER
-TRANSFORM` and `DROP TRANSFORM` take either form, and so do the `Trellis` methods
-that name a transform (`status`, `quarantine_status`, `sample_quarantined`,
-`release_key`, `self_check`). A qualified name must match exactly, so a wrong
-schema names nothing. `PAUSE` and `RESUME` also take `<transform>.<column>`,
-pausing or resuming a single calculated field rather than the whole definition.
-The column form always takes the bare transform name, and it wins when an
-address reads both ways: `a.b` is column `b` of transform `a` when `a` declares
-a field `b`, and otherwise the transform registered as `a.b` (name that
-transform bare when it collides). `DROP TRANSFORM a.b` refuses an address
-whose `a` is a transform and that names no transform itself, since dropping a
-field is `ALTER TRANSFORM a DROP b`.
-
-**Semantics** are covered by
-[0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md).
-In short: `PAUSE` and `DROP` are idempotent; `RESUME` re-validates the
-transform against the live schema, refusing while define would or while the
-target's own tables aren't what define would create, and rebuilds
-by a fresh backfill rather than catching up on changes that happened during
-the pause. A `RESUME` of a transform whose upstream (a transform whose target
-it reads) isn't `live` is accepted and waits for it, and is re-validated once
-it is, so a whole stack resumed at once, in any order, comes up in dependency
-order; a `PAUSE` of a waiting
-transform withdraws its resume;
-`DROP` removes the target table's data along with the definition, and is refused
-— naming the blockers — while another registered definition still chains off the
-subject, so a chain is retired from the leaves inward.
-
-`DROP TRANSFORM <target>.<column>` is not a statement: removing one
-calculated field is an `ALTER TRANSFORM` operation, not a drop.
-
-An `ALTER TRANSFORM` validates the definition it would leave against the source's
-live columns, the schema as of its own commit and not as of define, with define's
-rules: it refuses what define would refuse, naming the column and what to change.
-A column the host added since define is readable by an added or changed field,
-and a field named after it is refused. A column the host dropped, or retyped so
-that a field reading it no longer validates, refuses an edit that leaves that
-field, so drop or change the field in the same statement. An added or changed
-field can't read a column whose type the host changed since the transform was
-defined or last resumed, even one it would validate over: `PAUSE` and `RESUME` the
-transform first, which re-types it over the source as it is now, then edit it.
-
-An `ALTER` of a field compares the column's current type with the type `DEFINE` would
-give the altered field: a bare passthrough takes its source column's type with no
-modifier (so `varchar` and `text`, or `numeric(10,2)` and `numeric`, are one type and need
-no change), any other expression its value family's. An `ALTER` never re-types a column.
-One that would (a change of integer or float width, or of type family) would rewrite the
-target under `ACCESS EXCLUSIVE`, so it is refused, naming the remedy: `DROP` the field,
-then `ADD` it again.
-
-**`apply` only registers.** Every statement returns once the change is
-recorded; none reads the transform's source rows. A new transform is built in the
-background from `waiting_to_backfill`. An `ALTER TRANSFORM` that adds or
-changes fields, and a `RESUME TRANSFORM <target>.<column>`, start a
-*field build*: the transform goes `backfilling`, the changed fields are
-computed for every new change from that moment on, and background chunks
-rewrite them across the existing rows, reading the source once however many
-fields changed. The transform reads `live` again once they are all done, so
-poll its status before relying on the new fields
+**`ALTER TRANSFORM`** edits the fields of a 1-1 transform of one table, never
+its granularity or key. It validates the definition it would leave against the
+source as it is at its commit, with define's rules, and never re-types a
+column: an `ALTER` that would is refused, and the remedy is `DROP` the field,
+then `ADD` it again. A field it adds or changes, like a field `RESUME`, is
+built in the background: the transform reads `backfilling`, and a row's new
+field can be empty or hold the old value until it reads `live` again
 ([embedding — Poll to `live`, don't wait](embedding.md#poll-to-live-dont-wait)).
-Until then a row's new field can still be empty (an added field) or hold the
-old formula's value (a changed or resumed one). A field whose formula reads a
-source column the source's capture doesn't record yet waits, paused, until
-capture records it before its build starts.
+The rules are [0015-transform-redefinition](decisions/0015-transform-redefinition.md).
+
+**`PAUSE`, `RESUME` and `DROP`** are
+[0014-pause-and-drop-a-transform](decisions/0014-pause-and-drop-a-transform.md);
+what a resume checks and rebuilds is
+[operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume).
 
 ## Grammar versions
 
