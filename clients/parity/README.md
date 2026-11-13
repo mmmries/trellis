@@ -31,7 +31,10 @@ test`, `mix test`), so they run in the `ruby` and `elixir` CI jobs.
   "covers", "about"}`.
   - `op` is one of the binding's calls (`connect`, `apply`, `status`, ...), or
     a harness step: `sql` (run each statement over the suite's own
-    connection) or `now` (save the host's current time).
+    connection), `now` (save the host's current time) or `refresh_target`
+    (refill each target from its definition's `SELECT`,
+    `trellis::target_select_sql`, in a transaction rolled back after, and
+    check it holds the rows the engine maintains).
   - `args` are positional and `opts` are the call's options. Each host
     passes them however its API takes them. Ruby uses keywords. Elixir uses
     a keyword list, except `await_converged`, where `timeout_ms` is

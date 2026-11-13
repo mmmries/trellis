@@ -411,7 +411,7 @@
     {"about": "Writes after the builds, so the targets hold what the drain applied too.", "op": "sql", "args": ["insert into parity_rf_orders values (7, 2, 2, 0.75, 2), (8, null, null, 1, 1)", "update parity_rf_orders set amount = amount + 1.5, customer_id = 3 where id = 2", "update parity_rf_customers set tier = 'silver' where id = 2", "delete from parity_rf_orders where id = 1", "insert into parity_rf_customers values (9, 'bronze', 0.25)"]},
     {"op": "watermark_token", "save": "refresh_token", "expect": "string"},
     {"op": "await_converged", "args": [{"$ref": "refresh_token"}], "opts": {"timeout_ms": 30000}, "expect": null},
-    {"about": "Each target, refreshed by the host's test helper from its definition's SELECT in a transaction the harness rolls back, holds the rows the engine maintains, compared as values. The chained one refreshes its upstream first.", "op": "refresh_target", "args": ["parity_rf_one", "parity_rf_agg", "parity_rf_by_tier", "parity_rf_view", "parity_rf_chain"]},
+    {"about": "Each target, refilled from its definition's SELECT (trellis::target_select_sql) in a transaction the harness rolls back, holds the rows the engine maintains, compared as values. Ruby refills it with Trellis::TestSupport#refresh_trellis_target, which refreshes the chained one's upstream first.", "op": "refresh_target", "args": ["parity_rf_one", "parity_rf_agg", "parity_rf_by_tier", "parity_rf_view", "parity_rf_chain"]},
 
     {
       "about": "ALTER TRANSFORM edits only a live definition, which is why these statement forms wait for phase two.",

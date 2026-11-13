@@ -101,7 +101,7 @@ defmodule Trellis.Parity do
   end
 
   @doc "The fixture's own steps, which drive the test rather than the binding."
-  def harness_ops, do: ["sql", "now"]
+  def harness_ops, do: ["sql", "now", "refresh_target"]
 
   # The calls whose success is a bare `:ok` (Ruby's `nil`). Every other
   # call's success is `{:ok, value}`.
