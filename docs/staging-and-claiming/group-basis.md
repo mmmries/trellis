@@ -79,7 +79,7 @@ always do.
 What each covers (R8):
 
 - **Build or rebuild**, the plan job's whole build
-  ([data flow](../data-flow.md#an-aggregates-or-a-joins-build)): the target's
+  ([builds](builds.md#an-aggregates-or-a-joins-build)): the target's
   groups, the source's, and those undrained ring changes' old images name; over
   a partitioned source, one transaction per leaf and one for the rest.
 - **Release** of a held key, in its own transaction: the groups

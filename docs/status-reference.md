@@ -58,9 +58,9 @@ definition here.
 The staging worker has started the transform's build, which runs on drain
 threads. The target is partial. A plain 1-1 transform (over a table rather
 than another transform's target) is built by the Re-derive build
-([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)), and an
+([builds — A 1-1 build](staging-and-claiming/builds.md#a-1-1-build-re-derive-over-chunks)), and an
 aggregate or a `JOIN` by one absolute write per structure
-([data-flow — An aggregate's or a `JOIN`'s build](data-flow.md#an-aggregates-or-a-joins-build)).
+([builds — An aggregate's or a `JOIN`'s build](staging-and-claiming/builds.md#an-aggregates-or-a-joins-build)).
 It is maintained from the start, its live changes applied while it is built,
 so it goes from `backfilling` straight to `live` once its last chunk (or, for
 an aggregate or a `JOIN`, its write) has committed. Its resume rebuilds it the

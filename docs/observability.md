@@ -374,7 +374,7 @@ written or locked a row) holds it, and `status().build_wait` names the fence
 (`BuildWait::Fence { xid }`, a `backend_xid` at or below it in
 `pg_stat_activity`; the Elixir and Ruby bindings report the `xid` as
 `build_wait_xid`) until every such transaction has ended
-([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)). Because
+([builds — A seam-fed source takes a fence](staging-and-claiming/builds.md#a-seam-fed-source-takes-a-fence)). Because
 the wait is on transactions older than the fence anywhere in the cluster, an
 unrelated long-running transaction holds such a build in `backfilling` until
 it ends.

@@ -240,7 +240,10 @@ them:
   or not, with the segment registry (`capture::restore`). The rows carry the
   original cluster's positions and transaction ids, and the restored sources
   already hold their changes, which every definition rebuilds from on
-  `RESUME`.
+  `RESUME`. That `RESUME` first resets the ordering state the dump carried: a
+  1-1 ledger's `__applied_lsn` and `__basis`, and the truncate floors, and it
+  recreates the hidden tables of a group-basis aggregate and a `JOIN`. An
+  ordinary rebuild keeps `__applied_lsn`.
 - **An enum relabel's `RESUME`.** The `RESUME` of a definition paused for an
   enum relabel deletes its tables' rows that every definition has already
   drained and that were staged before the relabel, which still hold the old

@@ -239,7 +239,11 @@ image; Phase 3 settles each 1-1 target's records in one pass:
 4. **The target rows** of exactly those keys are upserted or deleted. The
    upsert evaluates the fields over each key's image or read row, cast back
    to the source columns' types and collations
-   (`staging::one_to_one_render`), so a value that fails a field (a data
+   (`staging::one_to_one_render`). The row is a jsonb object of the source
+   columns' `::text` renderings, read back under the same pinned output
+   settings it was written with; a field reading another by alias reads its
+   substituted expression, a number literal carries the type define inferred
+   for it, and a paused field is left out. A value that fails a field (a data
    exception, SQLSTATE class 22) fails the page, which isolation bisects
    ([06](06-cleanup-and-reclaim.md#quarantine-when-a-change-deterministically-kills-its-worker)).
 
@@ -254,11 +258,6 @@ and then applies. So the last Phase 3 for a key always leaves its final state.
 Nothing has to be re-read for a hot key: an Apply is judged by its own
 position, so a key whose source changes faster than a batch drains still
 gets each batch's newest image.
-
-`ALTER TRANSFORM`'s field rebuild and a column resume are field builds
-(`staging::build`): background chunks that lock a range of keys'
-entries as a page does and rewrite just the changed columns of their target
-rows from one snapshot, leaving the entries as they are.
 
 ### The ledger
 
@@ -285,12 +284,8 @@ A 1-1 target's ledger holds only the key and the ordering state, because the
 target row holds the values. It is keyed by `__from_key` and indexes its
 tombstones by `__applied_seg` (the tombstone GC's index, below).
 
-A plain 1-1 target is built by Re-derive (`staging::build`), on a captured
-source or on another definition's target alike: the build applies from its
-start and re-derives the source in chunks, each inserting the entries its keys
-don't have yet and locking the others as a page does, and stamping them as a
-Re-derive does. An aggregate or a `JOIN` is built by its plan job's one
-absolute write instead ([the group basis](group-basis.md#absolute-writes)).
+A 1-1 target's build, and a field build, lock and stamp entries as a page
+does ([builds](builds.md)).
 
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
@@ -372,7 +367,7 @@ on the 1-1 ledger's ordering state and each in one sorted statement; then it
 rewrites the target row of each changed `FROM` row, and of the other rows on a
 joined key the page changed.
 Both are built by their plan job's one absolute write
-([data flow](../data-flow.md#an-aggregates-or-a-joins-build)).
+([builds](builds.md#an-aggregates-or-a-joins-build)).
 
 ## The delta model
 
@@ -471,6 +466,14 @@ their lock rows, in [the order above](#join-targets)). The entry lock is ordered
 then pre-locked in key order, and an aggregate's group upsert writes its
 groups in group order.
 
+Every session Trellis opens sets `default_transaction_isolation` to
+`read committed` (`pool::READ_COMMITTED`), whatever the server's, database's
+or role's default, so a statement after a lock statement reads from a snapshot
+taken after the lock, as I1 requires
+([ADR-0028](../decisions/0028-locking-and-writing.md#i1-a-writer-reads-after-its-lock-under-read-committed)).
+A transaction that needs one snapshot for several reads asks for its level
+explicitly.
+
 A consistent total lock order has no cycle, so overlapping workers serialize on a
 shared hot group instead of deadlocking. That plus a bounded, idempotent retry on
 residual serialization failures (`40001`/`40P01`) is the whole deadlock story.
@@ -537,6 +540,14 @@ reconcile pass leaves a table whose lock stays held to the next pass
 The retire path's `TRUNCATE` is the older precedent: it takes its lock
 `NOWAIT` and skips the slot until the next tick.
 
+A `MIN`/`MAX` probe ([the group basis](group-basis.md#a-page)) takes the
+source's `ACCESS SHARE` lock while its page holds its groups. That conflicts
+with no row write; only an `ACCESS EXCLUSIVE` statement on the source (most
+`ALTER TABLE` forms, `DROP`, `TRUNCATE`, `VACUUM FULL`) queues behind it, until
+the probing page commits, and the application's statements queued behind that
+one wait with it. Behind an application's `ACCESS EXCLUSIVE` lock the probe
+times out, and the page rolls back with its group locks and is retried (I7).
+
 An autovacuum holding the table blocks the DDL the same way. Postgres cancels
 one only when a waiter runs its deadlock check, after `deadlock_timeout`,
 which a 50 ms attempt never reaches, so a join on a table under a long
@@ -561,6 +572,29 @@ Two termination mechanisms:
 
 An absolute round ceiling survives as defence-in-depth, catching runaways the hop
 bound cannot (e.g. an unbounded stream of fresh source changes). It is not the contract, so its message stays hedged: exceeding it is *not* necessarily a cycle.
+
+A target with an aggregate or `JOIN` reader stages exact images: the old
+image is the writer's own read under its lock (a delete's from its
+`RETURNING`), the new image a re-read by key. An upstream's own builds write
+through the seam too, at a resume and in a rebuild in place alike. A 1-1
+`RESUME` build stages, as every 1-1 writer does, the row its target held as
+the prior image, so its readers follow it without a rebuild. A group-basis
+`RESUME` build rebuilds its readers all the same: it starts from partials the
+resume emptied while its target keeps the earlier rows, so the images it and
+its pages stage meanwhile can carry prior values that match no row the
+readers hold. A rebuild in place of a `live` definition rebuilds nothing,
+because its hidden state matches its target. The readers' rebuild is started
+once, in the transaction that completes the whole build: on a partitioned
+source the remainder's, after the last leaf's, and for a `JOIN` the final `T`
+step's. Further hops need nothing: a reader's visible rows always match its
+own partials.
+
+That transaction, readers rebuilt or not, also asks for a retry of every key
+the target's direct readers hold, which the staging worker makes after it
+commits, with the automatic retry's semantics: a key held for a failure the
+upstream caused while it was rebuilt applies, and one whose failure persists
+is held again on its first failure. A paused or quarantined reader keeps its
+keys ([ADR-0003](../decisions/0003-quarantine-storage-and-api.md#retry-policy)).
 
 ## Suppressing no-op writes
 

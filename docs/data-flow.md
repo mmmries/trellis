@@ -67,8 +67,7 @@ those rows, so Trellis reads them from the table, and the read and the
 triggers have to meet exactly: every commit to the source is either seen by
 the read or captured by the triggers, and a commit that both see is counted
 once. Mechanics:
-[ADR-0002](decisions/0002-async-data-flow.md#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)
-and [stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md).
+[builds](staging-and-claiming/builds.md).
 
 ### Registration
 
@@ -94,96 +93,15 @@ worker changes capture, and the catalog is its only source of truth for what
 to capture: a drop removes catalog rows, and the next reconcile pass
 uninstalls the triggers of a table nothing reads any more.
 
-### The Re-derive build
+### Builds
 
-A plain 1-1 definition is built by the **Re-derive build** (`staging::build`),
-whether its source is a captured table or another definition's target. The
-definition **applies from its first chunk**, so the build needs no catch-up
-after it. A captured source needs no fence wait; a source that is another
-definition's target takes one fence per build (see below):
-
-1. **Start.** Once the reconcile pass finds the definition ready (its source
-   captured with the columns it reads), one transaction moves it
-   `waiting_to_backfill -> backfilling` and enqueues a plan job. From that
-   commit Apply folds every change to the source into the definition, as for
-   a `live` one.
-2. **Plan and chunks.** A drain thread walks the source's primary key and
-   enqueues chunks of `build_chunk_rows` rows (10,000 by default). Each chunk
-   re-derives its key range: it locks the keys' ledger entries, then one
-   statement reads the rows and `pg_current_snapshot()` and rewrites the
-   entries with that snapshot as their basis. Apply and a chunk agree through
-   the entry lock and the basis: a change the chunk's snapshot saw is skipped
-   when it drains, and one it didn't see applies over the entry the chunk
-   wrote. Commits between the join and the chunk's snapshot are therefore
-   read and captured but counted once.
-3. **Writes.** A chunk upserts and deletes the target rows itself.
-4. **Live.** The transaction that leaves the plan done and every chunk done
-   moves the definition to `live`, and deletes the build's finished plan job,
-   chunks and sweep from the queue.
-
-**A source that is another definition's target.** Such a source is never
-captured: its writes reach Apply through the target-mutation seam, whose
-writer reads the list of applying definitions inside its own transaction. A
-writer that read it before the build started can commit after a chunk's
-snapshot, with its rows staged for no one, so the plan job first takes a
-fence, a transaction id assigned after the start commit, and enqueues no
-chunk until the oldest running transaction in the cluster began after it. The
-seam's check takes the writer's transaction id before it reads the list, so
-every writer that read it too early has an id below the fence. An aggregate
-over another definition's target, and a `JOIN` either of whose tables is one,
-take the same fence before their build
-([below](#an-aggregates-or-a-joins-build)).
-While it waits, the definition's `status().build_wait` reads
-`BuildWait::Fence { xid }`, naming the id to look for in `pg_stat_activity`.
-Only these builds wait, and only on transactions older than the fence.
-
-A chunk that fails on its data splits until the key fails alone, and the key
-is quarantined as a drain eviction would quarantine it. Drain threads take
-build work only after their segments, and only while the ring's undrained
-backlog is small and the next seal has a slot, so a build never starves the
-drain or holds off a seal. Each chunk's transaction is short, so the build
-holds no long snapshot.
-
-A paused or quarantined definition keeps its ledger. Its resume starts a
-Re-derive build over the existing entries with no truncate, plus a **sweep**
-that re-derives each live entry no chunk did, which is a key deleted while
-the definition was frozen, and each target row with no live entry, which is
-one added or re-keyed by hand. A resume whose source's key columns, by name
-and in key order, are no longer the ones recorded at define or at its last
-resume (the table dropped and created again with another key, or a key column
-renamed) is refused, since the target is keyed by the source's key. An
-`ALTER TRANSFORM`
-that adds columns, and a column resume, run a field build: background chunks
-that rewrite just those columns from one snapshot. A 1-1 `JOIN` has no field
-build, so its column resume rebuilds the target in place
-([ADR-0021](decisions/0021-one-to-one-join-transforms.md#a-row-a-page-fails-to-write-is-held-in-the-page)).
-
-### An aggregate's or a `JOIN`'s build
-
-An aggregate and a `JOIN` keep each group's
-partials (its row count and running sums) in hidden tables, not a per-row
-ledger, so their build is **one absolute write per structure**
-([ADR-0002](decisions/0002-async-data-flow.md#an-aggregates-build-is-one-absolute-write-per-structure)).
-The plan job, in one transaction, locks every group, takes one snapshot, runs
-the `GROUP BY` of the source rows and writes each group's partials and target
-row from it. A plain aggregate's fresh build or resume writes each group once,
-over an unpartitioned source or per leaf: one statement inserts the groups
-that have no hidden row from its own snapshot and locks the rest, which a later
-statement rewrites from a new one
-([group basis](staging-and-claiming/group-basis.md#absolute-writes)). The
-definition applies from the moment the build starts, and a page waits only on
-the groups the build holds. Over a partitioned source, or a
-partitioned table of a `JOIN`, the write is one transaction per leaf of the
-recorded tree, then one for the groups that route to no leaf, so no
-transaction holds more than one leaf's groups. A write that fails on the
-source's data (a `SUM` argument that overflows) fails whole and is retried,
-and its fifth failure pauses the definition, keeping the error on its build
-job; no key is quarantined, so a `RESUME` once the row is fixed builds it.
-
-A resume drops and recreates the hidden tables and writes every group again. A
-rebuild of a `live` definition recomputes every group in place, in the same
-transactions, so its readers see the old values until each commits, then the
-new ones, never an empty or partial target.
+A plain 1-1 definition
+is built by **Re-derive over chunks** of its source's key, and an aggregate or
+a `JOIN` by **one absolute write per structure**; either way the definition
+applies from the moment its build starts, so nothing needs a catch-up
+afterwards, and it moves to `live` once the build is done. The steps, the
+fence a seam-fed source takes, resumes, rebuilds and field builds are in
+[builds](staging-and-claiming/builds.md).
 
 ### Re-reading a table for its applying readers
 
@@ -201,10 +119,10 @@ table carries it; a bare name two captured tables share is refused, naming both.
 Either one is repaired in the transaction that makes the call:
 
 - **An aggregate or a `JOIN`** reading the table is rebuilt in place
-  ([its build](#an-aggregates-or-a-joins-build)). The transaction moves it
+  ([its build](staging-and-claiming/builds.md#an-aggregates-or-a-joins-build)). The transaction moves it
   `live -> backfilling` and enqueues one job, which recomputes every group.
 - **A plain 1-1 transform** over the captured table
-  ([the Re-derive build](#the-re-derive-build)) is rebuilt.
+  ([the Re-derive build](staging-and-claiming/builds.md#a-1-1-build-re-derive-over-chunks)) is rebuilt.
   The transaction moves it
   `live -> backfilling` and enqueues one plan job and one sweep job, two
   rows per definition, so the call returns quickly whatever the table's size.
