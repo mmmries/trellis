@@ -699,7 +699,7 @@ under a collapsed warning.
 
 ## What this stage rests on
 
-The numbered rules (I1 to I8, R1 to R9) are indexed, with their pins, in
+The numbered rules (I0 to I8, R1 to R9) are indexed, with their pins, in
 [invariants and pins](08-invariants-and-pins.md). The properties specific to
 this stage:
 

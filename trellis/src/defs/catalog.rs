@@ -1192,7 +1192,7 @@ fn refuse_join_fixture(source_text: &str) {
 /// a live CDC delta folded into it before its build has started. From the
 /// start the definition applies, and the build's chunks and the pages agree
 /// through the ledger entry's `basis`: a delta for a commit a chunk's
-/// snapshot already saw is skipped rather than counted a second time (I1).
+/// snapshot already saw is skipped rather than counted a second time (I2).
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,

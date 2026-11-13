@@ -295,7 +295,7 @@ fn single_migration_cases() -> Vec<Case> {
         ),
         // The passthrough's `integer` copy is outgrown. PostgreSQL's 2026-11
         // minors version attributes on every retype, so `b`, read by `s`,
-        // reads as a same-type rewrite (R3b) after it: `s` rebuilds.
+        // reads as a same-type rewrite after it: `s` rebuilds.
         (
             "D9",
             "alter table public.{t} alter column a type bigint",
@@ -366,26 +366,26 @@ fn single_migration_cases() -> Vec<Case> {
             "grant select (a) on public.{t} to public",
             Expect::Nothing,
         ),
-        // Identity or type: a narrowed modifier. Every definition is still valid, and the
-        // passthrough's copy holds every value, so the readers
-        // rebuild. Versioned attributes add R3b for `n`, the read column
-        // after `v`, so a `value_rewrite` is counted too (and named here, as
-        // it comes first).
+        // Identity or type: a narrowed modifier. Every definition is still
+        // valid, and the passthrough's copy holds every value, so the readers
+        // rebuild. Versioned attributes add a same-type rewrite of `n`, the
+        // read column after `v`, so a `value_rewrite` is counted too (and
+        // named here, as it comes first).
         (
             "D22",
             "alter table public.{t} alter column v type varchar(10)",
             Expect::Rebuilt("value_rewrite"),
         ),
         // `s`'s `GROUP BY` copy is outgrown. Versioned attributes make `a`,
-        // after `g` and read by `r`, an R3b rewrite: `r` rebuilds.
+        // after `g` and read by `r`, a same-type rewrite: `r` rebuilds.
         (
             "D23",
             "alter table public.{t} alter column g type bigint",
             Expect::Statuses(TransformStatus::Backfilling, TransformStatus::Paused),
         ),
-        // Identity or type: a narrower scale renders the stored values with another number
-        // of fractional digits (`1.50` as `1.5`): the readers of the column
-        // rebuild; `s` doesn't read `n`.
+        // Identity or type: a narrower scale renders the stored values with
+        // another number of fractional digits (`1.50` as `1.5`): the readers
+        // of the column rebuild; `s` doesn't read `n`.
         (
             "D24",
             "alter table public.{t} alter column n type numeric(9,1)",
@@ -410,8 +410,8 @@ async fn single_migrations_act_only_on_a_changed_column_part_3() {
 }
 
 /// Migrations paired in one transaction, or one window, the way framework
-/// migrations run them: R3b ignores a rewrite whose column row changed
-/// visibly (P1, P2, P4, P7, X3, X4), which plain R3 paused for.
+/// migrations run them: the same-type rewrite check ignores a rewrite whose
+/// column row changed visibly (P1, P2, P4, P7, X3, X4).
 fn paired_migration_cases() -> Vec<Case> {
     vec![
         (
@@ -428,7 +428,7 @@ fn paired_migration_cases() -> Vec<Case> {
         ),
         // The widening rewrites nothing, but the volatile default moves the
         // file node, and versioned attributes re-stamp `n`, read after `v`:
-        // R3b rebuilds the readers.
+        // the same-type rewrite rebuilds the readers.
         (
             "P3",
             "begin; alter table public.{t} alter column v type varchar(255); \
@@ -522,28 +522,29 @@ async fn paired_migrations_rebuild_and_pause_nothing_part_2() {
     run_cases(part(&paired_migration_cases(), 1, 2)).await;
 }
 
-/// The study's controls, and R3b's documented residue.
+/// The study's controls, and the same-type rewrite check's documented residue.
 fn real_change_cases() -> Vec<Case> {
     vec![
-        // Identity or type: dropped and re-added with the same type; every definition is
-        // still valid, so the readers rebuild.
+        // Identity or type: dropped and re-added with the same type; every
+        // definition is still valid, so the readers rebuild.
         (
             "C1",
             "begin; alter table public.{t} drop column a; \
              alter table public.{t} add column a int; commit",
             Expect::Rebuilt("column_changed"),
         ),
-        // A pure widening the identity-or-type check leaves alone; the copy-type check pauses both readers, whose
-        // copies of `b` it outgrew. A reader with no such copy misses the
-        // values (docs/known-correctness-gaps.md). Versioned attributes also
-        // make the read columns after `b` an R3b rewrite, a rebuild counted
+        // A pure widening the identity-or-type check leaves alone; the
+        // copy-type check pauses both readers, whose copies of `b` it outgrew.
+        // A reader with no such copy misses the values
+        // (docs/known-correctness-gaps.md). Versioned attributes also make
+        // the read columns after `b` a same-type rewrite, a rebuild counted
         // before the pauses.
         (
             "C2",
             "alter table public.{t} alter column b type bigint using b * 10",
             Expect::Statuses(TransformStatus::Paused, TransformStatus::Paused),
         ),
-        // R3b.
+        // A same-type rewrite.
         (
             "C3",
             "alter table public.{t} alter column b type int using b * 10",
@@ -555,7 +556,7 @@ fn real_change_cases() -> Vec<Case> {
             "alter table public.{t} alter column b type int using b",
             Expect::Nothing,
         ),
-        // R2, in the pass.
+        // A redefined primary key, paused in the pass.
         (
             "C5",
             "alter table public.{t} drop constraint {t}_pkey, add primary key (id, g)",
@@ -629,7 +630,7 @@ fn real_change_cases() -> Vec<Case> {
         // The documented misses. PostgreSQL's 2026-11 minors version
         // attributes on every retype, so where a read column follows the
         // retyped one (`F2`, `Z1` to `Z3`) it reads as a same-type rewrite
-        // (R3b) and the table's readers rebuild; `F1`'s `x` is the last
+        // and the table's readers rebuild; `F1`'s `x` is the last
         // column, so it stays missed. A column added with a constant default
         // keeps it in its `pg_attribute` row until the table is rewritten,
         // and the rewrite clears it: a rewrite of the column then changed
@@ -686,7 +687,7 @@ async fn real_changes_rebuild_or_pause_part_3() {
     run_cases(part(&real_change_cases(), 2, 3)).await;
 }
 
-/// R3b end to end: the same-type rewrite rebuilds both readers, which
+/// The same-type rewrite end to end: it rebuilds both readers, which
 /// converge on the rewritten values with no write to the table.
 #[tokio::test]
 async fn a_same_type_rewrite_rebuilds_its_readers_to_the_new_values() {
@@ -740,9 +741,10 @@ async fn a_same_type_rewrite_rebuilds_its_readers_to_the_new_values() {
     assert_eq!(auto_rebuilds("public.w", "value_rewrite"), 1);
 }
 
-/// An identity or type change, by the validity rule, on readers with no typed copy of the column: a
-/// change define still accepts rebuilds (a `SUM` argument's scale, a column
-/// dropped and re-added as the same type); one it refuses, or one that
+/// An identity or type change, by the validity rule, on readers with no
+/// typed copy of the column: a change define still accepts rebuilds (a `SUM`
+/// argument's scale, a column dropped and re-added as the same type); one it
+/// refuses, or one that
 /// changes the type a definition evaluates the column as, pauses with a
 /// `capture_failure` naming the column and the change.
 #[tokio::test]
@@ -857,7 +859,7 @@ async fn bring_live_except(raw: &mut Client, pool: &trellis::pool::Pool, paused:
     panic!("not every definition went live: {:?}", statuses(raw).await);
 }
 
-/// R3b on a partitioned source: the root has no storage, so the baseline is
+/// A same-type rewrite on a partitioned source: the root has no storage, so the baseline is
 /// kept per leaf, and a `USING` on the root, which rewrites every leaf,
 /// rebuilds the readers. A leaf attached later is recorded by the install
 /// that covers it, and rebuilds nothing.

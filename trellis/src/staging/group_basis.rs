@@ -171,8 +171,9 @@
 //! 3. A caller may do its own work here, holding the groups' locks: a
 //!    `JOIN` (`super::join`) calls the steps itself, on its `P`, `M` and
 //!    `T` ([`Writer`]), with its `J` locks between them.
-//! 4. **Apply** ([`apply_locked_groups`], R2, F2): one later statement, so
-//!    under `READ COMMITTED` its snapshot sees every committed basis. It
+//! 4. **Apply** ([`apply_locked_groups`], R2; sides are never folded per
+//!    key): one later statement, so under `READ COMMITTED` its snapshot
+//!    sees every committed basis. It
 //!    sums the staged sides per (group, `row_txid`), keeps a sum only when
 //!    its transaction isn't visible in the group's basis (a `NULL` basis
 //!    sees nothing) and its `lsn` is above the target's truncate floor, adds
