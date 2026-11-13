@@ -206,8 +206,11 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trell
 /// is `text`), a wider timestamp precision or numeric precision and scale
 /// on a `GROUP BY` key (its copy is the type's full precision, or
 /// unconstrained `numeric`), any change to a column no definition keys by,
-/// and a change between deterministic collations. Every definition stays
-/// live and keeps converging.
+/// and a change between deterministic collations. No definition pauses,
+/// and every one keeps converging. The `id` widening rewrites the table, and
+/// PostgreSQL's 2026-11 minors re-version the columns after `id`, which the
+/// definitions read, so they read as a same-type rewrite and rebuild
+/// (`support/attver.rs`).
 #[tokio::test]
 async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
     let cluster = TestCluster::start();
@@ -233,21 +236,48 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
     let targets = ["per_kind", "per_at", "per_price"];
     bring_live(&mut raw, &db.pool, &targets).await;
 
-    for alter in [
-        "alter table public.events alter column id type bigint",
-        "alter table public.events alter column kind type varchar(40)",
-        "alter table public.events alter column kind type text",
-        "alter table public.events alter column at type timestamp(6)",
-        "alter table public.events alter column price type numeric(12,3)",
-        "alter table public.events alter column note type varchar(5)",
-        "alter table public.events alter column note type integer using 0",
-        "alter table public.events alter column kind type text collate \"C\"",
+    let attver = attver::Attver::probe(&raw).await;
+    for (alter, then) in [
+        (
+            "alter table public.events alter column id type bigint",
+            TransformStatus::Backfilling,
+        ),
+        (
+            "alter table public.events alter column kind type varchar(40)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column kind type text",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column at type timestamp(6)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column price type numeric(12,3)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column note type varchar(5)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column note type integer using 0",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column kind type text collate \"C\"",
+            TransformStatus::Live,
+        ),
     ] {
         raw.batch_execute(alter).await.expect(alter);
+        attver.after(&raw, alter).await;
         capture_pass(&mut raw, &db.pool).await;
         for target in targets {
-            assert_eq!(status(&raw, target).await, TransformStatus::Live, "{alter}");
+            assert_eq!(status(&raw, target).await, then, "{alter}");
         }
+        bring_live(&mut raw, &db.pool, &targets).await;
     }
 
     raw.batch_execute(

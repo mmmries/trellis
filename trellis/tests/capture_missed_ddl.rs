@@ -159,7 +159,8 @@ async fn run_cases(cases: &[Case]) {
             (TransformStatus::Paused, TransformStatus::Paused) if rebuilds == 0 => {
                 Some(Expect::PausedBoth)
             }
-            (r, s) => Some(Expect::Statuses(r, s)),
+            (r, s) if rebuilds > 0 => Some(Expect::Statuses(r, s)),
+            _ => None,
         };
         if got != Some(*expect) {
             failures.push(format!(
@@ -625,11 +626,11 @@ fn real_change_cases() -> Vec<Case> {
              alter table public.{t} alter column b type int using b * 10; commit",
             Expect::Rebuilt("value_rewrite"),
         ),
-        // The documented misses, when no read column follows the retyped one
-        // (`C3` is the control). PostgreSQL's 2026-11 minors version
-        // attributes on every retype, so `F2` and `Z1` to `Z3`, whose retyped
-        // column a read column follows, are caught: the later column reads as
-        // a same-type rewrite (R3b), and the table's readers rebuild. A column added with a constant default
+        // The documented misses. PostgreSQL's 2026-11 minors version
+        // attributes on every retype, so where a read column follows the
+        // retyped one (`F2`, `Z1` to `Z3`) it reads as a same-type rewrite
+        // (R3b) and the table's readers rebuild; `F1`'s `x` is the last
+        // column, so it stays missed. A column added with a constant default
         // keeps it in its `pg_attribute` row until the table is rewritten,
         // and the rewrite clears it: a rewrite of the column then changed
         // its row. (Any rewrite clears it, `VACUUM FULL` included, which is
