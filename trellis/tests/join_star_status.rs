@@ -6,6 +6,9 @@
 //! runtime signal of a lookup table joined at any position (#1766's
 //! Decision). The two-table `JOIN` is the one-position case.
 //!
+//! The capture failure of a retyped `ON` column names that column alone, once
+//! (#1950).
+//!
 //! Every test drives the pipeline by hand through `support/drain_driver.rs`
 //! and never polls for convergence.
 
@@ -16,7 +19,7 @@ mod star;
 
 use drain_driver::Driver;
 use star::{Shape, Star};
-use trellis::config::Config;
+use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::{JoinStatus, Trellis, TrellisOptions};
 
 async fn join_status(d: &Driver, star: Star) -> JoinStatus {
@@ -114,5 +117,49 @@ async fn status_lists_every_positions_m() {
         expected.extend(["M2", "M3", "M4"].into_iter().take(shape.positions - 1));
         expected.push("J");
         assert_eq!(names, expected, "{shape:?}");
+    }
+}
+
+/// An `ON` column retyped on one side pauses the star naming only the
+/// retyped column of that table (at a star `a` has an `ON` column per
+/// position, and the other positions' did not change), and the reason names
+/// the pair once.
+#[tokio::test]
+async fn a_retyped_on_column_is_named_alone_and_its_reason_said_once() {
+    for shape in [Shape::TWO, Shape::new(2, 1), Shape::new(2, 2)] {
+        for (table, column) in [("public.a", shape.k()), (shape.b().as_str(), "k".into())] {
+            let star = shape.stars()[0];
+            let mut d = star::start(&[star], A_ROWS, B_ROWS).await;
+            star::write(
+                &d,
+                &format!("alter table {table} alter column {column} type bigint"),
+            )
+            .await;
+            let pool = d.pool().clone();
+            trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+                .await
+                .expect("reconcile pass");
+            let failure = Trellis::connect(
+                Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+                TrellisOptions::default(),
+            )
+            .await
+            .expect("connect a Trellis")
+            .status(&star.name())
+            .await
+            .expect("status")
+            .expect("the definition exists")
+            .capture_failure
+            .expect("the retype pauses the star");
+            let name = format!("{shape:?} {table}.{column}");
+            assert_eq!(failure.source_table, table, "{name}: {}", failure.error);
+            assert_eq!(failure.columns, [column], "{name}: {}", failure.error);
+            assert_eq!(
+                failure.error.matches("don't match").count(),
+                1,
+                "{name}: {}",
+                failure.error
+            );
+        }
     }
 }
