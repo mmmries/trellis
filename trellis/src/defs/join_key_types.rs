@@ -42,7 +42,7 @@ pub enum JoinKey {
     /// Admitting it is safe on the same "text-stability is a property of the
     /// rendering" grounds every listed type is admitted under: `enumout`
     /// (what `<col>::text` calls — verified live against `pg_cast`,
-    /// `trellis/tests/defs_enum.rs`) renders each value as its own label text
+    /// `trellis/tests/defs/defs_enum.rs`) renders each value as its own label text
     /// verbatim, with no separator, no escaping, and no GUC dependence. An
     /// enum value's identity *is* its label text (a `pg_enum` row keyed by
     /// OID, `enumlabel` the payload), so there is no deeper representation
@@ -265,7 +265,7 @@ const TEXT_STABLE_JOIN_KEY_TYPES: &[KeyTypeSpec] = &[
     // native-array-cast pattern to the remaining scalar lookup sites (or
     // a typed key index, which would subsume it) is what would let
     // `boolean` join this list; until then it stays off. See
-    // `trellis/tests/defs_boolean.rs` for the live evidence and
+    // `trellis/tests/defs/defs_boolean.rs` for the live evidence and
     // `docs/type-support.md`'s "Boolean semantics" section.
     //
     // `bit` and `bit varying` join this list on the *original*

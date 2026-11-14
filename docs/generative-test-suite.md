@@ -368,7 +368,7 @@ beside them run on every `cargo test`.
   `TRANSFORM` reading another's target) only in the two-instance property and
   the chained-reader tier, whose readers are `JOIN`s; front-door coverage of
   an aggregate chained off a target lives in
-  `trellis/tests/defs_aggregate_chained_single_column_group_key.rs`.
+  `trellis/tests/defs/defs_aggregate_chained_single_column_group_key.rs`.
 - **`MIN`/`MAX` convergence** (#1117; the concurrent tier's `min_max` shape,
   `generate::min_max`). One table with nullable group columns `g1` and
   `g2` and an argument of each type the engine keeps an extreme of
@@ -510,7 +510,7 @@ beside them run on every `cargo test`.
   `ONE_TO_ONE_KNOWN_MISSES`). The tier's keys never hold the 10k rows a pending
   fan-out needs, so the marker exemption is never exercised here; the
   checker's unit tests cover it, and
-  `trellis/tests/join_one_to_one_fan_out.rs` reads the snapshot under a
+  `trellis/tests/join_one_to_one/join_one_to_one_fan_out.rs` reads the snapshot under a
   pending fan-out, chunk by chunk, to show that its rows are exact up to the
   cursor and stale past it.
   `GENERATIVE_JOIN1_INVARIANT=off` turns the invariant off; a number sets the

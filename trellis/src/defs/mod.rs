@@ -102,7 +102,7 @@ pub use ddl::{
 #[cfg(any(test, feature = "internals"))]
 pub use oracle::{render_aggregate_select_sql, render_expr_sql, render_one_to_one_select_sql};
 
-// Reached only by this crate's own `tests/*.rs`, through the `internals`
+// Reached only by this crate's own `tests/` targets, through the `internals`
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
 #[cfg(any(test, feature = "internals"))]
 pub use ast::{

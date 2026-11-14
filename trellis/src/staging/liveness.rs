@@ -329,7 +329,7 @@ type Registry = Arc<AsyncMutex<HashSet<(i64, String)>>>;
 pub struct HeartbeatDaemon {
     registry: Registry,
     // Read only by `connections_opened`/`is_connected`, which exist for
-    // `tests/liveness.rs`'s lazy-connect and idle-exit assertions. The
+    // `tests/client_app/liveness.rs`'s lazy-connect and idle-exit assertions. The
     // spawned task keeps its own `Arc` clones, so a build without the
     // `internals` feature simply doesn't carry these handles.
     #[cfg(any(test, feature = "internals"))]

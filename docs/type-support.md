@@ -147,7 +147,7 @@ function (as its own `SET` clauses), pins `DateStyle = 'ISO, YMD'`,
 `xmloption = 'content'` (`pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`). A capture
 image therefore does not depend on the writing session's settings, and a value
 captured and the same value read back are rendered alike
-(`trellis/tests/capture_parity.rs` pins one column of each family against a
+(`trellis/tests/capture/capture_parity.rs` pins one column of each family against a
 golden fixture).
 
 **One renderer.** A capture image renders a column with `format('%s', col)`,
@@ -209,7 +209,7 @@ and raises `22003` past range; `int4 + numeric` promotes to unbounded
 is `numeric`. `oid` is an
 unsigned 32-bit integer with no arithmetic; its `oid_out` is canonical
 decimal, so it is text-stable and a full key. Cross-checked against a live
-server in `trellis/tests/defs_exact_integers.rs`.
+server in `trellis/tests/defs/defs_exact_integers.rs`.
 
 ## Numeric and floating point
 
@@ -243,8 +243,8 @@ finite values' sum, a count of values per display scale, and counts of
 values at the column's declared scale, so a `numeric(p,s)` column's map
 stays empty while its values are finite
 ([ADR-0002](decisions/0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)).
-Checked in `trellis/tests/group_basis_numeric_scales.rs` and
-`trellis/tests/group_basis_numeric_nan.rs`.
+Checked in `trellis/tests/group_basis/group_basis_numeric_scales.rs` and
+`trellis/tests/group_basis/group_basis_numeric_nan.rs`.
 
 `real` and `double precision` are `ValueType::Float` (`trellis/src/float.rs`).
 Postgres, not IEEE 754, is the oracle: `NaN = NaN` is true, `NaN` sorts above
@@ -267,7 +267,7 @@ at define ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
 float addition is not associative, and `NaN`/`Infinity` are absorbing, so
 there is no exact inverse. `extra_float_digits >= 1` is pinned for the
 shortest-round-trip rendering `trellis::float::render` reproduces. Checked in
-`trellis/tests/defs_floats.rs`.
+`trellis/tests/defs/defs_floats.rs`.
 
 ## Arithmetic
 
@@ -299,8 +299,8 @@ Postgres would truncate, round differently by type or cast behind the user's
 back (`integer / integer`, an integer or float argument to `ROUND`, `%` on a
 float), define refuses the expression with a remedy
 ([expressions](expressions.md#refusals)).
-Checked in `trellis/tests/arithmetic_key_spaces.rs` and
-`trellis/tests/one_to_one_render.rs`.
+Checked in `trellis/tests/expressions/arithmetic_key_spaces.rs` and
+`trellis/tests/one_to_one/one_to_one_render.rs`.
 
 ## Comparison and logic
 
@@ -352,8 +352,8 @@ would read the inlined text (`NULL AS z, COALESCE(z, 1) AS n` makes `n` an
 `integer`). Where Postgres finds a `NULL` ambiguous, or types it by its
 function-candidate rules (a function or aggregate argument), define refuses it
 ([expressions](expressions.md#refusals)).
-Checked in `trellis/tests/logic_key_spaces.rs`, `trellis/tests/null_literal_key_spaces.rs`,
-`trellis/tests/one_to_one_render.rs` and the harness.
+Checked in `trellis/tests/expressions/logic_key_spaces.rs`, `trellis/tests/expressions/null_literal_key_spaces.rs`,
+`trellis/tests/one_to_one/one_to_one_render.rs` and the harness.
 
 ## Dates and times
 
@@ -390,8 +390,8 @@ under `timezone_abbreviations`, which every Trellis session pins to
 a `STABLE` overload that reads `TimeZone`, produce an `interval`, or read the
 time zone database, define refuses the expression with a remedy
 ([expressions](expressions.md#refusals)).
-Checked in `trellis/tests/date_key_spaces.rs`,
-`trellis/tests/one_to_one_render.rs` and the harness.
+Checked in `trellis/tests/expressions/date_key_spaces.rs`,
+`trellis/tests/one_to_one/one_to_one_render.rs` and the harness.
 
 ## Temporal types
 
@@ -417,14 +417,14 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
   `IntervalStyle`). The text must be in Postgres's canonical output spelling.
 
 `crate::temporal` classifies each family's text stability. Checked in
-`trellis/tests/defs_temporal.rs`.
+`trellis/tests/defs/defs_temporal.rs`.
 
 ## `bytea`
 
 `byteaout` under the pinned `bytea_output = 'hex'` is a bijection (`\x` plus
 lowercase hex), with no second renderer, so `bytea` is a key in every role. The typed
 literal must be canonical lowercase hex. Checked in
-`trellis/tests/defs_bytea.rs`.
+`trellis/tests/defs/defs_bytea.rs`.
 
 ## `boolean`
 
@@ -434,7 +434,7 @@ refused as join and primary key, admitted as a `GROUP BY` key.
 ([#1118](https://github.com/salesforce-misc/trellis/issues/1118)): the
 aggregate's current one-bit value cannot tell which of two different deletions
 happened (deleting the `false` of `{false, true, true}` makes `bool_and` true;
-deleting a `true` leaves it false). Checked in `trellis/tests/defs_boolean.rs`.
+deleting a `true` leaves it false). Checked in `trellis/tests/defs/defs_boolean.rs`.
 
 ## Network addresses
 
@@ -446,7 +446,7 @@ deleting a `true` leaves it false). Checked in `trellis/tests/defs_boolean.rs`.
   `network_show`'s always-explicit-prefix spelling. The IPv4-compatible IPv6
   form (`::192.168.1.1`) is rejected rather than risk mis-canonicalizing it.
 
-Checked in `trellis/tests/defs_netaddr.rs`.
+Checked in `trellis/tests/defs/defs_netaddr.rs`.
 
 ## Bit strings
 
@@ -459,7 +459,7 @@ and primary keys reuse the existing column's own concrete type, so both work.
 `bit_and`/`bit_or` are refused at define
 ([#1118](https://github.com/salesforce-misc/trellis/issues/1118)): deleting
 different rows from the same group yields different results from one starting
-value. Checked in `trellis/tests/defs_bit.rs`.
+value. Checked in `trellis/tests/defs/defs_bit.rs`.
 
 ## `jsonb`
 
@@ -471,7 +471,7 @@ canonical string escapes); it is rejected rather than normalized.
 
 `JSONB_AGG` is refused at define
 ([#1040](https://github.com/salesforce-misc/trellis/issues/1040)). `json` has
-no `=` and is never a key. Checked in `trellis/tests/defs_jsonb.rs`.
+no `=` and is never a key. Checked in `trellis/tests/defs/defs_jsonb.rs`.
 
 ## Enums
 

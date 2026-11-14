@@ -228,8 +228,8 @@ When an application `AFTER ROW` trigger, or a self-referencing cascade,
 rewrites a row its own statement wrote, the nested statement's capture runs
 first, so the outer statement's ring row has the higher `lsn`. The outer
 row's `new_image` is the live row, the final one, so a `GROUP BY` or 1-1
-target keeps the final values (`tests/capture_join.rs`,
-`tests/one_to_one_ledger_interleavings.rs`). Its `old_image` is the statement's OLD row;
+target keeps the final values (`tests/capture/capture_join.rs`,
+`tests/one_to_one/one_to_one_ledger_interleavings.rs`). Its `old_image` is the statement's OLD row;
 the fold keeps the earliest old image anyway. A nested write that re-keys a
 row is covered by the [known correctness gaps](../known-correctness-gaps.md).
 
@@ -257,7 +257,7 @@ transition rows wherever its images aren't them:
 A summing reader takes a row's sides from `transition_images` when it is set.
 A statement's rows then sum to `Σ f(NEW) − Σ f(OLD)` (a dropped no-op pair
 cancels), and a transaction's telescope. 1-1 readers ignore the column.
-`tests/capture_transition_images.rs` checks the sum, and each key's final
+`tests/capture/capture_transition_images.rs` checks the sum, and each key's final
 state, for every nested-write shape.
 
 ## When capture re-reads
@@ -281,7 +281,7 @@ keys by text and a type's `=` can be looser (`numeric` `1.0 = 1.00`). The
 probe is a `LATERAL … LIMIT 1` per row, and the function runs with
 `enable_seqscan` off: PL/pgSQL plans once per session, often against a table
 that was empty then, and a cached sequential scan would read the whole table
-for every captured row once it grows (`tests/capture_reread.rs`, at every
+for every captured row once it grows (`tests/capture/capture_reread.rs`, at every
 isolation level).
 
 Under `SERIALIZABLE` the re-read's index probe takes a predicate (SIREAD)
@@ -332,7 +332,7 @@ self-referencing `ON UPDATE CASCADE` can repeat a key among the new rows
 only, where pairing by key counts one old row twice. So an update capture
 also re-reads when a key occurs twice on either side, and the re-read pairs
 one to one.
-`tests/capture_ssi.rs` pins the gate, and `capture::sql`'s `function_body`
+`tests/capture/capture_ssi.rs` pins the gate, and `capture::sql`'s `function_body`
 has the argument.
 
 ## What it costs the writer

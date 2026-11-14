@@ -6124,7 +6124,7 @@ mod drainer_registration_tests {
 mod restore_gate_tests {
     //! A drain worker checks the logical-restore signal before its
     //! first claim, through [`app_worker_loop`] itself (the gate's own
-    //! answers are tested in `tests/logical_restore.rs`).
+    //! answers are tested in `tests/client_app/logical_restore.rs`).
 
     use super::log_capture::install_capture;
     use super::*;

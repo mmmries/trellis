@@ -1317,7 +1317,7 @@ mod tests {
 
     /// The client probes on the same schedule the server does, with the same
     /// user timeout. The server half
-    /// is checked against a live TCP session in `tests/tcp_keepalives.rs`;
+    /// is checked against a live TCP session in `tests/client_app/tcp_keepalives.rs`;
     /// `tokio_postgres` exposes no way to read the client's socket options
     /// back, so this checks the config instead.
     #[test]
@@ -1427,7 +1427,7 @@ mod tests {
 
     /// `connect_unpooled` opens its session with the pool's TLS settings
     /// (the pooled and dedicated sessions are covered in
-    /// `tests/tls_connect.rs`, which cannot reach this crate-private call).
+    /// `tests/client_app/tls_connect.rs`, which cannot reach this crate-private call).
     #[tokio::test]
     async fn an_unpooled_connection_is_encrypted_as_the_dsn_asks() {
         let cluster = testkit::TestCluster::start_with_tls();

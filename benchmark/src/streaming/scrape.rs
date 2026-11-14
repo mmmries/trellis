@@ -5,7 +5,7 @@
 //! [`trellis::metrics::LATENCY_BUCKETS`]' existing boundaries, so a
 //! cumulative-bucket-fraction read off a scrape answers them with no
 //! interpolation and no estimator. The `bucket_count`/`total_count` shape
-//! here mirrors the engine's own `tests/end_to_end_latency.rs` private
+//! here mirrors the engine's own `tests/staging/end_to_end_latency.rs` private
 //! helpers of the same name (this crate can't import those — they're private
 //! to another crate's test binary — so this is a deliberate small
 //! re-implementation, not a divergent one).

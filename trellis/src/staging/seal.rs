@@ -49,7 +49,7 @@ pub struct SealOutcome {
     pub sealed_seg_seq: i64,
     pub sealed_ring_slot: i16,
     /// Which ring slot the newly-active segment took. Read only by
-    /// `tests/sealing.rs`/`tests/retire.rs`, so it rides the `internals`
+    /// `tests/staging/sealing.rs`/`tests/staging/retire.rs`, so it rides the `internals`
     /// feature (ADR-0012) rather than sitting in production builds unread.
     #[cfg(any(test, feature = "internals"))]
     pub next_ring_slot: i16,

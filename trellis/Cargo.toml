@@ -129,7 +129,7 @@ otlp = [
 test-util = []
 # ADR-0012, and *not* its sanctioned exception. `defs`/`staging`/`intake` are
 # tier 3 — `pub(crate)`, named by no external crate. But this crate's own
-# `tests/*.rs` are separate compilation units, so `pub(crate)` is as invisible
+# `tests/` targets are separate compilation units, so `pub(crate)` is as invisible
 # to them as it is to `generative`, and they exercise the engine directly by
 # design (that is what an engine integration test *is*). This feature flips
 # those three modules back to `pub` for exactly that audience.
@@ -148,7 +148,7 @@ internals = ["test-util"]
 regex = "1.13"
 testkit = { path = "../testkit", features = ["engine-access"] }
 # Turns on `internals` (see above) for this crate's own test targets only —
-# `tests/*.rs` are separate compilation units and cannot otherwise see the
+# `tests/` targets are separate compilation units and cannot otherwise see the
 # tier-3 engine modules ADR-0012 made `pub(crate)`. Exactly the self
 # dev-dependency pattern `generative/Cargo.toml` uses for `proptest`/
 # `subprocess-backend`, and for the same reason: it keeps the feature out of
@@ -156,7 +156,7 @@ testkit = { path = "../testkit", features = ["engine-access"] }
 trellis = { path = ".", features = ["internals"] }
 # Dev-only: this crate's own tests capture spans/events emitted through
 # `tracing` to assert they fire with the right fields (see
-# `tests/tracing_instrumentation.rs`) — the same `tracing-subscriber`
+# `tests/staging/tracing_instrumentation.rs`) — the same `tracing-subscriber`
 # `Registry` + `Layer` combinator an embedder composes their own subscriber
 # from (`docs/observability.md`'s "Logs and traces" section), so these tests
 # exercise a realistic subscriber shape rather than a bespoke test-only

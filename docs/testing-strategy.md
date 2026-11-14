@@ -99,6 +99,14 @@ or reconcile pass, a seal, a settle), which the `Driver` is built on, and
 for raw connections and for the few waits a test can't step to, each with a
 hard deadline and a failure naming what it waited for.
 
+Each directory `trellis/tests/<family>/` is one test target: its `main.rs`
+declares the family's files as modules, and `support/` once, so the engine is
+linked into a dozen-odd binaries rather than one per file. Select one file's
+tests with `cargo test -p trellis --test <family> <module>::`. A file that
+installs process-global state (a global `tracing` subscriber) is its own
+target, `trellis/tests/<name>.rs`; so is a family whose assertions read a
+process-wide metric series by a name other tests write (`capture_metrics`).
+
 **This tier is the terminal home of every race bug found above it** — a
 generative finding is not fixed until it exists here (or in tier 3) as a
 deterministic pin that fails before the fix and passes after. A pin that is
@@ -106,13 +114,13 @@ easiest to state as a generated program stays in the `generative` crate with its
 operations written out (`generative/tests/pins`), in the same action vocabulary
 the generators draw from.
 
-**Opt-in third-party tier.** `trellis/tests/pg_partman.rs` drives pg_partman's
-partition maintenance (premake, `run_maintenance`, `partition_data_*`,
+**Opt-in third-party tier.** `trellis/tests/partition/pg_partman.rs` drives
+pg_partman's partition maintenance (premake, `run_maintenance`, `partition_data_*`,
 retention by detach and by drop, `undo_partition`, its background worker,
 concurrent writers) under real capture. Its tests are `#[ignore]`d because they
 need pg_partman built for the `postgres` on `PATH` (the file's header says how);
-`cargo test -p trellis --test pg_partman -- --ignored` runs them, one PG version
-per `ASDF_POSTGRES_VERSION`. `TestCluster::start_with_settings` starts the
+`cargo test -p trellis --test partition pg_partman:: -- --ignored` runs them, one
+PG version per `ASDF_POSTGRES_VERSION`. `TestCluster::start_with_settings` starts the
 cluster with the `shared_preload_libraries` the worker needs.
 
 ## 5. Generative tests
@@ -184,7 +192,7 @@ binaries, one at a time, with `cargo test --workspace --features benchmark/engin
 --no-fail-fast` narrowed to them, the flags `verify` uses.
 
 `.github/scripts/test-shards.py` assigns the binaries. It lists them from `cargo
-metadata`, so a new test file joins a shard with no edit, and balances them by the
+metadata`, so a new test target joins a shard with no edit, and balances them by the
 seconds in `.github/test-shards.txt`, one `unit seconds` line per binary. A binary the
 file does not list runs at the median weight and the run prints a warning. Correctness
 never rests on the weights: `lint` fails if any binary is in no shard or two, or if the

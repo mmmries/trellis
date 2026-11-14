@@ -50,7 +50,7 @@
 //! its interval.
 //!
 //! The model of a correct target is the one the seam-fed families use
-//! (`trellis/tests/join_one_to_one_over_targets.rs`): after each step the
+//! (`trellis/tests/join_one_to_one/join_one_to_one_over_targets.rs`): after each step the
 //! pipeline settles and every target equals its query over the tables, and
 //! `self_check` finds nothing. The families map to draw dimensions here:
 //! `LEFT` and `INNER` are drawn per definition; `a` on its primary key (`PkPk`)

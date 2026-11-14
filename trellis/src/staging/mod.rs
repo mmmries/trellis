@@ -211,7 +211,7 @@ pub use converge::{await_converged, has_pending, watermark_token};
 #[cfg(any(test, feature = "test-util"))]
 pub use seal::{seal_phase1, seal_phase2};
 
-// Reached only by this crate's own `tests/*.rs`, through the `internals`
+// Reached only by this crate's own `tests/` targets, through the `internals`
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.
 #[cfg(any(test, feature = "internals"))]
 pub use append::{

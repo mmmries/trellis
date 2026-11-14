@@ -81,7 +81,7 @@
 //!   in place, and the grain column, which the concurrent tier moves with
 //!   [`Mutate::MoveGroup`] (migrating a live row between groups by `Update`
 //!   is also exercised by hand in
-//!   `trellis/tests/group_basis_interleavings.rs`).
+//!   `trellis/tests/group_basis/group_basis_interleavings.rs`).
 //! - `KeySpace::Aggregate.group_by` is always exactly one column: the engine
 //!   grammar supports a composite group-by, but this generator does not draw
 //!   one.

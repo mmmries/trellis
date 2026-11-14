@@ -158,7 +158,7 @@ pub(crate) mod tls;
 // layered over reachable internals.
 //
 // `internals` (off by default, never on a production dependency edge) opens
-// them back up for this crate's *own* `tests/*.rs`, which are separate
+// them back up for this crate's *own* `tests/` targets, which are separate
 // compilation units and so cannot see `pub(crate)` — see `Cargo.toml`. It is
 // not the ADR's sanctioned exception, and it is not API; see `dev` below for
 // the sibling crates' curated, equally uncommitted surface.

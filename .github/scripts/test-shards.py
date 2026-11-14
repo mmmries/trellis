@@ -10,7 +10,7 @@ A *unit* is what one `cargo test` selector names:
   test:NAME    an integration-test binary (`--test NAME`)
   doc          the doc-tests (`--doc`, a separate cargo invocation)
 
-The unit list comes from `cargo metadata`, so a new test file is a new unit
+The unit list comes from `cargo metadata`, so a new test target is a new unit
 with no edit anywhere. Assignment is greedy longest-first over the per-unit
 seconds in .github/test-shards.txt; a unit the file does not list gets the
 median weight, so it still runs (and a warning annotation says to refresh the

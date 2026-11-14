@@ -2151,7 +2151,7 @@ async fn take_fuse_gate(txn: &Transaction<'_>, transform_id: i64) -> Result<(), 
 /// eviction read its candidates (see [`quarantine_if_crossed`]).
 ///
 /// `pub` rather than module-private only so the fuse-gate regression test
-/// (`tests/quarantine.rs`) can drive two genuinely overlapping eviction
+/// (`tests/staging/quarantine.rs`) can drive two genuinely overlapping eviction
 /// transactions through it directly: the race lives in the window between one
 /// transaction's `poison` insert and its commit, which two full
 /// `drain_once`/`isolate_and_evict` pipelines cannot be made to interleave

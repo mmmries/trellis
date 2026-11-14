@@ -924,8 +924,9 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
 /// writeup) was found and fixed entirely under the *single*-worker,
 /// burst-batching runtime (`ManualBackend::connect`/`connect_with_options`
 /// with `application_threads: 1`). That fix's own regression coverage
-/// (`client_lifecycle.rs`, `trellis/tests/sealing.rs`, `trellis/tests/converge.rs`)
-/// never drives it through this file's genuinely-concurrent, more-than-one-
+/// (`client_lifecycle.rs`, `trellis/tests/staging/sealing.rs`,
+/// `trellis/tests/client_app/converge.rs`) never drives it through this
+/// file's genuinely-concurrent, more-than-one-
 /// application-worker runtime at the same time as a restart/scale-out —
 /// i.e. nothing on this branch previously confirmed the fix holds when the
 /// *other* source of timing perturbation (real multi-worker draining)

@@ -328,7 +328,7 @@ impl TransformStatus {
 /// (ADR-0005); a **target** table is one a transform declares and creates. These aren't mutually exclusive on a
 /// table over its lifetime — a transform's target is a completely ordinary
 /// table a *later* transform can subscribe to as its source (chained/multi-hop
-/// transforms, exercised by `trellis/tests/apply.rs`'s two-hop propagation
+/// transforms, exercised by `trellis/tests/staging/apply.rs`'s two-hop propagation
 /// tests), so the same physical table ends up resolved under both roles.
 /// [`SchemaNode`] tracks that as two independent flags rather than one
 /// exclusive kind.
