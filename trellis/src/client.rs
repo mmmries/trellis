@@ -3065,10 +3065,10 @@ async fn handover_pass(
 /// a refusal of its own: another role has to run the migrations.
 fn cannot_migrate_reason(err: &crate::error::Error) -> String {
     if crate::error::permission_denied(err) {
-        // The refinery error alone: `Error::Migrate`'s own message already
-        // names the remedy.
+        // Without the remedy `Error::Migrate`'s own message appends: this
+        // one names it already.
         let detail = match err {
-            crate::error::Error::Migrate(inner) => inner.to_string(),
+            crate::error::Error::Migrate(inner) => format!("failed to apply migrations: {inner}"),
             other => other.to_string(),
         };
         format!(

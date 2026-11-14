@@ -625,6 +625,12 @@ async fn a_role_that_cannot_migrate_stands_by_and_says_so() {
         .as_deref()
         .expect("its pass tried and says why");
     assert!(reason.contains("this role cannot run them"), "{reason}");
+    // The refused migrate's own error, without its remedy a second time.
+    assert!(
+        reason.contains("(failed to apply migrations: `error asserting migrations table`"),
+        "{reason}"
+    );
+    assert!(!reason.contains("cannot create or alter"), "{reason}");
 
     let pool = trellis::pool::Pool::new(&as_role).expect("pool");
     let pass = handover_pass_as(&pool, &as_role, "probe")
