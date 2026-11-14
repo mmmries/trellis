@@ -13,7 +13,7 @@ Start with the reader you are. Terms are in the [glossary](glossary.md).
 
 * [Embedding](embedding.md): running it in-process from Rust, Ruby or Elixir, and polling to `live`.
 * [Instance identity](instance-identity.md): the schema an instance owns.
-* [Upgrading](upgrading.md) and [releasing](releasing.md): upgrade and roll back; what each release ships.
+* [Upgrading](upgrading.md): upgrade and roll back.
 
 ## I operate it
 
@@ -29,3 +29,4 @@ Start with the reader you are. Terms are in the [glossary](glossary.md).
 * [Data flow](data-flow.md): how a change travels, logically; [staging and claiming](staging-and-claiming/README.md) is the machinery, stage by stage.
 * [Decisions](decisions/): the ADRs, which every change must agree with.
 * [Testing strategy](testing-strategy.md) and the [generative test suite](generative-test-suite.md): how correctness is proven.
+* [Releasing](releasing.md): how a release is cut and what it ships.

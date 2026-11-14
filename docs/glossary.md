@@ -7,8 +7,8 @@ ADR; the [module map](architecture.md) says where each module sits.
 
 ## Fences
 
-Each fence is an ordering device with an adjective, and none is called "the
-fence" outside stage 03.
+Each fence is an ordering device. A doc that says just "the fence" means the
+one its stage owns: the seal fence in stage 03, the install fence in stage 01.
 
 | Term | Means | Owner |
 |---|---|---|
@@ -20,7 +20,7 @@ fence" outside stage 03.
 | **call fence** | The first lock of a state-changing call's write transaction, which refuses it if another version is live or the catalog floor is above this release. | [ADR-0023](decisions/0023-version-handover.md#the-rules), `locks::fence_call_txn` |
 | **seal gate** | The seal's guard that no writer of the previous batch is still in flight; it is backpressure, not a fence. | [03](staging-and-claiming/03-sealing-and-the-fence.md#the-two-guards--both-are-backpressure-never-overwrite), `staging::seal` |
 | **capture gate** | A table's WAL position, recorded by an install or widen, at or below which changes may lack a column; it holds a build until none is pending. | [01](staging-and-claiming/01-capture-by-triggers.md#which-definitions-may-start-a-build), `capture::gate` |
-| **chunk gate** | A rejected design for a chunked aggregate build; a chunk starts only while `chunk_allowed` holds. | [ADR-0002](decisions/0002-async-data-flow.md#rejected-alternatives), `staging::build` |
+| **chunk gate** | A rejected design: a lock in every page path that a chunked aggregate build would have needed. A 1-1 build chunk's backlog bound is `chunk_allowed`, not a gate. | [ADR-0002](decisions/0002-async-data-flow.md#rejected-alternatives), `staging::build` |
 
 ## Stops and waits
 
@@ -34,7 +34,7 @@ fence" outside stage 03.
 | **halted** | Paused by a halting failure, one no key can be blamed for (`capture_failure.kind = halt`). | [observability](observability.md#a-halting-failure), `staging::halt` |
 | **disruption** | Capture changed outside Trellis, a captured table gone, or a logical restore (`capture_failure.kind = disruption`); a pause. | [capture drift](staging-and-claiming/capture-drift.md#capture-changed-outside-trellis), `capture::triggers` |
 | **drain holdup** | A page the drain keeps failing on while charging no key and pausing nothing (`drain_failure`). | [status](status-reference.md#drain_failure), `staging::holdup` |
-| **capture holdup** | A table whose capture install is held up, by a lock (`capture_wait`) or a failure (`capture_failure`). | [status](status-reference.md#capture_wait), `capture::install` |
+| **capture holdup** | A table whose capture install is held up, by a lock (`capture_wait`) or a failure (`capture_failure`). | [status](status-reference.md#capture_wait), `capture::reconcile` |
 | **capture wait** | `capture_wait`: the install can't yet take its lock; cleared when the holder lets go. | [status](status-reference.md#capture_wait), `capture::install` |
 | **build wait** | `build_wait`: a build waiting on a [build fence](#fences) rather than on its own work. | [status](status-reference.md#build_wait), `staging::build` |
 | **`catching_up`** | Reported, never stored: a `live` definition reading an upstream that isn't `live`. | [status](status-reference.md#catching_up), `defs::model` |
@@ -49,10 +49,10 @@ fence" outside stage 03.
 | **Re-derive** | The 1-1 operation that re-reads one key's source row under its entry lock and writes the target row and the entry's basis; a build is Re-derive over chunks. | [ADR-0002](decisions/0002-async-data-flow.md#the-1-1-ledger-one-target-owned-entry-per-source-row), `staging::one_to_one_ledger` |
 | **absolute write** | The group-side counterpart of Re-derive: replaces groups' partials, basis and stamp from one read of the source. | [group basis](staging-and-claiming/group-basis.md#absolute-writes), `staging::group_basis` |
 | **recompute** | Not a term of its own: Re-derive for a 1-1 key, an absolute write for a group; a staged `Recompute` change asks for one. | [ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas), `staging::append` |
-| **field build** | The chunks that rewrite just the fields an `ALTER TRANSFORM` or a column resume changed, leaving the entries alone. | [builds](staging-and-claiming/builds.md#a-1-1-build-re-derive-over-chunks), `staging::build::one_to_one` |
+| **field build** | The chunks that rewrite just the fields an `ALTER TRANSFORM` or a column resume changed, leaving the entries alone. | [builds](staging-and-claiming/builds.md#a-1-1-build-re-derive-over-chunks), `staging::build` |
 | **correction** | Re-deriving the groups of one node of a partitioned source after its tree changed; `status().correcting`. | [ADR-0017](decisions/0017-partitioned-sources.md#each-changed-node-is-corrected-in-the-pass-that-sees-it-with-no-full-rescan), `staging::partition_correction` |
 | **sweep** | Three things: a 1-1 rebuild's closing job over entries no chunk reached; the every-pass sweep of rows routing to no leaf; the generative suite's planted-bug sweep. | [builds](staging-and-claiming/builds.md#a-1-1-build-re-derive-over-chunks), `staging::build` |
-| **catch-up** | A retired word for rebuilding readers of a table that missed changes; no build skips changes now. | [data-flow](data-flow.md#capturing-a-tables-existing-rows), `intake::catch_up` |
+| **catch-up** | A retired design: applying what a build skipped once it finished. Every build applies from its start now; `intake::catch_up` keeps the name for rebuilding a table's readers. | [data-flow](data-flow.md#capturing-a-tables-existing-rows), `intake::catch_up` |
 | **reconcile pass** | One iteration of the staging worker's maintenance loop: it brings capture to the catalog, pauses readers of drift, and starts ready builds. | [01](staging-and-claiming/01-capture-by-triggers.md#which-definitions-may-start-a-build), `capture::reconcile` |
 
 ## Units of work
@@ -74,7 +74,7 @@ fence" outside stage 03.
 
 | Term | Means | Owner |
 |---|---|---|
-| **basis** | The `pg_snapshot` of the last write that set a key's entry or a group's partials; a change is applied only if its transaction isn't visible in it. | [05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#the-ledger), `defs::ledger` |
+| **basis** | The `pg_snapshot` of the last absolute write (a Re-derive or a group's absolute write) to a key's entry or a group; a change is applied only if its transaction isn't visible in it. | [05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#the-ledger), `defs::ledger` |
 | **stamp** | The newest segment a group's basis saw. | [ADR-0002](decisions/0002-async-data-flow.md#aggregates-a-basis-per-group-kept-by-deltas), `staging::group_basis` |
 | **xbasis**, **xstamp** | A group's own basis and stamp for its `MIN`/`MAX` extremes. | [group basis](staging-and-claiming/group-basis.md#where-a-groups-state-lives), `staging::group_basis` |
 | **floor** | Two things: the truncate floor (`ledger_truncate_floor`), at or below which a target ignores changes; and a compatibility floor, the oldest release that can read the catalog or a definition. | [ADR-0002](decisions/0002-async-data-flow.md#truncate-ddl-drop), [ADR-0024](decisions/0024-compatibility-floors-and-rollback.md#the-rules), `staging::ledger`, `defs::floor` |
@@ -90,7 +90,7 @@ fence" outside stage 03.
 | **`agg_<id>`** | An aggregate's hidden table of per-group partials, basis and stamp. | [group basis](staging-and-claiming/group-basis.md#where-a-groups-state-lives), `staging::group_basis` |
 | **`P`, `M`, `J`, `T`** | An aggregate `JOIN`'s partials of `a` by (group, key), of `b` by (key, group), the per-key lock, and the target's groups. | [ADR-0019](decisions/0019-join-transforms.md#each-side-is-aggregated-before-the-join-and-the-target-is-their-combination), `defs::join` |
 | **`R`, `M`, `J`** | A 1-1 `JOIN`'s copy of `a`, one copy per joined table, and the per-key lock. | [05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#a-1-1-joins-hidden-state), `defs::join_one_to_one` |
-| **`join1_fan_out`** | A 1-1 `JOIN`'s pending fan-out markers: a `b` change reaching more `a` rows than one chunk. | [05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#a-1-1-joins-hidden-state), `staging::join_one_to_one` |
+| **`join1_fan_out`** | Not hidden: the catalog table of 1-1 `JOIN` fan-out markers, one per `b` change reaching more `a` rows than one chunk, until its last chunk commits. | [05](staging-and-claiming/05-apply-and-exactly-once-deltas.md#a-1-1-joins-hidden-state), `staging::join_one_to_one` |
 
 ## Other terms
 
@@ -104,10 +104,10 @@ fence" outside stage 03.
 
 | Alias | Use |
 |---|---|
-| the fence, published fence, read-time fence, `seal_snapshot` | [seal fence](#fences) |
-| table fence, source fence, pause fence | [version fence](#fences): a pause bumps it |
+| the fence (stage 03), published fence, `seal_snapshot` | [seal fence](#fences) |
+| table fence, source fence | [version fence](#fences): a pause bumps it |
 | seam fence, per-build fence, a build's fence | [build fence](#fences) |
-| join fence, drop fence | [install fence](#fences): ADR-0002's names for the install's lock and the uninstall's |
+| join fence, drop fence, the fence (stage 01) | [install fence](#fences): ADR-0002's names for the install's lock and the uninstall's |
 | handover fence | [call fence](#fences) |
 | marker fence | Rejected ([ADR-0002](decisions/0002-async-data-flow.md#rejected-alternatives)) |
 | re-read | [rebuild](#builds) |
