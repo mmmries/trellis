@@ -891,6 +891,87 @@ async fn an_a_page_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
     assert_eq!(d.rows("select key from poison").await, ["(1)"]);
 }
 
+/// A page that parks a held key's change for one definition and writes a
+/// 1-1 `JOIN` target of a lower id takes both definitions' rows in id order,
+/// before its first target: a re-backfill of their table, which takes every
+/// reader's row `FOR UPDATE` in id order, queues behind the page instead of
+/// closing a cycle with it (#2019).
+#[tokio::test]
+async fn a_page_that_parks_and_writes_a_join_and_a_rebackfill_never_deadlock() {
+    let kind = Kind::Left;
+    let ddl = format!(
+        "{DDL}; insert into public.a values {A_ROWS}; insert into public.b values {B_ROWS}"
+    );
+    let mut d = Driver::start(
+        &ddl,
+        &[
+            ("id", int4()),
+            ("k", int4()),
+            ("x", int4()),
+            ("y", ValueType::Text),
+        ],
+        &[
+            &kind.definition(),
+            "TRANSFORM a_copy FROM public.a SELECT y AS y",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    let join_id = definition_id(&d, &kind.target()).await;
+    let copy_id = definition_id(&d, "public.a_copy").await;
+    assert!(join_id < copy_id, "the join's row comes first in id order");
+    // Key 1 is held for the copy alone, so the page parks its change there
+    // and applies it to the join.
+    d.ctl
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             values ($1, 'public.a', '1', 'test')",
+            &[&copy_id],
+        )
+        .await
+        .expect("hold key 1 for the copy");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn");
+    let handle = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect");
+    write(
+        &d,
+        "update public.a set y = 'p' where id = 1; update public.a set y = 'q' where id = 2",
+    )
+    .await;
+    let batch = d.seal().await;
+    // Frozen at the copy's entry lock: past the park, before the join.
+    let mut page = d
+        .drain_frozen(
+            batch,
+            "page",
+            &[(PausePoint::AfterEntryLock, "public.a_copy")],
+        )
+        .await;
+    let reached = page.reached(PausePoint::AfterEntryLock).await;
+    let backfill = tokio::spawn(async move {
+        let result = handle.request_backfill("public.a").await;
+        handle.shutdown().await.expect("shutdown");
+        result
+    });
+    d.wait_blocked_behind(reached.backend_pid).await;
+    d.release(&mut page, PausePoint::AfterEntryLock).await;
+    let page_result = page.finish_result().await;
+    let backfill_result = backfill.await.expect("the backfill task");
+    let deadlocks = d.deadlocks_logged();
+    assert!(
+        deadlocks.is_empty(),
+        "page {:?}, backfill {backfill_result:?}: {deadlocks:?}",
+        page_result.as_ref().map(|_| ())
+    );
+    page_result.expect("the page");
+    backfill_result.expect("the backfill");
+    assert_eq!(
+        d.rows("select transform_id, key from poison_held").await,
+        [format!("({copy_id},1)")]
+    );
+}
+
 /// A pause of a 1-1 `JOIN`'s column bumps both tables' version fences, as
 /// the pages of either side write its fields: a `b` page that planned the
 /// column as live and holds `b`'s fence makes the pause wait for its commit,
