@@ -4,3 +4,4 @@
 # strategy changes shape, so seeds stay local. Transcribe a failure
 # into a hand-built pin instead (generative/README.md).
 *.proptest-regressions
+__pycache__/

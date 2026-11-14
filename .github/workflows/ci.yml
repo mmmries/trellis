@@ -66,6 +66,11 @@ jobs:
         # see .github/scripts/check-rule-ids.py.
         run: python3 .github/scripts/check-rule-ids.py
 
+      - name: Check doc links and anchors
+        # Relative Markdown links, their #fragments, and `docs/....md#anchor`
+        # references in source; see .github/scripts/check-doc-links.py.
+        run: python3 .github/scripts/check-doc-links.py
+
       - name: Check the compatibility-floor declarations
         # Each migration's catalog-floor header against its SQL and the
         # release being developed (defs::floor::DEVELOPING), which on main
