@@ -358,16 +358,48 @@ aggregate targets: it stages each change's cells before any lock, then takes
 the pair's lock row, the join keys `J`, the partial cells `P` and `M` and the
 visible groups `T`, each in one sorted statement, and moves each cell by the
 changes its basis hasn't counted, as a group does. A 1-1 `JOIN` target
-(`staging::join_one_to_one`, ADR-0021) applies last. Before any 1-1 `JOIN`
-lock row, the page takes, in id order, the definition row of each one that
-may hold a `FROM` row in quarantine or whose joined table it truncates, as a
-rebuild's start does. Then, per target: the pair's lock row, the join keys,
-then the entries of the `FROM` side and of the joined side, each
-on the 1-1 ledger's ordering state and each in one sorted statement; then it
-rewrites the target row of each changed `FROM` row, and of the other rows on a
-joined key the page changed.
+(`staging::join_one_to_one`, ADR-0021) applies last, in the lock order of
+[its hidden state](#a-1-1-joins-hidden-state); it rewrites the target row of
+each changed `FROM` row, and of the other rows on a joined key the page
+changed.
 Both are built by their plan job's one absolute write
 ([builds](builds.md#an-aggregates-or-a-joins-build)).
+
+### A 1-1 `JOIN`'s hidden state
+
+A 1-1 `JOIN` ([transforms](../transforms.md#1-1-join),
+[ADR-0021](../decisions/0021-one-to-one-join-transforms.md#each-table-keeps-a-trellis-owned-copy-ordered-by-adr-0002s-1-1-ledger))
+never reads a source table while it writes: each page reads Trellis-owned
+copies of its tables, kept in the catalog schema and named by the transform's
+id. Besides the entries `R`, the per-position `M` and the lock table `J` the
+ADR lays out, it keeps **pending fan-out markers** (`join1_fan_out`), one per
+position and key whose change reaches more `a` rows than one chunk, until the
+last chunk commits.
+
+Every transaction that touches a target row first holds that row's `R`
+entry, so the entry orders every pair of writers of the row whatever
+positions they write. An `a` change locks `J` at every position for its old
+and new keys; a change of the table at position `i` locks `J` at position `i`
+only, then the `R` entries of every row on its keys there, in one statement
+over every position the page touches, before it reads any `M`. A page takes
+its locks in one global order over the union of its keys:
+
+1. the definition rows, in id order: `FOR UPDATE` for a target whose joined
+   table the page truncates, and `FOR KEY SHARE` for one whose page may hold
+   a row in quarantine, so a page queues behind a rebuild's start, which takes
+   them in the same order;
+2. the truncate lock row: `FOR UPDATE` in a page that truncates a table,
+   `FOR SHARE` in any other, which orders a `TRUNCATE a` against the pages in
+   flight;
+3. `J`, in one statement sorted by `(position, key)`;
+4. the `R` entries, in one statement sorted by entry key;
+5. the `M` entries, sorted by `(position, id)`;
+6. the target rows.
+
+Placeholder inserts follow the same order, so no two transactions take two
+rows of `J`, `R` or `M` in opposite orders. Why each rule is needed at every
+position, and the model that checked them, is ADR-0021's
+[lock rules](../decisions/0021-one-to-one-join-transforms.md#no-writer-reads-another-tables-source-only-its-copy-under-j-and-the-rows-r-entry).
 
 ## The delta model
 

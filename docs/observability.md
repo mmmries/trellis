@@ -104,7 +104,7 @@ below, and the histograms above, also carries the `trellis_instance` label
   table's readers that the staging worker's capture pass started on its own,
   pausing nobody, because they missed changes no capture trigger saw while
   their definitions stayed valid
-  ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+  ([capture drift](staging-and-claiming/capture-drift.md#a-column-changed-or-rewritten-without-a-trigger)).
   `cause` is `value_rewrite` (a read column's values rewritten in place by an
   `ALTER COLUMN … TYPE` to the same type with a `USING`), `column_changed`
   (a read column dropped and re-added, or retyped other than by a pure

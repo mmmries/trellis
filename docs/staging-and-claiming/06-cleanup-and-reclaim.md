@@ -250,7 +250,7 @@ them:
   label. Nothing applies a drained row again, but a group-basis or `JOIN`
   rebuild names groups from the old images of every row left in a slot, and
   would fail to cast the old label
-  ([capture by triggers — An enum value relabelled](01-capture-by-triggers.md#an-enum-value-relabelled)).
+  ([capture drift — An enum value relabelled](capture-drift.md#an-enum-value-relabelled)).
 
 ## Failure matrix
 

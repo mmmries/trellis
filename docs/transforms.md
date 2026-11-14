@@ -104,7 +104,7 @@ condition can't arise later. An `ALTER TRANSFORM` is checked as define is.
 The rule reads a column's type. When the staging worker's capture pass finds
 a column a definition reads retyped, or dropped and added again, it runs
 define's validation again
-([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
+([capture drift](staging-and-claiming/capture-drift.md#a-column-changed-or-rewritten-without-a-trigger)).
 A definition that still validates keeps running. Its [floor](#floors) is recorded again over the new types, and its target is
 rebuilt in place unless the change was a pure widening. A definition pauses
 when define would now refuse it, when it would evaluate the column as another
@@ -116,7 +116,7 @@ its readers too. A source key's collation changed to another deterministic
 one pauses nothing, though the rest of any build then scans the source, and
 `self_check` reads the source by scan rather than by index (it pages under the
 target key's collation). A read column renamed or dropped pauses its readers
-([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-renamed-or-dropped-column)).
+([capture drift](staging-and-claiming/capture-drift.md#a-renamed-or-dropped-column)).
 
 #### Shape
 
@@ -347,7 +347,7 @@ pauses nothing here, except a `varchar(n)` key's. `RESUME` re-types each copy
 under `ACCESS EXCLUSIVE` (a table rewrite for `integer` → `bigint`, which
 reads of the target wait for) and rebuilds; a `JOIN`'s and a 1-1 `JOIN`'s
 hidden tables are created again instead
-([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-re-typed-key-column-or-an-outgrown-copy)).
+([capture drift](staging-and-claiming/capture-drift.md#a-re-typed-key-column-or-an-outgrown-copy)).
 
 #### A table of more than 1,600 columns
 
@@ -701,7 +701,7 @@ SELECT
 ```
 
 Trellis keeps a copy of each table and a lock row per position and join key
-([data flow](data-flow.md#a-1-1-joins-hidden-state)); the joined tables need
+([the apply stage](staging-and-claiming/05-apply-and-exactly-once-deltas.md#a-1-1-joins-hidden-state)); the joined tables need
 no source index, and the target stays readable across a `RESUME`'s rebuild. A
 change of an `a` row rewrites its target row. A change of a joined row
 recomputes every `a` row on its join key, in chunks, and `status()` warns of a

@@ -92,8 +92,8 @@ while every rule holds.
 
 The staging worker's reconcile pass compares each captured table's catalog
 with what it recorded, and rebuilds or pauses the readers when a read column
-changed ([capture by triggers — What rebuilds, what pauses, and what's
-missed](staging-and-claiming/01-capture-by-triggers.md#what-rebuilds-what-pauses-and-whats-missed)).
+changed ([capture drift — What rebuilds, what pauses, and what's
+missed](staging-and-claiming/capture-drift.md#what-rebuilds-what-pauses-and-whats-missed)).
 These changes look like routine maintenance to it.
 
 ### A column's values rewritten in place by `ALTER COLUMN TYPE`
@@ -165,7 +165,7 @@ pause the readers for the rename before the change is applied, because:
 the text now names the new value. An aggregate, a `JOIN`, and a 1-1 beside
 either on the same table apply the new value instead of the renamed one, with
 no error. Without the re-add, the label fails to cast and the key is held
-([capture by triggers — An enum value relabelled](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)).
+([capture drift — An enum value relabelled](staging-and-claiming/capture-drift.md#an-enum-value-relabelled)).
 
 **Detected by:** `self_check`.
 
@@ -192,8 +192,8 @@ dropped again, or a virtual generated column (PostgreSQL 18) renamed onto it
 and back. A pass that runs while the other column has the name rebuilds the
 readers, as for a column dropped and added again, or, for a virtual column,
 pauses them
-([capture by triggers — What rebuilds, what pauses, and what's
-missed](staging-and-claiming/01-capture-by-triggers.md#what-rebuilds-what-pauses-and-whats-missed)).
+([capture drift — What rebuilds, what pauses, and what's
+missed](staging-and-claiming/capture-drift.md#what-rebuilds-what-pauses-and-whats-missed)).
 
 **What goes wrong:** the capture function finds the columns it images by
 name, so while the other column has the name it images that column's values
@@ -295,7 +295,7 @@ can write it.
 The reconcile pass pauses the readers of a table whose capture triggers or
 functions were changed outside Trellis, or that is gone from its name, as
 soon as it sees it
-([capture by triggers — Capture changed outside Trellis](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)).
+([capture drift — Capture changed outside Trellis](staging-and-claiming/capture-drift.md#capture-changed-outside-trellis)).
 A trigger disabled and enabled again by name is seen. These aren't:
 
 **When:**
@@ -546,7 +546,7 @@ fixes and what it costs:
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)),
   and a column renamed, dropped or retyped, a primary key redefined, or
   capture changed outside Trellis
-  ([capture by triggers — What rebuilds, what pauses, and what's missed](staging-and-claiming/01-capture-by-triggers.md#what-rebuilds-what-pauses-and-whats-missed)).
+  ([capture drift — What rebuilds, what pauses, and what's missed](staging-and-claiming/capture-drift.md#what-rebuilds-what-pauses-and-whats-missed)).
 * **Stops that need you** (a pause, a quarantine, held keys, a drain holdup,
   a failing build): Trellis reports them, and the target stops short instead
   of going wrong ([operations](operations.md)).

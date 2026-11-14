@@ -73,19 +73,14 @@ once. Mechanics:
 
 Registering a transform (`Trellis::apply` with a `TRANSFORM` statement)
 validates the definition, creates the target table and the tables Trellis
-keeps beside it,
-writes the catalog row as `waiting_to_backfill`, and returns. It reads no
-source rows and installs no triggers, so its latency doesn't depend on the
-table's size. The table and the catalog row commit in one transaction, so a
-registration that fails leaves neither behind and can be retried as is. If
-any relation already exists under the target's qualified name, registration
-is refused with an error naming it: Trellis adopts a table it didn't create
-only when the definition asks for it (`ADOPT EXISTING TABLE`) and the table
-is empty and shaped as define would create it, because `DROP` later drops the
-target table
-([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). Which sources and
-targets are accepted is
-[Supported sources and targets](transforms.md#supported-sources-and-targets).
+keeps beside it, writes the catalog row as `waiting_to_backfill`, and returns.
+It reads no source rows and installs no triggers, so its latency doesn't depend
+on the table's size. The table and the catalog row commit in one transaction,
+so a registration that fails leaves neither behind and can be retried as is.
+Which sources and targets are accepted, and when a name already in use is
+refused or adopted, is
+[Supported sources and targets](transforms.md#supported-sources-and-targets)
+and [a target whose name is taken](transforms.md#a-target-whose-name-is-taken).
 
 Everything after registration runs in the background, driven by the staging
 worker's maintenance loop and executed on drain threads. Only the staging
@@ -112,25 +107,13 @@ partition correction engine serves is corrected for that leaf alone
 ([ADR-0017](decisions/0017-partitioned-sources.md)); any other reader is
 re-read. Capture triggers disabled, dropped or recreated outside Trellis, and
 a database restored from a logical dump, pause the readers rather than re-read them
-([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#capture-changed-outside-trellis)). An explicit
-`Trellis::request_backfill` on a captured table asks for the same re-read. It
-takes the table's `schema.table` name, or a bare name when exactly one captured
-table carries it; a bare name two captured tables share is refused, naming both.
-Either one is repaired in the transaction that makes the call:
-
-- **An aggregate or a `JOIN`** reading the table is rebuilt in place
-  ([its build](staging-and-claiming/builds.md#an-aggregates-or-a-joins-build)). The transaction moves it
-  `live -> backfilling` and enqueues one job, which recomputes every group.
-- **A plain 1-1 transform** over the captured table
-  ([the Re-derive build](staging-and-claiming/builds.md#a-1-1-build-re-derive-over-chunks)) is rebuilt.
-  The transaction moves it
-  `live -> backfilling` and enqueues one plan job and one sweep job, two
-  rows per definition, so the call returns quickly whatever the table's size.
-  It keeps applying, the plan re-derives every row the table has, and the
-  sweep re-derives the entries the table no longer backs. The status is
-  `backfilling` when the call returns, so polling for `live` waits out the
-  rebuild. A second request while a rebuild runs enqueues another plan and
-  sweep.
+([capture drift](staging-and-claiming/capture-drift.md#capture-changed-outside-trellis)).
+[`request_backfill`](operations.md#request_backfill) asks for the same re-read,
+repaired in the transaction that makes the call: each reader moves
+`live -> backfilling` and keeps applying while its
+[build](staging-and-claiming/builds.md) rewrites the target in place, so
+polling for `live` waits out the rebuild
+([status reference](status-reference.md#backfilling)).
 
 ### What it asks of a deployment
 
@@ -195,52 +178,6 @@ How that delta is applied **exactly once** — never twice, never zero times —
 apply and mark-complete in a single transaction, is
 [stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md).
 
-### A 1-1 `JOIN`'s hidden state
-
-A 1-1 `JOIN` ([transforms](transforms.md#1-1-join),
-[ADR-0021](decisions/0021-one-to-one-join-transforms.md)) never reads a source
-table while it writes: each page reads Trellis-owned copies of its tables,
-kept in the catalog schema and named by the transform's id. A star of `a` and
-up to four joined tables, numbered by position from 1 in `JOIN` order, keeps:
-
-* **`R`**, one entry per `a` row: the 1-1 ledger's ordering state
-  ([ADR-0002](decisions/0002-async-data-flow.md)), the row's join key at every
-  position and the `a` columns the fields read, with one index per position on
-  that position's join key.
-* **An `M` per position** (`M`, then `M2` to `M4`), one entry per row of the
-  table joined there, keyed by its primary key and indexed on its join key.
-* **`J`**, one table of lock rows, one per `(position, join key)`, and the
-  transform's truncate lock row.
-* **Pending fan-out markers** (`join1_fan_out`), one per position and key whose
-  change reaches more `a` rows than one chunk, until the last chunk commits.
-
-The two-table `JOIN` is the one-position case: the same tables, one `M`.
-
-Every transaction that touches a target row first holds that row's `R`
-entry, so the entry orders every pair of writers of the row whatever
-positions they write. An `a` change locks `J` at every position for its old
-and new keys; a change of the table at position `i` locks `J` at position `i`
-only, then the `R` entries of every row on its keys there, in one statement
-over every position the page touches, before it reads any `M`. A page takes
-its locks in one global order over the union of its keys:
-
-1. the definition rows, in id order: `FOR UPDATE` for a target whose joined
-   table the page truncates, and `FOR KEY SHARE` for one whose page may hold
-   a row in quarantine, so a page queues behind a rebuild's start, which takes
-   them in the same order;
-2. the truncate lock row: `FOR UPDATE` in a page that truncates a table,
-   `FOR SHARE` in any other, which orders a `TRUNCATE a` against the pages in
-   flight;
-3. `J`, in one statement sorted by `(position, key)`;
-4. the `R` entries, in one statement sorted by entry key;
-5. the `M` entries, sorted by `(position, id)`;
-6. the target rows.
-
-Placeholder inserts follow the same order, so no two transactions take two
-rows of `J`, `R` or `M` in opposite orders. Why each rule is needed at every
-position, and the model that checked them, is ADR-0021's
-[lock rules](decisions/0021-one-to-one-join-transforms.md#no-writer-reads-another-tables-source-only-its-copy-under-j-and-the-rows-r-entry).
-
 ## Writing to calculated tables and chaining
 
 Computed results are written to the calculated tables. Those writes are
@@ -281,36 +218,12 @@ Derived tables are eventually consistent. Two ways to reason about staleness:
 After it, values are exact: `await_converged` is how a reader gets exact
 values.
 
-What inconsistent looks like depends on the size of the group an aggregate
-reads:
-
-* **Groups of many rows** (thousands or more) read as slightly behind or ahead
-  by the changes still in flight. A count doesn't go negative and a group
-  doesn't disappear.
-* **Small or hot groups** (a handful of rows, fast concurrent writers) can
-  briefly show values no source state could produce: a negative `COUNT(x)`,
-  `COUNT(x)` above `COUNT(*)`, an `AVG` far off, or a group missing for a
-  moment. A `JOIN` target
-  ([ADR-0019](decisions/0019-join-transforms.md)) can show the same.
-
-An aggregate or `JOIN` target holds a group's row only while the group's row
-count is above 0, so a group whose count falls to 0 or below, even for a
-moment, has no row.
-
-This is by design. Pages apply in parallel and commit out of order, and the
-deltas commute, so the converged state is exact while a state between two
-out-of-order pages can describe no real data
-([ADR-0002](decisions/0002-async-data-flow.md#readers-see-a-group-only-while-its-row-count-is-above-0)).
+What inconsistent looks like, and why a group holds a row only while its row
+count is above 0, is
+[ADR-0002](decisions/0002-async-data-flow.md#readers-see-a-group-only-while-its-row-count-is-above-0).
 
 The predicate behind `await` — the one that must never falsely report
 "converged" — is [stage 07](staging-and-claiming/07-convergence-and-await.md).
-
-A rebuild of a `live` transform (`Trellis::request_backfill`, a capture
-re-install, or an automatic rebuild) never empties its target: it rewrites
-the target's rows in place while changes keep applying, so a reader sees
-each row's previous value until the rebuild rewrites it. The transform reads
-`backfilling` until the rebuild is done
-([status reference](status-reference.md#backfilling)).
 
 ## Correctness
 
