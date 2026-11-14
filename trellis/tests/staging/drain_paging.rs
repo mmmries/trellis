@@ -9,8 +9,7 @@
 //! COUNT over the live source for the aggregate, the source's own rows for the
 //! 1-1 copy.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, numeric_columns};
 use std::collections::HashMap;

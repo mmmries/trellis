@@ -2,16 +2,16 @@
 //! reconcile pass, a seal, and a settle (seal and drain until nothing is
 //! pending). Every test that drives the pipeline itself calls these rather
 //! than a private copy, so a change to the seal or drain API is one edit
-//! here. [`crate::drain_driver::Driver`] is built on them.
+//! here. [`super::drain_driver::Driver`] is built on them.
 //!
 //! Nothing here waits for convergence. [`settle`] is a bounded number of
 //! explicit rounds, and [`seal`] waits only for the seal gate's or a full
 //! ring's backpressure to clear, with a hard deadline and a panic naming
 //! what held it.
 //!
-//! A test file declares it at its root, `#[path = "support/pipeline.rs"]
-//! mod pipeline;`. A support module built on it declares it inside itself
-//! (`#[path = "pipeline.rs"] mod pipeline;`), so its users need no edit.
+//! A family target reaches it as `crate::support::pipeline`; a single-file
+//! target declares it at its root, `#[path = "support/pipeline.rs"] mod
+//! pipeline;`.
 
 #![allow(dead_code)]
 
@@ -48,7 +48,7 @@ pub const CAPTURE_PASS_BUDGET: Duration = Duration::from_secs(2);
 pub use testkit::{connect_raw, connect_with};
 
 /// A plain connection with only the engine's schema first on the path, the
-/// session [`crate::drain_driver::Driver`]'s clients have always had.
+/// session [`super::drain_driver::Driver`]'s clients have always had.
 /// [`connect_raw`] also pins date and `bytea` output.
 pub async fn connect(dsn: &str) -> Client {
     connect_with(dsn, &format!("set search_path to {DEFAULT_SCHEMA}, public")).await

@@ -8,8 +8,7 @@
 //! recorded node oid moved (a restore into another cluster). Each pass and
 //! the correction engine are called by hand.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

@@ -12,8 +12,7 @@
 //! These tests drive both instances' catalogs directly and never wait for a
 //! live pipeline to converge.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::columns;
 use std::collections::HashMap;

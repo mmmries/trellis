@@ -37,8 +37,7 @@
 //! plain `count(distinct ...)`, plain `to_jsonb`, plain `::text` — never
 //! against the engine's own renderer. Harness conventions follow `defs_temporal.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, drain, seal};
 use trellis::staging::apply;

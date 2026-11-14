@@ -2,20 +2,19 @@
 //! (#1117 rule 4, #1679): a retraction that reaches a group's extreme
 //! re-reads it from the source, as one endpoint of an index on the
 //! `GROUP BY` columns then the argument. Define requires that index (and
-//! refuses `WITHOUT SOURCE INDEX`, `tests/source_index.rs`). When it is
+//! refuses `WITHOUT SOURCE INDEX`, `tests/source_keys/source_index.rs`). When it is
 //! dropped after define, or replaced by one that doesn't serve the probe
 //! (partial, invalid, other leading columns, another direction or
 //! collation), the same probe scans the group instead: the target stays
 //! exact, `status` warns (`extreme_index_gaps`), and nothing pauses within
-//! the probe index's grace (`tests/probe_index_grace.rs` covers what happens
+//! the probe index's grace (`tests/source_keys/probe_index_grace.rs` covers what happens
 //! after it). The warning clears, and the probe reads the endpoint again,
 //! once the index exists.
 //!
 //! Every test steps its pages by hand through `support/drain_driver.rs` and
 //! reads `status` and the probe's plan directly: nothing sleeps or polls.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;

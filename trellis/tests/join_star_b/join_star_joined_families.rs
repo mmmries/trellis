@@ -21,10 +21,8 @@
 //!   entries on a key, Re-derives repairing uncaptured changes, a Re-derive
 //!   of a row with no entry, a page predating the build.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use drain_driver::Driver;
 use star::{SHAPES, Shape, Star, Writer};

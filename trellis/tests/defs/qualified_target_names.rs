@@ -6,8 +6,7 @@
 //!
 //! No test runs a pipeline: each asserts what a lookup finds or refuses.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, definer};
 use std::time::Duration;

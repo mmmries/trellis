@@ -30,8 +30,7 @@
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::columns;
 

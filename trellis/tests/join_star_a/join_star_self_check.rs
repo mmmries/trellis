@@ -20,10 +20,8 @@
 //!   and fan-out markers filtered by position, and the two-table read
 //!   refuses a star.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use drain_driver::Driver;
 use star::{Kind, Shape, Star};

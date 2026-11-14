@@ -13,8 +13,7 @@
 //! [`FenceMissBackoff`]'s pure sequence is covered in-module
 //! (`trellis/src/staging/liveness.rs`'s `#[cfg(test)]`), not here.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::time::{Duration, Instant, SystemTime};
 use testkit::connect_raw;

@@ -8,8 +8,7 @@
 //! trigger pair that refuses two tables written in one transaction. Nothing
 //! polls for convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::sync::{Arc, LazyLock, Mutex};
 

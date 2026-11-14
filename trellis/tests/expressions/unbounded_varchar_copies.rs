@@ -12,10 +12,8 @@
 //! pass are stepped by hand (`support/drain_driver.rs`), and nothing polls for
 //! convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/varchar_columns.rs"]
-mod varchar_columns;
+use crate::support::drain_driver;
+use crate::support::varchar_columns;
 
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;

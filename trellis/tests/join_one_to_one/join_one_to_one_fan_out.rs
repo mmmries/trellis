@@ -29,8 +29,7 @@
 //! - the generative suite's hidden-state snapshot reads the marker, with the
 //!   key's rows exact up to its cursor and stale past it.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;

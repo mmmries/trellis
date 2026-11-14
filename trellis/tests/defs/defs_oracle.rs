@@ -6,8 +6,7 @@
 //! alias, a wrong cast) is caught here rather than hiding in a comparison
 //! that uses the renderer on both sides.
 
-#[path = "support/render_lab.rs"]
-mod render_lab;
+use crate::support::render_lab;
 
 use render_lab::{Lab, Outcome};
 use testkit::TestCluster;

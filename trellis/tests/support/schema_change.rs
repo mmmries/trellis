@@ -2,13 +2,10 @@
 //! (`join_star_schema_changes.rs`, `join_one_to_one_schema_changes.rs`): the
 //! staging worker's pass by hand, the resume statements, and the reads of a
 //! definition's status, capture failures and column types.
-//!
-//! A binary using this module also declares `support/drain_driver.rs` as
-//! `mod drain_driver` at its root.
 
 #![allow(dead_code)]
 
-use crate::drain_driver::Driver;
+use super::drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::TransformStatus;
 use trellis::{Trellis, TrellisError, TrellisOptions};

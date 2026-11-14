@@ -3,8 +3,7 @@
 //! capture triggers of every recorded node, naming a node whose triggers were
 //! disabled (ADR-0017, "Every node carries capture").
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

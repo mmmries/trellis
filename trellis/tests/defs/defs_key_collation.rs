@@ -7,8 +7,7 @@
 //!
 //! The `JOIN` key twin of this rule is pinned in `defs_join_define.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{columns, definer};
 

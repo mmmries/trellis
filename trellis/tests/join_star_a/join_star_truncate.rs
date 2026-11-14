@@ -20,12 +20,9 @@
 //! The model (#1459) has no segment barrier, rebuild or floor (#1464 Q7), so
 //! these pins are the only evidence for the truncate rules at n + 1 tables.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
-#[path = "support/star_cx.rs"]
-mod star_cx;
+use crate::support::drain_driver;
+use crate::support::star;
+use crate::support::star_cx;
 
 use drain_driver::Driver;
 use star::{Kind, SHAPES, Shape, Star};

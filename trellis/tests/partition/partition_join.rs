@@ -22,8 +22,7 @@
 //! `DEFAULT` operated on, X12-7c a `HASH` re-split, X12-7e writes into the
 //! node while it is corrected).
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

@@ -41,8 +41,7 @@
 //! - readers of a 1-1 `JOIN` target are queued after it and restore and
 //!   build like any chain (`readers_of_a_one_to_one_join_restore_after_it`)
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use std::process::Command;

@@ -34,8 +34,7 @@
 //! exercises the *other* branch of the fix: the downstream group's own extinction
 //! from the deleted row's decoded image, not just a partial `SUM` decrement.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{columns, connect_raw, settle};
 

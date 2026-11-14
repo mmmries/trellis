@@ -7,8 +7,7 @@
 //! `release_held_key.rs` does: a check constraint on its target refuses the
 //! doubled value until the test drops it.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, SystemTime};
 

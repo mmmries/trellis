@@ -3,8 +3,7 @@
 //! (build, apply, recompute, `self_check`, rebuild) reads the source's columns
 //! only where it names them, never through an alias of its own (#1456).
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 

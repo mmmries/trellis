@@ -55,8 +55,7 @@
 //!   zero `T` groups' against pages and a build.
 //! - 14, `T` in the page's own transaction: `family14_…`.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

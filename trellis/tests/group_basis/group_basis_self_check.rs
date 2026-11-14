@@ -10,8 +10,7 @@
 //! polls for convergence: a check either runs on a drained pipeline or
 //! meets a sealed page nobody drained.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 
@@ -1050,7 +1049,7 @@ async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_grou
 /// A composite group key's page is a range scan of an index that leads with
 /// the group columns in `GROUP BY` order, with or without trailing columns,
 /// read forward or, all descending with `NULL` first, backward.
-/// Define refuses any other order (`tests/source_index.rs`).
+/// Define refuses any other order (`tests/source_keys/source_index.rs`).
 #[tokio::test]
 async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
     let d = start_with(

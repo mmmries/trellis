@@ -36,8 +36,7 @@
 //!
 //! Harness conventions follow `defs_enum.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, drain, seal};
 

@@ -42,8 +42,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::ValueType;
 use trellis::defs::{install_definition, tables_to_capture};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect_with;
 

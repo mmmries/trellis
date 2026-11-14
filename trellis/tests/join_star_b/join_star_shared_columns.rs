@@ -10,10 +10,8 @@
 //! kept. Each case ends with the oracle: the target is the live multi-join,
 //! nothing is held, and `self_check` finds nothing.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;

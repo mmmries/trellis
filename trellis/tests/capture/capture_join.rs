@@ -25,8 +25,7 @@ use trellis::defs::TransformStatus;
 use trellis::locks::{USER_TABLE_DDL_LOCK_TIMEOUT, USER_TABLE_DDL_RETRY_INTERVAL};
 use trellis::{ClientOptions, Trellis};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{bring_live, capture_pass_within, connect, definer, reconcile_pass, status};
 use trellis::staging::build::settle_builds;

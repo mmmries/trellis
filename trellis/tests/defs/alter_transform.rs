@@ -51,8 +51,7 @@
 //!   `altering_an_expression_into_a_narrower_passthrough_is_refused`,
 //!   `a_retype_a_view_blocks_is_refused_and_rolls_back`)
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, definer, start_and_settle_builds};
 use std::collections::HashSet;

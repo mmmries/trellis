@@ -9,11 +9,9 @@
 //! own test conventions ("reach past the mechanism, insert directly" for
 //! whichever half of a scenario this module itself doesn't produce).
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
-#[path = "support/sql_recompute.rs"]
-mod sql_recompute;
+use crate::support::sql_recompute;
 
 use drain_driver::pipeline::{self, connect_raw, numeric_columns};
 use std::collections::HashMap;

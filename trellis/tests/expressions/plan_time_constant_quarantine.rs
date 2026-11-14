@@ -25,8 +25,7 @@
 //! Every step is driven by hand (`drain_driver`); nothing waits for
 //! convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::Driver;
 use trellis::defs::{TransformStatus, ValueType};

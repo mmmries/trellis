@@ -7,11 +7,9 @@
 //! back) spells the canonical names, and `decimal(p,s)` is refused like
 //! `numeric(p,s)`.
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use testkit::TestCluster;

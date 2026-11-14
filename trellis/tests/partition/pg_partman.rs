@@ -18,7 +18,7 @@
 //! done
 //!
 //! ASDF_POSTGRES_VERSION=17.11 \
-//!   cargo test -p trellis --test pg_partman -- --ignored --test-threads 3
+//!   cargo test -p trellis --test partition pg_partman:: -- --ignored --test-threads 3
 //! ```
 //!
 //! `ASDF_POSTGRES_VERSION=15.19` (and so on) picks the server. Each case
@@ -42,8 +42,7 @@ use tokio_postgres::Client;
 use trellis::Trellis;
 use trellis::defs::TransformStatus;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, definer, drain, reconcile_pass, seal};
 use trellis::staging::build::settle_builds;

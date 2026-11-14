@@ -592,8 +592,7 @@ async fn everything_a_user_may_add_to_any_target_adopts() {
     assert_eq!(kept, 6 + 1 + 1 + 2);
 }
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 /// A driver whose `public.nums` (keys 1 to 3, `x` equal to the key) is read
 /// by `t`, adopted from a table that carries `extra` beside the key.

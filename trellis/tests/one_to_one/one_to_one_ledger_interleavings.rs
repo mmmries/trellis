@@ -19,8 +19,7 @@
 //! (An aggregate's ordering state is the group basis's, pinned by
 //! `group_basis_interleavings.rs`.)
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::Driver;
 use tokio_postgres::types::PgLsn;

@@ -19,8 +19,7 @@
 //! across every `.await` point in these tests only because nothing here
 //! ever hops to a different OS thread mid-poll.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
@@ -403,7 +402,8 @@ async fn seed_orders_totals(db: &testkit::TestDatabase, client: &Client, target:
 /// The quarantine event: isolating and evicting a poisoned key
 /// (`quarantine::evict_key`, called from `isolate_and_evict`) emits a
 /// `WARN` event naming the key — mirroring
-/// `tests/quarantine.rs`'s `zero_threshold_disables_eviction_even_past_the_default_threshold`'s
+/// `tests/staging/quarantine.rs`'s
+/// `zero_threshold_disables_eviction_even_past_the_default_threshold`'s
 /// convention of calling `isolate_and_evict` directly with a hand-built
 /// `FoldedChange`, here with `threshold: 1` so the single failing key
 /// evicts on its first attempt.

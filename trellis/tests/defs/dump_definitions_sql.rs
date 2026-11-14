@@ -16,8 +16,7 @@
 //! - a schema name with `%` or `'` in it dumps
 //!   (`a_schema_name_with_percent_and_quote_dumps`)
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use std::process::Command;

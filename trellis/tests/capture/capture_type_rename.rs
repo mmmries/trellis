@@ -20,8 +20,7 @@ use tokio_postgres::Client;
 use trellis::Trellis;
 use trellis::defs::TransformStatus;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, settle, status};
 

@@ -30,8 +30,7 @@
 //! No test waits on convergence: changes are applied by sealing and draining
 //! until nothing is pending, and builds are stepped by hand to idle.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::Driver;
 use trellis::config::Config;

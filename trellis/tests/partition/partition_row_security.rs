@@ -32,8 +32,7 @@ use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{apply, seal};
 use trellis::{SelfCheckOutcome, Trellis};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect_with;
 

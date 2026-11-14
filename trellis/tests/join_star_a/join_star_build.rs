@@ -27,10 +27,8 @@
 //! - A producer (#1401): an aggregate's target at position 2, keyed by its
 //!   nullable `GROUP BY` column, whose group keyed `NULL` the `M` pass reads.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use std::collections::HashMap;
 

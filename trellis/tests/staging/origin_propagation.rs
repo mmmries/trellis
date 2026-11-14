@@ -7,8 +7,7 @@
 //! Driven by hand through the engine's own seal, fold and apply path, with no
 //! live capture: `orders -> hop_a -> hop_b -> hop_c`, all 1-1.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;

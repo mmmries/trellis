@@ -15,8 +15,7 @@
 //! written over the captured tables, so the upstreams are checked through
 //! it.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

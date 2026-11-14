@@ -22,13 +22,10 @@
 //! equals `b{p}`; the engine's test-only oracle
 //! (`one_to_one_join_diverging_keys`) is clean; and so is a walk of the
 //! engine's `self_check` ([`self_check`]), every part at every position.
-//!
-//! A binary using this module also declares `support/drain_driver.rs` as
-//! `mod drain_driver` at its root.
 
 #![allow(dead_code)]
 
-use crate::drain_driver::{self, Driver};
+use super::drain_driver::{self, Driver};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;

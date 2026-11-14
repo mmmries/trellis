@@ -35,8 +35,7 @@
 //! NULLS NOT DISTINCT` like `sku_totals`, so it holds the `NULL` group's row,
 //! and the resumed column is restored there too.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::columns;
 
@@ -109,7 +108,7 @@ async fn sku_totals_echo(client: &Client) -> HashMap<Option<String>, Option<Stri
 
 /// The exact repro: pausing (reached past the mechanism, the same
 /// "insert directly into `column_status`" convention
-/// `tests/column_quarantine.rs` uses throughout) and then resuming
+/// `tests/staging/column_quarantine.rs` uses throughout) and then resuming
 /// `sku_totals_echo.echo_total` re-derives the column over every current row
 /// of `sku_totals` (the source), the NULL-keyed group's included. It must
 /// not panic, and must restore the column on every row, the NULL-keyed

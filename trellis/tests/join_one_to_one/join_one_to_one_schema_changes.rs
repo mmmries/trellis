@@ -10,10 +10,8 @@
 //! Every test drives the pipeline and the staging worker's pass by hand
 //! through `support/drain_driver.rs`; nothing polls or sleeps.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/schema_change.rs"]
-mod schema_change;
+use crate::support::drain_driver;
+use crate::support::schema_change;
 
 use std::collections::HashMap;
 

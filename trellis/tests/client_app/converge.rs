@@ -12,8 +12,7 @@
 //! The caller-side poll drains nothing, so these tests hold the predicate and
 //! the poll to the doc; the engine's workers are what make a token clear.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::time::Duration;
 use testkit::connect_raw;
@@ -157,7 +156,7 @@ async fn the_band_would_lie_the_slot_does_not() {
 /// `generative/tests/client_lifecycle.rs` and
 /// `generative/src/generate/mod.rs`'s `program_with_client_restart`/
 /// `program_with_scale_out` doc comments for the full investigation
-/// history, and `trellis/tests/sealing.rs`'s
+/// history, and `trellis/tests/staging/sealing.rs`'s
 /// `an_empty_active_segment_still_seals_to_catch_a_stranded_straggler` for
 /// the other half of the fix (making sure that successor seal actually
 /// happens).

@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use crate::drain_driver::{self, Driver, int4};
+use super::drain_driver::{self, Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::apply;
 pub use trellis::staging::build::settle_builds;

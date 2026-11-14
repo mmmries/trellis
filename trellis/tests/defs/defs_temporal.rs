@@ -44,8 +44,7 @@
 //!
 //! Harness conventions follow `defs_floats.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::collections::HashMap;
 

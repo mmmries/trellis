@@ -44,8 +44,7 @@
 //! forces (a backend queued on a lock, the self-check's convergence wait
 //! started), as `Driver::wait_blocked_behind` is.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 use std::time::Duration;

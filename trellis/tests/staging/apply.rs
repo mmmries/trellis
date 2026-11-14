@@ -9,11 +9,9 @@
 //! into the ring (mirroring `claims.rs`/`fold.rs`'s convention), rather than
 //! going through capture — capture is out of scope here.
 
-#[path = "support/sql_recompute.rs"]
-mod sql_recompute;
+use crate::support::sql_recompute;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{columns, connect_raw, numeric_columns};
 use std::collections::HashMap;

@@ -8,8 +8,7 @@
 //! `resume_after_source_key_change.rs`. Every pass, build and drain is
 //! stepped by hand. Nothing polls for convergence.
 
-#[path = "support/resume_passes.rs"]
-mod resume_passes;
+use crate::support::resume_passes;
 
 use resume_passes::{
     RECREATED, SOURCE, bring_live, capture_pass, reconcile_pass, rows, settle, setup, status,

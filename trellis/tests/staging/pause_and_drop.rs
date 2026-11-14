@@ -42,8 +42,7 @@
 //! - the target's `schema_nodes` row is actually reaped, not merely
 //!   unreachable (`dropping_reaps_the_targets_schema_nodes_row`)
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, definer, start_and_settle_builds};
 use testkit::TestCluster;

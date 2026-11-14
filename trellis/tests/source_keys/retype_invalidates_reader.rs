@@ -28,8 +28,7 @@ use trellis::{Trellis, TrellisError};
 use drain_driver::pipeline::{bring_live, connect, definer, reconcile_pass, settle, status};
 use trellis::staging::build::settle_builds;
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 /// `public.src (id, g, price int, d date)`, with `t` a passthrough of
 /// `price` as `p` and of `d`, and these readers of `t.p`, all live:

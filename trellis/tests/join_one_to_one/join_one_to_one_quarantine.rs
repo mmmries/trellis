@@ -7,8 +7,7 @@
 //! batches by hand (`support/drain_driver.rs`). Nothing sleeps or polls for convergence but
 //! the page a pause must queue behind.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 

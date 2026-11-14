@@ -25,12 +25,8 @@
 //!   `R` lock statement orders them; split `{1, 2}` then `{3}`
 //!   (`star_r_split`), two of them close a cycle and deadlock.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
-#[path = "support/star_cx.rs"]
-mod star_cx;
+use crate::support::star;
+use crate::support::star_cx;
 
 use star::{Shape, Writer};
 use star_cx::leak;

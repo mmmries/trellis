@@ -25,8 +25,7 @@
 //! single-column-only, so this file asserts against the target table's
 //! contents directly instead.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;

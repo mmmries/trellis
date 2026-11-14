@@ -5,8 +5,7 @@
 //! needed made the retirement pass skip it, and `seal` panicked on the
 //! `RingFull` that followed.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 

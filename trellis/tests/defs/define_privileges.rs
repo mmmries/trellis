@@ -20,8 +20,7 @@ use tokio_postgres::Client;
 use trellis::defs::ValueType;
 use trellis::{CatalogError, Config, ErrorCode, Trellis, TrellisOptions};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect_with;
 

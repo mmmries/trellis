@@ -7,8 +7,7 @@
 //! `REGEXP_COUNT` is cross-checked with both literal and real-metacharacter
 //! patterns, including ones that can match the empty string.
 
-#[path = "support/render_lab.rs"]
-mod render_lab;
+use crate::support::render_lab;
 
 use render_lab::{Lab, Outcome};
 use testkit::TestCluster;

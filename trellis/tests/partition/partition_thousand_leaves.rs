@@ -9,8 +9,7 @@
 //! a memory cap. Nothing waits for convergence: the
 //! pass, the ring and the correction engine are driven by hand.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 use std::sync::Arc;

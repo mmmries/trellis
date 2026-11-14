@@ -12,8 +12,7 @@ use trellis::defs::partition_tree::{
 };
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect_with;
 

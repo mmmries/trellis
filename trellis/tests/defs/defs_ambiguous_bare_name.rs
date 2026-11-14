@@ -3,8 +3,7 @@
 //! and both qualified spellings. A qualified `<table>.<column>` reads the
 //! source column.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, settle, start_and_settle_builds};
 

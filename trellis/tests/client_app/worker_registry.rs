@@ -8,7 +8,7 @@
 //! `staleness_is_read_time_and_needs_no_reclaim_pass` is the one test that
 //! goes straight at `staging::worker_registry` rather than through `Trellis`:
 //! it backdates a row's `last_seen` directly via raw SQL (matching
-//! `trellis/tests/liveness.rs`'s own convention for simulating a dead
+//! `trellis/tests/client_app/liveness.rs`'s own convention for simulating a dead
 //! worker) with a short `ttl`, so it can assert staleness within
 //! milliseconds instead of waiting out `Trellis::has_live_drain_workers`'s
 //! fixed 30s default — see that test's own doc comment for why "before any
@@ -280,7 +280,7 @@ async fn staleness_is_read_time_and_needs_no_reclaim_pass() {
 
     // Simulate the worker dying without ever heartbeating or deregistering
     // again: backdate `last_seen` directly via raw SQL, matching
-    // `trellis/tests/liveness.rs`'s own convention for `seg_claims.claimed_at`.
+    // `trellis/tests/client_app/liveness.rs`'s own convention for `seg_claims.claimed_at`.
     client
         .execute(
             "update worker_registry set last_seen = now() - interval '2 hours' \
@@ -400,9 +400,9 @@ const WORKER_PROCESS_DSN: &str = "TRELLIS_TEST_756_WORKER_DSN";
 
 /// One worker process for
 /// [`two_processes_register_distinct_rows_and_shutdown_removes_only_its_own`],
-/// which runs this test binary filtered to this test: start a drain `Client`,
-/// print `ready`, and shut it down cleanly once stdin closes. Ignored, so it
-/// only ever runs that way.
+/// which runs this test binary filtered to this test (by its path in the
+/// `client_app` target): start a drain `Client`, print `ready`, and shut it
+/// down cleanly once stdin closes. Ignored, so it only ever runs that way.
 #[test]
 #[ignore = "a child process of two_processes_register_distinct_rows_and_shutdown_removes_only_its_own"]
 fn worker_process() {
@@ -458,7 +458,12 @@ async fn two_processes_register_distinct_rows_and_shutdown_removes_only_its_own(
     // `Client::start` registers before it returns, so no waiting is needed.
     let spawn = || {
         let mut child = Command::new(std::env::current_exe().expect("test binary"))
-            .args(["worker_process", "--exact", "--ignored", "--nocapture"])
+            .args([
+                "worker_registry::worker_process",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
             .env(WORKER_PROCESS_DSN, db.dsn())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

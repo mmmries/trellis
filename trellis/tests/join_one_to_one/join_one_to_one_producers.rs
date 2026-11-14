@@ -16,8 +16,7 @@
 //!   rewrites its target through the target-mutation seam, and the join
 //!   follows its rows.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 

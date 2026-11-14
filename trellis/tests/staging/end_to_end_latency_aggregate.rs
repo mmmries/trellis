@@ -18,8 +18,7 @@
 //! `defs_aggregate_chained_single_column_group_key.rs`, the front-door
 //! aggregate-chaining fixture.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::columns;
 

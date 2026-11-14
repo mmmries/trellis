@@ -8,8 +8,7 @@
 //! Every pass, build and drain is stepped by hand. Nothing polls for
 //! convergence.
 
-#[path = "support/resume_passes.rs"]
-mod resume_passes;
+use crate::support::resume_passes;
 
 use resume_passes::{bring_live, reconcile_pass, rows, settle, setup, status};
 use testkit::TestCluster;

@@ -7,8 +7,7 @@
 //! does, and drives it with `drain_once`: deterministic, with no
 //! convergence polling.
 
-#[path = "support/render_lab.rs"]
-mod render_lab;
+use crate::support::render_lab;
 
 use std::collections::HashMap;
 
@@ -872,7 +871,7 @@ async fn coalesce_over_a_real_computes_what_postgres_computes() {
 /// to, and a constant sum Postgres can't compute, define: define evaluates no
 /// constant. Postgres raises `22003` for them while planning, for every row,
 /// so their rows are quarantined at run time
-/// (`tests/plan_time_constant_quarantine.rs`).
+/// (`tests/expressions/plan_time_constant_quarantine.rs`).
 #[tokio::test]
 async fn a_constant_postgres_fails_while_planning_defines() {
     let cluster = TestCluster::start();

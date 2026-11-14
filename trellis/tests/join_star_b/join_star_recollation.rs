@@ -16,10 +16,8 @@
 //! sleeps: changes are drained until nothing is pending, and builds are
 //! stepped by hand to idle.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};

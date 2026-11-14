@@ -23,8 +23,7 @@ use trellis::client::handover_pass_as;
 use trellis::staging::interleave::{PausePoint, PauseScope, with_scope};
 use trellis::{Config, ErrorCode, SelfCheckMode, Trellis, TrellisError, TrellisOptions};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{bring_live_all, connect};
 

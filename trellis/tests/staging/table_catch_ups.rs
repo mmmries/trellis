@@ -14,8 +14,7 @@
 //! CDC staged for it (the lost change the rebuild is there to repair), asks
 //! for the rebuild, and drives the build and the drain directly.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use std::collections::HashMap;

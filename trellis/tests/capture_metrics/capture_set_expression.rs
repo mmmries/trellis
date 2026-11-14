@@ -18,8 +18,7 @@ use tokio_postgres::Client;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{Config, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisOptions};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, settle};
 

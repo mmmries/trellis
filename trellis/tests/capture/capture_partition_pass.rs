@@ -18,8 +18,7 @@ use trellis::intake::harness;
 use trellis::staging::apply::ApplyError;
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 
@@ -923,8 +922,8 @@ fn thousand_leaves() -> String {
 }
 
 /// What the two fingerprints cost per pass at 1,000 leaves. Run by hand:
-/// `cargo test -p trellis --test capture_partition_pass -- --ignored
-/// --nocapture measure_fingerprint`.
+/// `cargo test -p trellis --test capture
+/// capture_partition_pass::measure_fingerprint -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "a measurement"]
 async fn measure_fingerprint_cost_at_a_thousand_leaves() {

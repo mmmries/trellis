@@ -12,8 +12,7 @@
 //! threshold and it is poisoned for `doubles`. `copies` reads the same table
 //! and applies the key throughout.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 

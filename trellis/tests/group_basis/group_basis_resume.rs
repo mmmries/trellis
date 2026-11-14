@@ -12,8 +12,7 @@
 //! pause points where the scenario needs it. None sleeps or polls for
 //! convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 use std::time::Duration;

@@ -43,8 +43,7 @@ use trellis::staging::converge::table_changes_pending_through;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{MIN_ROWS_TO_SPLIT, TRUNCATE_SENTINEL_KEY, apply, seal};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, settle};
 

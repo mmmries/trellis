@@ -18,10 +18,8 @@
 //! `join_star_families.rs` and `join_star_joined_families.rs`, and #1375's
 //! truncates (T) in `join_star_truncate.rs`.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use star::{Kind, SHAPES, Shape, Star};
 use trellis::staging::OneToOneJoinFanOutStep;

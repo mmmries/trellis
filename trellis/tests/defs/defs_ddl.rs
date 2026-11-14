@@ -1,8 +1,7 @@
 //! Integration tests for target-table DDL generation, run
 //! against a real, ephemeral Postgres instance via `testkit::TestCluster`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::numeric_columns;
 

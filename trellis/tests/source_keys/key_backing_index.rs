@@ -7,10 +7,8 @@
 //!
 //! Every pass and drain is stepped by hand. Nothing polls for convergence.
 
-#[path = "support/attver.rs"]
-mod attver;
-#[path = "support/resume_passes.rs"]
-mod resume_passes;
+use crate::support::attver;
+use crate::support::resume_passes;
 
 use resume_passes::{SCHEMA, bring_live, connect, reconcile_pass, rows, settle, setup, status};
 use testkit::TestCluster;

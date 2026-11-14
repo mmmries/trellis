@@ -4,8 +4,7 @@
 //! creates anything, and a `RESUME` of a definition whose target schema has
 //! since become one refuses it the same way. Direct, with no polling.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::definer;
 use testkit::{TestCluster, TestDatabase};

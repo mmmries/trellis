@@ -13,8 +13,7 @@
 //! daemon runs for real against a short interval. Nothing sleeps: the only
 //! waits are on a concrete condition with a bound.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

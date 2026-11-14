@@ -9,8 +9,7 @@
 //! through a live client, so each hop lands in its own batch and nothing
 //! waits on convergence timing.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::pipeline::{connect_raw, numeric_columns};
 use std::collections::{BTreeMap, HashMap};

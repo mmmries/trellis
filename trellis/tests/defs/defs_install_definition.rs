@@ -14,8 +14,7 @@
 //! The staging harness (connect, stage a CDC row, seal/drain to quiescence)
 //! is this file's own.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{columns, connect_raw, numeric_columns, settle, start_and_settle_builds};
 

@@ -22,8 +22,7 @@ use trellis::intake::harness;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::staging::{apply, quarantine, seal};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{capture_pass, connect_with};
 

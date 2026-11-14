@@ -14,8 +14,7 @@
 //! Every test drives the pipeline by hand through `support/drain_driver.rs`;
 //! nothing polls or sleeps.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 

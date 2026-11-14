@@ -10,11 +10,9 @@
 //! source: the oracle. The aggregate and `JOIN` sources are in
 //! `group_basis_chained.rs`.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
-#[path = "support/sql_recompute.rs"]
-mod sql_recompute;
+use crate::support::sql_recompute;
 
 use std::collections::HashMap;
 use std::time::Duration;

@@ -28,8 +28,7 @@ use trellis::intake::harness;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{CaptureFault, CatalogError, Divergence, SelfCheckOutcome, TrellisError};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{capture_pass, connect_with};
 

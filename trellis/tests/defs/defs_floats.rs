@@ -38,8 +38,7 @@
 //!
 //! Harness conventions follow `defs_exact_integers.rs`.
 
-#[path = "support/render_lab.rs"]
-mod render_lab;
+use crate::support::render_lab;
 
 use std::collections::HashMap;
 

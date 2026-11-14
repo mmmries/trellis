@@ -17,8 +17,7 @@
 //! gives zero oracle difference, no held key and `self_check` `Converged`.
 //! Every step is explicit; nothing polls.
 
-#[path = "support/relabel.rs"]
-mod relabel;
+use crate::support::relabel;
 
 use relabel::{H, RELABEL};
 use trellis::defs::TransformStatus;

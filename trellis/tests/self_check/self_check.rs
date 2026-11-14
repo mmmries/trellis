@@ -4,7 +4,7 @@
 //! A real, ephemeral Postgres instance per test (`testkit::TestCluster`).
 //! Definitions and the audit itself go through the public `Trellis` facade.
 //! Everything else "reaches past the mechanism, inserts directly", the way
-//! `trellis/tests/column_quarantine.rs` seeds its own scenarios: corrupting a
+//! `trellis/tests/staging/column_quarantine.rs` seeds its own scenarios: corrupting a
 //! target row, seeding `column_status`, and building the converged target in
 //! the first place. [`converged_fixture`] installs the source's capture
 //! triggers, lets them stage the rows it writes, and drains them through the
@@ -47,8 +47,7 @@
 //! `reproduced_keeps_only_divergences_seen_on_both_passes` unit-test the
 //! re-check's own matching logic directly.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::time::Duration;
 use testkit::connect_raw;
@@ -527,7 +526,7 @@ async fn a_converged_target_of_typed_literals_reports_no_divergence() {
 }
 
 /// A target row corrupted directly via raw SQL (bypassing the engine
-/// entirely, the way `trellis/tests/quarantine.rs`/`column_quarantine.rs`
+/// entirely, the way `trellis/tests/staging/quarantine.rs`/`column_quarantine.rs`
 /// seed their own scenarios) must be caught: `self_check` reports a
 /// [`Divergence::Cell`] whose `persisted` half is the corrupted value and
 /// whose `recomputed` half is the value the source data actually implies.
@@ -745,7 +744,7 @@ async fn a_field_chain_at_the_define_bound_audits_converged() {
 /// [`SelfCheckOutcome::Diverged`] (ADR-0013: "the correctness promise is
 /// conditional on being caught up ... self_check must never report a
 /// merely-lagging target as diverged"). Starts `running` staging-only (zero
-/// drain workers, mirroring `trellis/tests/app_converge.rs`'s own timeout
+/// drain workers, mirroring `trellis/tests/client_app/app_converge.rs`'s own timeout
 /// test), so the inserted row is genuinely staged and sealed but never
 /// applied — deterministic, not a timing coincidence: nothing in this test
 /// could possibly converge before `self_check`'s own short timeout expires.
@@ -931,7 +930,7 @@ async fn self_check_reports_a_connection_lost_during_its_convergence_wait_as_an_
 /// excluded from the comparison entirely (ADR-0013: "auditing it would
 /// report a false divergence on exactly the targets an operator is most
 /// likely to be inspecting"). Seeds `column_status` directly via raw SQL,
-/// the way `trellis/tests/column_quarantine.rs` seeds its own pause
+/// the way `trellis/tests/staging/column_quarantine.rs` seeds its own pause
 /// scenarios, rather than driving a real column fuse trip end to end.
 #[tokio::test]
 async fn self_check_excludes_a_paused_column_from_the_comparison() {

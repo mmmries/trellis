@@ -23,10 +23,8 @@
 //!   build, a field overflow, Re-derives of both tables in one page, a
 //!   Re-derive that changes nothing, and the fan-out's plan.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use drain_driver::Driver;
 use star::{SHAPES, Shape, Star, Writer};

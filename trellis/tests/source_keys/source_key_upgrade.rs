@@ -16,8 +16,7 @@
 //! drives the pipeline by hand through `support/drain_driver.rs`. None
 //! sleeps or polls for convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;

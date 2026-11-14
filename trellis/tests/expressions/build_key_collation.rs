@@ -38,8 +38,7 @@ const OPTIONS: WorkerOptions = WorkerOptions {
     reclaim_ttl: Duration::from_secs(30),
 };
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 

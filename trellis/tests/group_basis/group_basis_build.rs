@@ -14,8 +14,7 @@
 //! convergence: the one wait is for a page to queue on a lock the
 //! frozen build holds, which the test has forced.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 

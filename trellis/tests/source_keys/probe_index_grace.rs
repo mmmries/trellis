@@ -9,8 +9,7 @@
 //! miss, an hour to watch the clock run. Every pass and drain is stepped by
 //! hand. Nothing sleeps or polls.
 
-#[path = "support/resume_passes.rs"]
-mod resume_passes;
+use crate::support::resume_passes;
 
 use std::time::Duration;
 

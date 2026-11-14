@@ -7,8 +7,7 @@
 //! and never polls for convergence: a page is compared while a sealed
 //! segment nobody drained, or the active segment, still holds changes.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;

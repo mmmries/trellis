@@ -7,8 +7,7 @@
 //!
 //! No staging worker runs: these pins are of define, not of apply.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, definer};
 use std::collections::HashMap;

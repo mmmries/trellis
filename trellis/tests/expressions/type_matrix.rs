@@ -51,8 +51,7 @@
 //! - integer and float widths, the only changes that re-type a copy
 //!   (`capture_key_retype.rs`);
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 use trellis::staging::build::settle_builds;

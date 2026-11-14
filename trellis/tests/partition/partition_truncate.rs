@@ -8,8 +8,7 @@
 //! `GROUP BY` over the source. Nothing waits for convergence: the
 //! pass, the drain and the engine are called by hand.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

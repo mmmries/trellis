@@ -18,8 +18,7 @@
 //! - a statement outside the grammar changes nothing
 //!   (`statements_outside_the_grammar_are_parse_errors_that_change_nothing`)
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, definer};
 use testkit::TestCluster;

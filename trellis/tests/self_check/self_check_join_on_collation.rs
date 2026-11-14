@@ -16,8 +16,7 @@
 //! until nothing is pending, and a page that reads changes not applied yet
 //! is compared without the wait (`compare_page`).
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;

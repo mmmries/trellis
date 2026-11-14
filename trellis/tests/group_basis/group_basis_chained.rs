@@ -18,8 +18,7 @@
 //! over an upstream target whose keys have `NULL` parts, with writes and source
 //! `TRUNCATE`s around it.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 use std::time::Duration;

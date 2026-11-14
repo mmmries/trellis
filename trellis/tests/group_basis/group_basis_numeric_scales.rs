@@ -15,8 +15,7 @@
 //! Every test drives the pipeline by hand through `support/drain_driver.rs`
 //! and never polls for convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 use std::time::Duration;

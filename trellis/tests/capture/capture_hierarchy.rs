@@ -20,8 +20,7 @@ use trellis::intake::harness;
 use trellis::staging::apply::ApplyError;
 use trellis::{CatalogError, Config, Trellis, TrellisError, TrellisOptions};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{capture_pass, connect_with};
 

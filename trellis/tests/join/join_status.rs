@@ -4,8 +4,7 @@
 //! are `source_index.rs`'s.) Nothing here waits for anything: each report is a
 //! catalog read, and the sizes are made current by an explicit `ANALYZE`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use testkit::TestCluster;

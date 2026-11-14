@@ -9,8 +9,7 @@
 //! source rows are then in the target only once a chunk or an Apply writes
 //! them. Every test ends by checking the target against the source.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, Running, WAKE};
 use trellis::defs::ValueType;

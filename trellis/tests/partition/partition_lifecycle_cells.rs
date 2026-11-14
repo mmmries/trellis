@@ -5,11 +5,10 @@
 //! partition-key column, each between two reconcile passes: the recorded
 //! node names and routing texts go stale, and a write must not be lost nor a
 //! later operation on the renamed node left uncorrected. Same driver and
-//! oracle as `tests/partition_group_basis.rs`; nothing waits for
+//! oracle as `tests/partition/partition_group_basis.rs`; nothing waits for
 //! convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

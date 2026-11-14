@@ -21,8 +21,7 @@ use trellis::defs::TransformStatus;
 use trellis::staging::apply::ApplyError;
 use trellis::{CaptureFailureKind, Trellis, TrellisError};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, settle, status};
 use trellis::staging::build::settle_builds;

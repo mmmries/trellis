@@ -17,8 +17,7 @@ use trellis::capture::install::{self, Progress};
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 async fn connect(dsn: &str) -> Client {
     let setup = format!("set search_path to {DEFAULT_SCHEMA}, public; set lock_timeout = '10s'");

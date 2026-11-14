@@ -19,8 +19,7 @@
 //! the drain of changes made while it's live, and the rebuild a `RESUME`
 //! runs. `self_check` must report `Converged` after each.
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
 use std::time::Duration;
 

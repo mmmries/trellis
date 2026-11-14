@@ -12,8 +12,7 @@
 //! Every test is stepped by hand: no staging worker runs, and nothing polls
 //! for convergence.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, definer};
 

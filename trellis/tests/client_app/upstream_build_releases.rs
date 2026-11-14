@@ -9,10 +9,8 @@
 //! nothing polls for convergence.
 //!
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/upstream_releases.rs"]
-mod upstream_releases;
+use crate::support::drain_driver;
+use crate::support::upstream_releases;
 
 use upstream_releases::*;
 

@@ -15,8 +15,7 @@ use trellis::capture::install::{self, Installed, Progress, SINGLE_TRANSACTION_TA
 use trellis::capture::sql::{CaptureSpec, drop_node_trigger_statements};
 use trellis::config::DEFAULT_SCHEMA;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 

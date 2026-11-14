@@ -3,8 +3,7 @@
 //! its source, and a seal waits out the seal gate with a hard deadline and
 //! a failure naming the transaction that held it.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::time::Duration;
 

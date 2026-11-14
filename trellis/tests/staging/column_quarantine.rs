@@ -3,19 +3,18 @@
 //! per-column, then transform-wide", `docs/decisions/0008-public-api-design.md`
 //! decision 5): the per-`(transform,
 //! column)` fuse layered alongside the pre-existing row-level/transform-wide
-//! one (`trellis/tests/quarantine.rs`, unmodified by this feature — see
+//! one (`trellis/tests/staging/quarantine.rs`, unmodified by this feature — see
 //! `an_existing_row_level_fuse_scenario_is_unaffected` below for a targeted
 //! regression check of that claim in this file too).
 //!
-//! Follows `trellis/tests/quarantine.rs`'s own conventions: a real, ephemeral
+//! Follows `trellis/tests/staging/quarantine.rs`'s own conventions: a real, ephemeral
 //! Postgres instance per test (`testkit::TestCluster`), and "reach past the
 //! mechanism, insert directly" for whichever half of a scenario the
 //! mechanism under test doesn't itself produce (staging a malformed CDC
 //! image directly into the ring, rather than routing through the capture
 //! triggers).
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;
@@ -44,7 +43,7 @@ fn is_data_exception(err: &ApplyError) -> bool {
 }
 
 // ---------------------------------------------------------------------
-// Shared scaffolding (mirrors `tests/quarantine.rs`)
+// Shared scaffolding (mirrors `tests/staging/quarantine.rs`)
 // ---------------------------------------------------------------------
 
 /// The ring table `insert_cdc_row` must target *right now* — `seg_0` is only
@@ -72,7 +71,7 @@ async fn active_segment_table(client: &Client) -> String {
 /// Bare (no `.`) `name` qualified under [`DEFAULT_SCHEMA`] — where every bare
 /// `create table` in this file's own fixtures actually lands, since
 /// `connect_raw` pins `search_path` to `trellis, public` and never qualifies
-/// its own DDL. Matches `tests/quarantine.rs`'s (and `tests/apply.rs`'s) own
+/// its own DDL. Matches `tests/staging/quarantine.rs`'s (and `tests/staging/apply.rs`'s) own
 /// `qualify_fixture_table` (ADR-0011): a CDC-staged `src_table`
 /// must be fully qualified to match what a real CDC producer stages
 /// and what the dependency graph keys on, or
@@ -160,7 +159,7 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
 
 /// Adds a second, chained 1-1 transform (`order_summaries`, reading straight
 /// from `order_totals`'s own `total` column) — the fixture the cascade tests
-/// use. Mirrors `tests/quarantine.rs`'s `order_summary` hop-bound fixture.
+/// use. Mirrors `tests/staging/quarantine.rs`'s `order_summary` hop-bound fixture.
 async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
     let order_totals_columns = numeric_columns(&["id", "total"]);
     let summary_def = create_definition(
@@ -188,7 +187,7 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
 /// Stages one malformed (`price` = `"not-a-number"`) CDC insert per id in
 /// `ids`, all into the *same* segment, seals it, and drains it once —
 /// expecting a data-exception failure to surface (the drive-by-real-failures
-/// pattern `tests/quarantine.rs`'s own eviction test uses, just for the
+/// pattern `tests/staging/quarantine.rs`'s own eviction test uses, just for the
 /// column fuse instead of the row-level one).
 ///
 /// Deliberately one segment per call, not one per `id`: none of these
@@ -1036,7 +1035,7 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
 
     // Give the dependent its *own*, independent reason to stay paused —
     // reached past the mechanism directly, the same convention
-    // `tests/quarantine.rs` uses for seeding counters/markers by hand.
+    // `tests/staging/quarantine.rs` uses for seeding counters/markers by hand.
     client
         .execute(
             "update column_status set local_fuse = true \
@@ -1424,7 +1423,7 @@ fn blocking_trellis_exposes_the_read_and_resume_methods() {
 // ---------------------------------------------------------------------
 
 /// A targeted regression check living alongside the new feature's own
-/// tests, on top of `trellis/tests/quarantine.rs`'s full existing suite
+/// tests, on top of `trellis/tests/staging/quarantine.rs`'s full existing suite
 /// (unmodified, still green): a single stubborn key retried past the
 /// row-level threshold must still evict via `key_deaths`/`poison` exactly as
 /// before, and — the specific new-feature interaction this test is really

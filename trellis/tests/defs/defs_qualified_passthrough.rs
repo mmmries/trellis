@@ -12,8 +12,7 @@ use trellis::defs::ast::ValueType;
 use trellis::defs::install_definition;
 use trellis::integer::IntWidth;
 
-#[path = "support/trigger_pipeline.rs"]
-mod trigger_pipeline;
+use crate::support::trigger_pipeline;
 
 use trigger_pipeline::Pipeline;
 

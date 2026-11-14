@@ -16,8 +16,7 @@
 //! holds the pass's record, and changes staged across the re-type. Every
 //! step is explicit; nothing polls.
 
-#[path = "support/relabel.rs"]
-mod relabel;
+use crate::support::relabel;
 
 use relabel::H;
 use trellis::defs::TransformStatus;

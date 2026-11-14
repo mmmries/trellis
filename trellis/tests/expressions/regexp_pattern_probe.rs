@@ -8,8 +8,7 @@
 use testkit::TestCluster;
 use trellis::defs::{FieldDef, assert_regexp_patterns_accepted, parse};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_with, definer};
 

@@ -26,8 +26,7 @@ use trellis::{
     CatalogError, Config, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisError, TrellisOptions,
 };
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{capture_pass, connect, settle};
 

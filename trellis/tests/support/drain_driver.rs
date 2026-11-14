@@ -32,8 +32,7 @@ use trellis::staging::{
     retire_drained_segments,
 };
 
-#[path = "pipeline.rs"]
-pub mod pipeline;
+pub use super::pipeline;
 
 #[allow(unused_imports)]
 pub use pipeline::{WAKE, int4};

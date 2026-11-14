@@ -15,8 +15,7 @@
 //! hand, frozen at its pause points where the scenario needs it; the one
 //! wait is for the build to queue on a pause the test holds.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

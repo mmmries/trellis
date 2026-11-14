@@ -29,12 +29,8 @@
 //!   moved, after its key read, onto a key the page holds only for its root
 //!   item: the page retries, and its fan-out then locks that key's rows.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
-#[path = "support/star_cx.rs"]
-mod star_cx;
+use crate::support::star;
+use crate::support::star_cx;
 
 use star::Writer;
 use star_cx::{CROSS_SEED, LATE_SEED, N3, Orientation, SEED};

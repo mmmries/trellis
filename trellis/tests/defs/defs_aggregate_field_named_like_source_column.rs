@@ -5,8 +5,7 @@
 //! as in SQL, and a name that is no source column and names another aggregate
 //! field is refused at define.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, settle, start_and_settle_builds};
 

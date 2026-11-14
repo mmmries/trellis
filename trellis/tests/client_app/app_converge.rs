@@ -13,7 +13,7 @@
 //! facade instead.
 //!
 //! None of them runs a live `Client`. They manipulate the ring
-//! directly, the style `trellis/tests/converge.rs` established, so every
+//! directly, the style `trellis/tests/client_app/converge.rs` established, so every
 //! ordering they assert on is controlled by the test rather than raced
 //! against real capture/apply timing under a wall-clock budget.
 //! `await_converged_waits_for_a_sealed_write_until_it_is_applied` stages a
@@ -22,8 +22,7 @@
 //! `a_token_after_an_asynchronous_commit_waits_for_the_write`
 //! writes through a real capture trigger and never drains.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::time::{Duration, Instant};
 use testkit::connect_raw;
@@ -39,7 +38,7 @@ use trellis::{BlockingTrellis, Config, ErrorCode, Trellis, TrellisError, Trellis
 
 /// Inserts a bare recompute row directly into `seg_0` (the fresh, always-
 /// active slot on an untouched ring) with an explicit `origin_lsn` —
-/// `trellis/tests/converge.rs`'s own `insert_with_origin`, reproduced here
+/// `trellis/tests/client_app/converge.rs`'s own `insert_with_origin`, reproduced here
 /// rather than shared across a test-binary boundary.
 async fn insert_pending_row(client: &Client, key: &str, origin_lsn: PgLsn) {
     client
@@ -184,7 +183,7 @@ async fn await_converged_waits_for_a_sealed_write_until_it_is_applied() {
 /// [`Trellis::await_converged`] must propagate a real timeout as the named
 /// [`StagingError::ConvergenceTimeout`] (wrapped in [`TrellisError::Staging`]),
 /// not swallow or misclassify it — mirrors
-/// `trellis/tests/converge.rs::await_converged_times_out_with_a_named_error`,
+/// `trellis/tests/client_app/converge.rs::await_converged_times_out_with_a_named_error`,
 /// but through the facade and its own error type. Uses direct ring
 /// manipulation (no live CDC/drain workers at all) so the "never converges"
 /// half of this test is deterministic rather than a race against real
@@ -295,7 +294,7 @@ async fn await_converged_times_out_on_a_blocked_poll_and_leaves_the_pool_usable(
 
 /// `BlockingTrellis::watermark_token`/`BlockingTrellis::await_converged` must
 /// work from a plain, non-async `#[test]` with no surrounding `tokio`
-/// runtime on the calling thread — `trellis/tests/blocking_trellis.rs`'s own
+/// runtime on the calling thread — `trellis/tests/client_app/blocking_trellis.rs`'s own
 /// documented convention. Direct ring manipulation, same as the async
 /// timeout test above, keeps this deterministic without needing a live CDC
 /// pipeline.

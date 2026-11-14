@@ -11,8 +11,7 @@
 //! Each test steps the build by hand (`build::work_once`) to idle and asserts
 //! where the definition ended: no test waits on convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::Driver;
 use trellis::config::Config;

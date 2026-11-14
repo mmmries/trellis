@@ -27,13 +27,11 @@
 //! `create_target_table`, CDC rows staged straight into the ring, seal, then
 //! drain) are copied from `apply.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, drain, seal, start_and_settle_builds};
 
-#[path = "support/sql_recompute.rs"]
-mod sql_recompute;
+use crate::support::sql_recompute;
 
 use std::collections::HashMap;
 

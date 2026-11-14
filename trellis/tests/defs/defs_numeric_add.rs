@@ -4,8 +4,7 @@
 //! the staged image's text, is cast back to `numeric` by the rendered upsert,
 //! and the target column's text is compared with independently written SQL.
 
-#[path = "support/render_lab.rs"]
-mod render_lab;
+use crate::support::render_lab;
 
 use render_lab::{Lab, Outcome};
 use testkit::TestCluster;

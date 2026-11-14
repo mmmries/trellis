@@ -24,8 +24,7 @@ use trellis::capture::install::{self, Progress};
 use trellis::capture::sql::CaptureSpec;
 use trellis::config::DEFAULT_SCHEMA;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 

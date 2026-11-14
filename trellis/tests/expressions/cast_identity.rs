@@ -7,11 +7,9 @@
 //! and each integer width's bounds. The generative conformance harness draws
 //! these casts too, since it takes its pairs from `cast_result_type`.
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use testkit::TestCluster;

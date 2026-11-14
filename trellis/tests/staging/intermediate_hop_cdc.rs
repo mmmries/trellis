@@ -22,11 +22,9 @@ use trellis::capture::install::{Installed, installed};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::install_definition;
 
-#[path = "support/trigger_pipeline.rs"]
-mod trigger_pipeline;
+use crate::support::trigger_pipeline;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use trigger_pipeline::Pipeline;
 

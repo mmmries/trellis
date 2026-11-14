@@ -19,8 +19,7 @@
 //! *terminal* target could taint an assertion here that a given label never
 //! received an end-to-end observation.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, numeric_columns};
 

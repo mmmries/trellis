@@ -4,8 +4,7 @@
 //! and its quoted spelling; an addressing statement acts only on the exact
 //! name, never on a twin in another case.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, definer};
 use testkit::TestCluster;

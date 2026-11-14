@@ -26,10 +26,8 @@
 //! Pages are driven by hand (`support/drain_driver.rs`); nothing sleeps or
 //! polls for convergence but the lock a pause or a start must queue on.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use std::collections::HashMap;
 use std::time::Duration;

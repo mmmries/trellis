@@ -14,8 +14,7 @@
 //! 0). An absolute write, which only the build and recompute
 //! make, is planted by [`recompute`]: the model's locked group recompute.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, int4};
 use trellis::config::DEFAULT_SCHEMA;

@@ -41,10 +41,8 @@
 //! writes converged. A reader's own field failing on a row the target holds
 //! holds that key for that reader alone, as for a reader of any target.
 
-#[path = "support/attver.rs"]
-mod attver;
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::attver;
+use crate::support::drain_driver;
 
 use std::collections::HashMap;
 use std::time::Duration;

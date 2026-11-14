@@ -25,8 +25,7 @@
 //! pre-resume `poison` rows are (deliberately) still there, while a full
 //! fresh threshold's worth of new evictions must.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, numeric_columns, start_and_settle_builds};
 
@@ -40,7 +39,7 @@ use trellis::staging::quarantine;
 use trellis::staging::retire_drained_segments;
 
 /// Bare `name` qualified under [`DEFAULT_SCHEMA`] — matches
-/// `tests/quarantine.rs`'s own `qualify_fixture_table`: a CDC-staged
+/// `tests/staging/quarantine.rs`'s own `qualify_fixture_table`: a CDC-staged
 /// `src_table` (and everything keyed off it downstream, including
 /// `poison`/`transforms_for_source`) must be fully qualified.
 fn qualify_fixture_table(name: &str) -> String {
@@ -49,7 +48,7 @@ fn qualify_fixture_table(name: &str) -> String {
 
 /// The ring table backing the currently-active segment — read from
 /// `segment_pointer.ring_slot` rather than assuming `"seg_0"` the way
-/// `tests/quarantine.rs`'s fixtures can (those start from a completely
+/// `tests/staging/quarantine.rs`'s fixtures can (those start from a completely
 /// fresh database with nothing yet sealed). This file's own fixtures run
 /// real build and drain activity first, which seals and advances the ring
 /// pointer before a test ever stages its own CDC rows, so the active slot
@@ -65,7 +64,7 @@ async fn active_ring_table(client: &Client) -> String {
 
 /// Stages one image-bearing (CDC-shaped) change directly into ring table
 /// `table` — the same "reach past the mechanism, insert directly"
-/// convention `tests/quarantine.rs`'s own `insert_cdc_row` uses.
+/// convention `tests/staging/quarantine.rs`'s own `insert_cdc_row` uses.
 async fn insert_cdc_row(
     client: &Client,
     table: &str,
@@ -460,7 +459,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     // Stage a real CDC change for five distinct *keys* that are themselves
     // malformed (not numeric, so casting to `s4.id`'s `bigint` at write time
     // fails) — deliberately **not** a bad calculated-field value: a bad
-    // `new_image` (like `tests/quarantine.rs`'s own
+    // `new_image` (like `tests/staging/quarantine.rs`'s own
     // `repeated_real_failures_cross_the_eviction_threshold_and_the_batch_still_drains`)
     // would fail *evaluation*, which `attribute_column_failure` attributes
     // to the `(t4, x)` column pair — and since all five keys fail on their

@@ -11,11 +11,9 @@
 //! zero rows. Each test then runs `self_check` in strict mode, which renders
 //! every field with its own audit renderer, independent of the write path.
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use std::time::Duration;

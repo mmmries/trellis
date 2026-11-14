@@ -8,8 +8,7 @@
 //! oracle is a from-scratch `GROUP BY` over the source. Nothing waits for
 //! convergence: the race test freezes the pass at a pause point.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 

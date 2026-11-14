@@ -6,8 +6,7 @@
 //! left the copy at the old text for `self_check` to report. Every cell is a
 //! 1-1 passthrough, driven by explicit seals and drains.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 

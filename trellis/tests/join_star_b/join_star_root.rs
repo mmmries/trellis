@@ -29,10 +29,7 @@
 //! - **n = 4**: a root row moving all three keys ‖ a change on its new key at
 //!   the middle position.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::star;
 
 use star::{Shape, Writer};
 use trellis::staging::interleave::PausePoint;

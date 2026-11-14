@@ -14,10 +14,8 @@ use testkit::TestCluster;
 use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 
-#[path = "support/attver.rs"]
-mod attver;
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::attver;
+use crate::support::pipeline;
 
 use pipeline::{bring_live_all, capture_pass, connect, definer, reconcile_pass, settle, statuses};
 use trellis::staging::build::settle_builds;

@@ -9,8 +9,7 @@
 //! lease are out of scope — a claimed batch is expected to sit
 //! in `draining` with rows in `seg_claims` by the end of every test here.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

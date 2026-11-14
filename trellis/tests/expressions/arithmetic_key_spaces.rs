@@ -8,11 +8,9 @@
 //! and compares the target with the same query written by hand
 //! (ADR-0013): a symmetric difference of zero rows.
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use std::time::Duration;

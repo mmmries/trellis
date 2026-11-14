@@ -3,8 +3,7 @@
 //! connection's startup, run against a real, ephemeral Postgres instance via
 //! the shared harness (`testkit::TestCluster`).
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
 use testkit::TestCluster;
 use trellis::{Config, Trellis, TrellisOptions};
@@ -94,7 +93,7 @@ async fn define_accepts_a_uuid_and_a_jsonb_passthrough_column() {
 ///
 /// Enum types are not in this bucket (they have their own `PgType::Enum`
 /// classification and key/`GROUP BY`/`MIN`/`MAX` roles — see
-/// `trellis/tests/defs_enum.rs`), so this regression pin uses an array
+/// `trellis/tests/defs/defs_enum.rs`), so this regression pin uses an array
 /// column, which — like a range, composite, domain, or `citext` — is still
 /// genuinely `PgType::Unrecognized` today (`docs/type-support.md` defers
 /// these to #122). The original regression this test guards is about the

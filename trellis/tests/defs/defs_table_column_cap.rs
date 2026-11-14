@@ -15,8 +15,7 @@
 //!
 //! Every test is stepped by hand: no staging worker runs.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::definer;
 

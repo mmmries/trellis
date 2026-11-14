@@ -11,8 +11,7 @@
 //! re-fetch, the target write, and the update/delete lookups all have to
 //! agree on that raw text.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::collections::HashMap;
 use testkit::connect_raw;

@@ -18,8 +18,7 @@ use trellis::capture::sql::pinned_output_settings;
 use trellis::defs::TransformStatus;
 use trellis::{Config, Trellis, TrellisOptions};
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_with, reconcile_pass, settle};
 use trellis::staging::build::settle_builds;

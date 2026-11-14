@@ -44,8 +44,7 @@
 //! `min`/`max` — never against the engine's own renderer. Harness conventions follow
 //! `defs_boolean.rs`/`defs_bytea.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, drain, seal};
 

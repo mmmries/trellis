@@ -30,8 +30,7 @@
 //! installed and converged. The harness stages CDC rows by hand and
 //! seals/drains to quiescence.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{columns, connect_raw, settle};
 

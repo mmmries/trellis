@@ -16,11 +16,10 @@
 //! The cases are the variant-L scenarios (`P.*`), the lifecycle
 //! cells (X12-7a two-level trees, X12-7b a `DEFAULT` operated on, X12-7c a
 //! `HASH` re-split, X12-7e writes into the node while it is corrected), and
-//! the sweep's interleavings from `tests/partition_sweep.rs`, with no
+//! the sweep's interleavings from `tests/partition/partition_sweep.rs`, with no
 //! full-routing fallback.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::{Duration, Instant};
 
@@ -1476,7 +1475,7 @@ async fn a_new_hash_leaf_whose_middle_was_dropped_completes_without_error() {
     assert!(fx.queue().await.is_empty());
 }
 
-// --- The complement sweep (tests/partition_sweep.rs on the group basis) ---
+// --- The complement sweep (tests/partition/partition_sweep.rs on the group basis) ---
 
 /// `items` partitioned `kind` on `g` with leaves for the groups 0-11 only,
 /// empty; the rows (ten a group, none in the missing leaf); and the bound

@@ -36,8 +36,7 @@
 //! against the engine's own renderer. Harness conventions follow
 //! `defs_bit.rs`/`defs_boolean.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 

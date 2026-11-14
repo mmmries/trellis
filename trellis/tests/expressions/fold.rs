@@ -9,8 +9,7 @@
 //! and is meant to fail on a naive implementation: a blanket `COALESCE`, a
 //! filter on `op`, an own-slot-only window, or ignoring `change_id`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use std::time::SystemTime;
 use testkit::connect_raw;

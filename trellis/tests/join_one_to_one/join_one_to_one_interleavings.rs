@@ -13,8 +13,7 @@
 //! `join_star_truncate.rs` (truncates) and `join_star_harness.rs` (the build
 //! and plain changes).
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::{Driver, int4};
 use trellis::defs::ValueType;

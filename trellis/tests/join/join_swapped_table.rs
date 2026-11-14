@@ -5,8 +5,7 @@
 //!
 //! The pass is stepped by hand and nothing polls.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;

@@ -12,10 +12,8 @@
 //! Every test drives the pipeline by hand through `support/drain_driver.rs`
 //! and never polls for convergence.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
+use crate::support::drain_driver;
+use crate::support::star;
 
 use drain_driver::Driver;
 use star::{Shape, Star};

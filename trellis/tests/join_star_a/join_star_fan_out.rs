@@ -20,12 +20,9 @@
 //! - **PX8, PX9**: a held row and the fan-out at position 2.
 //! - **XT2**: a `TRUNCATE` against a pending marker at another position.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
-#[path = "support/star.rs"]
-mod star;
-#[path = "support/star_cx.rs"]
-mod star_cx;
+use crate::support::drain_driver;
+use crate::support::star;
+use crate::support::star_cx;
 
 use drain_driver::Driver;
 use star::{Shape, Star};

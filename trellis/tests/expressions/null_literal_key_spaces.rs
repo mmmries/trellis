@@ -12,11 +12,9 @@
 //! (ADR-0022). Each test then runs `self_check` in strict mode, which renders
 //! every field with its own audit renderer.
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 use std::time::Duration;

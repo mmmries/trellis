@@ -24,8 +24,7 @@
 //! statement), `NULL` (a `NULL` extreme never probes), `NULLKEY` (the probe
 //! matches a `NULL` group key by `=`) and `GCX` (the GC ignores `__xstamp`).
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use std::time::Duration;
 

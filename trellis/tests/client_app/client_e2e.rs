@@ -14,11 +14,9 @@
 //!   knobs: a staging-only client (no app workers) stages and seals but
 //!   drains nothing, leaving the target empty.
 
-#[path = "support/sql_recompute.rs"]
-mod sql_recompute;
+use crate::support::sql_recompute;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, numeric_columns};
 use std::collections::HashMap;

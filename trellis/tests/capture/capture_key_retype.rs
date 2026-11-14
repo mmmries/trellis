@@ -19,10 +19,8 @@ use tokio_postgres::Client;
 use trellis::defs::TransformStatus;
 use trellis::{Trellis, TrellisError};
 
-#[path = "support/attver.rs"]
-mod attver;
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::attver;
+use crate::support::pipeline;
 
 use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, settle, status};
 use trellis::staging::build::settle_builds;

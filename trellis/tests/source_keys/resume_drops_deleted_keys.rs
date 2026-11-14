@@ -10,8 +10,7 @@
 //! share of the change stream is never folded into its target. Every test
 //! drives the build and the drain by hand, so they wait on nothing.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect_raw, definer, start_and_settle_builds};
 use std::collections::HashMap;

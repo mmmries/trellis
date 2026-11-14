@@ -44,8 +44,7 @@ const OPTIONS: WorkerOptions = WorkerOptions {
     reclaim_ttl: Duration::from_secs(30),
 };
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::connect;
 
@@ -996,7 +995,7 @@ async fn a_one_to_one_sweep_whose_tag_shaped_cursor_v15_resets_finishes() {
         .expect("the earlier release's tag-shaped cursor");
     f.raw
         .batch_execute(include_str!(
-            "../migrations/V15__reset_tag_shaped_sweep_cursors.sql"
+            "../../migrations/V15__reset_tag_shaped_sweep_cursors.sql"
         ))
         .await
         .expect("migration V15");

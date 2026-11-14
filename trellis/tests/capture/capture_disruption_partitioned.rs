@@ -18,8 +18,7 @@ use trellis::Trellis;
 use trellis::capture::reconcile;
 use trellis::defs::TransformStatus;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{bring_live_all, capture_pass, connect, definer, reconcile_pass, statuses};
 use trellis::staging::build::settle_builds;

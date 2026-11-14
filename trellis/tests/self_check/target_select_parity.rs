@@ -11,8 +11,7 @@
 //! rendered `SELECT` and compared with the maintained rows, as values and as
 //! text (so a numeric's scale counts too).
 
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::wait_live;
 
 use std::time::Duration;
 

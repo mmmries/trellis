@@ -25,8 +25,7 @@
 //!   and for two whose lock rows a page takes in another order than their
 //!   ids.
 
-#[path = "support/drain_driver.rs"]
-mod drain_driver;
+use crate::support::drain_driver;
 
 use drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};

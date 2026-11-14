@@ -16,10 +16,8 @@
 //! test holds its build at a fixed point with an advisory lock, so the
 //! interleaving that matters is set up, not raced.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
-#[path = "support/wait_live.rs"]
-mod wait_live;
+use crate::support::pipeline;
+use crate::support::wait_live;
 
 use pipeline::{connect, definer};
 use std::time::{Duration, Instant};

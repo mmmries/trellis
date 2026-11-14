@@ -20,11 +20,9 @@ use std::collections::HashMap;
 use trellis::defs::ast::ValueType;
 use trellis::defs::install_definition;
 
-#[path = "support/trigger_pipeline.rs"]
-mod trigger_pipeline;
+use crate::support::trigger_pipeline;
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use trigger_pipeline::Pipeline;
 

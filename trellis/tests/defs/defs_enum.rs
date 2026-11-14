@@ -46,8 +46,7 @@
 //! never against the engine's own renderer. Harness conventions follow `defs_netaddr.rs`/
 //! `defs_bit.rs`.
 
-#[path = "support/pipeline.rs"]
-mod pipeline;
+use crate::support::pipeline;
 
 use pipeline::{connect, drain, seal};
 
