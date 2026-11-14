@@ -2848,28 +2848,13 @@ fn migrate_retry_after(err: &crate::error::Error) -> Option<Duration> {
             | Error::BelowCatalogFloor { .. }
             | Error::MigrationHistory(_)
             | Error::RestoreDefinition { .. }
-    ) || permission_denied(err);
+    ) || crate::error::permission_denied(err);
     waits_on_an_operator.then_some(MIGRATE_REFUSED_RETRY)
 }
 
 /// How long a background process waits to try `migrate` again after a
 /// refusal that waits on an operator ([`migrate_retry_after`]).
 const MIGRATE_REFUSED_RETRY: Duration = Duration::from_secs(60);
-
-/// Whether `err`'s chain carries Postgres's permission refusal (SQLSTATE
-/// 42501): the role can't do what `migrate` does.
-fn permission_denied(err: &crate::error::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(current) = source {
-        if let Some(db) = current.downcast_ref::<tokio_postgres::Error>()
-            && db.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
-        {
-            return true;
-        }
-        source = current.source();
-    }
-    false
-}
 
 /// Why a background process's last `migrate` refused, shared with the
 /// [`Client`] that runs it, so the handle's `status()` can say. `None` once
@@ -3079,10 +3064,16 @@ async fn handover_pass(
 /// that can read and write Trellis's tables but not create or alter them gets
 /// a refusal of its own: another role has to run the migrations.
 fn cannot_migrate_reason(err: &crate::error::Error) -> String {
-    if permission_denied(err) {
+    if crate::error::permission_denied(err) {
+        // The refinery error alone: `Error::Migrate`'s own message already
+        // names the remedy.
+        let detail = match err {
+            crate::error::Error::Migrate(inner) => inner.to_string(),
+            other => other.to_string(),
+        };
         format!(
             "migrations or takeover work pending and this role cannot run them: run `migrate` \
-             with a role that can (`trellis run`, a deploy step) ({err})"
+             with a role that can (`trellis run`, a deploy step) ({detail})"
         )
     } else {
         format!("migrate refused: {err}")

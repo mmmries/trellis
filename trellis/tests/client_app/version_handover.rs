@@ -570,6 +570,30 @@ async fn dml_only_role(db: &testkit::TestDatabase, raw: &Client) -> (Config, Str
     (config, grants)
 }
 
+/// `trellis run` has no stand-by for a role that can't migrate: it prints the
+/// refused `migrate`'s error and exits. That error names the remedy (#2008),
+/// not just refinery's `error asserting migrations table`.
+#[tokio::test]
+async fn a_refused_migrate_for_a_dml_only_role_names_the_remedy() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    rewind_to_v8(&raw).await;
+    let (as_role, _grants) = dml_only_role(&db, &raw).await;
+
+    let handle = Trellis::connect(as_role, TrellisOptions::default())
+        .await
+        .expect("connects");
+    let err = handle.migrate().await.expect_err("the role can't alter");
+    let message = err.to_string();
+    assert!(
+        message.contains("this role cannot create or alter Trellis's tables"),
+        "{message}"
+    );
+    assert!(message.contains("trellis apply"), "{message}");
+    assert!(!v9_ran(&raw).await);
+}
+
 /// Rule 3's refusals: a role that can read and write Trellis's tables but
 /// not alter them can't run the migrations, so its background process
 /// stands by and says why, in its log and in `status()`, and tries again
