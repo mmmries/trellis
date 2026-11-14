@@ -210,9 +210,18 @@ impl PauseReason {
     /// A standing capture failure about `table` (and none of its columns)
     /// that no upstream caused.
     pub(crate) fn capture(table: &str, text: impl Into<String>) -> PauseReason {
+        PauseReason::capture_of(table, Vec::new(), text)
+    }
+
+    /// [`PauseReason::capture`] about `columns` of `table`.
+    pub(crate) fn capture_of(
+        table: &str,
+        columns: Vec<String>,
+        text: impl Into<String>,
+    ) -> PauseReason {
         PauseReason::Capture {
             table: table.to_string(),
-            columns: Vec::new(),
+            columns,
             text: text.into(),
             caused_by: None,
         }
