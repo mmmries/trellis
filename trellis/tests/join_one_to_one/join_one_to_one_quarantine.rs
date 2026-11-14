@@ -892,10 +892,11 @@ async fn an_a_page_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
 }
 
 /// A page that parks a held key's change for one definition and writes a
-/// 1-1 `JOIN` target of a lower id takes both definitions' rows in id order,
-/// before its first target: a re-backfill of their table, which takes every
-/// reader's row `FOR UPDATE` in id order, queues behind the page instead of
-/// closing a cycle with it (#2019).
+/// 1-1 `JOIN` target of a lower id takes both definitions' rows in one id
+/// order, after its other targets: a re-backfill of their table, which takes
+/// every reader's row `FOR UPDATE` in id order, either runs before the page
+/// takes any of them or queues behind the page, and never closes a cycle with
+/// it (#2019).
 #[tokio::test]
 async fn a_page_that_parks_and_writes_a_join_and_a_rebackfill_never_deadlock() {
     let kind = Kind::Left;
@@ -940,7 +941,7 @@ async fn a_page_that_parks_and_writes_a_join_and_a_rebackfill_never_deadlock() {
     )
     .await;
     let batch = d.seal().await;
-    // Frozen at the copy's entry lock: past the park, before the join.
+    // Frozen at the copy's entry lock, before the definition rows.
     let mut page = d
         .drain_frozen(
             batch,
@@ -954,7 +955,16 @@ async fn a_page_that_parks_and_writes_a_join_and_a_rebackfill_never_deadlock() {
         handle.shutdown().await.expect("shutdown");
         result
     });
-    d.wait_blocked_behind(reached.backend_pid).await;
+    // The re-backfill queues behind the page only if the page holds one of
+    // its rows already: then it holds the copy's, from a park before its
+    // targets, and asks for the join's after.
+    testkit::wait_blocked_behind(
+        &d.ctl,
+        reached.backend_pid,
+        std::time::Duration::from_secs(60),
+        || backfill.is_finished(),
+    )
+    .await;
     d.release(&mut page, PausePoint::AfterEntryLock).await;
     let page_result = page.finish_result().await;
     let backfill_result = backfill.await.expect("the backfill task");

@@ -1466,8 +1466,8 @@ fn fan_lock_groups(shape: &JoinShape, inline: &PageKeys, root: bool) -> (Vec<Pag
 /// The definitions' rows `plans` (one page's) need, each with whether it is
 /// taken `FOR UPDATE`, and the ids of those whose page truncates `b` for
 /// [`start_rebuilds`]. The page takes them with every other definition row
-/// it needs, in one id order, before its first target
-/// (`super::apply::apply_page`). A rebuild's start takes every definition's
+/// it needs, in one id order, after its other targets and before its first
+/// 1-1 `JOIN` lock row (`super::apply::apply_page`). A rebuild's start takes every definition's
 /// row it rebuilds `FOR UPDATE`, in id order, before it takes their lock rows
 /// (`crate::intake::catch_up`, `super::build::BuildStarts::stamp`): a page
 /// that held one target's lock row, or another definition's row taken out of

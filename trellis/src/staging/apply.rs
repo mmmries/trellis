@@ -4233,33 +4233,6 @@ pub(crate) async fn apply_page(
     // 1. Version fence.
     hold_version_fences(txn, &plan.versions).await?;
 
-    // 1b. Every definition row the page needs, in one id order, before
-    // anything it parks or writes: those it parks a held key's change for
-    // (`FOR KEY SHARE`) and its 1-1 `JOIN` targets' (`join_one_to_one`'s
-    // `definition_locks`). A rebuild's start takes its readers' rows `FOR
-    // UPDATE` in id order, so a page that held one while it queued on a
-    // lower one would close a cycle with it.
-    let (mut definitions, join1_rebuilds) =
-        super::join_one_to_one::definition_locks(plan.join1_targets.values());
-    for (id, _) in &plan.poisoned_park {
-        definitions.entry(*id).or_default();
-    }
-    lock_definition_rows(txn, &definitions).await?;
-
-    // 1c. Park this batch's own folded contribution for every
-    // already-poisoned key it's excluding, before the drained mark below —
-    // "parked work is the source of truth" means every excluding batch must
-    // do this itself, in the same transaction, not just the batch that
-    // caused the eviction. See `quarantine::park_batch_contribution`'s doc
-    // comment for why this runs unconditionally rather than only on the
-    // batch that tripped the threshold. Attributed to the lowest (earliest)
-    // of the coalesced segments — `poison_held`'s `seg_seq` is audit
-    // bookkeeping ("which batch's contribution is this"), not something
-    // later correctness depends on picking exactly right among several
-    // equally-valid coalesced segments.
-    quarantine::park_batch_contribution(txn, &plan.floors, steps[0].seg_seq, &plan.poisoned_park)
-        .await?;
-
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
     // Every target write below reports its physically-changed
@@ -4361,8 +4334,38 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // 3d. 1-1 `JOIN` targets, in target order, under the definition rows
-    // step 1b took.
+    // 3d. Every definition row the page needs, in one id order, after its
+    // other targets and before its 1-1 `JOIN` targets' lock rows: those it
+    // parks a held key's change for (`FOR KEY SHARE`) and its 1-1 `JOIN`
+    // targets' (`join_one_to_one`'s `definition_locks`). A rebuild's start
+    // takes its readers' rows `FOR UPDATE` in id order, so a page that held
+    // one while it queued on a lower one would close a cycle with it; and a
+    // group-basis build's last transaction takes its readers' rows `FOR
+    // UPDATE` after its groups (`build`'s `run_group_structure`), so a page
+    // that held one while it queued on a group would close one too.
+    let (mut definitions, join1_rebuilds) =
+        super::join_one_to_one::definition_locks(plan.join1_targets.values());
+    for (id, _) in &plan.poisoned_park {
+        definitions.entry(*id).or_default();
+    }
+    lock_definition_rows(txn, &definitions).await?;
+
+    // 3e. Park this batch's own folded contribution for every
+    // already-poisoned key it's excluding, before the drained mark below —
+    // "parked work is the source of truth" means every excluding batch must
+    // do this itself, in the same transaction, not just the batch that
+    // caused the eviction. See `quarantine::park_batch_contribution`'s doc
+    // comment for why this runs unconditionally rather than only on the
+    // batch that tripped the threshold. Attributed to the lowest (earliest)
+    // of the coalesced segments — `poison_held`'s `seg_seq` is audit
+    // bookkeeping ("which batch's contribution is this"), not something
+    // later correctness depends on picking exactly right among several
+    // equally-valid coalesced segments.
+    quarantine::park_batch_contribution(txn, &plan.floors, steps[0].seg_seq, &plan.poisoned_park)
+        .await?;
+
+    // 3f. 1-1 `JOIN` targets, in target order, under the definition rows
+    // step 3d took.
     for join1_plan in plan.join1_targets.values() {
         let (written, deleted) = super::join_one_to_one::apply_page(
             txn,
