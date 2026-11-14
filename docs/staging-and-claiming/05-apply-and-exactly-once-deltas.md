@@ -491,15 +491,17 @@ rest (or an upsert that does both).
 | Version fence (`source_table_versions`) | `FOR SHARE`; bumped by an update | table name | `FOR SHARE`: a page, a build chunk, a sweep batch, a fan-out chunk, first. Bumped: a define, an edit, a drop, a resume, a pause, a release |
 | Column-pause lock (advisory) | shared or exclusive | — | A reader or writer of pause state (`locks::lock_column_pauses`) |
 | Fuse gate (`transform_fuse_gate`) | upsert | id | An eviction |
-| Definition rows (`transform_definitions`) | `FOR KEY SHARE`, `FOR NO KEY UPDATE` or `FOR UPDATE` | id | `KEY SHARE`: a page that parks a quarantined key's change, a plan job before it enqueues chunks, a GC batch (`NOWAIT`). `NO KEY UPDATE`: an eviction, a release, a re-type. `UPDATE`: a pause, a resume, a drop, a build's or a rebuild's start, a chunk's failure |
+| Definition rows (`transform_definitions`) | `FOR KEY SHARE`, `FOR NO KEY UPDATE` or `FOR UPDATE` | id | `KEY SHARE`: a page that parks a quarantined key's change, a plan job before it enqueues chunks, a GC batch (`NOWAIT`). `NO KEY UPDATE`: an eviction, a release, a re-type. `UPDATE`: a pause, a resume, a drop, an edit, a build's or a rebuild's start, a chunk's failure |
 | Parked rows (`poison_held`) | upsert | `(transform_id, src_table, key)` | A page that parks |
-| Build chunks (`backfill_chunks`) | `FOR KEY SHARE` or `FOR UPDATE` | id | `KEY SHARE`: a chunk's claim fence. `UPDATE`: a resume, a drop (its cascade), a chunk's failure |
+| Build chunks (`backfill_chunks`) | `FOR KEY SHARE` or `FOR UPDATE` | id | `KEY SHARE`: a chunk's claim fence. `UPDATE`: a resume, a drop (its cascade), a chunk's failure; a claim and a reclaim `SKIP LOCKED`, which never wait |
+| Truncate clears, 1-1 targets' then aggregate targets' | `TRUNCATE` of the ledger or hidden table (`ACCESS EXCLUSIVE`), the truncate floor upserted, the target's rows deleted | unsorted; the page drains alone | A page that carries a `TRUNCATE` |
 | 1-1 targets, in target order: entries, then rows | entries insert-then-lock `FOR UPDATE`; rows `FOR UPDATE` | entry key; target key | A page; a build chunk and a sweep batch (entries, then one statement writes the rows) |
 | Aggregate targets, in target order: hidden groups, then visible rows | insert-then-lock; upsert | group columns | A page, a build |
 | `JOIN` targets, in target order: lock row, `J`, `P` and `M` cells, `T` | lock row `FOR SHARE`, `FOR UPDATE` with a `TRUNCATE`; `J` insert-then-lock `FOR UPDATE`; cells and `T` insert-then-lock | join columns; group columns | A page, a build |
 | 1-1 `JOIN` definition rows | `FOR UPDATE` if the page truncates `b`, else `FOR KEY SHARE` if it may hold a row | id | A page, a fan-out chunk; a rebuild's start (`FOR UPDATE`) |
-| 1-1 `JOIN` targets, in target order: lock row, `J`, fan-out marker, `R`, `M`, target rows | lock row as for `JOIN`; `J`, `R` and `M` insert-then-lock `FOR UPDATE`; marker and target rows `FOR UPDATE` | `J` `(position, key)`; `R` entry key; `M` `(position, id)`; target rows none, since every writer of one holds its `R` entry | A page, a build step, a fan-out chunk (one key's `J` and marker) |
-| Segment claims and rows (`seg_claims`, `segments`) | update or delete; `FOR NO KEY UPDATE` | `seg_seq` | A page's completion, last |
+| 1-1 `JOIN` targets, in target order: lock row, `J`, `R`, `M`, target rows | lock row as for `JOIN`; `J`, `R` and `M` insert-then-lock `FOR UPDATE`; fan-out markers and target rows `FOR UPDATE` | `J` `(position, key)`; `R` entry key; `M` `(position, id)`; markers and target rows none, since every writer of a marker holds its key's `J` row and every writer of a target row its `R` entry | A page (its markers after `M`), a build step, a fan-out chunk (one key's `J`, its marker, then `R`) |
+| Segment claims and rows (`seg_claims`, `segments`), then `drain_cursor` and `drain_holdups` | update or delete; `FOR NO KEY UPDATE`; upsert; `FOR UPDATE` | `seg_seq` | A page's completion |
+| Segment pointer (`segment_pointer`) | `FOR SHARE`; updated by a seal after a segment's row | — | A build's or rebuild's start, last: a page that truncates a 1-1 `JOIN`'s `b` starts its rebuilds after its completion |
 
 The [1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger), the
 [group basis](group-basis.md#a-page) and
