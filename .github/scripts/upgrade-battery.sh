@@ -1308,10 +1308,11 @@ if want mixed; then
 
   # The same deploy with no `migrate` step anywhere (ADR-0023 rule 3): the
   # candidate is an embedded application's worker, not `trellis run`, so
-  # nothing else migrates. It stands by beside the old instance (its log says
-  # so; with only the migrations pending the catalog still reads, so `status()`
-  # answers and does not refuse), and once the old instance stops it runs the
-  # migrations itself and takes over.
+  # nothing else migrates. It stands by beside the old instance, and once the
+  # old instance stops it runs the migrations itself and takes over. Beside a
+  # release before 0.2.0 its `status()` refuses naming the pending migrations;
+  # from 0.2.0 on the catalog still reads, so `status()` answers and the
+  # standby shows in its log (the probe prints the engine's log events).
   if [ -z "$probe_new" ]; then
     record FAIL mixed "the probe does not build against the candidate, so the embedded handover did not run (see $logs/build-probe-candidate.log)"
   else
@@ -1322,11 +1323,15 @@ if want mixed; then
     pre_emb_history=$(history "$port" mixedemb)
     worker_bg new-mixedemb "$port" mixedemb "$probe_new" m_agg
     sleep 15
-    standby_re='standing by: .*migrations are pending and Trellis processes are live'
+    if [ "$old_pre020" -eq 1 ]; then
+      standby_re="this binary's migrations haven't run on this instance" standby_says="status() says the migrations are pending"
+    else
+      standby_re='standing by: .*migrations are pending and Trellis processes are live' standby_says="its log says it stands by"
+    fi
     paused_n=$(scalar "$port" mixedemb "select count(*) from trellis.capture_failures")
     if run_alive new-mixedemb && [ "$(history "$port" mixedemb)" = "$pre_emb_history" ] &&
        [ "$paused_n" -eq 0 ] && grep -qE "$standby_re" "$logs/run-new-mixedemb.log"; then
-      record PASS mixed "an embedded candidate worker stands by beside a live $old_tag instance: no migration ran and nothing paused ($(grep -E "$standby_re" "$logs/run-new-mixedemb.log" | head -1 | cut -c1-200))"
+      record PASS mixed "an embedded candidate worker stands by beside a live $old_tag instance: no migration ran, nothing paused, and $standby_says ($(grep -E "$standby_re" "$logs/run-new-mixedemb.log" | head -1 | cut -c1-200))"
     else
       record FAIL mixed "the embedded candidate worker did not stand by beside a live $old_tag instance ($paused_n paused, process $(run_alive new-mixedemb && echo running || echo exited), history $( [ "$(history "$port" mixedemb)" = "$pre_emb_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixedemb.log" | cut -c1-300))"
     fi

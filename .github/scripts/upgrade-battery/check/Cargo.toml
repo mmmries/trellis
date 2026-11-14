@@ -15,3 +15,6 @@ publish = false
 # Named `engine` so publish-packages.sh's rename of `trellis = { path = ... }` never matches it.
 engine = { package = "trellis", path = "TRELLIS_PATH" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+# `worker` prints the engine's log events (its standby and takeover lines), as
+# an embedded application's subscriber would.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
