@@ -82,8 +82,8 @@ break compatibility (a 0.x minor before 1.0, a major after).
 A fix that makes evaluation match what the documentation already says is a
 bug fix, not a change in meaning: it ships in any release, with no bump and no
 translation, and its release notes list the definitions to rebuild. By default
-the same holds for a fix toward Postgres's behaviour where the documentation is
-silent ([ADR-0022](0022-grammar-mirrors-postgres.md)).
+the same holds for a fix that makes evaluation match Postgres's where the
+documentation is silent ([ADR-0022](0022-grammar-mirrors-postgres.md)).
 
 ### Loading translates older text into the current grammar, in one place
 
