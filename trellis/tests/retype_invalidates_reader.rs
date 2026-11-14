@@ -427,7 +427,7 @@ async fn a_source_retype_to_unscaled_numeric_keeps_its_sum_readers_exact() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// The narrowed R1 for a change between two declared scales: a `SUM`
+/// The narrowed identity-or-type check for a change between two declared scales: a `SUM`
 /// over `numeric(10,2)` re-typed to `numeric(12,4)` pauses nothing, and the
 /// capture pass rebuilds the aggregate on its own, whose total and average
 /// are Postgres's text over the re-scaled values (`3.7500`, equal to the

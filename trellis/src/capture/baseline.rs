@@ -5,8 +5,8 @@
 //! Capture knows a column by its name, and three kinds of DDL change what a
 //! column holds without firing a DML trigger or changing its name:
 //!
-//! - **R1, the column's identity.** A column dropped and re-added under the
-//!   same name has a new `attnum`, and every row holds its new default. A
+//! - **The column's identity or type.** A column dropped and re-added under
+//!   the same name has a new `attnum`, and every row holds its new default. A
 //!   retype (`ALTER COLUMN ... TYPE`) can change every value's text: a
 //!   `numeric` scale change re-renders `1.50` as `1.5000` or rounds it, a
 //!   narrower `varchar` drops trailing spaces, `integer` to `double
@@ -19,7 +19,7 @@
 //!   changes which type rules admit the rest, so their floors are stamped
 //!   again (ADR-0024).
 //!   A copy Trellis made that it outgrows is `pause_readers_of_retyped`'s.
-//! - **R3b, a same-type value rewrite.** `ALTER COLUMN b TYPE integer USING
+//! - **A same-type value rewrite.** `ALTER COLUMN b TYPE integer USING
 //!   b * 10` on an `integer` column rewrites the table with no DML trigger,
 //!   and leaves the column's name, `attnum`, type and modifier as they were.
 //!   It does move two things: the `xmin` of the column's `pg_attribute`
@@ -27,8 +27,8 @@
 //!   (`SET DEFAULT`, `SET NOT NULL` and `SET STATISTICS` move the row;
 //!   `VACUUM FULL`, `CLUSTER`, pg_repack and a volatile `ADD COLUMN` move the
 //!   file node), and both together when a metadata `ALTER` and a rewrite
-//!   land in the same pass window, as framework migrations often do. So R3b
-//!   also requires the rest of the row, with the column's default
+//!   land in the same pass window, as framework migrations often do. So the
+//!   rewrite check also requires the rest of the row, with the column's default
 //!   expression, to be unchanged ([`Column::hash`]): a rewrite that changed
 //!   nothing else about the column. The row's attribute version, which
 //!   PostgreSQL 15.20, 16.16, 17.12 and 18.7 move on every `ALTER COLUMN ...
@@ -38,7 +38,7 @@
 //!   SET EXPRESSION AS (...)` (PostgreSQL 17 and later) rewrites the table
 //!   with every value of `g` computed by the new expression, with no DML
 //!   trigger, and changes the column's `pg_attrdef` expression, so its row's
-//!   hash changed and R3b doesn't see it. It is acted on when the column is
+//!   hash changed and the rewrite check doesn't see it. It is acted on when the column is
 //!   stored generated before and after, the file node moved, and the
 //!   expression's own hash ([`Column::expr_hash`]) changed. The hash leaves
 //!   out the expression's `:location` fields, and the expression refers to the
@@ -46,7 +46,7 @@
 //!   that parses the same changes nothing. A major-version `pg_upgrade`
 //!   stores every expression anew (PostgreSQL 18 adds a field to every column
 //!   reference) but keeps every file node. A `SET EXPRESSION` that restates
-//!   the column's expression leaves the hash as it was, and is R3b's.
+//!   the column's expression leaves the hash as it was, and is the rewrite check's.
 //!
 //! # The baseline
 //!
@@ -75,15 +75,16 @@
 //!
 //! The response follows the definition's validity:
 //!
-//! - **R3b, a stored generated column's expression replaced, and R1 where
-//!   every definition reading the column is still valid as written:** only
-//!   data was missed. The pass rebuilds every applying
-//!   reader of the table, exactly what `Trellis::request_backfill(table)`
+//! - **A same-type rewrite, a stored generated column's expression replaced, and
+//!   an identity or type change where every definition reading the column is
+//!   still valid as written:** only data was missed. The pass rebuilds every
+//!   applying reader of the table, exactly what `Trellis::request_backfill(table)`
 //!   does (`intake::catch_up::park_table_catch_ups`), and pauses nobody. It
 //!   logs a `WARN` naming the table, the cause and the readers it rebuilt,
 //!   and counts `capture_auto_rebuilds_total{source_table, cause}`
 //!   ([`CaptureRebuildCause`]).
-//! - **R1 where a definition reading the column may no longer be valid:**
+//! - **An identity or type change where a definition reading the column may no
+//!   longer be valid:**
 //!   define would now refuse it (`defs::catalog::revalidate`: `date + c`
 //!   over a `bigint`, a narrowing `CAST`), a column Trellis created for
 //!   it from the column was outgrown by an integer or float width (a copy
@@ -103,9 +104,9 @@
 //! the pass runs it after the logical-restore check, so a restored
 //! database's OIDs are never compared with the original's.
 //!
-//! R1's type check leaves alone a definition that uses the column as a
+//! The type check leaves alone a definition that uses the column as a
 //! key: `pause_readers_of_retyped` owns a key column's type. A key
-//! column dropped and re-added is R1's.
+//! column dropped and re-added is the identity check's.
 //!
 //! # A type renamed
 //!
@@ -118,7 +119,7 @@
 //!
 //! A metadata `ALTER` (`SET DEFAULT`, `SET STATISTICS`) on the same column,
 //! in the same pass window as a `USING` rewrite of it, changes the row the
-//! hash covers, so R3b misses the rewrite. So does the first rewrite of a
+//! hash covers, so the rewrite check misses the rewrite. So does the first rewrite of a
 //! column added with a constant default: its row keeps that default for the
 //! rows that predate it (`atthasmissing`) until the table is rewritten, and
 //! any rewrite clears it, `VACUUM FULL` included, which is why the hash
@@ -138,9 +139,10 @@
 //! after it.
 //!
 //! A pure widening with a `USING` that changes values (`integer` to `bigint
-//! USING b * 10`) is never R1's, and its row changed, so it isn't R3b's
-//! either: only a column Trellis created that it outgrows pauses its
-//! readers. These are in `docs/known-correctness-gaps.md`.
+//! USING b * 10`) is never an identity or type change, and its row
+//! changed, so it isn't a same-type rewrite either: only a column Trellis
+//! created that it outgrows pauses its readers. These are in
+//! `docs/known-correctness-gaps.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -666,21 +668,21 @@ pub(crate) async fn follow_renamed_types(client: &mut Client) -> Result<(), Capt
 /// What changed about one column since the baseline, on any of its nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Change {
-    /// R3b: its values were rewritten in place.
+    /// Rewrite: its values were rewritten in place.
     Rewritten,
     /// A stored generated column's values were rewritten under a new
     /// expression (`SET EXPRESSION`).
     ExpressionChanged,
-    /// R1: a pure widening ([`key_types::pure_widening`]): every value keeps
+    /// Identity or type: a pure widening ([`key_types::pure_widening`]): every value keeps
     /// its text, so nothing rebuilds, but a reader may no longer be valid (a
     /// `date + c` over an integer widened to `bigint`), and the type rules
     /// that admit it may
     /// have changed, which only its re-validation tells.
     Widened { from: String, to: String },
-    /// R1: its type or modifier changed, not by a pure widening, from the
+    /// Identity or type: its type or modifier changed, not by a pure widening, from the
     /// first rendering to the second.
     Retyped { from: String, to: String },
-    /// R1: it was dropped and re-added, with its type before and now.
+    /// Identity or type: it was dropped and re-added, with its type before and now.
     Readded { from: String, to: String },
 }
 
@@ -941,7 +943,7 @@ pub(crate) async fn check(
     Ok(!pauses.is_empty())
 }
 
-/// What `reader` needs for `change` to `column` of `table` (R1), by the
+/// What `reader` needs for `change` to `column` of `table` (an identity or type change), by the
 /// validity rule: `None` when its key use of the column leaves a type
 /// change to `pause_readers_of_retyped`.
 #[allow(clippy::too_many_arguments)]
@@ -1308,7 +1310,7 @@ mod tests {
             Some(Change::ExpressionChanged)
         );
         // 17: a function the expression calls replaced, then an identical
-        // `SET EXPRESSION`: only R3b sees it.
+        // `SET EXPRESSION`: only the rewrite check sees it.
         assert_eq!(
             compare(&was, &generated("200", 16390, "h", "e")),
             Some(Change::Rewritten)
@@ -1318,7 +1320,7 @@ mod tests {
         assert_eq!(compare(&was, &generated("100", 16384, "h", "e")), None);
         assert_eq!(compare(&was, &generated("100", 16390, "h", "e")), None);
         // 28: a same-type `ALTER COLUMN g TYPE integer` and `VACUUM FULL` in
-        // one window: R3b's rebuild for nothing, no new cause.
+        // one window: the rewrite check's rebuild for nothing, no new cause.
         assert_eq!(
             compare(&was, &generated("200", 16390, "h", "e")),
             Some(Change::Rewritten)

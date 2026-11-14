@@ -697,40 +697,38 @@ retry policy), which `status` reports as `drain_failure` on the definitions
 reading its tables, and the worker re-claims the page at the poll interval
 under a collapsed warning.
 
-## Invariants
+## What this stage rests on
 
-1. **The claim is an optimization; the fence plus the atomic apply ∪ mark are the
-   correctness mechanism.** A patch that makes correctness depend on claim
-   exclusivity is wrong.
-2. **The claimed batch is immutable.** Every producer writes to the *active*
-   batch, including a worker doing downstream propagation.
-3. **Apply and its claim ending are one commit**, per claimed bucket set and
-   page: the cursor advance on an earlier page, the drained mark on the last.
-   Splitting them reintroduces double-counting on the non-idempotent delta path.
-4. **A row's bucket is a total function of the row and its batch** — no row in
-   two buckets, none in zero.
-5. **The fold's four rules are individually load-bearing.**
-6. **Recompute reads committed current state and is deterministic.** A written
-   value is never *wrong* — it is a deterministic function of the state that was
-   read — only possibly *superseded*, and a later batch guarantees the superseding
-   recompute runs. Parallelism costs some redundant recomputes, never a wrong
-   final value. "Later" means later to *commit*, not later in `seg_seq`: for an
-   absolute write, invariant 7 is what makes that true.
-7. **A non-commutative write commits only if its basis is still current**, checked
-   under a lock that serializes every Phase 3 for that key. A new write path must
-   either commute (deltas), check its basis, or be serialized some other way
-   (the truncate barrier). A ledger entry or a group records its
-   basis, and every change to it is checked against it, so a group's
-   increments stay exactly-once. See the
-   classification table under
-   [the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger).
-8. **No Trellis transaction waits for a lock longer than `lock_timeout`**, and a
-   timed-out transaction is retried from outside any transaction, never
-   waited out inside one. Every connection caps the setting when it connects
-   ([I7](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)).
-9. **DDL on a user table runs in a retry loop of short transactions**, one
-   attempt per 200 ms. DDL writers queue behind runs under a 50 ms
-   `lock_timeout`, so no application writer queues behind it for longer than
-   that. `SHARE UPDATE EXCLUSIVE` DDL, which writers don't queue behind, waits
-   past `deadlock_timeout` so a blocking autovacuum is cancelled
-   ([I6](#ddl-on-a-user-table-never-blocks-a-writer-adr-0002-i6)).
+The numbered rules (I0 to I8, R1 to R9) are indexed, with their pins, in
+[invariants and pins](08-invariants-and-pins.md). The properties specific to
+this stage:
+
+- **The claim is an optimization; the fence plus the atomic apply ∪ mark are the
+  correctness mechanism.** A patch that makes correctness depend on claim
+  exclusivity is wrong.
+- **The claimed batch is immutable.** Every producer writes to the *active*
+  batch, including a worker doing downstream propagation.
+- **Apply and its claim ending are one commit**, per claimed bucket set and
+  page: the cursor advance on an earlier page, the drained mark on the last.
+  Splitting them reintroduces double-counting on the non-idempotent delta path.
+- **A row's bucket is a total function of the row and its batch** — no row in
+  two buckets, none in zero.
+- **The fold's four rules are individually load-bearing.**
+- **Recompute reads committed current state and is deterministic.** A written
+  value is never *wrong* — it is a deterministic function of the state that was
+  read — only possibly *superseded*, and a later batch guarantees the superseding
+  recompute runs. Parallelism costs some redundant recomputes, never a wrong
+  final value. "Later" means later to *commit*, not later in `seg_seq`: for an
+  absolute write, I2 is what makes that true.
+- **A non-commutative write commits only if its basis is still current** (I2),
+  checked under a lock that serializes every Phase 3 for that key. A new write path must
+  either commute (deltas), check its basis, or be serialized some other way
+  (the truncate barrier, R9). A ledger entry or a group records its
+  basis, and every change to it is checked against it, so a group's
+  increments stay exactly-once. See the
+  classification table under
+  [the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger).
+- **No lock wait holds a snapshot open, and DDL on a user table never blocks
+  a writer** (I7, I6): see the two sections on
+  [lock waits](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7) and
+  [user-table DDL](#ddl-on-a-user-table-never-blocks-a-writer-adr-0002-i6).

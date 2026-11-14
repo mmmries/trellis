@@ -60,6 +60,12 @@ jobs:
         # matrix below matches TEST_SHARDS; see .github/scripts/test-shards.py.
         run: python3 .github/scripts/test-shards.py check
 
+      - name: Check the rule ids cited in source
+        # Every I/R/Rx/JR/W rule id in a `trellis/src` comment has a row in the
+        # rule index of docs/staging-and-claiming/08-invariants-and-pins.md;
+        # see .github/scripts/check-rule-ids.py.
+        run: python3 .github/scripts/check-rule-ids.py
+
       - name: Check doc links and anchors
         # Relative Markdown links, their #fragments, and `docs/....md#anchor`
         # references in source; see .github/scripts/check-doc-links.py.
