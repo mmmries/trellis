@@ -27,7 +27,7 @@
 //!   `standard_conforming_strings` can't change their meaning either.
 //! - **It renders a value with the type's output function.** That is what
 //!   `format('%s', col)` calls, and what the rest of Trellis compares a
-//!   value's text against; `tests/capture_parity.rs` pins it against a golden
+//!   value's text against; `tests/capture/capture_parity.rs` pins it against a golden
 //!   fixture. `::text` is not the same: for example,
 //!   it strips `char(n)` padding. A `NULL` stays a JSON `null`, because
 //!   `format('%s', NULL)` is an empty string.
@@ -1195,7 +1195,7 @@ impl Render {
 /// version a transaction writes is in one statement's new rows and, unless
 /// it is the final one, one later statement's old rows, so the sums
 /// telescope. 1-1 readers ignore the column.
-/// `tests/capture_transition_images.rs` checks the sum for each nested-write
+/// `tests/capture/capture_transition_images.rs` checks the sum for each nested-write
 /// shape.
 ///
 /// The re-read never sees another transaction's change. Each row it joins
@@ -1219,7 +1219,7 @@ impl Render {
 ///   from `1.0` to `1.00` would find the new row for the old key and never
 ///   stage the old key's delete.
 ///
-/// `tests/capture_reread.rs` checks this at every isolation level.
+/// `tests/capture/capture_reread.rs` checks this at every isolation level.
 ///
 /// # An update that changed nothing read stages nothing
 ///

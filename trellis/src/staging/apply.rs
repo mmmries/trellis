@@ -1383,7 +1383,7 @@ mod tests {
         .collect();
         // The fixture entry point registers against a target its caller
         // already created, so the table comes first (from a hand-built
-        // `TransformDef`, as `tests/end_to_end_latency.rs` does).
+        // `TransformDef`, as `tests/staging/end_to_end_latency.rs` does).
         let mid_text = format!("TRANSFORM {mid_qualified} FROM {source} SELECT price AS p");
         let mid_def = crate::defs::ast::TransformDef {
             target: mid.to_string(),

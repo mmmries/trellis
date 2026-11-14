@@ -899,7 +899,7 @@ mod tests {
     /// two processes that found it due at once, the second finds the marker
     /// the first wrote, and runs nothing (here: leaves text this release
     /// refuses unpaused); an explicit `migrate` runs it every time. (That it
-    /// runs when due: `tests/version_handover.rs`.)
+    /// runs when due: `tests/client_app/version_handover.rs`.)
     #[tokio::test]
     async fn a_takeover_migrate_runs_the_work_only_while_it_is_due() {
         let cluster = testkit::TestCluster::start();

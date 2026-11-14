@@ -10,14 +10,11 @@
 //!
 //! An asymmetric family runs in both orientations: as written, and with the
 //! two positions swapped ([`swap`]), seed and writers alike.
-//!
-//! A binary using this module also declares `support/drain_driver.rs` as
-//! `mod drain_driver` and `support/star.rs` as `mod star` at its root.
 
 #![allow(dead_code)]
 
-use crate::drain_driver::Driver;
-use crate::star::{self, Shape, Star, Writer};
+use super::drain_driver::Driver;
+use super::star::{self, Shape, Star, Writer};
 use trellis::staging::interleave::PausePoint;
 
 /// The star of three tables.

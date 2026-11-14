@@ -8,8 +8,8 @@
 //! # Two fingerprints, every pass
 //!
 //! One statement per pass hashes two catalog views of the source, on the
-//! server (about 2-3 ms at 1,000 leaves, `tests/partition_fingerprints.rs`
-//! records it):
+//! server (about 2-3 ms at 1,000 leaves,
+//! `tests/partition/partition_thousand_leaves.rs` records it):
 //!
 //! - the **lifecycle** fingerprint covers every node reached from the root
 //!   through `pg_inherits`: its oid, its parent, `inhdetachpending`, the

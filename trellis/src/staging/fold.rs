@@ -527,7 +527,7 @@ fn fold_sql(
     // position on before the next statement's trigger reads it. The truncate
     // floor depends on that, since it refuses every change at or below the
     // truncate's `lsn` (`a_truncate_then_an_insert_in_one_transaction_*` in
-    // `tests/one_to_one_ledger_interleavings.rs` pins it). `change_id` (the ring's
+    // `tests/one_to_one/one_to_one_ledger_interleavings.rs` pins it). `change_id` (the ring's
     // append order) only breaks a tie capture doesn't produce.
     //
     // Load-bearing subtlety: a recompute row's `lsn` is NULL, and Postgres's

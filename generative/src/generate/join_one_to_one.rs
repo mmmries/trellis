@@ -40,7 +40,7 @@
 //! selects fields that read its table.
 //!
 //! The model of a correct target is the same as the pins' of the seam-fed
-//! families (`trellis/tests/join_one_to_one_over_targets.rs`): after each
+//! families (`trellis/tests/join_one_to_one/join_one_to_one_over_targets.rs`): after each
 //! step the pipeline settles and every target equals its query over the
 //! tables, and `self_check` finds nothing.
 //!

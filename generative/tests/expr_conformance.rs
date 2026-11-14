@@ -1514,7 +1514,7 @@ fn a_bare_null_conforms_in_every_context() {
 /// An expression Postgres folds and rejects for every row defines (define
 /// evaluates no constant) and Postgres raises a data exception on the
 /// where-false probe: agreement, as failing while planning. Its rows are
-/// quarantined at run time (`trellis/tests/plan_time_constant_quarantine.rs`).
+/// quarantined at run time (`trellis/tests/expressions/plan_time_constant_quarantine.rs`).
 /// So does an overflow around a call over constants, which Postgres folds
 /// too (#1446), and a guard over such a call.
 #[test]

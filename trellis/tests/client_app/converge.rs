@@ -1,0 +1,609 @@
+//! Integration tests for convergence and the read-your-writes predicate
+//! (stage 07), run against a real, ephemeral Postgres instance
+//! via the shared harness (`testkit::TestCluster`).
+//!
+//! See docs/staging-and-claiming/07-convergence-and-await.md for the design
+//! these tests hold the implementation to. The focus throughout is
+//! SOUNDNESS: every test here is meant to fail on a predicate that narrows
+//! condition 3 (drained-only, band-only, buckets-not-drained), that consults
+//! the summary band, or that treats a missing progress row or a NULL
+//! `origin_lsn` as "not pending".
+//!
+//! The caller-side poll drains nothing, so these tests hold the predicate and
+//! the poll to the doc; the engine's workers are what make a token clear.
+
+use crate::support::pipeline;
+
+use std::time::Duration;
+use testkit::connect_raw;
+
+use testkit::TestCluster;
+use tokio_postgres::Client;
+use tokio_postgres::types::PgLsn;
+use trellis::staging::{StagingError, converge};
+
+/// Inserts a bare recompute row with an explicit `origin_lsn` (recompute's
+/// own type, `StagedChange::Recompute`, never carries one — this reaches
+/// past the type to set it directly, the way `fold.rs`'s `RawRow` does for
+/// its own column it needs to control).
+async fn insert_with_origin(client: &Client, table: &str, key: &str, origin_lsn: Option<u64>) {
+    client
+        .execute(
+            &format!(
+                "insert into {table} (src_table, key, op, hop_gen, origin_lsn) \
+                 values ('orders', $1, 'recompute', 0, $2)"
+            ),
+            &[&key, &origin_lsn.map(PgLsn::from)],
+        )
+        .await
+        .expect("insert recompute row with origin_lsn");
+}
+
+async fn set_segment_state(client: &Client, seg_seq: i64, state: &str) {
+    client
+        .execute(
+            "update segments set state = $2 where seg_seq = $1",
+            &[&seg_seq, &state],
+        )
+        .await
+        .expect("set segment state");
+}
+
+#[tokio::test]
+async fn never_false_converged_until_active_and_sealed_all_clear() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    let token = PgLsn::from(50);
+
+    // A row in the active segment: condition 2 (the active tail) blocks.
+    insert_with_origin(&client, "seg_0", "k1", Some(20)).await;
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "the active segment still holds a row with origin_lsn (20) <= token (50)"
+    );
+
+    // Seal the active segment: the row now lives in a sealed, non-active
+    // slot. Condition 3 must pick up exactly where condition 2 left off —
+    // still not converged.
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "the sealed slot still holds the pending row; condition 3 must catch it"
+    );
+
+    // Only once the segment is marked drained does the row stop gating.
+    set_segment_state(&client, sealed_seg_seq, "drained").await;
+    assert!(
+        converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "the (now-empty) active tail and the drained slot should both clear"
+    );
+}
+
+/// Trigger capture writes a change's ring rows in the
+/// writer's own transaction, so there is no intake progress to wait for. An
+/// empty ring converges with no intake progress recorded anywhere.
+#[tokio::test]
+async fn an_empty_ring_converges_with_no_progress_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let converged = converge::converged_through(&client, PgLsn::from(0))
+        .await
+        .expect("converged_through");
+    assert!(converged, "nothing is pending anywhere");
+}
+
+/// The band would lie, the slot does not: this simulates a row that landed
+/// in an already-sealed slot after the seal (a stand-in for the phase-gap
+/// writer docs/staging-and-claiming/03-sealing-and-the-fence.md describes;
+/// stage 03 owns actually producing that race, so this test reaches past it
+/// and inserts directly). A per-batch summary band computed once at seal
+/// time could not see this row; condition 3 asks the slot itself, so it
+/// must still catch it.
+#[tokio::test]
+async fn the_band_would_lie_the_slot_does_not() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // A row with a comfortably high origin, present before the seal — if a
+    // band existed, this is the only row it would have summarized.
+    insert_with_origin(&client, "seg_0", "high-origin", Some(900)).await;
+    pipeline::seal(&mut client).await;
+
+    let token = PgLsn::from(50);
+    assert!(
+        converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "the only row in the sealed slot has origin_lsn (900) above the token (50)"
+    );
+
+    // Now a straggler lands directly in the already-sealed slot's table,
+    // with an origin far below the token — the shape a band finalized at
+    // seal time would have missed entirely, since it postdates the seal.
+    insert_with_origin(&client, "seg_0", "straggler", Some(10)).await;
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "condition 3 asks the slot directly, so the straggler must still gate"
+    );
+}
+
+/// Regression test for a real bug the generative suite's client-restart/
+/// scale-out lifecycle properties found: a `'drained'` segment used to clear
+/// *every* row in its slot unconditionally, including a phase-gap straggler
+/// (docs/staging-and-claiming/03-sealing-and-the-fence.md, "The scoping bug
+/// worth knowing about") that landed there *after* the segment's own fence
+/// was captured — such a row can never become visible in that immutable
+/// fence, so it is never folded into anything by *this* segment, and only
+/// the immediate successor's own fenced read (once that successor itself
+/// seals) can ever pick it up. If the segment's apply-and-mark nonetheless
+/// reaches `'drained'` (real for a tiny batch: everything it *could* see
+/// drains almost instantly) before that successor seal happens,
+/// `converged_through` used to report `true` — a straggler with no target
+/// write yet, silently misreported as fully converged. See
+/// `generative/tests/client_lifecycle.rs` and
+/// `generative/src/generate/mod.rs`'s `program_with_client_restart`/
+/// `program_with_scale_out` doc comments for the full investigation
+/// history, and `trellis/tests/staging/sealing.rs`'s
+/// `an_empty_active_segment_still_seals_to_catch_a_stranded_straggler` for
+/// the other half of the fix (making sure that successor seal actually
+/// happens).
+#[tokio::test]
+async fn a_drained_slots_unfenced_straggler_still_gates_convergence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    // Nothing in the active segment yet; seal it as-is, capturing S_1 over
+    // an empty slot.
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
+
+    // A straggler lands directly in the now-sealed slot, after S_1 was
+    // captured — genuinely invisible in S_1 forever, the same shape
+    // `sealing.rs`'s phase-gap/straddler tests produce via real timing.
+    insert_with_origin(&client, "seg_0", "stranded", Some(10)).await;
+
+    let token = PgLsn::from(50);
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "a freshly-sealed (not yet drained) slot must still gate on its own straggler"
+    );
+
+    // Stand in for the real apply-and-mark: segment 1 has finished
+    // applying everything *it* could see and reports `'drained'` — but the
+    // straggler was never visible in S_1, so nothing has actually applied
+    // it yet.
+    set_segment_state(&client, sealed_seg_seq, "drained").await;
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "a 'drained' owner must not clear a row it never actually saw — only a row genuinely \
+         visible in its own fence stops gating"
+    );
+
+    // Once the straggler is actually resolved — the successor's own fold
+    // claims it and it is retired out of the ring, exactly like any other
+    // fully-processed row — nothing is left to gate on. Simulated directly
+    // here (retirement's own truncate-then-delete is `retire.rs`'s concern,
+    // already covered there) rather than running the full claim/apply
+    // pipeline this module doesn't otherwise exercise.
+    client
+        .execute("truncate seg_0", &[])
+        .await
+        .expect("truncate seg_0");
+    assert!(
+        converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "once the straggler is gone (resolved and retired), the slot must stop gating"
+    );
+}
+
+#[tokio::test]
+async fn a_part_drained_batch_reports_its_whole_slot_pending() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
+
+    let token = PgLsn::from(50);
+
+    // Draining (not drained) is over-reporting's home: some of the batch
+    // may already be applied, but condition 3 is deliberately not narrowed
+    // to "buckets not yet drained" — the whole slot still counts as
+    // pending.
+    set_segment_state(&client, sealed_seg_seq, "draining").await;
+    assert!(
+        !converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "a draining (part-applied) segment must still report its whole slot pending"
+    );
+
+    // Once the segment actually reaches drained, it stops gating.
+    set_segment_state(&client, sealed_seg_seq, "drained").await;
+    assert!(
+        converge::converged_through(&client, token)
+            .await
+            .expect("converged_through"),
+        "a fully drained segment must no longer gate convergence"
+    );
+}
+
+#[tokio::test]
+async fn zero_origin_and_null_origin_rows_gate_any_token() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    // `origin_lsn = '0/0'` — "unknown, conservatively old" per the doc.
+    insert_with_origin(&client, "seg_0", "zero-origin", Some(0)).await;
+    let far_future_token = PgLsn::from(1_000_000);
+    assert!(
+        !converge::converged_through(&client, far_future_token)
+            .await
+            .expect("converged_through"),
+        "a 0-origin pending row must gate any token"
+    );
+
+    // A NULL origin_lsn (what `StagedChange::Recompute` actually produces —
+    // it never sets the column at all) means the same "unknown" and must
+    // gate identically, not silently fall out of the WHERE filter.
+    client
+        .execute("truncate seg_0", &[])
+        .await
+        .expect("truncate seg_0");
+    insert_with_origin(&client, "seg_0", "null-origin", None).await;
+    assert!(
+        !converge::converged_through(&client, far_future_token)
+            .await
+            .expect("converged_through"),
+        "a NULL-origin pending row must gate any token, same as 0/0"
+    );
+}
+
+#[tokio::test]
+async fn has_pending_reflects_ring_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    assert!(
+        !converge::has_pending(&client)
+            .await
+            .expect("has_pending on an empty ring"),
+        "an empty ring has nothing pending"
+    );
+
+    insert_with_origin(&client, "seg_0", "k1", Some(5)).await;
+    assert!(
+        converge::has_pending(&client)
+            .await
+            .expect("has_pending with an active-tail row"),
+        "a row in the active tail counts as pending"
+    );
+
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
+    assert!(
+        converge::has_pending(&client)
+            .await
+            .expect("has_pending with a sealed, non-drained row"),
+        "a sealed (not yet drained) slot still counts as pending"
+    );
+
+    set_segment_state(&client, sealed_seg_seq, "drained").await;
+    assert!(
+        !converge::has_pending(&client)
+            .await
+            .expect("has_pending once the only slot is drained"),
+        "once every slot is drained, nothing is pending"
+    );
+}
+
+#[tokio::test]
+async fn pending_count_counts_every_pending_row() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    assert_eq!(
+        converge::pending_count(&client)
+            .await
+            .expect("pending_count on an empty ring"),
+        0
+    );
+
+    insert_with_origin(&client, "seg_0", "k1", Some(5)).await;
+    insert_with_origin(&client, "seg_0", "k2", Some(6)).await;
+    assert_eq!(
+        converge::pending_count(&client)
+            .await
+            .expect("pending_count with two active-tail rows"),
+        2
+    );
+
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
+    set_segment_state(&client, sealed_seg_seq, "drained").await;
+    assert_eq!(
+        converge::pending_count(&client)
+            .await
+            .expect("pending_count once the only slot is drained"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn await_converged_returns_once_the_predicate_flips_true() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
+    let sealed_seg_seq = pipeline::seal(&mut client).await;
+
+    let token = PgLsn::from(50);
+
+    // Flip convergence true on a background task, shortly after the poll
+    // starts, so the poll must actually wait and retry rather than only
+    // succeeding when the first check happens to pass.
+    let db2 = db.dsn().to_string();
+    let flip = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let flipper = connect_raw(&db2).await;
+        set_segment_state(&flipper, sealed_seg_seq, "drained").await;
+    });
+
+    converge::await_converged(&client, token, Duration::from_secs(5))
+        .await
+        .expect("await_converged should succeed once the segment drains");
+    flip.await.expect("flip task");
+}
+
+#[tokio::test]
+async fn await_converged_times_out_with_a_named_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    insert_with_origin(&client, "seg_0", "k1", Some(10)).await;
+    pipeline::seal(&mut client).await;
+    // Deliberately never mark the segment drained — convergence can never
+    // be reached.
+
+    let token = PgLsn::from(50);
+    let timeout = Duration::from_millis(50);
+    match converge::await_converged(&client, token, timeout).await {
+        Err(StagingError::ConvergenceTimeout {
+            token: got_token,
+            waited,
+        }) => {
+            assert_eq!(got_token, token);
+            assert!(waited >= timeout);
+        }
+        other => panic!("expected ConvergenceTimeout, got {other:?}"),
+    }
+}
+
+/// Takes `ACCESS EXCLUSIVE` on `poison_held` (which every convergence poll
+/// reads, condition 4) in an open transaction on `holder`, so a poll on
+/// another session blocks on the lock until `holder` rolls back.
+async fn lock_poison_held(holder: &Client) {
+    holder
+        .batch_execute("begin; lock table poison_held in access exclusive mode")
+        .await
+        .expect("lock poison_held");
+}
+
+/// Backends queued behind the `poison_held` lock right now.
+async fn poison_held_waiters(observer: &Client) -> i64 {
+    observer
+        .query_one(
+            "select count(*) from pg_locks \
+             where relation = 'poison_held'::regclass and not granted",
+            &[],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0)
+}
+
+/// `await_converged`'s deadline must hold while a poll is
+/// blocked. Before the fix it checked the deadline only between polls, so a
+/// poll queued behind a lock waited out any timeout (here: until the lock is
+/// released, which this test only does after the call returns).
+///
+/// Three things are pinned: the wait ends in exactly
+/// [`StagingError::ConvergenceTimeout`] (`self_check` reads only that
+/// variant as "not caught up") and does so promptly; the server-side
+/// query is gone once it returns (no backend still queued on the lock); and
+/// the same connection serves a later wait normally.
+#[tokio::test]
+async fn await_converged_times_out_while_a_poll_blocks_on_a_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let holder = connect_raw(db.dsn()).await;
+
+    // Nothing pending, progress past the token: the only thing standing
+    // between this token and `converged` is the lock.
+    let token = PgLsn::from(50);
+
+    lock_poison_held(&holder).await;
+
+    let timeout = Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        converge::await_converged(&client, token, timeout),
+    )
+    .await
+    .expect("await_converged hung past its own 200ms deadline on a blocked poll");
+    let elapsed = started.elapsed();
+
+    match result {
+        Err(StagingError::ConvergenceTimeout {
+            token: got_token,
+            waited,
+        }) => {
+            assert_eq!(got_token, token);
+            assert!(waited >= timeout, "waited {waited:?} < timeout {timeout:?}");
+        }
+        other => panic!("expected ConvergenceTimeout, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a 200ms wait took {elapsed:?} to give up on a blocked poll"
+    );
+
+    // Still holding the lock: had the poll only been abandoned client-side,
+    // its query would still be queued on it.
+    assert_eq!(
+        poison_held_waiters(&holder).await,
+        0,
+        "the timed-out poll's query must not keep running on the server"
+    );
+
+    holder
+        .batch_execute("rollback")
+        .await
+        .expect("release lock");
+    converge::await_converged(&client, token, Duration::from_secs(5))
+        .await
+        .expect("the connection must serve a later wait once the lock is released");
+}
+
+/// A `statement_timeout` the session set itself,
+/// shorter than the wait's budget, fires well before the wait's deadline.
+/// That's the caller's own setting cancelling a query, not the wait running
+/// out of time, so it must surface as the database error it is rather than
+/// as [`StagingError::ConvergenceTimeout`].
+#[tokio::test]
+async fn await_converged_reports_a_session_statement_timeout_as_a_db_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let holder = connect_raw(db.dsn()).await;
+
+    let token = PgLsn::from(50);
+    client
+        .batch_execute("set statement_timeout = '100ms'")
+        .await
+        .expect("set statement_timeout");
+
+    lock_poison_held(&holder).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        converge::await_converged(&client, token, Duration::from_secs(60)),
+    )
+    .await
+    .expect("the session's own 100ms statement_timeout must end the wait");
+
+    match result {
+        Err(StagingError::Db(err)) => assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::QUERY_CANCELED),
+            "expected the session's statement_timeout, got {err}"
+        ),
+        other => panic!("expected the session's statement_timeout as a Db error, got {other:?}"),
+    }
+
+    holder
+        .batch_execute("rollback")
+        .await
+        .expect("release lock");
+}
+
+/// The poll's `statement_timeout` is transaction-local: once a
+/// wait returns, the session's own setting is back, both none (`0`) and one
+/// longer than the poll's budget. A session-level one would outlive the poll
+/// and cancel the connection's later statements.
+#[tokio::test]
+async fn a_poll_leaves_the_session_statement_timeout_as_it_was() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    for session in ["0", "90000"] {
+        client
+            .batch_execute(&format!("set statement_timeout = {session}"))
+            .await
+            .expect("set statement_timeout");
+        converge::await_converged(&client, PgLsn::from(50), Duration::from_secs(5))
+            .await
+            .expect("an empty instance is converged");
+        let in_force: String = client
+            .query_one(
+                "select setting from pg_settings where name = 'statement_timeout'",
+                &[],
+            )
+            .await
+            .expect("read statement_timeout")
+            .get(0);
+        assert_eq!(in_force, session, "after a wait from {session}");
+    }
+}
+
+/// A spent budget still gets one real check. A zero `timeout` means "check
+/// once", and callers lean on that: generative's `quiesce` passes whatever is
+/// left of its own budget (`saturating_sub`), possibly nothing, and expects
+/// the wait to confirm an already-converged ring rather than fail on it. With
+/// the server timeout set to the bare remaining budget, that check would get
+/// a 1ms `statement_timeout` and could never finish.
+#[tokio::test]
+async fn await_converged_with_a_spent_budget_still_checks_once() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+
+    let token = PgLsn::from(50);
+    for _ in 0..20 {
+        converge::await_converged(&client, token, Duration::ZERO)
+            .await
+            .expect("a converged token must pass its one check on a zero budget");
+    }
+}
+
+/// The same floor, made deterministic: the one check on a zero budget is
+/// held up briefly behind a lock (as a poll is behind a segment retire's
+/// `TRUNCATE`) and must still complete rather than time out at once.
+#[tokio::test]
+async fn await_converged_with_a_spent_budget_rides_out_a_brief_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let holder = connect_raw(db.dsn()).await;
+
+    let token = PgLsn::from(50);
+
+    lock_poison_held(&holder).await;
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        holder
+            .batch_execute("rollback")
+            .await
+            .expect("release lock");
+    });
+
+    converge::await_converged(&client, token, Duration::ZERO)
+        .await
+        .expect("a check held up by a brief lock must still complete on a zero budget");
+    release.await.expect("release task");
+}

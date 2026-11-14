@@ -3,7 +3,7 @@
 //! "test-util"))`**, like [`crate::plant`] and the pre-commit pause in
 //! [`super::apply`].
 //!
-//! The interleaving tests (`tests/one_to_one_ledger_interleavings.rs`) freeze one drain
+//! The interleaving tests (`tests/one_to_one/one_to_one_ledger_interleavings.rs`) freeze one drain
 //! worker between two steps of its page transaction, do something else (commit
 //! a source write, drain another batch on another worker), then let it go. No
 //! test sleeps or polls for convergence.

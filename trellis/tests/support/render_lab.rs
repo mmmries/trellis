@@ -13,8 +13,7 @@
 
 use std::collections::HashMap;
 
-#[path = "pipeline.rs"]
-pub mod pipeline;
+pub use super::pipeline;
 
 use testkit::TestDatabase;
 use tokio_postgres::Client;

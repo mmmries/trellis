@@ -3105,7 +3105,7 @@ fn group_by_key_rule(value_type: ValueType) -> Option<super::registry::GroupByKe
         // typed column (`jsonb_populate_record`), through `boolin` — a permissive *input* function that
         // accepts both `'t'`/`'f'` and `'true'`/`'false'` — and groups are
         // then matched natively, in SQL. Two renderings of one value always
-        // resolve to the same group. `trellis/tests/defs_boolean.rs`'s
+        // resolve to the same group. `trellis/tests/defs/defs_boolean.rs`'s
         // `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
         // pins it.
         ValueType::Boolean => Some(super::registry::GroupByKeyRule::Boolean),
@@ -3234,7 +3234,7 @@ fn group_by_key_rule(value_type: ValueType) -> Option<super::registry::GroupByKe
         // introspected type (`bit(5)`, not bare `bit`) verbatim
         // (`ddl::source_primary_key`). It is refused *only* here, and only
         // because this one role's DDL has no concrete-type-introspection
-        // escape hatch to reach for. `trellis/tests/defs_bit.rs` pins both
+        // escape hatch to reach for. `trellis/tests/defs/defs_bit.rs` pins both
         // halves of this split live.
         ValueType::Other(PgType::VarBit) => Some(super::registry::GroupByKeyRule::VarBit),
         // `jsonb` falls through to the reject arm below like

@@ -1619,7 +1619,7 @@ mod tests {
 
     /// The float result types, spelled out — the live-Postgres counterpart
     /// is `float_aggregate_column_types_match_postgres` in
-    /// `trellis/tests/defs_floats.rs`.
+    /// `trellis/tests/defs/defs_floats.rs`.
     #[test]
     fn float_aggregate_result_types_match_postgres() {
         use FloatWidth::{Float4, Float8};

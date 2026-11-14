@@ -476,7 +476,7 @@ it:
   more maintenance
   ([known correctness gaps](known-correctness-gaps.md)).
 * **pg_partman's maintenance needs no operator step on Trellis's side.** The
-  opt-in test tier (`trellis/tests/pg_partman.rs`, [testing
+  opt-in test tier (`trellis/tests/partition/pg_partman.rs`, [testing
   strategy](testing-strategy.md)) drove pg_partman 5.2.4 on PostgreSQL 15.19,
   16.15, 17.11 and 18.6 through six modes (time daily, time without a
   `DEFAULT`, id range, id list, epoch seconds, and time with id

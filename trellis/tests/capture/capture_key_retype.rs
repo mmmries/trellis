@@ -1,0 +1,3770 @@
+//! A key column re-typed after define, or a column Trellis keeps a typed
+//! copy of widened, pauses the definitions it concerns, and a resume
+//! re-validates and rebuilds them.
+//!
+//! Define refuses a key, join or `GROUP BY` column whose type or collation
+//! Trellis can't match by. An `ALTER COLUMN ... TYPE` or `COLLATE` after
+//! define can give one such a type, break a `JOIN`'s same-type `ON`
+//! pairing, render the keys Trellis already stored differently, or outgrow
+//! a copy Trellis keeps of the column. The staging worker's capture pass
+//! pauses the definitions concerned, with the reason on `Trellis::status`.
+//! A resume refuses while define would; otherwise it re-types Trellis's
+//! copies (through the staging worker) and rebuilds.
+//!
+//! Every test is stepped by hand: writes, then explicit capture passes,
+//! drains and backfill runs. Nothing polls for convergence.
+
+use testkit::TestCluster;
+use tokio_postgres::Client;
+use trellis::defs::TransformStatus;
+use trellis::{Trellis, TrellisError};
+
+use crate::support::attver;
+use crate::support::pipeline;
+
+use pipeline::{bring_live, capture_pass, connect, definer, reconcile_pass, settle, status};
+use trellis::staging::build::settle_builds;
+
+const SCHEMA: &str = "trellis";
+
+/// Drains the active segment, whose rows include a key whose write fails:
+/// each failed drain charges the key a death, until it is quarantined and
+/// the drain goes past it. Bounded attempts, not a timed wait. The
+/// quarantined key's held rows keep the ring from quiescence.
+async fn drain_past_failures(pool: &trellis::pool::Pool, client: &mut Client) {
+    use trellis::staging::{apply, retire_drained_segments, seal};
+    let outcome = seal::seal_phase1_waiting(client).await;
+    seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_key_retype_wake")
+        .await
+        .expect("seal phase 2");
+    let mut drained = false;
+    for _ in 0..16 {
+        match apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "capture_key_retype_test",
+            1,
+            "trellis_capture_key_retype_test",
+        )
+        .await
+        {
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => {
+                drained = true;
+                break;
+            }
+        }
+    }
+    assert!(drained, "the segment did not drain within 16 attempts");
+    retire_drained_segments(client)
+        .await
+        .expect("retire drained segments");
+}
+
+/// Whether a stored `status` is a rebuild's: the Re-derive build's own. (A
+/// reader of a rebuilding upstream stays stored `live`; it only reports
+/// `catching_up`.)
+fn rebuilding(status: TransformStatus) -> bool {
+    status == TransformStatus::Backfilling
+}
+
+async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    raw.query(sql, &[])
+        .await
+        .expect(sql)
+        .into_iter()
+        .map(|row| (0..row.len()).map(|i| row.get(i)).collect())
+        .collect()
+}
+
+/// The reasons `target` is paused with, asserting it's paused for a
+/// capture failure on `table` about `columns`.
+async fn paused_for(trellis: &Trellis, target: &str, table: &str, columns: &[&str]) -> String {
+    let reported = trellis.status(target).await.expect("status").expect(target);
+    assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+    let failure = reported
+        .capture_failure
+        .unwrap_or_else(|| panic!("{target}'s reason is reported"));
+    assert_eq!(failure.source_table, table, "{target}");
+    assert_eq!(
+        failure.columns,
+        columns.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+        "{target}"
+    );
+    // The reasons, without what the pass found `RESUME` would do after them,
+    // which it writes again whenever a relation the definition reads changes.
+    match &failure.resume_outcome {
+        Some(outcome) => failure
+            .error
+            .strip_suffix(&format!(". {outcome}"))
+            .unwrap_or_else(|| panic!("{target}: the message ends with the outcome"))
+            .to_string(),
+        None => failure.error,
+    }
+}
+
+/// `RESUME TRANSFORM target`, which must succeed.
+async fn resume(trellis: &Trellis, target: &str) {
+    trellis
+        .apply(&format!("RESUME TRANSFORM {target}"))
+        .await
+        .unwrap_or_else(|err| panic!("resume {target}: {err}"));
+}
+
+/// `RESUME TRANSFORM target`, which must be refused: returns the message.
+async fn resume_refused(trellis: &Trellis, target: &str) -> String {
+    match trellis.apply(&format!("RESUME TRANSFORM {target}")).await {
+        Err(
+            err @ TrellisError::Apply(trellis::staging::apply::ApplyError::ResumeRefused { .. }),
+        ) => err.to_string(),
+        other => panic!("expected the resume of {target} to be refused, got {other:?}"),
+    }
+}
+
+/// `table.column`'s type, as `format_type` renders it.
+async fn column_type(raw: &Client, table: &str, column: &str) -> String {
+    raw.query_one(
+        "select pg_catalog.format_type(atttypid, atttypmod) from pg_catalog.pg_attribute \
+         where attrelid = pg_catalog.to_regclass($1) and attname = $2",
+        &[&table, &column],
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{table}.{column}: {err}"))
+    .get(0)
+}
+
+/// `table`'s `relfilenode`: a rewrite gives the table a new one.
+async fn relfilenode(raw: &Client, table: &str) -> u32 {
+    raw.query_one(
+        "select relfilenode from pg_catalog.pg_class where oid = pg_catalog.to_regclass($1)",
+        &[&table],
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{table}: {err}"))
+    .get(0)
+}
+
+/// Whether `target`'s resume waits on the staging worker to re-type its
+/// copies: it is paused, its reason says so, and its request is recorded.
+async fn assert_retyping(trellis: &Trellis, raw: &Client, target: &str) -> String {
+    let reported = trellis.status(target).await.expect("status").expect(target);
+    assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+    let error = reported.capture_failure.expect("reason").error;
+    assert!(error.starts_with("resuming:"), "{error}");
+    let requested: i64 = raw
+        .query_one(
+            "select count(*) from resume_requests r join transform_definitions d \
+             on d.id = r.transform_id where split_part(d.target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read requests")
+        .get(0);
+    assert_eq!(requested, 1, "{target}");
+    error
+}
+
+/// `public.users` and `public.posts`, joined on `posts.author` =
+/// `users.handle`, with three definitions, all live:
+///
+/// - `post_authors` joins `users` to each post, grouped by the post, the
+///   handle and its name;
+/// - `post_titles` reads only `posts`;
+/// - `per_kind` counts `posts` per `kind`.
+async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
+    raw.batch_execute(
+        "create table public.users (handle varchar(8) primary key, name text); \
+         create table public.posts (id int primary key, author varchar(8), title text, \
+                                    kind int, price numeric(10,2)); \
+         insert into public.users values ('ann', 'Ann'), ('bob', 'Bob'); \
+         insert into public.posts values (1, 'ann', 'a', 1, 1.50), (2, 'bob', 'b', 2, 2.50), \
+                                         (3, 'ann', 'c', 1, 1.50); \
+         create index on public.posts (author);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(dsn).await;
+    for text in [
+        "TRANSFORM post_authors FROM public.posts JOIN public.users \
+         ON posts.author = users.handle GROUP BY posts.id, users.handle, users.name \
+         WITHOUT SOURCE INDEX SELECT posts.id AS id, users.handle AS handle, \
+         users.name AS name, COUNT(*) AS n",
+        "TRANSFORM post_titles FROM public.posts SELECT title AS title",
+        "TRANSFORM per_kind FROM public.posts GROUP BY kind WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(*) AS n",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(raw, pool, &["post_authors", "post_titles", "per_kind"]).await;
+    trellis
+}
+
+/// The changes no key rendering, typed copy or join pairing depends on
+/// pause nothing: widening an aggregate's source key (its ledger keys it by
+/// text), a `GROUP BY` key's `varchar` widening or move to `text` (its copy
+/// is `text`), a wider timestamp precision or numeric precision and scale
+/// on a `GROUP BY` key (its copy is the type's full precision, or
+/// unconstrained `numeric`), any change to a column no definition keys by,
+/// and a change between deterministic collations. No definition pauses,
+/// and every one keeps converging. The `id` widening rewrites the table, and
+/// PostgreSQL's 2026-11 minors re-version the columns after `id`, which the
+/// definitions read, so they read as a same-type rewrite and rebuild
+/// (`support/attver.rs`).
+#[tokio::test]
+async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.events (id int primary key, kind varchar(20), at timestamp(3), \
+                                     price numeric(10,2), note varchar(10)); \
+         insert into public.events values (1, 'a', '2024-01-01 10:00:00.123', 1.50, 'x'), \
+                                          (2, 'b', '2024-01-01 10:00:00.123', 2.50, 'y');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM per_kind FROM public.events GROUP BY kind WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(*) AS n",
+        "TRANSFORM per_at FROM public.events GROUP BY at WITHOUT SOURCE INDEX SELECT at AS at, COUNT(*) AS n",
+        "TRANSFORM per_price FROM public.events GROUP BY price \
+        WITHOUT SOURCE INDEX SELECT price AS price, COUNT(*) AS n",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    let targets = ["per_kind", "per_at", "per_price"];
+    bring_live(&mut raw, &db.pool, &targets).await;
+
+    let attver = attver::Attver::probe(&raw).await;
+    for (alter, then) in [
+        (
+            "alter table public.events alter column id type bigint",
+            TransformStatus::Backfilling,
+        ),
+        (
+            "alter table public.events alter column kind type varchar(40)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column kind type text",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column at type timestamp(6)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column price type numeric(12,3)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column note type varchar(5)",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column note type integer using 0",
+            TransformStatus::Live,
+        ),
+        (
+            "alter table public.events alter column kind type text collate \"C\"",
+            TransformStatus::Live,
+        ),
+    ] {
+        raw.batch_execute(alter).await.expect(alter);
+        attver.after(&raw, alter).await;
+        capture_pass(&mut raw, &db.pool).await;
+        for target in targets {
+            assert_eq!(status(&raw, target).await, then, "{alter}");
+        }
+        bring_live(&mut raw, &db.pool, &targets).await;
+    }
+
+    raw.batch_execute(
+        "insert into public.events values (3000000000, 'a', '2024-01-01 10:00:00.123456', \
+                                           1.505, 0); \
+         update public.events set kind = 'b' where id = 1;",
+    )
+    .await
+    .expect("writes");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    // `per_price` keeps the rendering each group was first written with,
+    // so its groups are compared as numbers.
+    for (target, column) in [
+        ("per_kind", "kind"),
+        ("per_at", "at"),
+        ("per_price", "(price * 1000)::bigint"),
+    ] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+        assert_eq!(
+            rows(
+                &raw,
+                &format!(
+                    "select {column}::text, n::text from public.{target} where n <> 0 \
+                     order by 1"
+                )
+            )
+            .await,
+            rows(
+                &raw,
+                &format!(
+                    "select {column}::text, count(*)::text from public.events \
+                     group by 1 order by 1"
+                )
+            )
+            .await,
+            "{target}"
+        );
+    }
+}
+
+/// `public.items`, keyed by an `integer`, with a 1-1 definition whose
+/// target copies the key and passes `name` (`varchar(10)`, an unbounded
+/// `varchar` on the target) and `amount` (`numeric(5,2)`) through,
+/// live.
+async fn items(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
+    raw.batch_execute(
+        "create table public.items (id int primary key, name varchar(10), qty int, \
+                                    amount numeric(5,2)); \
+         insert into public.items values (1, 'one', 1, 1.50), (2, 'two', 2, 2.50);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(dsn).await;
+    trellis
+        .apply(
+            "TRANSFORM item_names FROM public.items \
+             SELECT name AS name, qty + 1 AS next, amount AS amount",
+        )
+        .await
+        .expect("define item_names");
+    bring_live(raw, pool, &["item_names"]).await;
+    trellis
+}
+
+/// `public.item_names` against its oracle.
+async fn assert_item_names_match(raw: &Client) {
+    assert_eq!(
+        rows(
+            raw,
+            "select id::text, name, next::text from public.item_names order by id"
+        )
+        .await,
+        rows(
+            raw,
+            "select id::text, name::text, (qty + 1)::text from public.items order by id"
+        )
+        .await,
+    );
+}
+
+/// Widening a 1-1 definition's source key (`integer` to `bigint`) outgrows
+/// its target's key, a copy of it: the capture pass pauses the definition,
+/// naming the copy and the remedy. A resume returns at once, the
+/// definition still paused with its request; the staging worker's next
+/// pass re-types the copy and completes the resume, and the rebuild then
+/// takes a key above 2^31.
+#[tokio::test]
+async fn widening_a_one_to_one_key_pauses_and_resume_widens_the_target_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    assert!(
+        error.contains("widened to bigint")
+            && error.contains("public.item_names.id (integer)")
+            && error.contains("Resume the definition"),
+        "{error}"
+    );
+
+    resume(&trellis, "item_names").await;
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(
+        error.contains("public.item_names.id from integer to bigint"),
+        "{error}"
+    );
+    assert_eq!(
+        column_type(&raw, "public.item_names", "id").await,
+        "integer"
+    );
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
+        .await
+        .expect("a key above 2^31");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_item_names_match(&raw).await;
+
+    // The recorded key type moved with the resume: nothing pauses again.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+}
+
+/// A passthrough of a `varchar` is an unbounded `varchar`: the
+/// source column's widening changes nothing there, so only the key's
+/// `integer` to `bigint`, which rewrites, outgrows a copy. The pass pauses
+/// the definition, naming the key alone, and a resume re-types it and
+/// rebuilds, so a longer value lands. A narrowing of the passthrough pauses
+/// nothing and re-types nothing: every value still fits. It rebuilds the
+/// definition: the narrowing may have dropped trailing spaces.
+#[tokio::test]
+async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute("alter table public.items alter column name type varchar(8)")
+        .await
+        .expect("narrow the passthrough");
+    capture_pass(&mut raw, &db.pool).await;
+    assert!(rebuilding(status(&raw, "item_names").await));
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying"
+    );
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+
+    raw.batch_execute(
+        "alter table public.items alter column name type varchar(40), \
+                                  alter column id type bigint",
+    )
+    .await
+    .expect("widen the passthrough and the key");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    assert!(
+        error.contains("widened to bigint") && !error.contains("character varying"),
+        "{error}"
+    );
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying"
+    );
+
+    resume(&trellis, "item_names").await;
+    assert_retyping(&trellis, &raw, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "name").await,
+        "character varying"
+    );
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    raw.batch_execute("insert into public.items values (3000000000, 'a much longer name', 3)")
+        .await
+        .expect("a longer value");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_item_names_match(&raw).await;
+}
+
+/// Widening an aggregate's `GROUP BY` key (`integer` to `bigint`) outgrows
+/// its copy in the target: the pass pauses the aggregate, naming it, and a
+/// resume re-types it and rebuilds, after which groups above 2^31 land.
+#[tokio::test]
+async fn widening_a_group_by_key_pauses_and_resume_widens_its_copies() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount int); \
+         insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    raw.batch_execute("alter table public.orders alter column shop type bigint")
+        .await
+        .expect("widen the GROUP BY key");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_shop", "public.orders", &["shop"]).await;
+    assert!(error.contains("public.per_shop.shop (integer)"), "{error}");
+
+    resume(&trellis, "per_shop").await;
+    assert_retyping(&trellis, &raw, "per_shop").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.per_shop", "shop").await, "bigint");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    raw.batch_execute(
+        "insert into public.orders values (4, 3000000000, 7), (5, 3000000000, 8); \
+         update public.orders set shop = 3000000000 where id = 1;",
+    )
+    .await
+    .expect("groups above 2^31");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
+    assert_eq!(
+        rows(
+            &raw,
+            "select shop::text, total::text, n::text from public.per_shop where n <> 0 \
+             order by shop"
+        )
+        .await,
+        rows(
+            &raw,
+            "select shop::text, sum(amount)::text, count(*)::text from public.orders \
+             group by shop order by shop"
+        )
+        .await,
+    );
+}
+
+/// A key widened before the capture pass sees it, and a value above 2^31
+/// drained meanwhile: the target's copy can't hold it, so the key is
+/// quarantined. The pass then pauses the definition. The resume re-types
+/// the copy, releases the key and rebuilds, so the row lands.
+#[tokio::test]
+async fn resume_after_a_quarantine_releases_the_key_and_rebuilds_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute(
+        "alter table public.items alter column id type bigint; \
+         insert into public.items values (3000000000, 'big', 3);",
+    )
+    .await
+    .expect("widen the key and write past the copy");
+    drain_past_failures(&db.pool, &mut raw).await;
+    let poisoned: i64 = raw
+        .query_one("select count(*) from poison", &[])
+        .await
+        .expect("read poison")
+        .get(0);
+    assert_eq!(poisoned, 1, "the key the copy can't hold is quarantined");
+
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    resume(&trellis, "item_names").await;
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    let poisoned: i64 = raw
+        .query_one("select count(*) from poison", &[])
+        .await
+        .expect("read poison")
+        .get(0);
+    assert_eq!(poisoned, 0);
+    assert_item_names_match(&raw).await;
+}
+
+/// The staging worker re-types a resumed definition's copies and then
+/// completes the resume in its own transaction. A crash between the two
+/// (here the re-type done by hand, the completion never run) leaves the
+/// definition paused with its request. The next resume, or the next pass,
+/// finishes the work: there is nothing left to re-type.
+#[tokio::test]
+async fn a_crash_between_the_re_type_and_the_rebuild_leaves_the_resume_to_finish() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    raw.batch_execute("alter table public.item_names alter column id type bigint")
+        .await
+        .expect("the worker's re-type, then a crash");
+    assert_retyping(&trellis, &raw, "item_names").await;
+
+    resume(&trellis, "item_names").await;
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    let requests: i64 = raw
+        .query_one("select count(*) from resume_requests", &[])
+        .await
+        .expect("read requests")
+        .get(0);
+    assert_eq!(requests, 0);
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
+        .await
+        .expect("a key above 2^31");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_item_names_match(&raw).await;
+}
+
+/// The staging worker's own completion of a requested resume after a
+/// crash: the request alone is enough, without a second `RESUME`.
+#[tokio::test]
+async fn the_next_pass_finishes_a_resume_whose_copies_were_re_typed() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    raw.batch_execute("alter table public.item_names alter column id type bigint")
+        .await
+        .expect("the worker's re-type, then a crash");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    assert_item_names_match(&raw).await;
+}
+
+/// Narrowing a `varchar(n)` key strips trailing spaces past the new length
+/// in the table rewrite, with no trigger, so the stored key no longer
+/// matches: the pass pauses the definition, and a resume rebuilds it from
+/// the narrowed keys.
+#[tokio::test]
+async fn narrowing_a_varchar_key_pauses_and_resume_rebuilds_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.codes (code varchar(10) primary key, label text); \
+         insert into public.codes values ('abc   ', 'padded'), ('xyz', 'plain');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM code_labels FROM public.codes SELECT label AS label")
+        .await
+        .expect("define code_labels");
+    bring_live(&mut raw, &db.pool, &["code_labels"]).await;
+
+    raw.batch_execute("alter table public.codes alter column code type varchar(3)")
+        .await
+        .expect("narrow the key");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "code_labels", "public.codes", &["code"]).await;
+    assert!(
+        error.contains("from character varying(10) to character varying(3)"),
+        "{error}"
+    );
+
+    resume(&trellis, "code_labels").await;
+    capture_pass(&mut raw, &db.pool).await;
+    bring_live(&mut raw, &db.pool, &["code_labels"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select code::text, label from public.code_labels order by code"
+        )
+        .await,
+        rows(
+            &raw,
+            "select code::text, label from public.codes order by code"
+        )
+        .await,
+    );
+}
+
+/// A change that renders the existing keys differently pauses the
+/// definitions keyed by them, though define would accept the new type:
+/// `timestamp` to `timestamptz` (an `ALTER` in a New York session moves
+/// every instant, and the rendering gains `+00`). The definitions that don't
+/// key by the column keep applying. A resume re-types the aggregate's
+/// copies, records the new type and rebuilds, and its target then matches.
+#[tokio::test]
+async fn a_type_change_that_re_renders_the_keys_pauses_and_resume_rebuilds_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.readings (taken timestamp primary key, at_day timestamp, v int); \
+         insert into public.readings values \
+           ('2024-01-01 10:00', '2024-01-01', 1), ('2024-01-02 10:00', '2024-01-01', 2), \
+           ('2024-01-03 10:00', '2024-01-02', 4);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM by_taken FROM public.readings SELECT v AS v",
+        "TRANSFORM per_day FROM public.readings GROUP BY at_day WITHOUT SOURCE INDEX SELECT at_day AS at_day, \
+         SUM(v) AS total",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["by_taken", "per_day"]).await;
+
+    raw.batch_execute(
+        "begin; set local timezone = 'America/New_York'; \
+         alter table public.readings alter column at_day type timestamptz; commit;",
+    )
+    .await
+    .expect("re-type the GROUP BY column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_day", "public.readings", &["at_day"]).await;
+    assert!(
+        error.contains("from timestamp without time zone to timestamp with time zone")
+            && error.contains("GROUP BY")
+            && error.contains("Resume the definition"),
+        "{error}"
+    );
+    assert_eq!(status(&raw, "by_taken").await, TransformStatus::Live);
+
+    resume(&trellis, "per_day").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.per_day", "at_day").await,
+        "timestamp with time zone"
+    );
+    bring_live(&mut raw, &db.pool, &["per_day"]).await;
+    raw.batch_execute("insert into public.readings values ('2024-01-04 10:00', '2024-01-02', 8)")
+        .await
+        .expect("a write");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select at_day::text, total::text from public.per_day where total is not null \
+             order by at_day"
+        )
+        .await,
+        rows(
+            &raw,
+            "select at_day::text, sum(v)::text from public.readings group by at_day \
+             order by at_day"
+        )
+        .await,
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_day").await, TransformStatus::Live);
+
+    // The source key: a 1-1 target's key column is a copy of it. `date`
+    // renders it differently; the resume re-types the copy and rebuilds.
+    raw.batch_execute("alter table public.readings alter column taken type date")
+        .await
+        .expect("re-type the source key");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "by_taken", "public.readings", &["taken"]).await;
+    assert!(
+        error.contains("source key") && error.contains("date"),
+        "{error}"
+    );
+    resume(&trellis, "by_taken").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.by_taken", "taken").await, "date");
+    bring_live(&mut raw, &db.pool, &["by_taken"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select taken::text, v::text from public.by_taken order by taken"
+        )
+        .await,
+        rows(
+            &raw,
+            "select taken::text, v::text from public.readings order by taken"
+        )
+        .await,
+    );
+}
+/// A nondeterministic collation given to a `GROUP BY` column after define,
+/// which define refuses, pauses the aggregate. The `JOIN`, which
+/// doesn't key by the column, keeps applying.
+///
+/// Only ICU provides nondeterministic collations; every test cluster's
+/// default collation is ICU.
+#[tokio::test]
+async fn a_nondeterministic_collation_on_a_group_by_column_pauses_its_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply("TRANSFORM per_title FROM public.posts GROUP BY title WITHOUT SOURCE INDEX SELECT COUNT(*) AS n")
+        .await
+        .expect("define per_title");
+    bring_live(&mut raw, &db.pool, &["per_title"]).await;
+
+    raw.batch_execute(
+        "create collation public.case_insensitive \
+           (provider = icu, locale = 'und-u-ks-level2', deterministic = false); \
+         alter table public.posts alter column title type text collate public.case_insensitive",
+    )
+    .await
+    .expect("give the GROUP BY column a nondeterministic collation");
+    capture_pass(&mut raw, &db.pool).await;
+
+    let error = paused_for(&trellis, "per_title", "public.posts", &["title"]).await;
+    assert!(
+        error.contains("nondeterministic") && error.contains("case_insensitive"),
+        "{error}"
+    );
+    for target in ["post_authors", "post_titles", "per_kind"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+}
+
+/// A wider `numeric` scale on a `GROUP BY` key re-renders every stored
+/// value (`1.50` reads back as `1.500`) and fires no capture trigger, yet
+/// pauses nothing: numeric groups are matched as numbers, so a delete or
+/// update of a row the rewrite re-rendered still retracts from the group it
+/// was counted in, and a new row joins it. The pass records the wider
+/// scale, so narrowing back to the scale define saw pauses: it rounds the
+/// values stored under the wider one, so two groups (`1.555`, `1.556`)
+/// become one (`1.56`) with no trigger firing. A resume rebuilds the groups
+/// from the rounded values.
+#[tokio::test]
+async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower_one_pauses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply(
+            "TRANSFORM per_price FROM public.posts GROUP BY price \
+            WITHOUT SOURCE INDEX SELECT price AS price, COUNT(*) AS n, SUM(kind) AS kinds",
+        )
+        .await
+        .expect("define per_price");
+    bring_live(&mut raw, &db.pool, &["per_price"]).await;
+    let groups_match = async |raw: &Client| {
+        // Compared as numbers: the target's rendering of a group is the one
+        // it was first written with.
+        assert_eq!(
+            rows(
+                raw,
+                "select (price * 1000)::bigint::text, n::text, kinds::text from public.per_price \
+                 where n <> 0 order by price"
+            )
+            .await,
+            rows(
+                raw,
+                "select (price * 1000)::bigint::text, count(*)::text, sum(kind)::text \
+                 from public.posts group by price order by price"
+            )
+            .await,
+        );
+    };
+
+    raw.batch_execute("alter table public.posts alter column price type numeric(10,3)")
+        .await
+        .expect("change the GROUP BY key's scale");
+    capture_pass(&mut raw, &db.pool).await;
+    for target in ["post_authors", "post_titles", "per_kind", "per_price"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+
+    raw.batch_execute(
+        "delete from public.posts where id = 1; \
+         update public.posts set price = 1.5 where id = 2; \
+         insert into public.posts values (4, 'ann', 'd', 5, 2.5), (5, 'bob', 'e', 7, 1.5), \
+                                         (6, 'ann', 'f', 1, 1.555), (7, 'bob', 'g', 2, 1.556);",
+    )
+    .await
+    .expect("writes to rows the rewrite re-rendered, and at the wider scale");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "per_price").await, TransformStatus::Live);
+    groups_match(&raw).await;
+
+    // Back to the scale define saw: it rounds the keys stored at the wider
+    // one, merging 1.555 and 1.556.
+    raw.batch_execute("alter table public.posts alter column price type numeric(10,2)")
+        .await
+        .expect("narrow back to the scale define saw");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_price", "public.posts", &["price"]).await;
+    assert!(
+        error.contains("from numeric(10,3) to numeric(10,2)") && error.contains("GROUP BY"),
+        "{error}"
+    );
+    for target in ["post_authors", "post_titles", "per_kind"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+
+    // The resume rebuilds the groups from the rounded values.
+    resume(&trellis, "per_price").await;
+    bring_live(&mut raw, &db.pool, &["per_price"]).await;
+    groups_match(&raw).await;
+}
+
+/// A resume re-runs define-time validation against the live schema,
+/// whatever paused the definition. Paused by its operator, then a column
+/// one of its fields sums made `text`, the definition is one define would
+/// refuse (`SUM` over text): the resume refuses with define's error, and
+/// leaves it paused. With the column back, the resume rebuilds.
+#[tokio::test]
+async fn resume_refuses_a_definition_define_would_refuse_now() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM item_names")
+        .await
+        .expect("pause");
+    raw.batch_execute("alter table public.items alter column qty type text")
+        .await
+        .expect("re-type a column a field computes over");
+    capture_pass(&mut raw, &db.pool).await;
+    let refused = resume_refused(&trellis, "item_names").await;
+    assert!(
+        refused.contains("calculated field 'next'") && refused.contains("found text"),
+        "{refused}"
+    );
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
+
+    raw.batch_execute("alter table public.items alter column qty type int using qty::int")
+        .await
+        .expect("change it back");
+    resume(&trellis, "item_names").await;
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    assert_item_names_match(&raw).await;
+}
+
+/// A 1-1 definition whose source key was redefined to `(name)` is paused by
+/// the capture pass, and its resume re-keys its target to the new key, but
+/// the definition's field `name` has the new key column's name: the resume
+/// refuses, naming the field, with the remedies.
+#[tokio::test]
+async fn resume_refuses_a_redefined_source_key_whose_column_is_a_field() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute(
+        "alter table public.items drop constraint items_pkey; \
+         alter table public.items alter column name set not null; \
+         alter table public.items add primary key (name);",
+    )
+    .await
+    .expect("redefine the key");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
+    let refused = resume_refused(&trellis, "item_names").await;
+    assert!(
+        refused.contains("adds its key column \"name\"")
+            && refused.contains("field \"name\"")
+            && refused.contains("`DROP TRANSFORM` and define it again"),
+        "{refused}"
+    );
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
+}
+
+/// A field resume re-validates its definition too, and refuses while
+/// define would refuse it.
+#[tokio::test]
+async fn a_field_resume_refuses_a_definition_define_would_refuse_now() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM item_names.next")
+        .await
+        .expect("pause the field");
+    raw.batch_execute("alter table public.items alter column qty type text")
+        .await
+        .expect("re-type the column the field computes over");
+    match trellis.apply("RESUME TRANSFORM item_names.next").await {
+        Err(TrellisError::Apply(trellis::staging::apply::ApplyError::ResumeRefused {
+            reason,
+            ..
+        })) => assert!(reason.to_string().contains("'next'"), "{reason}"),
+        other => panic!("expected the field resume to be refused, got {other:?}"),
+    }
+    let still_paused: i64 = raw
+        .query_one(
+            "select count(*) from column_status \
+             where transform_table = 'item_names' and column_name = 'next'",
+            &[],
+        )
+        .await
+        .expect("read column_status")
+        .get(0);
+    assert_eq!(still_paused, 1);
+}
+
+/// Re-typing a copy in place can fail. A 1-1 key re-typed
+/// `text` to `uuid` with a `USING` that isn't a plain cast leaves the
+/// target's copy holding text no `uuid` cast accepts. The resume's re-type
+/// fails: the request ends, the definition stays paused with the Postgres
+/// error on its `capture_failure`, and the target keeps its type and rows.
+/// A second resume tries again and ends the same way.
+#[tokio::test]
+async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_its_target_as_it_was()
+{
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.tags (code text primary key, label text); \
+         insert into public.tags values ('red', 'Red'), ('blue', 'Blue');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tag_labels FROM public.tags SELECT label AS label")
+        .await
+        .expect("define tag_labels");
+    bring_live(&mut raw, &db.pool, &["tag_labels"]).await;
+    let before = rows(
+        &raw,
+        "select code, label from public.tag_labels order by code",
+    )
+    .await;
+
+    raw.batch_execute("alter table public.tags alter column code type uuid using md5(code)::uuid")
+        .await
+        .expect("re-type the key with a USING that isn't a cast");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "tag_labels", "public.tags", &["code"]).await;
+
+    for _ in 0..2 {
+        resume(&trellis, "tag_labels").await;
+        assert_retyping(&trellis, &raw, "tag_labels").await;
+        capture_pass(&mut raw, &db.pool).await;
+        let reported = trellis
+            .status("tag_labels")
+            .await
+            .expect("status")
+            .expect("tag_labels");
+        assert_eq!(reported.status, TransformStatus::Paused);
+        let error = reported.capture_failure.expect("reason").error;
+        // #828: it names the repair, and why Trellis doesn't make it.
+        assert!(
+            error.contains("couldn't re-type Trellis's columns public.tag_labels.code")
+                && error.contains("invalid input syntax for type uuid")
+                && error.contains("the target keeps its rows")
+                && error.contains(
+                    "DROP TRANSFORM tag_labels and define it again, which builds the target \
+                     from empty: Trellis doesn't empty a target on its own, since the \
+                     application reads it"
+                ),
+            "{error}"
+        );
+        let requests: i64 = raw
+            .query_one("select count(*) from resume_requests", &[])
+            .await
+            .expect("read requests")
+            .get(0);
+        assert_eq!(requests, 0);
+        assert_eq!(column_type(&raw, "public.tag_labels", "code").await, "text");
+        assert_eq!(
+            rows(
+                &raw,
+                "select code, label from public.tag_labels order by code"
+            )
+            .await,
+            before
+        );
+    }
+}
+
+/// The group basis: widening a column an aggregate sums (`integer`
+/// to `bigint`) outgrows the target's `SUM` column, which define now gives
+/// `numeric` (`sum(bigint)`'s type) rather than `bigint`. The pass pauses the
+/// aggregate; a resume re-types the column, recreates the partials and
+/// rebuilds, and values above 2^31 and 2^63 land exactly. Nothing pauses again.
+#[tokio::test]
+async fn widening_a_summed_column_on_the_group_basis_pauses_and_resume_re_types_its_target() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount int); \
+         insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop WITHOUT SOURCE INDEX \
+             SELECT shop AS shop, SUM(amount) AS total, AVG(amount) AS mean, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    let types = async |raw: &Client| {
+        let mut types = Vec::new();
+        for column in ["shop", "total", "mean", "n"] {
+            types.push(column_type(raw, "public.per_shop", column).await);
+        }
+        types
+    };
+    assert_eq!(
+        types(&raw).await,
+        ["integer", "bigint", "numeric", "bigint"]
+    );
+
+    raw.batch_execute("alter table public.orders alter column amount type bigint")
+        .await
+        .expect("widen the summed column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "per_shop", "public.orders", &["amount"]).await;
+    assert!(
+        error.contains("public.per_shop.total (bigint, now numeric)"),
+        "{error}"
+    );
+
+    resume(&trellis, "per_shop").await;
+    let error = assert_retyping(&trellis, &raw, "per_shop").await;
+    assert!(
+        error.contains("public.per_shop.total from bigint to numeric"),
+        "{error}"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        types(&raw).await,
+        ["integer", "numeric", "numeric", "bigint"]
+    );
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+    raw.batch_execute(
+        "insert into public.orders values (4, 1, 3000000000), (5, 3, 9000000000000000000), \
+                                          (6, 3, 9000000000000000000)",
+    )
+    .await
+    .expect("values above 2^31 and a sum above 2^63");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
+    assert_eq!(
+        rows(
+            &raw,
+            "select shop::text, total::text, mean::text, n::text from public.per_shop \
+             order by shop"
+        )
+        .await,
+        rows(
+            &raw,
+            "select shop::text, sum(amount)::text, avg(amount)::text, count(*)::text \
+             from public.orders group by shop order by shop"
+        )
+        .await,
+    );
+
+    // The types moved with the resume: nothing pauses again.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
+}
+
+/// The staging worker checks the ledger too before it re-types
+/// anything. The operator's resume is accepted (a widened column is waiting
+/// to be re-typed), then the ledger is dropped: the worker's pass refuses the
+/// resume, names the table and `DROP TRANSFORM`, and leaves the column as it
+/// was. A group-basis aggregate keeps no ledger.
+#[tokio::test]
+async fn the_worker_refuses_a_requested_resume_whose_ledger_was_dropped_first() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop int, amount numeric); \
+         insert into public.orders values (1, 1, 10.5), (2, 1, 20), (3, 2, 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM one_to_one FROM public.orders SELECT shop AS shop, amount AS amount")
+        .await
+        .expect("define");
+    bring_live(&mut raw, &db.pool, &["one_to_one"]).await;
+
+    raw.batch_execute("alter table public.orders alter column shop type bigint")
+        .await
+        .expect("widen the column the target copies");
+    capture_pass(&mut raw, &db.pool).await;
+    {
+        let target = "one_to_one";
+        resume(&trellis, target).await;
+        assert_retyping(&trellis, &raw, target).await;
+        raw.batch_execute(&format!("drop table public.{target}__ledger"))
+            .await
+            .expect("drop the ledger");
+    }
+    capture_pass(&mut raw, &db.pool).await;
+
+    {
+        let target = "one_to_one";
+        let reported = trellis
+            .status(target)
+            .await
+            .expect("status")
+            .expect("registered");
+        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+        let error = reported.capture_failure.expect("reason").error;
+        assert!(
+            error.starts_with("the resume was refused:")
+                && error.contains(&format!("{target}__ledger"))
+                && error.contains("DROP TRANSFORM"),
+            "{target}: {error}"
+        );
+        assert_eq!(
+            column_type(&raw, &format!("public.{target}"), "shop").await,
+            "integer",
+            "{target}"
+        );
+    }
+}
+
+/// A 1-1 definition has a ledger (a group-basis aggregate keeps none),
+/// so a resume refuses one whose ledger an operator dropped: the build's
+/// `start` reads it, and a resume that passed would fail every staging-worker
+/// pass after it. The message names the table and `DROP TRANSFORM`, and the
+/// definition stays paused without the table re-created.
+#[tokio::test]
+async fn a_resume_refuses_a_definition_whose_ledger_table_is_missing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount numeric); \
+         insert into public.orders values (1, 'a', 10.5), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM one_to_one FROM public.orders SELECT shop AS shop, amount AS amount")
+        .await
+        .expect("define");
+    bring_live(&mut raw, &db.pool, &["one_to_one"]).await;
+
+    {
+        let target = "one_to_one";
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause");
+        raw.batch_execute(&format!("drop table public.{target}__ledger"))
+            .await
+            .expect("drop the ledger");
+        let message = resume_refused(&trellis, target).await;
+        assert!(
+            message.contains("DROP TRANSFORM") && message.contains(&format!("{target}__ledger")),
+            "{message}"
+        );
+        // Define would accept this definition, so the message doesn't say it
+        // would refuse it.
+        assert!(!message.contains("define would refuse"), "{message}");
+        assert_eq!(status(&raw, target).await, TransformStatus::Paused);
+        let exists: bool = raw
+            .query_one(
+                &format!("select to_regclass('public.{target}__ledger') is not null"),
+                &[],
+            )
+            .await
+            .expect("look the table up")
+            .get(0);
+        assert!(!exists, "the refused resume must not create the table");
+    }
+}
+
+/// Negative control: a retype that keeps every field admitted (`SUM`
+/// over `integer` moved to `bigint`) leaves the definition as define would
+/// create it, so the resume goes ahead.
+#[tokio::test]
+async fn a_resume_goes_ahead_when_a_sum_argument_retype_keeps_the_delta_table_s_shape() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id int primary key, shop varchar(10), amount int); \
+         insert into public.orders values (1, 'a', 10), (2, 'a', 20), (3, 'b', 5);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM per_shop FROM public.orders GROUP BY shop \
+            WITHOUT SOURCE INDEX SELECT shop AS shop, SUM(amount) AS total, COUNT(*) AS n",
+        )
+        .await
+        .expect("define per_shop");
+    bring_live(&mut raw, &db.pool, &["per_shop"]).await;
+
+    trellis
+        .apply("PAUSE TRANSFORM per_shop")
+        .await
+        .expect("pause per_shop");
+    raw.batch_execute("alter table public.orders alter column amount type bigint")
+        .await
+        .expect("widen the summed column");
+    trellis
+        .apply("RESUME TRANSFORM per_shop")
+        .await
+        .expect("the resume isn't refused");
+}
+
+/// Widening a column a 1-1 calculated field reads (`qty + 1`, with
+/// `qty` `integer` to `bigint`) outgrows the field's column: the pass
+/// pauses the definition, and a resume re-types that column, leaving the
+/// key and the passthrough as they are, then rebuilds.
+#[tokio::test]
+async fn widening_a_column_a_calculated_field_reads_pauses_and_resume_re_types_the_field() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "integer"
+    );
+
+    raw.batch_execute("alter table public.items alter column qty type bigint")
+        .await
+        .expect("widen the calculated field's column");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["qty"]).await;
+    assert!(
+        error.contains("column \"qty\" of public.items widened to bigint")
+            && error.contains("public.item_names.next (integer, now bigint)")
+            && error.contains("Resume the definition"),
+        "{error}"
+    );
+    assert!(!error.contains("item_names.name"), "{error}");
+
+    resume(&trellis, "item_names").await;
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(
+        error.contains("public.item_names.next from integer to bigint"),
+        "{error}"
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    for (column, ty) in [
+        ("id", "integer"),
+        ("name", "character varying"),
+        ("next", "bigint"),
+    ] {
+        assert_eq!(
+            column_type(&raw, "public.item_names", column).await,
+            ty,
+            "{column}"
+        );
+    }
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    raw.batch_execute("insert into public.items values (3, 'three', 3000000000)")
+        .await
+        .expect("a value above 2^31");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_item_names_match(&raw).await;
+}
+
+/// The upstream definition (its bare target) whose resume `target`'s pause
+/// records as its cause (#828), if any. `target` must have a pause record.
+async fn caused_by(raw: &Client, target: &str) -> Option<String> {
+    raw.query_one(
+        "select split_part(u.target_table, '.', 2) from capture_failures f \
+         join transform_definitions d on d.id = f.transform_id \
+         left join transform_definitions u on u.id = f.caused_by \
+         where split_part(d.target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{target}'s pause record: {err}"))
+    .get(0)
+}
+
+/// When `target`'s pause record was last written.
+async fn failure_detected_at(raw: &Client, target: &str) -> String {
+    raw.query_one(
+        "select f.detected_at::text from capture_failures f \
+         join transform_definitions d on d.id = f.transform_id \
+         where split_part(d.target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{target}'s pause record: {err}"))
+    .get(0)
+}
+
+/// Whether `target` isn't paused and has no pause record. A reader of a
+/// target being rebuilt reports `catching_up`.
+async fn assert_unpaused(trellis: &Trellis, target: &str) {
+    let reported = trellis.status(target).await.expect("status").expect(target);
+    assert!(!reported.status.is_frozen(), "{target}: {reported:?}");
+    assert!(reported.capture_failure.is_none(), "{target}: {reported:?}");
+}
+
+/// Asserts `target` waits on `upstream`'s rebuild: it is
+/// paused with `upstream` as its cause, has no resume request, and its
+/// rebuild hasn't started (no backfill chunk, no build).
+async fn assert_waiting_on(trellis: &Trellis, raw: &Client, target: &str, upstream: &str) {
+    let reported = trellis.status(target).await.expect("status").expect(target);
+    assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+    assert_eq!(
+        caused_by(raw, target).await.as_deref(),
+        Some(upstream),
+        "{target}"
+    );
+    let started: i64 = raw
+        .query_one(
+            "select (select count(*) from resume_requests r where r.transform_id = d.id) \
+                  + (select count(*) from backfill_chunks c where c.definition_id = d.id and not c.done) \
+                  + (case when d.build is null then 0 else 1 end) \
+             from transform_definitions d where split_part(d.target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read what started")
+        .get(0);
+    assert_eq!(started, 0, "{target} has a request, chunks or a build");
+}
+
+/// Steps the staging worker by hand (a pass, the backfill chunks, a drain)
+/// until `upstream` is live, asserting after every step that `waiting` is
+/// still waiting on it. Bounded, not a timed wait.
+async fn step_until_live(
+    trellis: &Trellis,
+    raw: &mut Client,
+    pool: &trellis::pool::Pool,
+    upstream: &str,
+    waiting: &[&str],
+) {
+    for _ in 0..12 {
+        for step in 0..3 {
+            if status(raw, upstream).await == TransformStatus::Live {
+                return;
+            }
+            match step {
+                0 => reconcile_pass(raw, pool).await,
+                1 => settle_builds(pool).await,
+                _ => settle(pool, raw).await,
+            }
+            if status(raw, upstream).await != TransformStatus::Live {
+                for target in waiting {
+                    assert_waiting_on(trellis, raw, target, upstream).await;
+                }
+            }
+        }
+    }
+    panic!("{upstream} did not go live within 12 rounds of steps");
+}
+
+/// `public.items` and the chain `item_names` (A) -> `b_names` (B) ->
+/// `c_names` (C), all live.
+async fn chain(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
+    let trellis = items(dsn, raw, pool).await;
+    trellis
+        .apply("TRANSFORM b_names FROM public.item_names SELECT name AS name")
+        .await
+        .expect("define b_names");
+    bring_live(raw, pool, &["item_names", "b_names"]).await;
+    trellis
+        .apply("TRANSFORM c_names FROM public.b_names SELECT name AS name")
+        .await
+        .expect("define c_names");
+    bring_live(raw, pool, &["item_names", "b_names", "c_names"]).await;
+    trellis
+}
+
+/// Widens `public.items.id`, and has the operator resume A (`item_names`):
+/// the pass re-types its target and pauses B with A as its cause.
+async fn resume_head_of_chain(trellis: &Trellis, raw: &mut Client, pool: &trellis::pool::Pool) {
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(raw, pool).await;
+    paused_for(trellis, "item_names", "public.items", &["id"]).await;
+    assert_eq!(caused_by(raw, "item_names").await, None);
+    assert_unpaused(trellis, "b_names").await;
+
+    resume(trellis, "item_names").await;
+    capture_pass(raw, pool).await;
+    assert_eq!(column_type(raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+}
+
+/// `c_names` against its oracle, with a key above 2^31 written first.
+async fn assert_chain_converges(trellis: &Trellis, raw: &mut Client, pool: &trellis::pool::Pool) {
+    bring_live(raw, pool, &["item_names", "b_names", "c_names"]).await;
+    raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
+        .await
+        .expect("a key above 2^31");
+    reconcile_pass(raw, pool).await;
+    settle(pool, raw).await;
+    for target in ["item_names", "b_names", "c_names"] {
+        assert_unpaused(trellis, target).await;
+        assert_eq!(status(raw, target).await, TransformStatus::Live, "{target}");
+        assert_eq!(
+            column_type(raw, &format!("public.{target}"), "id").await,
+            "bigint"
+        );
+    }
+    assert_eq!(
+        rows(raw, "select id::text, name from public.c_names order by id").await,
+        rows(
+            raw,
+            "select id::text, name::text from public.items order by id"
+        )
+        .await,
+    );
+}
+
+/// A resume that re-types a target's key (`integer` to
+/// `bigint`) pauses the definition chained off that target, whose own key
+/// copy is still `integer`. Its pause records the upstream resume as its
+/// cause and its message names that resume, not a column the operator
+/// altered. The capture pass then resumes it once the upstream is live, so
+/// the operator's one `RESUME` of A carries A -> B -> C:
+///
+/// - while A rebuilds, B stays paused with no request and no build;
+/// - the first pass after A is live re-types B's target and pauses C with
+///   B as its cause;
+/// - C resumes the same way once B is live.
+#[tokio::test]
+async fn one_resume_carries_a_chain_of_definitions_each_rebuilt_after_its_upstream() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        error,
+        "the resume of transform item_names re-typed public.item_names.id from integer to \
+         bigint, which this definition reads, so the columns Trellis created for this \
+         definition from it can't hold every value of the types define would give them now: \
+         public.b_names.id (integer, now bigint). This definition resumes on its own once \
+         item_names is live again, bringing its columns to the new types and rebuilding it. \
+         Or drop the definition and define it again"
+    );
+    assert_waiting_on(&trellis, &raw, "b_names", "item_names").await;
+    assert_unpaused(&trellis, "c_names").await;
+
+    // Passes while A is waiting to backfill, building and catching up leave
+    // B alone.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_waiting_on(&trellis, &raw, "b_names", "item_names").await;
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_names"]).await;
+    assert_unpaused(&trellis, "c_names").await;
+
+    // The first pass after A is live re-types B's target, resumes B, and
+    // pauses C with B as its cause.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "b_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_unpaused(&trellis, "b_names").await;
+    let error = paused_for(&trellis, "c_names", "public.b_names", &["id"]).await;
+    assert!(
+        error.starts_with(
+            "the resume of transform b_names re-typed public.b_names.id from integer to bigint"
+        ) && error.contains("resumes on its own once b_names is live again"),
+        "{error}"
+    );
+    assert_waiting_on(&trellis, &raw, "c_names", "b_names").await;
+
+    step_until_live(&trellis, &mut raw, &db.pool, "b_names", &["c_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "c_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_chain_converges(&trellis, &mut raw, &db.pool).await;
+}
+
+/// The durable queue is `caused_by` plus `resume_requests`: dropping
+/// every handle after A's rebuild, and running the next pass from fresh
+/// ones, resumes B, and then C.
+#[tokio::test]
+async fn a_restart_after_the_upstream_rebuild_resumes_the_chain_from_where_it_stopped() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_names"]).await;
+    drop(trellis);
+    drop(raw);
+
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "b_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_waiting_on(&trellis, &raw, "c_names", "b_names").await;
+    step_until_live(&trellis, &mut raw, &db.pool, "b_names", &["c_names"]).await;
+    drop(trellis);
+    drop(raw);
+
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "c_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_chain_converges(&trellis, &mut raw, &db.pool).await;
+}
+
+/// The automatic resume of B comes back with copies to re-type, so
+/// it takes the request path an operator's resume does: the same pass
+/// records the request, re-types and completes it, and the cause is gone
+/// once the request is recorded. A crash between the request and the
+/// re-type (the request recorded by hand, the re-type never run) leaves the
+/// next pass to finish it.
+#[tokio::test]
+async fn a_crash_after_the_automatic_resume_requests_the_re_type_leaves_the_request_to_finish() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_names"]).await;
+    // The automatic resume's transaction alone: the request replaces the
+    // cause (`request_retype`), as it does in the pass.
+    raw.batch_execute(
+        "insert into resume_requests (transform_id) \
+           select id from transform_definitions where target_table = 'public.b_names'; \
+         update capture_failures set caused_by = null, error = 'resuming: re-typing' \
+          where transform_id = (select id from transform_definitions \
+                                 where target_table = 'public.b_names')",
+    )
+    .await
+    .expect("the request, then a crash");
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "integer");
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "b_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_waiting_on(&trellis, &raw, "c_names", "b_names").await;
+    step_until_live(&trellis, &mut raw, &db.pool, "b_names", &["c_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "bigint");
+    assert_chain_converges(&trellis, &mut raw, &db.pool).await;
+}
+
+/// B is refused at its automatic resume: the schema changed after
+/// the pause, so define would refuse it. The refusal is recorded on its
+/// `capture_failure`, the cause is cleared, and the next pass doesn't try
+/// again (its `detected_at` stands). C is untouched: B's target was never
+/// re-typed, so C stays live, reading it.
+#[tokio::test]
+async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refusal() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute(
+        "create table public.owners (code varchar primary key, label text); \
+         insert into public.owners values ('one', 'First'), ('two', 'Second');",
+    )
+    .await
+    .expect("seed owners");
+    trellis
+        .apply(
+            "TRANSFORM b_owners FROM public.item_names JOIN public.owners \
+             ON item_names.name = owners.code GROUP BY item_names.id, owners.label \
+             WITHOUT SOURCE INDEX SELECT item_names.id AS id, owners.label AS label, \
+             COUNT(*) AS n",
+        )
+        .await
+        .expect("define b_owners");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
+    trellis
+        .apply("TRANSFORM c_owners FROM public.b_owners SELECT label AS owner_label")
+        .await
+        .expect("define c_owners");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_owners", "c_owners"]).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_waiting_on(&trellis, &raw, "b_owners", "item_names").await;
+
+    // The schema changes after the pause: define refuses a join column of
+    // type character(n).
+    raw.batch_execute("alter table public.owners alter column code type character(10)")
+        .await
+        .expect("re-type the joined table's ON column");
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_owners"]).await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "b_owners", "public.item_names", &[]).await;
+    assert!(
+        error.starts_with("the resume was refused: ") && error.contains("character(10)"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "b_owners").await, None);
+    assert_eq!(column_type(&raw, "public.b_owners", "id").await, "integer");
+    let detected_at = failure_detected_at(&raw, "b_owners").await;
+
+    // The next pass leaves the record as it is.
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        paused_for(&trellis, "b_owners", "public.item_names", &[]).await,
+        error
+    );
+    assert_eq!(detected_at, failure_detected_at(&raw, "b_owners").await);
+    // C is untouched: never paused, reading B's paused target.
+    assert_unpaused(&trellis, "c_owners").await;
+    assert_eq!(status(&raw, "c_owners").await, TransformStatus::Live);
+}
+
+/// A `RESUME` by hand of a definition waiting on its upstream's
+/// chained resume (A not live) is accepted, and the definition keeps
+/// waiting, now on a request naming A instead of a cause. It follows A: the
+/// first pass after A is live re-types its target and resumes it, and
+/// pauses the definition below it with it as the cause.
+#[tokio::test]
+async fn a_resume_by_hand_of_a_waiting_definition_waits_for_its_upstream() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    assert_waiting_on(&trellis, &raw, "b_names", "item_names").await;
+    resume(&trellis, "b_names").await;
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_ne!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "integer");
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "item_names",
+        &[("b_names", "item_names")],
+    )
+    .await;
+    assert_unpaused(&trellis, "c_names").await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "b_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_waiting_on(&trellis, &raw, "c_names", "b_names").await;
+    step_until_live(&trellis, &mut raw, &db.pool, "b_names", &["c_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "bigint");
+    assert_chain_converges(&trellis, &mut raw, &db.pool).await;
+}
+
+/// `PAUSE TRANSFORM target`, which must succeed.
+async fn pause(trellis: &Trellis, target: &str) {
+    trellis
+        .apply(&format!("PAUSE TRANSFORM {target}"))
+        .await
+        .unwrap_or_else(|err| panic!("pause {target}: {err}"));
+}
+
+/// Whether `target`'s resume request is recorded.
+async fn requested(raw: &Client, target: &str) -> bool {
+    raw.query_one(
+        "select exists (select 1 from resume_requests r join transform_definitions d \
+                        on d.id = r.transform_id \
+                        where split_part(d.target_table, '.', 2) = $1)",
+        &[&target],
+    )
+    .await
+    .expect("read requests")
+    .get(0)
+}
+
+/// Asserts `target`'s resume waits for `upstream` to be live: it is
+/// paused with a resume request and no cause, its `capture_failure` names
+/// `upstream` and its target, and its rebuild hasn't started (no backfill
+/// chunk, no build).
+async fn assert_requested_wait(trellis: &Trellis, raw: &Client, target: &str, upstream: &str) {
+    let reported = trellis.status(target).await.expect("status").expect(target);
+    assert_eq!(reported.status, TransformStatus::Paused, "{target}");
+    let failure = reported.capture_failure.expect("reason");
+    assert_eq!(
+        failure.source_table,
+        format!("public.{upstream}"),
+        "{target}"
+    );
+    assert!(failure.columns.is_empty(), "{target}");
+    assert_eq!(
+        failure.error,
+        format!(
+            "resuming: waiting for transform {upstream}, whose target public.{upstream} this \
+             definition reads, to be live; then the staging worker rebuilds this definition, \
+             which stays paused until then. Resume {upstream} if it is paused, or pause this \
+             definition to withdraw its resume"
+        ),
+        "{target}"
+    );
+    assert_eq!(caused_by(raw, target).await, None, "{target}");
+    assert!(requested(raw, target).await, "{target}");
+    let started: i64 = raw
+        .query_one(
+            "select (select count(*) from backfill_chunks c where c.definition_id = d.id and not c.done) \
+                  + (case when d.build is null then 0 else 1 end) \
+             from transform_definitions d where split_part(d.target_table, '.', 2) = $1",
+            &[&target],
+        )
+        .await
+        .expect("read what started")
+        .get(0);
+    assert_eq!(started, 0, "{target} has chunks or a build");
+}
+
+/// [`step_until_live`] for definitions whose resume requests wait
+/// (`(target, upstream)` pairs, [`assert_requested_wait`]).
+async fn step_until_live_requested(
+    trellis: &Trellis,
+    raw: &mut Client,
+    pool: &trellis::pool::Pool,
+    upstream: &str,
+    waiting: &[(&str, &str)],
+) {
+    for _ in 0..12 {
+        for step in 0..3 {
+            if status(raw, upstream).await == TransformStatus::Live {
+                return;
+            }
+            match step {
+                0 => reconcile_pass(raw, pool).await,
+                1 => settle_builds(pool).await,
+                _ => settle(pool, raw).await,
+            }
+            if status(raw, upstream).await != TransformStatus::Live {
+                for (target, its_upstream) in waiting {
+                    assert_requested_wait(trellis, raw, target, its_upstream).await;
+                }
+            }
+        }
+    }
+    panic!("{upstream} did not go live within 12 rounds of steps");
+}
+
+/// An operator can resume a whole stack at once, in any order, and it
+/// comes up in dependency order. A -> B -> C, all paused by the operator,
+/// resumed C, then B, then A: C and B are accepted and wait, naming their
+/// upstream; no build starts early. Once A is live the next pass rebuilds B,
+/// and once B is live, C.
+#[tokio::test]
+async fn a_stack_resumed_in_any_order_comes_up_in_dependency_order() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    for target in ["item_names", "b_names", "c_names"] {
+        pause(&trellis, target).await;
+    }
+    raw.batch_execute("insert into public.items values (7, 'seven', 7)")
+        .await
+        .expect("a write while paused");
+
+    resume(&trellis, "c_names").await;
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+    resume(&trellis, "b_names").await;
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+    // Passes while A is paused change nothing.
+    reconcile_pass(&mut raw, &db.pool).await;
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+
+    resume(&trellis, "item_names").await;
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "item_names",
+        &[("b_names", "item_names"), ("c_names", "b_names")],
+    )
+    .await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&raw, "b_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_unpaused(&trellis, "b_names").await;
+    assert!(!requested(&raw, "b_names").await);
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "b_names",
+        &[("c_names", "b_names")],
+    )
+    .await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&raw, "c_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_unpaused(&trellis, "c_names").await;
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "c_names"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.c_names order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name::text from public.items order by id"
+        )
+        .await,
+    );
+}
+
+/// An upstream is `live` as the operator reads it: one stored
+/// `live` that reads a definition that isn't reports `catching_up`, and a
+/// resume below it waits for it. A -> B -> C, with A and C paused by the
+/// operator and B left running: after `RESUME A; RESUME C`, C waits on B
+/// while A rebuilds under B, and rebuilds only once B reports `live`.
+#[tokio::test]
+async fn a_resume_waits_for_an_upstream_that_reports_catching_up() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    pause(&trellis, "item_names").await;
+    pause(&trellis, "c_names").await;
+    raw.batch_execute("insert into public.items values (7, 'seven', 7)")
+        .await
+        .expect("a write while paused");
+
+    resume(&trellis, "item_names").await;
+    assert_eq!(status(&raw, "b_names").await, TransformStatus::Live);
+    let reported_b = || async {
+        trellis
+            .status("b_names")
+            .await
+            .expect("status")
+            .expect("b_names")
+            .status
+    };
+    assert_eq!(reported_b().await, TransformStatus::CatchingUp);
+    resume(&trellis, "c_names").await;
+    assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+
+    let mut rounds = 0;
+    while reported_b().await != TransformStatus::Live {
+        rounds += 1;
+        assert!(rounds <= 36, "b_names did not report live");
+        match rounds % 3 {
+            1 => reconcile_pass(&mut raw, &db.pool).await,
+            2 => settle_builds(&db.pool).await,
+            _ => settle(&db.pool, &mut raw).await,
+        }
+        if reported_b().await != TransformStatus::Live {
+            assert_requested_wait(&trellis, &raw, "c_names", "b_names").await;
+        }
+    }
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&raw, "c_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "c_names"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.c_names order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name::text from public.items order by id"
+        )
+        .await,
+    );
+}
+
+/// A resume waits on every definition whose target it reads,
+/// through its source or a `JOIN`'s joined table, so those waits end only if
+/// no definition can come to read its own target through them. Define
+/// refuses such a loop: here one closed by a `JOIN`'s joined table.
+#[tokio::test]
+async fn no_chain_of_upstreams_a_resume_waits_on_can_loop() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("create table public.others (id int primary key, region text)")
+        .await
+        .expect("seed others");
+    let refused = |text: &'static str| {
+        let trellis = &trellis;
+        async move {
+            let err = trellis
+                .apply(text)
+                .await
+                .expect_err("a definition that loops is refused");
+            assert!(
+                err.to_string().contains("cycle among tables"),
+                "{text}: {err}"
+            );
+        }
+    };
+    // items -> item_names, and item_names joined into items.
+    refused(
+        "TRANSFORM items FROM public.others JOIN public.item_names \
+         ON others.id = item_names.id GROUP BY others.region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+    )
+    .await;
+}
+
+/// A downstream whose upstream nobody resumes keeps waiting across
+/// passes, its record as it was, and an operator `PAUSE` withdraws its
+/// request: it then stays paused, with no request, after the upstream is
+/// resumed and live.
+#[tokio::test]
+async fn a_downstream_waits_on_a_paused_upstream_until_a_pause_withdraws_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    pause(&trellis, "item_names").await;
+    pause(&trellis, "b_names").await;
+
+    resume(&trellis, "b_names").await;
+    assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+    let detected_at = failure_detected_at(&raw, "b_names").await;
+    for _ in 0..3 {
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle_builds(&db.pool).await;
+        settle(&db.pool, &mut raw).await;
+        assert_requested_wait(&trellis, &raw, "b_names", "item_names").await;
+    }
+    assert_eq!(detected_at, failure_detected_at(&raw, "b_names").await);
+
+    pause(&trellis, "b_names").await;
+    assert!(!requested(&raw, "b_names").await);
+    let error = paused_for(&trellis, "b_names", "public.item_names", &[]).await;
+    assert!(
+        error.starts_with("paused by the operator, which withdrew its resume"),
+        "{error}"
+    );
+
+    resume(&trellis, "item_names").await;
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    for _ in 0..2 {
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
+    }
+    assert_eq!(status(&raw, "b_names").await, TransformStatus::Paused);
+    assert!(!requested(&raw, "b_names").await);
+    assert_eq!(
+        paused_for(&trellis, "b_names", "public.item_names", &[]).await,
+        error
+    );
+    // C, reading B's paused target, was never paused.
+    assert_unpaused(&trellis, "c_names").await;
+}
+
+/// A waiting request whose re-validation fails when its upstream is
+/// live ends with the refusal on its `capture_failure`, once: later passes
+/// don't try again.
+#[tokio::test]
+async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute(
+        "create table public.owners (code varchar primary key, label text); \
+         insert into public.owners values ('one', 'First'), ('two', 'Second');",
+    )
+    .await
+    .expect("seed owners");
+    trellis
+        .apply(
+            "TRANSFORM b_owners FROM public.item_names JOIN public.owners \
+             ON item_names.name = owners.code GROUP BY item_names.id, owners.label \
+             WITHOUT SOURCE INDEX SELECT item_names.id AS id, owners.label AS label, \
+             COUNT(*) AS n",
+        )
+        .await
+        .expect("define b_owners");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_owners"]).await;
+    pause(&trellis, "item_names").await;
+    pause(&trellis, "b_owners").await;
+    resume(&trellis, "b_owners").await;
+    assert_requested_wait(&trellis, &raw, "b_owners", "item_names").await;
+
+    // The schema changes while it waits: define refuses a join column of
+    // type character(n).
+    raw.batch_execute("alter table public.owners alter column code type character(10)")
+        .await
+        .expect("re-type the joined table's ON column");
+    resume(&trellis, "item_names").await;
+    step_until_live_requested(
+        &trellis,
+        &mut raw,
+        &db.pool,
+        "item_names",
+        &[("b_owners", "item_names")],
+    )
+    .await;
+
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "b_owners", "public.item_names", &[]).await;
+    assert!(
+        error.starts_with("the resume was refused: ") && error.contains("character(10)"),
+        "{error}"
+    );
+    assert!(!requested(&raw, "b_owners").await);
+    let detected_at = failure_detected_at(&raw, "b_owners").await;
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        paused_for(&trellis, "b_owners", "public.item_names", &[]).await,
+        error
+    );
+    assert_eq!(detected_at, failure_detected_at(&raw, "b_owners").await);
+}
+
+/// An operator `PAUSE` of B while it waits on A's chained
+/// resume (with A as its cause) takes it out of the chain: the cause is
+/// cleared, its message keeps the reason and no longer says it resumes on
+/// its own, and passes after A is live leave it paused, and C untouched.
+#[tokio::test]
+async fn a_pause_of_a_definition_waiting_on_its_cause_takes_it_out_of_the_chain() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    assert_waiting_on(&trellis, &raw, "b_names", "item_names").await;
+    pause(&trellis, "b_names").await;
+    assert_eq!(caused_by(&raw, "b_names").await, None);
+    let error = paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        error,
+        "the resume of transform item_names re-typed public.item_names.id from integer to \
+         bigint, which this definition reads, so the columns Trellis created for this \
+         definition from it can't hold every value of the types define would give them now: \
+         public.b_names.id (integer, now bigint). It was paused by the operator, so it stays \
+         paused: resume it to bring its columns to the new types and rebuild it, or drop the \
+         definition and define it again"
+    );
+
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    for _ in 0..2 {
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
+    }
+    assert_eq!(
+        paused_for(&trellis, "b_names", "public.item_names", &["id"]).await,
+        error
+    );
+    assert!(!requested(&raw, "b_names").await);
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "integer");
+    assert_unpaused(&trellis, "c_names").await;
+    assert_eq!(status(&raw, "c_names").await, TransformStatus::Live);
+}
+
+/// C, paused by the operator before the chain's resume, stays
+/// paused with no cause after A and B are live, through further passes.
+#[tokio::test]
+async fn a_definition_paused_by_the_operator_before_the_chain_stays_paused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    pause(&trellis, "c_names").await;
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "bigint");
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names"]).await;
+    for _ in 0..2 {
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle(&db.pool, &mut raw).await;
+    }
+    assert_eq!(status(&raw, "c_names").await, TransformStatus::Paused);
+    assert_eq!(caused_by(&raw, "c_names").await, None);
+    assert!(!requested(&raw, "c_names").await);
+    assert_eq!(column_type(&raw, "public.c_names", "id").await, "integer");
+}
+
+/// B's chained resume requests a re-type that fails for a
+/// reason no retry gets past (a view on B's target key column, `0A000`).
+/// The request ends: B stays paused with the re-type error and no cause,
+/// its target keeps its type, so C is never paused. A later pass doesn't
+/// retry.
+#[tokio::test]
+async fn a_chained_re_type_that_fails_stops_the_chain_there() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = chain(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("create view public.b_ids as select id from public.b_names")
+        .await
+        .expect("a view on B's key");
+
+    resume_head_of_chain(&trellis, &mut raw, &db.pool).await;
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["b_names"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let reported = trellis.status("b_names").await.expect("status").expect("b");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let error = reported.capture_failure.expect("reason").error;
+    assert!(error.contains("b_ids"), "{error}");
+    assert_eq!(caused_by(&raw, "b_names").await, None);
+    assert!(!requested(&raw, "b_names").await);
+    assert_eq!(column_type(&raw, "public.b_names", "id").await, "integer");
+    assert_unpaused(&trellis, "c_names").await;
+    assert_eq!(status(&raw, "c_names").await, TransformStatus::Live);
+
+    let detected_at = failure_detected_at(&raw, "b_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(detected_at, failure_detected_at(&raw, "b_names").await);
+    assert_unpaused(&trellis, "c_names").await;
+}
+
+/// #828: a definition the operator paused before the upstream's resume
+/// re-typed the target it reads was paused for another reason first. It
+/// gets the pause record, as before, but no cause: its message is the
+/// ordinary one. A sibling the resume did pause records it.
+#[tokio::test]
+async fn a_definition_paused_before_the_upstream_resume_records_no_cause() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    for text in [
+        "TRANSFORM b_names FROM public.item_names SELECT name AS name",
+        "TRANSFORM b_next FROM public.item_names SELECT next AS next",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "b_next"]).await;
+    trellis
+        .apply("PAUSE TRANSFORM b_next")
+        .await
+        .expect("pause b_next");
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+
+    paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        caused_by(&raw, "b_names").await.as_deref(),
+        Some("item_names")
+    );
+    let error = paused_for(&trellis, "b_next", "public.item_names", &["id"]).await;
+    assert!(
+        !error.contains("the resume of") && error.contains("Resume the definition"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "b_next").await, None);
+}
+
+/// #828: a definition the upstream's re-type pauses that also fails its own
+/// re-validation keeps its own error, with no cause: here the re-type moves
+/// the column a `SUM` reads (`next`, `qty + 1` over a `qty` now
+/// `double precision`) to `double precision`, which define refuses under a
+/// `SUM`, so a resume refuses until the column is changed back.
+#[tokio::test]
+async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply(
+            "TRANSFORM name_totals FROM public.item_names GROUP BY name \
+             WITHOUT SOURCE INDEX SELECT name AS name, SUM(next) AS total",
+        )
+        .await
+        .expect("define name_totals");
+    bring_live(&mut raw, &db.pool, &["item_names", "name_totals"]).await;
+
+    raw.batch_execute("alter table public.items alter column qty type double precision")
+        .await
+        .expect("move qty to double precision");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "double precision"
+    );
+
+    let error = paused_for(&trellis, "name_totals", "public.item_names", &["next"]).await;
+    assert!(
+        !error.contains("the resume of")
+            && error.contains("SUM is not supported: float and interval SUM/AVG")
+            && error.contains("refuses until that is fixed"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "name_totals").await, None);
+    // A resume waits for item_names to be live, then refuses.
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    resume_refused(&trellis, "name_totals").await;
+}
+
+/// #1120 lifted the refusal of a `SUM` over an unconstrained `numeric`: the
+/// upstream's re-type that moves the column a `SUM` reads (`next`, `qty + 1`
+/// over a `qty` now `numeric(10,2)`) there pauses the reader for the re-type
+/// alone, naming its cause, and it resumes on its own once the upstream is
+/// live, its sum then Postgres's text.
+#[tokio::test]
+async fn a_re_type_to_numeric_under_a_sum_resumes_with_its_upstream() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    trellis
+        .apply(
+            "TRANSFORM name_totals FROM public.item_names GROUP BY name \
+             WITHOUT SOURCE INDEX SELECT name AS name, SUM(next) AS total",
+        )
+        .await
+        .expect("define name_totals");
+    bring_live(&mut raw, &db.pool, &["item_names", "name_totals"]).await;
+
+    raw.batch_execute("alter table public.items alter column qty type numeric(10,2)")
+        .await
+        .expect("move qty to numeric(10,2)");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "numeric"
+    );
+    let error = paused_for(&trellis, "name_totals", "public.item_names", &["next"]).await;
+    assert!(
+        error.starts_with(
+            "the resume of transform item_names re-typed public.item_names.next from integer \
+             to numeric"
+        ) && error.contains("resumes on its own once item_names is live again"),
+        "{error}"
+    );
+    assert_eq!(
+        caused_by(&raw, "name_totals").await.as_deref(),
+        Some("item_names")
+    );
+
+    step_until_live(&trellis, &mut raw, &db.pool, "item_names", &["name_totals"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.name_totals", "total").await,
+        "numeric"
+    );
+    assert_unpaused(&trellis, "name_totals").await;
+    bring_live(&mut raw, &db.pool, &["name_totals"]).await;
+    raw.batch_execute("update public.items set qty = 1.25 where id = 1")
+        .await
+        .expect("a value at scale 2");
+    bring_live(&mut raw, &db.pool, &["item_names", "name_totals"]).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select name::text, total::text from public.name_totals order by 1"
+        )
+        .await,
+        rows(
+            &raw,
+            "select name::text, sum(qty + 1)::text from public.items group by 1 order by 1"
+        )
+        .await,
+    );
+}
+
+/// #828: [`a_definition_the_re_type_leaves_refused_keeps_its_own_error`]
+/// alongside a copy (`id`, a `GROUP BY` key) that outgrew only because that
+/// resume re-typed it. The refusal still stands, with no cause, while a
+/// sibling the same check pauses for the re-type alone records it.
+#[tokio::test]
+async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    for text in [
+        "TRANSFORM b_names FROM public.item_names SELECT name AS name",
+        "TRANSFORM id_totals FROM public.item_names GROUP BY id \
+         WITHOUT SOURCE INDEX SELECT id AS id, SUM(next) AS total",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["item_names", "b_names", "id_totals"]).await;
+
+    raw.batch_execute(
+        "alter table public.items alter column id type bigint, \
+                                  alter column qty type double precision",
+    )
+    .await
+    .expect("widen the key and qty");
+    capture_pass(&mut raw, &db.pool).await;
+    resume(&trellis, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+
+    let error = paused_for(&trellis, "id_totals", "public.item_names", &["id", "next"]).await;
+    assert!(
+        !error.contains("the resume of")
+            && error.contains("SUM is not supported: float and interval SUM/AVG")
+            && error.contains("refuses until that is fixed"),
+        "{error}"
+    );
+    assert_eq!(caused_by(&raw, "id_totals").await, None);
+    // The sibling the same check pauses for the re-type alone records it.
+    paused_for(&trellis, "b_names", "public.item_names", &["id"]).await;
+    assert_eq!(
+        caused_by(&raw, "b_names").await.as_deref(),
+        Some("item_names")
+    );
+    // A resume waits for item_names to be live, then refuses.
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    resume_refused(&trellis, "id_totals").await;
+}
+
+/// A source change whose columns Trellis created from it hold every
+/// value of the types define would give them now pauses nothing: a
+/// widening under an expression typed by its family (`CHAR_LENGTH(name)`,
+/// `qty + 2.5`, `COUNT(name)`, `SUM(price)` over a `numeric(10,2)`), and a
+/// narrowing under a `SUM`, a `COUNT` and a calculated field.
+#[tokio::test]
+async fn changes_no_created_column_outgrows_pause_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.lines (id int primary key, name varchar(10), qty bigint, \
+                                    price numeric(10,2), kind int); \
+         insert into public.lines values (1, 'a', 1, 1.50, 1), (2, 'bb', 2, 2.50, 1), \
+                                         (3, 'ccc', 3, 3.50, 2);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM line_sizes FROM public.lines \
+         SELECT CHAR_LENGTH(name) AS len, qty + 2.5 AS scaled, qty + 1 AS next",
+        "TRANSFORM per_kind FROM public.lines GROUP BY kind \
+        WITHOUT SOURCE INDEX SELECT kind AS kind, COUNT(name) AS top, SUM(price) AS total, SUM(qty) AS qty_total, \
+                COUNT(qty) AS least",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    let targets = ["line_sizes", "per_kind"];
+    bring_live(&mut raw, &db.pool, &targets).await;
+    let snapshot = async |raw: &Client| {
+        rows(
+            raw,
+            "select c.relname::text, a.attname::text, \
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) \
+             from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid \
+             where c.relname in ('line_sizes', 'per_kind') \
+               and a.attnum > 0 and not a.attisdropped order by 1, 2",
+        )
+        .await
+    };
+    let before = snapshot(&raw).await;
+
+    for alter in [
+        "alter table public.lines alter column name type varchar(40)",
+        "alter table public.lines alter column name type text",
+        "alter table public.lines alter column price type numeric(12,2)",
+    ] {
+        raw.batch_execute(alter).await.expect(alter);
+        capture_pass(&mut raw, &db.pool).await;
+        for target in targets {
+            assert_eq!(status(&raw, target).await, TransformStatus::Live, "{alter}");
+        }
+    }
+    // A narrowing isn't a pure widening: it rebuilds the readers,
+    // and still pauses nothing.
+    raw.batch_execute("alter table public.lines alter column qty type integer")
+        .await
+        .expect("narrow qty");
+    capture_pass(&mut raw, &db.pool).await;
+    for target in targets {
+        assert!(rebuilding(status(&raw, target).await), "{target}");
+    }
+    bring_live(&mut raw, &db.pool, &targets).await;
+    assert_eq!(snapshot(&raw).await, before);
+
+    raw.batch_execute(
+        "insert into public.lines values (4, 'a much longer name', 4, 1234567890.25, 2)",
+    )
+    .await
+    .expect("writes");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    for target in targets {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, len::text, scaled::text, next::text from public.line_sizes \
+             order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, char_length(name)::text, (qty + 2.5)::text, (qty + 1)::text \
+             from public.lines order by id"
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select kind::text, top::text, total::text, qty_total::text, least::text \
+             from public.per_kind order by kind"
+        )
+        .await,
+        rows(
+            &raw,
+            "select kind::text, count(name)::text, sum(price)::text, sum(qty)::text, \
+                    count(qty)::text \
+             from public.lines group by kind order by kind"
+        )
+        .await,
+    );
+}
+
+/// The columns an in-place re-type reaches, over `public.users` and
+/// `public.posts` (`posts.author` joined to `users.handle`):
+///
+/// - `user_labels`, a 1-1 definition: its target's key copies
+///   `users.handle`, and its passthrough `users.label`;
+/// - `post_labels`, a `JOIN` grouped by the post, `users.handle` and
+///   `users.label`: its target copies both joined columns;
+/// - `per_author` takes `COUNT(amount)` per `author`: its target and its
+///   group basis copy `posts.author` as the group key.
+///
+/// `key` is the type of `users.handle` and `posts.author`, `value` of
+/// `users.label` and `posts.amount`.
+async fn widening_fixture(
+    dsn: &str,
+    raw: &mut Client,
+    pool: &trellis::pool::Pool,
+    key: &str,
+    value: &str,
+) {
+    raw.batch_execute(&format!(
+        "create table public.users (handle {key} primary key, label {value}); \
+         create table public.posts (id int primary key, author {key}, amount {value}); \
+         insert into public.users values ('ann', '1.50'), ('bob', '2.25'); \
+         insert into public.posts values (1, 'ann', '1.50'), (2, 'bob', '2.25'), \
+                                         (3, 'ann', '3.75'); \
+         create index on public.posts (author);"
+    ))
+    .await
+    .expect("seed");
+    let trellis = definer(dsn).await;
+    for text in [
+        "TRANSFORM user_labels FROM public.users SELECT label AS label",
+        "TRANSFORM post_labels FROM public.posts LEFT JOIN public.users \
+         ON posts.author = users.handle GROUP BY posts.id, users.handle, users.label \
+         WITHOUT SOURCE INDEX SELECT posts.id AS id, users.handle AS handle, \
+         users.label AS label, COUNT(*) AS n",
+        "TRANSFORM per_author FROM public.posts GROUP BY author \
+        WITHOUT SOURCE INDEX SELECT author AS author, COUNT(amount) AS top",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(raw, pool, &WIDENING_TARGETS).await;
+}
+
+const WIDENING_TARGETS: [&str; 3] = ["user_labels", "post_labels", "per_author"];
+
+/// Each of [`widening_fixture`]'s targets against its oracle.
+async fn assert_widening_targets_match(raw: &Client) {
+    for (target, oracle) in [
+        (
+            "select handle::text, label::text from public.user_labels order by 1",
+            "select handle::text, label::text from public.users order by 1",
+        ),
+        (
+            "select id::text, handle::text, label::text, n::text from public.post_labels \
+             where n <> 0 order by 1",
+            "select p.id::text, u.handle::text, u.label::text, count(*)::text \
+             from public.posts p left join public.users u on u.handle = p.author \
+             group by p.id, u.handle, u.label order by 1",
+        ),
+        (
+            "select author::text, top::text from public.per_author order by 1",
+            "select author::text, count(amount)::text from public.posts group by 1 order by 1",
+        ),
+    ] {
+        assert_eq!(rows(raw, target).await, rows(raw, oracle).await, "{target}");
+    }
+}
+
+/// One widening of a type modifier (ADR-0020). The
+/// source's key columns are re-typed `key_to` (or kept, when `None`) and its
+/// value columns `value_to`. A copy has no modifier, so no column Trellis
+/// copied from them changes: a pass re-types nothing, rewrites nothing and
+/// pauses or rebuilds nothing, and every definition stays live. A key and a
+/// value the old types couldn't hold apply, with or without a pass before
+/// them. `key_to`'s and `value_to`'s second element is the copy's type,
+/// before and after.
+async fn a_modifier_widening_re_types_no_copy(
+    key: &str,
+    key_to: Option<(&str, &str)>,
+    value: &str,
+    (value_to, value_display): (&str, &str),
+    (long_key, long_value): (&str, &str),
+    written_before_the_pass: bool,
+) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    widening_fixture(db.dsn(), &mut raw, &db.pool, key, value).await;
+    let target_file = relfilenode(&raw, "public.user_labels").await;
+    let joined_file = relfilenode(&raw, "public.post_labels").await;
+
+    let mut alter = format!(
+        "alter table public.users alter column label type {value_to}; \
+         alter table public.posts alter column amount type {value_to};"
+    );
+    if let Some((key_to, _)) = key_to {
+        alter.push_str(&format!(
+            "alter table public.users alter column handle type {key_to}; \
+             alter table public.posts alter column author type {key_to};"
+        ));
+    }
+    raw.batch_execute(&alter).await.expect("widen the source");
+    let write_long = async |raw: &Client| {
+        raw.execute(
+            &format!("insert into public.users values ($1, $2::text::{value_to})"),
+            &[&long_key, &long_value],
+        )
+        .await
+        .expect("a key and a value the old types can't hold");
+        raw.execute(
+            &format!("insert into public.posts values (4, $1, $2::text::{value_to})"),
+            &[&long_key, &long_value],
+        )
+        .await
+        .expect("a post by it");
+    };
+    if written_before_the_pass {
+        // The copies of a string column are unbounded, so the drain
+        // applies these with no pass in between.
+        write_long(&raw).await;
+        settle(&db.pool, &mut raw).await;
+        assert_widening_targets_match(&raw).await;
+    }
+    reconcile_pass(&mut raw, &db.pool).await;
+
+    for target in WIDENING_TARGETS {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        column_type(&raw, "public.user_labels", "label").await,
+        value_display
+    );
+    assert_eq!(
+        column_type(&raw, "public.post_labels", "label").await,
+        value_display
+    );
+    if let Some((_, key_display)) = key_to {
+        assert_eq!(
+            column_type(&raw, "public.user_labels", "handle").await,
+            key_display
+        );
+        assert_eq!(
+            column_type(&raw, "public.post_labels", "handle").await,
+            key_display
+        );
+    }
+    assert_eq!(
+        relfilenode(&raw, "public.user_labels").await,
+        target_file,
+        "no rewrite"
+    );
+    assert_eq!(
+        relfilenode(&raw, "public.post_labels").await,
+        joined_file,
+        "no rewrite"
+    );
+
+    if !written_before_the_pass {
+        write_long(&raw).await;
+    }
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    for target in WIDENING_TARGETS {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    let held: i64 = raw
+        .query_one("select count(*) from poison", &[])
+        .await
+        .expect("read poison")
+        .get(0);
+    assert_eq!(held, 0);
+    assert_widening_targets_match(&raw).await;
+}
+
+/// A copy of a `varchar(n)` column is an unbounded `varchar`, so a
+/// source column's change of bound, or to `text`, re-types no copy: the
+/// pass leaves every column and file as it is and pauses nothing, and a key
+/// and a value past the old bound apply before it.
+#[tokio::test]
+async fn a_longer_varchar_re_types_no_copy() {
+    a_modifier_widening_re_types_no_copy(
+        "varchar(10)",
+        Some(("varchar(40)", "character varying")),
+        "varchar(10)",
+        ("varchar(40)", "character varying"),
+        ("a handle past ten", "a label past ten characters"),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_bounded_varchar_to_text_re_types_no_copy() {
+    a_modifier_widening_re_types_no_copy(
+        "varchar(10)",
+        Some(("text", "character varying")),
+        "varchar(10)",
+        ("text", "character varying"),
+        ("a handle past ten", "a label past ten characters"),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_unbounded_varchar_to_text_re_types_no_copy() {
+    a_modifier_widening_re_types_no_copy(
+        "varchar",
+        Some(("text", "character varying")),
+        "varchar",
+        ("text", "character varying"),
+        ("a handle past ten", "a label past ten characters"),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn removing_a_varchar_length_re_types_no_copy() {
+    a_modifier_widening_re_types_no_copy(
+        "varchar(10)",
+        Some(("varchar", "character varying")),
+        "varchar(10)",
+        ("varchar", "character varying"),
+        ("a handle past ten", "a label past ten characters"),
+        false,
+    )
+    .await;
+}
+
+/// `numeric` can't be a key, so only the value columns widen. The copy is an
+/// unconstrained `numeric`, so a value past the old precision applies with no
+/// pass before it.
+#[tokio::test]
+async fn more_numeric_precision_at_the_same_scale_re_types_no_copy() {
+    a_modifier_widening_re_types_no_copy(
+        "varchar(10)",
+        None,
+        "numeric(5,2)",
+        ("numeric(9,2)", "numeric"),
+        ("dan", "12345.67"),
+        true,
+    )
+    .await;
+}
+
+/// ADR-0020: a value past a widened `numeric(p,s)` or `varchar(n)` applies
+/// with no pass between the `ALTER` and the drain, to a 1-1 passthrough and
+/// to a `JOIN`'s copy of a joined table's column. Nothing is held, nothing pauses
+/// and no column changes. A key held for another reason (a check
+/// constraint on the target, `23514`) stays held, and the pass releases
+/// nothing.
+#[tokio::test]
+async fn a_value_the_old_modifier_couldnt_hold_applies_with_no_pass_and_no_hold() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.goods (id int primary key, name varchar(10), price numeric(5,2), \
+                                    qty int); \
+         insert into public.goods values (1, 'one', 1.00, 1), (2, 'two', 2.00, 2); \
+         create table public.users (id int primary key, score numeric(5,2)); \
+         create table public.posts (id int primary key, author_id int); \
+         insert into public.users values (1, 1.50), (2, 2.50); \
+         insert into public.posts values (1, 1), (2, 2), (3, 1); \
+         create index on public.posts (author_id);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM good_names FROM public.goods SELECT name AS name, price AS price, qty AS qty",
+        "TRANSFORM post_authors FROM public.posts JOIN public.users \
+         ON posts.author_id = users.id GROUP BY posts.id, users.score WITHOUT SOURCE INDEX \
+         SELECT posts.id AS id, users.score AS score, COUNT(*) AS n",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    let targets = ["good_names", "post_authors"];
+    bring_live(&mut raw, &db.pool, &targets).await;
+    raw.batch_execute("alter table public.good_names add constraint few check (qty < 100)")
+        .await
+        .expect("a check on the target");
+
+    raw.batch_execute(
+        "alter table public.goods alter column name type varchar(40), \
+                                  alter column price type numeric(9,2); \
+         alter table public.users alter column score type numeric(9,2); \
+         insert into public.goods values (3, 'a name past ten characters', 3.00, 3), \
+                                         (4, 'four', 12345.67, 4), (5, 'five', 5.00, 500); \
+         update public.users set score = 12345.67 where id = 1;",
+    )
+    .await
+    .expect("widen, then write values the old modifiers can't hold");
+    drain_past_failures(&db.pool, &mut raw).await;
+    let held = async |raw: &Client| {
+        rows(
+            raw,
+            "select split_part(d.target_table, '.', 2), p.src_table, p.key, p.sqlstate \
+             from poison p join transform_definitions d on d.id = p.transform_id order by 1, 3",
+        )
+        .await
+    };
+    let row = |target: &str, table: &str, key: &str, sqlstate: &str| {
+        [target, table, key, sqlstate]
+            .into_iter()
+            .map(|v| Some(v.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let expected_held = vec![row("good_names", "public.goods", "5", "23514")];
+    assert_eq!(
+        held(&raw).await,
+        expected_held,
+        "only the check holds a key"
+    );
+
+    reconcile_pass(&mut raw, &db.pool).await;
+    drain_past_failures(&db.pool, &mut raw).await;
+    for target in targets {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        column_type(&raw, "public.good_names", "price").await,
+        "numeric"
+    );
+    assert_eq!(held(&raw).await, expected_held);
+    let requests: i64 = raw
+        .query_one("select count(*) from retype_releases", &[])
+        .await
+        .expect("read retype_releases")
+        .get(0);
+    assert_eq!(requests, 0, "no re-type asked for a release");
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name, price::text, qty::text from public.good_names order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, name::text, price::text, qty::text from public.goods \
+             where id <> 5 order by id"
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, score::text from public.post_authors where n <> 0 \
+             order by id"
+        )
+        .await,
+        rows(
+            &raw,
+            "select p.id::text, u.score::text from public.posts p \
+             join public.users u on u.id = p.author_id order by p.id"
+        )
+        .await,
+    );
+}
+
+/// A `character(n)` length change (its values are blank-padded to the
+/// length) and a `text` column made `varchar(n)` (binary-coercible, but a
+/// narrowing) re-type no copy and pause nothing: every value still fits a
+/// passthrough of either. Neither is a pure widening, so the definition
+/// rebuilds.
+#[tokio::test]
+async fn character_and_text_to_varchar_changes_re_type_no_copy() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.tags (id int primary key, code char(5), note text); \
+         insert into public.tags values (1, 'ab', 'x'), (2, 'cd', 'y');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM tag_codes FROM public.tags SELECT code AS code, note AS note")
+        .await
+        .expect("define tag_codes");
+    bring_live(&mut raw, &db.pool, &["tag_codes"]).await;
+
+    raw.batch_execute(
+        "alter table public.tags alter column code type char(9), \
+                                 alter column note type varchar(20)",
+    )
+    .await
+    .expect("change both columns");
+    capture_pass(&mut raw, &db.pool).await;
+    assert!(rebuilding(status(&raw, "tag_codes").await));
+    bring_live(&mut raw, &db.pool, &["tag_codes"]).await;
+    assert_eq!(
+        column_type(&raw, "public.tag_codes", "code").await,
+        "bpchar"
+    );
+    assert_eq!(column_type(&raw, "public.tag_codes", "note").await, "text");
+}
+
+/// Counts each in-place re-type of `public.item_names` the server starts,
+/// in a sequence a rolled-back `ALTER` doesn't undo, and fails it with the
+/// SQLSTATE in `public.retype_injection`, if any. An event trigger at
+/// `ddl_command_start` runs before the `ALTER` takes its lock.
+async fn watch_item_names_retypes(raw: &Client) {
+    raw.batch_execute(
+        "create table public.retype_injection (code text); \
+         create sequence public.retype_attempts; \
+         create function public.watch_retype() returns event_trigger language plpgsql as $$ \
+         declare injected text; \
+         begin \
+           if pg_catalog.current_query() ilike 'alter table %item_names%' then \
+             perform pg_catalog.nextval('public.retype_attempts'); \
+             select code into injected from public.retype_injection limit 1; \
+             if injected is not null then \
+               raise exception 'injected %', injected using errcode = injected; \
+             end if; \
+           end if; \
+         end $$; \
+         create event trigger watch_retype on ddl_command_start when tag in ('ALTER TABLE') \
+           execute function public.watch_retype();",
+    )
+    .await
+    .expect("watch item_names's re-types");
+}
+
+/// How many in-place re-types of `public.item_names` the server started
+/// ([`watch_item_names_retypes`]).
+async fn retype_attempts(raw: &Client) -> i64 {
+    raw.query_one(
+        "select case when is_called then last_value else 0 end from public.retype_attempts",
+        &[],
+    )
+    .await
+    .expect("read retype_attempts")
+    .get(0)
+}
+
+/// #828: a resume's re-type that fails transiently (a deadlock, a statement
+/// timeout's cancel) leaves the request queued, as one that can't get its
+/// lock does: the definition stays paused waiting on the re-type, with no
+/// failed-conversion message and no `DROP TRANSFORM` advice, and the next
+/// clean pass completes the resume.
+#[tokio::test]
+async fn a_resume_re_type_that_fails_transiently_keeps_the_request() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    resume(&trellis, "item_names").await;
+    watch_item_names_retypes(&raw).await;
+
+    for (attempt, code) in ["40P01", "57014"].into_iter().enumerate() {
+        raw.execute("insert into public.retype_injection values ($1)", &[&code])
+            .await
+            .expect("inject the error");
+        capture_pass(&mut raw, &db.pool).await;
+        assert_eq!(retype_attempts(&raw).await, attempt as i64 + 1, "{code}");
+        let error = assert_retyping(&trellis, &raw, "item_names").await;
+        assert!(
+            !error.contains("couldn't re-type") && !error.contains("DROP TRANSFORM"),
+            "{code}: {error}"
+        );
+        assert_eq!(
+            column_type(&raw, "public.item_names", "id").await,
+            "integer",
+            "{code}"
+        );
+        raw.batch_execute("delete from public.retype_injection")
+            .await
+            .expect("stop injecting");
+    }
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(retype_attempts(&raw).await, 3);
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    assert_item_names_match(&raw).await;
+}
+
+/// A 1-1 key's copy of a `varchar(10)` source key is an
+/// unbounded `varchar` with the source key's collation and its index, and a
+/// widening to `varchar(40)` leaves both as they are. The source key is
+/// recorded at its new type, as a resume records it. Its target stores
+/// keys of that type from then on, so a later narrowing (`varchar(20)`,
+/// truncating a key past it) is measured from it, and pauses the
+/// definition: the stored key no longer matches the source's.
+#[tokio::test]
+async fn a_key_re_typed_in_place_is_measured_from_its_new_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.codes (code varchar(10) collate \"C\" primary key, n int); \
+         insert into public.codes values ('a', 1), ('b', 2);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM code_counts FROM public.codes SELECT n AS n")
+        .await
+        .expect("define code_counts");
+    bring_live(&mut raw, &db.pool, &["code_counts"]).await;
+
+    let key_index = async |raw: &Client| {
+        rows(
+            raw,
+            "select i.indexrelid::regclass::text, c.relfilenode::text, \
+                    (select co.collname::text from pg_catalog.pg_attribute a \
+                     join pg_catalog.pg_collation co on co.oid = a.attcollation \
+                     where a.attrelid = i.indrelid and a.attname = 'code') \
+             from pg_catalog.pg_index i join pg_catalog.pg_class c on c.oid = i.indexrelid \
+             where i.indrelid = 'public.code_counts'::regclass and i.indisprimary",
+        )
+        .await
+    };
+    let before = key_index(&raw).await;
+    assert_eq!(before[0][2].as_deref(), Some("C"));
+    raw.batch_execute("alter table public.codes alter column code type varchar(40) collate \"C\"")
+        .await
+        .expect("widen the key");
+    reconcile_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "code_counts").await, TransformStatus::Live);
+    assert_eq!(
+        column_type(&raw, "public.code_counts", "code").await,
+        "character varying"
+    );
+    assert_eq!(
+        key_index(&raw).await,
+        before,
+        "the same collation and index"
+    );
+    raw.batch_execute("insert into public.codes values ('a code past twenty chars', 3)")
+        .await
+        .expect("a key the old type couldn't hold");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+
+    raw.batch_execute(
+        "alter table public.codes alter column code type varchar(20) collate \"C\" \
+         using code::varchar(20)",
+    )
+    .await
+    .expect("narrow the key, truncating one");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "code_counts", "public.codes", &["code"]).await;
+    assert!(
+        error.contains("from character varying(40) to character varying(20)"),
+        "{error}"
+    );
+}
+
+// ---- A re-type cancelled by a statement_timeout ends the request ----
+
+/// Gives `public.item_names` an expression index whose function reads
+/// `public.retype_gate`: while its `mode` is `cancel`, rebuilding the index
+/// (which the `integer` to `bigint` rewrite of `id` does) cancels the
+/// session's own statement (`57014`, "user request"); while `sleep`, it
+/// sleeps for 30 s, which a `statement_timeout` cancels. No `mode` row, no
+/// effect. The cancel is as deterministic as a lock held by hand: no timer.
+async fn gate_item_names_retype(raw: &Client) {
+    raw.batch_execute(
+        "create table public.retype_gate (mode text); \
+         create function public.retype_gate_fn(v bigint) returns bigint \
+             language plpgsql immutable as $$ \
+         declare m text; \
+         begin \
+             select mode into m from public.retype_gate limit 1; \
+             if m = 'cancel' then \
+                 perform pg_cancel_backend(pg_backend_pid()); \
+                 perform pg_sleep(30); \
+             elsif m = 'sleep' then \
+                 perform pg_sleep(30); \
+             end if; \
+             return v; \
+         end $$; \
+         create index item_names_gate on public.item_names (public.retype_gate_fn(id));",
+    )
+    .await
+    .expect("gate the re-type");
+}
+
+async fn set_gate(raw: &Client, mode: Option<&str>) {
+    raw.batch_execute("delete from public.retype_gate")
+        .await
+        .expect("clear the gate");
+    if let Some(mode) = mode {
+        raw.execute("insert into public.retype_gate values ($1)", &[&mode])
+            .await
+            .expect("arm the gate");
+    }
+}
+
+/// `item_names`'s request count, or `None` once the request has ended.
+async fn timeout_cancels(raw: &Client, target: &str) -> Option<i32> {
+    raw.query_opt(
+        "select r.timeout_cancels from resume_requests r join transform_definitions d \
+         on d.id = r.transform_id where split_part(d.target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read the count")
+    .map(|row| row.get(0))
+}
+
+/// `item_names` paused for a widened key, its re-type gated, and resumed:
+/// the request waits for the staging worker's next pass.
+async fn gated_resume(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
+    let trellis = items(dsn, raw, pool).await;
+    gate_item_names_retype(raw).await;
+    raw.batch_execute("alter table public.items alter column id type bigint")
+        .await
+        .expect("widen the key");
+    capture_pass(raw, pool).await;
+    paused_for(&trellis, "item_names", "public.items", &["id"]).await;
+    resume(&trellis, "item_names").await;
+    assert_retyping(&trellis, raw, "item_names").await;
+    trellis
+}
+
+/// A re-type cancelled by a `statement_timeout` is retried on the
+/// next pass, each time telling the operator why in the `resuming:` message;
+/// the third cancellation ends the request, naming the timeout and both
+/// remedies. The definition stays paused, the copy keeps its type and the
+/// target its rows. A `RESUME` while the request is still there starts the
+/// count over; one after it ended starts at 0 and, with the cause gone,
+/// finishes the re-type.
+#[tokio::test]
+async fn a_re_type_cancelled_three_times_ends_the_request_and_a_resume_once_the_cause_is_gone_finishes()
+ {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+    let before = rows(
+        &raw,
+        "select id::text, name from public.item_names order by id",
+    )
+    .await;
+    set_gate(&raw, Some("cancel")).await;
+
+    for attempt in 1..=2 {
+        capture_pass(&mut raw, &db.pool).await;
+        let error = assert_retyping(&trellis, &raw, "item_names").await;
+        assert!(
+            error.contains("public.item_names.id from integer to bigint")
+                && error.contains(&format!(
+                    "attempt {attempt} of 3, last error: canceling statement due to user request"
+                )),
+            "{error}"
+        );
+        assert_eq!(timeout_cancels(&raw, "item_names").await, Some(attempt));
+    }
+
+    // A new RESUME while the request waits starts the count over.
+    resume(&trellis, "item_names").await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(0));
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(!error.contains("attempt"), "{error}");
+
+    for attempt in 1..=2 {
+        capture_pass(&mut raw, &db.pool).await;
+        assert_retyping(&trellis, &raw, "item_names").await;
+        assert_eq!(timeout_cancels(&raw, "item_names").await, Some(attempt));
+    }
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None, "ended");
+    let reported = trellis
+        .status("item_names")
+        .await
+        .expect("status")
+        .expect("item_names");
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let error = reported.capture_failure.expect("reason").error;
+    assert!(
+        error.contains("public.item_names.id")
+            && error.contains("target table item_names")
+            && error.contains("re-type was cancelled 3 times, by a statement_timeout")
+            && error.contains("(last: canceling statement due to user request)")
+            && error.contains("Raise statement_timeout for Trellis's role or database")
+            && error.contains("restart Trellis")
+            && error.contains("resume the definition again")
+            && error.contains("DROP TRANSFORM item_names and define it again")
+            && !error.starts_with("resuming:"),
+        "{error}"
+    );
+    assert_eq!(
+        column_type(&raw, "public.item_names", "id").await,
+        "integer"
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select id::text, name from public.item_names order by id"
+        )
+        .await,
+        before
+    );
+    // Ended, so a further pass leaves it alone.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None);
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
+
+    // The remedy: with the cause gone, a new RESUME starts at 0 and finishes.
+    set_gate(&raw, None).await;
+    resume(&trellis, "item_names").await;
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(0));
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None);
+}
+
+/// The other remedy the ending message names. `DROP TRANSFORM` and
+/// define again works after a request ended this way, and builds the target
+/// with the widened key.
+#[tokio::test]
+async fn drop_transform_and_define_again_works_after_a_re_type_request_ended_on_timeouts() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+    set_gate(&raw, Some("cancel")).await;
+    for _ in 0..3 {
+        capture_pass(&mut raw, &db.pool).await;
+    }
+    assert_eq!(timeout_cancels(&raw, "item_names").await, None, "ended");
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
+
+    set_gate(&raw, None).await;
+    trellis
+        .apply("DROP TRANSFORM item_names")
+        .await
+        .expect("drop");
+    trellis
+        .apply("TRANSFORM item_names FROM public.items SELECT name AS name, qty + 1 AS next")
+        .await
+        .expect("define again");
+    bring_live(&mut raw, &db.pool, &["item_names"]).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
+        .await
+        .expect("a key above 2^31");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
+    assert_item_names_match(&raw).await;
+}
+
+/// A lock timeout never held the lock, so it isn't counted: the
+/// request stays however many passes fail on it, and the message carries the
+/// last error without an attempt number. Here a reader of the target holds
+/// `ACCESS SHARE`, so the re-type's `ACCESS EXCLUSIVE` times out after
+/// `RETYPE_LOCK_TIMEOUT`; once it lets go the next pass re-types.
+#[tokio::test]
+async fn a_lock_timeout_on_the_re_type_is_retried_without_counting() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+
+    let mut reader = connect(db.dsn()).await;
+    let held = reader.transaction().await.expect("begin");
+    held.batch_execute("lock table public.item_names in access share mode")
+        .await
+        .expect("hold a read lock on the target");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(
+        error.contains("last error: canceling statement due to lock timeout")
+            && !error.contains(" of 3"),
+        "{error}"
+    );
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(0));
+    held.rollback().await.expect("release");
+
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(column_type(&raw, "public.item_names", "id").await, "bigint");
+    assert_eq!(
+        status(&raw, "item_names").await,
+        TransformStatus::WaitingToBackfill
+    );
+}
+
+/// The cancel is the operator's own `statement_timeout`, not only a
+/// cancel by request: a re-type that outlasts it is counted the same way.
+#[tokio::test]
+async fn a_re_type_outlasting_the_statement_timeout_is_counted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = gated_resume(db.dsn(), &mut raw, &db.pool).await;
+    set_gate(&raw, Some("sleep")).await;
+
+    // The timeout bounds every statement of the pass, not only the re-type,
+    // so it is set well above what any of the others takes on a loaded box;
+    // the gate's 30 s sleep is still ten times over it.
+    raw.batch_execute("set statement_timeout = '3s'")
+        .await
+        .expect("set the timeout");
+    capture_pass(&mut raw, &db.pool).await;
+    raw.batch_execute("reset statement_timeout")
+        .await
+        .expect("reset the timeout");
+    let error = assert_retyping(&trellis, &raw, "item_names").await;
+    assert!(
+        error.contains("attempt 1 of 3, last error: canceling statement due to statement timeout"),
+        "{error}"
+    );
+    assert_eq!(timeout_cancels(&raw, "item_names").await, Some(1));
+}
+
+// ---------------------------------------------------------------------
+// The capture pass skips a definition's typed-copy comparison while
+// nothing it reads has changed (`staging::drift_memo`).
+// ---------------------------------------------------------------------
+
+/// Every comparison of typed copies the capture pass has run for the
+/// definitions of `raw`'s database, by target.
+async fn copy_checks(raw: &Client) -> std::collections::BTreeMap<String, u64> {
+    let database: String = raw
+        .query_one("select pg_catalog.current_database()::text", &[])
+        .await
+        .expect("database")
+        .get(0);
+    raw.query(
+        "select id, split_part(target_table, '.', 2) from transform_definitions order by id",
+        &[],
+    )
+    .await
+    .expect("definitions")
+    .into_iter()
+    .map(|row| {
+        let id: i64 = row.get(0);
+        (
+            row.get::<_, String>(1),
+            trellis::staging::drift_checks(&database, SCHEMA, id),
+        )
+    })
+    .collect()
+}
+
+/// `setup`'s three live definitions after one capture pass has compared
+/// each and recorded it, with the checks run so far.
+async fn settled(
+    db: &testkit::TestDatabase,
+    raw: &mut Client,
+) -> (Trellis, std::collections::BTreeMap<String, u64>) {
+    let trellis = setup(db.dsn(), raw, &db.pool).await;
+    capture_pass(raw, &db.pool).await;
+    let checks = copy_checks(raw).await;
+    assert!(checks.values().all(|n| *n > 0), "{checks:?}");
+    (trellis, checks)
+}
+
+/// The skip itself: passes over an unchanged schema compare no definition's
+/// copies, however many definitions read the table.
+#[tokio::test]
+async fn passes_over_an_unchanged_schema_compare_no_copies() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    for _ in 0..3 {
+        capture_pass(&mut raw, &db.pool).await;
+    }
+    reconcile_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+
+    // Writes to the source change no column.
+    raw.batch_execute("insert into public.posts values (4, 'bob', 'd', 2, 2.50)")
+        .await
+        .expect("write");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+}
+
+/// A widening after clean passes is found by the next pass, and only the
+/// definitions on the changed tables are compared again.
+#[tokio::test]
+async fn a_widening_after_clean_passes_is_caught_on_the_next_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, settled) = settled(&db, &mut raw).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+
+    raw.batch_execute("alter table public.posts alter column kind type bigint")
+        .await
+        .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Paused);
+    let error = paused_for(&trellis, "per_kind", "public.posts", &["kind"]).await;
+    assert!(
+        error.contains("integer") && error.contains("bigint"),
+        "{error}"
+    );
+    let after = copy_checks(&raw).await;
+    assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
+}
+
+/// A widening of a `varchar` `ON` pair of a `JOIN`, after clean passes, is
+/// compared again by the next pass, both sides alike, and finds the
+/// unbounded copies current.
+#[tokio::test]
+async fn a_varchar_widening_after_clean_passes_is_compared_again_and_re_types_nothing() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, settled);
+
+    raw.batch_execute(
+        "alter table public.users alter column handle type varchar(40); \
+         alter table public.posts alter column author type varchar(40);",
+    )
+    .await
+    .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+
+    for target in ["post_authors", "post_titles", "per_kind"] {
+        assert_eq!(
+            status(&raw, target).await,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    assert_eq!(
+        column_type(&raw, "public.post_authors", "handle").await,
+        "character varying"
+    );
+    let after = copy_checks(&raw).await;
+    assert!(after["post_authors"] > settled["post_authors"], "{after:?}");
+}
+
+/// A column re-typed and re-typed back between two passes ends where it was,
+/// but is not the column the last comparison saw: the next pass compares
+/// again. The fingerprint carries each row's `xmin` for this. The two
+/// rewrites read as a same-type rewrite of the column, so the table's
+/// readers rebuild (a documented false positive), and nothing
+/// pauses.
+#[tokio::test]
+async fn a_column_re_typed_and_back_between_passes_is_compared_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    // Each retype moves the column's attribute version on a server that
+    // versions them, so the two rows differ only there (`support/attver.rs`).
+    let attver = attver::Attver::probe(&raw).await;
+    for statement in [
+        "alter table public.posts alter column kind type bigint",
+        "alter table public.posts alter column kind type integer",
+    ] {
+        raw.batch_execute(statement).await.expect("there and back");
+        attver.after(&raw, statement).await;
+    }
+    capture_pass(&mut raw, &db.pool).await;
+
+    for target in ["post_authors", "post_titles", "per_kind"] {
+        assert!(rebuilding(status(&raw, target).await), "{target}");
+    }
+    let after = copy_checks(&raw).await;
+    assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
+    // And settled again.
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(copy_checks(&raw).await, after);
+}
+
+/// A column Trellis created, re-typed by hand away from what define would
+/// give it, is found though the source never changed: the target's own
+/// columns are fingerprinted too.
+#[tokio::test]
+async fn a_copy_re_typed_by_hand_is_compared_again() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    raw.batch_execute("alter table public.post_titles alter column title type varchar(100)")
+        .await
+        .expect("narrow the copy by hand");
+    capture_pass(&mut raw, &db.pool).await;
+    let after = copy_checks(&raw).await;
+    assert!(after["post_titles"] > settled["post_titles"], "{after:?}");
+}
+
+/// A definition paused for a widening and resumed is compared afresh, finds
+/// its copies current, and then settles: nothing recorded before the pause
+/// stands in for the comparison after the resume.
+#[tokio::test]
+async fn a_resumed_definition_is_compared_again_and_then_skipped() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, settled) = settled(&db, &mut raw).await;
+
+    raw.batch_execute("alter table public.posts alter column kind type bigint")
+        .await
+        .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Paused);
+    resume(&trellis, "per_kind").await;
+    bring_live(&mut raw, &db.pool, &["per_kind"]).await;
+    assert_eq!(column_type(&raw, "public.per_kind", "kind").await, "bigint");
+    capture_pass(&mut raw, &db.pool).await;
+    let after = copy_checks(&raw).await;
+    assert!(after["per_kind"] > settled["per_kind"], "{after:?}");
+    for _ in 0..2 {
+        capture_pass(&mut raw, &db.pool).await;
+    }
+    assert_eq!(copy_checks(&raw).await, after);
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Live);
+}
+
+/// A copy found different from what define would give it, though the source
+/// is not past it (here an integer source narrowed to `smallint`), is
+/// compared on every pass.
+#[tokio::test]
+async fn a_drifted_copy_is_never_skipped() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, settled) = settled(&db, &mut raw).await;
+
+    raw.batch_execute("alter table public.posts alter column kind type smallint")
+        .await
+        .expect("narrow the source");
+    capture_pass(&mut raw, &db.pool).await;
+    let first = copy_checks(&raw).await;
+    assert!(first["per_kind"] > settled["per_kind"], "{first:?}");
+    capture_pass(&mut raw, &db.pool).await;
+    let second = copy_checks(&raw).await;
+    assert!(second["per_kind"] > first["per_kind"], "{second:?}");
+    // A narrowing pauses nothing.
+    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Live);
+}
+
+/// `ALTER TRANSFORM` rewrites a definition in place, giving it a column
+/// Trellis copies from the source. The column joins the comparison at once:
+/// the definition's recorded stamp names the definition it was taken from.
+#[tokio::test]
+async fn a_column_added_by_alter_transform_is_compared_after_clean_passes() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (trellis, settled) = settled(&db, &mut raw).await;
+
+    trellis
+        .apply("ALTER TRANSFORM post_titles ADD kind AS k")
+        .await
+        .expect("add a passthrough");
+    bring_live(&mut raw, &db.pool, &["post_titles"]).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let added = copy_checks(&raw).await;
+    assert!(added["post_titles"] > settled["post_titles"], "{added:?}");
+    assert_eq!(
+        column_type(&raw, "public.post_titles", "k").await,
+        "integer"
+    );
+
+    raw.batch_execute("alter table public.posts alter column kind type bigint")
+        .await
+        .expect("widen");
+    capture_pass(&mut raw, &db.pool).await;
+    // The new copy is among those found outgrown, with the group-by key.
+    let error = paused_for(&trellis, "post_titles", "public.posts", &["kind"]).await;
+    assert!(error.contains("public.post_titles.k"), "{error}");
+}
+
+/// A target column someone re-typed by hand, with its source column
+/// untouched, is reported as re-typed outside Trellis, not as a source
+/// column that widened.
+#[tokio::test]
+async fn a_target_column_re_typed_by_hand_is_not_blamed_on_the_source() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = items(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("alter table public.item_names alter column next type smallint")
+        .await
+        .expect("re-type the target column by hand");
+    capture_pass(&mut raw, &db.pool).await;
+    let error = paused_for(&trellis, "item_names", "public.items", &["qty"]).await;
+    assert!(
+        error.contains("re-typed outside Trellis")
+            && error.contains("public.item_names.next (smallint, now integer)")
+            && !error.contains("widened")
+            && error.contains("Resume the definition"),
+        "{error}"
+    );
+    resume(&trellis, "item_names").await;
+    assert_retyping(&trellis, &raw, "item_names").await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        column_type(&raw, "public.item_names", "next").await,
+        "integer"
+    );
+}
+
+/// A `COUNT` over a `jsonb` or `json` column on the group basis counts a JSON
+/// `'null'` value and skips a SQL `NULL`, as Postgres does, both in the build
+/// and in deltas computed from captured images.
+#[tokio::test]
+async fn a_group_basis_count_tells_a_json_null_from_a_sql_null() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.docs (id int primary key, g int, doc jsonb, j json); \
+         insert into public.docs values (1, 1, 'null', 'null'), (2, 1, null, null), (3, 1, '{\"a\":1}', '{\"a\":1}');",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM per_g FROM public.docs GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(doc) AS nd, COUNT(j) AS nj, COUNT(*) AS n")
+        .await
+        .expect("define");
+    bring_live(&mut raw, &db.pool, &["per_g"]).await;
+    let q = "select g::text, nd::text, nj::text, n::text from public.per_g order by g";
+    let o = "select g::text, count(doc)::text, count(j)::text, count(*)::text from public.docs group by g order by g";
+    assert_eq!(rows(&raw, q).await, rows(&raw, o).await, "the build");
+    raw.batch_execute("insert into public.docs values (4, 1, 'null', 'null'), (5, 2, 'null', 'null'); update public.docs set doc = 'null', j = 'null' where id = 3; delete from public.docs where id = 1").await.unwrap();
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+    assert_eq!(rows(&raw, q).await, rows(&raw, o).await, "applied changes");
+}

@@ -9,8 +9,7 @@ use tokio_postgres::Client;
 use trellis::Trellis;
 use trellis::defs::TransformStatus;
 
-#[path = "pipeline.rs"]
-mod pipeline;
+use super::pipeline;
 
 #[allow(unused_imports)]
 pub use pipeline::{capture_pass, connect, definer, reconcile_pass, settle};

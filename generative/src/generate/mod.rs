@@ -27,7 +27,6 @@
 //! unconditionally"), and every definition sourced from a table gets an
 //! identity-passthrough field for each of the `Text`/`Boolean`/`Uuid` columns
 //! (`SELECT <col> AS <col>`, the bare-`Expr::Column` shape
-//! `trellis/tests/defs_backfill_direct.rs` exercises by hand and
 //! `defs::ddl::passthrough_source_column` special-cases). See [`TableSpec`]'s
 //! `text_values`/`bool_values`/`uuid_values`/`grain_values` fields and the
 //! `text_value`/`bool_value`/`uuid_value`/`grain_value` strategies below.
@@ -81,7 +80,7 @@
 //!   in place, and the grain column, which the concurrent tier moves with
 //!   [`Mutate::MoveGroup`] (migrating a live row between groups by `Update`
 //!   is also exercised by hand in
-//!   `trellis/tests/group_basis_interleavings.rs`).
+//!   `trellis/tests/group_basis/group_basis_interleavings.rs`).
 //! - `KeySpace::Aggregate.group_by` is always exactly one column: the engine
 //!   grammar supports a composite group-by, but this generator does not draw
 //!   one.
@@ -940,9 +939,7 @@ pub fn build_program_multi_with_shapes(
                         },
                         // One identity-passthrough field per new
                         // column, reusing the column's own name as the field
-                        // name (`SELECT <col> AS <col>`) — the exact shape
-                        // `trellis/tests/defs_backfill_direct.rs` already
-                        // exercises by hand, and every def sourced from this
+                        // name (`SELECT <col> AS <col>`), and every def sourced from this
                         // table gets the same three, determined by the
                         // table's shape rather than drawn independently per
                         // def (matching how `total` already works). The

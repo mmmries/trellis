@@ -73,10 +73,10 @@
 //! the busy loop the emptiness guard exists to prevent); and
 //! `converged_through`'s condition 3 no longer treats a `'drained'` owner as
 //! sufficient on its own — a row must actually have been visible in that
-//! segment's own published fence to stop gating. `trellis/tests/sealing.rs`'s
+//! segment's own published fence to stop gating. `trellis/tests/staging/sealing.rs`'s
 //! `an_empty_active_segment_still_seals_to_catch_a_stranded_straggler`/
 //! `an_empty_active_segment_with_an_undrained_fully_fenced_predecessor_does_not_seal`
-//! and `trellis/tests/converge.rs`'s
+//! and `trellis/tests/client_app/converge.rs`'s
 //! `a_drained_slots_unfenced_straggler_still_gates_convergence` cover both
 //! sides directly, deterministically, at the unit level — no timing race
 //! needed. Every test in this file that this bug affected is un-`#[ignore]`d

@@ -1154,9 +1154,10 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// that changes a real value's text therefore makes those paths disagree,
 /// duplicating or orphaning the target row for exactly the values it
 /// rewrites — empirically reproduced for a `text` primary key holding a
-/// literal U+0001 (see `trellis/tests/one_to_one_control_char_pk.rs`). Since a not-null key can
-/// never *need* the `NULL` substitution, the only safe encoding for it is
-/// the identity one.
+/// literal U+0001 (see
+/// `trellis/tests/one_to_one/one_to_one_control_char_pk.rs`). Since a
+/// not-null key can never *need* the `NULL` substitution, the only safe
+/// encoding for it is the identity one.
 pub(crate) fn encode_key_part(value: Option<&str>) -> Cow<'_, str> {
     match value {
         None => Cow::Borrowed(NULL_KEY_SENTINEL),

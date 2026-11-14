@@ -52,6 +52,7 @@ Issues labelled `good first contribution`.
   - The test suite, if provided, must be complete and pass
   - Increase code coverage, not versa.
   - Use the `testkit` crate, which gives each test a throwaway, migrated Postgres database (`testkit::cluster`), and borrow inspiration from existing tests in `trellis/tests`.
+  - A new integration test file goes in its family's directory, `trellis/tests/<family>/`, with a `mod` line in that family's `main.rs`; run it with `cargo test -p trellis --test <family> <module>::` ([testing strategy](docs/testing-strategy.md#4-integration-tests)).
 - [x] Dependencies
   - Minimize number of dependencies.
   - Prefer Apache 2.0, BSD3, MIT, ISC and MPL licenses.

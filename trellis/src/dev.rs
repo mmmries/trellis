@@ -26,7 +26,7 @@
 //! for something here in order to *drive the engine into a state*, that is
 //! the thing ADR-0012 says to do through `Trellis`/`Client` instead.
 //!
-//! This is **not** the door this crate's own `tests/*.rs` use — those are
+//! This is **not** the door this crate's own `tests/` targets use — those are
 //! separate compilation units exercising the engine directly by design, and
 //! they see `defs`/`staging`/`intake` through the `internals` feature
 //! instead. See `Cargo.toml`.

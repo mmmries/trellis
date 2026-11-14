@@ -2,7 +2,7 @@
 //! (a `NULL` from its context, as Postgres types `unknown`), and what define
 //! refuses. Each expected type here was read off PostgreSQL 15, 17 and 18
 //! (`CREATE TABLE AS`); the conformance harness (`generative/tests/expr_conformance.rs`) and
-//! `tests/null_literal.rs` check the same against a live server.
+//! `tests/expressions/null_literal_key_spaces.rs` check the same against a live server.
 
 use std::collections::HashMap;
 

@@ -371,7 +371,7 @@ mod tests {
     /// same database must not contend for each other's singleton. Pure
     /// arithmetic, no database needed; the end-to-end proof that two
     /// instances can then actually both run lives in
-    /// `trellis/tests/staging_ring.rs` and
+    /// `trellis/tests/staging/staging_ring.rs` and
     /// `generative/tests/two_instance_noise.rs`.
     #[test]
     fn different_schemas_get_different_keys() {

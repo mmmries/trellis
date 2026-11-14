@@ -1,0 +1,1095 @@
+//! Group-basis aggregates whose source is another definition's target
+//! (ADR-0002 "Multi-hop").
+//!
+//! A target is never captured: its writers stage its changes through the
+//! target-mutation seam, and a target with a group-basis reader is on the
+//! seam's image feed (`staging::target_mutations`, "The image feed"). Each
+//! test here drives the pipeline by hand through `support/drain_driver.rs`
+//! and none sleeps or polls for convergence. Every source starts empty and is written through
+//! capture once every definition is live, except where a test says it builds
+//! over rows.
+//!
+//! The first tests cover a chained aggregate over a single-column and a composite
+//! group key, and one whose upstream 1-1 target loses a row. The rest cover a row
+//! that moves group upstream, a rollup whose upstream group is emptied and refilled
+//! in one page, a reader defined while an upstream writer is in flight, an
+//! upstream rebuild that rebuilds the reader, and an upstream release or
+//! `JOIN` rebuild whose seam rows reach the reader. The last group is a reader's build
+//! over an upstream target whose keys have `NULL` parts, with writes and source
+//! `TRUNCATE`s around it.
+
+use crate::support::drain_driver;
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use drain_driver::{Driver, Running, int4};
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ValueType;
+use trellis::defs::chunk_queue;
+use trellis::integer::IntWidth;
+use trellis::staging::interleave::PausePoint;
+
+const SRC: &str = "public.src";
+const SRC_DDL: &str = "create table public.src (id integer primary key, g integer, h integer, \
+                       v integer); \
+                       create index on public.src (g, h)";
+
+fn int8() -> ValueType {
+    ValueType::Integer(IntWidth::Int8)
+}
+
+fn src_columns() -> Vec<(&'static str, ValueType)> {
+    vec![("id", int4()), ("g", int4()), ("h", int4()), ("v", int4())]
+}
+
+/// `public.src (id, g, h, v)`, empty and captured, with `upstream` live over
+/// it and `downstream` (over `upstream`'s target, whose columns are
+/// `downstream_columns`) live after it, every aggregate on the group basis.
+async fn start(
+    upstream: &str,
+    downstream: &str,
+    downstream_columns: &[(&str, ValueType)],
+    aggregates: usize,
+) -> Driver {
+    let mut d = Driver::start(SRC_DDL, &src_columns(), &[upstream], &[SRC]).await;
+    install(&d, downstream, downstream_columns).await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    assert_eq!(hidden_tables(&d).await, aggregates, "on the group basis");
+    d
+}
+
+async fn install(d: &Driver, definition: &str, columns: &[(&str, ValueType)]) {
+    let columns: HashMap<String, ValueType> = columns
+        .iter()
+        .map(|(name, ty)| (name.to_string(), *ty))
+        .collect();
+    trellis::defs::install_definition(d.pool(), definition, &columns, "public")
+        .await
+        .unwrap_or_else(|e| panic!("install {definition}: {e}"));
+}
+
+/// How many group-basis hidden tables the catalog schema holds.
+async fn hidden_tables(d: &Driver) -> usize {
+    d.rows(&format!(
+        "select 1 from pg_tables where schemaname = '{DEFAULT_SCHEMA}' \
+         and tablename like 'agg\\_%'"
+    ))
+    .await
+    .len()
+}
+
+/// Asserts `actual` equals the oracle `expected`, both over the settled
+/// pipeline.
+async fn assert_equal(d: &mut Driver, actual: &str, expected: &str) {
+    d.settle().await;
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(expected).await,
+        "{actual} (left) differs from the oracle (right)"
+    );
+}
+
+// ---------------------------------------------- ported chained aggregates
+
+const AGG_G: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+
+fn agg_g_columns() -> Vec<(&'static str, ValueType)> {
+    vec![("g", int4()), ("total", int8()), ("n", int8())]
+}
+
+/// An extinct upstream group removes the chained group it was the only
+/// contributor to, and a shrunk one reduces it, with a plain
+/// single-column `GROUP BY` at both levels.
+#[tokio::test]
+async fn an_extinct_upstream_group_removes_its_rollup_group() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(total) AS total2",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const ROLL: &str = "select g, total2 from public.roll order by g";
+    const ORACLE: &str = "select g, sum(v) from public.src group by g order by g";
+    d.step_settle(
+        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2), (4, 3, 0, 11)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    d.step_settle("delete from public.src where id = 4").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    assert_eq!(
+        d.rows("select g from public.roll where g = 3").await.len(),
+        0
+    );
+    d.step_settle("delete from public.src where id = 1").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+}
+
+/// A coarser rollup over a composite upstream `GROUP BY`: an extinct
+/// `(g, h)` group reduces its `g`'s total and its group count.
+#[tokio::test]
+async fn an_extinct_composite_upstream_group_reduces_its_coarser_rollup() {
+    let mut d = start(
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n",
+        "TRANSFORM roll FROM public.agg GROUP BY g \
+        WITHOUT SOURCE INDEX SELECT SUM(total) AS total2, COUNT(*) AS groups",
+        &[
+            ("g", int4()),
+            ("h", int4()),
+            ("total", int8()),
+            ("n", int8()),
+        ],
+        2,
+    )
+    .await;
+    const ROLL: &str = "select g, total2, groups from public.roll order by g";
+    const ORACLE: &str = "select g, sum(v), count(distinct array[h]) from public.src \
+                          group by g order by g";
+    d.step_settle(
+        "insert into public.src values \
+         (1, 1, 1, 5), (2, 1, 1, 7), (3, 1, 2, 2), (4, 2, 1, 11), (5, 2, null, 3)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    d.step_settle("delete from public.src where id = 3").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    // A NULL grouping part: the upstream group `(2, NULL)` goes extinct.
+    d.step_settle("delete from public.src where id = 5").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    d.step_settle("delete from public.src where g = 2").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+}
+
+const ONE: &str = "TRANSFORM m FROM public.src SELECT g AS g, v + v AS w";
+const OVER_ONE: &str = "TRANSFORM agg FROM public.m GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(w) AS total, COUNT(*) AS n";
+const OVER_ONE_ACTUAL: &str = "select g, total, n from public.agg order by g";
+const OVER_ONE_ORACLE: &str =
+    "select g, sum(v + v), count(*) from public.src group by g order by g";
+
+fn one_columns() -> Vec<(&'static str, ValueType)> {
+    vec![("id", int4()), ("g", int4()), ("w", int4())]
+}
+
+/// A deleted row of a 1-1 target reduces the aggregate over it, and removes
+/// the group it was the last member of.
+#[tokio::test]
+async fn a_deleted_one_to_one_row_reduces_the_aggregate_over_it() {
+    let mut d = start(ONE, OVER_ONE, &one_columns(), 1).await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)")
+        .await;
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    d.step_settle("delete from public.src where id = 2").await;
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    d.step_settle("delete from public.src where id = 3").await;
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+}
+
+// ------------------------------------------------------ decision 5's cases
+
+/// The computed-measure pattern: an upstream 1-1 row moves group,
+/// so the aggregate over it decrements the group it left, which only the old
+/// image names. A key-only `Recompute` would leave it counted there.
+#[tokio::test]
+async fn an_upstream_row_that_moves_group_leaves_its_old_group() {
+    let mut d = start(ONE, OVER_ONE, &one_columns(), 1).await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)")
+        .await;
+    d.step_settle("update public.src set g = 2, v = 9 where id = 1")
+        .await;
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    // Two moves of one key in one page: the images chain through both.
+    d.write("update public.src set g = 3 where id = 2").await;
+    d.write("update public.src set g = 1, v = 1 where id = 2")
+        .await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    // The upstream group-key change moves group 2's only member away.
+    d.step_settle("update public.src set g = 1 where id = 3")
+        .await;
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+}
+
+/// A rollup grouped by an upstream value (each group's row count): one
+/// upstream page moves both of group 1's rows out and two new rows in
+/// (emptied and refilled), empties group 3 and grows group 2, so the rollup's
+/// groups by `n` see each kind of upstream change, and group 1's row moves
+/// between them only through its images.
+#[tokio::test]
+async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT SUM(total) AS total, COUNT(*) AS groups",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const ROLL: &str = "select n, total, groups from public.roll order by n";
+    const ORACLE: &str = "select n, sum(total), count(*) from \
+                          (select g, sum(v) as total, count(*) as n from public.src group by g) s \
+                          group by n order by n";
+    d.step_settle(
+        "insert into public.src values (1, 1, 0, 10), (3, 1, 0, 7), (5, 2, 0, 1), (6, 3, 0, 4)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    d.write(
+        "update public.src set g = 2 where id in (1, 3, 6); \
+         insert into public.src values (2, 1, 0, 5), (4, 1, 0, 6)",
+    )
+    .await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    // Emptied by one transaction and refilled by another, drained as one
+    // page: the upstream group's row count passes through 0.
+    d.write("delete from public.src where g = 1").await;
+    d.write("insert into public.src values (7, 1, 0, 3)").await;
+    let batch = d.seal().await;
+    d.drain(batch, "a").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+}
+
+/// A reader defined while an upstream writer is in flight (ADR-0002,
+/// "Multi-hop"): the upstream page resolved `m`'s feed before the reader
+/// existed, so it stages nothing for it, and commits after the reader's
+/// build started. The build's plan waits on its fence until that page has
+/// ended, so it sees the page's row rather than missing it: the build
+/// counts it and the reader goes `live` with it.
+#[tokio::test]
+async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_write() {
+    let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
+    d.write("insert into public.src values (1, 1, 0, 5)").await;
+    let batch = d.seal().await;
+    let mut page = d
+        .drain_frozen(batch, "writer", &[(PausePoint::BeforeCommit, "public.m")])
+        .await;
+    page.reached(PausePoint::BeforeCommit).await;
+
+    install(&d, OVER_ONE, &one_columns()).await;
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the reader's build");
+    assert_eq!(
+        d.rows("select status, build from transform_definitions where target_table = 'public.agg'")
+            .await,
+        ["(backfilling,rederive)"],
+        "the reader applies from its build's start"
+    );
+    // The plan waits for the writer, which began before its fence.
+    assert!(run_plan(&d).await, "a plan job to claim");
+    assert_eq!(
+        d.rows("select done, fence_xid is not null from backfill_chunks where kind = 'plan'")
+            .await,
+        ["(f,t)"],
+        "the plan defers on its fence"
+    );
+
+    d.release(&mut page, PausePoint::BeforeCommit).await;
+    page.finish().await;
+    d.ctl
+        .batch_execute("update backfill_chunks set next_attempt_at = null")
+        .await
+        .expect("skip the plan's backoff");
+    assert!(run_plan(&d).await, "the plan job again");
+    assert_eq!(
+        d.rows("select status from transform_definitions where target_table = 'public.agg'")
+            .await,
+        ["(live)"],
+        "the build counted the writer's row"
+    );
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    assert_eq!(d.rows(OVER_ONE_ACTUAL).await, ["(1,10,1)"]);
+}
+
+/// A reader defined over an upstream that is already live with rows: the
+/// build's plan waits on its fence, then one absolute write counts them.
+#[tokio::test]
+async fn a_reader_defined_over_a_seeded_upstream_builds_from_its_rows() {
+    let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 6), (3, 2, 0, 7)")
+        .await;
+    install(&d, OVER_ONE, &one_columns()).await;
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the reader's build");
+    while run_plan(&d).await {
+        d.ctl
+            .batch_execute("update backfill_chunks set next_attempt_at = null")
+            .await
+            .expect("skip the plan's backoff");
+    }
+    assert_eq!(
+        d.rows("select status from transform_definitions where target_table = 'public.agg'")
+            .await,
+        ["(live)"]
+    );
+    assert_equal(&mut d, OVER_ONE_ACTUAL, OVER_ONE_ORACLE).await;
+    assert_eq!(d.rows(OVER_ONE_ACTUAL).await, ["(1,22,2)", "(2,14,1)"]);
+}
+
+/// Claims the one Re-derive plan job, if any is claimable, and runs it.
+async fn run_plan(d: &Driver) -> bool {
+    let claimed = chunk_queue::claim_chunks_of(
+        &**d.pool().get().await.expect("pool"),
+        "test",
+        1,
+        &[chunk_queue::KIND_PLAN],
+    )
+    .await
+    .expect("claim the plan job");
+    let Some(chunk) = claimed.first() else {
+        return false;
+    };
+    let options = trellis::staging::build::WorkerOptions {
+        chunk_rows: 1_000,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    };
+    trellis::staging::build::run_claimed(d.pool(), chunk, "test", &options).await;
+    true
+}
+
+/// A rebuild of a group-basis upstream reaches its group-basis reader
+/// through the seam: each visible row the rebuild changes is staged
+/// with the row the target held as its prior image, so the reader moves
+/// each group between its rollup groups exactly once. Here the rebuild's
+/// snapshot sees an undrained insert and delete, which it folds into
+/// groups 2 and 3, and their own page is then refused upstream.
+#[tokio::test]
+async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups, SUM(total) AS t",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const ROLL: &str = "select n, groups, t from public.roll order by n";
+    const ORACLE: &str = "select n, count(*), sum(total) from ( \
+                              select count(*) as n, sum(v) as total from public.src group by g \
+                          ) s group by n order by n";
+    d.step_settle(
+        "insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2), (4, 3, 0, 11)",
+    )
+    .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    d.write("insert into public.src values (5, 2, 0, 1); delete from public.src where id = 4")
+        .await;
+    let undrained = d.seal().await;
+    let trellis = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    trellis
+        .request_backfill("src")
+        .await
+        .expect("request a rebuild");
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    d.drain(undrained, "undrained").await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    d.step_settle("insert into public.src values (6, 3, 0, 4)")
+        .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+}
+
+// ------------------------- an upstream release or JOIN rebuild, through the seam
+
+/// Holds `key` of `src_table` for the definition whose target is `target`,
+/// as an eviction would: from now on every page parks its changes.
+async fn hold(d: &Driver, target: &str, src_table: &str, key: &str) {
+    d.ctl
+        .execute(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, $1, $2, 'test' from transform_definitions \
+             where target_table = $3",
+            &[&src_table, &key, &target],
+        )
+        .await
+        .expect("hold the key");
+}
+
+/// How many rows the ring holds for `src_table`: a writer's staged seam rows
+/// for a target, before any page drains them.
+async fn ring_rows(d: &Driver, src_table: &str) -> usize {
+    d.rows(&format!(
+        "select 1 from (select src_table from seg_0 union all select src_table from seg_1 \
+         union all select src_table from seg_2 union all select src_table from seg_3) r \
+         where src_table = '{src_table}'"
+    ))
+    .await
+    .len()
+}
+
+/// A release of a held key on a group-basis upstream reaches its reader
+/// through the seam: the release stages the visible rows it changed, in its
+/// own transaction, and the reader follows them.
+#[tokio::test]
+async fn an_upstream_release_reaches_its_reader_through_the_seam() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups, SUM(total) AS t",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const ROLL: &str = "select n, groups, t from public.roll order by n";
+    const ORACLE: &str = "select n, count(*), sum(total) from ( \
+                              select count(*) as n, sum(v) as total from public.src group by g \
+                          ) s group by n order by n";
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 1, 0, 7), (3, 2, 0, 2)")
+        .await;
+    assert_equal(&mut d, ROLL, ORACLE).await;
+    hold(&d, "public.agg", SRC, "1").await;
+    d.write("update public.src set g = 2, v = 9 where id = 1")
+        .await;
+    let batch = d.seal().await;
+    d.drain(batch, "held").await;
+    assert_ne!(
+        d.rows(ROLL).await,
+        d.rows(ORACLE).await,
+        "the held change is parked"
+    );
+    let staged = ring_rows(&d, "public.agg").await;
+    trellis::staging::release_key(d.pool(), "agg", SRC, "1")
+        .await
+        .expect("release the key");
+    assert!(
+        ring_rows(&d, "public.agg").await > staged,
+        "the release stages the rows it changed for the reader"
+    );
+    assert_equal(&mut d, ROLL, ORACLE).await;
+}
+
+const JR: &str = "select ga, n, sy1 from public.jr order by ga";
+const JR_ORACLE: &str = "select a.ga, count(*), sum(b.y) + 1 from public.a join public.b \
+                         on a.k = b.k group by a.ga order by a.ga";
+
+/// A `JOIN` upstream, `j`, over `public.a` and `public.b`, with a 1-1
+/// reader, `jr`, both live, and a few rows in either table.
+async fn join_with_reader() -> Driver {
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, ga integer, k integer, x integer); \
+         create table public.b (id integer primary key, k integer, y integer); \
+         create index on public.a (k); create index on public.b (k)",
+        &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],
+        &[
+            "TRANSFORM j FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    install(
+        &d,
+        "TRANSFORM jr FROM public.j SELECT n AS n, sy + 1 AS sy1",
+        &[("ga", int4()), ("n", int8()), ("sy", int8())],
+    )
+    .await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    d.step_settle("insert into public.b values (1, 1, 10), (2, 2, 20)")
+        .await;
+    d.step_settle("insert into public.a values (1, 1, 1, 0), (2, 2, 2, 0)")
+        .await;
+    assert_equal(&mut d, JR, JR_ORACLE).await;
+    d
+}
+
+/// The same for a `JOIN` upstream: its release carries the key's cells to
+/// `T` and stages the visible rows that changed for the reader.
+#[tokio::test]
+async fn an_upstream_join_release_reaches_its_reader_through_the_seam() {
+    let mut d = join_with_reader().await;
+    hold(&d, "public.j", "public.a", "1").await;
+    d.write("update public.a set ga = 2 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "held").await;
+    assert_ne!(
+        d.rows(JR).await,
+        d.rows(JR_ORACLE).await,
+        "the held change is parked"
+    );
+    let staged = ring_rows(&d, "public.j").await;
+    trellis::staging::release_key(d.pool(), "j", "public.a", "1")
+        .await
+        .expect("release the key");
+    assert!(
+        ring_rows(&d, "public.j").await > staged,
+        "the release stages the rows it changed for the reader"
+    );
+    assert_equal(&mut d, JR, JR_ORACLE).await;
+}
+
+/// A rebuild in place of a `JOIN` upstream reaches its reader through the
+/// seam, with changes its snapshot saw before they drained folded in.
+#[tokio::test]
+async fn an_upstream_join_rebuild_reaches_its_reader_through_the_seam() {
+    let mut d = join_with_reader().await;
+    d.write("update public.a set ga = 2 where id = 1; insert into public.a values (3, 3, 2, 0)")
+        .await;
+    let undrained = d.seal().await;
+    let trellis = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    let staged = ring_rows(&d, "public.j").await;
+    trellis
+        .request_backfill("a")
+        .await
+        .expect("request a rebuild");
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    assert!(
+        ring_rows(&d, "public.j").await > staged,
+        "the rebuild stages the rows it changed for the reader"
+    );
+    d.drain(undrained, "undrained").await;
+    assert_equal(&mut d, JR, JR_ORACLE).await;
+}
+
+// ------------------------------------- 1-1 readers of a nullable key
+
+/// A 1-1 reader of a group-basis aggregate holds the groups whose key has a
+/// `NULL` part, as the aggregate does: its key is the aggregate's `UNIQUE
+/// NULLS NOT DISTINCT` one. A row moves into, within and out of
+/// such a group.
+#[tokio::test]
+async fn a_one_to_one_reader_holds_the_null_keyed_groups() {
+    let mut d = start(
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT COUNT(*) AS n, SUM(v) AS t",
+        "TRANSFORM a2 FROM public.agg SELECT n AS n, t + 1 AS t1",
+        &[("g", int4()), ("h", int4()), ("n", int8()), ("t", int8())],
+        1,
+    )
+    .await;
+    const A2: &str = "select g, h, n, t1 from public.a2 order by g, h";
+    const ORACLE: &str =
+        "select g, h, count(*), sum(v) + 1 from public.src group by g, h order by g, h";
+    for sql in [
+        "insert into public.src values (1, 1, null, 1), (2, 1, 2, 1)",
+        "insert into public.src values (3, 1, null, 3), (4, null, null, 4)",
+        "update public.src set h = null where id = 2",
+        "update public.src set v = 10 where id = 1",
+        "update public.src set h = 5 where id = 3",
+        "delete from public.src where h is null",
+    ] {
+        d.step_settle(sql).await;
+        assert_equal(&mut d, A2, ORACLE).await;
+    }
+    d.step_settle("insert into public.src values (5, null, null, 5)")
+        .await;
+    assert_equal(&mut d, A2, ORACLE).await;
+    assert_eq!(
+        d.rows("select n from public.a2 where g is null and h is null")
+            .await,
+        ["(1)"]
+    );
+}
+
+/// A 1-1 reader of a `JOIN` target, whose `GROUP BY` value can be `NULL`,
+/// holds the `NULL` group as the `JOIN` target does.
+#[tokio::test]
+async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, ga integer, k integer, x integer); \
+         create table public.b (id integer primary key, k integer, y integer); \
+         create index on public.a (k); create index on public.b (k)",
+        &[("id", int4()), ("ga", int4()), ("k", int4()), ("x", int4())],
+        &[
+            "TRANSFORM j FROM public.a JOIN public.b ON a.k = b.k GROUP BY a.ga \
+          WITHOUT SOURCE INDEX SELECT a.ga AS ga, COUNT(*) AS n, SUM(b.y) AS sy",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    install(
+        &d,
+        "TRANSFORM jr FROM public.j SELECT n AS n, sy + 1 AS sy1",
+        &[("ga", int4()), ("n", int8()), ("sy", int8())],
+    )
+    .await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)"]
+    );
+    const JR: &str = "select ga, n, sy1 from public.jr order by ga";
+    const ORACLE: &str = "select a.ga, count(*), sum(b.y) + 1 from public.a join public.b \
+                          on a.k = b.k group by a.ga order by a.ga";
+    for sql in [
+        "insert into public.b values (1, 1, 10), (2, 2, 20)",
+        "insert into public.a values (1, null, 1, 0), (2, 1, 2, 0), (3, null, 2, 0)",
+        "update public.a set ga = 1 where id = 3",
+        "update public.a set ga = null where id = 2",
+        "delete from public.b where id = 1",
+        "delete from public.a where ga is null",
+    ] {
+        d.step_settle(sql).await;
+        assert_equal(&mut d, JR, ORACLE).await;
+    }
+    d.step_settle("insert into public.a values (4, null, 2, 0)")
+        .await;
+    assert_equal(&mut d, JR, ORACLE).await;
+    assert_eq!(
+        d.rows("select n from public.jr where ga is null").await,
+        ["(1)"]
+    );
+}
+
+/// An aggregate over a 1-1 reader of a nullable key, grouped by a field:
+/// a `NULL`-keyed row that leaves a group (its count changes, or its group
+/// goes extinct upstream) is found in the group it left through its prior
+/// image, which the 1-1 apply captures for a `NULL`-keyed row as for any
+/// other.
+#[tokio::test]
+async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
+    let mut d = start(
+        "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        "TRANSFORM a2 FROM public.agg SELECT n AS n",
+        &[("g", int4()), ("h", int4()), ("n", int8())],
+        1,
+    )
+    .await;
+    install(
+        &d,
+        "TRANSFORM roll FROM public.a2 GROUP BY n WITHOUT SOURCE INDEX SELECT COUNT(*) AS groups",
+        &[("g", int4()), ("h", int4()), ("n", int8())],
+    )
+    .await;
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select status from transform_definitions order by id")
+            .await,
+        ["(live)", "(live)", "(live)"]
+    );
+    const ROLL: &str = "select n, groups from public.roll order by n";
+    const ORACLE: &str = "select n, count(*) from (select count(*) as n from public.src \
+                          group by g, h) s group by n order by n";
+    for sql in [
+        "insert into public.src values (1, 1, null, 1), (2, null, null, 1), (3, 1, 1, 1)",
+        "insert into public.src values (4, 1, null, 1), (5, null, null, 1)",
+        "insert into public.src values (6, null, null, 1)",
+        "delete from public.src where id = 4",
+        "delete from public.src where g is null and h is null",
+        "update public.src set h = 2 where id = 1",
+    ] {
+        d.step_settle(sql).await;
+        assert_equal(&mut d, ROLL, ORACLE).await;
+    }
+}
+
+/// A `PAUSE` and a `DROP` of a reader while a page that planned it is in
+/// flight. The page holds the reader's feed from its plan; the drop
+/// removes the reader's hidden table under it. The page must not fail on the
+/// dropped table, and nothing may be charged for it.
+#[tokio::test]
+async fn a_pause_and_drop_of_a_reader_wait_for_a_page_that_planned_it() {
+    let mut d = start(
+        AGG_G,
+        "TRANSFORM roll FROM public.agg GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(total) AS total2",
+        &agg_g_columns(),
+        2,
+    )
+    .await;
+    const AGG: &str = "select g, total, n from public.agg order by g";
+    const ORACLE: &str = "select g, sum(v), count(*) from public.src group by g order by g";
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)")
+        .await;
+    // Group 1's change reaches `roll` through the seam: its rows are pending
+    // when the next page is planned, with group 2's change beside them.
+    d.write("insert into public.src values (3, 1, 0, 1)").await;
+    let seam = d.seal().await;
+    d.drain(seam, "seam").await;
+    d.write("insert into public.src values (4, 2, 0, 1)").await;
+    let batch = d.seal().await;
+    let agg_id: i64 = d
+        .ctl
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.agg'",
+            &[],
+        )
+        .await
+        .expect("agg's id")
+        .get(0);
+    // Another transaction holds group 2 of `agg`, so the page queues on it
+    // with its plan already loaded.
+    let holder = d.user().await;
+    holder
+        .batch_execute(&format!(
+            "begin; select 1 from {DEFAULT_SCHEMA}.agg_{agg_id} where g = 2 for update"
+        ))
+        .await
+        .expect("hold group 2");
+    let page = d.drain_frozen(batch, "page", &[]).await;
+    d.wait_blocked(1).await;
+
+    let t = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    t.apply("PAUSE TRANSFORM roll").await.expect("pause");
+    let mut dropping = tokio::spawn(async move {
+        t.apply("DROP TRANSFORM roll").await.expect("drop");
+    });
+    // The drop queues on the page's fence, or, without one, completes.
+    tokio::select! {
+        () = d.wait_blocked(2) => {}
+        _ = &mut dropping => {}
+    }
+    assert!(
+        !dropping.is_finished(),
+        "the drop waits for the page in flight"
+    );
+    holder.batch_execute("commit").await.expect("release");
+    let outcome = page.finish_result().await.expect("the page applies");
+    assert!(outcome.is_some(), "the page committed");
+    dropping.await.expect("the drop's task");
+    assert_eq!(
+        d.rows(
+            "select (select count(*) from drain_holdups), (select count(*) from poison), \
+                    (select count(*) from key_deaths), (select count(*) from capture_failures), \
+                    to_regclass('public.roll') is null"
+        )
+        .await,
+        ["(0,0,0,0,t)"],
+        "the page failed no one"
+    );
+    assert_equal(&mut d, AGG, ORACLE).await;
+}
+
+/// A `PAUSE` and a `DROP` of a 1-1 definition while a page that planned it
+/// is in flight. The page writes its 1-1 targets in name order and
+/// queues on a row of `a1` before it reaches `m`, so it holds no lock on `m`
+/// yet, only its source's fence from its plan. The drop waits for the page,
+/// which commits, and nothing is charged.
+#[tokio::test]
+async fn a_pause_and_drop_of_a_one_to_one_wait_for_a_page_that_planned_it() {
+    let mut d = start(
+        "TRANSFORM a1 FROM public.src SELECT g AS g, v AS w",
+        "TRANSFORM m FROM public.src SELECT g AS g, v AS w",
+        &src_columns(),
+        0,
+    )
+    .await;
+    const A1: &str = "select id, g, w from public.a1 order by id";
+    const ORACLE: &str = "select id, g, v from public.src order by id";
+    d.step_settle("insert into public.src values (1, 1, 0, 5), (2, 2, 0, 7)")
+        .await;
+    d.write("update public.src set v = 9 where id = 2").await;
+    let batch = d.seal().await;
+    // Another transaction holds `a1`'s row 2, so the page queues on it with
+    // its plan already loaded and `m` not yet written.
+    let holder = d.user().await;
+    holder
+        .batch_execute("begin; select 1 from public.a1 where id = 2 for update")
+        .await
+        .expect("hold row 2");
+    let page = d.drain_frozen(batch, "page", &[]).await;
+    d.wait_blocked(1).await;
+
+    let t = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    t.apply("PAUSE TRANSFORM m").await.expect("pause");
+    let mut dropping = tokio::spawn(async move {
+        t.apply("DROP TRANSFORM m").await.expect("drop");
+    });
+    // The drop queues on the page's fence, or, without one, completes.
+    tokio::select! {
+        () = d.wait_blocked(2) => {}
+        _ = &mut dropping => {}
+    }
+    assert!(
+        !dropping.is_finished(),
+        "the drop waits for the page in flight"
+    );
+    holder.batch_execute("commit").await.expect("release");
+    let outcome = page.finish_result().await.expect("the page applies");
+    assert!(outcome.is_some(), "the page committed");
+    dropping.await.expect("the drop's task");
+    assert_eq!(
+        d.rows(
+            "select (select count(*) from drain_holdups), (select count(*) from poison), \
+                    (select count(*) from key_deaths), (select count(*) from capture_failures), \
+                    to_regclass('public.m') is null"
+        )
+        .await,
+        ["(0,0,0,0,t)"],
+        "the page failed no one"
+    );
+    assert_equal(&mut d, A1, ORACLE).await;
+}
+
+// ------------------------------------------ a build over NULL-part keys
+
+const UP_HG: &str = "TRANSFORM up FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
+const ROLL_H: &str = "TRANSFORM roll FROM public.up GROUP BY h WITHOUT SOURCE INDEX SELECT SUM(total) AS t2, \
+                      SUM(n) AS n2";
+const ROLL: &str = "public.roll";
+const ROLL_ACTUAL: &str = "select h, t2, n2 from public.roll order by h";
+const ROLL_ORACLE: &str = "select h, sum(total), sum(n) from \
+     (select g, h, sum(v) as total, count(*) as n from public.src group by g, h) u \
+     group by h order by h";
+
+fn up_columns() -> Vec<(&'static str, ValueType)> {
+    vec![
+        ("g", int4()),
+        ("h", int4()),
+        ("total", int8()),
+        ("n", int8()),
+    ]
+}
+
+/// `up` (keyed `(g, h)`, a key with `NULL` parts when a row's `g` or `h` is
+/// `NULL`) live over a captured `src` seeded with rows in `NULL`-part groups,
+/// and `roll` not yet defined over it.
+async fn seeded_upstream() -> Driver {
+    let mut d = Driver::start(SRC_DDL, &src_columns(), &[UP_HG], &[SRC]).await;
+    d.step_settle(
+        "insert into public.src values (1, 1, null, 10), (2, null, null, 5), (3, 2, 5, 7), \
+         (4, null, 5, 3), (5, 3, null, 1)",
+    )
+    .await;
+    d
+}
+
+/// Defines `roll` over `up`: it applies from here, with its plan job claimable.
+async fn define_roll(d: &Driver) {
+    d.write("create index on public.up (h)").await;
+    install(d, ROLL_H, &up_columns()).await;
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the reader's build");
+    assert_eq!(
+        d.rows("select status from transform_definitions where target_table = 'public.roll'")
+            .await,
+        ["(backfilling)"],
+        "the build started"
+    );
+}
+
+const ROLL_OPTIONS: trellis::staging::build::WorkerOptions =
+    trellis::staging::build::WorkerOptions {
+        chunk_rows: 1_000,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    };
+
+/// Claims the reader's plan job and runs it in its own task, frozen at each
+/// of `points` on `roll`'s target once reached.
+async fn build_frozen(d: &Driver, points: &[PausePoint]) -> Running<()> {
+    let points: Vec<(PausePoint, &str)> = points.iter().map(|p| (*p, ROLL)).collect();
+    let dsn = d.db.dsn().to_string();
+    d.run_frozen(&points, |_shared| async move {
+        let pool = trellis::pool::Pool::new(&trellis::config::Config::from_dsn(dsn).expect("dsn"))
+            .expect("the build's own pool");
+        let claimed = chunk_queue::claim_chunks_of(
+            &**pool.get().await.expect("pool"),
+            "build",
+            1,
+            &[chunk_queue::KIND_PLAN],
+        )
+        .await
+        .expect("claim the plan job");
+        assert_eq!(claimed.len(), 1, "one plan job to claim");
+        trellis::staging::build::run_claimed(&pool, &claimed[0], "build", &ROLL_OPTIONS).await;
+        Ok(())
+    })
+    .await
+}
+
+async fn assert_roll_finished(d: &Driver) {
+    assert_eq!(
+        d.rows(
+            "select status, (select count(*) from backfill_chunks where definition_id = d.id) \
+             from transform_definitions d where target_table = 'public.roll'"
+        )
+        .await,
+        ["(live,0)"],
+        "the build committed and flipped the reader live"
+    );
+}
+
+/// Writes to `NULL`-part groups of the upstream before, during and after the
+/// reader's build, over an upstream target whose keys have `NULL` parts. The
+/// before-write is in the build's snapshot; the during-write's seam page
+/// queues on the build's group lock and is refused (its snapshot saw the
+/// change); the after-write applies as a delta.
+#[tokio::test]
+async fn a_reader_build_over_null_part_keys_with_writes_around_it() {
+    let mut d = seeded_upstream().await;
+    d.step_settle("update public.src set v = 11 where id = 2")
+        .await;
+    define_roll(&d).await;
+    // The reader is defined and its build not started: this write's upstream
+    // page runs, and its seam page is sealed, ahead of the build's snapshot.
+    d.write(
+        "update public.src set v = 20 where id = 1; \
+               insert into public.src values (6, null, null, 4)",
+    )
+    .await;
+    let batch = d.seal().await;
+    d.drain(batch, "during").await;
+    let seam = d.seal().await;
+
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    let locked = building.reached(PausePoint::AfterRebuildLock).await;
+    let page = d.drain_frozen(seam, "seam", &[]).await;
+    d.wait_blocked_behind(locked.backend_pid).await;
+    assert!(
+        !page.is_finished(),
+        "the seam page waits for the build's lock"
+    );
+    // A write to a `NULL`-part row left in the active segment: the build's
+    // open transaction holds the seal of a later one.
+    d.write("update public.src set v = 6 where id = 4").await;
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    page.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(
+        d.rows(ROLL_ACTUAL).await,
+        ["(5,10,2)", "(,36,4)"],
+        "the build's snapshot saw the seam page's changes"
+    );
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+
+    d.step_settle("update public.src set v = 30 where id = 4; delete from public.src where id = 5")
+        .await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,37,2)", "(,35,3)"]);
+}
+
+/// A write to a `NULL`-part group committed before the reader was defined,
+/// with its seam page undrained until after the build: the build's snapshot
+/// saw the upstream target's new row, and the page is refused by the group's
+/// basis rather than counted twice.
+#[tokio::test]
+async fn an_undrained_seam_page_from_before_a_null_part_build_is_refused() {
+    let mut d = seeded_upstream().await;
+    d.write("update public.src set v = 11 where id = 2").await;
+    let batch = d.seal().await;
+    d.drain(batch, "before").await;
+    let seam = d.seal().await;
+    define_roll(&d).await;
+    let building = build_frozen(&d, &[]).await;
+    building.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,10,2)", "(,22,3)"]);
+    d.drain(seam, "seam").await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,10,2)", "(,22,3)"]);
+}
+
+/// Upstream source `TRUNCATE`s across the reader's build, over an upstream
+/// target with `NULL`-part keys:
+///
+/// - one whose upstream page ran and whose seam page (the target's clear,
+///   with images, then the new row) is sealed ahead of the build: the build's
+///   snapshot saw the cleared target, and the page queued on the build's
+///   lock is refused;
+/// - one committed while the build holds its locks, drained after it: its
+///   clear reaches the reader as deltas, removing the `NULL`-part groups the
+///   build wrote;
+/// - one after the build.
+#[tokio::test]
+async fn upstream_truncates_across_a_reader_build_over_null_part_keys() {
+    let mut d = seeded_upstream().await;
+    define_roll(&d).await;
+    d.write("truncate public.src; insert into public.src values (6, 1, null, 9), (7, null, 5, 2)")
+        .await;
+    let batch = d.seal().await;
+    d.drain(batch, "truncate").await;
+    let seam = d.seal().await;
+
+    let mut building = build_frozen(&d, &[PausePoint::AfterRebuildLock]).await;
+    let locked = building.reached(PausePoint::AfterRebuildLock).await;
+    let page = d.drain_frozen(seam, "seam", &[]).await;
+    d.wait_blocked_behind(locked.backend_pid).await;
+    assert!(
+        !page.is_finished(),
+        "the seam page waits for the build's lock"
+    );
+    // Left in the active segment, drained after the build.
+    d.write("truncate public.src; insert into public.src values (8, null, null, 4), (9, 2, 5, 1)")
+        .await;
+    d.release(&mut building, PausePoint::AfterRebuildLock).await;
+    building.finish().await;
+    page.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(
+        d.rows(ROLL_ACTUAL).await,
+        ["(5,2,1)", "(,9,1)"],
+        "the build counted the first truncate's rows"
+    );
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(5,1,1)", "(,4,1)"]);
+
+    d.step_settle("truncate public.src; insert into public.src values (10, null, null, 6)")
+        .await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,6,1)"]);
+}
+
+/// An insert of a `NULL`-part row from before an upstream source `TRUNCATE`,
+/// its upstream page run only after the truncate's and after the reader's
+/// build over the cleared upstream target: the upstream's truncate floor
+/// refuses it, so neither the upstream nor the reader counts a row the
+/// truncate removed.
+#[tokio::test]
+async fn a_change_from_before_an_upstream_truncate_is_refused_after_the_build() {
+    let mut d = seeded_upstream().await;
+    d.write("insert into public.src values (7, null, 5, 30)")
+        .await;
+    let before = d.seal().await;
+    d.write("truncate public.src; insert into public.src values (6, null, null, 9)")
+        .await;
+    let truncate = d.seal().await;
+    d.drain(truncate, "truncate").await;
+    define_roll(&d).await;
+    let building = build_frozen(&d, &[]).await;
+    building.finish().await;
+    assert_roll_finished(&d).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,9,1)"]);
+    d.drain(before, "before").await;
+    assert_equal(
+        &mut d,
+        "select g, h, total, n from public.up order by g, h",
+        "select g, h, sum(v), count(*) from public.src group by g, h order by g, h",
+    )
+    .await;
+    assert_equal(&mut d, ROLL_ACTUAL, ROLL_ORACLE).await;
+    assert_eq!(d.rows(ROLL_ACTUAL).await, ["(,9,1)"]);
+}

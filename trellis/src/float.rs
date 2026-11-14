@@ -213,7 +213,7 @@ pub fn parse(text: &str, width: FloatWidth) -> Result<f64, FloatError> {
 /// `f32`), just with Rust's own bare-exponent formatting — so this function
 /// takes those digits and re-formats them with Postgres's rule rather than
 /// vendoring a second Ryu. The `rendering_matches_postgres_over_a_value_grid`
-/// test in `trellis/tests/defs_floats.rs` checks the result against a live
+/// test in `trellis/tests/defs/defs_floats.rs` checks the result against a live
 /// `float4out`/`float8out` over a grid spanning both notations, both signs,
 /// the subnormal floor and the finite ceiling, so the equivalence is
 /// verified, not assumed.
@@ -308,7 +308,7 @@ mod tests {
     }
 
     /// Spot checks for [`render`]; the exhaustive comparison is against a
-    /// live `float8out`/`float4out` in `trellis/tests/defs_floats.rs`.
+    /// live `float8out`/`float4out` in `trellis/tests/defs/defs_floats.rs`.
     #[test]
     fn rendering_uses_postgres_notation_rules() {
         use FloatWidth::{Float4, Float8};

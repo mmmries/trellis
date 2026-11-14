@@ -1,0 +1,2681 @@
+//! Integration tests for `ALTER TRANSFORM` (ADR-0015) and
+//! its retrofit of `DROP TRANSFORM`'s dependency refusal to column
+//! granularity.
+//!
+//! Everything here drives the public [`trellis::Trellis`] facade (ADR-0012),
+//! the same convention `pause_and_drop.rs` follows, and verifies against
+//! Postgres directly rather than re-asking the engine what it thinks it did.
+//!
+//! Covered:
+//! - `ADD`/`DROP`/`ALTER` individually, and combined in one statement
+//!   (`add_single_column_backfills_existing_rows`,
+//!   `drop_single_column_removes_the_physical_column`,
+//!   `alter_single_column_recomputes_existing_rows`,
+//!   `combined_add_drop_alter_in_one_statement`)
+//! - an added bare passthrough column has the type `DEFINE` gives it, modifier
+//!   included (`an_added_passthrough_column_has_the_type_define_gives_it`)
+//! - an `ALTER` only registers a field build and returns
+//!   before any target row changes, and the field is built once its chunks
+//!   run (`an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the_field`,
+//!   driven by hand)
+//! - one field build for several added columns, reading each row once under
+//!   a concurrent writer (`one_field_build_reads_each_row_once_under_concurrent_writes`)
+//! - the field applies while its build runs, and the rest of the target
+//!   stays live and queryable
+//!   (`the_field_applies_while_its_build_runs_and_the_rest_of_the_target_stays_live`,
+//!   which stops the build at a fixed point and drives live apply by hand)
+//! - an `ALTER` never undoes a pause it didn't create, a pause landing
+//!   mid-build survives it, and `DROP <field>` clears the dropped column's
+//!   quarantine bookkeeping (`an_alter_leaves_a_pause_it_did_not_create_in_place`,
+//!   `a_pause_landing_mid_field_build_survives_it`,
+//!   `dropping_a_paused_field_clears_its_quarantine_state`)
+//! - idempotency in both directions for all three edit kinds
+//!   (`edits_are_idempotent_in_both_directions`), and the two genuine
+//!   conflicts that are *not* idempotent no-ops
+//!   (`add_an_existing_field_with_a_different_formula_is_rejected`,
+//!   `altering_a_field_that_does_not_exist_is_rejected`)
+//! - cycle detection reuse (`add_and_alter_that_would_cycle_is_rejected`)
+//! - the column-granularity `DROP <field>` refusal, and the same
+//!   infrastructure's naming precision retrofitted onto `DROP TRANSFORM`
+//!   (`dropping_a_field_still_read_by_a_dependent_is_refused`,
+//!   `dropping_a_transform_names_the_specific_column_a_dependent_reads`)
+//! - this release's deliberate scope-downs: aggregate targets, a
+//!   not-yet-live target, and a genuine column-type change
+//!   (`altering_an_aggregate_transform_is_unsupported`,
+//!   `altering_a_target_that_is_not_live_is_rejected`,
+//!   `altering_a_field_to_a_different_result_type_is_refused`,
+//!   `a_type_changing_alter_refuses_the_whole_statement`)
+//! - the modifier counts. A catalog-only widening is re-typed in place and a
+//!   narrowing refused (`altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place`,
+//!   `altering_a_varchar_passthrough_into_a_text_expression_changes_no_column_type`,
+//!   `altering_an_expression_into_a_narrower_passthrough_is_refused`,
+//!   `a_retype_a_view_blocks_is_refused_and_rolls_back`)
+
+use crate::support::pipeline;
+
+use pipeline::{connect, definer, start_and_settle_builds};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use testkit::TestCluster;
+use tokio_postgres::Client;
+use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
+use trellis::defs::chunk_queue;
+use trellis::{
+    Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
+};
+
+/// The live pipeline: capture, ring maintenance, and drain workers — what
+/// a plain (non-aggregate) 1-1 transform needs to actually reach `live`, and
+/// what keeps applying change events while a test's own `ALTER TRANSFORM`
+/// call runs concurrently.
+async fn running(dsn: &str) -> Trellis {
+    Trellis::connect(
+        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start the live pipeline")
+}
+
+async fn persisted_status(raw: &Client, target: &str) -> Option<String> {
+    raw.query_opt(
+        "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read status")
+    .map(|row| row.get(0))
+}
+
+/// `transform_definitions.definition_version` for `target`, read straight
+/// from Postgres — the audit-visible counter `alter_transform` bumps once
+/// per *real* edit and deliberately leaves untouched for an idempotent
+/// no-op clause. Used to verify a no-op claim isn't just "the reported delta
+/// was empty" but "nothing was actually written."
+async fn persisted_definition_version(raw: &Client, target: &str) -> i64 {
+    raw.query_one(
+        "select definition_version from transform_definitions \
+         where split_part(target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read definition_version")
+    .get(0)
+}
+
+async fn wait_for_live(raw: &Client, target: &str) {
+    testkit::wait_until(
+        "the chunked 1-1 target must finish its initial backfill",
+        Duration::from_secs(60),
+        async || persisted_status(raw, target).await.as_deref() == Some("live"),
+    )
+    .await;
+}
+
+/// `id bigint primary key, a numeric, b numeric` — `id` is `1..rows`, `a` is
+/// `id` itself, `b` is `id * 2`, so every downstream assertion has a simple,
+/// independently-recomputable expectation.
+async fn seed_orders(raw: &Client, rows: i64) {
+    raw.batch_execute(&format!(
+        "create table orders (id bigint primary key, a numeric, b numeric); \
+         insert into orders (id, a, b) \
+             select s, s::numeric, (s * 2)::numeric from generate_series(1, {rows}) s;"
+    ))
+    .await
+    .expect("seed orders");
+}
+
+async fn column_names(raw: &Client, schema: &str, table: &str) -> HashSet<String> {
+    raw.query(
+        "select column_name from information_schema.columns \
+         where table_schema = $1 and table_name = $2",
+        &[&schema, &table],
+    )
+    .await
+    .expect("introspect information_schema")
+    .into_iter()
+    .map(|row| row.get(0))
+    .collect()
+}
+
+/// The concrete Postgres type (`format_type`) `schema.table.column`
+/// currently has — used by the type-changing-`ALTER` refusal tests to
+/// confirm a refused `ALTER` never actually touches the physical column,
+/// not just that the call returned an error.
+async fn column_pg_type(raw: &Client, schema: &str, table: &str, column: &str) -> String {
+    raw.query_one(
+        "select pg_catalog.format_type(a.atttypid, a.atttypmod) \
+         from pg_attribute a \
+         where a.attrelid = pg_catalog.to_regclass($1) \
+           and a.attname = $2 \
+           and a.attnum > 0 \
+           and not a.attisdropped",
+        &[&format!("{schema}.{table}"), &column],
+    )
+    .await
+    .expect("introspect the column's physical type")
+    .get(0)
+}
+
+fn into_altered(applied: Applied) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match applied {
+        Applied::Altered {
+            added,
+            dropped,
+            altered,
+            ..
+        } => (added, dropped, altered),
+        other => panic!("expected Applied::Altered, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// ADD / DROP / ALTER, individually and combined
+// ---------------------------------------------------------------------
+
+/// `ALTER TRANSFORM ... ADD` creates a bare passthrough column
+/// with the type `DEFINE` gives it (the source column's own, typmod
+/// included; a `varchar(n)` is unbounded), and an expression column with its
+/// value family's type.
+/// A second transform defined with the same select is the oracle, and the
+/// capture pass's typed-copy comparison (`defs::copies`, `CopyState::drifted`)
+/// reads a passthrough as current exactly when its `(atttypid, atttypmod)` is
+/// its source column's, which is asserted directly.
+#[tokio::test]
+async fn an_added_passthrough_column_has_the_type_define_gives_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.posts (id int primary key, title text, price numeric(10,2), \
+                                    author varchar(8), qty int, note text, ts timestamptz); \
+         insert into public.posts \
+             select s, 't' || s, s + 0.5, 'a' || s, s, 'n' || s, now() from generate_series(1, 5) s;",
+    )
+    .await
+    .expect("seed");
+
+    let definer = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM edited FROM public.posts SELECT title AS title",
+        "TRANSFORM defined FROM public.posts SELECT title AS title, price AS price, \
+         author AS who, qty AS qty, note AS note2, ts AS ts2, qty + 1 AS qty_plus",
+    ] {
+        definer.apply(text).await.expect(text);
+    }
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "edited").await;
+    wait_for_live(&raw, "defined").await;
+    trellis
+        .apply(
+            "ALTER TRANSFORM edited ADD price AS price, ADD author AS who, ADD qty AS qty, \
+             ADD note AS note2, ADD ts AS ts2, ADD qty + 1 AS qty_plus",
+        )
+        .await
+        .expect("add the columns");
+    wait_for_live(&raw, "edited").await;
+
+    let expected = [
+        // A copy has no type modifier (ADR-0020).
+        ("price", "numeric"),
+        ("who", "character varying"),
+        ("qty", "integer"),
+        ("note2", "text"),
+        ("ts2", "timestamp with time zone"),
+        // An expression keeps its value family's type.
+        ("qty_plus", "integer"),
+    ];
+    for (column, expected) in expected {
+        let added = column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "edited", column).await;
+        let defined = column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "defined", column).await;
+        assert_eq!(added, defined, "{column}: ALTER ADD must match DEFINE");
+        assert_eq!(added, expected, "{column}");
+    }
+
+    // The comparison's own terms: each passthrough's type oid and typmod are
+    // its source column's, with no modifier (ADR-0020).
+    let drifted: Vec<String> = raw
+        .query(
+            &format!(
+                "select t.attname::text from pg_attribute t \
+                 join pg_attribute s on s.attrelid = 'public.posts'::regclass \
+                  and s.attname = case t.attname when 'who' then 'author' \
+                      when 'note2' then 'note' when 'ts2' then 'ts' else t.attname::text end \
+                 where t.attrelid = '{DEFAULT_TARGET_SCHEMA}.edited'::regclass \
+                   and t.attname::text in ('price', 'who', 'qty', 'note2', 'ts2') \
+                   and (t.atttypid, t.atttypmod) is distinct from (s.atttypid, -1)"
+            ),
+            &[],
+        )
+        .await
+        .expect("compare the types")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(drifted.is_empty(), "drifted from their source: {drifted:?}");
+
+    // The data is built as the define builds it.
+    let rows = |table: &'static str| {
+        let raw = &raw;
+        async move {
+            raw.query(
+                &format!(
+                    "select price::text, who::text, qty::text, note2, qty_plus::text \
+                     from {DEFAULT_TARGET_SCHEMA}.{table} order by id"
+                ),
+                &[],
+            )
+            .await
+            .expect("read")
+            .into_iter()
+            .map(|r| {
+                (0..5)
+                    .map(|i| r.get::<_, Option<String>>(i))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(rows("edited").await, rows("defined").await);
+    trellis.shutdown().await.expect("shut down");
+}
+
+#[tokio::test]
+async fn add_single_column_backfills_existing_rows() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 25).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+        .await
+        .expect("add a column");
+    let (added, dropped, altered) = into_altered(applied);
+    assert_eq!(added, vec!["double_a".to_string()]);
+    assert!(dropped.is_empty());
+    assert!(altered.is_empty());
+    // The drain workers build the field in the background, and
+    // the definition reads `live` again once they have.
+    wait_for_live(&raw, "order_calc").await;
+
+    let rows = raw
+        .query(
+            &format!(
+                "select a::text, double_a::text from {DEFAULT_TARGET_SCHEMA}.order_calc order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read target");
+    assert_eq!(rows.len(), 25, "every existing row is present");
+    for row in rows {
+        let a: String = row.get(0);
+        let double_a: String = row.get(1);
+        assert_eq!(
+            double_a.parse::<f64>().unwrap(),
+            a.parse::<f64>().unwrap() * 2.0,
+            "the field build must have populated every existing row"
+        );
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn drop_single_column_removes_the_physical_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("drop a column");
+    let (added, dropped, altered) = into_altered(applied);
+    assert!(added.is_empty());
+    assert_eq!(dropped, vec!["b".to_string()]);
+    assert!(altered.is_empty());
+
+    // The data the dropped column explained is actually removed, not merely
+    // hidden — the column itself is gone.
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(
+        !columns.contains("b"),
+        "a dropped field's physical column must be removed: {columns:?}"
+    );
+    assert!(columns.contains("a"), "the untouched field must survive");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn alter_single_column_recomputes_existing_rows() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 25).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    // `total`'s new formula (`a + b + b`) infers the exact same `ValueType`
+    // (numeric) its column already has:
+    // this is the case a type-changing-`ALTER` refusal must *not* catch, so
+    // this test also pins the column's physical type stays `numeric`
+    // throughout, not just that the call succeeds.
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        "numeric"
+    );
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ALTER total AS a + b + b")
+        .await
+        .expect("a same-result-type ALTER must still succeed");
+    let (added, dropped, altered) = into_altered(applied);
+    assert!(added.is_empty());
+    assert!(dropped.is_empty());
+    assert_eq!(altered, vec!["total".to_string()]);
+    wait_for_live(&raw, "order_calc").await;
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        "numeric",
+        "a same-type ALTER never touches the physical column type"
+    );
+
+    let rows = raw
+        .query(
+            &format!(
+                "select a::text, b::text, total::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read target");
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let b: f64 = row.get::<_, String>(1).parse().unwrap();
+        let total: f64 = row.get::<_, String>(2).parse().unwrap();
+        assert_eq!(total, a + b + b, "every existing row must be recomputed");
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `ALTER <field> AS <expr>` refuses
+/// outright when the new formula's inferred result type genuinely differs
+/// from the field's current physical column type, rather than issuing the
+/// `ALTER COLUMN ... TYPE ... USING NULL` that would otherwise silently
+/// rewrite the *entire* target table under an `ACCESS EXCLUSIVE` lock —
+/// exactly what ADR-0015 (`docs/decisions/0015-transform-redefinition.md`)
+/// promises an edit never does. `total` here is declared `numeric` (`a +
+/// b`); `a > b` infers `boolean`, a genuine type change.
+#[tokio::test]
+async fn altering_a_field_to_a_different_result_type_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let before_type = column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await;
+    assert_eq!(before_type, "numeric");
+    let before_version = persisted_definition_version(&raw, "order_calc").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ALTER total AS a > b")
+        .await
+        .expect_err("a genuine type change (numeric -> boolean) must be refused");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) => {
+            assert!(
+                detail.contains("total")
+                    && detail.contains("numeric")
+                    && detail.contains("boolean"),
+                "the refusal must name the field and both types: {detail}"
+            );
+            assert!(
+                detail.to_uppercase().contains("DROP") && detail.to_uppercase().contains("ADD"),
+                "the refusal must point at DROP+ADD as the supported path: {detail}"
+            );
+        }
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+
+    // The refusal is a pre-flight validation, not a runtime failure midway
+    // through work: no DDL and no backfill ever ran, so the column's
+    // physical type and the definition's persisted version are exactly as
+    // they were before this call.
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        before_type,
+        "a refused ALTER must never touch the physical column type — no table lock, \
+         no rewrite, was ever attempted"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        before_version,
+        "a refused ALTER must not bump the definition version — nothing was written"
+    );
+
+    // The existing data is untouched too — not just the schema.
+    let rows = raw
+        .query(
+            &format!(
+                "select a::text, b::text, total::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read target");
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let b: f64 = row.get::<_, String>(1).parse().unwrap();
+        let total: f64 = row.get::<_, String>(2).parse().unwrap();
+        assert_eq!(
+            total,
+            a + b,
+            "the refused ALTER must not have recomputed anything"
+        );
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The type-change refusal blocks the *whole* statement, not just its own
+/// clause: a combined `ADD ..., ALTER ...` where the `ALTER` half is a
+/// genuine type change must leave the `ADD` half unapplied too — matching
+/// every other all-or-nothing refusal `ALTER TRANSFORM` already has (a
+/// cycle, a blocked `DROP`).
+#[tokio::test]
+async fn a_type_changing_alter_refuses_the_whole_statement() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let before_version = persisted_definition_version(&raw, "order_calc").await;
+
+    let err = trellis
+        .apply(
+            "ALTER TRANSFORM order_calc \
+             ADD a + a AS double_a, \
+             ALTER total AS a > b",
+        )
+        .await
+        .expect_err("the ALTER half's type change must refuse the whole statement");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(_)) => {}
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(
+        !columns.contains("double_a"),
+        "the ADD half must not have been applied either: {columns:?}"
+    );
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "total").await,
+        "numeric",
+        "the ALTER half must never have touched the physical column type"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        before_version,
+        "a refused combined statement must not bump the definition version"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `posts` source whose `price` is `numeric(10,2)` and `author`
+/// `varchar(8)`, with `transform_text` defined and built over it by hand: no
+/// pipeline runs, so nothing waits on convergence.
+async fn modifier_fixture(
+    db: &testkit::TestDatabase,
+    raw: &Client,
+    transform_text: &str,
+) -> Trellis {
+    raw.batch_execute(
+        "create table public.posts (id int primary key, price numeric(10,2), author varchar(8)); \
+         insert into public.posts \
+             select s, s + 0.5, 'a' || s from generate_series(1, 5) s;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    trellis.apply(transform_text).await.expect("define");
+    start_and_settle_builds(&db.pool).await;
+    trellis
+}
+
+/// The file node of target `table`: a table rewrite moves it.
+async fn target_filenode(raw: &Client, table: &str) -> i64 {
+    raw.query_one(
+        &format!("select pg_relation_filenode('{DEFAULT_TARGET_SCHEMA}.{table}')::int8"),
+        &[],
+    )
+    .await
+    .expect("read the file node")
+    .get(0)
+}
+
+/// As ADR-0020 leaves it: a bare passthrough of
+/// `numeric(10,2)` is an unconstrained `numeric` column, so altering it into
+/// an expression of unconstrained `numeric` re-types nothing. The target is
+/// not rewritten, the field build's values keep their third decimal, and the
+/// column is the one a fresh `DEFINE` gives.
+#[tokio::test]
+async fn altering_a_passthrough_into_a_wider_expression_changes_no_column_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis =
+        modifier_fixture(&db, &raw, "TRANSFORM t FROM public.posts SELECT price AS p").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+        "numeric"
+    );
+    let before = target_filenode(&raw, "t").await;
+
+    trellis
+        .apply("ALTER TRANSFORM t ALTER p AS price + 0.001")
+        .await
+        .expect("the column is already unconstrained: nothing to re-type");
+    trellis::staging::build::settle_builds(&db.pool).await;
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+        "numeric"
+    );
+    // The field build's re-derive updates rows, which leaves the file node
+    // alone.
+    assert_eq!(
+        target_filenode(&raw, "t").await,
+        before,
+        "the target was not rewritten"
+    );
+    let values: Vec<String> = raw
+        .query(
+            &format!("select p::text from {DEFAULT_TARGET_SCHEMA}.t order by id"),
+            &[],
+        )
+        .await
+        .expect("read")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        values,
+        ["1.501", "2.501", "3.501", "4.501", "5.501"],
+        "the re-derive keeps the third decimal"
+    );
+
+    // Rule 5: the next capture pass finds the column current, so it pauses
+    // nothing for a widening or a drift.
+    for _ in 0..2 {
+        trellis::client::reconcile_pass(&mut raw, &db.pool, DEFAULT_SCHEMA)
+            .await
+            .expect("capture pass");
+    }
+    assert_ne!(persisted_status(&raw, "t").await.as_deref(), Some("paused"));
+    let failures: i64 = raw
+        .query_one("select count(*) from capture_failures", &[])
+        .await
+        .expect("read capture failures")
+        .get(0);
+    assert_eq!(failures, 0, "the pass recorded no capture failure");
+
+    // The column is the one a fresh DEFINE gives.
+    trellis
+        .apply("TRANSFORM oracle FROM public.posts SELECT price + 0.001 AS p")
+        .await
+        .expect("define the oracle");
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "oracle", "p").await,
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `varchar(8)` passthrough is an
+/// unbounded `varchar` column, so altering it to an expression of type `text`
+/// (the same family) re-types nothing: the column and the target's file stay
+/// as they are, and the field build re-derives the values.
+#[tokio::test]
+async fn altering_a_varchar_passthrough_into_a_text_expression_changes_no_column_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    let trellis = modifier_fixture(
+        &db,
+        &raw,
+        "TRANSFORM t FROM public.posts SELECT author AS who",
+    )
+    .await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "who").await,
+        "character varying"
+    );
+    let before = target_filenode(&raw, "t").await;
+
+    trellis
+        .apply("ALTER TRANSFORM t ALTER who AS COALESCE(author, 'none')")
+        .await
+        .expect("varchar and text are one family: nothing to re-type");
+    trellis::staging::build::settle_builds(&db.pool).await;
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "who").await,
+        "character varying"
+    );
+    assert_eq!(target_filenode(&raw, "t").await, before);
+    let first: String = raw
+        .query_one(
+            &format!("select who from {DEFAULT_TARGET_SCHEMA}.t where id = 1"),
+            &[],
+        )
+        .await
+        .expect("read")
+        .get(0);
+    assert_eq!(first, "a1");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// An expression field altered into another value family
+/// (here a `numeric` expression into an `integer` passthrough) would rewrite
+/// the target, so it is refused naming `DROP`/`ADD`, with the column, the
+/// definition and its version untouched.
+#[tokio::test]
+async fn altering_an_expression_into_another_family_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    let trellis = modifier_fixture(
+        &db,
+        &raw,
+        "TRANSFORM t FROM public.posts SELECT price + 0.001 AS p",
+    )
+    .await;
+    let before_version = persisted_definition_version(&raw, "t").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM t ALTER p AS id")
+        .await
+        .expect_err("numeric to integer rewrites the target");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) => {
+            assert!(
+                detail.contains("numeric")
+                    && detail.contains("integer")
+                    && detail.to_uppercase().contains("DROP")
+                    && detail.to_uppercase().contains("ADD"),
+                "the refusal names the types and the remedy: {detail}"
+            );
+        }
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "t", "p").await,
+        "numeric"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "t").await,
+        before_version
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn combined_add_drop_alter_in_one_statement() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 25).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let applied = trellis
+        .apply(
+            "ALTER TRANSFORM order_calc \
+             ADD a + b AS sum_ab, \
+             DROP b, \
+             ALTER total AS a + a",
+        )
+        .await
+        .expect("combined edit");
+    let (added, dropped, altered) = into_altered(applied);
+    assert_eq!(added, vec!["sum_ab".to_string()]);
+    assert_eq!(dropped, vec!["b".to_string()]);
+    assert_eq!(altered, vec!["total".to_string()]);
+    wait_for_live(&raw, "order_calc").await;
+
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(!columns.contains("b"));
+    assert!(columns.contains("sum_ab"));
+    assert!(columns.contains("total"));
+
+    let rows = raw
+        .query(
+            &format!(
+                "select a::text, sum_ab::text, total::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read target");
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let sum_ab: f64 = row.get::<_, String>(1).parse().unwrap();
+        let total: f64 = row.get::<_, String>(2).parse().unwrap();
+        // `sum_ab = a + b` reads `b` as a *source* column (`orders.b`), which
+        // dropping the target's own `b` passthrough field never touches.
+        assert_eq!(sum_ab, a + (a * 2.0), "sum_ab still reads source column b");
+        assert_eq!(total, a + a);
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------
+// Single-pass backfill and the version fence
+// ---------------------------------------------------------------------
+
+/// The target's rows as `(id, xmin)` text, in key order: a row any write
+/// touched has a new `xmin`.
+async fn row_versions(raw: &Client) -> Vec<String> {
+    raw.query(
+        &format!("select id::text || ':' || xmin::text from {DEFAULT_TARGET_SCHEMA}.order_calc order by id"),
+        &[],
+    )
+    .await
+    .expect("read the target's row versions")
+    .into_iter()
+    .map(|row| row.get(0))
+    .collect()
+}
+
+/// `backfill_chunks` rows of `kind` of a field build for `target`'s
+/// definition, and how many of them are done.
+async fn chunk_rows(raw: &Client, target: &str, kind: &str) -> (i64, i64) {
+    let row = raw
+        .query_one(
+            "select count(*), count(*) filter (where bc.done) from backfill_chunks bc \
+             join transform_definitions d on d.id = bc.definition_id \
+             where split_part(d.target_table, '.', 2) = $1 and bc.kind = $2 \
+               and bc.fields is not null",
+            &[&target, &kind],
+        )
+        .await
+        .expect("count chunk rows");
+    (row.get(0), row.get(1))
+}
+
+/// A drain worker's build options for the hand-driven steps below.
+fn worker_options() -> trellis::staging::build::WorkerOptions {
+    trellis::staging::build::WorkerOptions {
+        chunk_rows: trellis::staging::build::DEFAULT_CHUNK_ROWS,
+        drain_batch_cap: usize::MAX,
+        heartbeat_interval: Duration::from_secs(5),
+        reclaim_ttl: Duration::from_secs(60),
+    }
+}
+
+/// Claims one build row of `kind` and runs it, as a drain worker does.
+async fn run_one(pool: &trellis::pool::Pool, kind: &str) {
+    const BY: &str = "alter_transform_test_build_worker";
+    let claimed = {
+        let client = pool.get().await.expect("acquire connection");
+        chunk_queue::claim_chunks_of(&**client, BY, 1, &[kind])
+            .await
+            .expect("claim build work")
+    };
+    let chunk = claimed
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("a {kind} row to claim"));
+    trellis::staging::build::run_claimed(pool, &chunk, BY, &worker_options()).await;
+}
+
+/// `ALTER TRANSFORM` only registers its edit. On a source
+/// larger than one chunk it returns before any target row changes, with
+/// the definition `backfilling` and one field-scoped plan job enqueued, and
+/// the field is built once the drain workers' build steps, driven here by
+/// hand, run its chunks. No pipeline runs, so nothing else writes.
+#[tokio::test]
+async fn an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the_field() {
+    // Three chunks of `DEFAULT_CHUNK_ROWS`.
+    const ROWS: i64 = 2 * trellis::staging::build::DEFAULT_CHUNK_ROWS + 1;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, ROWS).await;
+
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    start_and_settle_builds(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live")
+    );
+    let before = row_versions(&raw).await;
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+        .await
+        .expect("add a column");
+    let (added, _, _) = into_altered(applied);
+    assert_eq!(added, vec!["double_a".to_string()]);
+
+    assert_eq!(
+        row_versions(&raw).await,
+        before,
+        "the ALTER must return before any target row is written"
+    );
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("backfilling"),
+        "the definition reads as not yet built until its field build is done"
+    );
+    let status = trellis
+        .status("order_calc")
+        .await
+        .expect("status")
+        .expect("the definition");
+    assert_eq!(status.status, TransformStatus::Backfilling);
+    let fields: Vec<String> = raw
+        .query_one(
+            "select fields from backfill_chunks where kind = 'plan' and not done",
+            &[],
+        )
+        .await
+        .expect("the field build's plan job")
+        .get(0);
+    assert_eq!(fields, vec!["double_a".to_string()]);
+    assert_eq!(chunk_rows(&raw, "order_calc", "rederive").await, (0, 0));
+
+    // The plan job, then each chunk, as a drain worker runs them.
+    run_one(&db.pool, chunk_queue::KIND_PLAN).await;
+    assert_eq!(
+        chunk_rows(&raw, "order_calc", "rederive").await,
+        (3, 0),
+        "a source of three chunks gets three field chunks"
+    );
+    for done in 1..=3 {
+        run_one(&db.pool, chunk_queue::KIND_REDERIVE).await;
+        let built: i64 = raw
+            .query_one(
+                &format!(
+                    "select count(*) from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                     where double_a = a + a"
+                ),
+                &[],
+            )
+            .await
+            .expect("count built rows")
+            .get(0);
+        assert_eq!(
+            built,
+            (done * trellis::staging::build::DEFAULT_CHUNK_ROWS).min(ROWS),
+            "each chunk builds its own range"
+        );
+    }
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live"),
+        "the last chunk's commit flips the definition `live`"
+    );
+    let wrong: i64 = raw
+        .query_one(
+            &format!(
+                "select count(*) from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 where double_a is distinct from a + a"
+            ),
+            &[],
+        )
+        .await
+        .expect("check the target")
+        .get(0);
+    assert_eq!(wrong, 0, "every row's field is built");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// **One read per row, not one per column.** Adds two columns in one
+/// statement while a concurrent writer keeps rewriting `a`. `col_x = a` and
+/// `col_y = a + 1` only agree (`col_y == col_x + 1`) if both came from the
+/// same read of a row. A build that ran one pass per column would read `a`
+/// twice, and every row the writer changed between the two passes would
+/// break the invariant.
+///
+/// The `ALTER` registers one field build for both columns, whose
+/// chunks are driven here by hand while the writer runs. No pipeline runs,
+/// so the check reads the chunks' own output: Apply, which writes both
+/// columns from one image too, never touches it.
+#[tokio::test]
+async fn one_field_build_reads_each_row_once_under_concurrent_writes() {
+    const ROWS: i64 = 20_000;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, ROWS).await;
+
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    start_and_settle_builds(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live"),
+        "ALTER TRANSFORM requires a live target"
+    );
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a AS col_x, ADD a + 1 AS col_y")
+        .await
+        .expect("add two columns");
+    let (added, _, _) = into_altered(applied);
+    assert_eq!(added, vec!["col_x".to_string(), "col_y".to_string()]);
+    assert_eq!(
+        chunk_rows(&raw, "order_calc", "plan").await,
+        (1, 0),
+        "one build for both fields"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let updates = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let dsn = db.dsn().to_string();
+        let stop = Arc::clone(&stop);
+        let updates = Arc::clone(&updates);
+        tokio::spawn(async move {
+            let client = connect(&dsn).await;
+            let mut id = 1i64;
+            while !stop.load(Ordering::Relaxed) {
+                // Rewrite `a` in place (`id` stays the key), so every value
+                // `a` ever holds is `id` plus a multiple of 1,000,000.
+                client
+                    .execute("update orders set a = a + 1000000 where id = $1", &[&id])
+                    .await
+                    .expect("concurrent update");
+                updates.fetch_add(1, Ordering::Relaxed);
+                id = (id % ROWS) + 1;
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+        })
+    };
+    while updates.load(Ordering::Relaxed) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let before = updates.load(Ordering::Relaxed);
+    trellis::staging::build::settle_builds(&db.pool).await;
+    let during = updates.load(Ordering::Relaxed) - before;
+    stop.store(true, Ordering::Relaxed);
+    writer.await.expect("writer task");
+    assert!(
+        during > 0,
+        "the writer must have updated rows while the build ran, or this test proves nothing"
+    );
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live")
+    );
+
+    let rows = raw
+        .query(
+            &format!("select id, col_x::text, col_y::text from {DEFAULT_TARGET_SCHEMA}.order_calc"),
+            &[],
+        )
+        .await
+        .expect("read the built target");
+    assert_eq!(rows.len() as i64, ROWS, "the build must cover every row");
+    for row in rows {
+        let id: i64 = row.get(0);
+        let col_x: i64 = row
+            .get::<_, Option<String>>(1)
+            .unwrap_or_else(|| panic!("row {id}: col_x must be built"))
+            .parse()
+            .unwrap();
+        let col_y: i64 = row
+            .get::<_, Option<String>>(2)
+            .unwrap_or_else(|| panic!("row {id}: col_y must be built"))
+            .parse()
+            .unwrap();
+        assert_eq!(
+            col_x % 1_000_000,
+            id,
+            "row {id}: col_x must be a value `a` actually held"
+        );
+        assert_eq!(
+            col_y,
+            col_x + 1,
+            "row {id}: col_y must equal col_x + 1. This only fails if the two columns were \
+             built from two different reads of the row, i.e. a build per column rather than \
+             one"
+        );
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Stages the CDC row the capture trigger would stage for `update orders set
+/// a = new_a where id = id` (both images complete), into the active ring
+/// segment.
+async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
+    let active: i16 = raw
+        .query_one("select ring_slot from segment_pointer", &[])
+        .await
+        .expect("read segment pointer")
+        .get(0);
+    let b = id * 2;
+    let old_image = format!(r#"{{"id":"{id}","a":"{old_a}","b":"{b}"}}"#);
+    let new_image = format!(r#"{{"id":"{id}","a":"{new_a}","b":"{b}"}}"#);
+    raw.execute(
+        &format!(
+            "insert into seg_{active} (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+             values ($1, $2, 'update', $3, $4::text::jsonb, $5::text::jsonb, 0)"
+        ),
+        &[
+            &format!("{DEFAULT_SCHEMA}.orders"),
+            &id.to_string(),
+            &testkit::wal_insert_lsn(raw).await,
+            &old_image,
+            &new_image,
+        ],
+    )
+    .await
+    .unwrap_or_else(|e| panic!("stage cdc for orders row {id}: {e}"));
+}
+
+/// The field applies from the `ALTER`'s commit, while its build runs,
+/// and the rest of the target stays live: checked at a fixed
+/// point with one of three chunks built, by hand, with no pipeline running.
+/// A live change to a row the built chunk covered and one to a row no chunk
+/// has reached both reach the new field through Apply, and the rest of the
+/// built and unbuilt rows are as the chunk left them. The build then
+/// finishes with every row right and nothing to catch up: the changed rows
+/// keep their Apply-written values, which the later chunks' snapshots also
+/// see.
+#[tokio::test]
+async fn the_field_applies_while_its_build_runs_and_the_rest_of_the_target_stays_live() {
+    const ROWS: i64 = 2 * trellis::staging::build::DEFAULT_CHUNK_ROWS + 1;
+    // Row 1 is in the first chunk, which the checkpoint has built; row ROWS
+    // is in the last, which it hasn't.
+    const BUILT_ID: i64 = 1;
+    const UNBUILT_ID: i64 = ROWS;
+    const NEW_A: i64 = 1000;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, ROWS).await;
+
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    start_and_settle_builds(&db.pool).await;
+    let mut ring = connect(db.dsn()).await;
+    pipeline::settle(&db.pool, &mut ring).await;
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+        .await
+        .expect("add a column");
+    run_one(&db.pool, chunk_queue::KIND_PLAN).await;
+    run_one(&db.pool, chunk_queue::KIND_REDERIVE).await;
+
+    // Checkpoint: the first chunk is built, the other two aren't.
+    let entry = trellis
+        .quarantine_status("order_calc.double_a")
+        .await
+        .expect("status");
+    assert_eq!(
+        entry.state,
+        trellis::QuarantineState::Live,
+        "the field applies while it builds: nothing pauses it"
+    );
+    let chunk = trellis::staging::build::DEFAULT_CHUNK_ROWS;
+    assert_eq!(built(&raw).await, (chunk, ROWS - chunk, 0));
+
+    // Live changes to a built row and an unbuilt one, through Apply.
+    for id in [BUILT_ID, UNBUILT_ID] {
+        raw.execute(
+            "update orders set a = $1::bigint where id = $2",
+            &[&NEW_A, &id],
+        )
+        .await
+        .expect("update the source row");
+        stage_orders_update(&raw, id, id, NEW_A).await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        pipeline::settle(&db.pool, &mut ring),
+    )
+    .await
+    .expect("live apply must not wait on the build");
+    for id in [BUILT_ID, UNBUILT_ID] {
+        let row = raw
+            .query_one(
+                &format!(
+                    "select a::text, double_a::text from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                     where id = $1"
+                ),
+                &[&id],
+            )
+            .await
+            .expect("read the live row");
+        assert_eq!(
+            (row.get::<_, String>(0), row.get::<_, Option<String>>(1)),
+            (NEW_A.to_string(), Some((2 * NEW_A).to_string())),
+            "row {id}: Apply writes the building field from its change's image"
+        );
+    }
+    // Every other row is as the build left it: the first chunk built, the
+    // rest not yet. (Row 1 counts as built and with `a` changed, row ROWS as
+    // built.)
+    assert_eq!(built(&raw).await, (chunk + 1, ROWS - chunk - 1, 2));
+
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        persisted_status(&raw, "order_calc").await.as_deref(),
+        Some("live"),
+        "the build's last chunk flips the definition `live`, with no catch-up"
+    );
+    let wrong: i64 = raw
+        .query_one(
+            &format!(
+                "select count(*) from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 where double_a is distinct from a + a"
+            ),
+            &[],
+        )
+        .await
+        .expect("check the target")
+        .get(0);
+    assert_eq!(wrong, 0, "at `live` every row's field is right");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `order_calc`'s rows whose `double_a` is built (`a + a`), whose
+/// `double_a` is still null, and whose `a` differs from its seed.
+async fn built(raw: &Client) -> (i64, i64, i64) {
+    let row = raw
+        .query_one(
+            &format!(
+                "select count(*) filter (where double_a = a + a), \
+                        count(*) filter (where double_a is null), \
+                        count(*) filter (where a is distinct from id) \
+                 from {DEFAULT_TARGET_SCHEMA}.order_calc"
+            ),
+            &[],
+        )
+        .await
+        .expect("the target stays readable while the field builds");
+    (row.get(0), row.get(1), row.get(2))
+}
+
+/// `(local_fuse, cascade edges into it)` for `transform.column`'s
+/// `column_status` row, or `None` when the column isn't paused at all.
+async fn column_pause_state(raw: &Client, transform: &str, column: &str) -> Option<(bool, i64)> {
+    raw.query_opt(
+        "select s.local_fuse, \
+                (select count(*) from column_pause_cascades c \
+                 where c.downstream_transform = s.transform_table \
+                   and c.downstream_column = s.column_name) \
+         from column_status s \
+         where s.transform_table = $1 and s.column_name = $2",
+        &[&transform, &column],
+    )
+    .await
+    .expect("read column_status")
+    .map(|row| (row.get(0), row.get(1)))
+}
+
+/// `ALTER TRANSFORM`'s own column pause (held while it backfills
+/// a changed field) must only ever be undone for a field whose pause *it*
+/// created. A field an operator paused, or one paused by cascade from an
+/// upstream column, stays paused through an `ALTER` of that same field —
+/// its recovery belongs to `RESUME`, not to an unrelated edit.
+#[tokio::test]
+async fn an_alter_leaves_a_pause_it_did_not_create_in_place() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define the upstream 1-1 target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    trellis
+        .apply("TRANSFORM order_next FROM order_calc SELECT total AS t2, a AS a2")
+        .await
+        .expect("define the chained 1-1 target");
+    wait_for_live(&raw, "order_next").await;
+
+    // An operator pause on `order_calc.total`, which cascades onto
+    // `order_next.t2` (the only field reading it).
+    trellis
+        .apply("PAUSE TRANSFORM order_calc.total")
+        .await
+        .expect("pause the column");
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "total").await,
+        Some((true, 0))
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t2").await,
+        Some((false, 1))
+    );
+
+    // ALTER the operator-paused field, together with an ADD whose pause is
+    // this call's own.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ALTER total AS a + b + b, ADD a + a AS double_a")
+        .await
+        .expect("alter a paused field");
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "total").await,
+        Some((true, 0)),
+        "the operator's pause must survive an ALTER of the same field"
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_calc", "double_a").await,
+        None,
+        "the ALTER's own pause on the field it added must be cleared"
+    );
+
+    // ALTER the cascade-paused field downstream.
+    trellis
+        .apply("ALTER TRANSFORM order_next ALTER t2 AS total + 1")
+        .await
+        .expect("alter a cascade-paused field");
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t2").await,
+        Some((false, 1)),
+        "a pause cascaded from a still-paused upstream column must survive an ALTER"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `ALTER TRANSFORM ... DROP <field>` takes the dropped column's quarantine
+/// bookkeeping with it, the same "quarantine state follows its owner" rule
+/// `DROP TRANSFORM` applies to a whole target. Otherwise a stale pause would
+/// outlive its column and silently land on a later `ADD` of the same name,
+/// now that an `ALTER` no longer clears pauses it didn't create.
+#[tokio::test]
+async fn dropping_a_paused_field_clears_its_quarantine_state() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    trellis
+        .apply("PAUSE TRANSFORM order_calc.b")
+        .await
+        .expect("pause the column");
+    raw.batch_execute(
+        "insert into column_deaths (transform_table, column_name, deaths) \
+             values ('order_calc', 'b', 1); \
+         insert into column_failures (transform_table, column_name, src_table, key, error) \
+             values ('order_calc', 'b', 'orders', '1', 'boom');",
+    )
+    .await
+    .expect("seed column-fuse bookkeeping for b");
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("drop the paused field");
+    for table in ["column_status", "column_deaths", "column_failures"] {
+        let n: i64 = raw
+            .query_one(
+                &format!(
+                    "select count(*) from {table} \
+                     where transform_table = 'order_calc' and column_name = 'b'"
+                ),
+                &[],
+            )
+            .await
+            .expect("count bookkeeping rows")
+            .get(0);
+        assert_eq!(n, 0, "{table} must not outlive the dropped column");
+    }
+
+    // Re-adding the same name starts clean and live. It reads `b`, which the
+    // definition stopped reading at the DROP, so the staging worker may have
+    // narrowed `b` out of the source's capture meanwhile: the field stays
+    // paused (its own pause, nothing inherited) until the capture images `b`
+    // again and the field build's start unpauses it.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD b AS b")
+        .await
+        .expect("re-add the field");
+    assert!(
+        matches!(
+            column_pause_state(&raw, "order_calc", "b").await,
+            None | Some((false, 0))
+        ),
+        "no pause outlives the dropped column"
+    );
+    testkit::wait_until(
+        "the re-added field goes live once its capture images `b`",
+        Duration::from_secs(30),
+        async || column_pause_state(&raw, "order_calc", "b").await.is_none(),
+    )
+    .await;
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The mid-build half: a pause that lands on a field *while*
+/// its field build runs holds the field out of the build's
+/// remaining chunks, and survives the build: an operator pause stays
+/// `local_fuse`, and an upstream pause cascading onto it keeps its edge.
+/// The field nothing paused is built.
+///
+/// Deterministic rather than timing-based: the test holds an `ACCESS
+/// EXCLUSIVE` lock on the edited definition's source table, which blocks the
+/// build's plan job (its walk reads the source) but not the `ALTER`, which
+/// only registers the build and so returns with the source still locked.
+///
+/// The ring is drained before the lock, so no page is in
+/// flight: a page re-derives under `order_calc`'s version fence and would
+/// wait on the lock holding it; the pauses bump that fence, and would wait
+/// on the page in turn. Before the pauses bumped the fence, such a page wrote all three new
+/// fields once the lock went, after both pauses had returned.
+#[tokio::test]
+async fn a_pause_landing_mid_field_build_survives_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b, a + b AS total")
+        .await
+        .expect("define the upstream 1-1 target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    trellis
+        .apply("TRANSFORM order_next FROM order_calc SELECT total AS t2, a AS a2")
+        .await
+        .expect("define the chained 1-1 target");
+    wait_for_live(&raw, "order_next").await;
+    let token = trellis.watermark_token().await.expect("watermark token");
+    trellis
+        .await_converged(token, Duration::from_secs(60))
+        .await
+        .expect("drain the ring");
+
+    // Freeze the build: `order_calc` is `order_next`'s source.
+    let mut locker = connect(db.dsn()).await;
+    let lock = locker.transaction().await.expect("begin the lock holder");
+    lock.batch_execute(&format!(
+        "lock table {DEFAULT_TARGET_SCHEMA}.order_calc in access exclusive mode"
+    ))
+    .await
+    .expect("lock the ALTER's source table");
+
+    // The ALTER returns with its source still locked: it reads nothing of it.
+    let operator = pipeline::definer(db.dsn()).await;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        operator.apply(
+            "ALTER TRANSFORM order_next \
+             ADD total + total AS t3, ADD a2 + 1 AS a3, ADD a2 + 2 AS a4",
+        ),
+    )
+    .await
+    .expect("the ALTER must not wait on its source")
+    .expect("add three columns");
+    assert_eq!(
+        persisted_status(&raw, "order_next").await.as_deref(),
+        Some("backfilling")
+    );
+    // An operator pause on one field the build is building...
+    operator
+        .apply("PAUSE TRANSFORM order_next.a3")
+        .await
+        .expect("pause a3 mid-build");
+    // ...and an upstream pause that cascades onto another (`t3` reads
+    // `total`).
+    operator
+        .apply("PAUSE TRANSFORM order_calc.total")
+        .await
+        .expect("pause the upstream column mid-build");
+    assert_eq!(
+        persisted_status(&raw, "order_next").await.as_deref(),
+        Some("backfilling"),
+        "the build must still be blocked"
+    );
+
+    lock.rollback().await.expect("release the source lock");
+    wait_for_live(&raw, "order_next").await;
+
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "a3").await,
+        Some((true, 0)),
+        "an operator pause taken mid-build must survive the build"
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "t3").await,
+        Some((false, 1)),
+        "a cascade onto the field mid-build must survive the build"
+    );
+    assert_eq!(
+        column_pause_state(&raw, "order_next", "a4").await,
+        None,
+        "a field nothing else paused is built and stays applying"
+    );
+    let row = raw
+        .query_one(
+            &format!(
+                "select count(*) filter (where a3 is not null or t3 is not null), \
+                        count(*) filter (where a4 is distinct from a2 + 2) \
+                 from {DEFAULT_TARGET_SCHEMA}.order_next"
+            ),
+            &[],
+        )
+        .await
+        .expect("read order_next");
+    assert_eq!(
+        (row.get::<_, i64>(0), row.get::<_, i64>(1)),
+        (0, 0),
+        "the build writes a4 and leaves the two paused fields alone"
+    );
+
+    operator.shutdown().await.expect("shutdown");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Lock order against a concurrent drain. Apply's version fence takes the
+/// `source_table_versions` row `for share` and then row-locks the target;
+/// `alter_transform` must take that same row *before* its DDL locks the
+/// target, or the two deadlock. This test stands in for the drain with a raw
+/// transaction that takes the same two locks in the same order. It holds the
+/// version row until the ALTER is blocked behind it, then locks target rows.
+#[tokio::test]
+async fn an_alter_racing_a_drain_for_the_version_fence_does_not_deadlock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = Arc::new(running(db.dsn()).await);
+    wait_for_live(&raw, "order_calc").await;
+
+    let mut drain = connect(db.dsn()).await;
+    let txn = drain.transaction().await.expect("begin");
+    txn.query_one(
+        "select version from source_table_versions \
+         where split_part(source_table, '.', 2) = 'orders' for share",
+        &[],
+    )
+    .await
+    .expect("take the version fence row for share");
+
+    let alter = {
+        let trellis = Arc::clone(&trellis);
+        tokio::spawn(async move {
+            trellis
+                .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+                .await
+        })
+    };
+
+    testkit::wait_until(
+        "the ALTER must block on the version fence row",
+        Duration::from_secs(30),
+        async || {
+            raw.query_one(
+                "select count(*) from pg_stat_activity \
+                 where wait_event_type = 'Lock' \
+                   and query like 'insert into source_table_versions%'",
+                &[],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get::<_, i64>(0)
+                > 0
+        },
+    )
+    .await;
+
+    txn.query(
+        &format!("select id from {DEFAULT_TARGET_SCHEMA}.order_calc order by id for update"),
+        &[],
+    )
+    .await
+    .expect("a drain holding the version fence must still be able to lock target rows");
+    txn.commit().await.expect("commit the drain");
+
+    let applied = alter
+        .await
+        .expect("join the ALTER")
+        .expect("the ALTER completes once the drain commits");
+    let (added, _, _) = into_altered(applied);
+    assert_eq!(added, vec!["double_a".to_string()]);
+
+    Arc::into_inner(trellis)
+        .expect("the ALTER task released its handle")
+        .shutdown()
+        .await
+        .expect("shutdown");
+}
+
+// ---------------------------------------------------------------------
+// Idempotency
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn edits_are_idempotent_in_both_directions() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    // ADD, then re-ADD the same field with the same formula.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+        .await
+        .expect("add");
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+        .await
+        .expect("re-adding the same field with the same formula is a no-op success");
+    let (added, dropped, altered) = into_altered(applied);
+    assert!(added.is_empty(), "no-op: nothing was actually added again");
+    assert!(dropped.is_empty());
+    assert!(altered.is_empty());
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a no-op re-ADD must not bump definition_version — nothing was actually written"
+    );
+
+    // ALTER to a new formula, then re-ALTER to the same (now-current) one.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ALTER double_a AS a + a + a")
+        .await
+        .expect("alter");
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ALTER double_a AS a + a + a")
+        .await
+        .expect("re-altering to the formula it already has is a no-op success");
+    let (added, dropped, altered) = into_altered(applied);
+    assert!(added.is_empty());
+    assert!(dropped.is_empty());
+    assert!(
+        altered.is_empty(),
+        "no-op: nothing was actually altered again"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a no-op re-ALTER must not bump definition_version — nothing was actually written"
+    );
+
+    // DROP, then re-DROP the same, now-absent field.
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP double_a")
+        .await
+        .expect("drop");
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc DROP double_a")
+        .await
+        .expect("dropping an already-absent field is a no-op success");
+    let (added, dropped, altered) = into_altered(applied);
+    assert!(added.is_empty());
+    assert!(dropped.is_empty(), "no-op: it was already gone");
+    assert!(altered.is_empty());
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a no-op re-DROP must not bump definition_version — nothing was actually written"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// An `ADD` and a `DROP` of the same name in one edit cancel,
+/// so the edit is a no-op. Neither its physical column nor any pause state
+/// survives it, and a later `ADD` of that name with a different result type
+/// creates the column with the new type.
+#[tokio::test]
+async fn an_add_and_a_drop_of_the_same_field_in_one_edit_cancel() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let version_before = persisted_definition_version(&raw, "order_calc").await;
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS z, DROP z")
+        .await
+        .expect("an ADD and a DROP of the same field cancel");
+    assert!(
+        !column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc")
+            .await
+            .contains("z"),
+        "the edit must leave no physical column z behind"
+    );
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version_before,
+        "a net no-op edit writes nothing"
+    );
+    let (added, dropped, altered) = into_altered(applied);
+    assert!(added.is_empty(), "z was not added: {added:?}");
+    assert!(dropped.is_empty(), "z was not dropped: {dropped:?}");
+    assert!(altered.is_empty());
+    let pause_rows: i64 = raw
+        .query_one(
+            "select (select count(*) from column_status where column_name = 'z') \
+                  + (select count(*) from column_pause_cascades \
+                     where upstream_column = 'z' or downstream_column = 'z')",
+            &[],
+        )
+        .await
+        .expect("read pause state")
+        .get(0);
+    assert_eq!(pause_rows, 0, "the edit must leave no pause state for z");
+
+    // The name is free: an ADD with a different result type gets its type.
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD a > 1 AS z")
+        .await
+        .expect("add z as a boolean");
+    wait_for_live(&raw, "order_calc").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "z").await,
+        "boolean"
+    );
+    let rows = raw
+        .query(
+            &format!("select a::text, z from {DEFAULT_TARGET_SCHEMA}.order_calc order by id"),
+            &[],
+        )
+        .await
+        .expect("read target");
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let z: Option<bool> = row.get(1);
+        assert_eq!(z, Some(a > 1.0));
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `DROP z, ADD z` replaces the field, which is
+/// the supported path for a change of result type, so it drops the old
+/// column and adds one with the new type.
+#[tokio::test]
+async fn a_drop_then_add_of_the_same_field_replaces_it_with_the_new_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, a + a AS z")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "z").await,
+        "numeric"
+    );
+
+    let applied = trellis
+        .apply("ALTER TRANSFORM order_calc DROP z, ADD a > 1 AS z")
+        .await
+        .expect("replace z");
+    let (added, dropped, altered) = into_altered(applied);
+    assert_eq!(added, vec!["z".to_string()]);
+    assert_eq!(dropped, vec!["z".to_string()]);
+    assert!(altered.is_empty());
+    wait_for_live(&raw, "order_calc").await;
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "order_calc", "z").await,
+        "boolean"
+    );
+    let rows = raw
+        .query(
+            &format!("select a::text, z from {DEFAULT_TARGET_SCHEMA}.order_calc order by id"),
+            &[],
+        )
+        .await
+        .expect("read target");
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let a: f64 = row.get::<_, String>(0).parse().unwrap();
+        let z: Option<bool> = row.get(1);
+        assert_eq!(z, Some(a > 1.0));
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn add_an_existing_field_with_a_different_formula_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS a")
+        .await
+        .expect_err(
+            "ADD naming an existing field with a different formula is ambiguous with ALTER",
+        );
+    match err {
+        TrellisError::Catalog(CatalogError::AlterFieldAlreadyExists { transform, field }) => {
+            assert_eq!(transform, "order_calc");
+            assert_eq!(field, "a");
+        }
+        other => panic!("expected CatalogError::AlterFieldAlreadyExists, got {other:?}"),
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn altering_a_field_that_does_not_exist_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ALTER nope AS a + a")
+        .await
+        .expect_err("there is nothing named 'nope' to alter");
+    match err {
+        TrellisError::Catalog(CatalogError::AlterFieldNotFound {
+            transform, field, ..
+        }) => {
+            assert_eq!(transform, "order_calc");
+            assert_eq!(field, "nope");
+        }
+        other => panic!("expected CatalogError::AlterFieldNotFound, got {other:?}"),
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------
+// Cycle detection reuse
+// ---------------------------------------------------------------------
+
+/// `validate`'s column-cycle detector — the same one a first `define`
+/// runs — is reused unchanged for an edit's merged field list: `b` and `c`
+/// only become mutually dependent once this one `ALTER TRANSFORM` statement
+/// lands, so the cycle exists nowhere before it and must be caught here.
+#[tokio::test]
+async fn add_and_alter_that_would_cycle_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, a AS m")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ADD m + 1 AS c, ALTER m AS c + 1")
+        .await
+        .expect_err("m and c would depend on each other after this edit");
+    match err {
+        TrellisError::Catalog(CatalogError::Validate(_)) => {}
+        other => panic!("expected CatalogError::Validate(.. Cycle ..), got {other:?}"),
+    }
+
+    // A rejected edit writes nothing at all.
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(!columns.contains("c"));
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------
+// An edit validates against the live source schema
+// ---------------------------------------------------------------------
+
+/// A definition's persisted `source_columns`, as the `name -> type` pairs
+/// its builds and applies cast through.
+async fn persisted_source_columns(raw: &Client, target: &str) -> String {
+    raw.query_one(
+        "select source_columns::text from transform_definitions \
+         where split_part(target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .expect("read source_columns")
+    .get(0)
+}
+
+/// Defines `order_calc` over `a`, runs the pipeline and waits for it live.
+async fn live_order_calc(db: &testkit::TestDatabase, raw: &Client) -> Trellis {
+    seed_orders(raw, 5).await;
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+    let trellis = running(db.dsn()).await;
+    wait_for_live(raw, "order_calc").await;
+    trellis
+}
+
+#[tokio::test]
+async fn an_added_field_named_after_a_column_the_source_gained_is_refused_like_define() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    let trellis = live_order_calc(&db, &raw).await;
+    let version = persisted_definition_version(&raw, "order_calc").await;
+
+    raw.batch_execute("alter table orders add column c3 numeric")
+        .await
+        .expect("the host adds c3");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + 2 AS c3")
+        .await
+        .expect_err("c3 is a source column now, which a define would refuse a field named c3");
+    let TrellisError::Catalog(CatalogError::Validate(alter_err)) = err else {
+        panic!("expected the validator's refusal, got {err:?}");
+    };
+    assert!(
+        matches!(
+            alter_err,
+            trellis::ValidationError::CalculatedFieldShadowsSourceColumn { ref field }
+                if field == "c3"
+        ),
+        "{alter_err:?}"
+    );
+
+    // The same definition, defined over the schema as it is now, gets the
+    // same refusal, message included.
+    let define_err = trellis
+        .apply("TRANSFORM shadowed FROM orders SELECT a AS a, a + 2 AS c3")
+        .await
+        .expect_err("define refuses the same definition");
+    let TrellisError::Catalog(CatalogError::Validate(define_err)) = define_err else {
+        panic!("expected the validator's refusal, got {define_err:?}");
+    };
+    assert_eq!(alter_err.to_string(), define_err.to_string());
+
+    // A refused edit writes nothing.
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version
+    );
+    assert!(
+        !column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc")
+            .await
+            .contains("c3")
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn an_added_field_reading_a_column_the_source_dropped_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    let trellis = live_order_calc(&db, &raw).await;
+    let version = persisted_definition_version(&raw, "order_calc").await;
+    let recorded = persisted_source_columns(&raw, "order_calc").await;
+
+    // `b` was a source column when `order_calc` was defined, and nothing
+    // reads it, so the drop pauses nothing.
+    raw.batch_execute("alter table orders drop column b")
+        .await
+        .expect("the host drops b");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ADD b + 1 AS b_plus")
+        .await
+        .expect_err("b is not a source column any more");
+    match err {
+        TrellisError::Catalog(CatalogError::Validate(
+            trellis::ValidationError::UnresolvedColumn { field, column },
+        )) => {
+            assert_eq!(field, "b_plus");
+            assert_eq!(column, "b");
+        }
+        other => panic!("expected UnresolvedColumn, got {other:?}"),
+    }
+    assert_eq!(
+        persisted_definition_version(&raw, "order_calc").await,
+        version
+    );
+    // A refused edit records nothing either.
+    assert_eq!(persisted_source_columns(&raw, "order_calc").await, recorded);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn an_added_field_can_read_a_column_the_source_gained_and_the_edit_records_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    let trellis = live_order_calc(&db, &raw).await;
+
+    raw.batch_execute("alter table orders add column c3 numeric; update orders set c3 = id * 10")
+        .await
+        .expect("the host adds c3");
+    assert!(
+        !persisted_source_columns(&raw, "order_calc")
+            .await
+            .contains("c3"),
+        "define recorded the source as it was"
+    );
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD c3 + c3 AS c3_twice")
+        .await
+        .expect("a column the source has now is readable, as at define");
+    // The field's builds and applies cast through the type it was validated
+    // over, so the edit records the column it reads, and only that.
+    let recorded = persisted_source_columns(&raw, "order_calc").await;
+    assert!(recorded.contains("\"c3\": \"numeric\""), "{recorded}");
+    assert!(recorded.contains("\"b\": \"numeric\""), "{recorded}");
+
+    wait_for_live(&raw, "order_calc").await;
+    let wrong: i64 = raw
+        .query_one(
+            &format!(
+                "select count(*) from {DEFAULT_TARGET_SCHEMA}.order_calc \
+                 where c3_twice is distinct from id * 20"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the target")
+        .get(0);
+    assert_eq!(wrong, 0, "every row's field is built from c3");
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn an_edit_over_an_unchanged_schema_leaves_the_recorded_columns_alone() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    let trellis = live_order_calc(&db, &raw).await;
+    let recorded = persisted_source_columns(&raw, "order_calc").await;
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + b AS ab")
+        .await
+        .expect("add");
+    assert_eq!(persisted_source_columns(&raw, "order_calc").await, recorded);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table readings (id bigint primary key, x integer, y numeric); \
+         insert into readings select s, s, s from generate_series(1, 3) s;",
+    )
+    .await
+    .expect("seed readings");
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM reading_calc FROM readings SELECT x AS x, y AS y")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "reading_calc").await;
+    let version = persisted_definition_version(&raw, "reading_calc").await;
+    let recorded = persisted_source_columns(&raw, "reading_calc").await;
+    // Another type family changes the type the definition evaluates `x` as,
+    // so the next capture pass pauses it. No capture pass runs
+    // until the pipeline restarts below, so the edits meet a live
+    // definition over the retyped column.
+    trellis.shutdown().await.expect("stop the pipeline");
+    let trellis = pipeline::definer(db.dsn()).await;
+
+    raw.batch_execute("alter table readings alter column x type double precision")
+        .await
+        .expect("the host retypes x");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM reading_calc ADD x + y AS xy")
+        .await
+        .expect_err("xy would be built over double precision and applied over integer");
+    let TrellisError::Catalog(CatalogError::UnsupportedAlter(detail)) = err else {
+        panic!("expected UnsupportedAlter, got {err:?}");
+    };
+    for part in [
+        "'xy'",
+        "'x'",
+        "as integer",
+        "as double precision",
+        "RESUME TRANSFORM reading_calc",
+    ] {
+        assert!(detail.contains(part), "{part} in {detail}");
+    }
+    assert_eq!(
+        persisted_definition_version(&raw, "reading_calc").await,
+        version
+    );
+    assert_eq!(
+        persisted_source_columns(&raw, "reading_calc").await,
+        recorded
+    );
+
+    // An edit that builds nothing over `x` goes ahead, and leaves `x`
+    // recorded as it was: the passthrough applies as it did before the edit.
+    trellis
+        .apply("ALTER TRANSFORM reading_calc ADD y + y AS y2")
+        .await
+        .expect("y2 reads only y");
+    assert_eq!(
+        persisted_source_columns(&raw, "reading_calc").await,
+        recorded
+    );
+
+    // The pipeline's capture pass pauses the definition for the retype, and
+    // a resume re-types it; the edit goes ahead after it.
+    trellis
+        .shutdown()
+        .await
+        .expect("stop the define-only facade");
+    let trellis = running(db.dsn()).await;
+    testkit::wait_until(
+        "the capture pass pauses reading_calc for the retyped x",
+        Duration::from_secs(60),
+        async || persisted_status(&raw, "reading_calc").await.as_deref() == Some("paused"),
+    )
+    .await;
+    let failure: String = raw
+        .query_one(
+            "select f.error from capture_failures f \
+             join transform_definitions d on d.id = f.transform_id \
+             where split_part(d.target_table, '.', 2) = 'reading_calc'",
+            &[],
+        )
+        .await
+        .expect("the pause is a capture failure")
+        .get(0);
+    assert!(
+        failure.contains("from integer to double precision"),
+        "{failure}"
+    );
+    trellis
+        .apply("RESUME TRANSFORM reading_calc")
+        .await
+        .expect("resume");
+    wait_for_live(&raw, "reading_calc").await;
+    trellis
+        .apply("ALTER TRANSFORM reading_calc ADD x + y AS xy")
+        .await
+        .expect("x is recorded as the source has it now");
+    assert!(
+        persisted_source_columns(&raw, "reading_calc")
+            .await
+            .contains("\"x\": \"double precision\"")
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_field_reading_a_column_the_source_dropped_is_dropped_by_an_edit_and_refuses_others() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+    // No capture pass from here on, so nothing pauses the definition for
+    // the dropped column before the edits below.
+    trellis.shutdown().await.expect("stop the pipeline");
+    let trellis = pipeline::definer(db.dsn()).await;
+
+    raw.batch_execute("alter table orders drop column b")
+        .await
+        .expect("the host drops b");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS a2")
+        .await
+        .expect_err("the edit would leave the field b reading a column the source dropped");
+    match err {
+        TrellisError::Catalog(CatalogError::Validate(
+            trellis::ValidationError::UnresolvedColumn { field, column },
+        )) => assert_eq!((field.as_str(), column.as_str()), ("b", "b")),
+        other => panic!("expected UnresolvedColumn, got {other:?}"),
+    }
+
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("an edit dropping the field is what define would accept");
+    assert!(
+        !column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc")
+            .await
+            .contains("b")
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------
+// Column-granularity drop refusal, and its retrofit onto
+// `DROP TRANSFORM`
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn dropping_a_field_still_read_by_a_dependent_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define the upstream target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    trellis
+        .apply("TRANSFORM order_calc_reader FROM order_calc SELECT a AS a_copy")
+        .await
+        .expect("a chained transform reading only order_calc.a, not order_calc.b");
+    wait_for_live(&raw, "order_calc_reader").await;
+
+    // Dropping `b` — which nothing reads — succeeds.
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("no dependent reads column b specifically");
+
+    // Dropping `a` — which `order_calc_reader` reads — is refused, naming
+    // the specific column it reads.
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc DROP a")
+        .await
+        .expect_err("order_calc_reader reads exactly this column");
+    match err {
+        TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+            subject,
+            dependents,
+            column_detail,
+        }) => {
+            assert_eq!(subject, "order_calc.a");
+            assert_eq!(dependents, vec!["order_calc_reader".to_string()]);
+            assert_eq!(column_detail.len(), 1);
+            assert!(column_detail[0].contains("order_calc_reader"));
+            assert!(column_detail[0].contains("order_calc.a"));
+        }
+        other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
+    }
+
+    // A refused drop writes nothing: the column is still there.
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(columns.contains("a"));
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `drop_transform`'s existing table-level refusal
+/// still refuses on *any* reader (unchanged — a reader of any column still
+/// blocks a whole-table drop), but now names the *specific* column that
+/// reader depends on, using the same column-granularity infrastructure
+/// `ALTER TRANSFORM ... DROP <field>` needs for its own, load-bearing check.
+#[tokio::test]
+async fn dropping_a_transform_names_the_specific_column_a_dependent_reads() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define the upstream target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    trellis
+        .apply("TRANSFORM order_calc_reader FROM order_calc SELECT a AS a_copy")
+        .await
+        .expect("a chained transform reading only order_calc.a");
+    wait_for_live(&raw, "order_calc_reader").await;
+
+    trellis
+        .apply("PAUSE TRANSFORM order_calc")
+        .await
+        .expect("pause before a drop attempt");
+    let err = trellis
+        .apply("DROP TRANSFORM order_calc")
+        .await
+        .expect_err("order_calc_reader still derives from this target");
+    match err {
+        TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+            subject,
+            dependents,
+            column_detail,
+        }) => {
+            assert_eq!(subject, "order_calc");
+            assert_eq!(dependents, vec!["order_calc_reader".to_string()]);
+            assert_eq!(
+                column_detail,
+                vec!["order_calc_reader.a_copy reads order_calc.a".to_string()],
+                "the refusal names the exact column a_copy reads, not just \
+                 \"something reads this table\""
+            );
+        }
+        other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// `column_dependents_any_keyspace` must see a
+/// dependency that only exists through a downstream **aggregate's own
+/// `GROUP BY` key** — not a `SELECT` field — since a `GROUP BY` key is not
+/// itself a [`trellis`]-internal `FieldDef`
+/// (`ast::KeySpace::Aggregate`'s own doc comment) and so is invisible to the
+/// plain field-list loop `column_dependents_via` also runs. Every other
+/// drop-refusal test in this file (and in `pause_and_drop.rs`) exercises a
+/// dependent that reads the column through an ordinary `SELECT` field, which
+/// would still pass even if the `KeySpace::Aggregate { group_by }` branch in
+/// `column_dependents_via` (`catalog.rs`) were deleted outright — this test
+/// exists specifically to fail if that branch regresses.
+#[tokio::test]
+async fn dropping_a_field_read_by_a_downstream_aggregates_group_by_key_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 6).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a, b AS b")
+        .await
+        .expect("define the upstream 1-1 target");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    // `order_group` groups directly on `order_calc.a` — not a passthrough
+    // `SELECT` field of its own — so the only edge from `order_group` back
+    // to `order_calc.a` is its `GROUP BY` key.
+    trellis
+        .apply("TRANSFORM order_group FROM order_calc GROUP BY a WITHOUT SOURCE INDEX SELECT count(*) AS n")
+        .await
+        .expect("an aggregate grouping directly on the upstream's column");
+
+    // Dropping `b` — which nothing reads, as a field or a GROUP BY key —
+    // still succeeds.
+    trellis
+        .apply("ALTER TRANSFORM order_calc DROP b")
+        .await
+        .expect("no dependent reads column b, as a field or a GROUP BY key");
+
+    // Dropping `a` — which `order_group` GROUPs BY — is refused, naming
+    // `order_group` and the exact column its own `GROUP BY` key reads.
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc DROP a")
+        .await
+        .expect_err("order_group's GROUP BY key reads exactly this column");
+    match err {
+        TrellisError::Catalog(CatalogError::DependentsBlockDrop {
+            subject,
+            dependents,
+            column_detail,
+        }) => {
+            assert_eq!(subject, "order_calc.a");
+            assert_eq!(dependents, vec!["order_group".to_string()]);
+            assert_eq!(
+                column_detail,
+                vec!["order_group.a reads order_calc.a".to_string()],
+                "the refusal must be traced to order_group's own GROUP BY key, \
+                 not just \"something reads this table\""
+            );
+        }
+        other => panic!("expected CatalogError::DependentsBlockDrop, got {other:?}"),
+    }
+
+    // A refused drop writes nothing: the column is still there.
+    let columns = column_names(&raw, DEFAULT_TARGET_SCHEMA, "order_calc").await;
+    assert!(columns.contains("a"));
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+// ---------------------------------------------------------------------
+// Scope-downs, named
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn altering_an_aggregate_transform_is_unsupported() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table orders (id bigint primary key, g bigint, a numeric(20,0)); \
+         insert into orders (id, g, a) select s, s % 2, s from generate_series(1, 6) s;",
+    )
+    .await
+    .expect("seed");
+
+    // The aggregate's build runs in the background; settling it here
+    // brings the definition live without a running pipeline.
+    let trellis = definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM order_rollup FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
+        .await
+        .expect("define the aggregate");
+    trellis::intake::harness::settle_builds(&db.pool).await;
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_rollup ADD g AS g2")
+        .await
+        .expect_err("ALTER TRANSFORM only supports 1-1 transforms in this release");
+    match err {
+        TrellisError::Catalog(CatalogError::UnsupportedAlter(_)) => {}
+        other => panic!("expected CatalogError::UnsupportedAlter, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn altering_a_target_that_is_not_live_is_rejected() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    seed_orders(&raw, 5).await;
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM order_calc FROM orders SELECT a AS a")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "order_calc").await;
+
+    trellis
+        .apply("PAUSE TRANSFORM order_calc")
+        .await
+        .expect("pause");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM order_calc ADD a + a AS double_a")
+        .await
+        .expect_err("a paused definition is not live");
+    match err {
+        TrellisError::Catalog(CatalogError::TransformNotLive { transform, status }) => {
+            assert_eq!(transform, "order_calc");
+            assert_eq!(status, TransformStatus::Paused);
+        }
+        other => panic!("expected CatalogError::TransformNotLive, got {other:?}"),
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A column Postgres reserves is written qualified with its table, so
+/// `ALTER TRANSFORM ... ADD t.order AS order` is the passthrough of `order`
+/// as `ADD order AS order` would be if the grammar could spell it: it adds a
+/// copy of the column with the source's type, builds it, and survives a
+/// `PAUSE` and `RESUME` (which validate the stored text again).
+#[tokio::test]
+async fn an_added_qualified_passthrough_of_a_reserved_word_column_is_a_copy() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.rw (id int primary key, val int, \"order\" bigint, \
+                                 \"group\" varchar(8)); \
+         insert into public.rw select s, s, s * 10, 'g' || s from generate_series(1, 4) s;",
+    )
+    .await
+    .expect("seed");
+
+    let definer = definer(db.dsn()).await;
+    definer
+        .apply("TRANSFORM edited FROM public.rw SELECT rw.val AS val")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "edited").await;
+    trellis
+        .apply("ALTER TRANSFORM edited ADD rw.order AS order, ADD public.rw.group AS group")
+        .await
+        .expect("add the qualified passthroughs");
+    wait_for_live(&raw, "edited").await;
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "edited", "order").await,
+        "bigint"
+    );
+    // A copy has no type modifier (ADR-0020).
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "edited", "group").await,
+        "character varying"
+    );
+    let copied: Vec<(String, String)> = raw
+        .query(
+            &format!(
+                "select \"order\"::text, \"group\" from {DEFAULT_TARGET_SCHEMA}.edited order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the copy")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let expected: Vec<(String, String)> = (1..=4)
+        .map(|s| ((s * 10).to_string(), format!("g{s}")))
+        .collect();
+    assert_eq!(copied, expected);
+
+    trellis
+        .apply("PAUSE TRANSFORM edited")
+        .await
+        .expect("pause");
+    trellis
+        .apply("RESUME TRANSFORM edited")
+        .await
+        .expect("resume revalidates the stored qualified passthroughs");
+    wait_for_live(&raw, "edited").await;
+
+    trellis.shutdown().await.expect("shutdown");
+}
