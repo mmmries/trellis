@@ -299,16 +299,21 @@ tombstone it wrote outlives every change its `__basis` would refuse. A later
 change to a collected key finds no entry and gets a fresh one, where I2
 reduces to the truncate floor.
 
-The GC skips the ledger of a definition under a build: one that is
-`backfilling`, or whose Re-derive build a pause or quarantine froze.
-A build chunk inserts a new key's entry from a snapshot taken before the
-insert, so a tombstone written after that snapshot must still be there when
-the insert looks for the key. A GC batch checks the definition and holds its
-row `for key share` until it commits, and a build's start takes that row
-`for update`, so a batch either commits before the start or sees the build
-and skips. The tombstones of deletes applied during a build therefore wait
-for it to finish, which bounds them by the write rate times the build's
-length.
+The GC skips the ledgers of a definition under a build: one that is
+`backfilling`, or whose Re-derive build a pause or quarantine froze. A 1-1
+`JOIN`'s build chunk inserts the `R` entries of rows that have none from a
+read in the same statement
+([ADR-0021](../decisions/0021-one-to-one-join-transforms.md#a-build-fills-every-m-then-r-and-the-target)),
+so a tombstone written after that read's snapshot must still be there at
+the insert's uniqueness check. A plain 1-1 chunk locks its entries before it
+reads, as a page's Re-derive does, and needs no skip; its ledger is skipped
+anyway, which only delays the GC
+([#2018](https://github.com/salesforce-misc/trellis/issues/2018)). A GC
+batch checks the definition and holds its row `for key share` until it
+commits, and a build's start takes that row `for update`, so a batch either
+commits before the start or sees the build and skips. The tombstones of
+deletes applied during a build therefore wait for it to finish, which bounds
+them by the write rate times the build's length.
 
 Only a tombstone carries `__applied_seg`. A write that leaves an entry
 a tombstone raises it to `greatest(old, its segment)`; one that leaves the
@@ -358,7 +363,7 @@ aggregate targets: it stages each change's cells before any lock, then takes
 the pair's lock row, the join keys `J`, the partial cells `P` and `M` and the
 visible groups `T`, each in one sorted statement, and moves each cell by the
 changes its basis hasn't counted, as a group does. A 1-1 `JOIN` target
-(`staging::join_one_to_one`, ADR-0021) applies last, in the lock order of
+(`staging::join_one_to_one`, ADR-0021) applies last, over
 [its hidden state](#a-1-1-joins-hidden-state); it rewrites the target row of
 each changed `FROM` row, and of the other rows on a joined key the page
 changed.
@@ -382,23 +387,10 @@ positions they write. An `a` change locks `J` at every position for its old
 and new keys; a change of the table at position `i` locks `J` at position `i`
 only, then the `R` entries of every row on its keys there, in one statement
 over every position the page touches, before it reads any `M`. A page takes
-its locks in one global order over the union of its keys:
-
-1. the definition rows, in id order: `FOR UPDATE` for a target whose joined
-   table the page truncates, and `FOR KEY SHARE` for one whose page may hold
-   a row in quarantine, so a page queues behind a rebuild's start, which takes
-   them in the same order;
-2. the truncate lock row: `FOR UPDATE` in a page that truncates a table,
-   `FOR SHARE` in any other, which orders a `TRUNCATE a` against the pages in
-   flight;
-3. `J`, in one statement sorted by `(position, key)`;
-4. the `R` entries, in one statement sorted by entry key;
-5. the `M` entries, sorted by `(position, id)`;
-6. the target rows.
-
-Placeholder inserts follow the same order, so no two transactions take two
-rows of `J`, `R` or `M` in opposite orders. Why each rule is needed at every
-position, and the model that checked them, is ADR-0021's
+these locks over the union of its keys, in the
+[lock order](#lock-ordering-because-parallel-workers-will-overlap). Why each
+rule is needed at every position, and the model that checked them, is
+ADR-0021's
 [lock rules](../decisions/0021-one-to-one-join-transforms.md#no-writer-reads-another-tables-source-only-its-copy-under-j-and-the-rows-r-entry).
 
 ## The delta model
@@ -486,17 +478,33 @@ slips through.
 ## Lock ordering, because parallel workers will overlap
 
 Two workers whose batches touch overlapping keys or groups will contend on the
-same rows. That is fine; deadlocking on them is not. A page takes its locks in
-one consistent order: its 1-1 targets, then its aggregate targets, then its
-`JOIN` targets, then its 1-1 `JOIN` targets, each in target order, and per
-target **its entries, then its rows, each in one sorted
-statement** (a `JOIN` target takes its pair's lock row first, then its
-structures, and the 1-1 `JOIN` targets' definition rows come before any of
-their lock rows, in [the order above](#join-targets)). The entry lock is ordered by key
-([the 1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger),
-[the group basis](group-basis.md#a-page)); a 1-1 target's rows are
-then pre-locked in key order, and an aggregate's group upsert writes its
-groups in group order.
+same rows. That is fine; deadlocking on them is not. Every writer takes the
+classes it needs in the order of this table, each class in one sorted
+statement, its placeholder inserts in the same order
+([ADR-0028 I5](../decisions/0028-locking-and-writing.md#i5-every-writer-takes-its-locks-in-one-order-each-class-in-one-sorted-statement)).
+"Insert-then-lock" is an insert of the keys with no row, then a lock of the
+rest (or an upsert that does both).
+
+| Class | Mode | Sort key | Taken by |
+|---|---|---|---|
+| Handover lock (advisory) | shared | — | A state-changing call, first (`locks::fence_call_txn`) |
+| Version fence (`source_table_versions`) | `FOR SHARE`; bumped by an update | table name | `FOR SHARE`: a page, a build chunk, a sweep batch, a fan-out chunk, first. Bumped: a define, an edit, a drop, a resume, a pause, a release |
+| Column-pause lock (advisory) | shared or exclusive | — | A reader or writer of pause state (`locks::lock_column_pauses`) |
+| Fuse gate (`transform_fuse_gate`) | upsert | id | An eviction |
+| Definition rows (`transform_definitions`) | `FOR KEY SHARE`, `FOR NO KEY UPDATE` or `FOR UPDATE` | id | `KEY SHARE`: a page that parks a quarantined key's change, a plan job before it enqueues chunks, a GC batch (`NOWAIT`). `NO KEY UPDATE`: an eviction, a release, a re-type. `UPDATE`: a pause, a resume, a drop, a build's or a rebuild's start, a chunk's failure |
+| Parked rows (`poison_held`) | upsert | `(transform_id, src_table, key)` | A page that parks |
+| Build chunks (`backfill_chunks`) | `FOR KEY SHARE` or `FOR UPDATE` | id | `KEY SHARE`: a chunk's claim fence. `UPDATE`: a resume, a drop (its cascade), a chunk's failure |
+| 1-1 targets, in target order: entries, then rows | entries insert-then-lock `FOR UPDATE`; rows `FOR UPDATE` | entry key; target key | A page; a build chunk and a sweep batch (entries, then one statement writes the rows) |
+| Aggregate targets, in target order: hidden groups, then visible rows | insert-then-lock; upsert | group columns | A page, a build |
+| `JOIN` targets, in target order: lock row, `J`, `P` and `M` cells, `T` | lock row `FOR SHARE`, `FOR UPDATE` with a `TRUNCATE`; `J` insert-then-lock `FOR UPDATE`; cells and `T` insert-then-lock | join columns; group columns | A page, a build |
+| 1-1 `JOIN` definition rows | `FOR UPDATE` if the page truncates `b`, else `FOR KEY SHARE` if it may hold a row | id | A page, a fan-out chunk; a rebuild's start (`FOR UPDATE`) |
+| 1-1 `JOIN` targets, in target order: lock row, `J`, fan-out marker, `R`, `M`, target rows | lock row as for `JOIN`; `J`, `R` and `M` insert-then-lock `FOR UPDATE`; marker and target rows `FOR UPDATE` | `J` `(position, key)`; `R` entry key; `M` `(position, id)`; target rows none, since every writer of one holds its `R` entry | A page, a build step, a fan-out chunk (one key's `J` and marker) |
+| Segment claims and rows (`seg_claims`, `segments`) | update or delete; `FOR NO KEY UPDATE` | `seg_seq` | A page's completion, last |
+
+The [1-1 ledger](#absolute-writes-do-not-commute-the-1-1-ledger), the
+[group basis](group-basis.md#a-page) and
+[a 1-1 `JOIN`'s hidden state](#a-1-1-joins-hidden-state) say why each class
+stands where it does.
 
 Every session Trellis opens sets `default_transaction_isolation` to
 `read committed` (`pool::READ_COMMITTED`), whatever the server's, database's
@@ -563,8 +571,9 @@ the DDL waits on stays open. In a benchmark run a bare `CREATE TRIGGER` stalled
 every writer for 25 s behind one open transaction; with a 50 ms
 `lock_timeout` retried every 200 ms the worst writer wait was 52 ms.
 
-**The rule.** DDL on a user table (`CREATE`/`DROP TRIGGER`) runs in a
-retry loop (`locks::DdlRetry`), each attempt its own transaction under
+**The rule.** Trellis's capture DDL on a source table (an install, a widen
+and an uninstall; a narrow takes no table lock) runs in a retry loop
+(`locks::DdlRetry`), each attempt its own transaction under
 `locks::USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms), one attempt per
 `locks::USER_TABLE_DDL_RETRY_INTERVAL` (200 ms). The staging worker's
 reconcile pass leaves a table whose lock stays held to the next pass
@@ -582,7 +591,7 @@ times out, and the page rolls back with its group locks and is retried (I7).
 
 An autovacuum holding the table blocks the DDL the same way. Postgres cancels
 one only when a waiter runs its deadlock check, after `deadlock_timeout`,
-which a 50 ms attempt never reaches, so a join on a table under a long
+which a 50 ms attempt never reaches, so an install on a table under a long
 autovacuum waits the vacuum out.
 
 ## Downstream propagation, and why it terminates
