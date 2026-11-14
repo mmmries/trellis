@@ -105,7 +105,7 @@ one its stage owns: the seal fence in stage 03, the install fence in stage 01.
 | Alias | Use |
 |---|---|
 | the fence (stage 03), published fence, `seal_snapshot` | [seal fence](#fences) |
-| table fence, source fence | [version fence](#fences): a pause bumps it |
+| table fence, source fence, pause fence | [version fence](#fences): a pause bumps it |
 | seam fence, per-build fence, a build's fence | [build fence](#fences) |
 | join fence, drop fence, the fence (stage 01) | [install fence](#fences): ADR-0002's names for the install's lock and the uninstall's |
 | handover fence | [call fence](#fences) |
