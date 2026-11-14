@@ -78,7 +78,6 @@ target. Trellis never adds a key, index or policy itself.
 Each refusal is one row of [the refusal table](#refusals): the condition, the
 error, what happens when the condition appears after define, and the remedy. A
 row links to an entry under [Details](#details) where it needs more room.
-Every error's remedy is in the errors reference (`docs/errors.md`), keyed by error code.
 What an expression may contain is refused in [its own table](expressions.md#refusals).
 
 ### After define

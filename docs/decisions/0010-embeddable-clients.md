@@ -175,8 +175,10 @@ not fork, but the pid guard is cheap enough to carry in both.
 
 ## 4. Only plain data crosses, and errors cross as `(code, message)`
 
-**Errors** carry exactly `ErrorCode::as_str()` plus the `Display` message — no
-error chain, no `source()` walking, no internal variant names.
+**Errors** carry exactly `ErrorCode::as_str()`, the per-error code
+([ADR-0008](0008-public-api-design.md#3-stable-ffi-safe-error-representation))
+and the `Display` message — no error chain, no `source()` walking, no internal
+variant names.
 
 * **Elixir:** `{:error, %Trellis.Error{code: :validation, message: "..."}}`
   from non-bang functions; bang variants raise the same struct.
