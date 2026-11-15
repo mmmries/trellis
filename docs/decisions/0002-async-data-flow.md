@@ -149,7 +149,7 @@ lock and write, which also holds the rules for a build's bulk writes.
 | **I3** | **Ordering state at the target's grain; group values are functions of sums.** A 1-1 row's ordering state is its ledger entry; a group's is its basis and stamp, and its partials are the sum of the sides applied since its last absolute write, which chain per row (R3). | In the interleaving experiment, eight workers creating the same groups at once, and a row passing through a group within one folded batch while that group rebuilds, both hold with groups as sums and no pre-lock or probe. |
 | **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry, and a zero group that has a basis, stay until the contiguous drained prefix passes their segment stamp ([Convergence and status](#convergence-and-status)). | In the interleaving experiment an older update resurrects a deleted row unless the tombstone is kept; in my group-basis model a GC that ignored the drained prefix was wrong in every soak run. |
 | **I5** | **One lock order, taken as one sorted batch (R7).** Every writer takes its locks in one order, each class in key order in one statement, never in a per-row loop. [ADR-0028](0028-locking-and-writing.md#i5-every-writer-takes-its-locks-in-one-order-each-class-in-one-sorted-statement) defines the order. | In ADR-0028. |
-| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried, and a `MIN`/`MAX` probe's `ACCESS SHARE` lock, which only an `ACCESS EXCLUSIVE` statement queues behind ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#ddl-on-a-user-table-never-blocks-a-writer-adr-0002-i6)). A schema change to a read column never fails the application's statement. | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s and, with a 50 ms `lock_timeout` retry, a worst wait of 52 ms; a rename of a read column under the capture function failed every insert until regeneration. |
+| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except its capture DDL on a source table (install, widen and uninstall), each bounded by `lock_timeout` and retried, and a `MIN`/`MAX` probe's `ACCESS SHARE` lock, which only an `ACCESS EXCLUSIVE` statement queues behind ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#ddl-on-a-user-table-never-blocks-a-writer-adr-0002-i6)). A schema change to a read column never fails the application's statement. | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s and, with a 50 ms `lock_timeout` retry, a worst wait of 52 ms; a rename of a read column under the capture function failed every insert until regeneration. |
 | **I7** | **No Trellis transaction waits for a lock while it holds a snapshot open.** Every lock statement runs under a `lock_timeout`; on timeout the transaction rolls back and the work is retried from outside any transaction. | In my 100M chunked-build run, a drain batch's ledger insert waited 1 h 50 min behind chunk transactions, holding back vacuum and the sealer for the whole wait. |
 | **I8** | **Memory is bounded by a batch cap, never by segment size.** A drain batch folds, re-reads and applies at most a fixed number of changes and pages through a larger bucket. | In my one-pass build, a drain held ~650 B per staged row per worker: 6.32 GB at 10M, OOM at 100M; fewer workers bound nothing. |
 
@@ -275,8 +275,7 @@ state that orders its writes. A 1-1 target owns it per source row
   Its cost is one more row write per change: ~200 B of WAL per row in
   `throughput-ramp` (about 500 B right after a checkpoint).
 - **Must:** exactly two operations exist, and every producer is one of them.
-  - **Re-derive(r).** Lock r's entry (inserting a placeholder if absent;
-    a build chunk instead inserts an absent entry from its read, I1).
+  - **Re-derive(r).** Lock r's entry (inserting a placeholder if absent).
     In one statement: take the snapshot and read r's source row. Then write
     the target row and replace the entry's basis with the snapshot, leaving
     `applied_lsn` as it was; a row gone from the source deletes the target
@@ -629,15 +628,10 @@ The steps are in [builds](../staging-and-claiming/builds.md).
   *Evidence:* in four 10M-row runs of a chunked-build prototype under 2,000
   writes/s the oracle matched, with 196–361k changes correctly skipped by
   chunk bases and 0 in-progress ids.
-- **Must:** a chunk is one short transaction. One statement takes the
-  snapshot, reads the range and inserts, in key order, the entry and target
-  row of every key that has none, written from that read. Then the chunk
-  locks the other keys' entries in key order, and one more statement takes a
-  snapshot, reads them and replaces their entries and rows. The insert's
-  snapshot is taken before its uniqueness check, so the insert relies on "no
-  entry" meaning "no Apply since the snapshot". The tombstone GC is the one
-  thing that removes an entry an Apply wrote, and it skips a definition under
-  a build (I4); a page's deleted placeholder holds no applied change (I1).
+- **Must:** a chunk is one short transaction. It reads the range's keys and
+  locks their entries in key order, inserting a placeholder for each key that
+  has none. Then one statement takes the snapshot, reads the keys' source
+  rows and replaces their entries and target rows (I1).
 - **Must:** a source that is another definition's target takes a per-build
   fence. A seam writer decides inside its own apply transaction whether a
   definition applies, so one that decided before the build's start can

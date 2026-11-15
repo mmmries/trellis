@@ -45,23 +45,24 @@ one order. Every statement that locks them follows the order, including a
 truncate's wipe and a chunk's retirement. A writer never locks in a per-row
 loop. (R7 is this rule for a group.)
 
-The order:
+The order between classes:
 
-- **Every writer:** build chunk rows in id order, then the page row.
-- **1-1 and aggregate targets:** a page's 1-1 targets, then its aggregate
-  targets, each in target order; per target its ledger entries, then its rows
-  or groups.
-- **A `JOIN … GROUP BY` transform** ([ADR-0019](0019-join-transforms.md)): the
-  pair's truncate lock row, `J` rows sorted by key (the tuple of join
-  columns), `P` and `M` cells, then `T` groups.
-- **A 1-1 JOIN transform** ([ADR-0021](0021-one-to-one-join-transforms.md)),
-  over the union of a page's key sets: the truncate lock row; `J`, in one
-  statement sorted by `(position, key)`; the `R` entries, in one statement
-  sorted by entry key; the `M` entries, sorted by `(position, id)`, in
-  statements that follow that order; then the target rows. The target rows
-  need no order of their own: every writer of a target row holds its `R` entry
-  first, so two writers of one row queue on that entry before either reaches
-  the row.
+- **A definition and its build chunks:** the definition's row, then its
+  `backfill_chunks` rows in id order, as a resume and a drop take them.
+- **A page:** its 1-1 targets, then its aggregate targets, then its `JOIN`
+  targets, then its 1-1 `JOIN` targets, each in target order, with the 1-1
+  `JOIN` targets' definition rows before any of their lock rows.
+- **A 1-1 or aggregate target:** its ledger entries, then its rows or groups.
+- **A `JOIN … GROUP BY` target** ([ADR-0019](0019-join-transforms.md)): the
+  pair's truncate lock row, `J`, the `P` and `M` cells, then `T`.
+- **A 1-1 `JOIN` target** ([ADR-0021](0021-one-to-one-join-transforms.md)),
+  over the union of a page's key sets: the truncate lock row, `J`, the `R`
+  entries, the `M` entries, then the target rows. The target rows need no
+  order of their own: every writer of a target row holds its `R` entry first.
+
+[Stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#lock-ordering-because-parallel-workers-will-overlap)
+lists every class with its lock mode, its sort key and the writers that take
+it.
 
 In my interleaving experiment a per-row loop deadlocked 19–22 times in 20 s;
 the sorted batch never did. The implemented paths held it in my benchmark
