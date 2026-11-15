@@ -578,8 +578,9 @@ pub async fn explain_page(
 /// One batch of a rebuild sweep's walk of the ledger `ledger` (quoted and
 /// qualified): up to `scan` entries after `after` in key order, and the live
 /// ones among them the build hasn't re-derived, whose `basis` is null
-/// (written by an Apply alone) or a snapshot taken before the build's start,
-/// `start_xid`. A key quarantined for the definition (its `poison` rows of
+/// (written by an Apply alone) or a snapshot whose `xmax` is not past
+/// `bound`: the build's start, or for a 1-1 `JOIN`'s `R` an id past its `M`
+/// pass (`super::build::join_one_to_one`). A key quarantined for the definition (its `poison` rows of
 /// `source_table` for `target`) is left as it is. Returns how many it read,
 /// the last key it read, and the stale keys, sorted. A plain 1-1 target's
 /// sweep (`super::build::one_to_one::sweep_batch`) and a 1-1 `JOIN`'s stale
@@ -588,7 +589,7 @@ pub async fn explain_page(
 pub(crate) async fn stale_entries(
     txn: &Transaction<'_>,
     ledger: &str,
-    start_xid: &str,
+    bound: &str,
     after: Option<&str>,
     scan: i64,
     source_table: &str,
@@ -598,7 +599,7 @@ pub(crate) async fn stale_entries(
     let row = txn
         .query_one(
             &stale_entries_statement(ledger, after.is_some()),
-            &[&start_xid, &scan, &after, &source_table, &target],
+            &[&bound, &scan, &after, &source_table, &target],
         )
         .await?;
     crate::metrics::record_build_statement(
@@ -609,7 +610,7 @@ pub(crate) async fn stale_entries(
 }
 
 /// [`stale_entries`]' statement on `ledger`, from the start or (`after`)
-/// after the key `$3`. Binds `$1` the build's start, `$2` the batch size, `$3`
+/// after the key `$3`. Binds `$1` the bound, `$2` the batch size, `$3`
 /// the key it walks on from (`text`, null from the start), `$4` the source
 /// table and `$5` the target.
 pub(crate) fn stale_entries_statement(ledger: &str, after: bool) -> String {

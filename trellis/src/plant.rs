@@ -411,6 +411,18 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_build`'s
     /// `the_m_pass_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild`.
     Join1MPassBOnly,
+    /// ADR-0021 (#2027, the sweep re-derives what the chunks did not): a 1-1
+    /// `JOIN` build's plan job leaves its sweep's bound at the build's start
+    /// instead of moving it past the `M` pass. An `R` entry a page
+    /// re-derived between the two, against the `M` the pass then replaced
+    /// without a fan-out, reads as fresh, and when its `a` row is gone at its
+    /// chunk's read, the build goes `live` with its target row joined to the
+    /// replaced `M`.
+    ///
+    /// Pinned by `join_one_to_one_build`'s
+    /// `s1_an_entry_a_page_rederived_before_the_m_pass_is_swept` and
+    /// `s2_an_entry_an_earlier_build_wrote_before_the_m_pass_is_swept`.
+    Join1SweepStartBound,
     /// ADR-0021 (#1375 T8, #1399): a 1-1 `JOIN`'s `TRUNCATE` empties the
     /// side's ledger (`R` or `M`) but doesn't raise its truncate floor, so a
     /// change of that side from before the truncate, which reaches a page
@@ -832,6 +844,7 @@ impl Plant {
         Plant::Join1NoOrphanPass,
         Plant::Join1OrphanDelete,
         Plant::Join1MPassBOnly,
+        Plant::Join1SweepStartBound,
         Plant::Join1TruncateNoFloor,
         Plant::Join1TruncateShareLock,
         Plant::Join1TruncateKeepsR,
@@ -911,6 +924,7 @@ impl Plant {
             Plant::Join1NoOrphanPass => "join1_no_orphan_pass",
             Plant::Join1OrphanDelete => "join1_orphan_delete",
             Plant::Join1MPassBOnly => "join1_m_pass_b_only",
+            Plant::Join1SweepStartBound => "join1_sweep_start_bound",
             Plant::Join1TruncateNoFloor => "join1_truncate_no_floor",
             Plant::Join1TruncateShareLock => "join1_truncate_share_lock",
             Plant::Join1TruncateKeepsR => "join1_truncate_keeps_r",

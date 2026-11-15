@@ -20,11 +20,16 @@
 //! - **The rebuild sweep** ([`sweep_batch`]) runs after the plan job and
 //!   every chunk, in two passes: `R`'s stale entries, then the orphans,
 //!   target rows no live `R` entry backs. Each batch re-derives what it found
-//!   as a page of `a` Re-derives. A build start enqueues it whenever the
-//!   target has rows (the parent module's `start`): a `RESUME` recreates `R`
-//!   and `M` empty and keeps the target, so the rows of `a` rows deleted
-//!   while the transform was paused are backed by nothing, and only the
-//!   orphan pass removes them (#1481).
+//!   as a page of `a` Re-derives. Every build start enqueues it (the parent
+//!   module's `start`). A `RESUME` recreates `R` and `M` empty and keeps the
+//!   target, so the rows of `a` rows deleted while the transform was paused
+//!   are backed by nothing, and only the orphan pass removes them (#1481).
+//!   And a page can re-derive an `R` entry after the start against an `M`
+//!   the `M` pass then replaces without a fan-out; when its `a` row is gone
+//!   at its chunk's read, no chunk rewrites it (#2027). So the stale pass's
+//!   bound is not the start but the id of the plan job's first walk
+//!   transaction, which it stores in the sweep row's `start_xid`: an entry
+//!   whose basis could predate the end of the `M` pass is re-derived.
 
 use std::sync::Arc;
 
@@ -426,23 +431,25 @@ impl Stage {
 
 /// One batch of a 1-1 `JOIN`'s rebuild sweep (see the module doc), from
 /// `cursor`, in `txn`, which the caller commits with the cursor's advance.
-/// `R`'s stale pass reads up to `scan` entries; the orphan pass, `scan` target
-/// rows. The sweep is finished when the orphan walk is.
+/// `R`'s stale pass reads up to `scan` entries and re-derives those whose
+/// basis is null or not past `bound` (the sweep row's `start_xid`, past the
+/// `M` pass); the orphan pass, `scan` target rows. The sweep is finished
+/// when the orphan walk is.
 pub(super) async fn sweep_batch(
     txn: &Transaction<'_>,
     plan: &JoinPlan,
-    start_xid: &str,
+    bound: &str,
     cursor: Option<&str>,
     scan: i64,
 ) -> Result<SweepOutcome, ChunkQueueError> {
-    under_chunk_lock_timeout(txn, sweep_batch_steps(txn, plan, start_xid, cursor, scan)).await
+    under_chunk_lock_timeout(txn, sweep_batch_steps(txn, plan, bound, cursor, scan)).await
 }
 
 /// [`sweep_batch`]'s steps, which lock the rows they write.
 async fn sweep_batch_steps(
     txn: &Transaction<'_>,
     plan: &JoinPlan,
-    start_xid: &str,
+    bound: &str,
     cursor: Option<&str>,
     scan: i64,
 ) -> Result<SweepOutcome, ChunkQueueError> {
@@ -453,7 +460,7 @@ async fn sweep_batch_steps(
             let (scanned, last, stale) = one_to_one_ledger::stale_entries(
                 txn,
                 shape.r_ident(),
-                start_xid,
+                bound,
                 after.as_deref(),
                 scan,
                 shape.source_table(),

@@ -64,7 +64,10 @@ Its resume, `request_backfill` and a capture re-install start a Re-derive build
 over the existing entries with no truncate, plus a **sweep** that runs once the
 chunks are done: it re-derives each live entry no chunk did (a key deleted
 while the definition was frozen) and each target row with no live entry (one
-added or re-keyed by hand). A resume whose source key columns, by name and in
+added or re-keyed by hand). Every 1-1 `JOIN` build, a fresh one too, gets the
+sweep, and its stale bound is past the `M` pass, so it also re-derives an `R`
+entry a page re-derived before the `M` pass was final whose `a` row is gone
+at its chunk. A resume whose source key columns, by name and in
 key order, are no longer the ones recorded is refused, since the target is
 keyed by them.
 A `request_backfill` of a live 1-1 definition makes the same move in the

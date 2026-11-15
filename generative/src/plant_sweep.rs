@@ -147,6 +147,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1NoOrphanPass
         | Plant::Join1OrphanDelete
         | Plant::Join1MPassBOnly
+        | Plant::Join1SweepStartBound
         | Plant::Join1TruncateNoFloor
         | Plant::Join1TruncateShareLock
         | Plant::Join1TruncateKeepsR
