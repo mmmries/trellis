@@ -1233,12 +1233,13 @@ async fn s2_an_entry_an_earlier_build_wrote_before_the_m_pass_is_swept() {
 
 /// The fresh-build face of #2027: every 1-1 `JOIN` build gets the sweep, an
 /// empty target's too. After the start and before the plan job, `a21` is
-/// inserted on key 0 and its page applies it: `M` is still empty, so its
-/// entry joins nothing. Row 7 is inserted on key 0 past capture, so only the
+/// inserted on key 0 and its page writes its entry: `M` is still empty, so
+/// it joins nothing. Row 7 is inserted on key 0 past capture, so only the
 /// `M` pass enters it, without a fan-out, and `a21` is deleted, its delete
 /// not yet drained, so no chunk visits it. Only the sweep re-derives the
-/// entry (its basis is null): at the flip it is a tombstone and its row is
-/// gone.
+/// entry, whose basis predates the end of the `M` pass: at the flip it is a
+/// tombstone and its row is gone. Planted `join1_sweep_start_bound` keeps
+/// it, as in `s1`.
 #[tokio::test]
 async fn s3_a_fresh_build_sweeps_an_entry_its_chunks_did_not_visit() {
     for kind in KINDS {

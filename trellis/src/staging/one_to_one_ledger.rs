@@ -580,12 +580,12 @@ pub async fn explain_page(
 /// ones among them the build hasn't re-derived, whose `basis` is null
 /// (written by an Apply alone) or a snapshot whose `xmax` is not past
 /// `bound`: the build's start, or for a 1-1 `JOIN`'s `R` an id past its `M`
-/// pass (`super::build::join_one_to_one`). A key quarantined for the definition (its `poison` rows of
-/// `source_table` for `target`) is left as it is. Returns how many it read,
-/// the last key it read, and the stale keys, sorted. A plain 1-1 target's
-/// sweep (`super::build::one_to_one::sweep_batch`) and a 1-1 `JOIN`'s stale
-/// pass over `R` (`super::build::join_one_to_one`) walk their ledgers through
-/// it.
+/// pass (`super::build::join_one_to_one`). A key quarantined for the
+/// definition (its `poison` rows of `source_table` for `target`) is left as
+/// it. Returns how many it read, the last key it read, and the stale keys,
+/// sorted. A plain 1-1 target's sweep (`super::build::one_to_one::sweep_batch`)
+/// and a 1-1 `JOIN`'s stale pass over `R` (`super::build::join_one_to_one`)
+/// walk their ledgers through it.
 pub(crate) async fn stale_entries(
     txn: &Transaction<'_>,
     ledger: &str,

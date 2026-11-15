@@ -525,7 +525,7 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
          moves M on the entry's key, and the entry's a row deleted, its delete undrained, \
          before its chunk reads the range, which the seed of #2027 hits in about two runs \
          in five: it fired in 24 of 24 cases and was caught in none, in either tier; \
-         `join_one_to_one_build`'s s1 and s2 pin it",
+         `join_one_to_one_build`'s s1 to s3 pin it",
     ),
     (
         "join1_truncate_no_floor",

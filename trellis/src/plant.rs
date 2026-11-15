@@ -420,8 +420,9 @@ pub enum Plant {
     /// replaced `M`.
     ///
     /// Pinned by `join_one_to_one_build`'s
-    /// `s1_an_entry_a_page_rederived_before_the_m_pass_is_swept` and
-    /// `s2_an_entry_an_earlier_build_wrote_before_the_m_pass_is_swept`.
+    /// `s1_an_entry_a_page_rederived_before_the_m_pass_is_swept`,
+    /// `s2_an_entry_an_earlier_build_wrote_before_the_m_pass_is_swept` and
+    /// `s3_a_fresh_build_sweeps_an_entry_its_chunks_did_not_visit`.
     Join1SweepStartBound,
     /// ADR-0021 (#1375 T8, #1399): a 1-1 `JOIN`'s `TRUNCATE` empties the
     /// side's ledger (`R` or `M`) but doesn't raise its truncate floor, so a
