@@ -670,3 +670,86 @@ async fn reader_operations_and_pages_while_the_build_parks() {
         }
     }
 }
+
+/// The definition rows a page takes come after its aggregate targets: the
+/// resumed build's commit parks its readers, taking their rows `for update`
+/// while it holds its groups, and a page that held a reader's row while it
+/// queued on a held group would close a cycle with it (#2019). Frozen just
+/// before that park, a drain whose batch holds a page of the aggregate on a
+/// held group (queued behind the build) and seam rows an earlier page staged
+/// for one reader, whose row the page takes: a 1-1 `JOIN` reader (`mj`),
+/// whose page may hold a row, or a 1-1 reader (`mirror`) whose page parks
+/// the change of a held key. Nothing deadlocks.
+#[tokio::test]
+async fn a_page_takes_a_readers_row_after_the_groups_the_builds_park_holds() {
+    for reader in ["mj", "mirror"] {
+        let ddl = format!(
+            "{SRC_DDL}; create table public.o (id integer primary key, w integer); \
+             insert into public.o values (1, 100), (2, 200), (3, 300)"
+        );
+        let mut d = Driver::start(
+            &ddl,
+            &[("id", int4()), ("g", int4()), ("v", int4()), ("w", int4())],
+            &[AGG],
+            &[SRC, "public.o"],
+        )
+        .await;
+        d.step_settle("insert into public.src values (1, 1, 10), (2, 1, 5), (3, 2, 7)")
+            .await;
+        if reader == "mj" {
+            install(
+                &d,
+                "TRANSFORM mj FROM public.agg LEFT JOIN public.o ON agg.g = o.id \
+                 SELECT agg.total AS total, o.w AS w",
+                &[("g", int4()), ("total", int8()), ("w", int4())],
+            )
+            .await;
+        } else {
+            install(
+                &d,
+                MIRROR,
+                &[("g", int4()), ("total", int8()), ("n", int8())],
+            )
+            .await;
+        }
+        trellis::intake::harness::settle_builds(d.pool()).await;
+        d.settle().await;
+        build::settle_builds(d.pool()).await;
+        d.settle().await;
+        pause(&d).await;
+        resume(&mut d).await;
+        if reader == "mirror" {
+            d.ctl
+                .execute(
+                    "insert into poison (transform_id, src_table, key, last_error) \
+                     select id, 'public.agg', '1', 'test' from transform_definitions \
+                     where target_table = 'public.mirror'",
+                    &[],
+                )
+                .await
+                .expect("hold group 1 for the mirror");
+        }
+        d.write("insert into public.src values (4, 1, 100)").await;
+        let batch = d.seal().await;
+        d.drain(batch, "page").await;
+        d.write("insert into public.src values (5, 1, 1), (6, 2, 2)")
+            .await;
+        let batch = d.seal().await;
+        let mut building = build_frozen(&d, &[PausePoint::BeforeRebuildCommit]).await;
+        let reached = building.reached(PausePoint::BeforeRebuildCommit).await;
+        let page = d.drain_frozen(batch, "held", &[]).await;
+        d.wait_blocked_behind(reached.backend_pid).await;
+        d.release(&mut building, PausePoint::BeforeRebuildCommit)
+            .await;
+        building.finish().await;
+        page.finish().await;
+        assert_eq!(d.deadlocks_logged(), Vec::<String>::new(), "{reader}");
+        if reader == "mirror" {
+            assert_eq!(
+                d.rows("select key from poison_held").await,
+                ["(1)"],
+                "the page parked group 1's change for the mirror"
+            );
+        }
+    }
+}

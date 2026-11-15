@@ -19,7 +19,7 @@
 //!   (`super::super::quarantine::evict_build_key`), not after the drain's
 //!   isolation has charged it to its death threshold. `poison`'s foreign key
 //!   takes the definition's row `FOR KEY SHARE`, which the page took before
-//!   its lock row ([`super::lock_definitions`]). The parked Re-derive carries
+//!   its lock row ([`super::definition_locks`]). The parked Re-derive carries
 //!   the earliest origin of the page's changes it holds back, so it holds
 //!   back every watermark token those changes do (`converge`'s condition 4):
 //!   the `b` changes for a fan-out's row; for an `a` change's row, the row's
