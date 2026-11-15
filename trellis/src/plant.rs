@@ -773,7 +773,7 @@ pub enum Plant {
     /// `a_row_a_middle_fan_out_holds_is_parked_with_the_changes_origin`.
     StarHeldOriginFirstOnly,
     /// #1780 (`star_def_lock_first_only`): a star page judges whether its
-    /// fan-out may hold a row (`staging::join_one_to_one::lock_definitions`)
+    /// fan-out may hold a row (`staging::join_one_to_one::definition_locks`)
     /// from its first position's records only, so a page fanning out at a
     /// later position takes the definition's row `FOR KEY SHARE` only when it
     /// holds a row, after its lock row, and closes a cycle with a rebuild's

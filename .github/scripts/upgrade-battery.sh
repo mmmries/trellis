@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The release upgrade battery (docs/releasing.md, "The upgrade battery"): the
-# released v0.1.0 CLI defines and builds databases of every definition shape,
-# the release candidate takes them over, and each check prints PASS, FAIL, INFO,
-# MANUAL or SKIP. Exit 0 when nothing FAILed, 1 otherwise, 2 for a usage or
+# The release upgrade battery (docs/releasing.md, "The upgrade battery"): a
+# released CLI (--old-tag) defines and builds databases of every definition
+# shape, the release candidate takes them over, and each check prints PASS,
+# FAIL, INFO, MANUAL or SKIP. Exit 0 when nothing FAILed, 1 otherwise, 2 for a usage or
 # setup error. A step it prints MANUAL for is not run; the runbook has its
 # commands.
 #
@@ -12,28 +12,32 @@
 #   migrations    1. the tag's files and history rows unchanged; refuses a tampered checksum (control)
 #   definitions   2. every shape resumes, converges, self_check is clean
 #   grammar       3. definitions the candidate refuses or keys differently pause with a remedy, and it works
+#                    (from a release before 0.2.0; from 0.2.0 on only the define-time-check cases run)
 #   inflight      4. mid-build, mid-rebuild, paused, held key, waiting for capture
-#   structure     5a. a structure.sql dumped by v0.1.0 loads and builds
-#   pgrestore     5b. a pg_dump/pg_restore of a v0.1.0 database (documented pauses, then RESUME)
-#   basebackup    5c. a pg_basebackup restore of a running v0.1.0 database
+#   structure     5a. a structure.sql dumped by the old release loads and builds
+#   pgrestore     5b. a pg_dump/pg_restore of an old-release database (documented pauses, then RESUME)
+#   basebackup    5c. a pg_basebackup restore of a running old-release database
 #   clients       6. Ruby gem and Elixir package (manual)
-#   mixed         7. the candidate stands by beside a live v0.1.0, then takes over;
+#   mixed         7. the candidate stands by beside a live old release, then takes over;
 #                    an embedded candidate worker with no migrate step migrates itself
 #   downgrade     8. rollback: the old release on a database the candidate wrote (ADR-0024)
 #
 # Options:
 #   --candidate REV|DIR   the release candidate: a directory or a git revision.
 #                         Default: the checkout this script is in.
-#   --candidate-version V the version string the candidate is built as (default
-#                         0.2.0, the release version: a candidate must report
-#                         exactly it, since version handover compares the exact
-#                         string). It is set in a scratch checkout, never in the
-#                         tree under test, and nothing is committed. `none`
-#                         builds the tree with the version it carries.
+#   --candidate-version V the version string the candidate is built as (default:
+#                         the release the candidate develops, DEVELOPING in
+#                         trellis/src/defs/floor.rs. A candidate must report
+#                         the release version exactly, since version handover
+#                         compares the exact string). It is set in a scratch
+#                         checkout, never in the tree under test, and nothing
+#                         is committed. `none` builds the tree with the version
+#                         it carries.
 #   --candidate-bin PATH  use this CLI binary; the candidate's source is still
 #                         needed (--candidate) for the library probe, which is
 #                         built reporting the binary's version
-#   --old-tag TAG         the released version to start from (default v0.1.0)
+#   --old-tag TAG         the released version to start from (default v0.1.0; v0.2.x
+#                         starting points skip the cases that are 0.1-only)
 #   --old-bin PATH        use this CLI binary instead of the tag's release asset
 #   --old-src DIR         the old build's source tree, for the library probe and
 #                         --build-old, instead of a checkout of the tag (with
@@ -69,7 +73,7 @@ old_src_dir=""
 build_old=0
 candidate="$repo"
 candidate_bin=""
-cand_ver_req=0.2.0
+cand_ver_req="" # empty: the release the candidate develops
 pg_bin="${PGBIN:-}"
 port=54920
 work="$repo/target/upgrade-battery"
@@ -97,8 +101,8 @@ while [ $# -gt 0 ]; do
     *) steps+=("$1"); shift ;;
   esac
 done
-[ "$cand_ver_req" = none ] || [[ "$cand_ver_req" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
-  die "--candidate-version $cand_ver_req is not a version (want e.g. 0.2.0, or none)"
+[ -z "$cand_ver_req" ] || [ "$cand_ver_req" = none ] || [[ "$cand_ver_req" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
+  die "--candidate-version $cand_ver_req is not a version (want e.g. 0.3.0, or none)"
 all_steps="migrations definitions grammar inflight structure pgrestore basebackup clients mixed downgrade"
 [ ${#steps[@]} -gt 0 ] || read -r -a steps <<< "$all_steps"
 for s in "${steps[@]}"; do
@@ -233,7 +237,8 @@ insert into events select (random()*1000000)::bigint, (random()*20)::bigint, 1 f
 update events set v = v + 1 where tenant = (random()*20)::bigint;
 delete from events where (id, tenant) in (select id, tenant from events limit 5);
 EOF
-writer_iters=0
+writer_iters=0       # iterations of the writers stopped last
+writer_iters_total=0 # iterations of every writers run (the downgrade step starts its own)
 start_writers() { # port db
   : >"$work/writers.on"; : >"$work/writer-iters.log"
   (
@@ -249,6 +254,7 @@ stop_writers() {
   rm -f "$work/writers.on"
   sleep 1
   writer_iters=$(wc -l <"$work/writer-iters.log" 2>/dev/null || echo 0)
+  writer_iters_total=$((writer_iters_total + writer_iters))
 }
 
 held_key() { [ "$(scalar "$1" "$2" "select count(*) from trellis.poison")" -ge 1 ]; } # port db
@@ -325,9 +331,22 @@ if [ "$build_old" -eq 1 ] && [ -z "$old_bin" ]; then
 fi
 old_version=$("$old_bin" --version)
 echo "old: $old_bin ($old_version)"
+# 0.2.0 and later accept the grammar, keys and literals the candidate does: the
+# cases that exist because a release before 0.2.0 read them differently are not
+# upgrade cases from it (old_pre020=0 skips them).
+old_pre020=1
+case "${old_version#trellis }" in 0.0.*|0.1.*) ;; *) old_pre020=0 ;; esac
 
 # ---------------------------------------------------------------- the candidate
 say "building the candidate"
+# developing_release: the release the candidate's tree develops (`DEVELOPING`
+# in trellis/src/defs/floor.rs), which a candidate reports as its version.
+developing_release() {
+  local rs=trellis/src/defs/floor.rs text
+  if [ -d "$candidate" ]; then text=$(cat "$candidate/$rs") || return 1
+  else text=$(git -C "$repo" show "$candidate:$rs") || return 1; fi
+  sed -n 's/^pub const DEVELOPING: Release = Release::new(\([0-9]*\), \([0-9]*\), \([0-9]*\));$/\1.\2.\3/p' <<<"$text" | grep .
+}
 # The version handover compares the exact version string, so a candidate is
 # built reporting the release version, set in a scratch checkout: the tree under
 # test is never touched and nothing is committed.
@@ -338,6 +357,8 @@ if [ -n "$candidate_bin" ]; then
   # The probe opens the database beside the binary, so it reports its version.
   override_version=$("$candidate_bin" --version) || die "$candidate_bin --version failed"
   override_version=${override_version#trellis }
+elif [ -z "$cand_ver_req" ]; then
+  override_version=$(developing_release) || die "cannot read DEVELOPING of the candidate: pass --candidate-version"
 elif [ "$cand_ver_req" != none ]; then override_version=$cand_ver_req; fi
 cand_dirty=""
 if [ -d "$candidate" ] && [ -z "$override_version" ]; then
@@ -440,8 +461,13 @@ for d in shapes inflight ctl mixed mixedemb clients keys consts; do sql "$port" 
 # ---------------------------------------------------------------- prep: shapes
 say "building the $old_tag databases"
 shapes_expected_live="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ledger_ovf nan_totals nan_join"
-shapes_grammar_paused="ledger_copy deep deep2"
-shapes_paused="$shapes_grammar_paused ord_paused"
+if [ "$old_pre020" -eq 1 ]; then
+  shapes_grammar_paused="ledger_copy deep deep2"
+else
+  shapes_grammar_paused=""
+fi
+shapes_paused="${shapes_grammar_paused:+$shapes_grammar_paused }ord_paused"
+sorted_words() { local w; for w in "$@"; do echo "$w"; done | sort | tr '\n' ' '; } # the words, sorted, each followed by a space
 # Step 8: definitions only the candidate can run. Each uses a feature,
 # overload, argument value or type-rule admission whose release in the
 # candidate's .github/feature-floors.txt is after the old release's (a
@@ -504,9 +530,11 @@ apply_old shapes 'TRANSFORM tenant_join FROM events JOIN customers ON events.ten
 apply_old shapes 'TRANSFORM orders_wide FROM orders SELECT amount AS amount, amount + 2 AS plus2, amount + 3 AS plus3'
 apply_old shapes 'TRANSFORM ord_paused FROM orders SELECT note AS note'
 apply_old shapes 'TRANSFORM ledger_ovf FROM ledger SELECT n + 9223372036854775000 AS big'
-apply_old shapes 'TRANSFORM ledger_copy FROM ledger SELECT order AS o'
-apply_old shapes "TRANSFORM deep FROM ledger SELECT $deep_chain AS d"
-apply_old shapes "TRANSFORM deep2 FROM ledger SELECT $deep_nested AS d"
+if [ "$old_pre020" -eq 1 ]; then
+  apply_old shapes 'TRANSFORM ledger_copy FROM ledger SELECT order AS o'
+  apply_old shapes "TRANSFORM deep FROM ledger SELECT $deep_chain AS d"
+  apply_old shapes "TRANSFORM deep2 FROM ledger SELECT $deep_nested AS d"
+fi
 
 run_bg old-shapes "$port" shapes "$old_bin"
 WAIT=240 wait_all "$port" shapes "$old_bin" live orders_copy orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ledger_ovf ord_paused nan_totals nan_join ||
@@ -593,7 +621,7 @@ pre_ctl_history=$(history "$port" ctl)
 # and a primary key dropped after define with a unique index left that backs a
 # key now (k_uniq) or none (k_none, over a nullable column).
 keys_defs="k_inc_copy k_def_tot k_uniq_tot k_uniq_copy k_none_copy"
-if want grammar; then
+if want grammar && [ "$old_pre020" -eq 1 ]; then
   sql "$port" keys <<'EOF'
 create table k_inc(id bigint, x bigint, v bigint not null, primary key (id) include (x));
 create table k_def(id bigint primary key deferrable, v bigint not null);
@@ -634,7 +662,7 @@ consts_diff() { # the rows where a target differs from Postgres's reading of the
     + (select count(*) from ((select id, \"false\" from c except select id, x from cf_copy) union all (select id, x from cf_copy except select id, \"false\" from c)) d)"
 }
 consts_converged() { [ "$(consts_diff 2>/dev/null)" = 0 ]; }
-if want grammar; then
+if want grammar && [ "$old_pre020" -eq 1 ]; then
   sql "$port" consts <<'EOF2'
 create table c(id bigint primary key, a bigint, "null" bigint, "false" boolean);
 insert into c select g, g, case when g % 4 = 0 then null else 10 * g end, g % 2 = 0 from generate_series(1,200) g;
@@ -765,8 +793,8 @@ else
   run_bg new-inflight "$port" inflight "$candidate_bin"
   inflight_candidate="the candidate's trellis run (the probe does not build against the candidate)"
 fi
-! want grammar || run_bg new-keys "$port" keys "$candidate_bin"
-! want grammar || run_bg new-consts "$port" consts "$candidate_bin"
+! want grammar || [ "$old_pre020" -eq 0 ] || run_bg new-keys "$port" keys "$candidate_bin"
+! want grammar || [ "$old_pre020" -eq 0 ] || run_bg new-consts "$port" consts "$candidate_bin"
 sleep 8
 stop_writers
 live_shapes=$shapes_expected_live
@@ -1005,8 +1033,9 @@ checks_grammar() {
   [ -z "$checks_old_refused" ] || record INFO grammar "$old_tag refuses itself, so not upgrade cases:$checks_old_refused"
   for c in $checks_chains; do chains="$chains ${c%%:*}"; done
   run_bg new-checks "$p" "$d" "$candidate_bin"
+  # No chain: the old release refused them all (wait_all needs a name).
   # shellcheck disable=SC2086
-  if ! WAIT=120 wait_all "$p" "$d" "$candidate_bin" live $chains; then
+  if [ -n "${chains// /}" ] && ! WAIT=120 wait_all "$p" "$d" "$candidate_bin" live $chains; then
     record FAIL grammar "calculated-field chains $old_tag accepted are not live after the takeover:$(missing_status "$p" "$d" "$candidate_bin" live $chains)"
     stop_run new-checks
     return
@@ -1053,33 +1082,37 @@ checks_grammar() {
 
 if want grammar; then
   say "3. definitions the candidate refuses that $old_tag accepted"
-  for n in ledger_copy deep deep2; do
-    st=$(stored_status "$port" shapes "$n")
-    reason=$(failure_reason "$port" shapes "$n")
-    if [ "$st" = paused ] && grep -qi 'drop the transform and define it again' <<<"$reason"; then
-      record PASS grammar "$n pauses with a remedy: $(echo "$reason" | sed 's/.*refused by this release: //' | cut -c1-110)..."
+  if [ "$old_pre020" -eq 1 ]; then
+    for n in ledger_copy deep deep2; do
+      st=$(stored_status "$port" shapes "$n")
+      reason=$(failure_reason "$port" shapes "$n")
+      if [ "$st" = paused ] && grep -qi 'drop the transform and define it again' <<<"$reason"; then
+        record PASS grammar "$n pauses with a remedy: $(echo "$reason" | sed 's/.*refused by this release: //' | cut -c1-110)..."
+      else
+        record FAIL grammar "$n is '$st' (reason: ${reason:-none})"
+      fi
+    done
+    # The remedy: drop, define again in the current grammar.
+    if rem=$(trellis "$port" shapes "$candidate_bin" apply 'DROP TRANSFORM ledger_copy' 2>&1 &&
+      trellis "$port" shapes "$candidate_bin" apply 'TRANSFORM ledger_copy FROM ledger SELECT ledger.order AS o' 2>&1 &&
+      trellis "$port" shapes "$candidate_bin" apply 'DROP TRANSFORM deep' 2>&1 &&
+      trellis "$port" shapes "$candidate_bin" apply 'TRANSFORM deep FROM ledger SELECT n + 1 + 1 AS d' 2>&1 &&
+      trellis "$port" shapes "$candidate_bin" apply 'DROP TRANSFORM deep2' 2>&1 &&
+      trellis "$port" shapes "$candidate_bin" apply 'TRANSFORM deep2 FROM ledger SELECT (n + 1) + 1 AS d' 2>&1); then
+      if WAIT=120 wait_all "$port" shapes "$candidate_bin" live ledger_copy deep deep2; then
+        record PASS grammar "the remedy (drop, define again with ledger.order / a shorter expression) goes live"
+        check_self "$port" shapes grammar ledger_copy deep deep2
+      else
+        record FAIL grammar "the redefined transforms did not go live: $(status_lines "$port" shapes "$candidate_bin" | grep -E 'ledger_copy|deep' | tr '\n' ' ')"
+      fi
     else
-      record FAIL grammar "$n is '$st' (reason: ${reason:-none})"
+      record FAIL grammar "the remedy did not apply: $rem"
     fi
-  done
-  # The remedy: drop, define again in the current grammar.
-  if rem=$(trellis "$port" shapes "$candidate_bin" apply 'DROP TRANSFORM ledger_copy' 2>&1 &&
-    trellis "$port" shapes "$candidate_bin" apply 'TRANSFORM ledger_copy FROM ledger SELECT ledger.order AS o' 2>&1 &&
-    trellis "$port" shapes "$candidate_bin" apply 'DROP TRANSFORM deep' 2>&1 &&
-    trellis "$port" shapes "$candidate_bin" apply 'TRANSFORM deep FROM ledger SELECT n + 1 + 1 AS d' 2>&1 &&
-    trellis "$port" shapes "$candidate_bin" apply 'DROP TRANSFORM deep2' 2>&1 &&
-    trellis "$port" shapes "$candidate_bin" apply 'TRANSFORM deep2 FROM ledger SELECT (n + 1) + 1 AS d' 2>&1); then
-    if WAIT=120 wait_all "$port" shapes "$candidate_bin" live ledger_copy deep deep2; then
-      record PASS grammar "the remedy (drop, define again with ledger.order / a shorter expression) goes live"
-      check_self "$port" shapes grammar ledger_copy deep deep2
-    else
-      record FAIL grammar "the redefined transforms did not go live: $(status_lines "$port" shapes "$candidate_bin" | grep -E 'ledger_copy|deep' | tr '\n' ' ')"
-    fi
+    keys_grammar
+    consts_grammar
   else
-    record FAIL grammar "the remedy did not apply: $rem"
+    record INFO grammar "$old_tag refuses the bare reserved word, nesting over 100 and a deferrable key itself and reads bare null/false as literals (grammar 2), so the reserved-word, nesting, keys and consts cases are not upgrade cases from it; skipped"
   fi
-  keys_grammar
-  consts_grammar
   checks_grammar
   record MANUAL grammar "not exercised: an index over more than 32 key columns, a table over 1600 columns ($old_tag cannot build either here), and any refusal added after this script; see the runbook"
 else
@@ -1134,9 +1167,10 @@ EOF
     bad=$(missing_status "$port" loaded "$candidate_bin" live $load_live)
     [ -z "$bad" ] && record PASS structure "every loaded definition built and is live (including both JOIN aggregates and the one the dump held paused)" ||
       record FAIL structure "not live after the load:$bad"
-    p3=$(status_lines "$port" loaded "$candidate_bin" | grep -E '=paused$' | sed 's/=.*//' | sort | tr '\n' ' ')
-    [ "$p3" = "deep deep2 ledger_copy " ] &&
-      record PASS structure "paused: only the three definitions the candidate refuses ($p3)" ||
+    p3=$(status_lines "$port" loaded "$candidate_bin" | { grep -E '=paused$' || true; } | sed 's/=.*//' | sort | tr '\n' ' ')
+    # shellcheck disable=SC2086
+    [ "$p3" = "$(sorted_words $shapes_grammar_paused)" ] &&
+      record PASS structure "paused: only the definitions the candidate refuses (${p3:-none})" ||
       record FAIL structure "paused after the load: [$p3]"
     check_self "$port" loaded structure orders_copy chain1 cust_totals cust_join cust_join_left tenant_totals tenant_join
     stop_run new-loaded
@@ -1192,8 +1226,9 @@ if want basebackup; then
     bad=$(missing_status "$port_b" shapes "$candidate_bin" live $shapes_expected_live)
     [ -z "$bad" ] && record PASS basebackup "the restored cluster opens under the candidate and every expected definition is live (no pause, no RESUME)" ||
       record FAIL basebackup "not live on the restored cluster:$bad"
-    p5=$(status_lines "$port_b" shapes "$candidate_bin" | grep -E '=paused$' | sed 's/=.*//' | sort | tr '\n' ' ')
-    [ "$p5" = "deep deep2 ledger_copy ord_paused " ] &&
+    p5=$(status_lines "$port_b" shapes "$candidate_bin" | { grep -E '=paused$' || true; } | sed 's/=.*//' | sort | tr '\n' ' ')
+    # shellcheck disable=SC2086
+    [ "$p5" = "$(sorted_words $shapes_paused)" ] &&
       record PASS basebackup "paused: only the expected set ($p5)" || record FAIL basebackup "paused on the restored cluster: [$p5]"
     check_self "$port_b" shapes basebackup orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join nan_totals nan_join
     stop_run new-backup
@@ -1238,7 +1273,7 @@ if want mixed; then
   case "$old_tag" in
     v0.1.*)
       if [ "$cand_ver" = "${old_version#trellis }" ]; then
-        record FAIL mixed "the candidate reports version $cand_ver, the same string as $old_tag, so this is no handover between two versions: build it as the release version (--candidate-version, default 0.2.0)"
+        record FAIL mixed "the candidate reports version $cand_ver, the same string as $old_tag, so this is no handover between two versions: build it as the release version (--candidate-version)"
       elif grep -qF "this binary is version $cand_ver;" "$logs/run-new-mixed.log" &&
          grep -qF 'at a release before 0.2.0' "$logs/run-new-mixed.log"; then
         record PASS mixed "the standby message names this binary's version $cand_ver and $old_tag as a release before 0.2.0 (it registers no version)"
@@ -1273,9 +1308,11 @@ if want mixed; then
 
   # The same deploy with no `migrate` step anywhere (ADR-0023 rule 3): the
   # candidate is an embedded application's worker, not `trellis run`, so
-  # nothing else migrates. It stands by beside the old instance, says the
-  # migrations are pending in `status()`, and once the old instance stops it
-  # runs them itself and takes over.
+  # nothing else migrates. It stands by beside the old instance, and once the
+  # old instance stops it runs the migrations itself and takes over. Beside a
+  # release before 0.2.0 its `status()` refuses naming the pending migrations;
+  # from 0.2.0 on the catalog still reads, so `status()` answers and the
+  # standby shows in its log (the probe prints the engine's log events).
   if [ -z "$probe_new" ]; then
     record FAIL mixed "the probe does not build against the candidate, so the embedded handover did not run (see $logs/build-probe-candidate.log)"
   else
@@ -1286,11 +1323,15 @@ if want mixed; then
     pre_emb_history=$(history "$port" mixedemb)
     worker_bg new-mixedemb "$port" mixedemb "$probe_new" m_agg
     sleep 15
-    pending_msg="this binary's migrations haven't run on this instance"
+    if [ "$old_pre020" -eq 1 ]; then
+      standby_re="this binary's migrations haven't run on this instance" standby_says="status() says the migrations are pending"
+    else
+      standby_re='standing by: .*migrations are pending and Trellis processes are live' standby_says="its log says it stands by"
+    fi
     paused_n=$(scalar "$port" mixedemb "select count(*) from trellis.capture_failures")
     if run_alive new-mixedemb && [ "$(history "$port" mixedemb)" = "$pre_emb_history" ] &&
-       [ "$paused_n" -eq 0 ] && grep -qF "$pending_msg" "$logs/run-new-mixedemb.log"; then
-      record PASS mixed "an embedded candidate worker stands by beside a live $old_tag instance: no migration ran, nothing paused, and status() says the migrations are pending ($(grep -F "$pending_msg" "$logs/run-new-mixedemb.log" | head -1 | cut -c1-200))"
+       [ "$paused_n" -eq 0 ] && grep -qE "$standby_re" "$logs/run-new-mixedemb.log"; then
+      record PASS mixed "an embedded candidate worker stands by beside a live $old_tag instance: no migration ran, nothing paused, and $standby_says ($(grep -E "$standby_re" "$logs/run-new-mixedemb.log" | head -1 | cut -c1-200))"
     else
       record FAIL mixed "the embedded candidate worker did not stand by beside a live $old_tag instance ($paused_n paused, process $(run_alive new-mixedemb && echo running || echo exited), history $( [ "$(history "$port" mixedemb)" = "$pre_emb_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixedemb.log" | cut -c1-300))"
     fi
@@ -1572,8 +1613,8 @@ say "summary"
 echo "old:        $old_version ($old_bin)"
 echo "candidate:  $cand_version at $cand_rev$cand_dirty ($cand_built)"
 echo "postgres:   $("$pg_bin/postgres" --version 2>/dev/null || echo "server_version_num $pg_major")"
-est_rows=$((seed_rows + writer_iters * 80))
-echo "rows written (estimate, for the logbook): $est_rows ($seed_rows seeded, $writer_iters writer iterations of about 80)"
+est_rows=$((seed_rows + writer_iters_total * 80))
+echo "rows written (estimate, for the logbook): $est_rows ($seed_rows seeded, $writer_iters_total writer iterations of about 80)"
 npass=0; nfail=0; ninfo=0; nman=0; nskip=0
 for r in "${results[@]}"; do
   case "${r%%|*}" in PASS) npass=$((npass+1));; FAIL) nfail=$((nfail+1));; INFO) ninfo=$((ninfo+1));; MANUAL) nman=$((nman+1));; SKIP) nskip=$((nskip+1));; esac

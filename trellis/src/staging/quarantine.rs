@@ -515,7 +515,10 @@ pub(crate) const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, k
 /// in id order, then each held row in `(transform_id, src_table, key)`
 /// order, so two pages parking overlapping keys queue on their first shared
 /// row rather than deadlock. Two pages parking the same key contend for its
-/// one row, and the second merges into what the first committed.
+/// one row, and the second merges into what the first committed. A page
+/// takes the definitions' rows before this, with every other definition row
+/// it needs, in one id order (`super::apply::apply_page`), so there the
+/// statement waits for nothing.
 ///
 /// **Parks only while the definition still holds the key.** `changes` were
 /// chosen from `poison` when the page was computed, outside this transaction.

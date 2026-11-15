@@ -107,7 +107,18 @@ impl fmt::Display for Error {
                 write!(f, "postgres connection error: ")?;
                 write_pg_error(f, err)
             }
-            Error::Migrate(err) => write!(f, "failed to apply migrations: {err}"),
+            Error::Migrate(err) => {
+                write!(f, "failed to apply migrations: {err}")?;
+                if permission_denied(self) {
+                    write!(
+                        f,
+                        ": this role cannot create or alter Trellis's tables; a role that can \
+                         must run the migrations first (`trellis apply`, or `trellis run` as \
+                         that role)"
+                    )?;
+                }
+                Ok(())
+            }
             Error::IncompatibleInstance(msg) => write!(f, "refusing to attach: {msg}"),
             Error::OtherVersionLive(seen) => write!(f, "refusing to migrate: {seen}"),
             Error::BelowCatalogFloor {
@@ -129,6 +140,21 @@ impl fmt::Display for Error {
             Error::SchemaDump(msg) => write!(f, "can't write the schema dump: {msg}"),
         }
     }
+}
+
+/// Whether `err`'s chain carries Postgres's permission refusal (SQLSTATE
+/// 42501): the role can't do what `migrate` does.
+pub(crate) fn permission_denied(err: &Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(db) = current.downcast_ref::<tokio_postgres::Error>()
+            && db.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 impl std::error::Error for Error {

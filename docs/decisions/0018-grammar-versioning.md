@@ -79,10 +79,11 @@ A bump that retires a meaning gives it a spelling in the new grammar, so every
 older text can be translated. A bump ships only in a release semver allows to
 break compatibility (a 0.x minor before 1.0, a major after).
 
-[OPEN: whether a fix that makes evaluation match what the documentation already
-says is a change in meaning. Recommendation: no; it ships with the definitions
-to rebuild, since a compatibility rule would keep the wrong values and a rewrite
-couldn't spell them.]
+A fix that makes evaluation match what the documentation already says is a
+bug fix, not a change in meaning: it ships in any release, with no bump and no
+translation, and its release notes list the definitions to rebuild. By default
+the same holds for a fix that makes evaluation match Postgres's where the
+documentation is silent ([ADR-0022](0022-grammar-mirrors-postgres.md)).
 
 ### Loading translates older text into the current grammar, in one place
 

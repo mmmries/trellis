@@ -2327,15 +2327,16 @@ pub struct ApplyPlan {
     /// The 1-1 `JOIN` targets (`super::join_one_to_one`), keyed by the
     /// definition's bare target name, in target order.
     join1_targets: BTreeMap<String, super::join_one_to_one::JoinOneToOnePlan>,
-    /// Targets to clear in full at Phase 3, keyed by target table name —
-    /// the truncate propagation. See [`ClearPlan`].
-    clears: HashMap<String, ClearPlan>,
+    /// Targets to clear in full at Phase 3, keyed by target table name, in
+    /// target order — the truncate propagation. See [`ClearPlan`].
+    clears: BTreeMap<String, ClearPlan>,
     /// The aggregate-target counterpart to [`ApplyPlan::clears`]: a
-    /// truncate on an aggregate definition's source clears every group.
-    /// Applied by the same `clear_target` as a 1-1 clear, keyed by the
-    /// target's `GROUP BY` columns, so each cleared group reaches the seam
-    /// and a transform chained off the aggregate target sees it.
-    aggregate_clears: HashMap<String, AggregateClearPlan>,
+    /// truncate on an aggregate definition's source clears every group, in
+    /// target order. Applied by the same `clear_target` as a 1-1 clear,
+    /// keyed by the target's `GROUP BY` columns, so each cleared group
+    /// reaches the seam and a transform chained off the aggregate target
+    /// sees it.
+    aggregate_clears: BTreeMap<String, AggregateClearPlan>,
     /// The (non-truncate) folded records whose `(src_table,
     /// key)` is poisoned for a definition that reads it, each paired with
     /// that definition's id — left out of that definition's plan only
@@ -3050,8 +3051,8 @@ pub(super) async fn compute_page(
     // targets via the catalog and record a full clear for each — the same
     // "resolve targets from the catalog" step the by-source loop above runs
     // per key, just once per truncated source instead of once per key.
-    let mut clears: HashMap<String, ClearPlan> = HashMap::new();
-    let mut aggregate_clears: HashMap<String, AggregateClearPlan> = HashMap::new();
+    let mut clears: BTreeMap<String, ClearPlan> = BTreeMap::new();
+    let mut aggregate_clears: BTreeMap<String, AggregateClearPlan> = BTreeMap::new();
     for change in &truncated {
         let source_key = canonical_of(&change.src_table);
         // Fence this source too, even though nothing evaluated against it —
@@ -4182,6 +4183,32 @@ async fn hold_version_fences(
     Ok(())
 }
 
+/// Takes the definition rows `definitions` names, each `FOR UPDATE` when
+/// its flag is set, else `FOR KEY SHARE`, in id order: one statement per run
+/// of ids that share a mode, so the rows are taken in one order whatever
+/// their modes.
+async fn lock_definition_rows(
+    txn: &Transaction<'_>,
+    definitions: &BTreeMap<i64, bool>,
+) -> Result<(), ApplyError> {
+    let mut entries = definitions.iter().peekable();
+    while let Some((&first, &update)) = entries.next() {
+        let mut ids = vec![first];
+        while let Some((&id, _)) = entries.next_if(|(_, next)| **next == update) {
+            ids.push(id);
+        }
+        let mode = if update { "update" } else { "key share" };
+        txn.execute(
+            &format!(
+                "select 1 from transform_definitions where id = any($1) order by id for {mode}"
+            ),
+            &[&ids],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// [`apply_and_mark_drained_many`] with an explicit claim ending per segment:
 /// a non-final page's transaction applies, checks the claim
 /// and advances the cursor; a final page's applies and completes. Everything
@@ -4205,20 +4232,6 @@ pub(crate) async fn apply_page(
 ) -> Result<ManyApplyOutcome, ApplyError> {
     // 1. Version fence.
     hold_version_fences(txn, &plan.versions).await?;
-
-    // 1b. Park this batch's own folded contribution for every
-    // already-poisoned key it's excluding, before the drained mark below —
-    // "parked work is the source of truth" means every excluding batch must
-    // do this itself, in the same transaction, not just the batch that
-    // caused the eviction. See `quarantine::park_batch_contribution`'s doc
-    // comment for why this runs unconditionally rather than only on the
-    // batch that tripped the threshold. Attributed to the lowest (earliest)
-    // of the coalesced segments — `poison_held`'s `seg_seq` is audit
-    // bookkeeping ("which batch's contribution is this"), not something
-    // later correctness depends on picking exactly right among several
-    // equally-valid coalesced segments.
-    quarantine::park_batch_contribution(txn, &plan.floors, steps[0].seg_seq, &plan.poisoned_park)
-        .await?;
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
@@ -4321,12 +4334,38 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // 3d. 1-1 `JOIN` targets, in target order, after the definition rows of
-    // those whose `b` the page truncates or fans out over, in id order: a
-    // rebuild's start takes them before any lock row (`join_one_to_one`'s
-    // module doc).
-    let join1_rebuilds =
-        super::join_one_to_one::lock_definitions(txn, plan.join1_targets.values()).await?;
+    // 3d. Every definition row the page needs, in one id order, after its
+    // other targets and before its 1-1 `JOIN` targets' lock rows: those it
+    // parks a held key's change for (`FOR KEY SHARE`) and its 1-1 `JOIN`
+    // targets' (`join_one_to_one`'s `definition_locks`). A rebuild's start
+    // takes its readers' rows `FOR UPDATE` in id order, so a page that held
+    // one while it queued on a lower one would close a cycle with it; and a
+    // group-basis build's last transaction takes its readers' rows `FOR
+    // UPDATE` after its groups (`build`'s `run_group_structure`), so a page
+    // that held one while it queued on a group would close one too.
+    let (mut definitions, join1_rebuilds) =
+        super::join_one_to_one::definition_locks(plan.join1_targets.values());
+    for (id, _) in &plan.poisoned_park {
+        definitions.entry(*id).or_default();
+    }
+    lock_definition_rows(txn, &definitions).await?;
+
+    // 3e. Park this batch's own folded contribution for every
+    // already-poisoned key it's excluding, before the drained mark below —
+    // "parked work is the source of truth" means every excluding batch must
+    // do this itself, in the same transaction, not just the batch that
+    // caused the eviction. See `quarantine::park_batch_contribution`'s doc
+    // comment for why this runs unconditionally rather than only on the
+    // batch that tripped the threshold. Attributed to the lowest (earliest)
+    // of the coalesced segments — `poison_held`'s `seg_seq` is audit
+    // bookkeeping ("which batch's contribution is this"), not something
+    // later correctness depends on picking exactly right among several
+    // equally-valid coalesced segments.
+    quarantine::park_batch_contribution(txn, &plan.floors, steps[0].seg_seq, &plan.poisoned_park)
+        .await?;
+
+    // 3f. 1-1 `JOIN` targets, in target order, under the definition rows
+    // step 3d took.
     for join1_plan in plan.join1_targets.values() {
         let (written, deleted) = super::join_one_to_one::apply_page(
             txn,

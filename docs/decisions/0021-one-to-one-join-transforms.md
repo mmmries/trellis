@@ -263,11 +263,11 @@ of the two-table rules without it were exact (#1371). The two-table JOIN
 takes it anyway, so one code path serves every `n`, at about 8% of its
 fan-out's time.
 
-**Lock order.** A page carrying changes and Re-derives of several tables
-takes the lock classes in one global order, over the union of its key sets.
-[ADR-0028](0028-locking-and-writing.md#i5-every-writer-takes-its-locks-in-one-order-each-class-in-one-sorted-statement)
-defines that order, for `J`, the `R` entries, the `M` entries and the target
-rows.
+**Lock order.** A page takes its lock classes in one global order over the
+union of its key sets, defined by
+[ADR-0028 I5](0028-locking-and-writing.md#i5-every-writer-takes-its-locks-in-one-order-each-class-in-one-sorted-statement)
+and listed in
+[stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#lock-ordering-because-parallel-workers-will-overlap).
 
 A truncate page holds the lock row `FOR UPDATE`, empties its table's hidden
 table and raises its floor. It empties the table with a `DELETE`: a build

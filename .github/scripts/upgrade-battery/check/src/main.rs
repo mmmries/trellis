@@ -9,7 +9,8 @@
 //! runs on whichever worker is attached to the database. `worker` is an
 //! embedded application's worker: a handle with the staging worker and drain
 //! threads that never calls `migrate`, which prints `<target>`'s `status()`
-//! (or its refusal) each time it changes, once a second, until Ctrl-C.
+//! (or its refusal) each time it changes, once a second, until Ctrl-C, and the
+//! engine's log events at INFO and above on stderr.
 
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,11 @@ async fn run(args: Vec<String>) -> Result<std::process::ExitCode, String> {
 /// An embedded worker: connects with the staging worker and drain threads,
 /// never migrating, and prints `target`'s status each time it changes.
 async fn worker(config: Config, target: &str) -> Result<std::process::ExitCode, String> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .try_init()
+        .map_err(|e| e.to_string())?;
     let trellis = Trellis::connect(
         config,
         TrellisOptions {
