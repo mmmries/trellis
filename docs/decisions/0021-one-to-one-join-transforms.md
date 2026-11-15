@@ -478,10 +478,11 @@ rows it took 834 s, and a concurrent page waited 807 s behind it. In 10k-row
 chunks on 4 workers the build took 446 s, and no page waited longer than
 0.74 s (#1375 Y3).
 
-A rebuild in place, and any build whose target has rows, ends with a sweep
-after the last chunk. It re-derives every entry of `R` whose basis is null or
-older than the build's start, so an entry whose row is gone becomes a
-tombstone and its target row goes. Then its orphan pass walks
+Every 1-1 `JOIN` build ends with a sweep after the last chunk. It re-derives
+every entry of `R` whose basis is null or older than the end of the `M` pass
+(an id taken after its last batch commits, before the first chunk is
+enqueued), so an entry whose row is gone becomes a tombstone and its target
+row goes. Then its orphan pass walks
 the target in its key order and re-derives, as an `a` Re-derive page, every
 target row no live `R` entry backs. It never deletes one by statement: a row
 re-inserted and applied between the read and the delete would be lost.
