@@ -286,7 +286,7 @@ async fn building(d: &Driver) -> Option<OneToOneBuildStep> {
 }
 
 /// A fresh build: the plan job's `M` pass, then its chunks one by one, then
-/// nothing once it is `live`.
+/// its sweep, then nothing once it is `live`.
 #[tokio::test]
 async fn status_names_each_step_of_a_fresh_build() {
     let d = start(false).await;
@@ -310,6 +310,17 @@ async fn status_names_each_step_of_a_fresh_build() {
         );
     }
     assert_eq!(build_step(&d, 3).await, Step::Chunk);
+    assert_eq!(
+        building(&d).await,
+        Some(OneToOneBuildStep::SweepStale),
+        "every 1-1 JOIN build ends with a sweep"
+    );
+    for _ in 0..20 {
+        if building(&d).await.is_none() {
+            break;
+        }
+        build_step(&d, 3).await;
+    }
     assert_eq!(building(&d).await, None, "the build is done");
 }
 
@@ -349,8 +360,8 @@ async fn status_names_the_stage_of_a_plan_job_by_its_cursor() {
     }
 }
 
-/// A rebuild in place of a live join, with a target that has rows, ends with
-/// a sweep: its stale `R` entries, then its orphans. A definition that is
+/// A rebuild in place of a live join ends with a sweep: its stale `R`
+/// entries, then its orphans. A definition that is
 /// paused reports no step.
 #[tokio::test]
 async fn status_names_the_steps_of_a_rebuild_and_its_sweep() {

@@ -24,6 +24,9 @@
 //!   (#1503). The build start under the lock row (#1400), for one definition
 //!   and for two whose lock rows a page takes in another order than their
 //!   ids.
+//! - `s…`: the sweep's bound (#2027): an `R` entry written after the build's
+//!   start and before its `M` pass, whose `a` row is gone at its chunk, by a
+//!   page and by an earlier build's chunk, and in a fresh build.
 
 use crate::support::drain_driver;
 
@@ -331,14 +334,15 @@ async fn trellis(d: &Driver) -> Trellis {
 
 /// A fresh build of a 20-row `a` in chunks of 3: the plan job re-derives every
 /// `b` row, then enqueues 7 chunks, and the target, `R` and `M` come out as
-/// the live join. A fresh build over an empty target gets no sweep.
+/// the live join. A fresh build over an empty target gets a sweep too (the
+/// `s…` tests).
 #[tokio::test]
 async fn a_build_of_several_chunks_fills_the_target_r_and_m() {
     let mut d = start(&KINDS, false).await;
     assert_eq!(
         pending(&d, &["sweep"]).await,
-        0,
-        "an empty target needs none"
+        2,
+        "every 1-1 JOIN build gets a sweep"
     );
     assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
     // The first plan job walked `a` in ranges of 3 rows, after its `M` pass.
@@ -1059,6 +1063,200 @@ async fn the_m_pass_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild() {
         );
         assert_target(&d, kind, "the chunks").await;
         assert_oracle(&mut d, &[kind], "the rebuild").await;
+    }
+}
+
+/// Asserts `kind`'s hidden state at a commit (ADR-0021): every target row
+/// is its live `R` entry joined to the live `M` entry on its key, and no
+/// other row is.
+async fn assert_target_joins_r_and_m(d: &Driver, kind: Kind, step: &str) {
+    let id = definition_id(d, kind).await;
+    let actual = d
+        .rows(&format!(
+            "select id, total, k0, s from {} order by id",
+            kind.target()
+        ))
+        .await;
+    let expected = d
+        .rows(&format!(
+            "select e.__from_key, e.c_r + coalesce(m.img, 0) as total, m.k0, e.s \
+             from (select __from_key, k, r as c_r, s from {DEFAULT_SCHEMA}.join1_{id}_r \
+                   where not __tombstone) e \
+             {} join (select k, img, k0 from {DEFAULT_SCHEMA}.join1_{id}_m \
+                      where not __tombstone) m on e.k = m.k \
+             order by 1",
+            kind.word()
+        ))
+        .await;
+    assert_eq!(
+        actual, expected,
+        "{kind:?} target (left) is not R joined to M (right) after {step}"
+    );
+}
+
+/// Runs build steps until `kind`'s definition is `live`.
+async fn run_until_live(d: &Driver, kind: Kind) {
+    for _ in 0..100 {
+        let status: String = d
+            .ctl
+            .query_one(
+                "select status from transform_definitions where target_table = $1",
+                &[&kind.target()],
+            )
+            .await
+            .expect("read the status")
+            .get(0);
+        if status == "live" {
+            return;
+        }
+        build_step(d.pool(), "builder", 3).await;
+    }
+    panic!("{kind:?} never went live");
+}
+
+/// The hidden state at the build's `live` flip, before the changes still in
+/// the ring drain: `R` equals `a`, `M` equals `b`, the target is the live
+/// join, and every target row is its `R` entry joined to `M`.
+async fn assert_flip(d: &Driver, kind: Kind, step: &str) {
+    run_until_live(d, kind).await;
+    assert_target_joins_r_and_m(d, kind, step).await;
+    assert_target(d, kind, step).await;
+    assert_m(d, kind, step).await;
+    let id = definition_id(d, kind).await;
+    let held = d
+        .rows(&format!(
+            "select __from_key, k, r as c_r, s from {DEFAULT_SCHEMA}.join1_{id}_r \
+             where not __tombstone order by 1"
+        ))
+        .await;
+    let live = d
+        .rows("select id, k, r as c_r, s from public.a order by 1")
+        .await;
+    assert_eq!(held, live, "{kind:?} R (left) differs from a after {step}");
+}
+
+/// The sweep's bound is past the `M` pass, not the build's start (#2027). On
+/// a rebuild in place, a page whose batch predates the build re-derives
+/// `a07`'s `R` entry (key 0) after the start and before the `M` pass: `M`
+/// has no entry on 0, so it writes no `INNER` row and a `LEFT` row with no
+/// `b` side. Then the `M` pass inserts the entry of row 7, inserted on key 0
+/// past capture, without a fan-out, and `a07` is
+/// deleted, its delete not yet drained, so no chunk visits it. The sweep
+/// re-derives the entry, whose basis predates the end of the `M` pass: at
+/// the flip it is a tombstone and its row is gone. Planted
+/// `join1_sweep_start_bound` keeps the start as the bound: the entry reads as
+/// fresh, and the build goes `live` with the row joined to the `M` the pass
+/// replaced.
+#[tokio::test]
+async fn s1_an_entry_a_page_rederived_before_the_m_pass_is_swept() {
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        write(&d, "update public.a set r = 77 where id = 'a07'").await;
+        let page = d.seal().await;
+        // Past capture, so only the `M` pass enters it: a page of its insert
+        // would re-derive its `M` entry with the fan-out.
+        write_uncaptured(
+            &d,
+            "public.b",
+            "insert into public.b values (7, 0, 700, 'k7')",
+        )
+        .await;
+        d.retire().await;
+        trellis(&d)
+            .await
+            .request_backfill("public.b")
+            .await
+            .expect("request a rebuild");
+        d.drain(page, "page").await;
+        assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
+        write(&d, "delete from public.a where id = 'a07'").await;
+        let delete = d.seal().await;
+        assert_flip(&d, kind, "the flip").await;
+        d.drain(delete, "page").await;
+        assert_oracle(&mut d, &[kind], "the rebuild").await;
+    }
+}
+
+/// The burst-3 face of #2027: an earlier build's chunk writes `a01`'s row
+/// after a second build has started and before that build's `M` pass. Row
+/// 1 moved off key 10 past capture, so only the second `M` pass moves its
+/// entry, without a fan-out, leaving `a01`'s row joined to it on 10. `a01`
+/// is then deleted, its delete not yet drained, so no chunk of the second
+/// build visits it. The entry's basis is past the second build's start but
+/// predates its `M` pass, so its sweep re-derives it: at the flip the entry
+/// is a tombstone and the row is gone. Planted `join1_sweep_start_bound`
+/// keeps it, joined to the `M` the pass replaced.
+#[tokio::test]
+async fn s2_an_entry_an_earlier_build_wrote_before_the_m_pass_is_swept() {
+    for kind in KINDS {
+        let target = kind.target();
+        let mut d = start(&[kind], true).await;
+        d.retire().await;
+        let t = trellis(&d).await;
+        t.request_backfill("public.b")
+            .await
+            .expect("request the first rebuild");
+        assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
+        write_uncaptured(&d, "public.b", "update public.b set k = 70 where bid = 1").await;
+        t.request_backfill("public.b")
+            .await
+            .expect("request the second rebuild");
+        // The second plan job's `M` pass is held before its first batch's
+        // locks while the first build's chunks run.
+        let mut planner = d
+            .run_frozen(
+                &[(PausePoint::BeforeJoin1Lock, &target)],
+                |pool| async move { Ok(build_step(&pool, "planner", 3).await) },
+            )
+            .await;
+        planner.reached(PausePoint::BeforeJoin1Lock).await;
+        for _ in 0..100 {
+            if pending(&d, &["rederive"]).await == 0 {
+                break;
+            }
+            assert_eq!(build_step(d.pool(), "builder", 3).await, Step::Chunk);
+        }
+        assert_eq!(
+            pending(&d, &["rederive"]).await,
+            0,
+            "the first build's chunks ran"
+        );
+        d.release(&mut planner, PausePoint::BeforeJoin1Lock).await;
+        assert_eq!(planner.finish().await, Step::Planned);
+        write(&d, "delete from public.a where id = 'a01'").await;
+        let delete = d.seal().await;
+        assert_flip(&d, kind, "the flip").await;
+        d.drain(delete, "page").await;
+        assert_oracle(&mut d, &[kind], "the rebuild").await;
+    }
+}
+
+/// The fresh-build face of #2027: every 1-1 `JOIN` build gets the sweep, an
+/// empty target's too. After the start and before the plan job, `a21` is
+/// inserted on key 0 and its page writes its entry: `M` is still empty, so
+/// it joins nothing. Row 7 is inserted on key 0 past capture, so only the
+/// `M` pass enters it, without a fan-out, and `a21` is deleted, its delete
+/// not yet drained, so no chunk visits it. Only the sweep re-derives the
+/// entry, whose basis predates the end of the `M` pass: at the flip it is a
+/// tombstone and its row is gone. Planted `join1_sweep_start_bound` keeps
+/// it, as in `s1`.
+#[tokio::test]
+async fn s3_a_fresh_build_sweeps_an_entry_its_chunks_did_not_visit() {
+    for kind in KINDS {
+        let mut d = start(&[kind], false).await;
+        step(&mut d, "insert into public.a values ('a21', 0, 21, 's21')").await;
+        write_uncaptured(
+            &d,
+            "public.b",
+            "insert into public.b values (7, 0, 700, 'k7')",
+        )
+        .await;
+        assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
+        write(&d, "delete from public.a where id = 'a21'").await;
+        let delete = d.seal().await;
+        assert_flip(&d, kind, "the flip").await;
+        d.drain(delete, "page").await;
+        assert_oracle(&mut d, &[kind], "the build").await;
     }
 }
 
