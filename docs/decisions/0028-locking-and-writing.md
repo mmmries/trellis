@@ -111,9 +111,12 @@ several reads asks for its level explicitly.
 Two writes read first, each the insert of a row that doesn't exist yet, from a
 read in the same statement.
 
-The first is a 1-1 build chunk's insert of the entry of a key that has none. Its uniqueness check comes after
-the read, and finding no entry there means no Apply has written the key since
-the read's snapshot, because the tombstone GC, the one thing that removes an
+The first is a 1-1 `JOIN` build chunk's insert of the `R` entries of rows that
+have none, from a read of `a` in the same statement, with that statement's
+snapshot as their basis
+([ADR-0021](0021-one-to-one-join-transforms.md#a-build-fills-every-m-then-r-and-the-target)).
+Its uniqueness check comes after the read, and finding no entry there means
+no Apply has written the key since the read's snapshot, because the tombstone GC, the one thing that removes an
 entry an Apply wrote, skips a ledger under a build (I4). A page deletes only a
 placeholder it wrote no change to, which holds no applied change, and a source
 truncate commits before the chunk's first read, which holds the source's lock,
@@ -222,9 +225,9 @@ check that turns a delta for an unlocked row into an error
 pages, whose lock set is computed separately from what they write.
 
 W3 is for writes that add a delta. An absolute write meets W1 another way: a
-1-1 build chunk and a fresh aggregate build insert a row that doesn't exist
-from their own read (I1). A row that exists is locked, read afresh and updated
-once, in W2's order; that is all of a rebuild in place.
+1-1 `JOIN` build chunk and a fresh aggregate build insert a row that doesn't
+exist from their own read (I1). A row that exists is locked, read afresh and
+updated once, in W2's order; that is all of a rebuild in place.
 
 ### The goal for a build is twice the cost of its plain query
 
