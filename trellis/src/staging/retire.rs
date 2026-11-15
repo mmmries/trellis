@@ -306,8 +306,8 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// statement, and the direct Re-derives stamp the latest segment there is.
 ///
 /// **Against a build.** A ledger whose definition is under a build is
-/// skipped ([`NOT_BUILDING_SQL`]): a build chunk's insert needs the
-/// tombstones written since its snapshot.
+/// skipped ([`NOT_BUILDING_SQL`]): a 1-1 `JOIN` build chunk's insert of
+/// `R` entries needs the tombstones written since its read's snapshot.
 ///
 /// **Against a page.** Each batch is a short transaction of its own. It
 /// takes the ledger's `ROW EXCLUSIVE` lock `NOWAIT`, so a build or drop of
@@ -624,12 +624,21 @@ pub async fn explain_collect_zero_groups(
 /// GC batch collects nothing from a ledger this returns no row for,
 /// and holds the lock until it commits.
 ///
-/// **Why.** A Re-derive build's chunk inserts the entries of keys that have
-/// none from a snapshot taken before the insert
-/// (`super::one_to_one_ledger::lock_entries`), which is right only if no
-/// Apply has written the key since that snapshot. A tombstone a page wrote
-/// since then, and collected before the insert's uniqueness check, would
-/// let the insert write a deleted key live, and nothing would retract it.
+/// **Why.** A 1-1 `JOIN`'s build chunk inserts the `R` entries of rows that
+/// have none from a read in the same statement
+/// (`super::join_one_to_one::build`'s `insert_from_read`), whose snapshot
+/// is taken before the insert's uniqueness check. That is right only if no
+/// Apply has written the key since the snapshot. A tombstone a page wrote
+/// since then, and collected before the check, would let the insert write
+/// a deleted row live, and nothing would retract it.
+///
+/// A plain 1-1 chunk needs no skip: it locks its entries before it reads
+/// (`super::one_to_one_ledger::lock_entries`, then one statement that takes
+/// the snapshot), as a page's Re-derive does beside the GC. A tombstone
+/// collected before the lock gets a fresh placeholder, and one collected
+/// between the placeholder insert and the `for update` fails the lock with
+/// a transient `ApplyError::LedgerEntryCollected`. Its ledger is skipped
+/// anyway, which only delays the GC (#2018).
 ///
 /// **Why the lock makes the skip enough.** A build starts by taking the
 /// definition's row `for update` (`super::build`'s `start`), which waits

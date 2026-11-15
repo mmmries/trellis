@@ -94,7 +94,7 @@
 //! target rows, sorted within each statement. A page
 //! that may hold rows of `a` in quarantine (one with `a` records, or whose
 //! fan-out may hold rows) takes its definition's row `FOR KEY SHARE` before
-//! the lock row ([`lock_definitions`]), as a rebuild's start takes it before
+//! the lock row ([`definition_locks`]), as a rebuild's start takes it before
 //! the lock row. The
 //! target rows are not locked ahead across statements, and need not be: each
 //! one is written only by a page that holds `J` for the key its `R` entry
@@ -123,7 +123,7 @@
 //! the read contract, exact after `await_converged`, which the marker holds
 //! back.
 //!
-//! # A `TRUNCATE` ([`truncate_sides`], [`lock_definitions`], [`start_rebuilds`])
+//! # A `TRUNCATE` ([`truncate_sides`], [`definition_locks`], [`start_rebuilds`])
 //!
 //! A page that carries a `TRUNCATE` of any of the JOIN's tables takes the
 //! lock row `FOR UPDATE` instead, so it waits for the pages and chunks in
@@ -1060,7 +1060,7 @@ pub(crate) async fn apply_page(
 
     // 2. The lock row, a truncate's clear, then K over every side's keys. A
     // page that truncates `b` holds its definition's row already: the caller
-    // takes it before any lock row ([`lock_definitions`]).
+    // takes it before any lock row ([`definition_locks`]).
     // Planted bug: the definition's row comes after the lock row. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -1463,13 +1463,16 @@ fn fan_lock_groups(shape: &JoinShape, inline: &PageKeys, root: bool) -> (Vec<Pag
     (vec![inline.clone()], shape.empty_keys())
 }
 
-/// Locks the definitions' rows of `plans` (one page's) before the page's
-/// first 1-1 `JOIN` lock row, in id order, and returns the ids of those whose
-/// page truncates `b` for [`start_rebuilds`]. A rebuild's start takes every
-/// definition's row it rebuilds `FOR UPDATE`, in id order, before it takes
-/// their lock rows (`crate::intake::catch_up`,
-/// `super::build::BuildStarts::stamp`): a page that held one target's lock row
-/// while it queued on a definition's row would close a cycle with a start.
+/// The definitions' rows `plans` (one page's) need, each with whether it is
+/// taken `FOR UPDATE`, and the ids of those whose page truncates `b` for
+/// [`start_rebuilds`]. The page takes them with every other definition row
+/// it needs, in one id order, after its other targets and before its first
+/// 1-1 `JOIN` lock row (`super::apply::apply_page`). A rebuild's start takes every definition's
+/// row it rebuilds `FOR UPDATE`, in id order, before it takes their lock rows
+/// (`crate::intake::catch_up`, `super::build::BuildStarts::stamp`): a page
+/// that held one target's lock row, or another definition's row taken out of
+/// order, while it queued on a definition's row would close a cycle with a
+/// start.
 ///
 /// - A page that truncates `b` takes its definition's row `FOR UPDATE`.
 /// - A page that may hold a row of `a` takes it `FOR KEY SHARE`, the lock
@@ -1477,10 +1480,9 @@ fn fan_lock_groups(shape: &JoinShape, inline: &PageKeys, root: bool) -> (Vec<Pag
 ///   after the lock row, never waits for it: a page with `a` records (a
 ///   drain's, [`write_a_changes`]), and one whose fan-out may hold a row (it
 ///   has `b` records and fans out).
-pub(crate) async fn lock_definitions<'a>(
-    txn: &Transaction<'_>,
+pub(crate) fn definition_locks<'a>(
     plans: impl IntoIterator<Item = &'a JoinOneToOnePlan>,
-) -> Result<Vec<i64>, ApplyError> {
+) -> (BTreeMap<i64, bool>, Vec<i64>) {
     // Each id with whether the page truncates its `b`; a truncate's
     // `FOR UPDATE` covers a hold's `FOR KEY SHARE`.
     let mut locks: BTreeMap<i64, bool> = BTreeMap::new();
@@ -1516,18 +1518,10 @@ pub(crate) async fn lock_definitions<'a>(
     );
     #[cfg(not(any(test, feature = "test-util")))]
     let late = false;
-    for (id, truncates) in &locks {
-        if *truncates && late {
-            continue;
-        }
-        let mode = if *truncates { "update" } else { "key share" };
-        txn.execute(
-            &format!("select 1 from transform_definitions where id = $1 for {mode}"),
-            &[id],
-        )
-        .await?;
+    if late {
+        locks.retain(|_, truncates| !*truncates);
     }
-    Ok(ids)
+    (locks, ids)
 }
 
 /// A page's `TRUNCATE` of any of its tables, under the lock row held `FOR
@@ -1603,7 +1597,7 @@ async fn truncate_sides(
     .await
 }
 
-/// Starts the rebuilds of the targets `ids` ([`lock_definitions`])
+/// Starts the rebuilds of the targets `ids` ([`definition_locks`])
 /// after a `TRUNCATE` of their `b`, in the page's transaction (ADR-0021):
 /// every target row may hold the `b` side of a row that is gone, so the
 /// build's chunks, not the page, rewrite them. Each definition reads
