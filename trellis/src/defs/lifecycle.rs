@@ -604,7 +604,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // A `JOIN` reads several tables, and a page of any may have planned it.
     // The names are read without a lock and bumped in table-name
     // order, the order every taker of two fences takes them in.
-    let mut fences: Vec<String> = txn
+    let fences: Vec<String> = txn
         .query(
             &format!(
                 "select distinct f from transform_definitions d, \
@@ -619,10 +619,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    fences.sort_unstable();
-    for source in &fences {
-        crate::staging::build::bump_version_fence(&*txn, source).await?;
-    }
+    crate::staging::build::bump_version_fences(&*txn, &fences).await?;
 
     // The column-pause lock, exclusive: this deletes the
     // target's pause rows and the cascade edges into and out of them, which

@@ -467,10 +467,11 @@ batches for one key draining out of order is closed separately, by the 1-1
 ledger ([above](#absolute-writes-do-not-commute-the-1-1-ledger)).
 
 **The fence runs first in Phase 3**, so a superseded batch rolls back before
-touching a derived row. It takes its tables' fences in table-name order, the
-order every transaction that bumps more than one (a `JOIN` definition's define,
-drop, resume or freeze bumps both its tables') takes them in, so a page and a
-bump never each hold a fence the other wants. The fence set must include
+touching a derived row. It takes its tables' fences in one statement in
+table-name order, the order every transaction that bumps more than one (a
+`JOIN` definition's define, drop, resume or freeze bumps both its tables')
+bumps them in, also in one statement, so a page and a bump never each hold a
+fence the other wants. The fence set must include
 tables that are *evaluated* but absent from the one-to-one write plan — an
 aggregate-only source, a `JOIN`'s joined table — or a grain change mid-batch
 slips through.
@@ -488,7 +489,7 @@ rest (or an upsert that does both).
 | Class | Mode | Sort key | Taken by |
 |---|---|---|---|
 | Handover lock (advisory) | shared | — | A state-changing call, first (`locks::fence_call_txn`) |
-| Version fence (`source_table_versions`) | `FOR SHARE`; bumped by an update | table name | `FOR SHARE`: a page, a build chunk, a sweep batch, a fan-out chunk, first. Bumped: a define, an edit, a drop, a resume, a pause, a release |
+| Version fence (`source_table_versions`) | `FOR SHARE`; bumped by an upsert | table name, byte order (`collate "C"`) | `FOR SHARE`: a page, a build chunk, a sweep batch, a fan-out chunk, first. Bumped: a define, an edit, a drop, a resume, a pause, a release, a restore |
 | Column-pause lock (advisory) | shared or exclusive | — | A reader or writer of pause state (`locks::lock_column_pauses`) |
 | Fuse gate (`transform_fuse_gate`) | upsert | id | An eviction |
 | Definition rows (`transform_definitions`) | `FOR KEY SHARE`, `FOR NO KEY UPDATE` or `FOR UPDATE` | id | `KEY SHARE`: a fan-out chunk, a plan job before it enqueues chunks, a GC batch (`NOWAIT`). `NO KEY UPDATE`: an eviction, a release, a re-type. `UPDATE`: a pause, a resume, a drop, an edit, a build's or a rebuild's start, a chunk's failure |
@@ -497,7 +498,7 @@ rest (or an upsert that does both).
 | 1-1 targets, in target order: entries, then rows | entries insert-then-lock `FOR UPDATE`; rows `FOR UPDATE` | entry key; target key | A page; a build chunk and a sweep batch (entries, then one statement writes the rows) |
 | Aggregate targets, in target order: hidden groups, then visible rows | insert-then-lock; upsert | group columns | A page, a build |
 | `JOIN` targets, in target order: lock row, `J`, `P` and `M` cells, `T` | lock row `FOR SHARE`, `FOR UPDATE` with a `TRUNCATE`; `J` insert-then-lock `FOR UPDATE`; cells and `T` insert-then-lock | join columns; group columns | A page, a build |
-| A page's definition rows, then its parked rows (`poison_held`) | definition rows as above; parked rows upserted | id; `(transform_id, src_table, key)` | A page: `KEY SHARE` for each definition it parks a quarantined key's change for and each 1-1 `JOIN` target that may hold a row, `UPDATE` for each 1-1 `JOIN` whose `b` it truncates, then its parks. A group-basis build's last transaction: its target's readers `UPDATE`, after its groups |
+| A page's definition rows, then its parked rows (`poison_held`) | definition rows as above; parked rows upserted | id; `(transform_id, src_table, key)` | A page: `KEY SHARE` for each definition it parks a quarantined key's change for and each 1-1 `JOIN` target that may hold a row, `UPDATE` for each 1-1 `JOIN` whose `b` it truncates, then its parks. A group-basis build's last transaction: its target's readers `UPDATE`, after its groups. Exception: a page takes its definition rows in one id order but one statement per run of ids that share a mode, since Postgres can't mix lock modes in one statement and taking them all `FOR UPDATE` would serialize pages |
 | 1-1 `JOIN` targets, in target order: lock row, `J`, `R`, `M`, target rows | lock row as for `JOIN`; `J`, `R` and `M` insert-then-lock `FOR UPDATE`; fan-out markers and target rows `FOR UPDATE` | `J` `(position, key)`; `R` entry key; `M` `(position, id)`; markers and target rows none, since every writer of a marker holds its key's `J` row and every writer of a target row its `R` entry | A page (its markers after `M`), a build step, a fan-out chunk (one key's `J`, its marker, then `R`) |
 | Segment claims and rows (`seg_claims`, `segments`), then `drain_cursor` and `drain_holdups` | update or delete; `FOR NO KEY UPDATE`; upsert; `FOR UPDATE` | `seg_seq` | A page's completion |
 | Segment pointer (`segment_pointer`) | `FOR SHARE`; updated by a seal after a segment's row | — | A build's or rebuild's start, last: a page that truncates a 1-1 `JOIN`'s `b` starts its rebuilds after its completion |
