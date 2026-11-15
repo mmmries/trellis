@@ -87,7 +87,8 @@ nested enums) that don't cross FFI cleanly — no stable layout, no meaningful
 
 **Decision:** adopt a stable representation now — a code plus a human-readable
 message — rather than translating only at the shim later (which would turn into
-a giant `match` over every internal variant).
+a giant `match` over every internal variant). Two codes: a coarse category a host
+branches on, and a per-error code a person looks up.
 
 **Settled:** `ErrorCode` is a small,
 `#[non_exhaustive]` enum of coarse categories an FFI caller would branch on
@@ -107,6 +108,13 @@ Every caller-facing error type (`TrellisError`, `ClientError`, `CatalogError`,
 by its SQLSTATE. `source()`/chaining stays
 Rust-idiomatic internally (`thiserror`, `#[from]`) and does not cross FFI; a
 caller gets `code()` plus the `Display` message, not a chain to walk.
+
+Every error a user can see also has a stable per-error code: `T` and four digits
+(`T0001`), assigned sequentially and never reused or renumbered. A pure wrapper
+variant reports its inner error's code. The code is public API: changing or
+removing one is a breaking change, renaming a Rust variant is not. Messages print
+the bare code (`T0042: ...`), and the public error types and the Ruby and Elixir
+bindings expose it beside `ErrorCode`.
 
 ### 4. Resource caps: out of scope
 
