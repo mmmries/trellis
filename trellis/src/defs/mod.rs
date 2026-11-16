@@ -127,8 +127,8 @@ pub use ddl::{PrimaryKeyColumn, neighbor_table_name};
 pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
 #[cfg(any(test, feature = "internals"))]
 pub use validate::{
-    KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
-    ValidationError,
+    ConflictingCollations, KeyColumnRole, NondeterministicCollationTextFunction,
+    NondeterministicKeyCollation, ValidationError,
 };
 
 #[cfg(test)]
