@@ -577,6 +577,13 @@ reaches one (`Trellis::Railtie.with_handle(:reports) { |reports|
 reports.define "TRANSFORM ..." }`). `trellis:migrate` migrates the default
 instance and every instance of `config.trellis.instances`. Neither it nor
 `trellis:migrate` needs ActiveRecord.
+
+In a migration, the helpers and `with_handle` connect to the database the
+migration is running on: its `database.yml` config (host, port, database,
+user, password), with the `schema`, `target_schema` and other options of
+`config.trellis.connect` (or of the named instance). `db:prepare` in
+development, which also migrates the test database, so defines in each
+database it migrates.
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
 

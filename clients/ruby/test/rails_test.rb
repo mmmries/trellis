@@ -224,6 +224,21 @@ class RailsTest < Minitest::Test
     assert_match "  db/reports_migrate/20260201000000_define_order_totals.rb", changed.fetch("stderr")
   end
 
+  # `db:prepare` in development migrates the test databases too, in the same
+  # process. A migration's helpers define in the database it is migrating:
+  # the default instance's helper and a named instance's alike, in each
+  # environment's own database, never in development's.
+  def test_db_prepare_defines_in_each_database_it_migrates
+    seen = boot("db_prepare")
+    assert_equal(
+      { "bp_primary_development" => %w[pb_source pb_target pb_target__ledger], "bp_primary_test" => %w[pb_source pb_target pb_target__ledger],
+        "bp_reports_development" => %w[pb_reports_source pb_reports_target pb_reports_target__ledger],
+        "bp_reports_test" => %w[pb_reports_source pb_reports_target pb_reports_target__ledger] },
+      seen.fetch("databases")
+    )
+    assert_empty seen.fetch("unused_database_tables")
+  end
+
   private
 
   # The app's environment is development unless a scenario names one, so

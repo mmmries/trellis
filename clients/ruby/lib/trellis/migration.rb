@@ -94,9 +94,15 @@ module Trellis
   # down. A migration's own handle never runs background work: staging and
   # drain_threads are always the defaults, whatever the configuration says.
   #
+  # A handle a helper connects is to the database the migration is running
+  # on (its connection's config: host, port, database, user, password and
+  # other libpq settings), whichever environment `db:prepare` is running, with
+  # the schema, target_schema and other options of config.trellis.connect.
+  # The same goes for `Trellis::Railtie.with_handle` called in a migration.
+  #
   # The helpers run on the default instance. A migration for an instance
   # named in config.trellis.instances runs its statements on that instance
-  # itself, in the same transaction-free way:
+  # itself, in the same transaction-free way, against the same database:
   #
   #   Trellis::Railtie.with_handle(:reports) do |reports|
   #     reports.define "TRANSFORM monthly_totals FROM orders SELECT total AS total"
@@ -170,7 +176,13 @@ module Trellis
               "define in down with apply \"PAUSE TRANSFORM <target>\" and " \
               "apply \"DROP TRANSFORM <target>\"."
       end
-      super
+      previous = Thread.current[:trellis_migrating_database]
+      Thread.current[:trellis_migrating_database] = conn.pool.db_config
+      begin
+        super
+      ensure
+        Thread.current[:trellis_migrating_database] = previous
+      end
     end
 
     private

@@ -208,6 +208,7 @@ module Trellis
 
         options = name ? named_options(name) : required_connect_options
         options = options.merge(staging: false, drain_threads: 0)
+        options = options.merge(url: migrating_url(options[:url], name)) if migrating_database
         instance = name ? Trellis::Instance.connect(**options) : connect_default(options)
         primary = nil
         begin
@@ -346,6 +347,22 @@ module Trellis
         end
 
         options.to_h.transform_keys(&:to_sym)
+      end
+
+      # The db_config of the database a Trellis::Migration is running on
+      # (Trellis::Migration#exec_migration sets it for the length of the
+      # migration), or nil outside one. with_handle then connects a handle it
+      # opens itself to that database, not config's, so a migration
+      # `db:prepare` runs on the test database defines there and not in
+      # development's.
+      def migrating_database
+        Thread.current[:trellis_migrating_database]
+      end
+
+      def migrating_url(configured_url, name)
+        require "trellis/schema_dump"
+        what = name ? "config.trellis.instances[#{name.inspect}]" : "config.trellis.connect"
+        SchemaDump.database_url(migrating_database, configured_url, what)
       end
 
       def required_connect_options

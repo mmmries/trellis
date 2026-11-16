@@ -243,6 +243,15 @@ module Trellis
         end
       end
 
+      # The url of the database db_config names, for the options of a
+      # Trellis instance: configured_url's settings (`what` names it in an
+      # error) with db_config's database, host, port, user, password and
+      # other libpq keywords.
+      def database_url(db_config, configured_url, what)
+        require "pg"
+        environment_url(db_config, configured_url, what)
+      end
+
       private
 
       # nil for the default instance (when config.trellis.connect is set),
