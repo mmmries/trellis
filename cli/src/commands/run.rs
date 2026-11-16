@@ -1,16 +1,20 @@
 //! `trellis run [--staging|--no-staging] [--drain-threads N]` — runs the live
 //! CDC/apply pipeline until interrupted.
 //!
-//! `run` connects once, with the pipeline's own options, and leaves the
-//! rest to the handle's background process, the one an embedded handle runs
-//! ([ADR-0023](../../../docs/decisions/0023-version-handover.md), rule 3): it
-//! migrates before it stages when migrations are pending, so a fresh
-//! database needs no separate `migrate` step. It stands by, says why and
-//! tries again, instead of exiting, while another version of Trellis is live,
-//! while the binary is below the catalog floor, and while its `migrate` is
-//! refused (the role can't alter Trellis's tables, the history doesn't fit).
-//! It starts the pipeline once the refusal is gone. The process's log goes to
-//! stderr (see [`init_logging`]).
+//! `run` migrates first, once, on a connection with no background work: the
+//! staging worker reads the catalog as it starts, so on a fresh database (no
+//! Trellis tables at all) the catalog has to exist before the pipeline
+//! connects, and a fresh database needs no separate `migrate` step.
+//!
+//! When that `migrate` is refused, `run` connects the pipeline anyway and
+//! leaves the rest to the handle's background process, the one an embedded
+//! handle runs ([ADR-0023](../../../docs/decisions/0023-version-handover.md),
+//! rule 3): it stands by, says why and tries again, instead of exiting, while
+//! another version of Trellis is live, while the binary is below the catalog
+//! floor, and while the role can't alter Trellis's tables or the history
+//! doesn't fit ([`stands_by_on`]). It starts the pipeline once the refusal is
+//! gone. Any other `migrate` error exits. The process's log goes to stderr
+//! (see [`init_logging`]).
 //!
 //! No definitions need to be registered yet: the staging worker
 //! captures nothing until `trellis apply` registers something, then picks
@@ -39,7 +43,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use trellis::Metrics;
-use trellis::{Config, Trellis, TrellisOptions};
+use trellis::{Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
 
 /// Help text for `trellis run -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.
@@ -181,12 +185,28 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
     })
 }
 
-/// Connects, prints a startup message, blocks until Ctrl-C (while
+/// Migrates, connects, prints a startup message, blocks until Ctrl-C (while
 /// also serving `--prometheus-bind`'s listener, if given), then shuts down
 /// cleanly. Returns the shutdown message on success.
 pub async fn run(args: Args, database_url: Option<String>) -> Result<String, String> {
     let config = Config::resolve(database_url).map_err(|err| err.to_string())?;
     init_logging();
+
+    // Migrate on a plain, no-background-work connection first, so the
+    // catalog the staging worker reads as it starts exists on a fresh
+    // database. See the module doc comment.
+    let migrator = Trellis::connect(config.clone(), TrellisOptions::default())
+        .await
+        .map_err(|err| err.to_string())?;
+    let refused = match migrator.migrate().await {
+        Ok(()) => None,
+        Err(err) if stands_by_on(&err) => Some(err),
+        Err(err) => {
+            let _ = migrator.shutdown().await;
+            return Err(err.to_string());
+        }
+    };
+    migrator.shutdown().await.map_err(|err| err.to_string())?;
 
     let options = TrellisOptions {
         staging: args.staging,
@@ -195,7 +215,12 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     };
     let trellis = Trellis::connect(config, options)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| match &refused {
+            // A refused `migrate` on a database with no catalog yet: the
+            // pipeline can't start, and the refusal says what to do.
+            Some(refused) => format!("{refused} (and the pipeline couldn't start: {err})"),
+            None => err.to_string(),
+        })?;
 
     let metrics_listener = match args.prometheus_bind {
         Some(bind) => match TcpListener::bind(bind).await {
@@ -246,6 +271,40 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     println!("shutting down...");
     trellis.shutdown().await.map_err(|err| err.to_string())?;
     Ok("shut down cleanly".to_string())
+}
+
+/// Whether `err`, from `migrate`, is a refusal the pipeline stands by on
+/// (ADR-0023, rule 3): another version is live, the binary is below the catalog
+/// floor, the role can't create or alter Trellis's tables, or the migration
+/// history doesn't fit. The pipeline's own pass tries `migrate` again and
+/// says why it stands by. Any other error ends `run`, as it always has.
+fn stands_by_on(err: &TrellisError) -> bool {
+    if matches!(
+        err.code(),
+        ErrorCode::VersionHandover | ErrorCode::VersionFloor
+    ) {
+        return true;
+    }
+    match err {
+        TrellisError::Engine(trellis::Error::MigrationHistory(_)) => true,
+        TrellisError::Engine(engine) => permission_denied(engine),
+        _ => false,
+    }
+}
+
+/// Whether `err`'s chain carries Postgres's permission refusal (SQLSTATE
+/// 42501).
+fn permission_denied(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(current) = source {
+        if let Some(db) = current.downcast_ref::<tokio_postgres::Error>()
+            && db.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Sends the engine's log events (a standby and its reason, a takeover,

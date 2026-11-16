@@ -1289,7 +1289,7 @@ if want mixed; then
   taken=0
   for _ in $(seq 1 120); do
     if [ "$(history "$port" mixed | wc -l)" -gt "$(wc -l <<<"$pre_mixed_history")" ] &&
-       grep -q 'migrated, taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
+       grep -q 'pending migrations (.*); taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
     sleep 0.5
   done
   if [ "$taken" -eq 1 ] && run_alive new-mixed; then
