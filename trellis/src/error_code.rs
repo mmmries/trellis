@@ -163,6 +163,31 @@ impl fmt::Display for ErrorId {
     }
 }
 
+/// A condition that several error enums report, so it has one code: each
+/// variant that means it reports [`SharedCondition::error_id`]. One condition,
+/// one code, whichever layer found it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SharedCondition {
+    /// A transform name that names no definition.
+    TransformNotFound,
+    /// A source table that isn't on the search path.
+    SourceTableNotFound,
+    /// A type a literal can't be spelled as.
+    UnsupportedLiteralType,
+}
+
+impl SharedCondition {
+    /// The code, written as `match` arms, the form `error_code::assigned`'s
+    /// test reads.
+    pub(crate) fn error_id(self) -> ErrorId {
+        match self {
+            SharedCondition::SourceTableNotFound => ErrorId(126),
+            SharedCondition::TransformNotFound => ErrorId(148),
+            SharedCondition::UnsupportedLiteralType => ErrorId(28),
+        }
+    }
+}
+
 /// A coded error's message without its [`ErrorId`] prefix. Its `Display`
 /// writes the code and then this; a message that embeds another coded error
 /// writes that error's [`Message::message`], so the text carries one code.
@@ -320,10 +345,10 @@ mod tests {
     #[test]
     fn a_message_starts_with_its_code_once() {
         let leaf = crate::TrellisError::SourceTableNotFound("widgets".to_string());
-        assert_eq!(leaf.error_id().to_string(), "T0209");
+        assert_eq!(leaf.error_id().to_string(), "T0126");
         assert_eq!(
             leaf.to_string(),
-            "T0209: source table \"widgets\" not found on the search path"
+            "T0126: source table \"widgets\" not found on the search path"
         );
 
         let inner = crate::ParseError::UnterminatedString;
@@ -370,6 +395,33 @@ mod tests {
             crate::Error::OtherVersionLive(seen).error_id(),
             refused.error_id()
         );
+
+        // Leaves of different enums that mean one condition share its code.
+        use crate::{CatalogError, TrellisError, ValidationError};
+
+        let name = || "totals".to_string();
+        let not_found = [
+            CatalogError::TransformNotFound { transform: name() }.error_id(),
+            crate::ApplyError::TransformNotFound { transform: name() }.error_id(),
+            TrellisError::TransformNotFound(name()).error_id(),
+        ];
+        assert!(not_found.iter().all(|id| id.to_string() == "T0148"));
+
+        let table = [
+            CatalogError::SourceTableNotFound(name()).error_id(),
+            TrellisError::SourceTableNotFound(name()).error_id(),
+        ];
+        assert!(table.iter().all(|id| id.to_string() == "T0126"));
+
+        let literal = [
+            crate::ParseError::UnsupportedLiteralType { name: name() }.error_id(),
+            ValidationError::UnsupportedLiteralType {
+                field: name(),
+                value_type: crate::defs::ValueType::Numeric,
+            }
+            .error_id(),
+        ];
+        assert!(literal.iter().all(|id| id.to_string() == "T0028"));
     }
 
     /// The server reporting a dead or unavailable connection is

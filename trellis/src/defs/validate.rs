@@ -22,7 +22,7 @@ use super::ast::{
 use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
 use super::pg_type::PgType;
-use crate::error_code::{ErrorCode, ErrorId};
+use crate::error_code::{ErrorCode, ErrorId, SharedCondition};
 use crate::integer::IntWidth;
 
 /// Which key a [`ValidationError::NondeterministicKeyCollation`] column
@@ -944,7 +944,9 @@ impl ValidationError {
             ValidationError::FunctionArgTypeMismatch { .. } => ErrorId(95),
             ValidationError::NonLiteralRegexPattern { .. } => ErrorId(96),
             ValidationError::InvalidTypedLiteral { .. } => ErrorId(97),
-            ValidationError::UnsupportedLiteralType { .. } => ErrorId(98),
+            ValidationError::UnsupportedLiteralType { .. } => {
+                SharedCondition::UnsupportedLiteralType.error_id()
+            }
             ValidationError::UnresolvedGroupByColumn { .. } => ErrorId(99),
             ValidationError::UnsupportedGroupByKeyType { .. } => ErrorId(100),
             ValidationError::GroupByKeysShareTargetColumn { .. } => ErrorId(101),
