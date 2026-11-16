@@ -168,3 +168,36 @@ async fn an_added_field_comparing_two_collations_is_refused() {
         .expect_err("an added conflicting field must be refused");
     assert_conflict(err, "n", "NULLIF", "trellis.s.a", "trellis.s.p");
 }
+
+/// A column re-collated after define into a conflict is refused at `RESUME`
+/// with define's error: define's validations hold for the definition's life.
+#[tokio::test]
+async fn a_conflict_made_after_define_is_refused_at_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = pipeline::connect(db.dsn()).await;
+    raw.batch_execute(
+        r#"create table public.r (id bigint primary key, a text collate "C", p text collate "C")"#,
+    )
+    .await
+    .expect("create the source");
+    let trellis = pipeline::definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM rc FROM r SELECT a = p AS same")
+        .await
+        .expect("one collation defines");
+    trellis.apply("PAUSE TRANSFORM rc").await.expect("pause");
+    raw.batch_execute(r#"alter table public.r alter column p type text collate "POSIX""#)
+        .await
+        .expect("re-collate p");
+    let err = trellis
+        .apply("RESUME TRANSFORM rc")
+        .await
+        .expect_err("a resume into a conflict must be refused")
+        .to_string();
+    assert!(
+        err.starts_with("T0233") && err.contains("public.r.a") && err.contains("public.r.p"),
+        "{err}"
+    );
+    trellis.shutdown().await.expect("shutdown");
+}

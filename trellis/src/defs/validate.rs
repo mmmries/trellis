@@ -860,13 +860,13 @@ pub(crate) fn check_collation_reads<'a>(
     check_collation_conflicts(def, only_fields, &resolve)
 }
 
+/// The database default's `pg_collation` OID.
+const DEFAULT_COLLATION_OID: u32 = 100;
+
 /// The collation an expression's text carries, as Postgres derives it
 /// (`assign_collations`): a column's own, the database default for a
 /// constant or a computed value, and a conflict where two different
 /// collations meet. The database default yields to any other collation.
-/// The database default's `pg_collation` OID.
-const DEFAULT_COLLATION_OID: u32 = 100;
-
 enum Derived {
     Collation {
         oid: u32,
