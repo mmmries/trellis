@@ -243,13 +243,22 @@ module Trellis
         end
       end
 
-      # The url of the database db_config names, for the options of a
-      # Trellis instance: configured_url's settings (`what` names it in an
-      # error) with db_config's database, host, port, user, password and
-      # other libpq keywords.
-      def database_url(db_config, configured_url, what)
+      # The url an instance configured with configured_url (`what` names it
+      # in an error) connects to in a migration running on db_config, a
+      # database of another environment than the one running the task
+      # (`db:prepare` in development migrates the test databases too): that
+      # environment's config of the same name as the running environment's
+      # config configured_url points at, compared as verify_same_database!
+      # compares, or db_config itself when it points at none of them. Either
+      # is read as environment_url reads it.
+      def migration_url(db_config, configured_url, what)
         require "pg"
-        environment_url(db_config, configured_url, what)
+        configurations = ::ActiveRecord::Base.configurations
+        found = trellis_database(configured_url, what)
+        running = configurations.configs_for(env_name: ::ActiveRecord::Tasks::DatabaseTasks.env.to_s)
+                                .find { |config| same_database?(found, rails_database(config.configuration_hash)) }
+        counterpart = running && configurations.configs_for(env_name: db_config.env_name, name: running.name)
+        environment_url(counterpart || db_config, configured_url, what)
       end
 
       private

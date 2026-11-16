@@ -94,15 +94,15 @@ module Trellis
   # down. A migration's own handle never runs background work: staging and
   # drain_threads are always the defaults, whatever the configuration says.
   #
-  # A handle a helper connects is to the database the migration is running
-  # on (its connection's config: host, port, database, user, password and
-  # other libpq settings), whichever environment `db:prepare` is running, with
-  # the schema, target_schema and other options of config.trellis.connect.
-  # The same goes for `Trellis::Railtie.with_handle` called in a migration.
+  # A migration of another environment's database (`db:prepare` in
+  # development migrates the test databases too) never uses this process's
+  # handle: the helpers, and `Trellis::Railtie.with_handle` called in it,
+  # connect one to that environment's counterpart of the database the
+  # instance's url points at (Trellis::Railtie.with_handle).
   #
   # The helpers run on the default instance. A migration for an instance
   # named in config.trellis.instances runs its statements on that instance
-  # itself, in the same transaction-free way, against the same database:
+  # itself, in the same transaction-free way:
   #
   #   Trellis::Railtie.with_handle(:reports) do |reports|
   #     reports.define "TRANSFORM monthly_totals FROM orders SELECT total AS total"
@@ -124,37 +124,37 @@ module Trellis
   # The guard checks the target's name, not its definition: a changed
   # statement for a target that exists is an `ALTER TRANSFORM`.
   module Migration
-    # The helpers' Trellis::Railtie.with_handle: runs the block with this
+    # The helpers' Trellis::Railtie.with_handle: yields the block this
     # process's handle, or one connected from config.trellis.connect for the
-    # length of the block, running Trellis.migrate first either way, and
+    # length of the block, running migrate on it first either way, and
     # returns the block's value. Without Rails, it uses this process's
     # handle. Raises ActiveRecord::MigrationError if there's neither.
-    def self.with_handle(&)
-      if Trellis.connected?
-        Trellis.migrate
-        return yield
+    def self.with_handle
+      if defined?(Trellis::Railtie) && Trellis::Railtie.connect_options
+        return Trellis::Railtie.with_handle { |trellis| yield trellis }
       end
 
-      unless defined?(Trellis::Railtie) && Trellis::Railtie.connect_options
+      unless Trellis.connected?
         raise ActiveRecord::MigrationError,
               "there's no Trellis to run this against: set config.trellis.connect to " \
               "Trellis.connect's options (config.trellis.connect = { url: ENV.fetch(\"DATABASE_URL\") }), " \
               "or call Trellis.connect before migrating"
       end
 
-      Trellis::Railtie.with_handle(&)
+      Trellis.migrate
+      yield Trellis.default_instance
     end
 
     # Registers a transform from a `TRANSFORM` statement and returns its
     # target table: Trellis.define, run as the migration reaches it.
     def define(statement)
-      trellis_statement("define", statement) { Trellis.define(statement) }
+      trellis_statement("define", statement) { |trellis| trellis.define(statement) }
     end
 
     # Runs any statement of Trellis's grammar and returns its Applied:
     # Trellis.apply, run as the migration reaches it.
     def apply(statement)
-      trellis_statement("apply", statement) { Trellis.apply(statement) }
+      trellis_statement("apply", statement) { |trellis| trellis.apply(statement) }
     end
 
     # The Status of the transform writing target_table, or nil when none
@@ -163,7 +163,7 @@ module Trellis
     def status(target_table)
       return if off_database?("this status wasn't read: #{target_table}")
 
-      Migration.with_handle { Trellis.status(target_table) }
+      Migration.with_handle { |trellis| trellis.status(target_table) }
     end
 
     # ActiveRecord's entry point for running this migration in a direction:
@@ -197,7 +197,7 @@ module Trellis
 
       refuse_open_transaction!("this statement wasn't applied: #{statement}")
 
-      say_with_time("#{helper}(#{statement.inspect})") { Migration.with_handle { yield } }
+      say_with_time("#{helper}(#{statement.inspect})") { Migration.with_handle { |trellis| yield trellis } }
     end
 
     # Whether the migrating database belongs to an environment Trellis is off

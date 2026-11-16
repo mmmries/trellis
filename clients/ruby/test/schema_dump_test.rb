@@ -319,6 +319,32 @@ class SchemaDumpTest < Minitest::Test
     assert_equal exclusions, Trellis::SchemaDump.schema_flags(config, hash, parts)
   end
 
+  # A migration of the test environment's database, run by `db:prepare` in
+  # development, connects an instance to the test counterpart of the
+  # development database its url points at, whichever database the
+  # migration runs on; an instance at no database of database.yml, to the
+  # migrating one.
+  def test_a_migration_of_another_environment_connects_to_the_counterpart_of_the_configured_database
+    configurations = ActiveRecord::DatabaseConfigurations.new(
+      %w[development test].to_h do |env|
+        [env, { "primary" => { "adapter" => "postgresql", "host" => "h", "database" => "app_#{env}" },
+                "reports" => { "adapter" => "postgresql", "host" => "h", "database" => "reports_#{env}" } }]
+      end
+    )
+    primary_test = configurations.configs_for(env_name: "test", name: "primary")
+    dbname = lambda do |configured|
+      url = SchemaDump.migration_url(primary_test, configured, "test")
+      PG::Connection.conninfo_parse(url).to_h { |entry| [entry[:keyword], entry[:val]] }.fetch("dbname")
+    end
+    ActiveRecord::Base.stub(:configurations, configurations) do
+      Tasks.stub(:env, "development") do
+        assert_equal "app_test", dbname.call("host=h dbname=app_development")
+        assert_equal "reports_test", dbname.call("postgres://h/reports_development")
+        assert_equal "app_test", dbname.call("host=elsewhere dbname=warehouse")
+      end
+    end
+  end
+
   def test_another_environment_s_url_takes_the_libpq_keys_rails_accepts
     configured = "host=devhost hostaddr=10.0.0.1 port=5432 dbname=app_dev user=dev password=x"
     hash = { adapter: "postgresql", host: "testhost", dbname: "app_test", user: "bob" }
