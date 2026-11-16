@@ -351,7 +351,8 @@ every public item.
 Public enums and the status and report structs (`DefinitionStatus`,
 `SelfCheckReport` and the like) are `#[non_exhaustive]`: match an enum with a
 wildcard arm, and read a struct's fields rather than building or destructuring
-it exhaustively. An error's contract is its `code()` (an `ErrorCode`) and its
+it exhaustively. An error's contract is its `code()` (an `ErrorCode`), its
+`error_id()` (an `ErrorId`, `T0042`, which the message starts with) and its
 `Display` message, as for the bindings ([ADR-0010](decisions/0010-embeddable-clients.md),
 decision 4). Match an error's variants if useful, but some variants carry
 engine types that aren't public, so don't rely on their payloads. The options structs (`TrellisOptions`, `ClientOptions`) are

@@ -95,7 +95,7 @@ defmodule Trellis.LogBridgeTest do
   test "an unknown filter word is a validation error, and the installed filter survives it", %{
     trellis: trellis
   } do
-    assert {:error, {"validation", _}} = Trellis.Native.install_log_bridge("verbose")
+    assert {:error, {"validation", nil, _}} = Trellis.Native.install_log_bridge("verbose")
 
     log =
       capture_log(fn ->

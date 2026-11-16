@@ -173,8 +173,11 @@ fn select_sql(
     // a `JOIN`'s keeps its columns' tables, and a reference to a `GROUP BY`
     // key's field reads the key.
     let substituted: HashMap<&str, Expr> = match join {
-        None => super::backfill::substitute_all_fields(def)
-            .map_err(|err| TargetSelectError::Unsubstitutable(err.to_string()))?,
+        None => super::backfill::substitute_all_fields(def).map_err(|err| {
+            TargetSelectError::Unsubstitutable(
+                crate::error_code::Message::message(&err).to_string(),
+            )
+        })?,
         Some(_) => def
             .fields
             .iter()

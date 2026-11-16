@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 module Trellis
-  # An error from Trellis: the engine's message and a stable #code, and
-  # nothing else (ADR-0010 decision 4). Every error the binding raises is one
+  # An error from Trellis: the engine's message, a stable #code and the
+  # per-error #error_id, and nothing else (ADR-0010 decision 4). Every error the binding raises is one
   # of the subclasses below, so `rescue Trellis::Error` catches them all, and
   # `rescue Trellis::NotFoundError` just one kind.
   #
@@ -20,13 +20,23 @@ module Trellis
       self.class::CODE
     end
 
-    # The exception for the native extension's `(code, message)` pair.
-    # Not part of the public API.
-    def self.from_native(code, message)
-      klass = BY_CODE[code]
-      return klass.new(message) if klass
+    # The engine's per-error code, such as "T0042", which the message also
+    # starts with: the thing to look up. nil for an error the binding raises
+    # itself.
+    attr_reader :error_id
 
-      UnknownError.new("(error code #{code.inspect}) #{message}")
+    def initialize(message = nil, error_id: nil)
+      super(message)
+      @error_id = error_id
+    end
+
+    # The exception for the native extension's `(code, error_id, message)`.
+    # Not part of the public API.
+    def self.from_native(code, error_id, message)
+      klass = BY_CODE[code]
+      return klass.new(message, error_id: error_id) if klass
+
+      UnknownError.new("(error code #{code.inspect}) #{message}", error_id: error_id)
     end
   end
 

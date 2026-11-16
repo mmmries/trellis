@@ -43,6 +43,7 @@
 
 use crate::app::TrellisError;
 use crate::config::Config;
+use crate::error_code::Message as _;
 use crate::pool::{Pool, quote_ident};
 
 /// What loading a table does.
@@ -884,7 +885,8 @@ pub(crate) async fn restore_queued(
             code,
             message,
         };
-        let catalog = |err: crate::defs::CatalogError| refused(err.code(), err.to_string());
+        let catalog =
+            |err: crate::defs::CatalogError| refused(err.code(), err.message().to_string());
         let target = unparsed.target_table;
         // A definition the catalog already holds for this target: the same
         // one dequeues, a different one refuses (see above).

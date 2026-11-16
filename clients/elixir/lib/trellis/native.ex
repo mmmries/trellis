@@ -1,8 +1,8 @@
 defmodule Trellis.Native do
   @moduledoc false
   # The NIF boundary (native/trellis_nif). Every result is `{:ok, value}` or
-  # `{:error, {code, message}}` with `code` a binary; `Trellis` turns the
-  # error into a `Trellis.Error`.
+  # `{:error, {code, error_id, message}}` with `code` a binary and `error_id`
+  # a binary or nil; `Trellis` turns the error into a `Trellis.Error`.
   #
   # A call on a handle doesn't run on a dirty scheduler: the NIF submits it
   # on a normal one and returns `{:ok, call_ref}` at once, and the engine
@@ -65,7 +65,8 @@ defmodule Trellis.Native do
   Runs `function` on `handle` (a handle's `ref`) with `args` and waits for its
   result, in the calling process.
   """
-  @spec call(reference(), atom(), [term()]) :: {:ok, term()} | {:error, {String.t(), String.t()}}
+  @spec call(reference(), atom(), [term()]) ::
+          {:ok, term()} | {:error, {String.t(), String.t() | nil, String.t()}}
   def call(handle, function, args) do
     case Kernel.apply(__MODULE__, function, [handle | args]) do
       {:ok, call_ref} when is_reference(call_ref) -> await(call_ref, @reply_backstop_ms)
@@ -78,14 +79,14 @@ defmodule Trellis.Native do
   # The wait for call `call_ref`'s reply, public so a test can drive the
   # backstop with a short one.
   @spec await(reference(), non_neg_integer()) ::
-          {:ok, term()} | {:error, {String.t(), String.t()}}
+          {:ok, term()} | {:error, {String.t(), String.t() | nil, String.t()}}
   def await(call_ref, backstop_ms) do
     receive do
       {^call_ref, result} -> result
     after
       backstop_ms ->
         {:error,
-         {"timeout",
+         {"timeout", nil,
           "no reply from the engine within #{backstop_ms} ms, past the call's 30-second deadline"}}
     end
   end

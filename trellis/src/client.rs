@@ -58,7 +58,7 @@ use crate::capture::{self, CaptureError};
 use crate::config::Config;
 use crate::defs::chunk_queue;
 use crate::defs::{self, CatalogError};
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId, Message as _};
 use crate::handover::{self, Verdict};
 use crate::intake::IntakeError;
 use crate::pool::{Pool, quote_ident};
@@ -405,10 +405,30 @@ impl ClientError {
             ClientError::Apply(err) => err.code(),
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            ClientError::HeartbeatNotUnderReclaimTtl { .. } => ErrorId(202),
+            ClientError::Spawn(..) => ErrorId(203),
+            ClientError::ThreadExitedBeforeReady => ErrorId(204),
+            ClientError::ThreadPanicked => ErrorId(205),
+            ClientError::Config(err) => err.error_id(),
+            ClientError::Db(..) => ErrorId(206),
+            ClientError::Catalog(err) => err.error_id(),
+            ClientError::Staging(err) => err.error_id(),
+            ClientError::Intake(err) => err.error_id(),
+            ClientError::Apply(err) => err.error_id(),
+        }
+    }
 }
 
-impl fmt::Display for ClientError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(ClientError);
+
+impl crate::error_code::Message for ClientError {
+    fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::HeartbeatNotUnderReclaimTtl {
                 heartbeat_interval,
@@ -432,15 +452,15 @@ impl fmt::Display for ClientError {
                     "the client's runtime thread panicked while shutting down"
                 )
             }
-            ClientError::Config(err) => write!(f, "{err}"),
+            ClientError::Config(err) => err.fmt_message(f),
             ClientError::Db(err) => {
                 write!(f, "client setup database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            ClientError::Catalog(err) => write!(f, "{err}"),
-            ClientError::Staging(err) => write!(f, "{err}"),
-            ClientError::Intake(err) => write!(f, "{err}"),
-            ClientError::Apply(err) => write!(f, "{err}"),
+            ClientError::Catalog(err) => err.fmt_message(f),
+            ClientError::Staging(err) => err.fmt_message(f),
+            ClientError::Intake(err) => err.fmt_message(f),
+            ClientError::Apply(err) => err.fmt_message(f),
         }
     }
 }
@@ -3069,14 +3089,14 @@ fn cannot_migrate_reason(err: &crate::error::Error) -> String {
         // one names it already.
         let detail = match err {
             crate::error::Error::Migrate(inner) => format!("failed to apply migrations: {inner}"),
-            other => other.to_string(),
+            other => other.message().to_string(),
         };
         format!(
             "migrations or takeover work pending and this role cannot run them: run `migrate` \
              with a role that can (`trellis run`, a deploy step) ({detail})"
         )
     } else {
-        format!("migrate refused: {err}")
+        format!("migrate refused: {}", err.message())
     }
 }
 

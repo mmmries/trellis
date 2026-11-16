@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId};
 use crate::staging::StagingError;
 
 /// Failure modes of the intake helpers.
@@ -63,14 +63,31 @@ impl IntakeError {
             | IntakeError::NoIdentityKey { .. } => ErrorCode::Internal,
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            IntakeError::Staging(err) => err.error_id(),
+            IntakeError::Db(..) => ErrorId(198),
+            IntakeError::InvalidTableName(..) => ErrorId(199),
+            IntakeError::DottedIdentifierComponent { .. } => ErrorId(200),
+            IntakeError::NoIdentityKey { .. } => ErrorId(201),
+            IntakeError::Catalog(err) => err.error_id(),
+            IntakeError::Propagation(err) => err.error_id(),
+        }
+    }
 }
 
-impl fmt::Display for IntakeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(IntakeError);
+
+impl crate::error_code::Message for IntakeError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntakeError::Staging(err) => write!(f, "{err}"),
-            IntakeError::Catalog(err) => write!(f, "{err}"),
-            IntakeError::Propagation(err) => write!(f, "{err}"),
+            IntakeError::Staging(err) => err.fmt_message(f),
+            IntakeError::Catalog(err) => err.fmt_message(f),
+            IntakeError::Propagation(err) => err.fmt_message(f),
             IntakeError::Db(err) => {
                 write!(f, "backfill database error: ")?;
                 crate::error::write_pg_error(f, err)

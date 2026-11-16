@@ -138,6 +138,67 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// A stable per-error code: `T` and four digits (`T0042`), the thing a person
+/// looks up, where [`ErrorCode`] is the category a host branches on
+/// (`docs/decisions/0008-public-api-design.md`, decision 3).
+///
+/// Every error variant a caller can see has one, and its message starts with
+/// it (`T0042: ...`). A variant that only wraps another error reports the
+/// wrapped error's code. Codes are assigned sequentially, never reused or
+/// renumbered: changing or removing one is a breaking change, renaming the
+/// Rust variant is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ErrorId(pub(crate) u16);
+
+impl ErrorId {
+    /// The code's number: 42 for `T0042`.
+    pub fn number(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Display for ErrorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "T{:04}", self.0)
+    }
+}
+
+/// A coded error's message without its [`ErrorId`] prefix. Its `Display`
+/// writes the code and then this; a message that embeds another coded error
+/// writes that error's [`Message::message`], so the text carries one code.
+pub(crate) trait Message {
+    /// Writes the message, without the code.
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+
+    /// The message, without the code, as something to format.
+    fn message(&self) -> MessageOf<'_, Self> {
+        MessageOf(self)
+    }
+}
+
+/// [`Message::message`]'s value.
+pub(crate) struct MessageOf<'a, E: ?Sized>(&'a E);
+
+impl<E: Message + ?Sized> fmt::Display for MessageOf<'_, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt_message(f)
+    }
+}
+
+/// Implements `Display` for a coded error as `<ErrorId>: <message>`, from its
+/// inherent `error_id()` and its [`Message`].
+macro_rules! coded_display {
+    ($ty:ty) => {
+        impl ::std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                write!(f, "{}: ", self.error_id())?;
+                $crate::error_code::Message::fmt_message(self, f)
+            }
+        }
+    };
+}
+pub(crate) use coded_display;
+
 /// Test-only: asserts that `$ty::ALL` holds exactly the variants named, and
 /// that the names are every variant of `$ty`.
 ///
@@ -254,6 +315,31 @@ mod tests {
         assert_eq!(names.len(), ErrorCode::ALL.len());
     }
 
+    /// A message starts with its code; a wrapping variant reports the
+    /// wrapped error's code, and its context, once.
+    #[test]
+    fn a_message_starts_with_its_code_once() {
+        let leaf = crate::TrellisError::SourceTableNotFound("widgets".to_string());
+        assert_eq!(leaf.error_id().to_string(), "T0209");
+        assert_eq!(
+            leaf.to_string(),
+            "T0209: source table \"widgets\" not found on the search path"
+        );
+
+        let inner = crate::ParseError::UnterminatedString;
+        let wrapped = crate::TrellisError::Catalog(crate::CatalogError::Parse(inner.clone()));
+        assert_eq!(wrapped.error_id(), inner.error_id());
+        assert_eq!(
+            wrapped.to_string(),
+            format!(
+                "{}: failed to parse transform definition: {}",
+                inner.error_id(),
+                inner.message()
+            )
+        );
+        assert!(inner.to_string().starts_with("T0002: "), "{inner}");
+    }
+
     /// The server reporting a dead or unavailable connection is
     /// connectivity, whichever connection it happened to.
     #[test]
@@ -311,3 +397,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod assigned;

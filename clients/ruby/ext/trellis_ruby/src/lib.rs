@@ -34,7 +34,7 @@
 //!   (statuses, quarantine states, `apply` outcome kinds, `self_check` outcomes and divergence kinds), but only
 //!   words from the closed sets `trellis-embed` lists, which [`init`] interns
 //!   up front, never a string read from the database.
-//! - **Errors cross as `(code, message)`.** Ruby's `Trellis::Error.from_native`
+//! - **Errors cross as `(code, error_id, message)`.** Ruby's `Trellis::Error.from_native`
 //!   picks the exception class for the code, so the code-to-class map lives in
 //!   one place, `lib/trellis/error.rb`.
 //!
@@ -830,7 +830,9 @@ fn trellis_module(ruby: &Ruby) -> Result<RModule, Error> {
 fn raise(ruby: &Ruby, err: PlainError) -> Error {
     let exception = trellis_module(ruby)
         .and_then(|module| module.const_get::<_, RClass>("Error"))
-        .and_then(|class| class.funcall::<_, _, Exception>("from_native", (err.code, err.message)));
+        .and_then(|class| {
+            class.funcall::<_, _, Exception>("from_native", (err.code, err.error_id, err.message))
+        });
     match exception {
         Ok(exception) => exception.into(),
         Err(err) => err,

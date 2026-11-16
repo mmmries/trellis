@@ -929,7 +929,7 @@ defmodule Trellis do
 
   defp local_ref(ref) do
     {:error,
-     {"validation",
+     {"validation", nil,
       "this Trellis handle was connected on node #{node(ref)}; " <>
         "a handle works only on the node that connected it, so call it there"}}
   end

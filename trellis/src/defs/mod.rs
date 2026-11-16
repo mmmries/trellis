@@ -153,6 +153,7 @@ mod table_key_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error_code::Message as _;
 
     #[test]
     fn parses_a_binary_add_expression() {
@@ -1204,7 +1205,7 @@ mod tests {
             }
         );
         assert_eq!(
-            err.to_string(),
+            err.message().to_string(),
             "GROUP BY key 'product.kind' does not name this transform's FROM table ('orders'); \
              a qualified key must name the FROM table, and a second table is read with a JOIN"
         );

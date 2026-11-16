@@ -68,9 +68,16 @@ defmodule Trellis.ParityTest do
 
       value =
         case conversion["type"] do
-          "Error" -> Parity.canonical(Trellis.Error.from_native({native.code, native.message}))
-          "Applied" -> Parity.canonical_applied(Trellis.Applied.from_native(native))
-          type -> Parity.canonical(Module.concat(Trellis, type).from_native(native))
+          "Error" ->
+            Parity.canonical(
+              Trellis.Error.from_native({native.code, native[:error_id], native.message})
+            )
+
+          "Applied" ->
+            Parity.canonical_applied(Trellis.Applied.from_native(native))
+
+          type ->
+            Parity.canonical(Module.concat(Trellis, type).from_native(native))
         end
 
       assert_shape(conversion["expect"], value, %{}, conversion["about"])

@@ -114,7 +114,7 @@ use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::{Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT};
 use crate::defs::source_index::{ExtremeIndexGap, SourceIndexGap};
 use crate::defs::{self, CatalogError, ParseError, StoredStatus, TransformStatus, ValueType};
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId, Message as _};
 use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
@@ -641,7 +641,7 @@ impl Trellis {
         .await;
         match found {
             Some(found) => TrellisError::Catalog(CatalogError::NameCaseMismatch {
-                error: err.to_string(),
+                error: err.message().to_string(),
                 code: err.code(),
                 found,
             }),
@@ -3253,15 +3253,47 @@ impl TrellisError {
             }
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            TrellisError::Parse(err) => err.error_id(),
+            TrellisError::MigrationsPending { .. } => ErrorId(207),
+            TrellisError::Catalog(err) => err.error_id(),
+            TrellisError::Client(err) => err.error_id(),
+            TrellisError::Engine(err) => err.error_id(),
+            TrellisError::Db(..) => ErrorId(208),
+            TrellisError::SourceTableNotFound(..) => ErrorId(209),
+            TrellisError::TableNotCaptured { .. } => ErrorId(210),
+            TrellisError::AmbiguousSourceTable { .. } => ErrorId(211),
+            TrellisError::BlockingSpawn(..) => ErrorId(212),
+            TrellisError::BlockingThreadExitedBeforeReady => ErrorId(213),
+            TrellisError::BlockingThreadGone => ErrorId(214),
+            TrellisError::CancelledByShutdown => ErrorId(215),
+            TrellisError::CalledFromAsyncContext => ErrorId(216),
+            TrellisError::Apply(err) => err.error_id(),
+            TrellisError::TransformNotFound(..) => ErrorId(217),
+            TrellisError::ColumnNotFound { .. } => ErrorId(218),
+            TrellisError::Staging(err) => err.error_id(),
+            TrellisError::SelfCheck(err) => err.error_id(),
+            TrellisError::CallTimeout { .. } => ErrorId(219),
+            TrellisError::OtherVersionLive(..) => ErrorId(220),
+            TrellisError::TargetSelect { .. } => ErrorId(221),
+        }
+    }
 }
 
-impl std::fmt::Display for TrellisError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+crate::error_code::coded_display!(TrellisError);
+
+impl crate::error_code::Message for TrellisError {
+    fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TrellisError::Parse(err) => write!(f, "{err}"),
-            TrellisError::Catalog(err) => write!(f, "{err}"),
-            TrellisError::Client(err) => write!(f, "{err}"),
-            TrellisError::Engine(err) => write!(f, "{err}"),
+            TrellisError::Parse(err) => err.fmt_message(f),
+            TrellisError::Catalog(err) => err.fmt_message(f),
+            TrellisError::Client(err) => err.fmt_message(f),
+            TrellisError::Engine(err) => err.fmt_message(f),
             TrellisError::Db(err) => {
                 write!(f, "database error: ")?;
                 crate::error::write_pg_error(f, err)
@@ -3300,7 +3332,7 @@ impl std::fmt::Display for TrellisError {
                 "BlockingTrellis was called from a thread that already has a tokio runtime \
                  entered; call the async Trellis directly in that context instead"
             ),
-            TrellisError::Apply(err) => write!(f, "{err}"),
+            TrellisError::Apply(err) => err.fmt_message(f),
             TrellisError::TransformNotFound(target) => {
                 write!(f, "no transform named \"{target}\" is registered")
             }
@@ -3317,8 +3349,8 @@ impl std::fmt::Display for TrellisError {
                     declared.join(", ")
                 }
             ),
-            TrellisError::Staging(err) => write!(f, "{err}"),
-            TrellisError::SelfCheck(err) => write!(f, "{err}"),
+            TrellisError::Staging(err) => err.fmt_message(f),
+            TrellisError::SelfCheck(err) => err.fmt_message(f),
             TrellisError::CallTimeout {
                 budget,
                 abandoned: false,
@@ -3345,7 +3377,8 @@ impl std::fmt::Display for TrellisError {
             TrellisError::MigrationsPending { pending, error } => {
                 write!(
                     f,
-                    "refused: {pending}; the catalog can't be read until they run: {error}"
+                    "refused: {pending}; the catalog can't be read until they run: {}",
+                    error.message()
                 )
             }
         }

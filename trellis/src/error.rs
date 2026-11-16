@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId};
 
 /// Errors that can occur while resolving configuration, connecting to
 /// Postgres, or running migrations.
@@ -92,10 +92,31 @@ impl Error {
             Error::SchemaDump(_) => ErrorCode::Internal,
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            Error::Config(..) => ErrorId(222),
+            Error::BuildPool(..) => ErrorId(223),
+            Error::Pool(..) => ErrorId(224),
+            Error::Connect(..) => ErrorId(225),
+            Error::Migrate(..) => ErrorId(226),
+            Error::IncompatibleInstance(..) => ErrorId(227),
+            Error::OtherVersionLive(..) => ErrorId(228),
+            Error::BelowCatalogFloor { .. } => ErrorId(229),
+            Error::MigrationHistory(..) => ErrorId(230),
+            Error::RestoreDefinition { .. } => ErrorId(231),
+            Error::SchemaDump(..) => ErrorId(232),
+        }
+    }
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(Error);
+
+impl crate::error_code::Message for Error {
+    fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Config(msg) => write!(f, "invalid trellis configuration: {msg}"),
             Error::BuildPool(err) => write!(f, "failed to build connection pool: {err}"),

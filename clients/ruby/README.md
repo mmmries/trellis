@@ -367,7 +367,9 @@ default one included.
   `NotFoundError`, `InternalError`, `TimeoutError`, `VersionHandoverError`,
   `VersionFloorError`),
   each with `#code` (a
-  symbol) and `#message`. A code newer than the binding arrives as
+  symbol), `#error_id` (the engine's per-error code, `"T0042"`, which the
+  message starts with; `nil` for an error the binding raises itself) and
+  `#message`. A code newer than the binding arrives as
   `UnknownError`, naming the code in its message. `ForkedHandleError` is a
   `ValidationError`. Raising is Ruby's idiom, so where the Elixir binding
   has `{:ok, value}` / `{:error, error}` and bang variants, every Ruby

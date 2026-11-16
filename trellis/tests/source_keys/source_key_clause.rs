@@ -190,12 +190,14 @@ async fn an_unbacked_key_outcome_is_the_resume_refusal() {
         reason.contains("no unique index backs KEY (k1, k2) on 'public.s'"),
         "{reason}"
     );
-    // Define refuses an unbacked `KEY` too, so the outcome says so.
+    // Define refuses an unbacked `KEY` too, so the outcome says so, with
+    // the refusal's code first.
+    let (code, message) = reason.split_once(": ").expect("a coded message");
     assert_eq!(
         outcome,
         format!(
-            "RESUME would refuse: define would refuse the definition as the schema stands \
-             now: {reason}"
+            "RESUME would refuse: {code}: define would refuse the definition as the schema \
+             stands now: {message}"
         )
     );
     assert_eq!(
