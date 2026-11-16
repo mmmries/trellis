@@ -1256,12 +1256,12 @@ if want mixed; then
   sleep 15
   workers=$(scalar "$port" mixed "select count(*) from trellis.worker_registry where last_seen > now() - interval '30 seconds'")
   paused_n=$(scalar "$port" mixed "select count(*) from trellis.capture_failures")
-  # ADR-0023: the candidate's `trellis run` stands by, with this message, and
-  # runs no migration while the old instance is live.
-  standby_msg='trellis standing by: migrations are pending and Trellis processes are live on this instance'
-  if run_alive new-mixed && grep -qF "$standby_msg" "$logs/run-new-mixed.log" &&
+  # ADR-0023: the candidate's `trellis run` stands by, logging this message,
+  # and runs no migration while the old instance is live.
+  standby_msg='standing by: .*migrations are pending and Trellis processes are live'
+  if run_alive new-mixed && grep -qE "$standby_msg" "$logs/run-new-mixed.log" &&
      [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && [ "$paused_n" -eq 0 ]; then
-    record PASS mixed "the candidate stands by beside a live $old_tag instance: no migration ran, nothing paused ($(grep -F "$standby_msg" "$logs/run-new-mixed.log" | head -1 | cut -c1-200))"
+    record PASS mixed "the candidate stands by beside a live $old_tag instance: no migration ran, nothing paused ($(grep -E "$standby_msg" "$logs/run-new-mixed.log" | head -1 | cut -c1-200))"
   else
     record FAIL mixed "the candidate did not stand by beside a live $old_tag instance ($workers workers registered, $paused_n paused, candidate process $(run_alive new-mixed && echo running || echo exited), history $( [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixed.log" | cut -c1-300))"
   fi
@@ -1289,7 +1289,7 @@ if want mixed; then
   taken=0
   for _ in $(seq 1 120); do
     if [ "$(history "$port" mixed | wc -l)" -gt "$(wc -l <<<"$pre_mixed_history")" ] &&
-       grep -q 'migrated, taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
+       grep -q 'pending migrations (.*); taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
     sleep 0.5
   done
   if [ "$taken" -eq 1 ] && run_alive new-mixed; then

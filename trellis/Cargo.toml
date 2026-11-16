@@ -124,7 +124,7 @@ otlp = [
 # feature, activated only by its self dev-dependency. Any future enabler
 # must do the same. `.github/scripts/check-release-binary.sh` checks that the
 # CLI binary holds none of the pause hook's, the plant hook's or `dev`'s strings
-# (`TRELLIS_TEST_PAUSE`, `TRELLIS_TEST_PLANT`, `render_aggregate_select_sql`);
+# (`TRELLIS_TEST_PAUSE`, `TRELLIS_TEST_PLANT`, `TRELLIS_TEST_STANDBY_POLL_MS`, `render_aggregate_select_sql`);
 # CI runs it, and so does the release build.
 test-util = []
 # ADR-0012, and *not* its sanctioned exception. `defs`/`staging`/`intake` are

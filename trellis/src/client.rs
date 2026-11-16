@@ -1683,6 +1683,35 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 /// How often a standby tries to take the staging-worker singleton.
 const STANDBY_POLL: Duration = Duration::from_secs(5);
 
+/// The environment variable that replaces the standby poll, and the wait
+/// after a refused `migrate`, with this many milliseconds, so an end-to-end
+/// test of a process that stands by needn't wait out 5 or 60 seconds. Read
+/// only in builds with the `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
+const TEST_STANDBY_POLL_ENV: &str = "TRELLIS_TEST_STANDBY_POLL_MS";
+
+/// The standby poll: [`STANDBY_POLL`], or the test override.
+fn standby_poll() -> Duration {
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(ms) = std::env::var(TEST_STANDBY_POLL_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    STANDBY_POLL
+}
+
+/// The wait after a refused `migrate` that waits on an operator:
+/// [`MIGRATE_REFUSED_RETRY`], or the test override.
+fn migrate_refused_retry() -> Duration {
+    #[cfg(any(test, feature = "test-util"))]
+    if std::env::var_os(TEST_STANDBY_POLL_ENV).is_some() {
+        return standby_poll();
+    }
+    MIGRATE_REFUSED_RETRY
+}
+
 /// How soon a leader that lost its session retries the singleton, then again,
 /// before it falls back to [`STANDBY_POLL`]. Its lock frees as soon as the
 /// server sees the session go, so the retry usually wins it straight back.
@@ -1707,7 +1736,7 @@ impl LockSchedule {
     fn standby(now: Instant) -> Self {
         Self {
             refused: LOST_LEADER_RETRIES.len(),
-            next: now + STANDBY_POLL,
+            next: now + standby_poll(),
         }
     }
 
@@ -1742,7 +1771,7 @@ impl LockSchedule {
         let delay = LOST_LEADER_RETRIES
             .get(self.refused)
             .copied()
-            .unwrap_or(STANDBY_POLL);
+            .unwrap_or_else(standby_poll);
         self.next = now + delay;
     }
 }
@@ -2817,7 +2846,7 @@ async fn worker_upkeep_pass(pool: &Pool, reclaim_ttl: Duration) {
 /// often as [`upkeep_interval`], so the registry row stays live across two
 /// missed passes.
 fn handover_interval(reclaim_ttl: Duration) -> Duration {
-    STANDBY_POLL.min(upkeep_interval(reclaim_ttl))
+    standby_poll().min(upkeep_interval(reclaim_ttl))
 }
 
 /// A background process's identity in the worker registry: what its
@@ -2869,7 +2898,7 @@ fn migrate_retry_after(err: &crate::error::Error) -> Option<Duration> {
             | Error::MigrationHistory(_)
             | Error::RestoreDefinition { .. }
     ) || crate::error::permission_denied(err);
-    waits_on_an_operator.then_some(MIGRATE_REFUSED_RETRY)
+    waits_on_an_operator.then(migrate_refused_retry)
 }
 
 /// How long a background process waits to try `migrate` again after a
