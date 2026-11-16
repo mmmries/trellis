@@ -33,7 +33,7 @@ here is maintained by, and the grammar of
 has a `GROUP BY`. A join with no `GROUP BY` keeps one row per row of `a`, the
 1-1 grain, and is a 1-1 JOIN transform
 ([ADR-0021](0021-one-to-one-join-transforms.md)). Three or more tables,
-`RIGHT`/`FULL` joins, non-equi joins and `WHERE` are out of scope.
+`RIGHT`/`FULL` joins and non-equi joins are out of scope.
 
 ## Decisions
 
@@ -86,8 +86,16 @@ would break a stored definition, which is stored as text and re-parsed.
   becomes a target column named after its bare column name, so two keys with
   the same bare name (`orders.region`, `customers.region`) are refused; a 1-1
   transform that renames the column on one side is the remedy.
-- **`WHERE`.** `TRUE`-only, as on every transform; a future `WHERE` applies
-  after the join, as in SQL.
+- **`WHERE`.** A total predicate ([ADR-0004](0004-transform-definition-grammar.md)),
+  split into its top-level `AND` conjuncts. Each conjunct reads one side's
+  columns and filters that side's rows before they reach its partials: `a`'s
+  conjuncts decide what `P` counts, `b`'s what `M` counts. Under `INNER` this
+  equals SQL's filter after the join, because a row that fails its side's
+  conjunct joins nothing that survives the filter. Under `LEFT`, a conjunct on
+  `b` is refused: in SQL it also removes the unmatched `a` rows a `LEFT` keeps,
+  which makes the join an `INNER` one, so the refusal names `INNER JOIN`. Also
+  refused: a conjunct that reads both sides (no one side can apply it) and a
+  conjunct that reads no column.
 
 What's admitted is the shape the design below is proven exact for. Refused at
 define, by name: two sides sharing a bare table name; `RIGHT` (swap the sides
@@ -151,6 +159,9 @@ of the last:
   `matches = Σ M.n` over the key.
 - **`T(ga, gb)`**: the target's groups, holding the joined partials
   `Σ_k P[ga,k] ⊗ M[k,gb]`.
+
+With a `WHERE`, `P` and `M` count only their side's passing rows. `J`, `T`,
+the product `⊗` and the locks are unchanged.
 
 `P`, `M`, `J`, `T`'s partials and the pair's truncate lock row belong to one
 definition, never shared with another, and live in hidden tables in the
@@ -395,9 +406,10 @@ It doesn't refuse: the transform is correct, only expensive.
 
 ### `self_check` audits JOIN targets and their hidden structures
 
-`self_check` compares the target with the `JOIN … GROUP BY` query, and audits
-the invariants `P = GROUP BY a`, `M = GROUP BY b`, `J.matches = Σ M.n` and
-`T = Σ_k P ⊗ M`. It detects and reports, and never repairs; the scope and
+`self_check` compares the target with the `JOIN … GROUP BY` query, with the
+definition's `WHERE` applied verbatim (not the engine's per-side split), and
+audits the invariants `P = GROUP BY a`, `M = GROUP BY b` (each over its side's
+passing rows), `J.matches = Σ M.n` and `T = Σ_k P ⊗ M`. It detects and reports, and never repairs; the scope and
 semantics are in [ADR-0013](0013-self-check-production-recompute-audit.md).
 
 ### Enrichment at the fact's own grain is a 1-1 JOIN transform
@@ -469,7 +481,8 @@ query shows them.
   target; after it, values are exact.
 - The admitted aggregate set is `COUNT`, `SUM` and `AVG` over integers and
   scaled `numeric`, with arguments over one side. Each other aggregate, an
-  argument mixing the sides, and the out-of-scope
-  join shapes are refused until designed.
+  argument mixing the sides, a `b`-side `WHERE` conjunct under `LEFT`, a
+  conjunct that mixes the sides, and the out-of-scope join shapes are refused
+  until designed.
 - A transform that copies a dimension attribute onto every fact row is a
   1-1 JOIN transform (ADR-0021), not a JOIN aggregate.
