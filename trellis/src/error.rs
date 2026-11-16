@@ -104,7 +104,7 @@ impl Error {
             Error::Connect(..) => ErrorId(225),
             Error::Migrate(..) => ErrorId(226),
             Error::IncompatibleInstance(..) => ErrorId(227),
-            Error::OtherVersionLive(..) => ErrorId(228),
+            Error::OtherVersionLive(seen) => seen.error_id(),
             Error::BelowCatalogFloor { .. } => ErrorId(229),
             Error::MigrationHistory(..) => ErrorId(230),
             Error::RestoreDefinition { .. } => ErrorId(231),

@@ -340,6 +340,38 @@ mod tests {
         assert!(inner.to_string().starts_with("T0002: "), "{inner}");
     }
 
+    /// A variant that carries another error, or the same payload as a
+    /// variant of another enum, reports that one code.
+    #[test]
+    fn one_condition_reports_one_code() {
+        let reason = crate::CatalogError::SourceTableNotFound("widgets".to_string());
+        let id = reason.error_id();
+        let refused = crate::ApplyError::ResumeRefused {
+            transform: "totals".to_string(),
+            reason: Box::new(reason),
+        };
+        assert_eq!(refused.error_id(), id);
+        assert!(
+            refused
+                .to_string()
+                .starts_with(&format!("{id}: 'totals' can't resume: ")),
+            "{refused}"
+        );
+
+        let seen = crate::OtherVersionLive {
+            this_version: "0.4.0".to_string(),
+            processes: Vec::new(),
+            unregistered_staging_worker: true,
+            migrations_pending: false,
+        };
+        let refused = crate::TrellisError::OtherVersionLive(seen.clone());
+        assert_eq!(refused.error_id().to_string(), "T0220");
+        assert_eq!(
+            crate::Error::OtherVersionLive(seen).error_id(),
+            refused.error_id()
+        );
+    }
+
     /// The server reporting a dead or unavailable connection is
     /// connectivity, whichever connection it happened to.
     #[test]

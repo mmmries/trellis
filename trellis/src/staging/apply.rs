@@ -375,8 +375,8 @@ impl ApplyError {
             ApplyError::TransformNotPaused { .. } => ErrorId(177),
             ApplyError::KeyNotHeld { .. } => ErrorId(178),
             ApplyError::ReleaseLockTimeout { .. } => ErrorId(179),
-            ApplyError::ColumnPauseLockTimeout(..) => ErrorId(180),
-            ApplyError::ResumeRefused { .. } => ErrorId(181),
+            ApplyError::ColumnPauseLockTimeout(err) => err.error_id(),
+            ApplyError::ResumeRefused { reason, .. } => reason.error_id(),
             ApplyError::TruncateWithoutLsn { .. } => ErrorId(182),
         }
     }

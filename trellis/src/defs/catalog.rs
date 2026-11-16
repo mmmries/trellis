@@ -658,7 +658,7 @@ impl CatalogError {
             CatalogError::AlterFieldNotFound { .. } => ErrorId(155),
             CatalogError::AlterFieldAlreadyExists { .. } => ErrorId(156),
             CatalogError::UnsupportedAlter(..) => ErrorId(157),
-            CatalogError::ColumnPauseLockTimeout(..) => ErrorId(158),
+            CatalogError::ColumnPauseLockTimeout(err) => err.error_id(),
         }
     }
 }

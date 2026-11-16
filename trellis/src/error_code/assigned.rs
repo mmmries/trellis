@@ -4,7 +4,8 @@
 /// Every code assigned, in order, with the variant that reports it. A new
 /// error variant takes the next number and is appended here. An entry is
 /// never removed or renumbered: a code is public API. Renaming a variant
-/// renames its entry and keeps the code.
+/// renames its entry and keeps the code. A code no variant reports any more
+/// stays as `Tnnnn retired: <why>`, and is never reported again.
 const ASSIGNED: &[&str] = &[
     "T0001 ParseError::UnexpectedChar",
     "T0002 ParseError::UnterminatedString",
@@ -163,7 +164,7 @@ const ASSIGNED: &[&str] = &[
     "T0155 CatalogError::AlterFieldNotFound",
     "T0156 CatalogError::AlterFieldAlreadyExists",
     "T0157 CatalogError::UnsupportedAlter",
-    "T0158 CatalogError::ColumnPauseLockTimeout",
+    "T0158 ColumnPauseLockTimeout",
     "T0159 BackfillError::Db",
     "T0160 BackfillError::Unsupported",
     "T0161 BackfillError::Superseded",
@@ -185,8 +186,8 @@ const ASSIGNED: &[&str] = &[
     "T0177 ApplyError::TransformNotPaused",
     "T0178 ApplyError::KeyNotHeld",
     "T0179 ApplyError::ReleaseLockTimeout",
-    "T0180 ApplyError::ColumnPauseLockTimeout",
-    "T0181 ApplyError::ResumeRefused",
+    "T0180 retired: ApplyError::ColumnPauseLockTimeout reports T0158",
+    "T0181 retired: ApplyError::ResumeRefused reports its reason's code",
     "T0182 ApplyError::TruncateWithoutLsn",
     "T0183 StagingError::InvalidRingSlot",
     "T0184 StagingError::ProducerAlreadyRunning",
@@ -225,7 +226,7 @@ const ASSIGNED: &[&str] = &[
     "T0217 TrellisError::TransformNotFound",
     "T0218 TrellisError::ColumnNotFound",
     "T0219 TrellisError::CallTimeout",
-    "T0220 TrellisError::OtherVersionLive",
+    "T0220 OtherVersionLive",
     "T0221 TrellisError::TargetSelect",
     "T0222 Error::Config",
     "T0223 Error::BuildPool",
@@ -233,45 +234,65 @@ const ASSIGNED: &[&str] = &[
     "T0225 Error::Connect",
     "T0226 Error::Migrate",
     "T0227 Error::IncompatibleInstance",
-    "T0228 Error::OtherVersionLive",
+    "T0228 retired: Error::OtherVersionLive reports T0220",
     "T0229 Error::BelowCatalogFloor",
     "T0230 Error::MigrationHistory",
     "T0231 Error::RestoreDefinition",
     "T0232 Error::SchemaDump",
 ];
 
-/// The files whose error enums map variants to codes.
-const SOURCES: &[(&str, &str)] = &[
-    ("defs/error.rs", include_str!("../defs/error.rs")),
-    ("defs/validate.rs", include_str!("../defs/validate.rs")),
-    ("defs/ddl.rs", include_str!("../defs/ddl.rs")),
-    ("defs/catalog.rs", include_str!("../defs/catalog.rs")),
-    ("defs/backfill.rs", include_str!("../defs/backfill.rs")),
-    ("staging/apply.rs", include_str!("../staging/apply.rs")),
-    ("staging/error.rs", include_str!("../staging/error.rs")),
-    (
-        "staging/self_check.rs",
-        include_str!("../staging/self_check.rs"),
-    ),
-    ("intake/error.rs", include_str!("../intake/error.rs")),
-    ("client.rs", include_str!("../client.rs")),
-    ("app.rs", include_str!("../app.rs")),
-    ("error.rs", include_str!("../error.rs")),
-];
+/// Every `.rs` file under `src/` but this one, as (path, text): read at test
+/// time, so an error enum in a new file is checked without being listed.
+fn sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).expect("read src") {
+            let path = entry.expect("a src entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !path.ends_with("error_code/assigned.rs")
+            {
+                let text = std::fs::read_to_string(&path).expect("read a source file");
+                out.push((path.display().to_string(), text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut out,
+    );
+    out
+}
 
 /// Each `Enum::Variant ... => ErrorId(n),` arm in `source`, as `Tnnnn
-/// Enum::Variant`.
-fn arms(source: &str) -> Vec<(u16, String)> {
+/// Enum::Variant`. Every `ErrorId(<number>)` in `source` must be such an
+/// arm, naming one variant, so no code is assigned where this can't see it.
+fn arms(path: &str, source: &str) -> Vec<(u16, String)> {
     let mut found = Vec::new();
     for line in source.lines() {
         let line = line.trim();
-        let Some((pattern, rest)) = line.split_once(" => ErrorId(") else {
+        let literals = line
+            .match_indices("ErrorId(")
+            .filter(|(at, _)| {
+                line[at + "ErrorId(".len()..].starts_with(|c: char| c.is_ascii_digit())
+            })
+            .count();
+        if literals == 0 {
             continue;
+        }
+        let arm = line.split_once(" => ErrorId(").and_then(|(pattern, rest)| {
+            let (number, _) = rest.split_once(')')?;
+            Some((pattern, number.parse::<u16>().ok()?))
+        });
+        let Some((pattern, number)) = arm.filter(|(pattern, _)| {
+            literals == 1 && !pattern.contains('|') && !pattern.starts_with('_')
+        }) else {
+            panic!(
+                "{path}: `{line}` assigns a code outside a one-variant `Variant => ErrorId(n),` \
+                 arm, which this test can't check"
+            );
         };
-        let Some((number, _)) = rest.split_once(')') else {
-            continue;
-        };
-        let number: u16 = number.parse().expect("an ErrorId literal");
         let variant: String = pattern
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
@@ -282,10 +303,14 @@ fn arms(source: &str) -> Vec<(u16, String)> {
 }
 
 /// Codes are unique across the enums, every recorded code is still reported
-/// by the variant recorded for it, and every code reported is recorded.
+/// by the variant recorded for it, unless retired, and every code reported is
+/// recorded (so a retired code is never reported again).
 #[test]
 fn every_assigned_code_is_reported_once_by_its_variant() {
-    let mut found: Vec<(u16, String)> = SOURCES.iter().flat_map(|(_, s)| arms(s)).collect();
+    let mut found: Vec<(u16, String)> = sources()
+        .iter()
+        .flat_map(|(path, source)| arms(path, source))
+        .collect();
     found.sort();
     for pair in found.windows(2) {
         assert_ne!(
@@ -299,6 +324,9 @@ fn every_assigned_code_is_reported_once_by_its_variant() {
             entry.starts_with(&format!("T{:04} ", index + 1)),
             "ASSIGNED is out of order at {entry}: codes are sequential"
         );
+        if entry.contains(" retired: ") {
+            continue;
+        }
         assert!(
             found.iter().any(|(_, arm)| arm == entry),
             "{entry} is no longer reported: a code is never removed or moved to another \

@@ -3279,7 +3279,7 @@ impl TrellisError {
             TrellisError::Staging(err) => err.error_id(),
             TrellisError::SelfCheck(err) => err.error_id(),
             TrellisError::CallTimeout { .. } => ErrorId(219),
-            TrellisError::OtherVersionLive(..) => ErrorId(220),
+            TrellisError::OtherVersionLive(seen) => seen.error_id(),
             TrellisError::TargetSelect { .. } => ErrorId(221),
         }
     }

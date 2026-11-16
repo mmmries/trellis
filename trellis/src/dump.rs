@@ -997,7 +997,7 @@ pub(crate) async fn restore_queued(
             crate::defs::grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION,
             crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
         )
-        .map_err(|err| refused(err.code(), err.to_string()))?;
+        .map_err(|err| refused(err.code(), err.message().to_string()))?;
         // What the text resolves to here, against what the dump recorded.
         let resolve = async |explicit: Option<&str>, bare: &str| match explicit {
             Some(schema) => crate::intake::qualify(schema, bare)
