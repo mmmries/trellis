@@ -31,7 +31,7 @@ Postgres, hidden tables included, detects and never repairs
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1654](https://github.com/salesforce-misc/trellis/issues/1654) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
-| [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
+| [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | documented |
 | [A read column given a nondeterministic collation](#a-read-column-given-a-nondeterministic-collation) | `self_check` | [#1643](https://github.com/salesforce-misc/trellis/issues/1643) (research) |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
@@ -213,9 +213,7 @@ the column; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 that read it. To avoid it, let another column take a read column's name only
 while the transforms that read the table are paused.
 
-**Ends with:** [#1586](https://github.com/salesforce-misc/trellis/issues/1586)
-weighs having the capture function check each column's position as well as
-its name.
+**Ends with:** documented.
 
 ### A read column given a nondeterministic collation
 
