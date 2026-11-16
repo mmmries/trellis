@@ -394,7 +394,8 @@ async fn the_outcome_is_what_resume_does() {
         .expect_err("the resume refuses while the column is gone");
     let named = dropped
         .strip_prefix(
-            "RESUME would refuse: define would refuse the definition as the schema stands now: ",
+            "RESUME would refuse: T0044: define would refuse the definition as the schema \
+             stands now: ",
         )
         .unwrap_or_else(|| panic!("{dropped}"));
     assert!(err.to_string().contains(named), "{err} vs {dropped}");

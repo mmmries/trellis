@@ -22,7 +22,7 @@ use super::ast::{
 use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
 use super::pg_type::PgType;
-use crate::error_code::ErrorCode;
+use crate::error_code::{ErrorCode, ErrorId};
 use crate::integer::IntWidth;
 
 /// Which key a [`ValidationError::NondeterministicKeyCollation`] column
@@ -881,6 +881,87 @@ impl ValidationError {
         ErrorCode::Validation
     }
 
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            ValidationError::DuplicateFieldName { .. } => ErrorId(40),
+            ValidationError::ReservedFieldName { .. } => ErrorId(41),
+            ValidationError::ReservedGroupByColumnName { .. } => ErrorId(42),
+            ValidationError::FieldNamedAfterPrimaryKey { .. } => ErrorId(43),
+            ValidationError::UnresolvedColumn { .. } => ErrorId(44),
+            ValidationError::Cycle { .. } => ErrorId(45),
+            ValidationError::FieldExpansionTooLarge => ErrorId(46),
+            ValidationError::TableCycle { .. } => ErrorId(47),
+            ValidationError::TargetEqualsSource { .. } => ErrorId(48),
+            ValidationError::JoinNeedsBothTables => ErrorId(49),
+            ValidationError::JoinSelf { .. } => ErrorId(50),
+            ValidationError::JoinTooManyTables => ErrorId(51),
+            ValidationError::JoinUnknownTable { .. } => ErrorId(52),
+            ValidationError::JoinUnqualifiedColumn { .. } => ErrorId(53),
+            ValidationError::JoinUnresolvedColumn { .. } => ErrorId(54),
+            ValidationError::JoinOnSameSide { .. } => ErrorId(55),
+            ValidationError::JoinMixedSideArgument { .. } => ErrorId(56),
+            ValidationError::JoinOnRepeatedPair { .. } => ErrorId(57),
+            ValidationError::JoinOnRepeatedColumn { .. } => ErrorId(58),
+            ValidationError::IndexKeyTooWide { .. } => ErrorId(59),
+            ValidationError::TableTooWide { .. } => ErrorId(60),
+            ValidationError::JoinKeyTypeMismatch { .. } => ErrorId(61),
+            ValidationError::JoinUnsupportedKeyType { .. } => ErrorId(62),
+            ValidationError::JoinNondeterministicCollation { .. } => ErrorId(63),
+            ValidationError::JoinFieldShape { .. } => ErrorId(64),
+            ValidationError::OneToOneJoinAggregate { .. } => ErrorId(65),
+            ValidationError::OneToOneJoinKeyNotUnique { .. } => ErrorId(66),
+            ValidationError::OneToOneJoinUnsupported { .. } => ErrorId(67),
+            ValidationError::StarJoinTooManyTables { .. } => ErrorId(68),
+            ValidationError::JoinOnReadsAnotherJoinedTable { .. } => ErrorId(69),
+            ValidationError::DeferredAggregate { .. } => ErrorId(70),
+            ValidationError::UnsupportedAggregateArgument { .. } => ErrorId(71),
+            ValidationError::UnsupportedExtremeArgument { .. } => ErrorId(72),
+            ValidationError::ExtremeOfExpression { .. } => ErrorId(73),
+            ValidationError::ChainedExtreme { .. } => ErrorId(74),
+            ValidationError::ExtremesWithoutSourceIndex { .. } => ErrorId(75),
+            ValidationError::ReservedTargetSuffix { .. } => ErrorId(76),
+            ValidationError::TargetNameTooLong { .. } => ErrorId(77),
+            ValidationError::TypeMismatch { .. } => ErrorId(78),
+            ValidationError::MixedFloatExactComparison { .. } => ErrorId(79),
+            ValidationError::MixedTemporalComparison { .. } => ErrorId(80),
+            ValidationError::TextOrderingComparison { .. } => ErrorId(81),
+            ValidationError::ComparisonTypeMismatch { .. } => ErrorId(82),
+            ValidationError::NullIfFirstArgumentCast { .. } => ErrorId(83),
+            ValidationError::CaseConditionNotBoolean { .. } => ErrorId(84),
+            ValidationError::CaseResultTypeMismatch { .. } => ErrorId(85),
+            ValidationError::UntypedNull { .. } => ErrorId(86),
+            ValidationError::ConstantDivisorZero { .. } => ErrorId(87),
+            ValidationError::IntegerDivision { .. } => ErrorId(88),
+            ValidationError::FloatModulo { .. } => ErrorId(89),
+            ValidationError::TemporalOperand { .. } => ErrorId(90),
+            ValidationError::TemporalLiteral { .. } => ErrorId(91),
+            ValidationError::UnsupportedCast { .. } => ErrorId(92),
+            ValidationError::NumericFunctionArgument { .. } => ErrorId(93),
+            ValidationError::ScaleNotIntegerLiteral { .. } => ErrorId(94),
+            ValidationError::FunctionArgTypeMismatch { .. } => ErrorId(95),
+            ValidationError::NonLiteralRegexPattern { .. } => ErrorId(96),
+            ValidationError::InvalidTypedLiteral { .. } => ErrorId(97),
+            ValidationError::UnsupportedLiteralType { .. } => ErrorId(98),
+            ValidationError::UnresolvedGroupByColumn { .. } => ErrorId(99),
+            ValidationError::UnsupportedGroupByKeyType { .. } => ErrorId(100),
+            ValidationError::GroupByKeysShareTargetColumn { .. } => ErrorId(101),
+            ValidationError::UngroupedColumnReference { .. } => ErrorId(102),
+            ValidationError::AggregateOfAggregateField { .. } => ErrorId(103),
+            ValidationError::AmbiguousColumnReference(..) => ErrorId(104),
+            ValidationError::QualifiedColumnNotFromSource { .. } => ErrorId(105),
+            ValidationError::GroupingColumnFieldMustBePassthrough { .. } => ErrorId(106),
+            ValidationError::CalculatedFieldShadowsSourceColumn { .. } => ErrorId(107),
+            ValidationError::NondeterministicKeyCollation(..) => ErrorId(108),
+            ValidationError::NondeterministicCollationTextFunction(..) => ErrorId(109),
+            ValidationError::QualifiedSourceTableNotFound { .. } => ErrorId(110),
+            ValidationError::QualifiedTargetTableNotFound { .. } => ErrorId(111),
+            ValidationError::StringAggSeparatorNotLiteral { .. } => ErrorId(112),
+        }
+    }
+
     /// Fills in the `FROM` table's schema for an
     /// [`ValidationError::AmbiguousColumnReference`] that doesn't have it yet,
     /// so its message spells the three-part qualified name. `schema` comes
@@ -910,8 +991,10 @@ impl ValidationError {
     }
 }
 
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(ValidationError);
+
+impl crate::error_code::Message for ValidationError {
+    fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidationError::DuplicateFieldName { name } => {
                 write!(f, "duplicate calculated field name '{name}'")
@@ -4879,6 +4962,7 @@ mod tests {
     use super::*;
     use crate::defs::ast::Operator;
     use crate::defs::pg_type::PgType;
+    use crate::error_code::Message as _;
     use crate::float::FloatWidth;
 
     fn def(fields: Vec<FieldDef>) -> TransformDef {
@@ -6495,7 +6579,7 @@ mod tests {
     /// way to read the field.
     #[test]
     fn the_ambiguity_message_names_both_meanings_and_both_spellings() {
-        let message = ambiguity("total", "val", "(grp + 1)").to_string();
+        let message = ambiguity("total", "val", "(grp + 1)").message().to_string();
         assert_eq!(
             message,
             "calculated field 'total' reads 'val', which is ambiguous: it names both the \
@@ -6676,7 +6760,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, refused("c"));
         assert_eq!(
-            err.to_string(),
+            err.message().to_string(),
             "calculated field 'c' reads 'product.cost', but a qualified column must name this \
              transform's FROM table ('s'); a second table is read with a JOIN"
         );
@@ -7763,7 +7847,7 @@ mod tests {
             Err(ValidationError::JoinTooManyTables)
         );
         assert_eq!(
-            ValidationError::JoinTooManyTables.to_string(),
+            ValidationError::JoinTooManyTables.message().to_string(),
             "a JOIN transform joins exactly two tables; a second JOIN is not supported"
         );
     }
@@ -8130,6 +8214,7 @@ mod tests {
 #[cfg(test)]
 mod key_collation_tests {
     use super::*;
+    use crate::error_code::Message as _;
 
     fn column() -> JoinColumnInfo {
         JoinColumnInfo {
@@ -8178,7 +8263,7 @@ mod key_collation_tests {
                     }
                 ))
             );
-            let message = err.to_string();
+            let message = err.message().to_string();
             assert!(
                 message.starts_with(&format!("shop.orders.code is {role}, and its collation"))
                     && message.contains(r#""case_insensitive" is nondeterministic"#),

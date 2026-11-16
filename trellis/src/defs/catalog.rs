@@ -83,7 +83,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
@@ -612,6 +612,55 @@ impl CatalogError {
             CatalogError::ColumnPauseLockTimeout(_) => ErrorCode::Timeout,
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            CatalogError::Parse(err) => err.error_id(),
+            CatalogError::Validate(err) => err.error_id(),
+            CatalogError::Db(..) => ErrorId(124),
+            CatalogError::Pool(err) => err.error_id(),
+            CatalogError::UnknownValueType { .. } => ErrorId(125),
+            CatalogError::Backfill(err) => err.error_id(),
+            CatalogError::SourceTableNotFound(..) => ErrorId(126),
+            CatalogError::InvalidRegexPattern { .. } => ErrorId(127),
+            CatalogError::TableNotAccessible { .. } => ErrorId(128),
+            CatalogError::KeyRepairBlocked { .. } => ErrorId(129),
+            CatalogError::KeyConstraintBlocked { .. } => ErrorId(130),
+            CatalogError::KeyColumnTaken { .. } => ErrorId(131),
+            CatalogError::SourceKeyChanged { .. } => ErrorId(132),
+            CatalogError::VirtualGeneratedColumn { .. } => ErrorId(133),
+            CatalogError::SourceIndexMissing { .. } => ErrorId(134),
+            CatalogError::ExtremeIndexMissing { .. } => ErrorId(135),
+            CatalogError::ExtremeSourceNotReadable { .. } => ErrorId(136),
+            CatalogError::LedgerTableMissing { .. } => ErrorId(137),
+            CatalogError::TargetTableMissing { .. } => ErrorId(138),
+            CatalogError::TargetInCatalogSchema { .. } => ErrorId(139),
+            CatalogError::TargetTableSuffixCollision { .. } => ErrorId(140),
+            CatalogError::TargetTableExists { .. } => ErrorId(141),
+            CatalogError::TargetNameHasReaders { .. } => ErrorId(142),
+            CatalogError::TargetNotAdoptable { .. } => ErrorId(143),
+            CatalogError::SourceNotChangeKeyed { .. } => ErrorId(144),
+            CatalogError::PartitionedSource(..) => ErrorId(145),
+            CatalogError::RowSecurityApplies(..) => ErrorId(146),
+            CatalogError::Subscribed(..) => ErrorId(147),
+            CatalogError::Ddl(err) => err.error_id(),
+            CatalogError::DirectBackfill(err) => err.error_id(),
+            CatalogError::TransformNotFound { .. } => ErrorId(148),
+            CatalogError::NameCaseMismatch { .. } => ErrorId(149),
+            CatalogError::TransformNotPaused { .. } => ErrorId(150),
+            CatalogError::AboveRunningRelease { .. } => ErrorId(151),
+            CatalogError::CannotRun { .. } => ErrorId(152),
+            CatalogError::DependentsBlockDrop { .. } => ErrorId(153),
+            CatalogError::TransformNotLive { .. } => ErrorId(154),
+            CatalogError::AlterFieldNotFound { .. } => ErrorId(155),
+            CatalogError::AlterFieldAlreadyExists { .. } => ErrorId(156),
+            CatalogError::UnsupportedAlter(..) => ErrorId(157),
+            CatalogError::ColumnPauseLockTimeout(err) => err.error_id(),
+        }
+    }
 }
 
 impl CatalogError {
@@ -643,12 +692,16 @@ impl CatalogError {
     }
 }
 
-impl fmt::Display for CatalogError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(CatalogError);
+
+impl crate::error_code::Message for CatalogError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CatalogError::Parse(err) => write!(f, "failed to parse transform definition: {err}"),
+            CatalogError::Parse(err) => {
+                write!(f, "failed to parse transform definition: {}", err.message())
+            }
             CatalogError::Validate(err) => {
-                write!(f, "definition failed validation: {err}")
+                write!(f, "definition failed validation: {}", err.message())
             }
             CatalogError::Db(err) => {
                 write!(f, "transform catalog database error: ")?;
@@ -656,13 +709,17 @@ impl fmt::Display for CatalogError {
             }
             // `err` already says what failed (a pool checkout reads
             // "failed to acquire a connection: ...").
-            CatalogError::Pool(err) => write!(f, "{err}"),
+            CatalogError::Pool(err) => err.fmt_message(f),
             CatalogError::UnknownValueType { column, text } => write!(
                 f,
                 "column '{column}' has an unrecognized persisted value type '{text}'"
             ),
             CatalogError::Backfill(err) => {
-                write!(f, "failed to backfill the definition's source table: {err}")
+                write!(
+                    f,
+                    "failed to backfill the definition's source table: {}",
+                    err.message()
+                )
             }
             CatalogError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
@@ -907,9 +964,13 @@ impl fmt::Display for CatalogError {
             // A key a table lost is no failure to create anything.
             CatalogError::Ddl(
                 err @ (DdlError::RecordedKeyMissing { .. } | DdlError::NoPrimaryKeyToRecord { .. }),
-            ) => write!(f, "{err}"),
-            CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
-            CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
+            ) => err.fmt_message(f),
+            CatalogError::Ddl(err) => {
+                write!(f, "failed to create target table: {}", err.message())
+            }
+            CatalogError::DirectBackfill(err) => {
+                write!(f, "direct backfill failed: {}", err.message())
+            }
             CatalogError::TransformNotFound { transform } => {
                 write!(f, "no transform named '{transform}' is registered")
             }
@@ -8202,6 +8263,7 @@ mod reported_status_tests {
 #[cfg(test)]
 mod table_not_accessible_tests {
     use super::*;
+    use crate::error_code::Message as _;
 
     fn not_accessible(usage: bool, privilege: bool) -> CatalogError {
         CatalogError::TableNotAccessible {
@@ -8216,19 +8278,19 @@ mod table_not_accessible_tests {
     #[test]
     fn the_message_names_what_the_role_lacks_and_the_doc_section() {
         let doc = "see \"One Trellis role\" in docs/recommendations.md";
-        let usage = not_accessible(true, false).to_string();
+        let usage = not_accessible(true, false).message().to_string();
         assert!(
             usage.contains("lacks USAGE on schema \"public\""),
             "{usage}"
         );
         assert!(!usage.contains("app_owner"), "{usage}");
-        let privilege = not_accessible(false, true).to_string();
+        let privilege = not_accessible(false, true).message().to_string();
         assert!(
             privilege.contains("isn't a member of \"app_owner\", the table's owner"),
             "{privilege}"
         );
         assert!(!privilege.contains("USAGE on schema"), "{privilege}");
-        let both = not_accessible(true, true).to_string();
+        let both = not_accessible(true, true).message().to_string();
         assert!(both.contains("lacks USAGE on schema \"public\""), "{both}");
         assert!(both.contains("\"app_owner\""), "{both}");
         for message in [usage, privilege, both] {
@@ -8636,6 +8698,7 @@ mod virtual_generated_tests {
 
     use super::*;
     use crate::defs::join::{JOINED, Side};
+    use crate::error_code::Message as _;
 
     fn def(text: &str) -> TransformDef {
         parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
@@ -8744,7 +8807,7 @@ mod virtual_generated_tests {
         assert_eq!(err.code(), ErrorCode::Validation);
         assert!(err.is_define_refusal());
         assert_eq!(
-            err.to_string(),
+            err.message().to_string(),
             "column \"g\" of public.bv is a virtual generated column (GENERATED ALWAYS AS \
              (img * 2) VIRTUAL), which Trellis can't capture: a capture trigger can't read a \
              value PostgreSQL computes only when a query reads the row. Write the expression \

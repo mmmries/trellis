@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId};
 use crate::pool::quote_ident;
 use tokio_postgres::GenericClient;
 
@@ -68,10 +68,26 @@ impl BackfillError {
             BackfillError::Superseded => ErrorCode::Internal,
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            BackfillError::Db(..) => ErrorId(159),
+            BackfillError::Pool(err) => err.error_id(),
+            BackfillError::Ddl(err) => err.error_id(),
+            BackfillError::Unsupported(..) => ErrorId(160),
+            BackfillError::Propagation(err) => err.error_id(),
+            BackfillError::Superseded => ErrorId(161),
+        }
+    }
 }
 
-impl std::fmt::Display for BackfillError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+crate::error_code::coded_display!(BackfillError);
+
+impl crate::error_code::Message for BackfillError {
+    fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BackfillError::Db(err) => {
                 write!(f, "direct backfill database error: ")?;
@@ -79,15 +95,18 @@ impl std::fmt::Display for BackfillError {
             }
             // `err` already says what failed (a pool checkout reads
             // "failed to acquire a connection: ...").
-            BackfillError::Pool(err) => write!(f, "{err}"),
-            BackfillError::Ddl(err) => write!(f, "direct backfill schema error: {err}"),
+            BackfillError::Pool(err) => err.fmt_message(f),
+            BackfillError::Ddl(err) => {
+                write!(f, "direct backfill schema error: {}", err.message())
+            }
             BackfillError::Unsupported(what) => {
                 write!(f, "direct backfill does not support {what}")
             }
             BackfillError::Propagation(err) => {
                 write!(
                     f,
-                    "staging the backfill's downstream propagation failed: {err}"
+                    "staging the backfill's downstream propagation failed: {}",
+                    err.message()
                 )
             }
             BackfillError::Superseded => {

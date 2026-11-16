@@ -12,11 +12,12 @@ class ErrorTest < Minitest::Test
     refute_empty codes
 
     codes.each do |code|
-      error = Trellis::Error.from_native(code, "boom")
+      error = Trellis::Error.from_native(code, "T0001", "T0001: boom")
       refute_instance_of Trellis::UnknownError, error,
                          "error code #{code.inspect} has no Trellis::Error subclass; add it"
       assert_equal code.to_sym, error.code
-      assert_equal "boom", error.message
+      assert_equal "T0001", error.error_id
+      assert_equal "T0001: boom", error.message
     end
   end
 
@@ -26,7 +27,7 @@ class ErrorTest < Minitest::Test
   end
 
   def test_a_code_this_binding_does_not_know_becomes_an_unknown_error_naming_it
-    error = Trellis::Error.from_native("brand_new_code", "something broke")
+    error = Trellis::Error.from_native("brand_new_code", nil, "something broke")
     assert_instance_of Trellis::UnknownError, error
     assert_equal :unknown, error.code
     assert_match "brand_new_code", error.message
@@ -44,6 +45,7 @@ class ErrorTest < Minitest::Test
     error = Trellis::ForkedHandleError.new("forked")
     assert_kind_of Trellis::ValidationError, error
     assert_equal :validation, error.code
+    assert_nil error.error_id
   end
 
   def test_status_symbols_come_from_a_closed_set

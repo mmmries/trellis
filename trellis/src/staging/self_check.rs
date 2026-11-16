@@ -168,7 +168,7 @@ use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::{Definition, StoredStatus, TransformStatus};
 use crate::defs::registry;
 use crate::defs::typed_literal;
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId};
 use crate::pool::{Pool, quote_ident};
 
 use super::capture_audit::{self, CaptureFault};
@@ -468,10 +468,31 @@ impl SelfCheckError {
             SelfCheckError::Pool(err) => err.code(),
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            SelfCheckError::TargetNotFound(..) => ErrorId(191),
+            SelfCheckError::UnsupportedKeySpace { .. } => ErrorId(192),
+            SelfCheckError::InvalidScope { .. } => ErrorId(193),
+            SelfCheckError::UnsupportedExpr { .. } => ErrorId(194),
+            SelfCheckError::PageTimedOut { .. } => ErrorId(195),
+            SelfCheckError::UnreadableJob { .. } => ErrorId(196),
+            SelfCheckError::Ddl(err) => err.error_id(),
+            SelfCheckError::Catalog(err) => err.error_id(),
+            SelfCheckError::Staging(err) => err.error_id(),
+            SelfCheckError::Db(..) => ErrorId(197),
+            SelfCheckError::Pool(err) => err.error_id(),
+        }
+    }
 }
 
-impl fmt::Display for SelfCheckError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(SelfCheckError);
+
+impl crate::error_code::Message for SelfCheckError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SelfCheckError::TargetNotFound(target) => {
                 write!(f, "no transform named \"{target}\" is registered")
@@ -499,16 +520,16 @@ impl fmt::Display for SelfCheckError {
                 f,
                 "self_check needs a positive SelfCheckScope::limit; got {limit}"
             ),
-            SelfCheckError::Ddl(err) => write!(f, "{err}"),
-            SelfCheckError::Catalog(err) => write!(f, "{err}"),
-            SelfCheckError::Staging(err) => write!(f, "{err}"),
+            SelfCheckError::Ddl(err) => err.fmt_message(f),
+            SelfCheckError::Catalog(err) => err.fmt_message(f),
+            SelfCheckError::Staging(err) => err.fmt_message(f),
             SelfCheckError::Db(err) => {
                 write!(f, "self_check database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
             // `err` already says what failed (a pool checkout reads
             // "failed to acquire a connection: ...").
-            SelfCheckError::Pool(err) => write!(f, "{err}"),
+            SelfCheckError::Pool(err) => err.fmt_message(f),
         }
     }
 }

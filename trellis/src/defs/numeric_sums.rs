@@ -42,8 +42,8 @@ fn counts_nan(sum: &str) -> String {
 }
 
 /// An error of the conversion, as the attach reports it.
-fn failed(e: impl std::fmt::Display) -> crate::Error {
-    crate::Error::IncompatibleInstance(format!("converting numeric sums: {e}"))
+fn failed(e: impl crate::error_code::Message) -> crate::Error {
+    crate::Error::IncompatibleInstance(format!("converting numeric sums: {}", e.message()))
 }
 
 /// Converts every stored definition's hidden tables, in `txn` (see the module

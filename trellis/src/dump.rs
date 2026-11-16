@@ -43,6 +43,7 @@
 
 use crate::app::TrellisError;
 use crate::config::Config;
+use crate::error_code::Message as _;
 use crate::pool::{Pool, quote_ident};
 
 /// What loading a table does.
@@ -884,7 +885,8 @@ pub(crate) async fn restore_queued(
             code,
             message,
         };
-        let catalog = |err: crate::defs::CatalogError| refused(err.code(), err.to_string());
+        let catalog =
+            |err: crate::defs::CatalogError| refused(err.code(), err.message().to_string());
         let target = unparsed.target_table;
         // A definition the catalog already holds for this target: the same
         // one dequeues, a different one refuses (see above).
@@ -995,7 +997,7 @@ pub(crate) async fn restore_queued(
             crate::defs::grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION,
             crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
         )
-        .map_err(|err| refused(err.code(), err.to_string()))?;
+        .map_err(|err| refused(err.code(), err.message().to_string()))?;
         // What the text resolves to here, against what the dump recorded.
         let resolve = async |explicit: Option<&str>, bare: &str| match explicit {
             Some(schema) => crate::intake::qualify(schema, bare)

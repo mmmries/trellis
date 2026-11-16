@@ -265,10 +265,10 @@ defmodule Trellis.CallsTest do
   @tag timeout: 5_000
   test "the wait for a reply has a backstop, and it is a timeout" do
     # A reply that never comes, as a lost one would be.
-    assert {:error, {"timeout", message}} = Trellis.Native.await(make_ref(), 50)
+    assert {:error, {"timeout", nil, message}} = Trellis.Native.await(make_ref(), 50)
     assert message =~ "no reply"
 
-    assert %Error{code: :timeout} = Error.from_native({"timeout", message})
+    assert %Error{code: :timeout} = Error.from_native({"timeout", nil, message})
   end
 
   test "a handle from another node is refused with a validation error, not a bad argument" do

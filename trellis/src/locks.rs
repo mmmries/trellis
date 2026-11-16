@@ -27,6 +27,8 @@
 
 use std::time::{Duration, Instant};
 
+use crate::error_code::ErrorId;
+
 /// The longest any Trellis statement waits for a lock (I7). A session whose
 /// `lock_timeout` is already set shorter (a DSN's `options`, a role or
 /// database default) keeps its own; anything longer, or unset, is capped
@@ -209,6 +211,18 @@ pub struct ColumnPauseLockTimeout {
     /// Which operation was waiting.
     pub op: ColumnPauseOp,
     source: tokio_postgres::Error,
+}
+
+impl ColumnPauseLockTimeout {
+    /// The code of the error variants that carry this, one in each of
+    /// `CatalogError` and `ApplyError`: one condition, one code. Written as a `match` arm,
+    /// the form `error_code::assigned`'s test reads.
+    #[allow(clippy::match_single_binding)]
+    pub(crate) fn error_id(&self) -> ErrorId {
+        match self {
+            ColumnPauseLockTimeout { .. } => ErrorId(158),
+        }
+    }
 }
 
 impl std::fmt::Display for ColumnPauseLockTimeout {

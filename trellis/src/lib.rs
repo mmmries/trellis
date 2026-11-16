@@ -234,7 +234,7 @@ pub use client::{Client, ClientError, ClientOptions};
 pub use config::Config;
 pub use dump::SchemaDump;
 pub use error::Error;
-pub use error_code::ErrorCode;
+pub use error_code::{ErrorCode, ErrorId};
 pub use handover::{MigrationsPending, OtherProcess, OtherVersionLive};
 pub use metrics::Metrics;
 pub use migrate::migrate;

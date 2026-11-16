@@ -1,7 +1,7 @@
 defmodule Trellis.Error do
   @moduledoc """
-  An error from Trellis: a stable `code` and the engine's message, and
-  nothing else (ADR-0010 decision 4).
+  An error from Trellis: a stable `code`, the per-error `error_id` and the
+  engine's message, and nothing else (ADR-0010 decision 4).
 
   Non-bang functions return `{:error, %Trellis.Error{}}`; bang functions
   raise it.
@@ -9,6 +9,10 @@ defmodule Trellis.Error do
   `code` is one of `t:code/0`. The engine's error codes are an open set, so a
   code this version of the binding doesn't know arrives as `:unknown`, with
   the engine's code named in the message, rather than crashing.
+
+  `error_id` is the engine's per-error code, such as `"T0042"`, which the
+  message also starts with: the thing to look up. It is `nil` for an error
+  the binding raises itself.
   """
 
   @typedoc """
@@ -53,9 +57,9 @@ defmodule Trellis.Error do
           | :internal
           | :unknown
 
-  @type t :: %__MODULE__{code: code(), message: String.t()}
+  @type t :: %__MODULE__{code: code(), error_id: String.t() | nil, message: String.t()}
 
-  defexception [:code, :message]
+  defexception [:code, :error_id, :message]
 
   # The closed set of code atoms, written out so no atom is ever built from a
   # string that crossed the NIF boundary. `test/trellis/error_test.exs`
@@ -73,14 +77,19 @@ defmodule Trellis.Error do
   }
 
   @doc false
-  @spec from_native({String.t(), String.t()}) :: t()
-  def from_native({code, message}) when is_binary(code) and is_binary(message) do
+  @spec from_native({String.t(), String.t() | nil, String.t()}) :: t()
+  def from_native({code, error_id, message})
+      when is_binary(code) and (is_binary(error_id) or is_nil(error_id)) and is_binary(message) do
     case Map.fetch(@codes, code) do
       {:ok, atom} ->
-        %__MODULE__{code: atom, message: message}
+        %__MODULE__{code: atom, error_id: error_id, message: message}
 
       :error ->
-        %__MODULE__{code: :unknown, message: "(error code #{inspect(code)}) #{message}"}
+        %__MODULE__{
+          code: :unknown,
+          error_id: error_id,
+          message: "(error code #{inspect(code)}) #{message}"
+        }
     end
   end
 

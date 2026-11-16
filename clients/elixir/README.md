@@ -195,9 +195,11 @@ accounting is in
 ### Conventions
 
 - Non-bang functions return `{:ok, value}` (or `:ok`) or
-  `{:error, %Trellis.Error{code: code, message: message}}`; bang variants
-  return the value or raise that error. `code` is one of a closed set of
-  atoms, with `:unknown` for a code newer than the binding.
+  `{:error, %Trellis.Error{code: code, error_id: error_id, message: message}}`;
+  bang variants return the value or raise that error. `code` is one of a
+  closed set of atoms, with `:unknown` for a code newer than the binding.
+  `error_id` is the engine's per-error code (`"T0042"`), which the message
+  starts with, or `nil` for an error the binding raises itself.
 - No atom is ever built from a string the database returned: every atom in a
   result comes from a closed set the NIF allocates when it loads.
 - Times are `DateTime`s. They cross the NIF as epoch microseconds.

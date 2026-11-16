@@ -111,7 +111,7 @@ floor changes nothing:
   the floor and its own version:
 
   ```
-  refusing to attach: the catalog floor is 0.3.0, the oldest Trellis version that can read this catalog, and this binary is version 0.2.0; run Trellis 0.3.0 or later
+  T0229: refusing to attach: the catalog floor is 0.5.0, the oldest Trellis version that can read this catalog, and this binary is version 0.4.0; run Trellis 0.5.0 or later
   ```
 
 - Its background processes connect and stand by: they stage, drain and
