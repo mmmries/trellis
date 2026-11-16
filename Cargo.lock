@@ -2378,6 +2378,8 @@ dependencies = [
  "testkit",
  "tokio",
  "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
  "trellis",
 ]
 
