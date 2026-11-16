@@ -28,6 +28,9 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Load) do
     definitions of one database don't belong in another.
 
     The handle it migrates with starts no background work.
+
+    Where Trellis is off (`Trellis.enabled?/0`), it is `mix ecto.load` and
+    nothing more: the target tables load as plain tables.
     """
 
     alias __MODULE__.RecordingShell
@@ -38,6 +41,21 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Load) do
     @impl Mix.Task
     def run(args) do
       {:ok, _} = Application.ensure_all_started(:trellis_pg)
+
+      if Trellis.enabled?() do
+        run_enabled(args)
+      else
+        Mix.shell().info(
+          "Trellis is off (config :trellis_pg, enabled: false): loading the structure only, " <>
+            "so target tables are plain tables"
+        )
+
+        load(args)
+        :ok
+      end
+    end
+
+    defp run_enabled(args) do
       {opts, _, _} = OptionParser.parse(args, strict: @switches, aliases: @aliases)
 
       trellis_repos =

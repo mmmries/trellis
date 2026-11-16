@@ -86,6 +86,14 @@ if Code.ensure_loaded?(Ecto.Migration) do
     background work: `:staging` and `:drain_threads` are always the defaults,
     whatever the configuration says.
 
+    ## Where Trellis is off
+
+    With `config :trellis_pg, enabled: false` (`Trellis.enabled?/0`), the
+    helpers connect nothing and skip with a log message: `define/1` and
+    `apply/1` queue nothing, so the migration still records as run, and
+    `status/1` returns `nil`. The database is built by loading the structure
+    file (`mix trellis.load`), which carries the targets as plain tables.
+
     ## Running a migration once
 
     A define isn't idempotent: a second define of a target that exists fails
@@ -153,13 +161,31 @@ if Code.ensure_loaded?(Ecto.Migration) do
     does. It is `Trellis.status!/2`, run as it's called rather than queued.
     """
     @spec status(String.t()) :: Trellis.Status.t() | nil
-    def status(target_table) when is_binary(target_table),
-      do: with_handle(Ecto.Migration.repo(), &Trellis.status!(&1, target_table))
+    def status(target_table) when is_binary(target_table) do
+      if Trellis.enabled?() do
+        with_handle(Ecto.Migration.repo(), &Trellis.status!(&1, target_table))
+      else
+        Logger.info(off_message("status(#{inspect(target_table)}) returns nil"))
+        nil
+      end
+    end
 
     # Queued with a reverse that raises: a module that `use`s this one can't
     # define `change/0`, but one calling the helpers by their full name can,
     # and rolling that back fails naming the statement.
     defp queue(statement, call) do
+      if Trellis.enabled?(), do: do_queue(statement, call), else: skipped(statement)
+    end
+
+    defp skipped(statement) do
+      Logger.info(off_message("skipped #{statement}"))
+      :ok
+    end
+
+    defp off_message(what),
+      do: "Trellis is off (config :trellis_pg, enabled: false): #{what}"
+
+    defp do_queue(statement, call) do
       repo = Ecto.Migration.repo()
 
       Ecto.Migration.execute(
