@@ -125,7 +125,8 @@ there is no `interval`. `infinity` and `-infinity` follow Postgres
 (`infinity + 1` is `infinity`, `EXTRACT(year FROM 'infinity'::date)` is
 `Infinity`, `EXTRACT(day FROM ...)` of it is `NULL`), and a row whose date
 leaves the range (`date + n` past 5874897-12-31, two dates one of which is
-infinite, a date past 294276-12-31 cast to `timestamp`) raises `22008` for
+infinite, a date past 294276-12-31 cast to `timestamp`, a `DATE_TRUNC` that
+truncates below the `timestamp` range) raises `22008` for
 that row's record, which is quarantined; a constant that does fails every row.
 
 A bucket for an aggregate is computed in a 1-1 transform and grouped by in
