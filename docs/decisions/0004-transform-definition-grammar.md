@@ -113,8 +113,7 @@ so does `orders.order AS order`. `AT TIME ZONE`
 binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
-definition time. `<predicate>` accepts only the
-literal `TRUE`; any other `WHERE` is refused at definition time.
+definition time. `<predicate>` follows the partial-data predicate rule above.
 
 ### Typed literals spell constants in canonical Postgres form
 
