@@ -30,7 +30,8 @@ own transaction. The ring row's transaction id is therefore the source
 commit's, and that identity is what makes every derived write orderable.
 
 **Ordering is owned by the target, at the grain the target is kept at.** A
-1-1 target keeps a slim ledger with one entry per source row: the ring
+1-1 target keeps a slim ledger with one entry per member row (every source row
+when the transform has no `WHERE`): the ring
 position last applied to the row and the snapshot it was last derived under.
 An aggregate target keeps the same ordering state once per *group*, beside
 hidden per-group partials (a row count, non-null counts and sums)
@@ -135,7 +136,7 @@ never-fail rule).
 
 The design is these invariants; every element below exists to hold one of
 them. I0 to I5 are the ordering rules as my experiments refined them, stated
-for both grains: a 1-1 target's ledger entry per source row, and an aggregate
+for both grains: a 1-1 target's ledger entry per member row, and an aggregate
 target's group. I6 to I8 are the rules the capture and build experiments
 forced. I1 and I5 are defined in
 [ADR-0028](0028-locking-and-writing.md), the one definition of how writers
@@ -259,14 +260,14 @@ A ring writer is the application, at whatever isolation level it chose.
 - Nothing relies on what drains before or after a seal, or on which process
   seals.
 
-## The 1-1 ledger: one target-owned entry per source row
+## The 1-1 ledger: one target-owned entry per member row
 
 **Decision point.** The target, not the ring and not a projection, owns the
-state that orders its writes. A 1-1 target owns it per source row
+state that orders its writes. A 1-1 target owns it per member row
 ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#the-ledger)).
 
 - **Must:** a 1-1 target's ledger is a slim side table beside an unchanged
-  target table, one entry per source key holding the position and segment
+  target table, one entry per member key holding the position and segment
   last applied, the basis snapshot and a tombstone flag; the target row holds
   the values. It is written in the same transaction as the target, entries
   locked in key order before any target row is touched. A tombstone row in
@@ -279,7 +280,8 @@ state that orders its writes. A 1-1 target owns it per source row
     In one statement: take the snapshot and read r's source row. Then write
     the target row and replace the entry's basis with the snapshot, leaving
     `applied_lsn` as it was; a row gone from the source deletes the target
-    row and makes the entry a tombstone. It never stores the read's position
+    row and makes the entry a tombstone. A row whose predicate is not `TRUE` is
+    treated as a row gone from the source. It never stores the read's position
     as `applied_lsn`: a change whose trigger ran before the read but which
     committed after it would sit below that position, invisible to the
     basis, and be skipped for good. The basis alone, the full `pg_snapshot`
@@ -287,7 +289,8 @@ state that orders its writes. A 1-1 target owns it per source row
   - **Apply(r, C, image).** Lock r's entry. If C is visible in the entry's
     basis, or C's position is at or below `applied_lsn`, stop (I2).
     Otherwise write the target row from C's new image and set `applied_lsn`
-    to C's position, basis unchanged. A delete makes the entry a tombstone.
+    to C's position, basis unchanged. A delete makes the entry a tombstone. A row
+    whose predicate is not `TRUE` is treated as a row gone from the source.
 - **Must:** Postgres evaluates every field, over the source row cast back to
   the source columns' own types and collations, and Rust computes no
   values, so a field means over the row what it means over the source
@@ -315,7 +318,8 @@ only: a retraction that removes a group's current `MIN` or `MAX` re-reads
 that group's extreme with one index probe, after the group's lock
 ([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
 Every other admitted aggregate is kept from the changes alone and needs no
-source index to stay exact.
+source index to stay exact. Partials count member rows only; the predicate
+filters every staged image and every source read; group naming is unfiltered.
 
 A per-row ledger is not needed for old values: the ring carries every
 change's old image. It exists for ordering, and one row's changes form a
@@ -959,7 +963,7 @@ Each alternative below is recorded with the number that rejected it.
   application can queue behind is a bug, and a condition that fails the
   application's statement is a bug. Both get a written rule and a test.
 - **Storage grows with the source only for 1-1 targets.** A 1-1 target
-  carries a slim ledger of one row per source row; an aggregate target
+  carries a slim ledger of one row per member row; an aggregate target
   carries state per group (5 MB for 50k groups, whatever the source's
   size). No full old row is ever staged and `REPLICA IDENTITY FULL` is not
   required anywhere.
