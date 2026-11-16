@@ -404,6 +404,7 @@ mod tests {
             CatalogError::TransformNotFound { transform: name() }.error_id(),
             crate::ApplyError::TransformNotFound { transform: name() }.error_id(),
             TrellisError::TransformNotFound(name()).error_id(),
+            crate::SelfCheckError::TargetNotFound(name()).error_id(),
         ];
         assert!(not_found.iter().all(|id| id.to_string() == "T0148"));
 

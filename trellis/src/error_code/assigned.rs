@@ -197,7 +197,7 @@ const ASSIGNED: &[&str] = &[
     "T0188 StagingError::UnfencedSealedSegment",
     "T0189 StagingError::ConvergenceTimeout",
     "T0190 StagingError::Db",
-    "T0191 SelfCheckError::TargetNotFound",
+    "T0191 retired: SelfCheckError::TargetNotFound reports T0148",
     "T0192 SelfCheckError::UnsupportedKeySpace",
     "T0193 SelfCheckError::InvalidScope",
     "T0194 SelfCheckError::UnsupportedExpr",

@@ -168,7 +168,7 @@ use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::{Definition, StoredStatus, TransformStatus};
 use crate::defs::registry;
 use crate::defs::typed_literal;
-use crate::error_code::{self, ErrorCode, ErrorId};
+use crate::error_code::{self, ErrorCode, ErrorId, SharedCondition};
 use crate::pool::{Pool, quote_ident};
 
 use super::capture_audit::{self, CaptureFault};
@@ -474,7 +474,7 @@ impl SelfCheckError {
     /// error's code.
     pub fn error_id(&self) -> ErrorId {
         match self {
-            SelfCheckError::TargetNotFound(..) => ErrorId(191),
+            SelfCheckError::TargetNotFound(..) => SharedCondition::TransformNotFound.error_id(),
             SelfCheckError::UnsupportedKeySpace { .. } => ErrorId(192),
             SelfCheckError::InvalidScope { .. } => ErrorId(193),
             SelfCheckError::UnsupportedExpr { .. } => ErrorId(194),
