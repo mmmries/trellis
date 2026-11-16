@@ -51,6 +51,7 @@ mod lexer;
 pub mod lifecycle;
 pub(crate) mod live_table;
 pub mod model;
+pub(crate) mod neighbour_literals;
 pub(crate) mod numeric_sums;
 pub mod oracle;
 mod parser;

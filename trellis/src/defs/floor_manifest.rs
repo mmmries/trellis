@@ -450,6 +450,7 @@ fn features() -> Vec<Feature> {
         Feature::TableAlias,
         Feature::TableKey,
         Feature::StarJoin,
+        Feature::NeighbourTypedLiteral,
     ];
     features.extend(every(&units, |f| match f {
         Feature::QualifiedTable => 0,
@@ -459,6 +460,7 @@ fn features() -> Vec<Feature> {
         Feature::TableAlias => 4,
         Feature::TableKey => 5,
         Feature::StarJoin => 6,
+        Feature::NeighbourTypedLiteral => 7,
         // Listed above or below.
         Feature::KeySpace(_)
         | Feature::JoinKind(_)
