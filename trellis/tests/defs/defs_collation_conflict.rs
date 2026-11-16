@@ -201,3 +201,73 @@ async fn a_conflict_made_after_define_is_refused_at_resume() {
     );
     trellis.shutdown().await.expect("shutdown");
 }
+
+/// A column re-collated into a conflict while the definition is live is
+/// reported, not silent: every key written to it fails with `42P22`, is held
+/// after the drain's retries (`held_keys`, status still `live`), and
+/// definitions reading other tables keep draining. Not a known correctness
+/// gap: it is the documented held-key stop, released once the cause is fixed.
+#[tokio::test]
+async fn a_conflict_made_while_live_holds_each_written_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = pipeline::connect(db.dsn()).await;
+    raw.batch_execute(
+        r#"create table public.r (id bigint primary key, a text collate "C", p text collate "C");
+           create table public.u (id bigint primary key, v int)"#,
+    )
+    .await
+    .expect("create the sources");
+    let trellis = pipeline::definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM rc FROM r SELECT a = p AS same")
+        .await
+        .expect("one collation defines");
+    trellis
+        .apply("TRANSFORM un FROM u SELECT v AS v")
+        .await
+        .expect("defines");
+    pipeline::bring_live_all(&mut raw, &db.pool).await;
+    raw.batch_execute(r#"alter table public.r alter column p type text collate "POSIX""#)
+        .await
+        .expect("re-collate p");
+    pipeline::reconcile_pass(&mut raw, &db.pool).await;
+    raw.batch_execute("insert into r values (1, 'x', 'x'); insert into u values (1, 1)")
+        .await
+        .expect("write both sources");
+    let batch = pipeline::seal(&mut raw).await;
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match trellis::staging::apply::drain_once(&db.pool, batch, "probe", 1, pipeline::WAKE).await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => last_error = e.to_string(),
+        }
+    }
+    assert!(
+        last_error.contains("could not determine which collation"),
+        "{last_error}"
+    );
+    let status = trellis
+        .status("rc")
+        .await
+        .expect("status")
+        .expect("defined");
+    assert_eq!(status.status, trellis::TransformStatus::Live, "{status:?}");
+    assert_eq!(status.held_keys.as_ref().expect("the key is held").count, 1);
+    assert!(status.drain_failure.is_none(), "{status:?}");
+    assert_eq!(
+        pipeline::rows(&raw, "select sqlstate from poison").await,
+        ["(42P22)"]
+    );
+    assert_eq!(
+        pipeline::rows(&raw, "select count(*) from public.rc").await,
+        ["(0)"]
+    );
+    assert_eq!(
+        pipeline::rows(&raw, "select v::text from public.un").await,
+        ["(1)"]
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
