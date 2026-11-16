@@ -142,6 +142,8 @@ pub enum KeySpaceKind {
 pub enum PredicateKind {
     /// None, or `WHERE TRUE`.
     True,
+    /// Any other `WHERE`, `WHERE (TRUE)` included.
+    Filter,
 }
 
 /// A kind of expression node whose since has no further detail: the nodes
@@ -303,6 +305,7 @@ impl Feature {
             Feature::StarJoin => Some(BASELINE),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
+                PredicateKind::Filter => Release::new(0, 4, 0),
             }),
             Feature::Expr(node) => Some(match node {
                 ExprNode::Column
@@ -482,6 +485,7 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
     }
     used.add(Feature::Predicate(match predicate {
         Predicate::True => PredicateKind::True,
+        Predicate::Filter(_) => PredicateKind::Filter,
     }));
     if *without_source_index {
         used.add(Feature::WithoutSourceIndex);
@@ -493,6 +497,9 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         used.add(Feature::PartitionedSource);
     }
     for FieldDef { name: _, expr } in fields {
+        used.expr(expr);
+    }
+    if let Predicate::Filter(expr) = predicate {
         used.expr(expr);
     }
     let extremes = used

@@ -1237,6 +1237,7 @@ impl Trellis {
             let mut source_index_gaps = Vec::new();
             let mut extreme_index_gaps = Vec::new();
             let mut join = None;
+            let mut filter = None;
             let mut correcting = Vec::new();
             if let Some(row) = &row {
                 let status_text: String = row.get(0);
@@ -1314,6 +1315,10 @@ impl Trellis {
                         row.get("source_table"),
                     )
                     .await?;
+                    filter = def
+                        .predicate
+                        .filter()
+                        .map(crate::defs::ast::render_field_expr);
                     join = crate::staging::join_status::for_definition(
                         &*txn,
                         self.config.schema(),
@@ -1367,6 +1372,7 @@ impl Trellis {
                 migrations_pending: None,
                 below_catalog_floor,
                 floor: row.get("floor_version"),
+                filter,
             }))
         }
         .await
@@ -2631,6 +2637,11 @@ pub struct DefinitionStatus {
     /// whose floor is above it, under this release
     /// (`docs/upgrading.md`, rolling back).
     pub floor: String,
+    /// The definition's `WHERE`, as definition text, when it is other than
+    /// `TRUE`: the target holds only the source rows it is `TRUE` for.
+    /// `None` for an unfiltered definition, and for one this release can't
+    /// run, which it doesn't parse.
+    pub filter: Option<String>,
 }
 
 /// Why capture of a table a definition reads is broken; see [`DefinitionStatus::capture_failure`].

@@ -27,6 +27,7 @@ const EXEMPT: &[&str] = &[
     // A name that resolves to nothing; the message names it.
     "ValidationError::UnresolvedColumn",
     "ValidationError::UnresolvedGroupByColumn",
+    "ValidationError::PredicateColumnNotFound",
     "ValidationError::QualifiedSourceTableNotFound",
     "ValidationError::QualifiedTargetTableNotFound",
     "CatalogError::SourceTableNotFound",
@@ -48,6 +49,8 @@ const EXEMPT: &[&str] = &[
     "ValidationError::JoinNeedsBothTables",
     "ValidationError::UnsupportedLiteralType",
     "DdlError::MalformedCompositeKey",
+    // A `WHERE` other than `TRUE` in grammar-1 text, which never held one.
+    "ParseError::UnsupportedPredicate",
     "DdlError::InvalidDefinition",
     "DdlError::AliasSubstitution",
     "DdlError::UnroutedAggregate",

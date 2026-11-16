@@ -107,6 +107,9 @@ pub struct PlainDefinitionStatus {
     /// The oldest Trellis release that can run the definition,
     /// `major.minor.patch`; see [`DefinitionStatus::floor`].
     pub floor: String,
+    /// The definition's `WHERE` when it is other than `TRUE`; see
+    /// [`DefinitionStatus::filter`].
+    pub filter: Option<String>,
 }
 
 /// A [`JoinStatus`] flattened to plain data: how big a `JOIN` transform's
@@ -455,6 +458,7 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .map(PlainBelowCatalogFloor::from),
             join: status.join.as_ref().map(PlainJoinStatus::from),
             floor: status.floor.clone(),
+            filter: status.filter.clone(),
         }
     }
 }
@@ -776,6 +780,7 @@ mod tests {
                 below_catalog_floor: None,
                 join: None,
                 floor: "0.3.1".to_string(),
+                filter: None,
             }
         );
     }
@@ -1005,6 +1010,7 @@ mod tests {
                 below_catalog_floor: None,
                 join: None,
                 floor: "0.2.0".to_string(),
+                filter: None,
             }
         );
     }

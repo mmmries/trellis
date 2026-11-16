@@ -12,6 +12,7 @@ feature KeySpace(JoinOneToOne) 0.2.0
 feature JoinKind(Inner) 0.2.0
 feature JoinKind(Left) 0.2.0
 feature Predicate(True) 0.2.0
+feature Predicate(Filter) 0.4.0
 feature Expr(Column) 0.2.0
 feature Expr(NumberLiteral) 0.2.0
 feature Expr(StringLiteral) 0.2.0

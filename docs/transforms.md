@@ -22,7 +22,7 @@ TRANSFORM <table> [ADOPT EXISTING TABLE]
   [GROUP BY <column>, ...]
   [WITHOUT SOURCE INDEX]
   SELECT <expression> AS <field>, ...
-  [WHERE TRUE]
+  [WHERE <expression>]
 
 <table> ::= [<schema>.]<name>
 <join>  ::= [INNER | LEFT [OUTER]] JOIN <table> [KEY (<column>, ...)] [[AS] <alias>]
@@ -54,8 +54,10 @@ DROP   TRANSFORM <transform>
   [the index `self_check` pages by](#a-source-without-the-index-its-self_check-walk-pages-by).
 - `<expression>` is the [expression grammar](expressions.md); `<field>` names
   a target column.
-- `WHERE` takes only `TRUE`: every source row participates
-  ([#804](https://github.com/salesforce-misc/trellis/issues/804)).
+- `WHERE` takes a `boolean` [expression](expressions.md#where) over source
+  columns that can't raise an error. No key space applies one yet, so define
+  refuses any `WHERE` but `TRUE`
+  ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 - `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
   `<name>.<field>` pauses or resumes one field
   ([Changing a definition](#changing-a-definition)).
@@ -230,7 +232,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | `SUM` or `AVG` over anything but `smallint`, `integer`, `bigint` and `numeric`: a running float sum drifts from Postgres's | `DeferredAggregate` (`float and interval SUM/AVG`), `UnsupportedAggregateArgument` for another type | [Retype](#retype) | An integer or `numeric` column ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)) |
 | `array_agg`, `string_agg` or `jsonb_agg` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1040](https://github.com/salesforce-misc/trellis/issues/1040) |
 | **Filters and chaining** | | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE`: partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)) | `UnsupportedPredicate` | [Text](#text) | None |
+| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every key space today ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | `FilterNotYetSupported` | [Text](#text) | None yet |
 | A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | `TargetEqualsSource`, `TableCycle` | [Text](#text) | Another target |
 | Chaining off a transform that is not `live` | `TransformNotLive` | n/a | Wait for the upstream to go `live` |
 | **Target names** | | | |

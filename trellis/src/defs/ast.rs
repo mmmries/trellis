@@ -833,11 +833,18 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
         .collect();
     out.push_str(&fields.join(", "));
 
-    // `def.predicate` is always `Predicate::True` (the grammar's only
-    // variant, and the same value an omitted `WHERE` parses to) — omitting
-    // the clause entirely round-trips identically to writing `WHERE TRUE`,
-    // so there is nothing this render ever needs to spell out.
-    let Predicate::True = def.predicate;
+    // An omitted `WHERE` and a lone `WHERE TRUE` parse to the same
+    // `Predicate::True`, so it renders nothing. A filter that is the lone
+    // literal keeps its parentheses: a bare `WHERE TRUE` would read back as
+    // `Predicate::True`, with the older floor.
+    if let Predicate::Filter(expr) = &def.predicate {
+        out.push_str(" WHERE ");
+        if matches!(expr, Expr::BooleanLiteral(true)) {
+            out.push_str("(TRUE)");
+        } else {
+            out.push_str(&render_expr(expr, &aliases));
+        }
+    }
 
     out
 }
@@ -1103,12 +1110,24 @@ fn typed_literal_keyword(value_type: ValueType) -> &'static str {
         })
 }
 
-/// The partial-data predicate slot (`docs/transforms.md#a-where-other-than-true`, #804).
-///
-/// This slice accepts only a trivially-true predicate — either `WHERE` is
-/// omitted, or written as the literal `WHERE TRUE`. General predicate
-/// expressions are deferred to a later issue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The partial-data predicate (ADR-0004): which source rows the target
+/// holds.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
+    /// Every row: `WHERE` omitted, or the lone unquoted token `TRUE`.
     True,
+    /// A `boolean` expression over source columns; a row is a member when
+    /// `(<expr>) IS TRUE`. Every other accepted text, `WHERE (TRUE)`
+    /// included, so its floor is the predicate's (ADR-0024).
+    Filter(Expr),
+}
+
+impl Predicate {
+    /// The filter's expression, `None` for [`Predicate::True`].
+    pub fn filter(&self) -> Option<&Expr> {
+        match self {
+            Predicate::True => None,
+            Predicate::Filter(expr) => Some(expr),
+        }
+    }
 }

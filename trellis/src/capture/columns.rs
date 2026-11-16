@@ -149,6 +149,9 @@ fn own_columns(def: &TransformDef) -> BTreeSet<String> {
     if let KeySpace::Aggregate { group_by } = &def.key_space {
         columns.extend(group_by.iter().cloned());
     }
+    // The `WHERE`'s columns decide membership, so every image carries them
+    // and a rename, drop or retype of one reaches the definition.
+    columns.extend(crate::defs::oracle::predicate_columns(def));
     columns
 }
 

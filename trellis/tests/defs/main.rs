@@ -45,6 +45,7 @@ mod defs_table_column_cap;
 mod defs_temporal;
 mod defs_text_functions;
 mod defs_typed_literals;
+mod defs_where;
 mod dump_definitions_sql;
 mod identifier_case_hint;
 mod mixed_case_source;

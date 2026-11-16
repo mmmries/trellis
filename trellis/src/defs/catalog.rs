@@ -7417,6 +7417,17 @@ async fn column_dependents_via(
                 deps.push((target.clone(), field.name.clone()));
             }
         }
+        // A downstream `WHERE` reads the column too, named `WHERE`: a drop
+        // of the column is refused, and `status` names the paused column as
+        // the reader's cause. Not for the 1-1 field-pause cascade, which
+        // pauses fields: pausing every field would still let the frozen
+        // column decide membership.
+        if !only_one_to_one
+            && qualified_source == qualified_upstream
+            && super::oracle::predicate_columns(&def).contains(upstream_column)
+        {
+            deps.push((target.clone(), "WHERE".to_string()));
+        }
         // A `GROUP BY` key is not itself a `FieldDef` in `def.fields` — see
         // `ast::KeySpace::Aggregate`'s own doc comment — so the loop above
         // never sees it. Only reachable when `only_one_to_one` is false

@@ -303,6 +303,7 @@ pub mod fixtures {
             migrations_pending: None,
             below_catalog_floor: None,
             floor: "0.2.0".to_string(),
+            filter: None,
         }
     }
 

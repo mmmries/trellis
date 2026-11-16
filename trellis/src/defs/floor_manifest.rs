@@ -381,10 +381,11 @@ fn features() -> Vec<Feature> {
         .into_iter()
         .map(Feature::JoinKind),
     );
-    let predicates = [PredicateKind::True];
+    let predicates = [PredicateKind::True, PredicateKind::Filter];
     features.extend(
         every(&predicates, |p| match p {
             PredicateKind::True => 0,
+            PredicateKind::Filter => 1,
         })
         .into_iter()
         .map(Feature::Predicate),
