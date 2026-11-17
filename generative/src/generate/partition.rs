@@ -9,8 +9,8 @@
 //! [`super::render_mutate`] set from plain pk liveness no longer hold. A
 //! [`PartitionSim`] replays the table's ops the way Postgres applies them
 //! (rows keyed by `(pk, grain)`, routed to the leaf whose bound holds the
-//! grain, or to the `DEFAULT`, or nowhere) and sets every op's
-//! [`Op::expect`] from that.
+//! grain, or to the `DEFAULT`, or nowhere; within a middle, on to its own
+//! leaf the same way) and sets every op's [`Op::expect`] from that.
 //!
 //! The model routes grains `0..=`[`ROUTED_GRAIN_MAX`]. `HASH` routing is
 //! Postgres's own hash of a `bigint`, which [`HASH_REMAINDERS`] tabulates;
@@ -98,6 +98,38 @@ pub enum MaintenanceKind {
     /// new leaves over its remainders at a multiple of its modulus, each
     /// with `rows` rows.
     Resplit { rows: u8 },
+    /// A new middle for a bound no leaf holds (for `LIST`, a free value and
+    /// up to two more free values above it), partitioned `BY LIST` of the
+    /// grain: a leaf for each of `leaves` of the grains its bound holds, and
+    /// a `DEFAULT` when `default` or `leaves` is zero. It holds `rows` rows
+    /// (primary keys `1..=rows`) spread over the grains its leaves take;
+    /// when `standalone`, it is built outside the tree and attached with
+    /// them. When every bound is held, a leaf is dropped first. Once
+    /// created, `then` acts on it at once; later, it is detached, attached,
+    /// dropped, truncated and rebound like any other leaf of the tree, and
+    /// its own leaves are written and truncated by name.
+    Middle {
+        rows: u8,
+        leaves: u8,
+        default: bool,
+        standalone: bool,
+        then: MiddleThen,
+    },
+}
+
+/// What a [`MaintenanceKind::Middle`] does to the middle right after
+/// creating it, so a middle's detach, attach and drop are drawn as often
+/// as the middle itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddleThen {
+    /// Nothing.
+    Stay,
+    /// Detach it, `CONCURRENTLY` when asked and Postgres allows it.
+    Detach { concurrently: bool },
+    /// Detach it as for `Detach`, then attach it again under its bound.
+    Reattach { concurrently: bool },
+    /// Drop it.
+    Drop,
 }
 
 /// One draw [`add_partition_maintenance`] layers on a program's partitioned
@@ -298,8 +330,62 @@ impl Layout {
     }
 }
 
+/// A leaf of a middle: a `LIST` leaf over `values`, or its `DEFAULT` when
+/// `None`.
+#[derive(Debug, Clone)]
+struct SubLeaf {
+    name: String,
+    values: Option<BTreeSet<i64>>,
+}
+
+/// The leaf of `leaves` a row with `grain` routes to: the one whose value
+/// list holds it, else the `DEFAULT`, else none.
+fn sub_route(leaves: &[SubLeaf], grain: i64) -> Option<usize> {
+    leaves
+        .iter()
+        .position(|l| l.values.as_ref().is_some_and(|v| v.contains(&grain)))
+        .or_else(|| leaves.iter().position(|l| l.values.is_none()))
+}
+
+/// The bound clause of a middle's leaf over `values` (`None`: its
+/// `DEFAULT`), and back.
+fn sub_bound(values: Option<&BTreeSet<i64>>) -> String {
+    match values {
+        Some(values) => {
+            let values: Vec<String> = values.iter().map(i64::to_string).collect();
+            format!("for values in ({})", values.join(", "))
+        }
+        None => "default".to_string(),
+    }
+}
+
+fn sub_values(bound: &str) -> Option<BTreeSet<i64>> {
+    if bound == "default" {
+        return None;
+    }
+    let values = bound
+        .strip_prefix("for values in (")
+        .and_then(|b| b.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("no middle's leaf has the bound {bound:?} — a generator bug"));
+    Some(
+        values
+            .split(", ")
+            .map(|v| v.parse().expect("a middle's leaf value is a grain"))
+            .collect(),
+    )
+}
+
+/// Where a write named on a table lands: table `table` of
+/// [`PartitionSim::tables`], or, for a middle, its leaf `leaf` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Node {
+    table: usize,
+    leaf: Option<usize>,
+}
+
 /// One table that is, or was, a leaf: its bound's slots, whether it is in
-/// the tree, and its rows' `(pk, grain)` keys.
+/// the tree, and its rows' `(pk, grain)` keys. A middle's rows are its
+/// leaves', which [`SimTable::sub`] routes.
 #[derive(Debug, Clone)]
 struct SimTable {
     name: String,
@@ -311,6 +397,8 @@ struct SimTable {
     /// and refuses every row outside it.
     checks: Vec<BTreeSet<usize>>,
     rows: BTreeSet<(i64, i64)>,
+    /// A middle's leaves, partitioned by the grain; empty for a leaf.
+    sub: Vec<SubLeaf>,
 }
 
 /// A partitioned source as Postgres holds it, for working out each op's
@@ -353,6 +441,7 @@ impl PartitionSim {
                 attached: true,
                 checks: Vec::new(),
                 rows: BTreeSet::new(),
+                sub: Vec::new(),
             })
             .collect();
         PartitionSim {
@@ -398,15 +487,23 @@ impl PartitionSim {
     /// The smallest grain a leaf over `slots` holds in the tree as it is (for
     /// a `DEFAULT`, one no other leaf takes), if any.
     fn grain_for(&self, slots: &BTreeSet<usize>) -> Option<i64> {
+        self.grains_for(slots).first().copied()
+    }
+
+    /// Every grain up to [`PARTITION_GRAIN_MAX`] a leaf over `slots` holds
+    /// in the tree as it is, smallest first.
+    fn grains_for(&self, slots: &BTreeSet<usize>) -> Vec<i64> {
         let default = self
             .layout
             .default_slot()
             .is_some_and(|d| slots.contains(&d));
-        (0..=PARTITION_GRAIN_MAX).find(|&g| match self.layout.slot_of(g) {
-            Some(s) if !default => slots.contains(&s),
-            Some(s) => self.occupant(s).is_none(),
-            None => default,
-        })
+        (0..=PARTITION_GRAIN_MAX)
+            .filter(|&g| match self.layout.slot_of(g) {
+                Some(s) if !default => slots.contains(&s),
+                Some(s) => self.occupant(s).is_none(),
+                None => default,
+            })
+            .collect()
     }
 
     /// The leaf a row with `grain` routes to: its bound's, else the
@@ -419,9 +516,43 @@ impl PartitionSim {
     }
 
     /// Whether a row with `grain` may live in table `t`: one its `CHECK`
-    /// constraints pass and, in the tree, that routes there.
+    /// constraints pass, that, in the tree, routes there and, for a middle,
+    /// that one of its leaves takes.
     fn holds(&self, t: usize, grain: i64) -> bool {
-        (!self.tables[t].attached || self.route(grain) == Some(t)) && self.passes_checks(t, grain)
+        (!self.tables[t].attached || self.route(grain) == Some(t))
+            && self.passes_checks(t, grain)
+            && (self.tables[t].sub.is_empty() || sub_route(&self.tables[t].sub, grain).is_some())
+    }
+
+    /// Whether a row with `grain` of `node`'s table lands in `node`.
+    fn in_node(&self, node: Node, grain: i64) -> bool {
+        node.leaf
+            .is_none_or(|l| sub_route(&self.tables[node.table].sub, grain) == Some(l))
+    }
+
+    /// The name of the table a row of table `t` with `grain` lives in: for a
+    /// middle, the leaf of its own that takes it, if any.
+    fn name_in(&self, t: usize, grain: i64) -> String {
+        let table = &self.tables[t];
+        match sub_route(&table.sub, grain) {
+            Some(l) => table.sub[l].name.clone(),
+            None => table.name.clone(),
+        }
+    }
+
+    /// The `(table, row)` of every row a write named on `within` (the root
+    /// when `None`) reaches.
+    fn scope_rows(&self, within: Option<Node>) -> Vec<(usize, (i64, i64))> {
+        (0..self.tables.len())
+            .filter(|&t| within.map_or(self.tables[t].attached, |w| w.table == t))
+            .flat_map(|t| {
+                self.tables[t]
+                    .rows
+                    .iter()
+                    .filter(move |&&(_, g)| within.is_none_or(|w| self.in_node(w, g)))
+                    .map(move |&row| (t, row))
+            })
+            .collect()
     }
 
     /// Whether `rows` all fit the bound over `slots` in the tree as it is,
@@ -458,6 +589,24 @@ impl PartitionSim {
             .unwrap_or_else(|| panic!("no modelled table is named {name:?} — a generator bug"))
     }
 
+    /// The table, or a middle's leaf, named `name`.
+    fn node_named(&self, name: &str) -> Node {
+        if let Some(table) = self.tables.iter().position(|t| t.name == name) {
+            return Node { table, leaf: None };
+        }
+        self.tables
+            .iter()
+            .enumerate()
+            .find_map(|(table, t)| {
+                let leaf = t.sub.iter().position(|l| l.name == name)?;
+                Some(Node {
+                    table,
+                    leaf: Some(leaf),
+                })
+            })
+            .unwrap_or_else(|| panic!("no modelled table is named {name:?} — a generator bug"))
+    }
+
     /// The `(pk, grain)` of a row an insert writes.
     fn key(&self, row: &[(String, Option<String>)]) -> (i64, i64) {
         let get = |column: &str| -> i64 {
@@ -475,14 +624,17 @@ impl PartitionSim {
         (get(&self.pk_col), get(&self.grain_col))
     }
 
-    /// Inserts `row` into table `t` (any leaf when `None`: the one it
+    /// Inserts `row` into `within` (any leaf when `None`: the one it
     /// routes to), as Postgres would.
-    fn insert(&mut self, t: Option<usize>, row: &[(String, Option<String>)]) -> OpOutcome {
+    fn insert(&mut self, within: Option<Node>, row: &[(String, Option<String>)]) -> OpOutcome {
         let (pk, grain) = self.key(row);
-        let Some(t) = t.or_else(|| self.route(grain)) else {
+        let Some(node) =
+            within.or_else(|| self.route(grain).map(|table| Node { table, leaf: None }))
+        else {
             return OpOutcome::Fails;
         };
-        if !self.holds(t, grain) {
+        let t = node.table;
+        if !self.holds(t, grain) || !self.in_node(node, grain) {
             return OpOutcome::Fails;
         }
         if self.tables[t].rows.insert((pk, grain)) {
@@ -495,22 +647,12 @@ impl PartitionSim {
     /// Updates the rows with primary-key column `pk` in `within` (every leaf
     /// when `None`, as through the root), setting the grain to `grain` when
     /// given.
-    fn update(&mut self, within: Option<usize>, pk: i64, grain: Option<i64>) -> OpOutcome {
-        let scope: Vec<usize> = match within {
-            Some(t) => vec![t],
-            None => (0..self.tables.len())
-                .filter(|&t| self.tables[t].attached)
-                .collect(),
-        };
-        let matched: Vec<(usize, i64)> = scope
-            .iter()
-            .flat_map(|&t| {
-                self.tables[t]
-                    .rows
-                    .iter()
-                    .filter(move |&&(p, _)| p == pk)
-                    .map(move |&(_, g)| (t, g))
-            })
+    fn update(&mut self, within: Option<Node>, pk: i64, grain: Option<i64>) -> OpOutcome {
+        let matched: Vec<(usize, i64)> = self
+            .scope_rows(within)
+            .into_iter()
+            .filter(|&(_, (p, _))| p == pk)
+            .map(|(t, (_, g))| (t, g))
             .collect();
         let Some(new) = grain else {
             return if matched.is_empty() {
@@ -529,10 +671,10 @@ impl PartitionSim {
                 // moves there; named on a leaf, it must stay.
                 let dest = match within {
                     None => match self.route(new) {
-                        Some(dest) if self.passes_checks(dest, new) => dest,
+                        Some(dest) if self.holds(dest, new) => dest,
                         _ => return OpOutcome::Fails,
                     },
-                    Some(_) if self.holds(t, new) => t,
+                    Some(node) if self.holds(t, new) && self.in_node(node, new) => t,
                     Some(_) => return OpOutcome::Fails,
                 };
                 if self.tables[dest].rows.contains(&(pk, new)) {
@@ -545,40 +687,35 @@ impl PartitionSim {
         }
     }
 
-    fn delete(&mut self, within: Option<usize>, pk: i64) -> OpOutcome {
-        let mut removed = false;
-        for (t, table) in self.tables.iter_mut().enumerate() {
-            if within.map_or(table.attached, |w| w == t) {
-                let before = table.rows.len();
-                table.rows.retain(|&(p, _)| p != pk);
-                removed |= table.rows.len() != before;
-            }
+    fn delete(&mut self, within: Option<Node>, pk: i64) -> OpOutcome {
+        self.remove(within, |p| p == pk)
+    }
+
+    fn truncate(&mut self, within: Option<Node>) -> OpOutcome {
+        self.remove(within, |_| true)
+    }
+
+    /// Removes the rows in `within` whose primary-key column `doomed`
+    /// accepts.
+    fn remove(&mut self, within: Option<Node>, doomed: impl Fn(i64) -> bool) -> OpOutcome {
+        let rows: Vec<(usize, (i64, i64))> = self
+            .scope_rows(within)
+            .into_iter()
+            .filter(|&(_, (p, _))| doomed(p))
+            .collect();
+        for (t, row) in &rows {
+            self.tables[*t].rows.remove(row);
         }
-        if removed {
-            OpOutcome::Succeeds
-        } else {
+        if rows.is_empty() {
             OpOutcome::AffectsNoRows
+        } else {
+            OpOutcome::Succeeds
         }
     }
 
-    fn truncate(&mut self, within: Option<usize>) -> OpOutcome {
-        let mut removed = false;
-        for (t, table) in self.tables.iter_mut().enumerate() {
-            if within.map_or(table.attached, |w| w == t) {
-                removed |= !table.rows.is_empty();
-                table.rows.clear();
-            }
-        }
-        if removed {
-            OpOutcome::Succeeds
-        } else {
-            OpOutcome::AffectsNoRows
-        }
-    }
-
-    /// Applies a write on the root, or on table `within`, and returns its
+    /// Applies a write on the root, or on `within`, and returns its
     /// outcome.
-    fn write(&mut self, within: Option<usize>, op: &Op) -> OpOutcome {
+    fn write(&mut self, within: Option<Node>, op: &Op) -> OpOutcome {
         match op {
             Op::Insert { row, .. } => self.insert(within, row),
             Op::BulkInsert { rows, .. } => {
@@ -620,8 +757,8 @@ impl PartitionSim {
         );
         match op {
             Op::Leaf { leaf, op } => {
-                let t = self.table_named(leaf);
-                self.write(Some(t), op)
+                let node = self.node_named(leaf);
+                self.write(Some(node), op)
             }
             Op::Partition { action, .. } => self.maintain(action),
             _ => self.write(None, op),
@@ -686,6 +823,46 @@ impl PartitionSim {
                     attached: true,
                     checks: Vec::new(),
                     rows: keys,
+                    sub: Vec::new(),
+                });
+                OpOutcome::Succeeds
+            }
+            PartitionAction::CreateMiddle {
+                middle,
+                bound,
+                leaves,
+                rows,
+                ..
+            } => {
+                let slots = self.layout.slots_of_bound(bound);
+                assert!(
+                    self.free(&slots),
+                    "a new middle for a bound a leaf holds — a generator bug"
+                );
+                let sub: Vec<SubLeaf> = leaves
+                    .iter()
+                    .map(|(name, bound)| SubLeaf {
+                        name: name.clone(),
+                        values: sub_values(bound),
+                    })
+                    .collect();
+                let mut keys = BTreeSet::new();
+                for row in rows {
+                    let key = self.key(row);
+                    if !keys.insert(key) || sub_route(&sub, key.1).is_none() {
+                        return OpOutcome::Fails;
+                    }
+                }
+                if !self.may_take_slots(&slots, &keys) {
+                    return OpOutcome::Fails;
+                }
+                self.tables.push(SimTable {
+                    name: middle.clone(),
+                    slots,
+                    attached: true,
+                    checks: Vec::new(),
+                    rows: keys,
+                    sub,
                 });
                 OpOutcome::Succeeds
             }
@@ -710,16 +887,41 @@ pub fn resimulate(program: &mut Program, table: usize) {
 }
 
 /// The coverage names of the ops on `program`'s partitioned tables that
-/// change a bound, each one Postgres accepts: `attach_rebound` (a table
-/// attached under a bound other than the one it last had), `attach_widened`
-/// (a `LIST` table attached with values added to its own), and
-/// `create_resplit` (a new `HASH` leaf at a modulus other than the tree's
-/// initial one).
-pub fn bound_change_names(program: &Program) -> Vec<&'static str> {
+/// change a bound or act on a middle, each one Postgres accepts:
+/// `attach_rebound` (a table attached under a bound other than the one it
+/// last had), `attach_widened` (a `LIST` table attached with values added
+/// to its own), `create_resplit` (a new `HASH` leaf at a modulus other than
+/// the tree's initial one), `middle_default` (a new middle with a
+/// `DEFAULT`), `attach_middle`, `detach_middle` and `drop_middle` (of a
+/// middle), and `middle_leaf_write` (a write named on a middle's leaf).
+pub fn tree_change_names(program: &Program) -> Vec<&'static str> {
     let mut names = Vec::new();
     for table in program.tables.iter().filter(|t| t.partitioning.is_some()) {
         let mut sim = PartitionSim::new(table);
         for op in program.ops.iter().filter(|op| op.table() == table.name) {
+            let is_middle = |leaf: &str| !sim.tables[sim.table_named(leaf)].sub.is_empty();
+            let middle = match op {
+                Op::Partition {
+                    action: PartitionAction::Attach { leaf, .. },
+                    ..
+                } if is_middle(leaf) => Some("attach_middle"),
+                Op::Partition {
+                    action: PartitionAction::Detach { leaf, .. },
+                    ..
+                } if is_middle(leaf) => Some("detach_middle"),
+                Op::Partition {
+                    action: PartitionAction::Drop { leaf },
+                    ..
+                } if is_middle(leaf) => Some("drop_middle"),
+                Op::Partition {
+                    action: PartitionAction::CreateMiddle { leaves, .. },
+                    ..
+                } if leaves.iter().any(|(_, bound)| bound == "default") => Some("middle_default"),
+                Op::Leaf { leaf, .. } if sim.node_named(leaf).leaf.is_some() => {
+                    Some("middle_leaf_write")
+                }
+                _ => None,
+            };
             let name = match op {
                 Op::Partition {
                     action: PartitionAction::Attach { leaf, bound },
@@ -753,10 +955,9 @@ pub fn bound_change_names(program: &Program) -> Vec<&'static str> {
                 },
                 _ => None,
             };
-            if sim.apply(op) == OpOutcome::Succeeds
-                && let Some(name) = name
-            {
-                names.push(name);
+            if sim.apply(op) == OpOutcome::Succeeds {
+                names.extend(name);
+                names.extend(middle);
             }
         }
     }
@@ -906,7 +1107,7 @@ fn maintenance(
         }
     };
     match kind {
-        MaintenanceKind::Create { .. } => {
+        MaintenanceKind::Create { .. } | MaintenanceKind::Middle { .. } => {
             // A new leaf needs a bound no leaf holds: with none free, it
             // replaces a leaf, dropped first.
             if sim.free_bounds().is_empty()
@@ -914,8 +1115,47 @@ fn maintenance(
             {
                 emit(sim, op, out);
             }
-            if let Some(op) = maintenance_op(sim, table, pick, kind) {
-                emit(sim, op, out);
+            let Some(op) = maintenance_op(sim, table, pick, kind) else {
+                return;
+            };
+            let middle = match &op {
+                Op::Partition {
+                    action: PartitionAction::CreateMiddle { middle, .. },
+                    ..
+                } => Some(middle.clone()),
+                _ => None,
+            };
+            emit(sim, op, out);
+            // A middle's next step, if Postgres created it.
+            let (Some(middle), MaintenanceKind::Middle { then, .. }) = (middle, kind) else {
+                return;
+            };
+            let Some(t) = sim.tables.iter().position(|t| t.name == middle) else {
+                return;
+            };
+            match then {
+                MiddleThen::Stay => {}
+                MiddleThen::Drop => {
+                    emit(sim, partition(PartitionAction::Drop { leaf: middle }), out)
+                }
+                MiddleThen::Detach { concurrently } | MiddleThen::Reattach { concurrently } => {
+                    let bound = sim.layout.bound(&sim.tables[t].slots);
+                    emit(
+                        sim,
+                        partition(detach_action(sim, &middle, concurrently)),
+                        out,
+                    );
+                    if matches!(then, MiddleThen::Reattach { .. }) {
+                        emit(
+                            sim,
+                            partition(PartitionAction::Attach {
+                                leaf: middle,
+                                bound,
+                            }),
+                            out,
+                        );
+                    }
+                }
             }
         }
         MaintenanceKind::Rebound { concurrently } => {
@@ -1079,8 +1319,9 @@ fn new_leaf(
 
 /// `op`, a write through the root, named on the table its row lives in (a
 /// detached one, if `detached` and one holds it), or for an insert, the leaf
-/// it routes to. Unchanged when there is no such table (an insert that
-/// routes nowhere), or the op is a whole-table one.
+/// it routes to; in a middle, on the middle's leaf that takes the row.
+/// Unchanged when there is no such table (an insert that routes nowhere),
+/// or the op is a whole-table one.
 fn on_leaf(sim: &PartitionSim, op: Op, detached: bool) -> Op {
     let leaf = match &op {
         Op::Insert { row, .. } => {
@@ -1092,27 +1333,121 @@ fn on_leaf(sim: &PartitionSim, op: Op, detached: bool) -> Op {
                     })
                 })
                 .flatten();
-            outside.or_else(|| sim.route(grain))
+            outside
+                .or_else(|| sim.route(grain))
+                .map(|t| sim.name_in(t, grain))
         }
         Op::Update { pk, .. } | Op::Delete { pk, .. } => {
             let pk = parse_pk(pk);
-            let holds = |t: &SimTable| t.rows.iter().any(|&(p, _)| p == pk);
+            let grain = |t: &SimTable| t.rows.iter().find(|&&(p, _)| p == pk).map(|&(_, g)| g);
             let outside = detached
-                .then(|| sim.tables.iter().position(|t| !t.attached && holds(t)))
+                .then(|| {
+                    sim.tables
+                        .iter()
+                        .position(|t| !t.attached && grain(t).is_some())
+                })
                 .flatten();
             outside
-                .or_else(|| sim.tables.iter().position(|t| t.attached && holds(t)))
-                .or_else(|| sim.tables.iter().position(|t| t.attached))
+                .or_else(|| {
+                    sim.tables
+                        .iter()
+                        .position(|t| t.attached && grain(t).is_some())
+                })
+                .map(|t| sim.name_in(t, grain(&sim.tables[t]).expect("the table holds the pk")))
+                .or_else(|| {
+                    sim.tables
+                        .iter()
+                        .position(|t| t.attached)
+                        .map(|t| sim.tables[t].name.clone())
+                })
         }
         _ => None,
     };
     match leaf {
-        Some(t) => Op::Leaf {
-            leaf: sim.tables[t].name.clone(),
+        Some(leaf) => Op::Leaf {
+            leaf,
             op: Box::new(op),
         },
         None => op,
     }
+}
+
+/// A new middle ([`MaintenanceKind::Middle`]) for a free bound, or `None`
+/// if none is free or no grain fits it.
+fn new_middle(
+    sim: &mut PartitionSim,
+    table: &Table,
+    pick: usize,
+    rows: u8,
+    leaves: u8,
+    default: bool,
+    standalone: bool,
+) -> Option<Op> {
+    let free = sim.free_bounds();
+    let mut slots = (!free.is_empty()).then(|| free[pick % free.len()].clone())?;
+    if matches!(sim.layout.0, PartitionStrategy::List { .. })
+        && !sim
+            .layout
+            .default_slot()
+            .is_some_and(|d| slots.contains(&d))
+    {
+        // A `LIST` bound is one value: up to two more free values above it
+        // give the middle's leaves values to split.
+        let first = *slots.first().expect("a bound holds a slot");
+        for bound in &free {
+            let s = *bound.first().expect("a bound holds a slot");
+            if slots.len() < 3 && s > first && Some(s) != sim.layout.default_slot() {
+                slots.insert(s);
+            }
+        }
+    }
+    let grains = sim.grains_for(&slots);
+    if grains.is_empty() {
+        return None;
+    }
+    let count = usize::from(leaves).min(grains.len());
+    let mut values: Vec<i64> = (0..count)
+        .map(|i| grains[(pick + i) % grains.len()])
+        .collect();
+    values.sort_unstable();
+    let default = default || count == 0;
+    sim.created += 1;
+    let middle = format!("{}_m{}", table.name, sim.created);
+    let mut sub: Vec<(String, String)> = values
+        .iter()
+        .map(|&g| {
+            (
+                format!("{middle}_{g}"),
+                sub_bound(Some(&BTreeSet::from([g]))),
+            )
+        })
+        .collect();
+    if default {
+        sub.push((format!("{middle}_d"), sub_bound(None)));
+    }
+    let routed = if default { &grains } else { &values };
+    let grain_col = &table.partitioning.as_ref().expect("partitioned").column;
+    let rows = (1..=i64::from(rows))
+        .map(|pk| {
+            let grain = routed[(pk as usize - 1) % routed.len()];
+            vec![
+                (table.pk_col.clone(), Some(pk.to_string())),
+                (table.columns[1].name.clone(), Some(pk.to_string())),
+                (grain_col.clone(), Some(grain.to_string())),
+            ]
+        })
+        .collect();
+    Some(Op::Partition {
+        table: table.name.clone(),
+        action: PartitionAction::CreateMiddle {
+            middle,
+            bound: sim.layout.bound(&slots),
+            leaves: sub,
+            rows,
+            standalone,
+        },
+        expect: OpOutcome::Succeeds,
+    })
 }
 
 /// The op a single-op [`PartitionDraw::Maintenance`] becomes in the tree
@@ -1146,9 +1481,19 @@ fn maintenance_op(
             })
         }
         MaintenanceKind::TruncateLeaf => {
-            let t = choose(attached)?;
+            // A leaf or middle of the tree, or a middle's leaf.
+            let names: Vec<String> = attached
+                .iter()
+                .map(|&t| sim.tables[t].name.clone())
+                .chain(
+                    attached
+                        .iter()
+                        .flat_map(|&t| sim.tables[t].sub.iter().map(|l| l.name.clone())),
+                )
+                .collect();
+            let i = choose((0..names.len()).collect())?;
             Op::Leaf {
-                leaf: sim.tables[t].name.clone(),
+                leaf: names[i].clone(),
                 op: Box::new(Op::Truncate {
                     table: table.name.clone(),
                     expect: OpOutcome::Succeeds,
@@ -1170,6 +1515,15 @@ fn maintenance_op(
             let free = sim.free_bounds();
             let slots = (!free.is_empty()).then(|| free[pick % free.len()].clone())?;
             return new_leaf(sim, table, &slots, rows, standalone);
+        }
+        MaintenanceKind::Middle {
+            rows,
+            leaves,
+            default,
+            standalone,
+            ..
+        } => {
+            return new_middle(sim, table, pick, rows, leaves, default, standalone);
         }
         MaintenanceKind::Rebound { .. }
         | MaintenanceKind::Widen { .. }
@@ -1644,7 +1998,7 @@ mod tests {
                 ("update".into(), OpOutcome::Succeeds),
             ]
         );
-        assert_eq!(bound_change_names(&program), vec!["attach_widened"]);
+        assert_eq!(tree_change_names(&program), vec!["attach_widened"]);
         assert_eq!(
             Layout(PartitionStrategy::List {
                 values: 3,
@@ -1701,7 +2055,7 @@ mod tests {
             }
         );
         assert_eq!(shape(&program).last(), Some(&(attach, OpOutcome::Fails)));
-        assert!(bound_change_names(&program).is_empty());
+        assert!(tree_change_names(&program).is_empty());
     }
 
     /// A `HASH` table attached at a coarser modulus than its own counts as a
@@ -1748,7 +2102,7 @@ mod tests {
             "{:#?}",
             program.ops
         );
-        assert_eq!(bound_change_names(&program), vec!["attach_rebound"]);
+        assert_eq!(tree_change_names(&program), vec!["attach_rebound"]);
     }
 
     /// A `HASH` leaf re-split to a multiple modulus is replaced by a leaf per
@@ -1792,5 +2146,351 @@ mod tests {
                 ..
             } if leaf == "t0_p0"
         ));
+    }
+
+    /// A full row of `table` with primary-key column `pk` at `grain`.
+    fn row(table: &Table, pk: i64, grain: i64) -> Vec<(String, Option<String>)> {
+        let grain_col = &table.partitioning.as_ref().expect("partitioned").column;
+        vec![
+            (table.pk_col.clone(), Some(pk.to_string())),
+            (table.columns[1].name.clone(), Some(pk.to_string())),
+            (grain_col.clone(), Some(grain.to_string())),
+        ]
+    }
+
+    /// The outcomes `ops` get, applied in order to a fresh model of `table`.
+    fn outcomes(table: &Table, ops: &[Op]) -> Vec<OpOutcome> {
+        let mut sim = PartitionSim::new(table);
+        ops.iter().map(|op| sim.apply(op)).collect()
+    }
+
+    fn ddl(table: &Table, action: PartitionAction) -> Op {
+        Op::Partition {
+            table: table.name.clone(),
+            action,
+            expect: OpOutcome::Succeeds,
+        }
+    }
+
+    fn drop_leaf(table: &Table, leaf: &str) -> Op {
+        ddl(table, PartitionAction::Drop { leaf: leaf.into() })
+    }
+
+    fn insert(table: &Table, pk: i64, grain: i64) -> Op {
+        Op::Insert {
+            table: table.name.clone(),
+            row: row(table, pk, grain),
+            expect: OpOutcome::Succeeds,
+        }
+    }
+
+    fn move_row(table: &Table, pk: i64, grain: i64) -> Op {
+        let grain_col = &table.partitioning.as_ref().expect("partitioned").column;
+        Op::Update {
+            table: table.name.clone(),
+            pk: pk.to_string(),
+            changes: vec![(grain_col.clone(), Some(grain.to_string()))],
+            expect: OpOutcome::Succeeds,
+        }
+    }
+
+    fn named(leaf: &str, op: Op) -> Op {
+        Op::Leaf {
+            leaf: leaf.into(),
+            op: Box::new(op),
+        }
+    }
+
+    /// A middle routes its rows to its own leaves, as Postgres 17 does
+    /// against a scratch database: a row its value lists miss lands in its
+    /// `DEFAULT`, a write named on one of its leaves must stay in that
+    /// leaf, a row moved through the root moves between its leaves, and a
+    /// concurrent detach leaves a `CHECK` on it (and its leaves) that
+    /// refuses a row outside its bound.
+    #[test]
+    fn a_middle_routes_its_rows_to_its_own_leaves() {
+        let program = program(
+            PartitionStrategy::List {
+                values: 5,
+                default: false,
+            },
+            &[],
+            vec![],
+        );
+        let t = &program.tables[0];
+        let ops = vec![
+            drop_leaf(t, "t0_p1"),
+            drop_leaf(t, "t0_p2"),
+            ddl(
+                t,
+                PartitionAction::CreateMiddle {
+                    middle: "t0_m1".into(),
+                    bound: "for values in (1, 2)".into(),
+                    leaves: vec![
+                        ("t0_m1_1".into(), "for values in (1)".into()),
+                        ("t0_m1_d".into(), "default".into()),
+                    ],
+                    rows: vec![row(t, 1, 1), row(t, 2, 2)],
+                    standalone: true,
+                },
+            ),
+            insert(t, 3, 2),
+            named("t0_m1_1", insert(t, 4, 2)),
+            move_row(t, 1, 2),
+            named("t0_m1_d", move_row(t, 3, 0)),
+            named("t0_m1", move_row(t, 3, 1)),
+            ddl(
+                t,
+                PartitionAction::Detach {
+                    leaf: "t0_m1".into(),
+                    concurrently: true,
+                },
+            ),
+            named("t0_m1_d", insert(t, 5, 3)),
+            drop_leaf(t, "t0_p3"),
+            // The middle's rows are at grains 1 and 2.
+            ddl(
+                t,
+                PartitionAction::Attach {
+                    leaf: "t0_m1".into(),
+                    bound: "for values in (3)".into(),
+                },
+            ),
+            ddl(
+                t,
+                PartitionAction::Attach {
+                    leaf: "t0_m1".into(),
+                    bound: "for values in (1, 2)".into(),
+                },
+            ),
+            named(
+                "t0_m1_1",
+                Op::Truncate {
+                    table: t.name.clone(),
+                    expect: OpOutcome::Succeeds,
+                },
+            ),
+            // Pk 3 left `t0_m1_1` with its truncate.
+            move_row(t, 3, 2),
+            move_row(t, 2, 1),
+        ];
+        assert_eq!(
+            outcomes(t, &ops),
+            vec![
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::AffectsNoRows,
+                OpOutcome::Succeeds,
+            ]
+        );
+    }
+
+    /// A middle with no `DEFAULT` refuses a row none of its leaves takes,
+    /// through the root or named on it, and refuses to be created with one.
+    #[test]
+    fn a_middle_without_a_default_refuses_a_grain_none_of_its_leaves_takes() {
+        let program = program(PartitionStrategy::Hash { modulus: 1 }, &[], vec![]);
+        let t = &program.tables[0];
+        let middle = |rows| {
+            ddl(
+                t,
+                PartitionAction::CreateMiddle {
+                    middle: "t0_m1".into(),
+                    bound: "for values with (modulus 1, remainder 0)".into(),
+                    leaves: vec![("t0_m1_0".into(), "for values in (0)".into())],
+                    rows,
+                    standalone: false,
+                },
+            )
+        };
+        let ops = vec![
+            drop_leaf(t, "t0_p0"),
+            middle(vec![row(t, 1, 0), row(t, 2, 1)]),
+            middle(vec![row(t, 1, 0)]),
+            insert(t, 2, 0),
+            insert(t, 3, 1),
+            named("t0_m1", insert(t, 3, 1)),
+            move_row(t, 2, 1),
+        ];
+        assert_eq!(
+            outcomes(t, &ops),
+            vec![
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Fails,
+                OpOutcome::Fails,
+            ]
+        );
+    }
+
+    /// A partitioned `DEFAULT` holding a bound's rows in one of its own
+    /// leaves refuses a new leaf for that bound, as a plain one does.
+    #[test]
+    fn a_partitioned_default_holding_a_bounds_rows_refuses_a_leaf_for_it() {
+        let program = program(
+            PartitionStrategy::List {
+                values: 2,
+                default: true,
+            },
+            &[],
+            vec![],
+        );
+        let t = &program.tables[0];
+        let leaf = |name: &str| {
+            ddl(
+                t,
+                PartitionAction::Create {
+                    leaf: name.into(),
+                    bound: "for values in (1)".into(),
+                    rows: vec![],
+                    standalone: false,
+                },
+            )
+        };
+        let ops = vec![
+            drop_leaf(t, "t0_pd"),
+            drop_leaf(t, "t0_p1"),
+            ddl(
+                t,
+                PartitionAction::CreateMiddle {
+                    middle: "t0_m1".into(),
+                    bound: "default".into(),
+                    leaves: vec![
+                        ("t0_m1_5".into(), "for values in (5)".into()),
+                        ("t0_m1_d".into(), "default".into()),
+                    ],
+                    rows: vec![row(t, 1, 5), row(t, 2, 6)],
+                    standalone: false,
+                },
+            ),
+            insert(t, 3, 1),
+            leaf("t0_n1"),
+            named(
+                "t0_m1_d",
+                Op::Delete {
+                    table: t.name.clone(),
+                    pk: "3".into(),
+                    expect: OpOutcome::Succeeds,
+                },
+            ),
+            leaf("t0_n2"),
+            insert(t, 3, 1),
+        ];
+        assert_eq!(
+            outcomes(t, &ops),
+            vec![
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+            ]
+        );
+    }
+
+    /// A [`MaintenanceKind::Middle`] draw over a tree with no free bound
+    /// drops a leaf, creates a middle with a leaf per drawn grain and its
+    /// rows spread over them, and takes its next step at once; a write
+    /// named on a leaf then names the middle's leaf its row routes to.
+    #[test]
+    fn a_middle_draw_creates_a_middle_and_takes_its_next_step() {
+        let range = PartitionStrategy::Range { bounds: 1 };
+        // ops: insert pk1 (g0), insert pk2 (g1).
+        let program = add_partition_maintenance(
+            program(range, &[0, 1], vec![]),
+            0,
+            &[
+                PartitionDraw::Maintenance {
+                    at: 1,
+                    pick: 0,
+                    kind: MaintenanceKind::Middle {
+                        rows: 1,
+                        leaves: 2,
+                        default: false,
+                        standalone: false,
+                        then: MiddleThen::Reattach { concurrently: true },
+                    },
+                },
+                PartitionDraw::ViaLeaf {
+                    at: 1,
+                    detached: false,
+                },
+            ],
+        );
+        let bound = "for values from (minvalue) to (maxvalue)".to_string();
+        assert_eq!(
+            shape(&program),
+            vec![
+                ("insert".into(), OpOutcome::Succeeds),
+                (
+                    format!(
+                        "{:?}",
+                        PartitionAction::Drop {
+                            leaf: "t0_p0".into()
+                        }
+                    ),
+                    OpOutcome::Succeeds
+                ),
+                (
+                    format!(
+                        "{:?}",
+                        PartitionAction::CreateMiddle {
+                            middle: "t0_m1".into(),
+                            bound: bound.clone(),
+                            leaves: vec![
+                                ("t0_m1_0".into(), "for values in (0)".into()),
+                                ("t0_m1_1".into(), "for values in (1)".into()),
+                            ],
+                            rows: vec![row(&program.tables[0], 1, 0)],
+                            standalone: false,
+                        }
+                    ),
+                    OpOutcome::Succeeds
+                ),
+                (
+                    format!(
+                        "{:?}",
+                        PartitionAction::Detach {
+                            leaf: "t0_m1".into(),
+                            concurrently: true,
+                        }
+                    ),
+                    OpOutcome::Succeeds
+                ),
+                (
+                    format!(
+                        "{:?}",
+                        PartitionAction::Attach {
+                            leaf: "t0_m1".into(),
+                            bound,
+                        }
+                    ),
+                    OpOutcome::Succeeds
+                ),
+                ("insert on t0_m1_1".into(), OpOutcome::Succeeds),
+            ]
+        );
+        assert_eq!(
+            tree_change_names(&program),
+            vec!["detach_middle", "attach_middle", "middle_leaf_write"]
+        );
     }
 }

@@ -396,6 +396,124 @@ async fn partition_maintenance_converges_end_to_end() {
     }
 }
 
+/// Middles (ADR-0017) converge end to end, one program per partitioning
+/// strategy: a middle built outside the tree and attached with rows, one
+/// detached concurrently and attached again, one dropped, a `DEFAULT` under
+/// a middle, writes named on a middle's leaves and a truncate of one, and a
+/// detached middle written and then attached again.
+#[tokio::test(flavor = "multi_thread")]
+async fn middles_converge_end_to_end() {
+    use generative::generate::partition::{
+        MaintenanceKind, MiddleThen, PartitionDraw, RECONCILE_INTERVAL, add_partition_maintenance,
+    };
+    use generative::model::{Op, OpOutcome, PartitionAction, PartitionStrategy};
+    let cluster = TestCluster::start();
+    for strategy in [
+        PartitionStrategy::Hash { modulus: 2 },
+        PartitionStrategy::List {
+            values: 3,
+            default: true,
+        },
+        PartitionStrategy::Range { bounds: 2 },
+    ] {
+        let db = cluster.create_isolated_database().await;
+        let mut spec = TableSpec::numeric_only(
+            vec![
+                (Some(10), Some(1)),
+                (Some(20), Some(2)),
+                (Some(30), Some(3)),
+                (Some(40), Some(4)),
+            ],
+            vec![Mutate::Update {
+                pk: 2,
+                c1: Some(7),
+                c2: None,
+            }],
+        );
+        spec.grain_values = ["0", "1", "2", "3"]
+            .iter()
+            .map(|g| Some((*g).to_string()))
+            .collect();
+        let base = partition_table(
+            build_program_multi_with_shapes(
+                &[spec],
+                &[(
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![AggregateFn::Sum(AggregateColumn::C1), AggregateFn::Count],
+                    },
+                )],
+            ),
+            0,
+            strategy,
+        );
+        let middle = |at, pick, standalone, then| PartitionDraw::Maintenance {
+            at,
+            pick,
+            kind: MaintenanceKind::Middle {
+                rows: 3,
+                leaves: 2,
+                default: true,
+                standalone,
+                then,
+            },
+        };
+        // pick 3 drops the `DEFAULT` of the `LIST` tree, so its first middle
+        // is a partitioned `DEFAULT`, and later detaches that middle.
+        let maintenance = |at, pick, kind| PartitionDraw::Maintenance { at, pick, kind };
+        let program = add_partition_maintenance(
+            base,
+            0,
+            &[
+                maintenance(1, 3, MaintenanceKind::Drop),
+                middle(1, 0, true, MiddleThen::Stay),
+                PartitionDraw::ViaLeaf {
+                    at: 2,
+                    detached: false,
+                },
+                PartitionDraw::ViaLeaf {
+                    at: 3,
+                    detached: false,
+                },
+                maintenance(4, 7, MaintenanceKind::TruncateLeaf),
+                maintenance(4, 3, MaintenanceKind::Detach { concurrently: true }),
+                PartitionDraw::ViaLeaf {
+                    at: 4,
+                    detached: true,
+                },
+                maintenance(5, 0, MaintenanceKind::Attach),
+                middle(5, 1, false, MiddleThen::Reattach { concurrently: true }),
+                middle(5, 0, false, MiddleThen::Drop),
+            ],
+        );
+        let middles = program
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Partition {
+                        action: PartitionAction::CreateMiddle { .. },
+                        expect: OpOutcome::Succeeds,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(middles >= 3, "{strategy:?}: {:#?}", program.ops);
+        let mut backend = ManualBackend::connect(db.dsn())
+            .await
+            .expect("connect manual backend");
+        backend.set_reconcile_interval(RECONCILE_INTERVAL);
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let outcome = run_convergence(&mut backend, &pool, &program)
+            .await
+            .unwrap_or_else(|err| panic!("{strategy:?}: {err:?}\n{:#?}", program.ops));
+        assert!(outcome.as_pass(), "{strategy:?}: {outcome}");
+    }
+}
+
 /// The named "first end-to-end green": a fully-worked, hand-built convergent
 /// program driven through the real convergence property (not the generator),
 /// so a reader has one concrete, legible case that must pass.

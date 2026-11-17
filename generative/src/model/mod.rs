@@ -254,6 +254,19 @@ pub enum PartitionAction {
         rows: Vec<Vec<(String, Option<String>)>>,
         standalone: bool,
     },
+    /// A new middle: a table partitioned `BY LIST` on the root's partition
+    /// key, with a leaf per entry of `leaves` (its name and bound, `for
+    /// values in (1)` or `default`), holding `rows`, in one transaction:
+    /// created `PARTITION OF` the root under `bound`, given its leaves and
+    /// then written through, or, when `standalone`, created `LIKE` the root,
+    /// given its leaves, written, and then attached.
+    CreateMiddle {
+        middle: String,
+        bound: String,
+        leaves: Vec<(String, String)>,
+        rows: Vec<Vec<(String, Option<String>)>>,
+        standalone: bool,
+    },
 }
 
 impl Op {

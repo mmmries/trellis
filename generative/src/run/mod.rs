@@ -600,7 +600,7 @@ pub async fn run_convergence_bursty<B: Backend>(
 
 /// `program`'s ops in bursts of up to `burst_size` consecutive ops, split
 /// early so no burst both brings a leaf into a tree that may hold a `DEFAULT`
-/// (a new leaf, or an attach) and removes it again (a detach or drop): the
+/// (a new leaf or middle, or an attach) and removes it again (a detach or drop): the
 /// second op starts a new burst. [`run_convergence_bursty`] settles between
 /// bursts, which waits for the reconcile pass that records the leaf, so a
 /// leaf beside a `DEFAULT` is never created and removed between two passes
@@ -639,7 +639,10 @@ fn bursts(program: &Program, burst_size: usize) -> Vec<&[Op]> {
         }
         if let Op::Partition {
             table,
-            action: PartitionAction::Attach { leaf, .. } | PartitionAction::Create { leaf, .. },
+            action:
+                PartitionAction::Attach { leaf, .. }
+                | PartitionAction::Create { leaf, .. }
+                | PartitionAction::CreateMiddle { middle: leaf, .. },
             ..
         } = op
         {

@@ -2947,7 +2947,9 @@ mod strategy {
     /// dropped, truncated, or a new leaf created empty, written directly, or
     /// built outside the tree and attached; a table attached under another
     /// bound, a `LIST` value list widened, a `HASH` leaf re-split at a
-    /// multiple modulus), partition-key updates that move
+    /// multiple modulus; a middle, partitioned again by the grain with a
+    /// `DEFAULT` or without, created or attached, which the other
+    /// maintenance then detaches, attaches and drops), partition-key updates that move
     /// a row to another partition, and writes named on a leaf, or on a
     /// detached table, rather than the root.
     pub fn partitioned_program() -> impl Strategy<Value = Program> {
@@ -3016,7 +3018,7 @@ mod strategy {
         op_count: usize,
         seed_count: usize,
     ) -> impl Strategy<Value = partition::PartitionDraw> {
-        use partition::{MaintenanceKind, PartitionDraw};
+        use partition::{MaintenanceKind, MiddleThen, PartitionDraw};
         let kind = prop_oneof![
             any::<bool>().prop_map(|concurrently| MaintenanceKind::Detach { concurrently }),
             Just(MaintenanceKind::Attach),
@@ -3028,6 +3030,24 @@ mod strategy {
             any::<bool>().prop_map(|concurrently| MaintenanceKind::Rebound { concurrently }),
             any::<bool>().prop_map(|concurrently| MaintenanceKind::Widen { concurrently }),
             (0u8..=2).prop_map(|rows| MaintenanceKind::Resplit { rows }),
+            (
+                (0u8..=3, 0u8..=2, any::<bool>(), any::<bool>()),
+                prop_oneof![
+                    Just(MiddleThen::Stay),
+                    any::<bool>().prop_map(|concurrently| MiddleThen::Detach { concurrently }),
+                    any::<bool>().prop_map(|concurrently| MiddleThen::Reattach { concurrently }),
+                    Just(MiddleThen::Drop),
+                ],
+            )
+                .prop_map(|((rows, leaves, default, standalone), then)| {
+                    MaintenanceKind::Middle {
+                        rows,
+                        leaves,
+                        default,
+                        standalone,
+                        then,
+                    }
+                }),
         ];
         prop_oneof![
             3 => (0..=op_count, 0..8usize, kind)

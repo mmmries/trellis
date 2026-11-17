@@ -109,13 +109,16 @@ pub struct Coverage {
     /// (ADR-0017), by [`partition_op_name`]: partition
     /// maintenance (`"detach"`, `"detach_concurrently"`, `"attach"`,
     /// `"drop"`, `"truncate_leaf"`, a new leaf `"create_empty"`,
-    /// `"create_written"` or `"create_attached"`), writes named on a leaf
+    /// `"create_written"` or `"create_attached"`, a new middle
+    /// `"create_middle"` or `"create_middle_attached"`), writes named on a leaf
     /// (`"leaf_insert"`, `"leaf_update"`, `"leaf_delete"`), and
     /// partition-key updates through the root that move a row
     /// (`"key_update"`) or are refused (`"key_update_refused"`). On top,
-    /// the bound changes Postgres accepted, by
-    /// [`crate::generate::partition::bound_change_names`]
-    /// (`"attach_rebound"`, `"attach_widened"`, `"create_resplit"`).
+    /// the bound changes and middle operations Postgres accepted, by
+    /// [`crate::generate::partition::tree_change_names`]
+    /// (`"attach_rebound"`, `"attach_widened"`, `"create_resplit"`,
+    /// `"middle_default"`, `"attach_middle"`, `"detach_middle"`,
+    /// `"drop_middle"`, `"middle_leaf_write"`).
     pub partition_ops: HashMap<&'static str, usize>,
     /// Bursts recorded by [`Coverage::record_concurrent_plan`].
     pub concurrent_bursts: usize,
@@ -151,7 +154,7 @@ impl Coverage {
     pub fn record_program(&mut self, program: &Program) {
         self.cases += 1;
 
-        for name in crate::generate::partition::bound_change_names(program) {
+        for name in crate::generate::partition::tree_change_names(program) {
             *self.partition_ops.entry(name).or_insert(0) += 1;
         }
         for op in &program.ops {
@@ -860,6 +863,10 @@ fn partition_op_name(program: &Program, op: &Op) -> Option<&'static str> {
             } => "create_attached",
             PartitionAction::Create { rows, .. } if rows.is_empty() => "create_empty",
             PartitionAction::Create { .. } => "create_written",
+            PartitionAction::CreateMiddle {
+                standalone: true, ..
+            } => "create_middle_attached",
+            PartitionAction::CreateMiddle { .. } => "create_middle",
         }),
         Op::Leaf { op, .. } => match **op {
             Op::Truncate { .. } => Some("truncate_leaf"),
