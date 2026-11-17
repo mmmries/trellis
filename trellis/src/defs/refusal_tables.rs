@@ -133,6 +133,8 @@ fn error_cells<'a>(file: &str, doc: &'a str, failures: &mut Vec<String>) -> Vec<
         in_table = in_table && line.starts_with('|');
         if in_table
             && !line.starts_with("|---")
+            // A group's heading row (`| **Source keys** | | |`) has no cells.
+            && !line.ends_with(" | | |")
             && let Some(cell) = line.split(" | ").nth(1)
         {
             cells.push(cell);
@@ -149,17 +151,24 @@ fn refusal_tables_link_each_error_to_its_heading() {
     let mut links = 0;
     for (file, doc) in TABLES {
         for cell in error_cells(file, doc, &mut failures) {
-            // A link whose text is `T0042 Variant` and whose target is errors.md at
-            // the anchor `t0042-variant`.
-            for link in cell.split('[').skip(1) {
-                let Some((text, rest)) = link.split_once("](") else {
+            // Every link to errors.md has the text `T0042 Variant` and the anchor
+            // `t0042-variant`. What is left of the cell names no variant.
+            let mut rest = String::new();
+            let mut cell_links = 0;
+            let mut tail = cell;
+            while let Some((before, after)) = tail.split_once('[') {
+                rest.push_str(before);
+                let Some((text, after)) = after.split_once("](") else {
+                    tail = after;
                     continue;
                 };
-                let target = rest.split(')').next().unwrap_or_default();
-                if !text.starts_with('T') || !target.starts_with("errors.md#") {
+                let (target, after) = after.split_once(')').unwrap_or((after, ""));
+                tail = after;
+                if !target.starts_with("errors.md") {
+                    rest.push_str(text);
                     continue;
                 }
-                links += 1;
+                cell_links += 1;
                 let (code, name) = text.split_once(' ').unwrap_or((text, ""));
                 let known = codes
                     .iter()
@@ -172,13 +181,20 @@ fn refusal_tables_link_each_error_to_its_heading() {
                     failures.push(format!("docs/{file}: `{text}` links to `{target}`"));
                 }
             }
-            for word in cell.split('`').skip(1).step_by(2) {
-                if names.contains(&word) {
-                    failures.push(format!(
-                        "docs/{file}: the Error column names `{word}` bare: link it to its \
-                         docs/errors.md heading, with its code as the link text"
-                    ));
-                }
+            rest.push_str(tail);
+            links += cell_links;
+            if cell_links == 0 && rest.trim() != "n/a" {
+                failures.push(format!(
+                    "docs/{file}: the Error cell `{cell}` links no docs/errors.md heading: link \
+                     each error, or write `n/a`"
+                ));
+            }
+            let words = rest.split(|c: char| !c.is_ascii_alphanumeric());
+            for word in words.filter(|word| names.contains(word)) {
+                failures.push(format!(
+                    "docs/{file}: the Error column names `{word}` bare: link it to its \
+                     docs/errors.md heading, with its code as the link text"
+                ));
             }
         }
     }

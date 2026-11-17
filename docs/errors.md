@@ -212,8 +212,8 @@ release ([upgrading](upgrading.md#rolling-back)).
 
 ## Definition checks
 
-The text parses, but what it computes isn't one Trellis maintains exactly.
-Each is a row of a [refusal table](expressions.md#refusals).
+The text parses, but what it computes isn't one Trellis maintains exactly
+([refusal table](expressions.md#refusals)).
 
 ### T0028 UnsupportedLiteralType
 
@@ -472,8 +472,10 @@ value or a column; `x / NULLIF(col, 0)`.
 
 A date or time construct over a type it doesn't take
 ([details](expressions.md#date-and-time-arithmetic)); the message names the
-fix. For example `DATE_TRUNC('month', CAST(d AS timestamp))` for a date, and
-`tz AT TIME ZONE 'UTC'` before reading a `timestamptz` as a `timestamp`.
+fix. For example `DATE_TRUNC('month', CAST(d AS timestamp))` for a date,
+`tz AT TIME ZONE 'UTC'` before reading a `timestamptz` as a `timestamp`, and
+an `integer` day count or `EXTRACT(EPOCH FROM …)` differences for date
+arithmetic.
 
 ### T0091 TemporalLiteral
 
@@ -590,9 +592,10 @@ A `string_agg` separator that isn't a string literal. Not reached while
 ## Tables and keys
 
 What a definition reads or writes can't be maintained as it stands
-([refusal table](transforms.md#refusals)). After define, the same condition
-pauses the definition ([paused definitions](operations.md#paused-definitions));
-fix it, then `RESUME`.
+([refusal table](transforms.md#refusals)), at define or at `RESUME`. A
+condition that appears after define pauses the definition
+([paused definitions](operations.md#paused-definitions)); fix it, then
+`RESUME`.
 
 ### T0113 NoPrimaryKey
 
@@ -600,8 +603,8 @@ A source table with no primary key, and no `KEY (…)` for it
 ([the key](transforms.md#the-key-a-transform-keys-each-table-by)). Add a
 primary key, or name a unique key with `KEY (…)`. Another instance's
 aggregate target has none: chain within the instance
-([instance identity](instance-identity.md)), or name its group key with
-`KEY (…)`.
+([instance identity](instance-identity.md)), group over a 1-1 transform of
+it, or name its group key with `KEY (…)`.
 
 ### T0114 DeferrablePrimaryKey
 
@@ -630,7 +633,8 @@ read it. Name the same key, the one the message gives.
 ### T0118 RecordedKeyMissing
 
 The index over the key Trellis recorded for a table is gone. Create a unique
-index over exactly those columns again, then `RESUME`.
+index over exactly those columns again (`NULLS NOT DISTINCT` if one can be
+`NULL`), then `RESUME`.
 
 ### T0119 NoPrimaryKeyToRecord
 
@@ -871,13 +875,14 @@ and define it again with the change.
 
 ### T0158 ColumnPauseLockTimeout
 
-A define, `ALTER TRANSFORM`, `DROP TRANSFORM` or `RESUME` waited out
-`lock_timeout` for a lock. Nothing changed: retry.
+A `PAUSE`, `RESUME`, define, `ALTER TRANSFORM` or `DROP TRANSFORM` waited out
+`lock_timeout` for the column-pause lock. Retry: each step is idempotent, so a
+call that committed some of its steps first finishes the rest.
 
 ### T0173 ColumnNotPaused
 
-`RESUME TRANSFORM <target>.<column>` of a column that isn't paused. Nothing
-to do.
+`RESUME TRANSFORM <target>.<column>` of a column that isn't paused, or that
+names no field. Nothing to do, or fix the name.
 
 ### T0174 DefinitionNotLive
 
@@ -922,16 +927,16 @@ message lists the fields. Fix the name. A two-part address reads as
 
 ### T0221 TargetSelect
 
-`target_select_sql` can't render the target's `SELECT`: the target has a
-column the definition computes nothing for. Read the columns the definition
-writes.
+`target_select_sql` was passed a target column that is neither a field nor a
+key column of the definition (a column you added, say). Pass only the
+definition's columns.
 
 ## Builds and drains
 
-A failure every key reproduces. It halts the build, drain or staging pass and
-pauses the definitions it reaches, with the code in their
-[`capture_failure`](status-reference.md#capture_failure); find the reason in
-[paused definitions](operations.md#paused-definitions).
+A failure every key reproduces. It pauses the definitions it reaches, with
+the error in their [`capture_failure`](status-reference.md#capture_failure)
+or [`backfill_failure`](status-reference.md#backfill_failure); find the
+reason in [paused definitions](operations.md#paused-definitions).
 
 ### T0160 Unsupported
 
@@ -959,25 +964,6 @@ it again.
 
 A change names a source table Postgres no longer has. Its staged changes are
 purged; put the table back, then `RESUME`.
-
-### T0184 ProducerAlreadyRunning
-
-Another process holds the staging worker's lock. Only one staging worker runs
-per instance; this one stands by.
-
-### T0185 RingFull
-
-The staging ring has no free slot: drains are behind
-([ring size](staging-and-claiming/02-the-staging-ring.md#ring-size-and-backpressure)).
-Capture keeps appending; it clears as drains catch up. If it persists, check
-the drain workers are live and size the ring up
-([ring sizing](recommendations.md#ring-sizing)).
-
-### T0189 ConvergenceTimeout
-
-A wait for a watermark token didn't converge within its timeout. Poll again
-([poll to `live`](embedding.md#poll-to-live-dont-wait)); check
-[`drain_failure`](status-reference.md#drain_failure) if it never does.
 
 ## Self-check
 
@@ -1075,9 +1061,17 @@ there.
 
 ### T0219 CallTimeout
 
-The call didn't finish within 30 seconds, and changed nothing
-([every call returns within 30 seconds](embedding.md#every-call-returns-within-30-seconds)).
+The call didn't finish within 30 seconds, and changed nothing it hadn't
+committed ([every call returns within 30 seconds](embedding.md#every-call-returns-within-30-seconds)).
 Retry; if it keeps timing out, find the lock or load it waited on.
+
+### T0189 ConvergenceTimeout
+
+`await_converged` ran out of time before the token's changes drained: the
+target is behind, not broken. Call again, or allow longer
+([reading your own writes](embedding.md#reading-your-own-writes)). If it never
+converges, check [`held_keys`](status-reference.md#held_keys) and
+[`drain_failure`](status-reference.md#drain_failure).
 
 ### T0220 OtherVersionLive
 
@@ -1119,15 +1113,17 @@ message names, or later.
 
 ### T0230 MigrationHistory
 
-The catalog's migration history doesn't match this binary's: another build of
-the same version, or a gap. Run the build that migrated the database.
+The catalog's migration history doesn't fit this binary's: a migration with
+another name or checksum, a gap, newer migrations with no catalog floor, or a
+version that isn't a release; the message says which. Run the release that
+migrated the database.
 
 ### T0231 RestoreDefinition
 
 `migrate` couldn't restore a definition from a
-[schema dump](embedding.md#schema-dumps); the message says why. Fix the
-tables it resolves to, then run `migrate` again; the definitions after it stay
-queued.
+[schema dump](embedding.md#schema-dumps): its text resolves to other tables
+than the dump recorded, or define refused it; the message says which. Fix
+that, then run `migrate` again; the definitions after it stay queued.
 
 ### T0232 SchemaDump
 
@@ -1137,9 +1133,9 @@ version.
 
 ## Retried by Trellis
 
-A worker lost a race or a claim. Nothing applied twice or was lost, and
-Trellis retries: these reach a log, not a caller. Look further only if one
-repeats without end.
+A worker lost a race or a claim, or waits on another. Nothing applied twice
+or was lost, and Trellis retries: these reach a log, not a caller. Look
+further only if one repeats without end.
 
 ### T0161 Superseded
 
@@ -1165,6 +1161,20 @@ A 1-1 ledger entry was collected during a page.
 
 A 1-1 `JOIN` key moved during a page.
 
+### T0184 ProducerAlreadyRunning
+
+Another process holds the staging worker's lock; this one stands by
+([rolling deploys](embedding.md#rolling-deploys)).
+
+### T0185 RingFull
+
+The staging ring has no free slot to seal into: drains are behind
+([backpressure](staging-and-claiming/02-the-staging-ring.md#ring-size-and-backpressure)).
+Capture keeps appending to the active segment meanwhile. If it persists,
+check that drain workers are live
+([`has_live_drain_workers`](embedding.md#detecting-it-has_live_drain_workers-and-has_live_staging_worker)),
+and watch free disk ([ring sizing](recommendations.md#ring-sizing)).
+
 ### T0186 SealGateBlocked
 
 A seal waited for its predecessor's writers.
@@ -1172,6 +1182,11 @@ A seal waited for its predecessor's writers.
 ### T0187 Raced
 
 Another worker advanced the ring first.
+
+### T0188 UnfencedSealedSegment
+
+A sealed segment has no fence yet: a crash between the seal's two steps. The
+drain skips it until the staging worker's recovery pass fences it.
 
 ## Internal errors
 
@@ -1206,11 +1221,6 @@ A staged truncate has no WAL position.
 ### T0183 InvalidRingSlot
 
 The ring pointer names a slot outside the ring.
-
-### T0188 UnfencedSealedSegment
-
-A sealed segment has no fence: a crash between the seal's two steps. The
-drain stalls rather than apply it.
 
 ## Database errors
 
