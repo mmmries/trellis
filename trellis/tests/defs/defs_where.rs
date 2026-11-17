@@ -22,37 +22,37 @@ async fn define_refuses_a_filter_and_creates_nothing() {
     for (text, expected) in [
         (
             "TRANSFORM t1 FROM public.s SELECT qty AS q WHERE qty > 0",
-            "T0237",
+            "T0238",
         ),
         (
             "TRANSFORM t2 FROM public.s GROUP BY g SELECT g AS g, COUNT(*) AS n WHERE active",
-            "T0237",
+            "T0238",
         ),
         (
             "TRANSFORM t3 FROM public.s JOIN public.u ON s.id = u.id GROUP BY s.g \
              SELECT s.g AS g, COUNT(*) AS n WHERE u.flag",
-            "T0237",
+            "T0238",
         ),
         (
             "TRANSFORM t4 FROM public.s JOIN public.u ON s.id = u.id \
              SELECT s.qty AS q WHERE u.flag",
-            "T0237",
+            "T0238",
         ),
         (
             "TRANSFORM t5 FROM public.s SELECT qty AS q WHERE amount / qty > 5",
-            "T0236",
+            "T0237",
         ),
         (
             "TRANSFORM t6 FROM public.s SELECT qty AS q WHERE status = note",
-            "T0236",
+            "T0237",
         ),
         (
             "TRANSFORM t7 FROM public.s SELECT qty AS q WHERE qty",
-            "T0233",
+            "T0234",
         ),
         (
             "TRANSFORM t8 FROM public.s SELECT amount AS amt WHERE amt > 1",
-            "T0235",
+            "T0236",
         ),
     ] {
         let err = trellis.apply(text).await.expect_err(text);

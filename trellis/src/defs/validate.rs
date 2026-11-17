@@ -980,11 +980,11 @@ impl ValidationError {
             ValidationError::QualifiedSourceTableNotFound { .. } => ErrorId(110),
             ValidationError::QualifiedTargetTableNotFound { .. } => ErrorId(111),
             ValidationError::StringAggSeparatorNotLiteral { .. } => ErrorId(112),
-            ValidationError::PredicateNotBoolean { .. } => ErrorId(233),
-            ValidationError::AggregateInPredicate { .. } => ErrorId(234),
-            ValidationError::PredicateColumnNotFound { .. } => ErrorId(235),
-            ValidationError::PredicateNotTotal { .. } => ErrorId(236),
-            ValidationError::FilterNotYetSupported { .. } => ErrorId(237),
+            ValidationError::PredicateNotBoolean { .. } => ErrorId(234),
+            ValidationError::AggregateInPredicate { .. } => ErrorId(235),
+            ValidationError::PredicateColumnNotFound { .. } => ErrorId(236),
+            ValidationError::PredicateNotTotal { .. } => ErrorId(237),
+            ValidationError::FilterNotYetSupported { .. } => ErrorId(238),
         }
     }
 
@@ -1019,9 +1019,28 @@ impl ValidationError {
 
 crate::error_code::coded_display!(ValidationError);
 
+/// The site the field-level refusals name for a check of the `WHERE`
+/// predicate, which they carry as the field `WHERE`.
+const PREDICATE_SITE: &str = "calculated field 'WHERE'";
+
 impl crate::error_code::Message for ValidationError {
+    /// A field-level refusal raised over the `WHERE` predicate names the
+    /// predicate, not a "calculated field 'WHERE'".
     fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
+        let text = FieldMessage(self).to_string();
+        match text.strip_prefix(PREDICATE_SITE) {
+            Some(rest) => write!(f, "the WHERE predicate{rest}"),
+            None => f.write_str(&text),
+        }
+    }
+}
+
+/// [`ValidationError`]'s message as each variant words it.
+struct FieldMessage<'a>(&'a ValidationError);
+
+impl std::fmt::Display for FieldMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
             ValidationError::DuplicateFieldName { name } => {
                 write!(f, "duplicate calculated field name '{name}'")
             }

@@ -1171,10 +1171,6 @@ fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
     }
 }
 
-/// The bounded comparison itself (ADR-0013: the target read and the
-/// recompute share one snapshot). Reads one keyset page of `def`'s source
-/// (recomputed via [`render_leaf`]) and of the persisted target in a single
-/// statement ([`page_sql`]), and diffs the two in Rust ([`diff_page`]).
 /// The refusal of a definition whose `WHERE` this release's comparison
 /// doesn't render. Define refuses such a definition, so only a catalog this
 /// release didn't write can hold one.
@@ -1185,6 +1181,10 @@ pub(super) fn unaudited_filter(def: &Definition) -> SelfCheckError {
     }
 }
 
+/// The bounded comparison itself (ADR-0013: the target read and the
+/// recompute share one snapshot). Reads one keyset page of `def`'s source
+/// (recomputed via [`render_leaf`]) and of the persisted target in a single
+/// statement ([`page_sql`]), and diffs the two in Rust ([`diff_page`]).
 async fn compare_once(
     pool: &Pool,
     def: &Definition,

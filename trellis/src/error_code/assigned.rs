@@ -239,11 +239,11 @@ const ASSIGNED: &[&str] = &[
     "T0230 Error::MigrationHistory",
     "T0231 Error::RestoreDefinition",
     "T0232 Error::SchemaDump",
-    "T0233 ValidationError::PredicateNotBoolean",
-    "T0234 ValidationError::AggregateInPredicate",
-    "T0235 ValidationError::PredicateColumnNotFound",
-    "T0236 ValidationError::PredicateNotTotal",
-    "T0237 ValidationError::FilterNotYetSupported",
+    "T0234 ValidationError::PredicateNotBoolean",
+    "T0235 ValidationError::AggregateInPredicate",
+    "T0236 ValidationError::PredicateColumnNotFound",
+    "T0237 ValidationError::PredicateNotTotal",
+    "T0238 ValidationError::FilterNotYetSupported",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

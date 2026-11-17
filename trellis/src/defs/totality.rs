@@ -75,6 +75,13 @@ fn number_literal(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Whether the number literal `text` is the lowest `integer` or `bigint`,
+/// the type Postgres gives it: `ABS` of it raises while planning.
+fn lowest_integer(text: &str) -> bool {
+    text.parse::<i128>()
+        .is_ok_and(|value| value == i128::from(i32::MIN) || value == i128::from(i64::MIN))
+}
+
 /// Whether the number literal `text` converts to a float of `width` the way
 /// Postgres's input function does: finite, and not rounded to zero unless
 /// it is zero (an underflow raises `22003`).
@@ -222,9 +229,8 @@ fn check_node(expr: &Expr, columns: &ColumnTypes<'_>) -> Result<(), NotTotal> {
         | Expr::IsNull { .. } => Ok(()),
         Expr::NumberLiteral(text) => {
             let (integer, fraction) = text.split_once('.').unwrap_or((text, ""));
-            if integer.trim_start_matches('0').len() > NUMERIC_INTEGER_DIGITS
-                || fraction.len() > NUMERIC_FRACTION_DIGITS
-            {
+            let digits = integer.trim_start_matches('-').trim_start_matches('0');
+            if digits.len() > NUMERIC_INTEGER_DIGITS || fraction.len() > NUMERIC_FRACTION_DIGITS {
                 return refuse(expr, "the literal is out of numeric's range (22003)");
             }
             Ok(())
@@ -305,7 +311,9 @@ fn function(
     match name {
         "CHAR_LENGTH" | "OCTET_LENGTH" | "TRUNC" | "EXTRACT" => Ok(()),
         "ABS" => match first {
-            Some(ValueType::Integer(_)) if number_literal(&args[0]).is_none() => {
+            Some(ValueType::Integer(_))
+                if number_literal(&args[0]).is_none_or(|text| lowest_integer(&text)) =>
+            {
                 refuse(expr, "ABS of the lowest integer overflows (22003)")
             }
             _ => Ok(()),
@@ -407,6 +415,9 @@ mod tests {
             "-n > 1",
             "ABS(n) > 1",
             "ABS(f) > 1",
+            "ABS(-2147483647) > 1",
+            "ABS(-2147483649) > 1",
+            "ABS(-9223372036854775809) > 1",
             "CEIL(f) > 1",
             "FLOOR(f) > 1",
             "TRUNC(n) > 1",
@@ -444,6 +455,9 @@ mod tests {
             ("i % j = 0", "\"i\" % \"j\""),
             ("-i > 0", "-\"i\""),
             ("ABS(i) > 5", "abs(\"i\")"),
+            // Postgres types these literals `integer` and `bigint`.
+            ("ABS(-2147483648) > 5", "abs(-2147483648)"),
+            ("ABS(-9223372036854775808) > 5", "abs(-9223372036854775808)"),
             ("CEIL(n) = 3", "ceil(\"n\")"),
             ("FLOOR(n) = 3", "floor(\"n\")"),
             ("ROUND(n, 2) = 1.25", "round(\"n\", 2)"),
@@ -501,5 +515,8 @@ mod tests {
         assert!(verdict(&format!("n > {wide}")).is_err());
         let fine = "9".repeat(1000);
         assert_eq!(verdict(&format!("n > {fine}")), Ok(()));
+        // The sign is no digit.
+        let widest = "9".repeat(NUMERIC_INTEGER_DIGITS);
+        assert_eq!(verdict(&format!("n > -{widest}")), Ok(()));
     }
 }

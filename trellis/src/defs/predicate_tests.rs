@@ -316,3 +316,15 @@ fn the_target_select_carries_the_where() {
         "{sql}"
     );
 }
+
+#[test]
+fn a_field_level_refusal_over_the_predicate_names_the_where() {
+    let err = validated("TRANSFORM t FROM s SELECT qty AS q WHERE CAST(amount AS integer) > 0")
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("the WHERE predicate casts a numeric value")
+            && !message.contains("calculated field"),
+        "{message}"
+    );
+}
