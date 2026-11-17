@@ -123,6 +123,12 @@ module Trellis
   # state-changing calls raise VersionFloorError. Run a version at or above
   # the floor. nil when this binary meets it.
   #
+  # maintenance_refusals lists the ring and maintenance steps this process's
+  # staging worker is refused (RefusedSteps), such as retiring a drained
+  # segment without TRUNCATE. Nothing is paused for them; each clears itself
+  # once a pass of its step succeeds. Only the process that runs the staging
+  # worker reports them; empty otherwise.
+  #
   # join is set for a JOIN definition, aggregate or 1-1, and nil for any
   # other (a JoinStatus). It never holds anything up: it changes nothing
   # about the definition's status. It reports the estimated size of the
@@ -139,7 +145,7 @@ module Trellis
                        :held_keys, :drain_failure, :source_index_gaps,
                        :extreme_index_gaps, :correcting, :paused_upstream_columns,
                        :build_wait_xid, :version_handover, :below_catalog_floor,
-                       :join, :floor) do
+                       :maintenance_refusals, :join, :floor) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -162,6 +168,7 @@ module Trellis
           build_wait_xid: hash.fetch(:build_wait_xid),
           version_handover: version_handover && VersionHandover.from_native(version_handover),
           below_catalog_floor: below_catalog_floor && BelowCatalogFloor.new(**below_catalog_floor),
+          maintenance_refusals: hash.fetch(:maintenance_refusals, []).map { |r| RefusedStep.new(**r) },
           join: join && JoinStatus.from_native(join),
           floor: hash.fetch(:floor))
     end
@@ -265,6 +272,13 @@ module Trellis
   # process changes nothing, as Trellis.status reports it: the floor the
   # catalog records (floor) and this binary's version (this_version).
   BelowCatalogFloor = Data.define(:floor, :this_version)
+
+  # A ring or maintenance step the staging worker's role is refused, in a
+  # Status's maintenance_refusals: the step (step), the role (role), the table
+  # or sequence refused (object), the privileges the role lacks on it
+  # (missing) and Postgres's message (error). role and object are nil, and
+  # missing is empty, when they couldn't be read. Grant what it names.
+  RefusedStep = Data.define(:step, :role, :object, :missing, :error)
 
   # A node of a partitioned source a definition is being corrected for, as
   # Trellis.status reports it: the schema-qualified node (node), when the
