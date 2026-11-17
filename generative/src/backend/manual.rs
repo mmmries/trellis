@@ -1666,7 +1666,7 @@ impl super::ConcurrentBackend for ManualBackend {
                         // Not a verdict on correctness: a definition an
                         // operator action left paused, or one reading it
                         // (reported `catching_up`), is checked by the
-                        // run's end-of-run `live` check.
+                        // run's unexpected-pause check (`run::pause`).
                         trellis::SelfCheckOutcome::NotLive(_) => {}
                         _ => failures.push(format!("{target}: {report:#?}")),
                     },

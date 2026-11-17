@@ -33,8 +33,8 @@ pub(super) enum RunKind {
     Noise,
     /// `run_convergence_with_db_admin`: Postgres restarts and checkpoints.
     DbAdmin,
-    /// `run_convergence_with_restore`, the original side. The restored side
-    /// is held to a stricter rule (`PausedAfterRestore`), never to this one.
+    /// `run_convergence_with_restore`, both sides. The restored side is also
+    /// held to `PausedAfterRestore`, checked first.
     Restore,
     /// `run_two_instance_convergence`.
     TwoInstance,
@@ -50,27 +50,25 @@ pub(super) struct Allowance {
 /// The allowlist: `Some` when the run is one that provokes pauses on
 /// purpose, `None` when any pause fails it.
 ///
-/// - **Disruption** (`DbAdmin`, `Restore`): the server restarts or stops
-///   under the engine, which severs capture and may pause definitions.
 /// - **Partition**: partition maintenance (`Op::Partition`: attach, detach,
 ///   drop, new leaves) changes a source's tree under a definition, and
 ///   capture may pause it. It runs in the sequential, bursty and concurrent
 ///   runners, so it is read off the program.
 ///
-/// Schema change has no tier of its own: no generated op alters a tracked
-/// source's columns. If one is added it joins this list, here.
+/// Schema change and capture disruption have no tier of their own: no
+/// generated op alters a tracked source's columns or Trellis's capture of
+/// it. One that is added joins this list, here.
 ///
 /// Not on it, with why: the sequential, bursty and concurrent runs without
 /// partition ops (every pause they take, `PAUSE TRANSFORM` or a column
 /// pause, is resumed within the burst, so none is left at a check); the
 /// noise tier (untracked tables never reach a definition); the two-instance
-/// tier (an instance's definitions never read the other's source).
+/// tier (an instance's definitions never read the other's source); the
+/// db-admin and restore tiers (a restart, a checkpoint or a cold copy keeps
+/// every table, oid and trigger, so nothing pauses: each of their actions
+/// leaves the converged state unchanged).
 pub(super) fn allowance(kind: RunKind, program: &Program) -> Option<Allowance> {
     match kind {
-        RunKind::DbAdmin | RunKind::Restore => Some(Allowance {
-            tier: "disruption",
-            why: "the server restarts or stops under the engine",
-        }),
         RunKind::Sequential | RunKind::Bursty | RunKind::Concurrent
             if program
                 .ops
@@ -86,6 +84,8 @@ pub(super) fn allowance(kind: RunKind, program: &Program) -> Option<Allowance> {
         | RunKind::Bursty
         | RunKind::Concurrent
         | RunKind::Noise
+        | RunKind::DbAdmin
+        | RunKind::Restore
         | RunKind::TwoInstance => None,
     }
 }
@@ -160,6 +160,8 @@ mod tests {
             RunKind::Bursty,
             RunKind::Concurrent,
             RunKind::Noise,
+            RunKind::DbAdmin,
+            RunKind::Restore,
             RunKind::TwoInstance,
         ] {
             let allowed = allowance(kind, &program);
@@ -191,7 +193,7 @@ mod tests {
 
     #[test]
     fn a_pause_in_an_allowlisted_tier_does_not_fail() {
-        let states = [state("t0", "paused", Some("disruption: connection lost"))];
+        let states = [state("t0", "paused", Some("capture: a leaf was detached"))];
         let partition = program_with(vec![Op::Partition {
             table: "s".to_string(),
             action: PartitionAction::Detach {
@@ -200,16 +202,9 @@ mod tests {
             },
             expect: OpOutcome::Succeeds,
         }]);
-        let plain = program_with(Vec::new());
-        for (kind, program, tier) in [
-            (RunKind::DbAdmin, &plain, "disruption"),
-            (RunKind::Restore, &plain, "disruption"),
-            (RunKind::Sequential, &partition, "partition"),
-            (RunKind::Bursty, &partition, "partition"),
-            (RunKind::Concurrent, &partition, "partition"),
-        ] {
-            let allowed = allowance(kind, program);
-            assert_eq!(allowed.map(|a| a.tier), Some(tier), "{kind:?}");
+        for kind in [RunKind::Sequential, RunKind::Bursty, RunKind::Concurrent] {
+            let allowed = allowance(kind, &partition);
+            assert_eq!(allowed.map(|a| a.tier), Some("partition"), "{kind:?}");
             check_no_unexpected_pause(0, &states, allowed)
                 .unwrap_or_else(|e| panic!("{kind:?}: {e:?}"));
         }

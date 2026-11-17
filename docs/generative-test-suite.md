@@ -745,11 +745,10 @@ would also fail without naming the cause. The reason is the definition's
 `capture_failures` row or its poisoned keys' error.
 
 The allowlist is `run::pause::allowance`: a tier on it may find a definition
-paused, and a tier not on it treats any pause as a failure. On it: the
-disruption runners (`run_convergence_with_db_admin`, and the original side of
-`run_convergence_with_restore`, whose restored side must not pause at all), and
-any program with partition maintenance (`Op::Partition`). A tier that starts
-provoking pauses (a source schema change, say) is added there, with its reason.
+paused, and a tier not on it treats any pause as a failure. On it: any program
+with partition maintenance (`Op::Partition`). A tier that starts provoking
+pauses (a source schema change or a capture disruption, say) is added there,
+with its reason.
 
 Every divergence report, in every backend, prints each definition's status and
 pause reason under `definitions:` beside the cell diffs.

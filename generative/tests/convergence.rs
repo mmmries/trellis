@@ -1052,4 +1052,44 @@ async fn a_paused_definition_reads_back_as_paused() {
         .expect("states");
     assert_eq!(paused[0].target, target);
     assert!(paused[0].is_paused(), "{:?}", paused[0]);
+
+    // The reason reads the catalog's own record of why: the failure's kind
+    // and error, each further reason, and the poisoned keys' error.
+    for statement in [
+        format!(
+            "insert into capture_failures (transform_id, source_table, columns, error, kind) \
+             select id, 'public.s', '{{}}', 'a column it reads was dropped', 'capture' \
+             from transform_definitions where split_part(target_table, '.', 2) = '{target}'"
+        ),
+        "insert into capture_failure_reasons \
+             (transform_id, position, source_table, columns, reason) \
+         select transform_id, 1, source_table, columns, error from capture_failures \
+         union all \
+         select transform_id, 2, source_table, columns, 'its key changed' from capture_failures"
+            .to_string(),
+        format!(
+            "insert into poison (transform_id, src_table, key, last_error) \
+             select id, 'public.s', k, 'refused' \
+             from transform_definitions, unnest(array['1', '2']) k \
+             where split_part(target_table, '.', 2) = '{target}'"
+        ),
+    ] {
+        backend
+            .execute_raw(&statement)
+            .await
+            .expect("record why it paused");
+    }
+    let reasoned = backend
+        .definition_states(&program.defs)
+        .await
+        .expect("states");
+    assert_eq!(
+        reasoned[0].reason.as_deref(),
+        Some(
+            "capture: a column it reads was dropped; its key changed; \
+             poisoned 2 key(s), last error: refused"
+        ),
+        "{:?}",
+        reasoned[0]
+    );
 }
