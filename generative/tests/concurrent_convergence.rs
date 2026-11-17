@@ -1591,16 +1591,17 @@ const COOLING_KEY_MISSES: &[&str] = &[];
 const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS];
 
 /// Why the cooling-key and hot-key tiers don't gate
-/// `o2o_where_build_unfiltered`: they install every definition before the
-/// first insert and rebuild nothing, so each build runs over an empty
-/// source and the unfiltered build writes no row. The plant counts as fired
-/// whenever a filtered build plans (23 of 48 cooling-key and 8 of 48
-/// hot-key cases, caught in none, logbook `20261117T111758-e-sweep`).
+/// `o2o_where_build_unfiltered`: their only builds are the install builds,
+/// which start with the first burst and read only the rows its opening
+/// writes committed, keys the burst writes again. That later change
+/// applies the `WHERE` and repairs the row the unfiltered build wrote. It
+/// fired in 23 of 48 cooling-key and 8 of 48 hot-key cases and was caught
+/// in none (logbook `20261117T111758-e-sweep`).
 const NO_BUILD_OVER_ROWS: (&str, &str) = (
     "o2o_where_build_unfiltered",
-    "every build runs at install over an empty source, so it writes no row to leave \
-     unfiltered (fired in 23 of 48 cooling-key and 8 of 48 hot-key cases, caught in none); \
-     the mid-burst and steady-load tiers gate it",
+    "the only builds are the install builds, which read just the first writes, and a later \
+     change to each key repairs the row (fired in 23 of 48 cooling-key and 8 of 48 hot-key \
+     cases, caught in none); the mid-burst and steady-load tiers gate it",
 );
 const COOLING_KEY_NOT_GATED: &[(&str, &str)] = &[NO_BUILD_OVER_ROWS];
 const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[NO_BUILD_OVER_ROWS];

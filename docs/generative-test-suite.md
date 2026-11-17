@@ -314,16 +314,16 @@ conjuncts, each over one table's integer columns, none over `jb` under `LEFT`
 
 The meta-test `every_where_crossing_bucket_is_drawn_for_each_filtering_key_space`
 (`tests/coverage.rs`) replays the serial, hot-key, cooling-key, `JOIN`, 1-1
-`JOIN` and star draws with no database (`run::coverage::where_crossings`, over the evaluator
-`where_clause::eval`) and fails when a key space has a crossing bucket
+`JOIN` and star draws with no database (`run::coverage::where_crossings`, over
+the evaluator `where_clause::eval`) and fails when a key space has a crossing bucket
 (`in_in`, `in_out`, `out_in`, `out_out`) no change lands in. The coverage
 report prints the same tally as `where_crossings`. A join aggregate's
 crossing is a row of one side changing that side's conjuncts.
 
 The `WHERE` plants are gated where their key space is drawn: the aggregate
 ones in every concurrent tier but `min_max`; the plain 1-1 ones in every tier
-with a 1-1 definition, `o2o_where_build_unfiltered` only in the two that build
-over rows (mid-burst, steady-load); `join_where_m_unfiltered` in the `JOIN`
+with a 1-1 definition, `o2o_where_build_unfiltered` only in the two that
+rebuild under load (mid-burst, steady-load); `join_where_m_unfiltered` in the `JOIN`
 tier; the 1-1 `JOIN` ones in the two-table tier (the star tier gates
 `join1_where_build_unfiltered`). Deterministic pins alone gate the rest:
 `gb_where_filtered_naming` needs a held key's release or a partition
