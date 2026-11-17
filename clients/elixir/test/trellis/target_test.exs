@@ -23,6 +23,8 @@ defmodule Trellis.TargetTest do
     @primary_key {:id, :integer, autogenerate: false}
     schema "guard_plain" do
       field(:total, :integer)
+      # Not a real relation: lets a plain parent write a target child.
+      has_many(:counters, Counter, foreign_key: :total, references: :id)
     end
   end
 
@@ -73,13 +75,29 @@ defmodule Trellis.TargetTest do
       delete!: fn -> GuardedTestRepo.delete!(row) end,
       insert_or_update: fn -> GuardedTestRepo.insert_or_update(change) end,
       insert_or_update!: fn -> GuardedTestRepo.insert_or_update!(change) end,
+      insert_opts: fn -> GuardedTestRepo.insert(%Counter{id: 2, total: 1}, returning: true) end,
+      delete_opts!: fn -> GuardedTestRepo.delete!(row, stale_error_field: :id) end,
       insert_all: fn -> GuardedTestRepo.insert_all(Counter, [%{id: 3, total: 3}]) end,
+      insert_all_tuple: fn ->
+        GuardedTestRepo.insert_all({"guard_counters", Counter}, [%{id: 3, total: 3}], [])
+      end,
+      update_all_source_tuple: fn ->
+        GuardedTestRepo.update_all(from(c in {"guard_counters", Counter}), set: [total: 0])
+      end,
       update_all: fn -> GuardedTestRepo.update_all(Counter, set: [total: 0]) end,
       update_all_query: fn ->
         GuardedTestRepo.update_all(from(c in Counter, where: c.id == 1), set: [total: 0])
       end,
       delete_all: fn -> GuardedTestRepo.delete_all(Counter) end,
       delete_all_query: fn -> GuardedTestRepo.delete_all(from(c in Counter, where: c.id == 1)) end,
+      child_of_plain_parent: fn ->
+        GuardedTestRepo.insert(%Plain{id: 1, counters: [%Counter{id: 6}]})
+      end,
+      multi_update_all: fn ->
+        Ecto.Multi.new()
+        |> Ecto.Multi.update_all(:rows, Counter, set: [total: 0])
+        |> GuardedTestRepo.transaction()
+      end,
       multi: fn ->
         Ecto.Multi.new()
         |> Ecto.Multi.insert(:row, %Counter{id: 4, total: 1})
@@ -146,6 +164,14 @@ defmodule Trellis.TargetTest do
     assert {1, _} = GuardedTestRepo.update_all(Plain, set: [total: 2])
     assert {1, _} = GuardedTestRepo.delete_all(Plain)
     assert {1, _} = GuardedTestRepo.insert_all("guard_plain", [%{id: 9, total: 1}])
+  end
+
+  test "queries that name no schema pass the guard without crashing" do
+    assert :ok = Trellis.Target.guard!(from(c in "guard_counters"), :update_all)
+    assert :ok = Trellis.Target.guard!(from(s in subquery(from(c in Counter))), :update_all)
+    assert :ok = Trellis.Target.guard!("guard_counters", :insert_all)
+    assert :ok = Trellis.Target.guard!({"guard_plain", Plain}, :insert_all)
+    assert {1, _} = GuardedTestRepo.update_all(from(c in "guard_counters"), set: [total: 0])
   end
 
   test "use Trellis.Repo before use Ecto.Repo is refused at compile time" do

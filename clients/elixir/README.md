@@ -308,10 +308,10 @@ the test environment:
 
 ```elixir
 # config/test.exs
-config :trellis_pg, enabled: false
+config :trellis_pg, enabled: false, allow_target_writes: true
 ```
 
-Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
+`allow_target_writes` lets a test write target schemas (see below). Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
 skip, and `mix trellis.load` / `mix trellis.dump` are `ecto.load` /
 `ecto.dump`, so target tables are plain tables a test writes directly.
 Build the test database with `mix ecto.load` (aliased to `trellis.load`),
@@ -337,16 +337,12 @@ end
 
 `insert`, `update`, `delete`, `insert_or_update` (and bang forms), `insert_all`, `update_all`
 and `delete_all` on a marked schema raise `Trellis.ReadOnlyTarget` before any SQL is sent;
-`Ecto.Multi` goes through them. Raw SQL and schemaless `insert_all("table", ...)` go around
-the guard: a `SELECT`-only grant is the strong answer (`docs/recommendations.md`).
+`Ecto.Multi` goes through them. Raw SQL and writes that name no schema
+(`insert_all("table", ...)`, `from("table")`) go around the guard: a `SELECT`-only grant
+is the strong answer (`docs/recommendations.md`).
 
 `config :trellis_pg, allow_target_writes: true` lifts it (default `false`, read at each
-write, independent of `enabled`). A test setup sets both:
-
-```elixir
-# config/test.exs
-config :trellis_pg, enabled: false, allow_target_writes: true
-```
+write, independent of `enabled`).
 
 ## Fixtures and bulk loads in tests
 

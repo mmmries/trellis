@@ -25,8 +25,11 @@ defmodule Trellis.Target do
 
   The guard covers the repo's `insert`, `update`, `delete`, `insert_or_update`
   (and bang forms), `insert_all`, `update_all` and `delete_all`, so
-  `Ecto.Multi` too. Writes that name no schema go around it: SQL sent with
-  `Ecto.Adapters.SQL.query/3`, and a schemaless `insert_all("table", ...)`.
+  `Ecto.Multi` and associated records written with a parent too. Writes
+  that name no schema go around it: SQL sent with `Ecto.Adapters.SQL.query/3`,
+  a schemaless `insert_all("table", ...)` or `from("table")`, and a parent's
+  `has_many`/`has_one` `on_delete: :delete_all`/`:nilify_all` cascade, which
+  Ecto runs without the repo's functions.
   That is the database grant's job (`docs/recommendations.md`,
   "Application roles read targets, and nothing else").
   """
