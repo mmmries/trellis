@@ -15,4 +15,5 @@ mod one_to_one_ledger_interleavings;
 mod one_to_one_nullable_key;
 mod one_to_one_render;
 mod one_to_one_self_check_ring;
+mod one_to_one_where;
 mod oneone_text_compare;

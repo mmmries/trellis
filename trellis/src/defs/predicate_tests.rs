@@ -213,14 +213,12 @@ fn a_predicate_that_can_raise_is_refused_by_name() {
 }
 
 /// Until each key space's step lands (#1991), define refuses its filter by
-/// name, after the predicate's own checks. A plain aggregate applies one.
+/// name, after the predicate's own checks. A plain 1-1 transform and a plain
+/// aggregate apply one.
 #[test]
 fn every_key_space_refuses_a_filter_until_its_step_lands() {
-    assert_eq!(
-        validated("TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0"),
-        Err(ValidationError::FilterNotYetSupported { key_space: "1-1" }),
-    );
     for text in [
+        "TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0",
         "TRANSFORM t FROM s SELECT qty AS q",
         "TRANSFORM t FROM s SELECT qty AS q WHERE TRUE",
         "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n, SUM(qty) AS total, \

@@ -512,43 +512,64 @@ async fn collect_tombstones_skips_a_ledger_without_its_tombstone_index() {
     assert_eq!(collected, 1, "k1's tombstone goes once the index is back");
 }
 
-/// The GC skips the ledger of a definition under a build: one that
-/// is `backfilling`, or whose Re-derive build a pause froze (`build` still
-/// set), and one whose row another transaction holds `for update`, as a
-/// build's start does. A build's chunk inserts the entry of a key with no
-/// entry from a snapshot taken before the insert, which a tombstone
-/// collected in between would make wrong
-/// (`staging::one_to_one_ledger::lock_entries`). Once the build is over, the
-/// GC collects as usual.
+/// The GC skips a 1-1 `JOIN`'s hidden ledgers while their definition is
+/// under a build: one that is `backfilling`, or whose Re-derive build a
+/// pause froze (`build` still set), and one whose row another transaction
+/// holds `for update`, as a build's start does. The `JOIN`'s build chunk
+/// inserts `R` entries from a read whose snapshot predates the insert's
+/// uniqueness check, which a tombstone collected in between would make
+/// wrong. A plain 1-1 target's ledger is collected throughout: its chunks
+/// lock their entries before they read (#2018). Once the build is over,
+/// the GC collects the hidden ledger as usual.
 #[tokio::test]
-async fn collect_tombstones_skips_a_ledger_under_a_build() {
+async fn collect_tombstones_skips_only_a_joins_hidden_ledger_under_a_build() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
 
-    client
-        .batch_execute(
+    let ledger = |name: &str| {
+        format!(
             r#"
-            create table public.t__ledger (
+            create table {name} (
                 "__from_key" text primary key,
                 "__applied_lsn" pg_lsn,
                 "__applied_seg" bigint,
                 "__basis" pg_snapshot,
                 "__tombstone" boolean not null default false
             );
-            create index on public.t__ledger ("__applied_seg") where "__tombstone";
-            insert into public.t__ledger ("__from_key", "__applied_seg", "__tombstone")
+            create index on {name} ("__applied_seg") where "__tombstone";
+            insert into {name} ("__from_key", "__applied_seg", "__tombstone")
             values ('k1', 1, true);
-
+            "#
+        )
+    };
+    client
+        .batch_execute(&format!(
+            r#"
+            {}
             insert into source_table_versions (source_table, version)
             values ('public.src', 1);
             insert into transform_definitions
                 (target_table, source_table, source_version, definition_text, status, build)
-            values ('public.t', 'public.src', 1, 'n/a', 'backfilling', 'rederive');
+            values ('public.t', 'public.src', 1, 'n/a', 'backfilling', 'rederive'),
+                   ('public.joined', 'public.src', 1, 'n/a', 'backfilling', 'rederive');
             "#,
+            ledger("public.t__ledger")
+        ))
+        .await
+        .expect("create the definitions, building");
+    let id: i64 = client
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.joined'",
+            &[],
         )
         .await
-        .expect("create a ledger whose definition is building");
+        .expect("read the id")
+        .get(0);
+    client
+        .batch_execute(&ledger(&format!(r#""join1_{id}_r""#)))
+        .await
+        .expect("create a hand-made hidden ledger");
 
     seal_and_fence(&mut client).await; // segment 1
     mark_drained(&client, 1).await;
@@ -556,7 +577,19 @@ async fn collect_tombstones_skips_a_ledger_under_a_build() {
     let collected = retire::collect_tombstones(&mut client)
         .await
         .expect("collect_tombstones");
-    assert_eq!(collected, 0, "backfilling");
+    assert_eq!(
+        collected, 1,
+        "backfilling: the plain ledger's tombstone alone"
+    );
+    let plain: i64 = client
+        .query_one("select count(*) from public.t__ledger", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(
+        plain, 0,
+        "the plain 1-1 ledger is collected under its build"
+    );
 
     client
         .batch_execute("update transform_definitions set status = 'paused'")
@@ -586,7 +619,7 @@ async fn collect_tombstones_skips_a_ledger_under_a_build() {
     let collected = retire::collect_tombstones(&mut client)
         .await
         .expect("collect_tombstones");
-    assert_eq!(collected, 1, "k1's tombstone goes once no build runs");
+    assert_eq!(collected, 1, "R's tombstone goes once no build runs");
 }
 
 /// A 1-1 `JOIN`'s hidden ledgers `R` and `M` (`join1_{id}_{r|m}`, in the

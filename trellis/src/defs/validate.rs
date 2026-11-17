@@ -2164,8 +2164,7 @@ pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), Valida
         return Ok(());
     }
     let key_space = match &def.key_space {
-        KeySpace::OneToOne => "1-1",
-        KeySpace::Aggregate { .. } => return Ok(()),
+        KeySpace::OneToOne | KeySpace::Aggregate { .. } => return Ok(()),
         KeySpace::Join(_) => "JOIN aggregate",
         KeySpace::JoinOneToOne(_) => "1-1 JOIN",
     };

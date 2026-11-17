@@ -19,6 +19,8 @@
 //! `applied_lsn`, or seen by that entry's `basis`. A key with no ledger entry
 //! whose earliest unapplied change has an old image is uncertain
 //! ([`Ring::uncertain_keys_sql`]): a build read the source past that change.
+//! Under a `WHERE`, only an old image that is a member row makes it so: a
+//! failing row has no entry and no target row.
 //!
 //! "Unapplied" is a ring row of the source that
 //!
@@ -245,11 +247,31 @@ impl Ring<'_> {
     /// drains, its old image is not what the target holds. In a statement
     /// with [`Self::one_to_one_ctes`]'s CTEs.
     pub(super) fn uncertain_keys_sql(&self) -> String {
+        self.uncertain_keys_sql_where(None)
+    }
+
+    /// [`Self::uncertain_keys_sql`] for a 1-1 definition with a `WHERE`,
+    /// `member` being its membership test over the source's bare column
+    /// names. A failing row has no ledger entry either, and holds no target
+    /// row: a key with no entry whose earliest unapplied old image is no
+    /// member is one the target agrees with, so only a member old image
+    /// makes the key uncertain.
+    pub(super) fn uncertain_keys_sql_where(&self, member: Option<&str>) -> String {
+        let member = member
+            .map(|member| {
+                format!(
+                    " and exists (select 1 from jsonb_populate_record(null::{}, __i) \
+                     where {member})",
+                    self.source_row
+                )
+            })
+            .unwrap_or_default();
         format!(
             "select __key as __k from {rows} where __kind = 'uncertain' \
              union select ph.key from poison_held ph \
              where ph.transform_id = {id} and ph.src_table = {src} and ph.origin_lsn is null \
-             union select __k from {pend} where __unledgered and jsonb_typeof(__i) = 'object'",
+             union select __k from {pend} \
+             where __unledgered and jsonb_typeof(__i) = 'object'{member}",
             rows = self.cte("rows"),
             pend = self.cte("pend"),
             id = self.transform_id,
