@@ -55,9 +55,10 @@ DROP   TRANSFORM <transform>
 - `<expression>` is the [expression grammar](expressions.md); `<field>` names
   a target column.
 - `WHERE` takes a `boolean` [expression](expressions.md#where) over source
-  columns that can't raise an error. A plain aggregate applies one: its groups
-  count only the rows it is `TRUE` for. A [1-1 `JOIN`](#1-1-join) applies one
-  too. Every other key space refuses any `WHERE` but `TRUE` for now
+  columns that can't raise an error. Every key space applies one. A plain 1-1
+  transform holds only the rows it is `TRUE` for, and a plain aggregate's
+  groups count only those rows. A [join aggregate](#join-aggregate) applies one
+  per table, and a [1-1 `JOIN`](#1-1-join) one
   ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 - `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
   `<name>.<field>` pauses or resumes one field
@@ -225,6 +226,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | [An unsupported `JOIN` shape](#an-unsupported-join-shape) | [T0005 UnsupportedKeySpace](errors.md#t0005-unsupportedkeyspace), [T0015 TableAlias](errors.md#t0015-tablealias), [T0016 AliasedTableName](errors.md#t0016-aliasedtablename), [T0050 JoinSelf](errors.md#t0050-joinself), [T0051 JoinTooManyTables](errors.md#t0051-jointoomanytables), [T0055 JoinOnSameSide](errors.md#t0055-joinonsameside), [T0057 JoinOnRepeatedPair](errors.md#t0057-joinonrepeatedpair), [T0053 JoinUnqualifiedColumn](errors.md#t0053-joinunqualifiedcolumn), [T0052 JoinUnknownTable](errors.md#t0052-joinunknowntable), [T0054 JoinUnresolvedColumn](errors.md#t0054-joinunresolvedcolumn), [T0056 JoinMixedSideArgument](errors.md#t0056-joinmixedsideargument), [T0064 JoinFieldShape](errors.md#t0064-joinfieldshape) | [Text](#text) |
 | [A 1-1 `JOIN`](#a-1-1-join) | [T0066 OneToOneJoinKeyNotUnique](errors.md#t0066-onetoonejoinkeynotunique), [T0065 OneToOneJoinAggregate](errors.md#t0065-onetoonejoinaggregate), [T0067 OneToOneJoinUnsupported](errors.md#t0067-onetoonejoinunsupported), [T0145 PartitionedSource](errors.md#t0145-partitionedsource), [T0058 JoinOnRepeatedColumn](errors.md#t0058-joinonrepeatedcolumn) | [Key](#key), [Retype](#retype), [Shape](#shape) |
 | [1-1 `JOIN` of more than two tables (star)](#1-1-join-of-more-than-two-tables-star) | [T0068 StarJoinTooManyTables](errors.md#t0068-starjointoomanytables), [T0069 JoinOnReadsAnotherJoinedTable](errors.md#t0069-joinonreadsanotherjoinedtable), the 1-1 `JOIN`'s at each position | As for a 1-1 `JOIN`, at each position |
+| A join aggregate's `WHERE` with a top-level `AND` condition that reads both tables, reads the joined table under `LEFT`, or reads no column ([join aggregate](#join-aggregate)) | [T0243 JoinPredicateReadsBothSides](errors.md#t0243-joinpredicatereadsbothsides), [T0244 JoinPredicateJoinedSideUnderLeft](errors.md#t0244-joinpredicatejoinedsideunderleft), [T0245 JoinPredicateReadsNoColumn](errors.md#t0245-joinpredicatereadsnocolumn) | [Text](#text) |
 | `ON` columns that differ in type or collation (a modifier never counts; `text` and `varchar` are one type), are off the join-key allowlist in [type-support](type-support.md) (a domain always is), or have a nondeterministic collation; a `GROUP BY` key of a type that can't be one | [T0061 JoinKeyTypeMismatch](errors.md#t0061-joinkeytypemismatch), [T0062 JoinUnsupportedKeyType](errors.md#t0062-joinunsupportedkeytype), [T0063 JoinNondeterministicCollation](errors.md#t0063-joinnondeterministiccollation), [T0100 UnsupportedGroupByKeyType](errors.md#t0100-unsupportedgroupbykeytype) | [Retype](#retype); a change between deterministic collations pauses nothing, but `RESUME` refuses until they match |
 | **Aggregate functions** | | |
 | [`MIN` or `MAX` in a plain aggregate](#min-or-max-in-a-plain-aggregate) | [T0073 ExtremeOfExpression](errors.md#t0073-extremeofexpression), [T0072 UnsupportedExtremeArgument](errors.md#t0072-unsupportedextremeargument), [T0074 ChainedExtreme](errors.md#t0074-chainedextreme), [T0075 ExtremesWithoutSourceIndex](errors.md#t0075-extremeswithoutsourceindex), [T0135 ExtremeIndexMissing](errors.md#t0135-extremeindexmissing) | [Index](#index), [Retype](#retype) |
@@ -235,7 +237,6 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | [T0071 UnsupportedAggregateArgument](errors.md#t0071-unsupportedaggregateargument) | [Retype](#retype) |
 | `array_agg`, `string_agg` or `jsonb_agg` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
 | **Filters and chaining** | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every one but the plain aggregate and the 1-1 `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | [T0238 FilterNotYetSupported](errors.md#t0238-filternotyetsupported) | [Text](#text) |
 | `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an extreme is read from a source index, which holds the rows the `WHERE` drops too | [T0239 FilteredExtreme](errors.md#t0239-filteredextreme) | [Text](#text) |
 | A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | [T0048 TargetEqualsSource](errors.md#t0048-targetequalssource), [T0047 TableCycle](errors.md#t0047-tablecycle) | [Text](#text) |
 | Chaining off a transform that is not `live` | [T0154 TransformNotLive](errors.md#t0154-transformnotlive) | n/a |
@@ -587,10 +588,10 @@ grant on.
 
 ### 1-1
 
-One target row per source row, keyed by the source's key: its primary key or
-the `KEY (…)` the definition names, or, over an aggregate or `JOIN` target
-whose group key can be `NULL`, a `UNIQUE NULLS NOT DISTINCT` constraint over
-the same columns. The target carries the key columns, so a field can't reuse a
+One target row per source row the `WHERE` admits, keyed by the source's key:
+its primary key or the `KEY (…)` the definition names, or, over an aggregate
+or `JOIN` target whose group key can be `NULL`, a `UNIQUE NULLS NOT DISTINCT`
+constraint over the same columns. The target carries the key columns, so a field can't reuse a
 key column's name ([expressions — Refusals](expressions.md#refusals)). It
 reads one table: one row per row of a table with columns of a second is a
 [1-1 `JOIN`](#1-1-join), and one row per group of a join a
@@ -651,6 +652,20 @@ TRANSFORM sales_by_tier FROM shop.orders AS o JOIN customers c
   ON o.customer_id = c.id
 GROUP BY c.tier
 SELECT c.tier AS tier, SUM(o.amount) AS total
+```
+
+A `WHERE` is split at its top-level `AND`s, and each condition reads one table
+and filters that table's rows before they are aggregated
+([ADR-0019](decisions/0019-join-transforms.md)). Under `INNER` that is SQL's
+filter after the join. Under `LEFT`, a condition on the joined table is
+refused: it would also drop the unmatched rows the `LEFT` keeps.
+
+```text
+TRANSFORM paid_by_tier FROM orders JOIN customers
+  ON orders.customer_id = customers.id
+GROUP BY customers.tier
+SELECT customers.tier AS tier, SUM(orders.amount) AS total
+WHERE orders.status = 'paid' AND customers.active
 ```
 
 ### 1-1 `JOIN`

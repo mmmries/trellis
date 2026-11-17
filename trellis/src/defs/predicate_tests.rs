@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use super::ast::{Expr, KeySpace, Operator, Predicate, ValueType, render_definition_text};
+use super::ast::{Expr, Operator, Predicate, ValueType, render_definition_text};
 use super::floor::{Floors, Release};
 use super::validate::{ValidationError, validate};
 use super::{grammar, parse};
@@ -26,13 +26,9 @@ fn validated(text: &str) -> Result<(), ValidationError> {
     validate(&parse(text).expect("parses"), &columns())
 }
 
-/// The refusal define gives `text`, past the key-space refusal: the
-/// predicate's checks come before it, so a refusal here is the predicate's.
+/// The refusal define gives `text`, if any.
 fn predicate_refusal(text: &str) -> Option<ValidationError> {
-    match validated(text) {
-        Err(ValidationError::FilterNotYetSupported { .. }) | Ok(()) => None,
-        Err(other) => Some(other),
-    }
+    validated(text).err()
 }
 
 #[test]
@@ -212,15 +208,12 @@ fn a_predicate_that_can_raise_is_refused_by_name() {
     ));
 }
 
-/// Until each key space's step lands (#1991), define refuses its filter by
-/// name, after the predicate's own checks. A plain aggregate applies one.
+/// Every key space applies a filter (#1991): define admits one on each, after
+/// the predicate's own checks.
 #[test]
-fn every_key_space_refuses_a_filter_until_its_step_lands() {
-    assert_eq!(
-        validated("TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0"),
-        Err(ValidationError::FilterNotYetSupported { key_space: "1-1" }),
-    );
+fn every_key_space_admits_a_filter() {
     for text in [
+        "TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0",
         "TRANSFORM t FROM s SELECT qty AS q",
         "TRANSFORM t FROM s SELECT qty AS q WHERE TRUE",
         "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n, SUM(qty) AS total, \
@@ -228,22 +221,6 @@ fn every_key_space_refuses_a_filter_until_its_step_lands() {
     ] {
         assert_eq!(validated(text), Ok(()), "{text}");
     }
-    let text = "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g \
-                SELECT s.g AS g, COUNT(*) AS n WHERE s.qty > 0";
-    let def = parse(text).unwrap();
-    assert!(matches!(def.key_space, KeySpace::Join(_)));
-    assert_eq!(
-        super::validate::validate_join(&def, &HashMap::new(), &[]),
-        Err(ValidationError::FilterNotYetSupported {
-            key_space: "JOIN aggregate"
-        }),
-        "{text}"
-    );
-    // The 1-1 `JOIN` filters at recompute (#2041): its validator checks
-    // the predicate (`validate_join_one_to_one`'s tests).
-    let def =
-        parse("TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0").unwrap();
-    assert_eq!(super::validate::refuse_unsupported_filter(&def), Ok(()));
 }
 
 /// A plain aggregate's `MIN`/`MAX` is refused under any `WHERE` other than

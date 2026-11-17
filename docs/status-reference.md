@@ -458,7 +458,9 @@ live on each call, it reports three things, none of which changes the status:
   Estimates keep the call cheap on large tables; they are as fresh as the
   table's last `ANALYZE` or autovacuum.
 - `partials_warning`: set once `P`'s estimated rows reach half of the `FROM`
-  table's (and the `FROM` table has at least 1000 estimated rows). `P` is the
+  table's (and the `FROM` table has at least 1000 estimated rows). With a
+  `WHERE` on the `FROM` table, `fact_rows` is the planner's estimate of the
+  rows it keeps, which are all `P` holds. `P` is the
   `FROM` table grouped by its `GROUP BY` columns and join key, so a `P` near
   the table's size means the grouping barely compresses it and the hidden
   table costs about as much as the table it summarises. A `FROM` table joined

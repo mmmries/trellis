@@ -3738,6 +3738,21 @@ async fn settle_one_to_one_target(
     );
     #[cfg(not(any(test, feature = "test-util")))]
     let predicate = true;
+    // Which Apply images are member rows, decided before the entries are
+    // touched: to everything below, an image whose `WHERE` is not `TRUE` is
+    // a delete (ADR-0002, Apply), so a change that leaves a row failing
+    // writes a tombstone like any delete (#1991 rule 16).
+    let failing = failing_apply_keys(txn, plan, &by_key).await?;
+    // An Apply's image, `None` for a delete or a row that is no member.
+    let apply_image = |r: &OneToOneRecord| -> Option<Option<String>> {
+        r.apply.as_ref().map(|(_, _, image)| {
+            if failing.contains(r.pk_text.as_str()) {
+                None
+            } else {
+                image.clone()
+            }
+        })
+    };
     // A Re-derive's `present` is unknown before its read; the lock ignores
     // it.
     let to_lock: Vec<one_to_one_ledger::EntryChange<'_>> = by_key
@@ -3745,10 +3760,7 @@ async fn settle_one_to_one_target(
         .map(|r| one_to_one_ledger::EntryChange {
             key: &r.pk_text,
             apply: r.apply.as_ref().map(|(lsn, txid, _)| (*lsn, txid.as_str())),
-            present: r
-                .apply
-                .as_ref()
-                .is_none_or(|(_, _, values)| values.is_some()),
+            present: apply_image(r).is_none_or(|image| image.is_some()),
         })
         .collect();
     let inserted =
@@ -3776,11 +3788,29 @@ async fn settle_one_to_one_target(
         .await?;
         (read.rows, Some(read.snapshot), seg_seq.max(read.seg))
     };
-    // A Re-derive's row, `None` for a key with no row.
-    let rederived: HashMap<&str, Option<String>> = rederive_keys
+    // A Re-derive's row, `None` for a key with no row, or whose row the
+    // read found is no member (ADR-0002, Re-derive): its membership is
+    // decided from the text read under the entry lock.
+    let mut rederived: HashMap<&str, Option<String>> = rederive_keys
         .into_iter()
         .map(|key| (key, read.remove(key)))
         .collect();
+    if plan.render.filtered() {
+        let read: Vec<(&str, &str)> = rederived
+            .iter()
+            .filter_map(|(key, row)| Some((*key, row.as_deref()?)))
+            .collect();
+        let images: Vec<&str> = read.iter().map(|(_, image)| *image).collect();
+        let members = plan.render.members(txn, &images).await?;
+        let failing: Vec<&str> = read
+            .iter()
+            .zip(&members)
+            .filter_map(|((key, _), member)| (!member).then_some(*key))
+            .collect();
+        for key in failing {
+            rederived.insert(key, None);
+        }
+    }
 
     let mut changes: Vec<one_to_one_ledger::EntryChange<'_>> = Vec::with_capacity(by_key.len());
     for record in by_key.values() {
@@ -3788,8 +3818,8 @@ async fn settle_one_to_one_target(
         if record.apply.is_some() && inserted.keys.contains(&record.pk_text) {
             continue;
         }
-        let present = match &record.apply {
-            Some((_, _, values)) => values.is_some(),
+        let present = match apply_image(record) {
+            Some(values) => values.is_some(),
             None => match rederived.get(record.pk_text.as_str()) {
                 Some(values) => values.is_some(),
                 None => continue,
@@ -3829,8 +3859,8 @@ async fn settle_one_to_one_target(
         if !changed.contains(&record.pk_text) {
             continue;
         }
-        let image = match &record.apply {
-            Some((_, _, image)) => image.clone(),
+        let image = match apply_image(record) {
+            Some(image) => image,
             None => rederived.get(record.pk_text.as_str()).cloned().flatten(),
         };
         match image {
@@ -3850,6 +3880,34 @@ async fn settle_one_to_one_target(
         }
     }
     apply_target(txn, target, plan, &writes, &deletes, mutations).await
+}
+
+/// The keys of `by_key`'s Apply records whose new image is no member row:
+/// its `WHERE` is not `TRUE` ([`super::one_to_one_render::OneToOneRender::members`]).
+/// Empty, with no statement run, for an unfiltered definition.
+async fn failing_apply_keys<'a>(
+    txn: &Transaction<'_>,
+    plan: &TargetPlan,
+    by_key: &BTreeMap<&'a str, &'a OneToOneRecord>,
+) -> Result<HashSet<&'a str>, ApplyError> {
+    if !plan.render.filtered() {
+        return Ok(HashSet::new());
+    }
+    let applied: Vec<(&str, &str)> = by_key
+        .values()
+        .filter_map(|r| match &r.apply {
+            Some((_, _, Some(image))) => Some((r.pk_text.as_str(), image.as_str())),
+            _ => None,
+        })
+        .collect();
+    let images: Vec<&str> = applied.iter().map(|(_, image)| *image).collect();
+    let members = plan.render.members(txn, &images).await?;
+    let failing = applied
+        .iter()
+        .zip(&members)
+        .filter_map(|((key, _), member)| (!member).then_some(*key))
+        .collect();
+    Ok(failing)
 }
 
 /// Runs one target table's ordered pre-lock, then its no-op-suppressed

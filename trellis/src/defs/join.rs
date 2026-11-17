@@ -314,6 +314,52 @@ fn walk_columns(expr: &Expr, visit: &mut impl FnMut(&QualifiedColumn)) {
     });
 }
 
+/// `predicate`'s top-level `AND` conjuncts, in the order written: `x AND (y
+/// AND z)` is `[x, y, z]`; anything else is one conjunct.
+pub(crate) fn conjuncts(predicate: &Expr) -> Vec<&Expr> {
+    fn collect<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                op: super::ast::Operator::And,
+                lhs,
+                rhs,
+            } => {
+                collect(lhs, out);
+                collect(rhs, out);
+            }
+            _ => out.push(expr),
+        }
+    }
+    let mut out = Vec::new();
+    collect(predicate, &mut out);
+    out
+}
+
+/// The sides a conjunct of a join aggregate's `WHERE` reads, each once.
+pub(crate) fn conjunct_sides(def: &TransformDef, conjunct: &Expr) -> BTreeSet<Side> {
+    expr_columns(def, conjunct)
+        .into_iter()
+        .map(|(side, _)| side)
+        .collect()
+}
+
+/// A join aggregate's filter of `side`'s rows (ADR-0019, "`WHERE`"): the
+/// `AND` of its `WHERE`'s top-level conjuncts that read only `side`, or
+/// `None` when none does. Define refuses a conjunct that reads both sides
+/// or none, so the two sides' filters together are the whole `WHERE`.
+pub(crate) fn side_predicate(def: &TransformDef, side: Side) -> Option<Expr> {
+    let predicate = def.predicate.filter()?;
+    conjuncts(predicate)
+        .into_iter()
+        .filter(|c| conjunct_sides(def, c) == BTreeSet::from([side]))
+        .cloned()
+        .reduce(|lhs, rhs| Expr::BinaryOp {
+            op: super::ast::Operator::And,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        })
+}
+
 /// Whether `name` (uppercased) is an aggregate a `JOIN` admits.
 fn is_aggregate(name: &str) -> bool {
     matches!(name, "COUNT" | "SUM" | "AVG")

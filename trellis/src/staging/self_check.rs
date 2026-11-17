@@ -162,7 +162,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, FieldDef, KeySpace, Predicate, as_extract};
+use crate::defs::ast::{Expr, FieldDef, KeySpace, as_extract};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::{Definition, StoredStatus, TransformStatus};
@@ -1175,16 +1175,6 @@ fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
     }
 }
 
-/// The refusal of a definition whose `WHERE` this release's comparison
-/// doesn't render. Define refuses such a definition, so only a catalog this
-/// release didn't write can hold one.
-pub(super) fn unaudited_filter(def: &Definition) -> SelfCheckError {
-    SelfCheckError::UnsupportedExpr {
-        target: def.def.target.clone(),
-        detail: "its WHERE is not audited by this release".to_string(),
-    }
-}
-
 /// The bounded comparison itself (ADR-0013: the target read and the
 /// recompute share one snapshot). Reads one keyset page of `def`'s source
 /// (recomputed via [`render_leaf`]) and of the persisted target in a single
@@ -1225,16 +1215,6 @@ async fn compare_once(
         )
         .await;
     }
-    // The recompute `SELECT` below carries no `WHERE` for the definition's
-    // own partial-data predicate: an unfiltered recompute would report every
-    // excluded source row as a `MissingRow`. Define refuses a 1-1 `WHERE`
-    // until its step (#2038) renders it here, so a filter is refused rather
-    // than audited wrong.
-    match &def.def.predicate {
-        Predicate::True => {}
-        Predicate::Filter(_) => return Err(unaudited_filter(def)),
-    }
-
     let comparable: Vec<&FieldDef> = def
         .def
         .fields
@@ -1326,12 +1306,24 @@ fn page_sql(
     let source_ident = ddl::qualified_source_table(&def.source_table);
     let target_ident = ddl::qualified_target_table_ident(&def.target_table);
 
+    // The definition's `WHERE`, rendered here as written (ADR-0013): the
+    // expected rows are the member rows, live rows and unapplied images
+    // alike, and a field is read only on a member row, as the write path
+    // reads it. Every name in it is a source column.
+    let member = def
+        .def
+        .predicate
+        .filter()
+        .map(|p| format!("(({}) is true)", render_leaf(p)));
     let mut recomputed = Vec::with_capacity(comparable.len());
     let mut persisted = Vec::with_capacity(comparable.len());
     let mut inliner = FieldInliner::new(&def.target_table, &def.def.fields);
     for field in comparable {
         let leaf = inliner.render(field)?;
-        recomputed.push(format!("({leaf})::text"));
+        recomputed.push(match &member {
+            Some(member) => format!("(case when {member} then ({leaf}) end)::text"),
+            None => format!("({leaf})::text"),
+        });
         persisted.push(format!("{}::text", quote_ident(&field.name)));
     }
     // The recompute side reads the source as the target has applied it
@@ -1355,6 +1347,10 @@ fn page_sql(
           where jsonb_typeof(p.__i) = 'object') e",
         skey = ddl::pk_key_sql_expr(pk, Some("s")),
     );
+    let expected = match &member {
+        Some(member) => format!("(select e.* from {expected} where {member}) e"),
+        None => expected,
+    };
     let side = |table: &str, values: &[String]| {
         keyset.side(&refs, |cond| {
             format!(
@@ -1379,7 +1375,7 @@ fn page_sql(
             " union all select 3, page.page_end, u.__k, null::text[] \
                 from page, ({}) u \
               union all select 4, page.page_end, '', null::text[] from page where {}",
-            ring.uncertain_keys_sql(),
+            ring.uncertain_keys_sql_where(member.as_deref()),
             ring.global_sql()
         ),
     ))

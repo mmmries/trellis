@@ -66,6 +66,7 @@ use crate::pool::{Pool, quote_ident};
 use super::super::apply::ApplyError;
 use super::super::keyset::{ArmSql, Keyset};
 use super::super::one_to_one_ledger::{self, EntryChange};
+use super::super::one_to_one_render;
 use super::super::target_mutations::TargetMutations;
 use super::orphans::{self, OrphanCursor, OrphanWalk};
 use super::{SweepOutcome, under_chunk_lock_timeout};
@@ -89,6 +90,10 @@ pub struct OneToOnePlan {
     /// Which fields read which others by alias, so a field reading a paused
     /// one is left out with it.
     alias_readers: crate::defs::alias_readers::AliasReaders,
+    /// The definition's `WHERE` as `((<p>) is true)` over the source row
+    /// `s`; `None` for `TRUE`. A chunk reads, locks and writes member rows
+    /// only, so the ledger stays the size of the target (#1991 rule 16).
+    predicate: Option<String>,
 }
 
 /// Whether `definition` is a 1-1 target the Re-derive build serves: a 1-1 key
@@ -131,6 +136,11 @@ impl OneToOnePlan {
             return Ok(None);
         }
         let substituted = crate::defs::backfill::substitute_all_fields(&definition.def)?;
+        let predicate = definition
+            .def
+            .predicate
+            .filter()
+            .map(|p| one_to_one_render::membership_sql(p, "s"));
         let fields = definition
             .def
             .fields
@@ -139,7 +149,10 @@ impl OneToOnePlan {
             .map(|(field, expr)| {
                 (
                     field.name.clone(),
-                    crate::defs::oracle::render_expr_sql(expr),
+                    one_to_one_render::guard_field(
+                        predicate.as_deref(),
+                        crate::defs::oracle::render_expr_sql(expr),
+                    ),
                 )
             })
             .collect();
@@ -153,6 +166,7 @@ impl OneToOnePlan {
             target_key,
             fields,
             alias_readers: crate::defs::alias_readers::AliasReaders::of(&definition.def),
+            predicate,
         }))
     }
 }
@@ -253,7 +267,9 @@ async fn run_range(
     // 1. The keys in the range, but for the quarantined ones
     // and any with a `NULL` part, as `fail_chunk`'s narrowing counts them:
     // the plan stages those
-    // (`super::stage_null_keys`).
+    // (`super::stage_null_keys`). A row whose `WHERE` is not `TRUE` is
+    // skipped: it gets no entry, as a row gone from the source gets none. If
+    // it becomes a member, its change writes it.
     let started = Instant::now();
     let source_param = format!("${}", params.len() + 1);
     let target_param = format!("${}", params.len() + 2);
@@ -268,13 +284,17 @@ async fn run_range(
     let keys: Vec<String> = txn
         .query(
             &format!(
-                "select {k_expr} from {} s where {range_where} and {} \
+                "select {k_expr} from {} s where {range_where} and {}{} \
                  and not exists (select 1 from poison p \
                                  join transform_definitions d on d.id = p.transform_id \
                                  where p.src_table = {source_param} and p.key = {k_expr} \
                                    and d.target_table = {target_param})",
                 ddl::qualified_source_table(&plan.source_table),
                 not_null.join(" and "),
+                plan.predicate
+                    .as_ref()
+                    .map(|member| format!(" and {member}"))
+                    .unwrap_or_default(),
             ),
             &key_params,
         )
@@ -286,6 +306,15 @@ async fn run_range(
     if keys.is_empty() {
         return Ok(OneToOneOutcome::default());
     }
+    // Test-only pause point, between the unlocked key read and the entry
+    // lock. See `super::super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::super::interleave::pause_at(
+        txn,
+        super::super::interleave::PausePoint::AfterChunkKeyRead,
+        &plan.target,
+    )
+    .await?;
     let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
 
     // 2. The entry lock, under the chunk's own short lock timeout.
@@ -346,10 +375,8 @@ fn chunk_pick(plan: &OneToOnePlan, lo: &Option<Vec<String>>, keys_param: &str) -
         crate::defs::backfill::pk_range_where(&idents, &plan.pk, lo)
     };
     Pick {
-        src_from: format!(
-            "where {} and {k_src} = any({keys_param}::text[])",
-            qualify("s")
-        ),
+        src_join: None,
+        src_cond: format!("{} and {k_src} = any({keys_param}::text[])", qualify("s")),
         target_where: format!("{} and {k_tgt} = any({keys_param}::text[])", qualify("t")),
         keys: keys_param.to_string(),
     }
@@ -681,15 +708,16 @@ async fn rederive_keys(
 /// column names, which a user column named like a part would make ambiguous.
 pub(in crate::staging) fn sweep_pick(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> Pick {
     let arm = ArmSql::named(pk, pattern, "u", 2, |_, n| format!("__trellis_p{n}"));
-    let (src_from, target_where) = match arm.relation() {
+    let (src_join, target_where) = match arm.relation() {
         Some(keys) => (
-            format!("join {keys} on {}", arm.matches("s")),
+            Some(format!("join {keys}")),
             format!("exists (select 1 from {keys} where {})", arm.matches("t")),
         ),
-        None => (format!("where {}", arm.matches("s")), arm.matches("t")),
+        None => (None, arm.matches("t")),
     };
     Pick {
-        src_from,
+        src_join,
+        src_cond: arm.matches("s"),
         target_where,
         keys: "$1".to_string(),
     }
@@ -746,14 +774,32 @@ async fn lock_chunk_entries(
 /// How a chunk or a sweep batch picks its keys' rows in
 /// [`rederive_statement`].
 pub(in crate::staging) struct Pick {
-    /// What follows `from <source> s` in the source read: the join and
-    /// filter that pick the locked keys' rows.
-    pub(in crate::staging) src_from: String,
+    /// The join, if any, that picks the locked keys' rows in the source
+    /// read, without its `on`: [`Self::src_cond`] is its condition.
+    src_join: Option<String>,
+    /// The condition over the source aliased `s` that picks the locked
+    /// keys' rows: the join's `on`, or with no join the `where`.
+    src_cond: String,
     /// A predicate over the target aliased `t` that picks the locked keys'
     /// target rows.
     pub(in crate::staging) target_where: String,
     /// The locked keys' `text[]` parameter.
     keys: String,
+}
+
+impl Pick {
+    /// What follows `from <source> s` in the source read: the join and
+    /// filter that pick the locked keys' rows, and `member` with them.
+    pub(in crate::staging) fn src_from(&self, member: Option<&str>) -> String {
+        let cond = match member {
+            Some(member) => format!("{} and {member}", self.src_cond),
+            None => self.src_cond.clone(),
+        };
+        match &self.src_join {
+            Some(join) => format!("{join} on {cond}"),
+            None => format!("where {cond}"),
+        }
+    }
 }
 
 /// The plan settings a 1-1 chunk's or sweep batch's statement runs under,
@@ -951,7 +997,7 @@ fn rederive_statement(
          select (select count(*) from upd), (select count(*) from ups), \
                 (select count(*) from del){seam}",
         src_cols = src_cols.join(", "),
-        src_from = pick.src_from,
+        src_from = src_from(plan, pick),
         keys = pick.keys,
         target_where = pick.target_where,
         basis = q(crate::defs::ledger::BASIS_COLUMN),
@@ -965,6 +1011,15 @@ fn rederive_statement(
         key = q(crate::defs::ledger::KEY_COLUMN),
         insert_cols = insert_cols.join(", "),
     )
+}
+
+/// What follows `from <source> s` in a chunk's or sweep batch's source read:
+/// the pick of the locked keys' rows, and with a `WHERE` other than `TRUE`
+/// its membership, so a locked key whose row is no member reads as a key
+/// with no row (ADR-0002, Re-derive): the statement deletes its target row
+/// and makes its entry a tombstone. A field build writes member rows only.
+fn src_from(plan: &OneToOnePlan, pick: &Pick) -> String {
+    pick.src_from(plan.predicate.as_deref())
 }
 
 /// A field build's chunk statement ([`run_field_chunk`]): rewrites `fields`,
@@ -1040,7 +1095,7 @@ fn field_statement(
          ) \
          select 0::bigint, (select count(*) from upd), 0::bigint{seam}",
         src_cols = src_cols.join(", "),
-        src_from = pick.src_from,
+        src_from = src_from(plan, pick),
         target_where = pick.target_where,
         sets = sets.join(", "),
         join = join.join(" and "),
@@ -1130,5 +1185,31 @@ mod unit_tests {
             );
             assert!(SWEEP_TAGS.contains(&tag));
         }
+    }
+
+    /// A `WHERE`'s membership joins either pick's source condition: the
+    /// join's `on` of a sweep batch's keys with a value, and the `where` of
+    /// its keys that are all `NULL` (and of a chunk).
+    #[test]
+    fn a_pick_carries_the_membership_in_either_shape() {
+        use crate::defs::ddl::PrimaryKeyColumn;
+        let key = vec![PrimaryKeyColumn {
+            name: "id".to_string(),
+            data_type: "integer".to_string(),
+            nullable: true,
+            collation: None,
+        }];
+        let member = Some(r#"((s."w" > 0) is true)"#);
+        let valued = super::sweep_pick(&key, &[false]);
+        assert_eq!(
+            valued.src_from(member),
+            r#"join unnest($2::text[]::integer[]) as u(__trellis_p0) on s."id" = u.__trellis_p0 and ((s."w" > 0) is true)"#
+        );
+        let nulls = super::sweep_pick(&key, &[true]);
+        assert_eq!(nulls.src_from(None), r#"where s."id" is null"#);
+        assert_eq!(
+            nulls.src_from(member),
+            r#"where s."id" is null and ((s."w" > 0) is true)"#
+        );
     }
 }

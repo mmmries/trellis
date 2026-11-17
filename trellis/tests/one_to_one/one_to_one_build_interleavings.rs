@@ -1683,3 +1683,148 @@ async fn a_build_in_flight_holds_no_column_pause_lock() {
         d.rows("select id, v + 1 from public.src order by id").await,
     );
 }
+
+// ------------------------------------- the tombstone GC beside a real build
+
+/// `public.src` seeded with `rows`, [`ONE`] defined and its build started:
+/// `backfilling`, its jobs unclaimed. The tombstone GC runs beside it.
+async fn start_backfilling(rows: &[(i32, i32, i32)]) -> (Driver, OneToOnePlan) {
+    let d = Driver::start_unbuilt(
+        &[],
+        &format!("{CREATE} {}", seed(rows)),
+        &columns(),
+        &[ONE],
+        &["public.src"],
+    )
+    .await;
+    assert_eq!(
+        d.rows("select status::text from transform_definitions")
+            .await,
+        ["(backfilling)"]
+    );
+    let plan = OneToOnePlan::load(d.pool(), "one")
+        .await
+        .expect("load the 1-1 plan")
+        .expect("a plain 1-1 target takes the re-derive build");
+    (d, plan)
+}
+
+/// Deletes key 2, drains the delete (a tombstone), and collects it while
+/// the definition is `backfilling`: a plain 1-1 ledger is collected under
+/// its build (#2018).
+async fn delete_and_collect(d: &mut Driver) {
+    d.write("delete from public.src where id = 2").await;
+    let batch = d.seal().await;
+    d.drain(batch, "delete").await;
+    assert_eq!(
+        d.rows("select __tombstone from public.one__ledger where __from_key = '2'")
+            .await,
+        ["(t)"],
+        "the delete left a tombstone"
+    );
+    drain_past_tombstones(d).await;
+    assert_eq!(
+        d.collect_tombstones().await,
+        1,
+        "the GC collects a plain 1-1 ledger's tombstone during its build"
+    );
+}
+
+/// Seals and drains the active segment, and retires the drained ones: a
+/// page that predates the build re-derives, and stamps its tombstone with
+/// the newest segment its read saw, which must drain before the GC may
+/// collect it.
+async fn drain_past_tombstones(d: &mut Driver) {
+    let batch = d.seal().await;
+    d.drain(batch, "past").await;
+    d.retire().await;
+}
+
+/// Finishes the build and checks the target against the source.
+async fn finish_build(d: &mut Driver) {
+    trellis::staging::build::settle_builds(d.pool()).await;
+    assert_oracle(d).await;
+    assert_eq!(
+        d.rows("select status::text from transform_definitions")
+            .await,
+        ["(live)"]
+    );
+}
+
+/// The GC collects a deleted key's tombstone while a build chunk is between
+/// its unlocked key read (which saw the key) and its entry lock. The lock
+/// inserts a fresh placeholder, the chunk's snapshot sees the delete, and
+/// the key ends deleted.
+#[tokio::test]
+async fn the_gc_collects_between_a_chunks_key_read_and_its_lock() {
+    let (mut d, plan) = start_backfilling(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    let mut running = chunk_frozen(
+        &d,
+        &plan,
+        None,
+        "100",
+        &[(PausePoint::AfterChunkKeyRead, TARGET)],
+    )
+    .await;
+    running.reached(PausePoint::AfterChunkKeyRead).await;
+    delete_and_collect(&mut d).await;
+    d.release(&mut running, PausePoint::AfterChunkKeyRead).await;
+    assert_eq!(
+        running.finish().await.keys,
+        3,
+        "the chunk locked the key it read"
+    );
+    assert_eq!(
+        d.rows("select __tombstone from public.one__ledger where __from_key = '2'")
+            .await,
+        ["(t)"],
+        "the chunk's Re-derive tombstoned the deleted key"
+    );
+    finish_build(&mut d).await;
+}
+
+/// The GC collects a deleted key's tombstone while a build chunk is between
+/// its placeholder insert and its `for update`: the lock finds the entry
+/// gone and fails transiently, and the chunk's retry no longer reads the
+/// key. The key ends deleted.
+#[tokio::test]
+async fn the_gc_collects_between_a_chunks_placeholders_and_its_lock() {
+    let (mut d, plan) = start_backfilling(&[(1, 1, 1), (2, 1, 2), (3, 2, 3)]).await;
+    let mut running = chunk_frozen(
+        &d,
+        &plan,
+        None,
+        "100",
+        &[
+            (PausePoint::AfterChunkKeyRead, TARGET),
+            (PausePoint::AfterPlaceholders, TARGET),
+        ],
+    )
+    .await;
+    running.reached(PausePoint::AfterChunkKeyRead).await;
+    // The delete's tombstone exists before the lock, so the chunk inserts
+    // no placeholder for key 2.
+    d.write("delete from public.src where id = 2").await;
+    let batch = d.seal().await;
+    d.drain(batch, "delete").await;
+    d.release(&mut running, PausePoint::AfterChunkKeyRead).await;
+    running.reached(PausePoint::AfterPlaceholders).await;
+    drain_past_tombstones(&mut d).await;
+    assert_eq!(
+        d.collect_tombstones().await,
+        1,
+        "the GC collects the unlocked tombstone during the build"
+    );
+    d.release(&mut running, PausePoint::AfterPlaceholders).await;
+    let err = running
+        .finish_result()
+        .await
+        .expect_err("the lock finds it gone");
+    assert!(
+        matches!(err, apply::ApplyError::LedgerEntryCollected { .. }),
+        "{err:?}"
+    );
+    assert_eq!(classify(&err), FailureClass::Transient);
+    assert_eq!(chunk(&d, &plan, None, "100").await.keys, 2, "the retry");
+    finish_build(&mut d).await;
+}

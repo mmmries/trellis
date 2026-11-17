@@ -49,8 +49,10 @@ Each changed visible row reaches the target-mutation seam with its prior image.
 
 ## A `WHERE`
 
-A plain aggregate's `WHERE` filters every side the stage evaluates and every
-source read below: partials count member rows only. An image without a column
+A plain aggregate's `WHERE`, and a `JOIN` side's own conjuncts of it
+([join aggregate](../transforms.md#join-aggregate)), filter every side the
+stage evaluates and every source read below: partials count member rows only,
+so `J.matches` counts the joined rows `M` keeps. An image without a column
 the predicate reads fails the stage, which holds its key, rather than reading
 the column as `NULL`. Group naming stays unfiltered (the groups step 2 locks,
 a recompute's groups, a build's enumeration), since an image may hold only the

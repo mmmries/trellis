@@ -86,6 +86,61 @@ async fn status_reports_hidden_tables_and_a_large_p() {
     assert_eq!((p.table, p.estimated_rows), ("P", 1500));
 }
 
+/// With a `WHERE` on the `FROM` table, `P` holds only the rows it keeps,
+/// so the warning compares `P` with the planner's estimate of those rows:
+/// a `P` that is small against the whole table but as big as the rows it
+/// summarises warns.
+#[tokio::test]
+async fn a_filtered_p_is_compared_with_the_rows_the_where_keeps() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, region text); \
+         create table public.items (id integer primary key, order_id integer, qty integer); \
+         create index on public.items (order_id); \
+         insert into public.orders select g, 'r' || g from generate_series(1, 4000) g; \
+         analyze public.orders",
+    )
+    .await
+    .expect("create tables");
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis
+        .apply(&format!("{BY_REGION} WHERE orders.id <= 2000"))
+        .await
+        .expect("define");
+    let id: i64 = raw
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.by_region'",
+            &[],
+        )
+        .await
+        .expect("id")
+        .get(0);
+    // 1500 cells: 37.5% of the table, 75% of the rows the `WHERE` keeps.
+    raw.batch_execute(&format!(
+        "insert into {DEFAULT_SCHEMA}.join_{id}_p (region, id, __n) \
+             select 'r' || g, g, 1 from generate_series(1, 1500) g; \
+         analyze {DEFAULT_SCHEMA}.join_{id}_p"
+    ))
+    .await
+    .expect("seed P");
+    let status = join_status(&trellis).await;
+    let warning = status
+        .partials_warning
+        .expect("P is 75% of the rows the WHERE keeps");
+    assert!(
+        (1800..=2200).contains(&warning.fact_rows),
+        "the planner's estimate of the kept rows: {}",
+        warning.fact_rows
+    );
+}
+
 #[tokio::test]
 async fn a_plain_transform_has_no_join_status() {
     let cluster = TestCluster::start();
@@ -110,4 +165,41 @@ async fn a_plain_transform_has_no_join_status() {
         .expect("status")
         .expect("exists");
     assert_eq!(status.join, None);
+}
+
+/// The kept-rows estimate never waits on the `FROM` table's lock: a
+/// migration holding it (or queued for it) leaves `status` answering at
+/// once, with the table's own estimate.
+#[tokio::test]
+async fn a_filtered_p_estimate_does_not_wait_on_the_table_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, region text); \
+         create table public.items (id integer primary key, order_id integer, qty integer); \
+         create index on public.items (order_id)",
+    )
+    .await
+    .expect("create tables");
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis
+        .apply(&format!("{BY_REGION} WHERE orders.id <= 2000"))
+        .await
+        .expect("define");
+    let migration = connect(db.dsn()).await;
+    migration
+        .batch_execute("begin; lock table public.orders in access exclusive mode")
+        .await
+        .expect("lock");
+    let status = tokio::time::timeout(std::time::Duration::from_secs(30), join_status(&trellis))
+        .await
+        .expect("status answers while the table is locked");
+    assert!(status.partials_warning.is_none());
+    migration.batch_execute("rollback").await.expect("unlock");
 }
