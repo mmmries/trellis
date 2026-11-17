@@ -5015,6 +5015,7 @@ pub(crate) async fn validate_live_schema(
         let source_key: Vec<&str> = key.iter().map(|column| column.name.as_str()).collect();
         check_key_collations(def, table, &source_key, |name| live.info(name))?;
         if plain {
+            super::validate::check_enum_literals(def, &live.typed())?;
             check_collation_reads(def, None, |read| {
                 Some((table.to_string(), live.info(&read.column)?))
             })?;

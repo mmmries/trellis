@@ -639,6 +639,12 @@ extreme is read from a source index, which holds the rows the `WHERE` drops
 too. Take the `MIN`/`MAX` of a stored generated column
 `CASE WHEN <predicate> THEN <column> END` in an unfiltered transform.
 
+### T0241 EnumLiteralNotALabel
+
+An enum column compared with a string literal that is not one of its labels:
+Postgres fails every statement that reads it. Use a label of the enum. After a
+label was renamed, rename it back, or drop the transform and define it again.
+
 ## Tables and keys
 
 What a definition reads or writes can't be maintained as it stands

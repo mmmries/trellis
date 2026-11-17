@@ -247,6 +247,7 @@ const ASSIGNED: &[&str] = &[
     "T0238 ValidationError::FilterNotYetSupported",
     "T0239 ValidationError::FilteredExtreme",
     "T0240 ParseError::UnsupportedAggregateModifier",
+    "T0241 ValidationError::EnumLiteralNotALabel",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

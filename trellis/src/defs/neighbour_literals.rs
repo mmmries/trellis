@@ -260,6 +260,7 @@ mod tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            enum_labels: None,
             copy_type: String::new(),
             copy_collation: None,
             trellis_target: false,
