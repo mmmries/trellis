@@ -43,6 +43,7 @@ use crate::backend::{
 };
 use crate::model::{BackupKind, Program, RestorePlan};
 
+use super::pause::RunKind;
 use super::{
     Divergence, Outcome, RunError, apply_and_check_outcome, check_defs, quiesce_snapshot_and_check,
 };
@@ -142,7 +143,16 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
                 .await
                 .map_err(|e| restore_error(op_index, "reconnect after the backup", e))?;
         }
-        quiesce_snapshot_and_check(backend, pool, program, op_index, &program.defs, false).await?;
+        quiesce_snapshot_and_check(
+            backend,
+            pool,
+            program,
+            op_index,
+            &program.defs,
+            false,
+            RunKind::Restore,
+        )
+        .await?;
         if op_index == k {
             let snapshot = backend
                 .snapshot()
@@ -190,11 +200,16 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
             restored: restored_sources,
         });
     }
+    let states = restored
+        .definition_states(&program.defs)
+        .await
+        .map_err(|e| restore_error(k, "read definition states", e))?;
     if let Some(divergence) = Divergence::from_checked(
         k,
         check_defs(&restored_pool, program, &program.defs, &snapshot)
             .await
             .map_err(RunError::Oracle)?,
+        states,
     ) {
         return Err(RunError::Diverged(divergence));
     }
@@ -210,6 +225,7 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
             op_index,
             &program.defs,
             false,
+            RunKind::Restore,
         )
         .await?;
     }

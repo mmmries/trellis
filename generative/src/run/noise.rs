@@ -27,7 +27,8 @@ use trellis::dev::pool::Pool;
 use crate::backend::{Backend, ManualBackend};
 use crate::model::{NoisePlan, OpOutcome, Program};
 
-use super::{Divergence, Outcome, RunError, check_program};
+use super::pause::RunKind;
+use super::{Divergence, Outcome, RunError, check_program, settled_states};
 
 /// Fires every event in `plan.events` whose `before_op` equals `position`, in
 /// the order they appear in `plan.events`. A no-op when nothing matches
@@ -94,9 +95,11 @@ pub async fn run_convergence_with_noise(
             .await
             .map_err(|e| RunError::Snapshot(format!("{e:?}")))?;
 
+        let states =
+            settled_states(backend, program, op_index, &program.defs, RunKind::Noise).await?;
         let checked = check_program(pool, program, &snapshot).await;
         if let Some(divergence) =
-            Divergence::from_checked(op_index, checked.map_err(RunError::Oracle)?)
+            Divergence::from_checked(op_index, checked.map_err(RunError::Oracle)?, states)
         {
             return Err(RunError::Diverged(divergence));
         }
