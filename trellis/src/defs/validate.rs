@@ -549,6 +549,27 @@ pub enum ValidationError {
     /// separator is fixed per definition so the ledger's contribution column
     /// is the value argument alone.
     StringAggSeparatorNotLiteral { field: String },
+    /// The `WHERE` predicate is not `boolean` (Postgres: "argument of WHERE
+    /// must be type boolean").
+    PredicateNotBoolean { found: ValueType },
+    /// An aggregate call in the `WHERE` predicate, which Postgres refuses
+    /// ("aggregate functions are not allowed in WHERE").
+    AggregateInPredicate { function: String },
+    /// A name in the `WHERE` predicate that is no source column. As in
+    /// Postgres, a predicate reads the source, never a calculated field.
+    PredicateColumnNotFound { column: String },
+    /// A construct of the `WHERE` predicate that can raise an error for
+    /// some value of its operand types (ADR-0004): only a total predicate
+    /// is admitted (`defs::totality`).
+    PredicateNotTotal { construct: String, reason: String },
+    /// A `WHERE` other than `TRUE` on a key space whose apply path doesn't
+    /// filter yet. Each key space's step of #1991 lifts it for that key
+    /// space.
+    FilterNotYetSupported { key_space: &'static str },
+    /// `MIN` or `MAX` in an aggregate with a `WHERE` other than `TRUE`: an
+    /// extreme is kept by probing a source index for the group's endpoint,
+    /// and a filtered extreme's endpoint is no index endpoint (#1991).
+    FilteredExtreme { field: String, function: String },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -636,6 +657,10 @@ pub(crate) fn collation_refusing_function_reads(def: &TransformDef) -> Vec<Colla
     let mut reads = Vec::new();
     for field in &def.fields {
         collect_refusing_calls(&field.expr, &field.name, &fields_by_name, &mut reads);
+    }
+    // A predicate's names are source columns, never fields.
+    if let Some(predicate) = def.predicate.filter() {
+        collect_refusing_calls(predicate, "WHERE", &HashMap::new(), &mut reads);
     }
     let mut seen = HashSet::new();
     reads.retain(|read| seen.insert(read.clone()));
@@ -1185,6 +1210,12 @@ impl ValidationError {
             ValidationError::QualifiedSourceTableNotFound { .. } => ErrorId(110),
             ValidationError::QualifiedTargetTableNotFound { .. } => ErrorId(111),
             ValidationError::StringAggSeparatorNotLiteral { .. } => ErrorId(112),
+            ValidationError::PredicateNotBoolean { .. } => ErrorId(234),
+            ValidationError::AggregateInPredicate { .. } => ErrorId(235),
+            ValidationError::PredicateColumnNotFound { .. } => ErrorId(236),
+            ValidationError::PredicateNotTotal { .. } => ErrorId(237),
+            ValidationError::FilterNotYetSupported { .. } => ErrorId(238),
+            ValidationError::FilteredExtreme { .. } => ErrorId(239),
         }
     }
 
@@ -1219,9 +1250,28 @@ impl ValidationError {
 
 crate::error_code::coded_display!(ValidationError);
 
+/// The site the field-level refusals name for a check of the `WHERE`
+/// predicate, which they carry as the field `WHERE`.
+const PREDICATE_SITE: &str = "calculated field 'WHERE'";
+
 impl crate::error_code::Message for ValidationError {
+    /// A field-level refusal raised over the `WHERE` predicate names the
+    /// predicate, not a "calculated field 'WHERE'".
     fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
+        let text = FieldMessage(self).to_string();
+        match text.strip_prefix(PREDICATE_SITE) {
+            Some(rest) => write!(f, "the WHERE predicate{rest}"),
+            None => f.write_str(&text),
+        }
+    }
+}
+
+/// [`ValidationError`]'s message as each variant words it.
+struct FieldMessage<'a>(&'a ValidationError);
+
+impl std::fmt::Display for FieldMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
             ValidationError::DuplicateFieldName { name } => {
                 write!(f, "duplicate calculated field name '{name}'")
             }
@@ -1821,6 +1871,35 @@ impl crate::error_code::Message for ValidationError {
                 f,
                 "calculated field '{field}': STRING_AGG's separator must be a string literal"
             ),
+            ValidationError::PredicateNotBoolean { found } => {
+                write!(
+                    f,
+                    "argument of WHERE must be type boolean, not type {found}"
+                )
+            }
+            ValidationError::AggregateInPredicate { function } => write!(
+                f,
+                "aggregate functions are not allowed in WHERE ({function})"
+            ),
+            ValidationError::PredicateColumnNotFound { column } => write!(
+                f,
+                "WHERE reads column '{column}', which is not a column of the source; a WHERE \
+                 reads source columns, never a calculated field"
+            ),
+            ValidationError::PredicateNotTotal { construct, reason } => write!(
+                f,
+                "WHERE: {construct} can raise an error for some rows: {reason}; a WHERE must \
+                 be total"
+            ),
+            ValidationError::FilterNotYetSupported { key_space } => write!(
+                f,
+                "a WHERE other than TRUE is not supported on a {key_space} transform yet"
+            ),
+            ValidationError::FilteredExtreme { field, function } => write!(
+                f,
+                "calculated field '{field}': {function} is not supported in an aggregate with a \
+                 WHERE; an extreme of the rows the WHERE keeps can't be read from a source index"
+            ),
         }
     }
 }
@@ -1925,8 +2004,8 @@ pub fn validate(
             }
         }
     }
-    match def.predicate {
-        Predicate::True => {}
+    if let Some(predicate) = def.predicate.filter() {
+        validate_predicate(predicate, source_columns)?;
     }
 
     let mut field_names = HashSet::with_capacity(def.fields.len());
@@ -2020,10 +2099,103 @@ pub fn validate(
     }
 
     if let KeySpace::Aggregate { .. } = &def.key_space {
+        refuse_filtered_extremes(def)?;
         reject_extremes_without_source_index(def, source_columns)?;
         check_aggregate_table_widths(def, source_columns)?;
     }
 
+    refuse_unsupported_filter(def)?;
+
+    Ok(())
+}
+
+/// The checks of a one-table definition's `WHERE` predicate, as Postgres
+/// reads it: no aggregate call, every name a source column (never a
+/// calculated field, so a field named like a column reads the column), type
+/// `boolean` (a lone `NULL` is one by position), and total ([`super::totality`]).
+/// A qualified name is checked with the fields' (`validate_qualified_columns`).
+fn validate_predicate(
+    predicate: &Expr,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), ValidationError> {
+    let mut aggregate = None;
+    predicate.walk(&mut |e| {
+        if let Expr::FunctionCall { name, .. } = e
+            && aggregate.is_none()
+            && super::registry::is_aggregate_name(name)
+        {
+            aggregate = Some(name.clone());
+        }
+    });
+    if let Some(function) = aggregate {
+        return Err(ValidationError::AggregateInPredicate { function });
+    }
+    if let Some(column) = predicate
+        .columns()
+        .into_iter()
+        .find(|name| !source_columns.contains_key(*name))
+    {
+        return Err(ValidationError::PredicateColumnNotFound {
+            column: column.to_string(),
+        });
+    }
+    let columns = ColumnTypes::Source(source_columns);
+    if !matches!(predicate, Expr::Null) {
+        let found = infer_expr_type_in("WHERE", predicate, &columns)?;
+        if found != ValueType::Boolean {
+            return Err(ValidationError::PredicateNotBoolean { found });
+        }
+    }
+    super::totality::check(predicate, &columns).map_err(|refused| {
+        ValidationError::PredicateNotTotal {
+            construct: refused.construct,
+            reason: refused.reason,
+        }
+    })
+}
+
+/// Refuses a `WHERE` other than `TRUE` on a key space whose apply path
+/// doesn't filter yet (#1991). Each key space's step removes its arm once
+/// its build, apply and `self_check` read the predicate; until then define
+/// refuses here, after every other check, so the predicate's own refusals
+/// are reported first.
+pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), ValidationError> {
+    if matches!(def.predicate, Predicate::True) {
+        return Ok(());
+    }
+    let key_space = match &def.key_space {
+        KeySpace::OneToOne => "1-1",
+        KeySpace::Aggregate { .. } => return Ok(()),
+        KeySpace::Join(_) => "JOIN aggregate",
+        KeySpace::JoinOneToOne(_) => "1-1 JOIN",
+    };
+    Err(ValidationError::FilterNotYetSupported { key_space })
+}
+
+/// Refuses `MIN`/`MAX` in an aggregate whose `WHERE` is other than `TRUE`
+/// ([`ValidationError::FilteredExtreme`]), naming the first field that calls
+/// one.
+fn refuse_filtered_extremes(def: &TransformDef) -> Result<(), ValidationError> {
+    if def.predicate.filter().is_none() {
+        return Ok(());
+    }
+    for field in &def.fields {
+        let mut found = None;
+        field.expr.walk(&mut |e| {
+            if let Expr::FunctionCall { name, .. } = e
+                && found.is_none()
+                && matches!(name.to_ascii_uppercase().as_str(), "MIN" | "MAX")
+            {
+                found = Some(name.to_ascii_uppercase());
+            }
+        });
+        if let Some(function) = found {
+            return Err(ValidationError::FilteredExtreme {
+                field: field.name.clone(),
+                function,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2460,7 +2632,26 @@ pub(crate) fn validate_live(
         .iter()
         .map(|(name, info)| (name.clone(), info.value_type))
         .collect();
-    validate(def, &value_types)?;
+    validate(def, &value_types).map_err(|err| match err {
+        // `validate` only knows the column's `ValueType`; the live model
+        // knows the declared type, which the aggregate-admission refusal
+        // names too.
+        ValidationError::UnsupportedExtremeArgument {
+            function,
+            argument,
+            pg_type,
+        } => {
+            let column = columns
+                .get(&argument)
+                .or_else(|| columns.get(argument.rsplit('.').next().unwrap_or(&argument)));
+            ValidationError::UnsupportedExtremeArgument {
+                function,
+                pg_type: column.map_or(pg_type, |info| info.pg_type.clone()),
+                argument,
+            }
+        }
+        err => err,
+    })?;
     validate_aggregate_admitted(def, columns)
 }
 
@@ -2742,6 +2933,9 @@ pub fn validate_join(
     left: &HashMap<String, JoinColumnInfo>,
     joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
+    // A `JOIN`'s predicate reads qualified columns of either table, which
+    // the steps that apply it check (#1991); until then it is refused here.
+    refuse_unsupported_filter(def)?;
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);
     }
@@ -3027,9 +3221,15 @@ pub(crate) fn validate_qualified_columns(
                     });
                 }
                 if !source_columns.contains_key(column) {
-                    return Err(ValidationError::UnresolvedColumn {
-                        field: field.to_string(),
-                        column: render_field_expr(expr),
+                    return Err(if field == "WHERE" {
+                        ValidationError::PredicateColumnNotFound {
+                            column: render_field_expr(expr),
+                        }
+                    } else {
+                        ValidationError::UnresolvedColumn {
+                            field: field.to_string(),
+                            column: render_field_expr(expr),
+                        }
                     });
                 }
                 Ok(())
@@ -3054,7 +3254,11 @@ pub(crate) fn validate_qualified_columns(
     }
     def.fields
         .iter()
-        .try_for_each(|f| walk(&f.expr, &f.name, def, source_columns, source_schema))
+        .try_for_each(|f| walk(&f.expr, &f.name, def, source_columns, source_schema))?;
+    match def.predicate.filter() {
+        Some(predicate) => walk(predicate, "WHERE", def, source_columns, source_schema),
+        None => Ok(()),
+    }
 }
 
 /// Refuses a bare name that could mean either a source column or a field:
@@ -5098,13 +5302,22 @@ fn validate_regexp_pattern(field_name: &str, pattern_arg: &Expr) -> Result<(), V
 /// non-literal pattern is [`validate`]'s refusal.
 pub(crate) fn regexp_pattern_literals(def: &TransformDef) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for field in &def.fields {
-        field.expr.walk(&mut |expr| {
-            if let Expr::FunctionCall { name, args } = expr
-                && name == "REGEXP_COUNT"
+    let predicate = def.predicate.filter().map(|p| ("WHERE", p));
+    for (name, expr) in def
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), &f.expr))
+        .chain(predicate)
+    {
+        expr.walk(&mut |expr| {
+            if let Expr::FunctionCall {
+                name: function,
+                args,
+            } = expr
+                && function == "REGEXP_COUNT"
                 && let Some(Expr::StringLiteral(pattern)) = args.get(1)
             {
-                out.push((field.name.clone(), pattern.clone()));
+                out.push((name.to_string(), pattern.clone()));
             }
         });
     }
@@ -7461,6 +7674,28 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// #1895: a plain `MIN`/`MAX` refused over a column's type names the
+    /// declared type, not the `ValueType`'s.
+    #[test]
+    fn plain_extreme_refusal_names_the_declared_type() {
+        let def = parse_text("TRANSFORM t FROM s GROUP BY g SELECT g AS g, MIN(w) AS lo").unwrap();
+        let columns: HashMap<String, JoinColumnInfo> = [
+            ("g".to_string(), int4()),
+            (
+                "w".to_string(),
+                jcol(ValueType::Text, "character varying(5)", 1043, 9),
+            ),
+        ]
+        .into();
+        let err = validate_live(&def, &columns).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::UnsupportedExtremeArgument { pg_type, .. }
+                if pg_type == "character varying(5)"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("character varying(5)"), "{err}");
     }
 
     /// `MIN`/`MAX` take a plain source column (#1117 rule 5) of a table that

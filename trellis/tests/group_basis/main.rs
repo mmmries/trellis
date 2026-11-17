@@ -20,3 +20,4 @@ mod group_basis_rebuild;
 mod group_basis_resume;
 mod group_basis_resume_after_source_key_change;
 mod group_basis_self_check;
+mod group_basis_where;

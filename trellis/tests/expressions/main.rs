@@ -19,6 +19,7 @@ mod logic_key_spaces;
 mod null_literal_key_spaces;
 mod numeric_sums_upgrade;
 mod plan_time_constant_quarantine;
+mod predicate_totality;
 mod regexp_pattern_probe;
 mod strict_stored_values;
 mod type_matrix;

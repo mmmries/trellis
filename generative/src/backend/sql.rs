@@ -25,7 +25,9 @@ use trellis::dev::defs::ast::{
     Expr, FieldDef, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn, TransformDef,
     ValueType,
 };
-use trellis::dev::staging::{StagingError, converged_through, watermark_token};
+use trellis::dev::staging::{
+    StagingError, converged_through, converged_through_except_held, watermark_token,
+};
 
 use super::DefinitionState;
 use super::ring_wait::{
@@ -1169,7 +1171,20 @@ pub(super) async fn quiesce(
     budget: QuiesceBudget,
 ) -> Result<(), QuiesceError> {
     let mut deadline = ProgressDeadline::new(budget, Instant::now());
-    quiesce_within(raw, defs, &mut deadline).await
+    quiesce_within(raw, defs, &mut deadline, HeldKeys::Block).await
+}
+
+/// What a quiesce makes of a key a definition holds in quarantine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldKeys {
+    /// It blocks convergence, as it blocks every engine wait: a run that
+    /// models no held key never settles past one.
+    Block,
+    /// It doesn't: the quiesce settles once everything but the held keys'
+    /// parked changes has drained. A change still failing, its key not yet
+    /// held, keeps the ring pending until the key fuse holds it. For a run
+    /// that models held keys (`crate::run::run_convergence_with_held_keys`).
+    Settle,
 }
 
 /// [`quiesce`] within a caller's `deadline`, which the caller can read
@@ -1184,8 +1199,9 @@ pub(super) async fn quiesce_within(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
     deadline: &mut ProgressDeadline,
+    held: HeldKeys,
 ) -> Result<(), QuiesceError> {
-    let result = quiesce_passes(raw, defs, deadline).await;
+    let result = quiesce_passes(raw, defs, deadline, held).await;
     if let Err(
         QuiesceError::DefinitionsUnsettled { .. } | QuiesceError::PartitionsUnsettled { .. },
     ) = &result
@@ -1202,6 +1218,7 @@ async fn quiesce_passes(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
     deadline: &mut ProgressDeadline,
+    held: HeldKeys,
 ) -> Result<(), QuiesceError> {
     loop {
         poll_until_empty(deadline.window_start(), deadline.window_budget(), || {
@@ -1222,14 +1239,18 @@ async fn quiesce_passes(
         })?;
 
         let token = watermark_token(raw).await?;
-        await_ring(raw, token, deadline).await?;
+        await_ring(raw, token, deadline, held).await?;
 
         let unsettled = unsettled_definitions(raw, defs).await?;
         if unsettled.is_empty() && unsettled_partitions(raw).await?.is_empty() {
             // Rows staged with no origin between the ring wait and the read
             // above (an image-less `recompute`) gate every token, `token`
             // included, so this one check fails only if such rows appeared.
-            if converged_through(raw, token).await? {
+            let converged = match held {
+                HeldKeys::Block => converged_through(raw, token).await?,
+                HeldKeys::Settle => converged_through_except_held(raw, token).await?,
+            };
+            if converged {
                 return Ok(());
             }
             continue;

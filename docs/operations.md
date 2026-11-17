@@ -151,15 +151,14 @@ waiting (below) withdraws the resume, and its `capture_failure` says so.
 **What a resume checks.** A resume first runs define's validation against the
 live schema, and refuses while define would (a column it reads is gone or
 retyped into something it can't use), leaving the definition paused and
-untouched; the error, `ApplyError::ResumeRefused`, is define's own, naming
-the column and what to change. A whole-transform resume also
-refuses, as define does, while a source index the definition's `self_check`
-pages by is missing, unless it was defined `WITHOUT SOURCE INDEX`; create the
-index the message names, then resume. It also refuses in two cases
-define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
-
-* its target table is missing;
-* its ledger table is missing.
+untouched; the error is define's own, with define's code
+([errors](errors.md)). A whole-transform resume also refuses, as define does,
+while a source index the definition's `self_check` pages by is missing, unless
+it was defined `WITHOUT SOURCE INDEX`
+([T0134](errors.md#t0134-sourceindexmissing)). It also refuses in two cases
+define doesn't: its target table is missing
+([T0138](errors.md#t0138-targettablemissing)), or its ledger table is
+([T0137](errors.md#t0137-ledgertablemissing)).
 
 A `JOIN` has no ledger. Its resume drops and recreates its hidden tables
 instead, keeps the target, and rebuilds both sides and the target's groups
@@ -181,11 +180,12 @@ trip both its column fuse and the whole-transform fuse, run `RESUME TRANSFORM
 An aggregate or `JOIN` reading a table by its primary key takes the primary
 key the table has now, for every transform that reads the table, and
 rebuilds; with no primary key left it refuses rather than take another unique
-index, until you add one. A `KEY (…)`'s columns never change: its resume refuses until a unique
-index backs them again. A target that lost the index over its key refuses
-until a unique index over exactly its key columns is created again
-(`UNIQUE NULLS NOT DISTINCT` if one can be `NULL`). Each refusal names the
-table, the key and the unique indexes it has.
+index ([T0119](errors.md#t0119-noprimarykeytorecord)). A `KEY (…)`'s columns
+never change: its resume refuses until a unique index backs them again
+([T0116](errors.md#t0116-keynotbacked)). A target that lost the index over its
+key refuses until one is created again
+([T0118](errors.md#t0118-recordedkeymissing)). Each refusal names the table,
+the key and the unique indexes it has.
 
 A 1-1 target is keyed by its source's key (a 1-1 `JOIN`'s, by its `FROM`
 table's), so its resume first re-keys the target in place to the new key,
@@ -204,12 +204,11 @@ The pause message says which columns the resume will add and drop. The
 target's new key is recorded, which pauses the transforms reading the
 target, and their own resumes follow these rules over it. The re-key refuses,
 naming the conflict, while define would refuse the transform, when a new key
-column's name is taken by a column of the target that isn't a copy of it (a
-field of that name, or a column you added), and when a view, index or foreign
-key of yours depends on a column it would drop or on the key constraint it
-replaces. Drop the object it names, or drop or rename your column; for a
-field of the new key column's name, restore the key, resume, and rename the
-field with `ALTER TRANSFORM`; or `DROP TRANSFORM` and define it again.
+column's name is taken by a column of the target that isn't a copy of it
+([T0131](errors.md#t0131-keycolumntaken)), and when a view, index or foreign
+key of yours depends on a column it would drop
+([T0129](errors.md#t0129-keyrepairblocked)) or on the key constraint it
+replaces ([T0130](errors.md#t0130-keyconstraintblocked)).
 
 **What a resume changes.**
 

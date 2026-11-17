@@ -114,7 +114,8 @@ Nothing in the binding uses it.
   `nil` for any other definition. `status` reports the oldest Trellis release
   that can run a definition (`floor`, `"major.minor.patch"`), which an
   application reads before rolling back to an earlier Trellis release
-  ([upgrading](../../docs/upgrading.md#rolling-back)).
+  ([upgrading](../../docs/upgrading.md#rolling-back)), and its `WHERE`
+  (`filter`, definition text, `nil` when unfiltered).
 - `Trellis.request_backfill(source_table)`,
   `Trellis.detect_capture_disruptions` (pauses now the readers of every table
   whose Trellis capture was changed outside Trellis, and returns the tables),

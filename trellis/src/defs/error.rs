@@ -26,6 +26,12 @@ pub enum ParseError {
     UnsupportedOperator { operator: String },
     /// A function call other than one in `super::registry::FUNCTIONS`.
     UnsupportedFunction { name: String },
+    /// `DISTINCT`, `ALL`, `ORDER BY` or `FILTER` in an aggregate call: Postgres
+    /// parses them, Trellis supports none (#1739).
+    UnsupportedAggregateModifier {
+        function: String,
+        modifier: &'static str,
+    },
     /// A registered function called with the wrong number of arguments
     /// — a structural check the parser can make directly from
     /// `super::registry::FunctionSpec::arg_types`'s length, without
@@ -37,7 +43,8 @@ pub enum ParseError {
     },
     /// An identifier known to be non-immutable (`NOW()`, `RANDOM()`, ...).
     NonImmutableConstruct { name: String },
-    /// A partial-data predicate other than a literal `TRUE`.
+    /// A partial-data predicate other than a literal `TRUE` in grammar-1
+    /// text, which had no other (stored text never holds one).
     UnsupportedPredicate { detail: String },
     /// `COALESCE` called with zero arguments.
     AtLeastOneArgumentRequired { name: String },
@@ -200,6 +207,7 @@ impl ParseError {
             ParseError::ReservedTableName { .. } => ErrorId(37),
             ParseError::GrammarVersionTooOld { .. } => ErrorId(38),
             ParseError::GrammarVersionTooNew { .. } => ErrorId(39),
+            ParseError::UnsupportedAggregateModifier { .. } => ErrorId(240),
         }
     }
 }
@@ -248,6 +256,23 @@ impl crate::error_code::Message for ParseError {
                 f,
                 "unsupported function '{name}': not in the registered function set (ADR-0004: grammar and renderer function sets must match)"
             ),
+            ParseError::UnsupportedAggregateModifier { function, modifier } => {
+                write!(
+                    f,
+                    "{modifier} inside {function}(...) is not supported: an aggregate takes \
+                     its arguments only"
+                )?;
+                match (function.as_str(), *modifier) {
+                    ("COUNT", "DISTINCT") => write!(
+                        f,
+                        "; to count distinct values, group by the key and the value in one \
+                         transform (GROUP BY g, x), then COUNT(x) grouped by g in a second \
+                         transform over its target"
+                    ),
+                    (_, "ALL") => write!(f, "; ALL is the default, so drop it"),
+                    _ => Ok(()),
+                }
+            }
             ParseError::FunctionArityMismatch {
                 name,
                 expected,

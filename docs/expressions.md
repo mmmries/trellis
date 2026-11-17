@@ -144,57 +144,90 @@ row (current time, timezone, collation, session settings, random values) is
 disallowed: incremental maintenance requires that re-evaluating a formula on
 unchanged inputs always yields the same result.
 
+## WHERE
+
+A transform's `WHERE` is an expression of this grammar, of type `boolean`,
+read as Postgres reads it ([ADR-0004](decisions/0004-transform-definition-grammar.md)).
+A row is a member when it is `TRUE`; `FALSE` and `NULL` exclude it. Every name
+is a source column, never a field, and it calls no aggregate.
+
+It must be **total**: no construct in it may raise an error for any value of
+its operand types, since a predicate that raised would stop every statement
+reading the row. Admitted:
+
+* column reads, literals, `IS [NOT] NULL`, `AND`, `OR`, `NOT`;
+* every comparison and `NULLIF`, except between two text columns (their
+  collations can conflict) and a number literal beside a float that the float
+  can't hold;
+* `CASE` and `COALESCE`, unless they mix `numeric` with a float;
+* the casts but `date` to `timestamp`;
+* `-`, `ABS`, `TRUNC` of a `numeric` or a float, and `CEIL`, `FLOOR` of a
+  float;
+* `EXTRACT`, `AT TIME ZONE 'UTC'`, `DATE_TRUNC` to a `week` or less,
+  `CHAR_LENGTH`, `OCTET_LENGTH`, `STRPOS` reading at most one text column;
+* `%` by a nonzero number literal.
+
+Everything else is refused by name: `+`, `-`, `*`, `/` (overflow, division by
+zero), date arithmetic, `-` and `ABS` of an integer, `CEIL`, `FLOOR` and
+`ROUND` of a `numeric`, `DATE_TRUNC` to a month or more, and `REGEXP_COUNT`.
+Compare without the arithmetic where algebra allows (`amount > discount`), or
+compute the value in a stored generated column or a [chained](transforms.md#chaining-and-cycle-detection)
+1-1 transform and filter on that.
+
 ## Refusals
 
 The columns are those of [transforms' table](transforms.md#refusals); "After
 define" names one of [its classes](transforms.md#after-define). A row links to
 an entry under [Details](#details) where it needs more room.
 
-| Condition | Error | After define | Remedy |
-|---|---|---|---|
-| **Constants** | | | |
-| [A literal zero divisor](#a-literal-zero-divisor) | `ConstantDivisorZero` | [Text](transforms.md#text) | A nonzero divisor or a column; `x / NULLIF(col, 0)` |
-| [A typed literal not in its type's canonical spelling](#a-typed-literal-not-in-its-types-canonical-spelling), or of a type with no admitted literal | `InvalidTypedLiteral`, `UnsupportedLiteralType` | [Text](transforms.md#text) | The spelling Postgres prints: `DATE '2024-01-05'` |
-| A number with an exponent (`1e3`), a `0x`/`0o`/`0b` prefix or `_` separators | `UnsupportedNumericForm` | [Text](transforms.md#text) | Plain digits, with an optional fraction |
-| **Comparisons** | | | |
-| [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | `MixedFloatExactComparison` | [Retype](transforms.md#retype) | Compare two floats or two exact values |
-| A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`): a conversion to or from `timestamptz` reads the session time zone | `MixedTemporalComparison` | [Retype](transforms.md#retype) | Cast one side so both are one type |
-| `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` are admitted | `TextOrderingComparison` | [Retype](transforms.md#retype) | Order by a non-text value, or by `CHAR_LENGTH` |
-| A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` over text columns of two different collations, neither the database default, directly or through `COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and fails every row where both are not `NULL` | `ConflictingCollations` (T0233) | A column re-collated later holds each key written ([releasing held keys](operations.md#releasing-held-keys)), and `RESUME` refuses it | Give the two columns one collation (`ALTER COLUMN … TYPE text COLLATE …`) |
-| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, enums, `inet`, …) | `ComparisonTypeMismatch` | [Retype](transforms.md#retype) | Compare values of one family; `IS NULL` takes any type |
-| Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | `NonAssociativeComparison` | [Text](transforms.md#text) | Join them with `AND`, or add parentheses |
-| **Grammar forms and typing** | | | |
-| `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, the simple `CASE <operand> WHEN <value> THEN …`, `<expr>::<type>`, and `--` (a comment) | `UnsupportedIsForm`, `SimpleCaseUnsupported`, `UnsupportedCastOperator`, `DoubleMinus` | [Text](transforms.md#text) | `x IS NOT DISTINCT FROM TRUE` (`IS DISTINCT FROM` for the `NOT` forms), `x IS NULL`; `CASE WHEN <operand> = <value> THEN …`; `CAST`; `- -x` |
-| [An untyped `NULL` literal](#an-untyped-null-literal) | `UntypedNull` | [Text](transforms.md#text); beside a column (`date_col + NULL`), [Retype](transforms.md#retype) | `CAST(NULL AS <type>)` |
-| A `CASE` condition that isn't `boolean`, or `CASE` results that don't unify as `COALESCE`'s do (`THEN 1 ELSE 'x'`). Results unify to a common type: two integers to the wider, an exact numeric with a float to the float, otherwise `numeric` | `CaseConditionNotBoolean`, `CaseResultTypeMismatch` | [Retype](transforms.md#retype) | Make the results one type, with `CAST` |
-| `NULLIF(a, b)` where Postgres casts `a` to compare it: an integer `a` with a `numeric` `b`, or an exact `a` with a float `b` | `NullIfFirstArgumentCast` | [Retype](transforms.md#retype) | `NULLIF(CAST(a AS numeric), b)`, or the float first |
-| **Expression size** | | | |
-| An expression nested more than 100 levels deep (operands chained by operators, or nested parentheses or calls); a flat list of many terms is not deep. Also more than 100 prefix `NOT`s or `-`s in a row | `ExpressionTooDeep`, `NotChainTooLong`, `PrefixMinusChainTooLong` | [Text](transforms.md#text) | Split it into calculated fields |
-| Calculated fields that read each other so often or so deeply that inlining them passes 100 levels or more than a build can render | `FieldExpansionTooLarge` | [Text](transforms.md#text) | Shorten the chain, or read source columns in the later fields |
-| An expression whose fields inline to more than 100,000 nodes (each `WHEN x = 1 THEN 1` branch is four) | `FieldExpansionTooLarge` | [Text](transforms.md#text) | Shorten it, or split it into calculated fields |
-| **Arithmetic, functions and casts** | | | |
-| A function or operator the [lists above](#calculated-fields) don't name (`a \|\| b`, `a ^ b`), one that isn't [immutable](#immutability) (`now()`, `random()`), or a call with the wrong number of arguments | `UnsupportedFunction`, `UnsupportedOperator`, `UnexpectedChar` (an operator character no listed operator uses), `NonImmutableConstruct`, `FunctionArityMismatch`, `AtLeastOneArgumentRequired` | [Text](transforms.md#text) | A listed function or operator |
-| An operator given an operand type it doesn't take (`text_col + 1`, `NOT num_col`; `+` never concatenates) | `TypeMismatch` | [Retype](transforms.md#retype) | `CAST`, or an operand of the operator's type |
-| `/` between two integers (`qty / 2`): Postgres truncates the quotient. `numeric` and float quotients are admitted | `IntegerDivision` | [Retype](transforms.md#retype) | `CAST(qty AS numeric) / 2` |
-| `%` with a float operand: Postgres has no float modulo. `%` takes integers and `numeric` | `FloatModulo` | [Retype](transforms.md#retype) | Use `numeric` operands |
-| [An argument `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` does not admit](#an-argument-abs-ceil-floor-round-or-trunc-does-not-admit) | `NumericFunctionArgument`, `ScaleNotIntegerLiteral`, `FunctionArgTypeMismatch` | [Retype](transforms.md#retype) | A `numeric` value; a literal scale |
-| [A `CAST` that is not an exact conversion](#a-cast-that-is-not-an-exact-conversion) | `UnsupportedCast`, `TemporalOperand`, `UnsupportedCastTarget` | [Retype](transforms.md#retype) | Widen the column, or compute in `numeric`; `tz AT TIME ZONE 'UTC'` |
-| A `REGEXP_COUNT` pattern that isn't a string literal, or that Postgres rejects (`(?P<n>a)`, `a++`, `\pL`); define, `ALTER TRANSFORM` and `RESUME` probe it with `regexp_count('', pattern)`. Back-references, lookahead and `\m`/`\M` are admitted | `NonLiteralRegexPattern`, `InvalidRegexPattern` (with the server's message) | [Text](transforms.md#text); a Postgres upgrade that changes the verdict is [Per row](transforms.md#per-row) | Write a pattern Postgres's `regexp_count` accepts |
-| **Dates and times** | | | |
-| [Date and time arithmetic](#date-and-time-arithmetic) | `TemporalOperand` | [Retype](transforms.md#retype) | An `integer` day count; `EXTRACT(EPOCH FROM …)` differences |
-| `DATE_TRUNC` of a `date` or `timestamptz`, `EXTRACT` of any type but `date` and `timestamp`, and `date_part` (an unsupported function) | `TemporalOperand` | [Retype](transforms.md#retype) | `DATE_TRUNC('month', CAST(d AS timestamp))`; `… tz AT TIME ZONE 'UTC'`; `EXTRACT` for `date_part` |
-| [A `DATE_TRUNC` unit or `EXTRACT` field that is not admitted](#a-date_trunc-unit-or-extract-field-that-is-not-admitted) | `TemporalLiteral` | [Text](transforms.md#text) | A listed spelling |
-| `AT TIME ZONE` with a zone other than the literal `'UTC'`, or over anything but a `timestamptz`: zone offsets change with time zone database releases | `TemporalLiteral` (the zone), `TemporalOperand` (the operand) | [Retype](transforms.md#retype) | Convert in the source; `CAST(d AS timestamp)` for a date |
-| **Field, column and table names** | | | |
-| Two fields with one name, or fields that read each other in a cycle | `DuplicateFieldName`, `Cycle` | [Text](transforms.md#text) | Rename a field; break the cycle |
-| A field named after a 1-1 source key column or a 1-1 `JOIN`'s `a` key column (`id AS id`; `id AS order_id` is fine), or a field or `GROUP BY` column whose name starts with `__` | `FieldNamedAfterPrimaryKey`, `ReservedFieldName`, `ReservedGroupByColumnName` | [Text](transforms.md#text) | Rename the field |
-| An aggregate whose argument names another aggregate field no source column is named after (`SUM(val) AS total, SUM(total)`) | `AggregateOfAggregateField` | [Text](transforms.md#text) | Aggregate the source column |
-| A bare name that is both a source column and a field whose expression isn't just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`; see [Calculated Fields](#calculated-fields)). A 1-1 transform refuses such a field whether or not anything reads it | `AmbiguousColumnReference`; in a 1-1 transform, `CalculatedFieldShadowsSourceColumn` | [Resume only](transforms.md#resume-only): a source column added under a field's name | Write `src.val` for the column, or rename the field |
-| [An unquoted reserved word as a name](#an-unquoted-reserved-word-as-a-name) | `ReservedWord` | [Retype](transforms.md#retype): renaming a read column is a rename | Quote it (`"order"`), or qualify it (`orders.order`) |
-| An unquoted target, `FROM` or `JOIN` table name that Postgres reserves (`FROM user`, `FROM order`); `public.order` is fine | `ReservedTableName` | [Text](transforms.md#text) | Quote it as the catalog spells it (`FROM "order"`) |
-| A name over 63 bytes after folding and unescaping, in any position: Postgres would truncate it | `NameTooLong` | [Text](transforms.md#text); a definition 0.1.x stored with a longer `AS` label keeps running, its `ALTER TRANSFORM` refuses, and the upgrade that writes a `KEY (…)` into it pauses it | 63 bytes or fewer; drop and define such a stored definition again |
-| [An unsupported quoted name](#an-unsupported-quoted-name) | `ZeroLengthQuotedIdentifier`, `UnicodeEscapeIdentifier`, `UnsupportedQuotedIdentifier` | [Text](transforms.md#text) | ASCII names; function and type names unquoted |
-| A qualified name whose table isn't the `FROM` table (`product.cost`), or whose schema isn't its schema; a `JOIN`'s are in [transforms](transforms.md#an-unsupported-join-shape). A table name of more than two parts, a column of more than three | `QualifiedColumnNotFromSource`, `GroupByKeyNotFromSource`, `TooManyQualifiedNameParts`, `TooManyColumnNameParts` | [Text](transforms.md#text) | Name the `FROM` table, or read the other table with a `JOIN` |
+| Condition | Error | After define |
+|---|---|---|
+| **Constants** | | |
+| [A literal zero divisor](#a-literal-zero-divisor) | [T0087 ConstantDivisorZero](errors.md#t0087-constantdivisorzero) | [Text](transforms.md#text) |
+| [A typed literal not in its type's canonical spelling](#a-typed-literal-not-in-its-types-canonical-spelling), or of a type with no admitted literal | [T0097 InvalidTypedLiteral](errors.md#t0097-invalidtypedliteral), [T0028 UnsupportedLiteralType](errors.md#t0028-unsupportedliteraltype) | [Text](transforms.md#text) |
+| A number with an exponent (`1e3`), a `0x`/`0o`/`0b` prefix or `_` separators | [T0023 UnsupportedNumericForm](errors.md#t0023-unsupportednumericform) | [Text](transforms.md#text) |
+| **Comparisons** | | |
+| [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | [T0079 MixedFloatExactComparison](errors.md#t0079-mixedfloatexactcomparison) | [Retype](transforms.md#retype) |
+| A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`): a conversion to or from `timestamptz` reads the session time zone | [T0080 MixedTemporalComparison](errors.md#t0080-mixedtemporalcomparison) | [Retype](transforms.md#retype) |
+| `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` are admitted | [T0081 TextOrderingComparison](errors.md#t0081-textorderingcomparison) | [Retype](transforms.md#retype) |
+| A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` over text columns of two different collations, neither the database default, directly or through `COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and fails every row where both are not `NULL` | [T0233 ConflictingCollations](errors.md#t0233-conflictingcollations) | A column re-collated later holds each key written ([releasing held keys](operations.md#releasing-held-keys)), and `RESUME` refuses it |
+| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, enums, `inet`, …) | [T0082 ComparisonTypeMismatch](errors.md#t0082-comparisontypemismatch) | [Retype](transforms.md#retype) |
+| Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | [T0024 NonAssociativeComparison](errors.md#t0024-nonassociativecomparison) | [Text](transforms.md#text) |
+| **Grammar forms and typing** | | |
+| `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, the simple `CASE <operand> WHEN <value> THEN …`, `<expr>::<type>`, and `--` (a comment) | [T0025 UnsupportedIsForm](errors.md#t0025-unsupportedisform), [T0027 SimpleCaseUnsupported](errors.md#t0027-simplecaseunsupported), [T0029 UnsupportedCastOperator](errors.md#t0029-unsupportedcastoperator), [T0021 DoubleMinus](errors.md#t0021-doubleminus) | [Text](transforms.md#text) |
+| [An untyped `NULL` literal](#an-untyped-null-literal) | [T0086 UntypedNull](errors.md#t0086-untypednull) | [Text](transforms.md#text); beside a column (`date_col + NULL`), [Retype](transforms.md#retype) |
+| A `CASE` condition that isn't `boolean`, or `CASE` results that don't unify as `COALESCE`'s do (`THEN 1 ELSE 'x'`). Results unify to a common type: two integers to the wider, an exact numeric with a float to the float, otherwise `numeric` | [T0084 CaseConditionNotBoolean](errors.md#t0084-caseconditionnotboolean), [T0085 CaseResultTypeMismatch](errors.md#t0085-caseresulttypemismatch) | [Retype](transforms.md#retype) |
+| `NULLIF(a, b)` where Postgres casts `a` to compare it: an integer `a` with a `numeric` `b`, or an exact `a` with a float `b` | [T0083 NullIfFirstArgumentCast](errors.md#t0083-nulliffirstargumentcast) | [Retype](transforms.md#retype) |
+| **Expression size** | | |
+| An expression nested more than 100 levels deep (operands chained by operators, or nested parentheses or calls); a flat list of many terms is not deep. Also more than 100 prefix `NOT`s or `-`s in a row | [T0030 ExpressionTooDeep](errors.md#t0030-expressiontoodeep), [T0026 NotChainTooLong](errors.md#t0026-notchaintoolong), [T0018 PrefixMinusChainTooLong](errors.md#t0018-prefixminuschaintoolong) | [Text](transforms.md#text) |
+| Calculated fields that read each other so often or so deeply that inlining them passes 100 levels or more than a build can render | [T0046 FieldExpansionTooLarge](errors.md#t0046-fieldexpansiontoolarge) | [Text](transforms.md#text) |
+| An expression whose fields inline to more than 100,000 nodes (each `WHEN x = 1 THEN 1` branch is four) | [T0046 FieldExpansionTooLarge](errors.md#t0046-fieldexpansiontoolarge) | [Text](transforms.md#text) |
+| **Arithmetic, functions and casts** | | |
+| A function or operator the [lists above](#calculated-fields) don't name (`a \|\| b`, `a ^ b`), one that isn't [immutable](#immutability) (`now()`, `random()`), or a call with the wrong number of arguments | [T0007 UnsupportedFunction](errors.md#t0007-unsupportedfunction), [T0006 UnsupportedOperator](errors.md#t0006-unsupportedoperator), [T0001 UnexpectedChar](errors.md#t0001-unexpectedchar) (an operator character no listed operator uses), [T0009 NonImmutableConstruct](errors.md#t0009-nonimmutableconstruct), [T0008 FunctionArityMismatch](errors.md#t0008-functionaritymismatch), [T0011 AtLeastOneArgumentRequired](errors.md#t0011-atleastoneargumentrequired) | [Text](transforms.md#text) |
+| An operator given an operand type it doesn't take (`text_col + 1`, `NOT num_col`; `+` never concatenates) | [T0078 TypeMismatch](errors.md#t0078-typemismatch) | [Retype](transforms.md#retype) |
+| `/` between two integers (`qty / 2`): Postgres truncates the quotient. `numeric` and float quotients are admitted | [T0088 IntegerDivision](errors.md#t0088-integerdivision) | [Retype](transforms.md#retype) |
+| `%` with a float operand: Postgres has no float modulo. `%` takes integers and `numeric` | [T0089 FloatModulo](errors.md#t0089-floatmodulo) | [Retype](transforms.md#retype) |
+| [An argument `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` does not admit](#an-argument-abs-ceil-floor-round-or-trunc-does-not-admit) | [T0093 NumericFunctionArgument](errors.md#t0093-numericfunctionargument), [T0094 ScaleNotIntegerLiteral](errors.md#t0094-scalenotintegerliteral), [T0095 FunctionArgTypeMismatch](errors.md#t0095-functionargtypemismatch) | [Retype](transforms.md#retype) |
+| [A `CAST` that is not an exact conversion](#a-cast-that-is-not-an-exact-conversion) | [T0092 UnsupportedCast](errors.md#t0092-unsupportedcast), [T0090 TemporalOperand](errors.md#t0090-temporaloperand), [T0017 UnsupportedCastTarget](errors.md#t0017-unsupportedcasttarget) | [Retype](transforms.md#retype) |
+| A `REGEXP_COUNT` pattern that isn't a string literal, or that Postgres rejects (`(?P<n>a)`, `a++`, `\pL`); define, `ALTER TRANSFORM` and `RESUME` probe it with `regexp_count('', pattern)`. Back-references, lookahead and `\m`/`\M` are admitted | [T0096 NonLiteralRegexPattern](errors.md#t0096-nonliteralregexpattern), [T0127 InvalidRegexPattern](errors.md#t0127-invalidregexpattern) (with the server's message) | [Text](transforms.md#text); a Postgres upgrade that changes the verdict is [Per row](transforms.md#per-row) |
+| **Dates and times** | | |
+| [Date and time arithmetic](#date-and-time-arithmetic) | [T0090 TemporalOperand](errors.md#t0090-temporaloperand) | [Retype](transforms.md#retype) |
+| `DATE_TRUNC` of a `date` or `timestamptz`, `EXTRACT` of any type but `date` and `timestamp`, and `date_part` (an unsupported function) | [T0090 TemporalOperand](errors.md#t0090-temporaloperand) | [Retype](transforms.md#retype) |
+| [A `DATE_TRUNC` unit or `EXTRACT` field that is not admitted](#a-date_trunc-unit-or-extract-field-that-is-not-admitted) | [T0091 TemporalLiteral](errors.md#t0091-temporalliteral) | [Text](transforms.md#text) |
+| `AT TIME ZONE` with a zone other than the literal `'UTC'`, or over anything but a `timestamptz`: zone offsets change with time zone database releases | [T0091 TemporalLiteral](errors.md#t0091-temporalliteral) (the zone), [T0090 TemporalOperand](errors.md#t0090-temporaloperand) (the operand) | [Retype](transforms.md#retype) |
+| **`WHERE`** | | |
+| A `WHERE` that isn't `boolean`, or that calls an aggregate | [T0234 PredicateNotBoolean](errors.md#t0234-predicatenotboolean), [T0235 AggregateInPredicate](errors.md#t0235-aggregateinpredicate) | [Retype](transforms.md#retype); an aggregate, [Text](transforms.md#text) |
+| A [`WHERE` construct that can raise an error](#where) | [T0237 PredicateNotTotal](errors.md#t0237-predicatenottotal) | [Retype](transforms.md#retype) |
+| **Field, column and table names** | | |
+| Two fields with one name, or fields that read each other in a cycle | [T0040 DuplicateFieldName](errors.md#t0040-duplicatefieldname), [T0045 Cycle](errors.md#t0045-cycle) | [Text](transforms.md#text) |
+| A field named after a 1-1 source key column or a 1-1 `JOIN`'s `a` key column (`id AS id`; `id AS order_id` is fine), or a field or `GROUP BY` column whose name starts with `__` | [T0043 FieldNamedAfterPrimaryKey](errors.md#t0043-fieldnamedafterprimarykey), [T0041 ReservedFieldName](errors.md#t0041-reservedfieldname), [T0042 ReservedGroupByColumnName](errors.md#t0042-reservedgroupbycolumnname) | [Text](transforms.md#text) |
+| An aggregate whose argument names another aggregate field no source column is named after (`SUM(val) AS total, SUM(total)`) | [T0103 AggregateOfAggregateField](errors.md#t0103-aggregateofaggregatefield) | [Text](transforms.md#text) |
+| A bare name that is both a source column and a field whose expression isn't just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`; see [Calculated Fields](#calculated-fields)). A 1-1 transform refuses such a field whether or not anything reads it | [T0104 AmbiguousColumnReference](errors.md#t0104-ambiguouscolumnreference); in a 1-1 transform, [T0107 CalculatedFieldShadowsSourceColumn](errors.md#t0107-calculatedfieldshadowssourcecolumn) | [Resume only](transforms.md#resume-only): a source column added under a field's name |
+| [An unquoted reserved word as a name](#an-unquoted-reserved-word-as-a-name) | [T0019 ReservedWord](errors.md#t0019-reservedword) | [Retype](transforms.md#retype): renaming a read column is a rename |
+| An unquoted target, `FROM` or `JOIN` table name that Postgres reserves (`FROM user`, `FROM order`); `public.order` is fine | [T0037 ReservedTableName](errors.md#t0037-reservedtablename) | [Text](transforms.md#text) |
+| A name over 63 bytes after folding and unescaping, in any position: Postgres would truncate it | [T0036 NameTooLong](errors.md#t0036-nametoolong) | [Text](transforms.md#text); a definition 0.1.x stored with a longer `AS` label keeps running, its `ALTER TRANSFORM` refuses, and the upgrade that writes a `KEY (…)` into it pauses it |
+| [An unsupported quoted name](#an-unsupported-quoted-name) | [T0033 ZeroLengthQuotedIdentifier](errors.md#t0033-zerolengthquotedidentifier), [T0034 UnicodeEscapeIdentifier](errors.md#t0034-unicodeescapeidentifier), [T0035 UnsupportedQuotedIdentifier](errors.md#t0035-unsupportedquotedidentifier) | [Text](transforms.md#text) |
+| A qualified name whose table isn't the `FROM` table (`product.cost`), or whose schema isn't its schema; a `JOIN`'s are in [transforms](transforms.md#an-unsupported-join-shape). A table name of more than two parts, a column of more than three | [T0105 QualifiedColumnNotFromSource](errors.md#t0105-qualifiedcolumnnotfromsource), [T0014 GroupByKeyNotFromSource](errors.md#t0014-groupbykeynotfromsource), [T0012 TooManyQualifiedNameParts](errors.md#t0012-toomanyqualifiednameparts), [T0013 TooManyColumnNameParts](errors.md#t0013-toomanycolumnnameparts) | [Text](transforms.md#text) |
 
 ### Details
 
@@ -270,8 +303,7 @@ refused:
 
 The errors are `NumericFunctionArgument` (with the reason),
 `ScaleNotIntegerLiteral`, and `FunctionArgTypeMismatch` for a non-numeric
-argument, each naming the field and the function. Use the integer itself, or
-`CAST(qty AS numeric)`.
+argument, each naming the field and the function.
 
 #### A `CAST` that is not an exact conversion
 
@@ -298,7 +330,7 @@ These are refused:
 - `UnsupportedCast`, naming both types: a narrowing (`bigint` to `integer`), a
   cast from a float or a non-numeric type, or a cast to or from a float.
 - `TemporalOperand`: a `timestamptz` to `timestamp`, which converts through
-  the session `TimeZone`. Use `tz AT TIME ZONE 'UTC'` instead.
+  the session `TimeZone`.
 - `UnsupportedCastTarget`: any other target spelling (`smallint`, `text`,
   `real`, `int2`, `dec`, `timestamptz`, `date`), or a modifier
   (`numeric(10, 2)`, `timestamp(3)`), which rounds and can overflow.
@@ -384,5 +416,4 @@ Refused, each as a parse error:
 Postgres accepts the last of these, and looks a quoted function or type name
 up exactly, so `"int4"` is a type there and `"INT4"` and `"integer"` are not.
 Trellis addresses a table by its `<schema>.<table>` text, which a `.` inside a
-name would make ambiguous. Rename the table or column, or write the name in
-ASCII characters.
+name would make ambiguous.

@@ -466,6 +466,18 @@ pub enum SourceTables {
     SharedExisting,
 }
 
+/// What one definition reports about its held keys
+/// ([`ManualBackend::held_key_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldKeyReport {
+    /// Its status, as `Trellis::status` spells it (`live`, `quarantined`).
+    pub status: String,
+    /// `held_keys.count`, 0 when `held_keys` is unset.
+    pub count: u64,
+    /// Every key `sample_quarantined` lists, as the text it reports.
+    pub keys: std::collections::BTreeSet<String>,
+}
+
 /// The manual backend. Owns a raw connection (DDL, DML, watermark reads,
 /// snapshot reads) and, once [`ManualBackend::install`] has run, a live
 /// [`EngineClient`] draining sealed batches into every installed
@@ -557,6 +569,7 @@ pub struct ManualBackend {
     /// clean, so a test can tell an audit that ran from one that skipped
     /// every target.
     strict_audits_converged: usize,
+    held_keys: sql::HeldKeys,
 }
 
 impl ManualBackend {
@@ -694,7 +707,58 @@ impl ManualBackend {
             source_tables: SourceTables::Own,
             config,
             operator: None,
+            held_keys: sql::HeldKeys::Block,
         })
+    }
+
+    /// Whether [`Backend::quiesce`](super::Backend::quiesce) settles past
+    /// keys a definition holds in quarantine ([`sql::HeldKeys::Settle`]) or
+    /// waits on them as every engine wait does ([`sql::HeldKeys::Block`],
+    /// the default). Only a run that models held keys settles past them.
+    pub fn set_held_keys(&mut self, held: sql::HeldKeys) {
+        self.held_keys = held;
+    }
+
+    /// What `target`'s definition reports about its held keys, through the
+    /// public facade a user reads: its status, `held_keys.count` from
+    /// `Trellis::status`, and the keys `Trellis::sample_quarantined` lists.
+    pub async fn held_key_report(
+        &mut self,
+        target: &str,
+    ) -> Result<HeldKeyReport, ManualBackendError> {
+        let operator = self.operator().await?;
+        let status = operator.status(target).await?;
+        let (status, count) = match status {
+            Some(status) => (
+                status.status.as_str().to_string(),
+                status.held_keys.map_or(0, |held| held.count),
+            ),
+            None => ("<missing>".to_string(), 0),
+        };
+        let mut keys = std::collections::BTreeSet::new();
+        let mut after = None;
+        loop {
+            let page = operator.sample_quarantined(target, after, 100).await?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.src_table.clone(), last.key.clone()));
+            keys.extend(page.into_iter().map(|row| row.key));
+        }
+        Ok(HeldKeyReport {
+            status,
+            count,
+            keys,
+        })
+    }
+
+    /// The operator facade, connected on first use.
+    async fn operator(&mut self) -> Result<&trellis::Trellis, ManualBackendError> {
+        if self.operator.is_none() {
+            self.operator = Some(
+                trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default())
+                    .await?,
+            );
+        }
+        Ok(self.operator.as_ref().expect("connected just above"))
     }
 
     /// Sets the rows per Re-derive build chunk ([`ClientOptions::build_chunk_rows`])
@@ -1376,7 +1440,8 @@ impl super::Backend for ManualBackend {
 
         // Partition maintenance, definition status and the ring,
         // in that order — see `sql::quiesce` for why the order matters.
-        let result = sql::quiesce_within(&self.raw, &self.defs, &mut deadline).await;
+        let result =
+            sql::quiesce_within(&self.raw, &self.defs, &mut deadline, self.held_keys).await;
 
         if timing_enabled {
             eprintln!(

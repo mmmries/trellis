@@ -30,7 +30,7 @@ class ValuesTest < Minitest::Test
       capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
       source_index_gaps: [], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -45,7 +45,7 @@ class ValuesTest < Minitest::Test
       source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
       below_catalog_floor: nil, maintenance_refusals: [], join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     ), status
   end
 
@@ -60,7 +60,7 @@ class ValuesTest < Minitest::Test
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
       drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -79,7 +79,7 @@ class ValuesTest < Minitest::Test
       source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
       below_catalog_floor: nil, maintenance_refusals: [], join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     ), status
   end
 
@@ -91,7 +91,7 @@ class ValuesTest < Minitest::Test
                        since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
       source_index_gaps: [], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal Trellis::DrainFailure.new(
       seg_seq: 17, tables: ["public.lines", "public.orders"],
@@ -132,7 +132,7 @@ class ValuesTest < Minitest::Test
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
       drain_failure: nil, source_index_gaps: [gap], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal [Trellis::SourceIndexGap.new(**gap)], status.source_index_gaps
   end
@@ -144,7 +144,7 @@ class ValuesTest < Minitest::Test
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
       drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [gap], correcting: [],
       paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal [Trellis::ExtremeIndexGap.new(**gap)], status.extreme_index_gaps
   end
@@ -156,7 +156,7 @@ class ValuesTest < Minitest::Test
       correcting: [{ node: "public.items_p1", since_micros: MICROS, keys_remaining: 5 },
                    { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }],
       paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal :backfilling, status.status
     assert_equal [
@@ -173,7 +173,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: ["t.total"],
       build_wait_xid: nil, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal :catching_up, status.status
     assert_equal ["t.total"], status.paused_upstream_columns
@@ -185,7 +185,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [],
       build_wait_xid: 4_294_967_301, version_handover: nil, join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal 4_294_967_301, status.build_wait_xid
     assert_nil status.version_handover
@@ -203,7 +203,7 @@ class ValuesTest < Minitest::Test
         unregistered_staging_worker: true, migrations_pending: false
       },
       join: nil,
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_nil status.build_wait_xid
     assert_equal Trellis::VersionHandover.new(
@@ -222,7 +222,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil,
       version_handover: nil, below_catalog_floor: { floor: "0.3.0", this_version: "0.2.0" },
-      join: nil, floor: "0.2.0"
+      join: nil, floor: "0.2.0", filter: nil
     )
     assert_equal Trellis::BelowCatalogFloor.new(floor: "0.3.0", this_version: "0.2.0"),
                  status.below_catalog_floor
@@ -260,7 +260,7 @@ class ValuesTest < Minitest::Test
         building: { step: :side, side: :joined, part: :leaf, leaf: "public.items_p2",
                     remaining: nil, position: nil }
       },
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal Trellis::JoinStatus.new(
       hidden_tables: [
@@ -291,7 +291,7 @@ class ValuesTest < Minitest::Test
         building: { step: :chunks, side: nil, part: nil, leaf: nil, remaining: 4_294_967_301,
                     position: nil }
       },
-      floor: "0.2.0"
+      floor: "0.2.0", filter: nil
     )
     assert_equal Trellis::JoinStatus.new(
       hidden_tables: [], partials_warning: nil, fan_out_warnings: [],

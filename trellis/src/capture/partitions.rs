@@ -1120,16 +1120,19 @@ async fn pause_noncompliant(
     table: &str,
     refusals: &[(i64, PartitionRefusal)],
 ) -> Result<(), CaptureError> {
-    let txn = client.transaction().await?;
-    for (id, refusal) in refusals {
+    let pauses = refusals.iter().map(|(id, refusal)| {
         let error = format!(
             "{refusal}; fix the table, then resume the definition to rebuild it, or drop the \
              definition"
         );
-        let reason = crate::staging::pause_message::PauseReason::capture(table, error);
-        if crate::defs::lifecycle::pause(&txn, *id, &reason).await? {
-            crate::instance_log::warn!(transform_id = *id, table = %table, "definition paused: {reason}");
-        }
+        (
+            *id,
+            crate::staging::pause_message::PauseReason::capture(table, error),
+        )
+    });
+    let txn = client.transaction().await?;
+    for (id, reason) in crate::defs::lifecycle::pause_many(&txn, pauses).await? {
+        crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
     }
     txn.commit().await?;
     Ok(())

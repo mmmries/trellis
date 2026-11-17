@@ -152,6 +152,12 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
+    /// `converged_through` and `await_converged` without the held-key
+    /// condition, for the generative held-key tier, which models held keys
+    /// and so waits for "converged except the held keys".
+    pub use crate::staging::converge::{
+        await_converged_except_held, converged_through_except_held,
+    };
     /// The plan of a group-basis page's apply statement, for plan-shape
     /// tests.
     #[cfg(any(test, feature = "internals"))]
@@ -304,6 +310,7 @@ pub mod fixtures {
             below_catalog_floor: None,
             maintenance_refusals: Vec::new(),
             floor: "0.2.0".to_string(),
+            filter: None,
         }
     }
 

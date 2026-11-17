@@ -484,9 +484,61 @@ pub(crate) struct GroupShape {
     /// expression with each aggregate call replaced by its placeholder
     /// column ([`placeholder`]).
     pub(super) fields: Vec<(String, String, Expr)>,
+    /// The definition's `WHERE` ([`Membership`]): which images contribute
+    /// and which rows an absolute read counts. `None` for `TRUE`, and for
+    /// every `JOIN` structure. Group naming never reads it (ADR-0002: "group
+    /// naming is unfiltered"): naming runs on images that may hold only the
+    /// group columns, and a group whose rows all fail just counts zero.
+    pub(super) predicate: Option<Membership>,
+}
+
+/// A plain aggregate's `WHERE`, rendered over the source row `s`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Membership {
+    /// `((<p>) is true)`: whether `s` is a member row.
+    pub(super) sql: String,
+    /// The source columns the predicate reads: an image without one holds
+    /// its key rather than reading the column as `NULL`
+    /// ([`GroupShape::contributes`]).
+    pub(super) columns: Vec<String>,
 }
 
 impl GroupShape {
+    /// ` and <membership>`, or nothing: the condition on an image `s`,
+    /// populated from the jsonb `image`, under which it contributes to its
+    /// group. A column the predicate reads that the image lacks fails the
+    /// statement with a data exception (`22P02`, naming the column), so the
+    /// record is isolated and its key held, as the 1-1 path's image read
+    /// does (`one_to_one_render::OneToOneRender::row_sql`): read as `NULL`,
+    /// it would drop a member row silently. Each column's test wraps the
+    /// next in a `CASE`, which fixes the order: the image is checked before
+    /// the predicate reads it. The failing arm reads the image, so the
+    /// planner can't fold it into an error for every row.
+    fn contributes(&self, image: &str) -> String {
+        let Some(member) = &self.predicate else {
+            return String::new();
+        };
+        let mut sql = member.sql.clone();
+        for column in member.columns.iter().rev() {
+            let name = quote_literal(column);
+            let missing = quote_literal(&format!("the row has no column {column}"));
+            sql = format!(
+                "(case when {image} operator(pg_catalog.?) {name} then {sql} \
+                 else ({missing} || pg_catalog.left({image}::text, 0))::integer > 0 end)"
+            );
+        }
+        format!(" and {sql}")
+    }
+
+    /// ` where <membership>`, or nothing: an absolute read's filter over
+    /// the source row `s`.
+    fn where_member(&self) -> String {
+        match &self.predicate {
+            Some(member) => format!(" where {}", member.sql),
+            None => String::new(),
+        }
+    }
+
     /// The `GROUP BY` columns: the source's, the target's and the hidden
     /// table's column of that name.
     pub(crate) fn group_columns(&self) -> &[String] {
@@ -608,6 +660,20 @@ pub(crate) fn route(
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
     let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;
     let distinct = distinct_arguments(&def.fields, group_by, &substituted);
+    let predicate = def.predicate.filter().map(|p| Membership {
+        sql: format!("(({}) is true)", render_qualified_expr_sql(p, "s")),
+        columns: crate::defs::oracle::predicate_columns(def)
+            .into_iter()
+            .collect(),
+    });
+    // An argument is never evaluated on a row that is no member (#1991):
+    // each statement filters by the predicate already, and the guard keeps
+    // a raising argument (`amount / qty` under `WHERE qty <> 0`) safe from
+    // whatever order the planner evaluates its quals in.
+    let guarded = |sql: String| match &predicate {
+        Some(member) => format!("(case when {} then {sql} end)", member.sql),
+        None => sql,
+    };
     let mut shape = GroupShape {
         group_cols,
         group_types,
@@ -615,7 +681,7 @@ pub(crate) fn route(
         args: distinct
             .iter()
             .map(|arg| Arg {
-                sql: render_qualified_expr_sql(arg, "s"),
+                sql: guarded(render_qualified_expr_sql(arg, "s")),
                 expr: arg.clone(),
                 summed: false,
                 numeric: false,
@@ -626,6 +692,7 @@ pub(crate) fn route(
             .collect(),
         aggs: Vec::new(),
         fields: Vec::new(),
+        predicate,
     };
     let arg_of = |arg: &Expr| distinct.iter().position(|d| d == arg);
     for field in &def.fields {
@@ -2649,7 +2716,7 @@ impl GroupTargetPlan {
              ev as ( \
                  select {values} \
                  from sides sd cross join lateral jsonb_populate_record(null::{src}, sd.__i) as s \
-                 where jsonb_typeof(sd.__i) = 'object'{filter} \
+                 where jsonb_typeof(sd.__i) = 'object'{filter}{contributes} \
              ), \
              staged as ( \
                  insert into {staged} \
@@ -2666,6 +2733,7 @@ impl GroupTargetPlan {
             sums = sums.join(", "),
             hinted = hinted,
             filter = self.stage_filter,
+            contributes = self.shape.contributes("sd.__i"),
             returned = returned,
             flags = if flags.is_empty() {
                 "null::boolean[]".to_string()
@@ -4186,9 +4254,10 @@ impl GroupTargetPlan {
                 .map(|(name, agg, _)| format!("{agg} as {name}"))
                 .collect();
             return format!(
-                "select {}{} from {from} s{}",
+                "select {}{} from {from} s{}{}",
                 lead(values),
                 list.join(", "),
+                self.shape.where_member(),
                 positions(values.len())
             );
         }
@@ -4216,10 +4285,11 @@ impl GroupTargetPlan {
             .map(|(name, _, fold)| format!("{fold} as {name}"))
             .collect();
         format!(
-            "select {}{} from (select {} from {from} s{}) as s{}",
+            "select {}{} from (select {} from {from} s{}{}) as s{}",
             lead(groups),
             outer.join(", "),
             inner.join(", "),
+            self.shape.where_member(),
             positions(keys),
             if groups.is_empty() {
                 String::new()

@@ -615,6 +615,13 @@ report it as `floor`. Before rolling back to an earlier release, drop each
 definition whose floor is above it
 ([upgrading — Before rolling back](upgrading.md#before-rolling-back)).
 
+### `filter`
+
+The definition's [`WHERE`](expressions.md#where), when it is other than a
+lone `TRUE`, as Trellis renders it (each operation parenthesized:
+`(active AND (qty > 0))`): the target holds only the source rows it is `TRUE`
+for. Unset for an unfiltered definition.
+
 ## Limits and defaults
 
 The fixed values behind the fields above. None is an option unless the row

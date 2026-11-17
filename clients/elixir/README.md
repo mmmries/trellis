@@ -106,7 +106,8 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   transform. `status/2` reports the oldest Trellis release that can run a
   transform (`floor`, `"major.minor.patch"`), which an application reads
   before rolling back to an earlier Trellis release
-  ([upgrading](../../docs/upgrading.md#rolling-back)).
+  ([upgrading](../../docs/upgrading.md#rolling-back)), and its `WHERE`
+  (`filter`, definition text, `nil` when unfiltered).
 - `request_backfill/2`, `detect_capture_disruptions/1` (pauses now the readers
   of every table whose Trellis capture was changed outside Trellis, and
   returns the tables), `has_live_drain_workers/1`,
@@ -308,15 +309,41 @@ the test environment:
 
 ```elixir
 # config/test.exs
-config :trellis_pg, enabled: false
+config :trellis_pg, enabled: false, allow_target_writes: true
 ```
 
-Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
+`allow_target_writes` lets a test write target schemas (see below). Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
 skip, and `mix trellis.load` / `mix trellis.dump` are `ecto.load` /
 `ecto.dump`, so target tables are plain tables a test writes directly.
 Build the test database with `mix ecto.load` (aliased to `trellis.load`),
 not `mix ecto.migrate`: a skipped define creates no target table.
 `Trellis.enabled?/0` reports the setting.
+
+## Target schemas are read-only
+
+Only Trellis writes a target. Mark an Ecto schema over one, and add the guard to the repo:
+
+```elixir
+defmodule MyApp.EventCount do
+  use Ecto.Schema
+  use Trellis.Target
+  # schema "event_counts" do ... end
+end
+
+defmodule MyApp.Repo do
+  use Ecto.Repo, otp_app: :my_app, adapter: Ecto.Adapters.Postgres
+  use Trellis.Repo # after `use Ecto.Repo`
+end
+```
+
+`insert`, `update`, `delete`, `insert_or_update` (and bang forms), `insert_all`, `update_all`
+and `delete_all` on a marked schema raise `Trellis.ReadOnlyTarget` before any SQL is sent;
+`Ecto.Multi` goes through them. Raw SQL and writes that name no schema
+(`insert_all("table", ...)`, `from("table")`) go around the guard: a `SELECT`-only grant
+is the strong answer (`docs/recommendations.md`).
+
+`config :trellis_pg, allow_target_writes: true` lifts it (default `false`, read at each
+write, independent of `enabled`).
 
 ## Fixtures and bulk loads in tests
 

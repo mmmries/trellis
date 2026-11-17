@@ -63,6 +63,7 @@ pub mod row_security;
 pub mod source_index;
 pub mod source_key;
 pub mod subscription;
+pub(crate) mod totality;
 pub mod typed_literal;
 pub mod validate;
 pub(crate) mod validate_join_one_to_one;
@@ -133,6 +134,8 @@ pub use validate::{
 };
 
 #[cfg(test)]
+mod aggregate_modifier_tests;
+#[cfg(test)]
 mod arithmetic_tests;
 #[cfg(test)]
 mod date_tests;
@@ -144,6 +147,8 @@ mod identifier_tests;
 mod literal_tests;
 #[cfg(test)]
 mod logic_tests;
+#[cfg(test)]
+mod predicate_tests;
 #[cfg(test)]
 mod refusal_tables;
 #[cfg(test)]
@@ -995,17 +1000,6 @@ mod tests {
                 },
             }]
         );
-    }
-
-    #[test]
-    fn rejects_general_predicates() {
-        let err = parse("TRANSFORM t FROM s SELECT a AS x WHERE a = b").unwrap_err();
-        match err {
-            ParseError::UnsupportedPredicate { detail } => {
-                assert!(detail.contains("TRUE"));
-            }
-            other => panic!("expected UnsupportedPredicate, got {other:?}"),
-        }
     }
 
     // ADR-0011: `TRANSFORM`/`FROM` accept an

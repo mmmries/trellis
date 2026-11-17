@@ -45,6 +45,9 @@ pub const JOIN_CHAINED_TIER: &str = "join_chained";
 /// The `MIN`/`MAX` tampering tier's sweep tier (`self_check_cross_check.rs`).
 pub const EXTREMES_TAMPER_TIER: &str = "extremes_tamper";
 
+/// The held-key tier's sweep tier (`held_keys.rs`).
+pub const HELD_KEYS_TIER: &str = "held_keys";
+
 /// The sweep tiers an entry can name.
 pub const TIERS: &[&str] = &[
     "cooling_key",
@@ -58,6 +61,7 @@ pub const TIERS: &[&str] = &[
     JOIN_STAR_TIER,
     JOIN_CHAINED_TIER,
     EXTREMES_TAMPER_TIER,
+    HELD_KEYS_TIER,
 ];
 
 /// The repository whose issues the entries name.

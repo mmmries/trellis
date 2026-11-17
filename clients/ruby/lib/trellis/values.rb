@@ -141,11 +141,15 @@ module Trellis
   # definition is defined, altered or rebuilt by a resume. Before rolling the
   # application back to an earlier Trellis release, drop each definition
   # whose floor is above that release, under the newer one.
+  #
+  # filter is the definition's WHERE, as definition text, when it is other
+  # than TRUE: the target holds only the source rows it is TRUE for. nil for
+  # an unfiltered definition.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
                        :held_keys, :drain_failure, :source_index_gaps,
                        :extreme_index_gaps, :correcting, :paused_upstream_columns,
                        :build_wait_xid, :version_handover, :below_catalog_floor,
-                       :maintenance_refusals, :join, :floor) do
+                       :maintenance_refusals, :join, :floor, :filter) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -170,7 +174,8 @@ module Trellis
           below_catalog_floor: below_catalog_floor && BelowCatalogFloor.new(**below_catalog_floor),
           maintenance_refusals: hash.fetch(:maintenance_refusals, []).map { |r| RefusedStep.new(**r) },
           join: join && JoinStatus.from_native(join),
-          floor: hash.fetch(:floor))
+          floor: hash.fetch(:floor),
+          filter: hash[:filter])
     end
   end
 

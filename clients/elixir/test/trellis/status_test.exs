@@ -32,7 +32,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert %Trellis.Status{
@@ -79,7 +80,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert %Trellis.Status{
@@ -133,7 +135,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -173,7 +176,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.source_index_gaps == [
@@ -213,7 +217,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.extreme_index_gaps == [struct!(Trellis.ExtremeIndexGap, gap)]
@@ -240,7 +245,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.paused_upstream_columns == ["t.total"]
@@ -277,7 +283,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.build_wait_xid == 4_294_967_301
@@ -310,7 +317,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.build_wait_xid == nil
@@ -344,7 +352,8 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: %{floor: "0.3.0", this_version: "0.2.0"},
         maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.below_catalog_floor == %Trellis.BelowCatalogFloor{
@@ -379,7 +388,8 @@ defmodule Trellis.StatusTest do
           }
         ],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.maintenance_refusals == [
@@ -429,7 +439,8 @@ defmodule Trellis.StatusTest do
             position: nil
           }
         },
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.join == %Trellis.JoinStatus{
@@ -501,7 +512,8 @@ defmodule Trellis.StatusTest do
             position: nil
           }
         },
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.join == %Trellis.JoinStatus{
@@ -540,7 +552,7 @@ defmodule Trellis.StatusTest do
            }
   end
 
-  test "a transform's floor keeps the release it names" do
+  test "a transform's floor and filter keep what the engine reports" do
     status =
       Trellis.Status.from_native(%{
         status: :live,
@@ -558,10 +570,12 @@ defmodule Trellis.StatusTest do
         below_catalog_floor: nil,
         maintenance_refusals: [],
         join: nil,
-        floor: "0.3.1"
+        floor: "0.3.1",
+        filter: "(qty > 0)"
       })
 
     assert status.floor == "0.3.1"
+    assert status.filter == "(qty > 0)"
     assert status.paused_upstream_columns == ["upstream.amount"]
   end
 
