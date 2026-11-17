@@ -462,11 +462,11 @@ async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
 }
 
 /// After define: a `SUM` argument re-typed from `integer`
-/// to `double precision` pauses its aggregate on the capture pass, and the
-/// resume refuses with define's family refusal until the column is
+/// to `text` pauses its aggregate on the capture pass, and the
+/// resume refuses with define's refusal until the column is
 /// an admitted type again.
 #[tokio::test]
-async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses() {
+async fn a_source_retype_to_text_pauses_its_sum_reader_and_the_resume_refuses() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -480,7 +480,7 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
         .expect("define agg");
     bring_live(&mut raw, &db.pool, &["agg"]).await;
 
-    raw.batch_execute("alter table public.src alter column q type double precision")
+    raw.batch_execute("alter table public.src alter column q type text")
         .await
         .expect("retype q");
     reconcile_pass(&mut raw, &db.pool).await;
@@ -489,7 +489,8 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
 
     match trellis.apply("RESUME TRANSFORM agg").await {
         Err(err) => assert!(
-            err.to_string().contains("float and interval SUM/AVG"),
+            err.to_string()
+                .contains("'SUM' expects a numeric value, found text"),
             "{err}"
         ),
         Ok(applied) => panic!("the resume should be refused: {applied:?}"),

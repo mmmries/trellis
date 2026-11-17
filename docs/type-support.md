@@ -262,10 +262,13 @@ is widened to `double precision`, so the comparison runs in `double precision`:
 with `r = 0.1::real`, `r > 0.1` is true (the widened `r` is 0.10000000149...),
 `r = 0.1` is false and `r > 0.1::real` is false. Floats are refused as every
 key role: `-0` and `0` are equal but render as `'-0'` and `'0'`, which would
-split one group into two target rows. `SUM` and `AVG` over a float are refused
-at define ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
-float addition is not associative, and `NaN`/`Infinity` are absorbing, so
-there is no exact inverse. `extra_float_digits >= 1` is pinned for the
+split one group into two target rows. `SUM` and `AVG` over a float are the
+exact sum of the values, rounded once to the result type, with `NaN` and the
+infinities counted. This departs from Postgres's `sum()`, which adds in scan
+order (`{1e20, 1, -1e20}` sums to 0 or 1; the exact sum is 1), adds `real`s
+in `real`, and keeps a `-0` sum that the exact sum reads as `0`
+([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
+`extra_float_digits >= 1` is pinned for the
 shortest-round-trip rendering `trellis::float::render` reproduces. Checked in
 `trellis/tests/defs/defs_floats.rs`.
 
@@ -408,10 +411,11 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
   disagrees with `::text` (a `T` separator), which is why no engine read uses
   it. `defs_temporal.rs` sweeps the whole key allowlist for render agreement.
 - **`interval`** is refused as a key: `'24 hours' = '1 day'` is true but they
-  render differently, and no renderer fix helps. `SUM`/`AVG(interval)` is
-  refused ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
-  `interval` addition is exact but partial (`infinity + -infinity` raises, and
-  overflow depends on scan order), which a delta cannot represent.
+  render differently, and no renderer fix helps. `SUM(interval)` is the
+  exact fieldwise sum and raises `interval out of range` only when the final
+  value is, where Postgres's `sum()` raises by scan order; `AVG(interval)`
+  is Postgres's `avg()` wherever the sum is in range
+  ([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
 - Typed literals exist for `DATE`, `TIMESTAMP`, `TIME` and `TIMETZ`, not
   `TIMESTAMPTZ` (no canonical-form checker) or `INTERVAL` (`interval_in` reads
   `IntervalStyle`). The text must be in Postgres's canonical output spelling.

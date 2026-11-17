@@ -227,7 +227,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A field reading a column that is neither a `GROUP BY` key nor inside an aggregate, or named after a key but not that key (`GROUP BY id SELECT SUM(id) AS id`) | `UngroupedColumnReference`, `GroupingColumnFieldMustBePassthrough` | [Text](#text) | Aggregate the column, or rename the field |
 | `MIN` or `MAX` in a `JOIN` transform | `DeferredAggregate` (`MIN/MAX`) | [Text](#text) | Take it in a plain aggregate over one table |
 | `bool_and`, `bool_or`, `bit_and` or `bit_or` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1118](https://github.com/salesforce-misc/trellis/issues/1118) |
-| `SUM` or `AVG` over anything but `smallint`, `integer`, `bigint` and `numeric`: a running float sum drifts from Postgres's | `DeferredAggregate` (`float and interval SUM/AVG`), `UnsupportedAggregateArgument` for another type | [Retype](#retype) | An integer or `numeric` column ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)) |
+| `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | `UnsupportedAggregateArgument` | [Retype](#retype) | A number or `interval` column |
 | `array_agg`, `string_agg` or `jsonb_agg` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1040](https://github.com/salesforce-misc/trellis/issues/1040) |
 | **Filters and chaining** | | | |
 | <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE`: partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)) | `UnsupportedPredicate` | [Text](#text) | None |
