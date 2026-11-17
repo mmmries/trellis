@@ -172,3 +172,161 @@ async fn an_injected_target_corruption_reads_as_target_not_sql() {
         "corruption localizes to target != SQL: {report}"
     );
 }
+
+/// The exact-sum oracle (#1119) reads what Postgres's own `sum()`/`avg()`
+/// read wherever those don't depend on scan order: a `double precision` or
+/// `real` sum of two values (one correctly rounded addition), a single
+/// value's `AVG`, and an `interval` group whose partial sums stay in range,
+/// its `SUM` and `AVG` printed character for character as Postgres prints
+/// them. Values are random bit patterns and fields, with the specials.
+#[tokio::test]
+async fn the_exact_sum_oracle_reads_postgres_where_postgres_is_order_free() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = db.connect_raw().await;
+    raw.batch_execute(
+        "create table public.es (id bigint primary key, g int, f float8, r real, iv interval); \
+         create table public.es_one (id bigint primary key, g int, f float8)",
+    )
+    .await
+    .expect("tables");
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let double = |next: &mut dyn FnMut() -> u64| -> String {
+        match next() % 20 {
+            0 => "NaN".to_string(),
+            1 => "Infinity".to_string(),
+            2 => "-Infinity".to_string(),
+            3 => "-0".to_string(),
+            // Subnormals.
+            4 => format!("{:e}", f64::from_bits(next() % (1 << 52))),
+            _ => {
+                let v = f64::from_bits(next());
+                if v.is_finite() {
+                    format!("{v:e}")
+                } else {
+                    "1".to_string()
+                }
+            }
+        }
+    };
+    let mut id = 0i64;
+    for g in 0..300i32 {
+        let fields = |next: &mut dyn FnMut() -> u64| {
+            let signed = |v: u64, m: u64| (v % m) as i64 - (m / 2) as i64;
+            format!(
+                "{} mons {} days {} microseconds",
+                signed(next(), 2_000_000),
+                signed(next(), 20_000_000),
+                signed(next(), 1 << 60)
+            )
+        };
+        for _ in 0..2 {
+            id += 1;
+            let f = double(&mut next);
+            // A `real` from a double's bits, in range.
+            let r = match double(&mut next).parse::<f64>().map(|v| v as f32) {
+                Ok(v) if v.is_finite() || v.is_nan() => format!("{v:e}"),
+                _ => "Infinity".to_string(),
+            };
+            let iv = fields(&mut next);
+            raw.execute(
+                "insert into public.es values ($1, $2, $3::text::float8, \
+                 ($4::text::float8)::real, $5::text::interval)",
+                &[&id, &g, &f, &r, &iv],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("insert {f} {r} {iv}: {e}"));
+        }
+        let f = double(&mut next);
+        raw.execute(
+            "insert into public.es_one values ($1, $2, $3::text::float8)",
+            &[&id, &g, &f],
+        )
+        .await
+        .expect("insert one");
+    }
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let call = |name: &str, column: &str| FieldDef {
+        name: format!("{}_{column}", name.to_lowercase()),
+        expr: Expr::FunctionCall {
+            name: name.to_string(),
+            args: vec![Expr::Column(column.to_string())],
+        },
+    };
+    let def = |source: &str, fields: Vec<FieldDef>| TransformDef {
+        target: format!("{source}_t"),
+        source: source.to_string(),
+        key_space: KeySpace::Aggregate {
+            group_by: vec!["g".to_string()],
+        },
+        fields: std::iter::once(FieldDef {
+            name: "g".to_string(),
+            expr: Expr::Column("g".to_string()),
+        })
+        .chain(fields)
+        .collect(),
+        predicate: Predicate::True,
+        without_source_index: false,
+        adopt_target: false,
+        source_key: None,
+        explicit_source_schema: Some("public".to_string()),
+        explicit_target_schema: None,
+    };
+    let floats_equal = |a: &str, b: &str| {
+        let (a, b): (f64, f64) = (a.parse().expect("a float"), b.parse().expect("a float"));
+        a == b || (a.is_nan() && b.is_nan())
+    };
+    let check = async |def: TransformDef, postgres: &str, floats: &[&str]| {
+        let oracle = sql_oracle(&pool, &def, "id").await.expect("sql oracle");
+        let rows = raw.query(postgres, &[]).await.expect("postgres");
+        assert_eq!(oracle.len(), rows.len());
+        for row in rows {
+            let g: i32 = row.get(0);
+            let ours = &oracle[&generative::model::group_key(&[Some(g.to_string())])];
+            for (i, field) in def.fields.iter().skip(1).enumerate() {
+                let theirs: Option<String> = row.get(i + 1);
+                let mine = ours[&field.name].clone();
+                let agree = match (&mine, &theirs) {
+                    (Some(a), Some(b)) if floats.contains(&field.name.as_str()) => {
+                        floats_equal(a, b)
+                    }
+                    _ => mine == theirs,
+                };
+                assert!(
+                    agree,
+                    "group {g}, {}: oracle {mine:?}, Postgres {theirs:?}",
+                    field.name
+                );
+            }
+        }
+    };
+    check(
+        def(
+            "es",
+            vec![
+                call("SUM", "f"),
+                call("SUM", "r"),
+                call("SUM", "iv"),
+                call("AVG", "iv"),
+            ],
+        ),
+        // Postgres's float `AVG` of two values divides its rounded sum, so
+        // the float `AVG` is read over a single value below.
+        "select g, sum(f)::text, sum(r)::text, sum(iv)::text, avg(iv)::text \
+         from public.es group by g",
+        &["sum_f", "sum_r"],
+    )
+    .await;
+    check(
+        def("es_one", vec![call("AVG", "f"), call("SUM", "f")]),
+        "select g, avg(f)::text, sum(f)::text from public.es_one group by g",
+        &["avg_f", "sum_f"],
+    )
+    .await;
+}

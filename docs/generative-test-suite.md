@@ -121,6 +121,14 @@ source, run it in the same cluster, and assert the persisted target equals it.
 - **Aggregate:** `SELECT grain, sum(measure) FROM src GROUP BY grain` → compare.
 - **Join aggregate:** the definition's own `SELECT keys, aggregates FROM a [LEFT]
   JOIN b ON … GROUP BY keys` over the two tables → compare byte for byte.
+- **Float and `interval` sums** are the one exception. Postgres's `sum()` over
+  them depends on scan order, and the engine reads the exact sum instead
+  ([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
+  So the `SELECT` gathers each group's argument values, and the oracle
+  (`oracle::exact_sums`) sums them exactly in Rust: a float rounded once, an
+  `interval` field by field, its `AVG` through `interval_div`'s steps. A group
+  whose sum is out of range is a raise, which no target value equals. Only a
+  top-level `SUM`/`AVG` is modelled; a nested one over these types panics.
 
 Postgres evaluates every field of the engine's targets (ADR-0002), so a
 divergence is a pipeline / fold / exactly-once-apply / ordering / convergence
@@ -400,6 +408,23 @@ beside them run on every `cargo test`.
   and `gbx_probe_no_xbasis` in 13. `gbx_null_extreme_no_probe` (2 of 48) and
   `gbx_gc_ignores_xstamp` (1 of 48) are known misses, and the
   `self_check` plants are left to the tampering tier and their pins (§9).
+- **Float and `interval` sums** (#1119, `generate::exact_sums`). Half the
+  `min_max` cases add a `real`, a `double precision` and an `interval` column
+  and one to three `SUM`/`AVG` fields over them per definition; three `JOIN`
+  cases in ten make `ja.x` and `jb.y` one of those types and keep only the
+  top-level `SUM`/`AVG`/`COUNT` fields. The arm is derived from the case's
+  existing draws (the `min_max` seed, the first op's `pick`), so the draws
+  of every case are what they were before it. The values take the shapes
+  where the order-dependent sum and the exact one differ: magnitudes that
+  cancel (`1e20`, `1`, `-1e20`), inexact decimals, subnormals, `-0`, rare
+  `NaN` and infinities, `interval`s with mixed signs, equal values in
+  different fields, microseconds past `2^53`, fields near their limits, and
+  on Postgres 17+ the infinities (one sign per case: both in a group raise).
+  No group may leave its type's range even transiently, since the engine
+  would hold its key and stall the convergence wait: the `min_max` arm keeps
+  a budget of every magnitude written, and the `JOIN` arm's magnitudes stay
+  in range over any product of its row counts. The raise itself is pinned
+  by a build over an out-of-range group (`tests/exact_sums.rs`).
 - **Join convergence** (`tests/join_convergence.rs`). Two
   tables, one to three `LEFT` or `INNER` join aggregates over them (joined on one
   column or on two, grouped by the joined table's column, by a column of each
@@ -711,12 +736,14 @@ concurrency.
 - **Exact decimals compared by value, ignoring scale** (`2.50 ≡ 2.5`), and
   `NaN ≡ NaN` as Postgres's `=` has it for `numeric`. Byte-level rendering is
   pinned in a separate test.
-- **Floats within a combined absolute+relative tolerance** (~1e-9), NaN ≡ NaN. (Not
-  reachable until the value language gains floats.)
+- **Floats by value**, exactly, with Postgres's equality (`NaN ≡ NaN`,
+  `-0 ≡ 0`); a `real` read as one. Every float is Postgres's own value or an
+  exact sum rounded once, so the bits agree.
 - **An aggregate's `interval` by value**, as Postgres's `=` compares it (a month
   is 30 days, a day 24 hours): `26:00:00 ≡ 1 day 02:00:00`. An aggregate holds an
   equal value (ADR-0020), and `MIN`/`MAX` keep one of a tie's spellings. A 1-1
-  field's `interval` stays exact text.
+  field's `interval` stays exact text, and a `SUM`/`AVG` compares field by
+  field (`1 mon` is not `30 days`).
 - **A column present on one side and absent on the other is a divergence,** not a
   missing-key skip — this is how an unwritten derived cell surfaces.
 
