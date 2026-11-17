@@ -178,7 +178,13 @@ if Code.ensure_loaded?(Ecto.Migration) do
     end
 
     defp skipped(statement) do
-      Logger.info(off_message("skipped #{statement}"))
+      Logger.info(
+        off_message(
+          "skipped #{statement}. A database where Trellis is off gets its target " <>
+            "tables from the structure file (mix trellis.load), not from migrating"
+        )
+      )
+
       :ok
     end
 

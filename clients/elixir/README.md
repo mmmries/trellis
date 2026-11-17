@@ -306,6 +306,8 @@ config :trellis_pg, enabled: false
 Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
 skip, and `mix trellis.load` / `mix trellis.dump` are `ecto.load` /
 `ecto.dump`, so target tables are plain tables a test writes directly.
+Build the test database with `mix ecto.load` (aliased to `trellis.load`),
+not `mix ecto.migrate`: a skipped define creates no target table.
 `Trellis.enabled?/0` reports the setting.
 
 ## Fixtures and bulk loads in tests
