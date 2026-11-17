@@ -225,6 +225,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | **Aggregate functions** | | | |
 | [`MIN` or `MAX` in a plain aggregate](#min-or-max-in-a-plain-aggregate) | `ExtremeOfExpression`, `UnsupportedExtremeArgument`, `ChainedExtreme`, `ExtremesWithoutSourceIndex`, `ExtremeIndexMissing` | [Index](#index), [Retype](#retype) | Create the index the message names; a plain column |
 | A field reading a column that is neither a `GROUP BY` key nor inside an aggregate, or named after a key but not that key (`GROUP BY id SELECT SUM(id) AS id`) | `UngroupedColumnReference`, `GroupingColumnFieldMustBePassthrough` | [Text](#text) | Aggregate the column, or rename the field |
+| `DISTINCT` or `ALL` before an aggregate's arguments, `ORDER BY` after them, or a `FILTER (WHERE …)` clause: Postgres accepts each | `UnsupportedAggregateModifier` | [Text](#text) | For `COUNT(DISTINCT x)`, [count in two transforms](#counting-distinct-values); drop `ALL`; otherwise none |
 | `MIN` or `MAX` in a `JOIN` transform | `DeferredAggregate` (`MIN/MAX`) | [Text](#text) | Take it in a plain aggregate over one table |
 | `bool_and`, `bool_or`, `bit_and` or `bit_or` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1118](https://github.com/salesforce-misc/trellis/issues/1118) |
 | `SUM` or `AVG` over anything but `smallint`, `integer`, `bigint` and `numeric`: a running float sum drifts from Postgres's | `DeferredAggregate` (`float and interval SUM/AVG`), `UnsupportedAggregateArgument` for another type | [Retype](#retype) | An integer or `numeric` column ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)) |
@@ -488,8 +489,8 @@ refused when its argument:
 - is of a type other than `smallint`, `integer`, `bigint`, `numeric`, `real`,
   `double precision`, `date`, `time`, `timestamp`, `timestamptz`, `interval`
   or `oid`, so `text` is refused (`UnsupportedExtremeArgument`);
-- is a column of another transform's target (`ChainedExtreme`), which has no
-  such index and would need a long `CREATE INDEX` on a table Trellis owns.
+- is a column of another transform's target (`ChainedExtreme`), whatever
+  indexes that target has.
 
 It is also refused `WITHOUT SOURCE INDEX` (`ExtremesWithoutSourceIndex`), and
 when the source lacks, per argument, a valid, non-partial btree index leading
@@ -644,6 +645,22 @@ SELECT
 
 Throughput falls as more distinct groups receive writes at once
 ([recommendations](recommendations.md#benchmark-aggregates-over-many-concurrently-written-groups)).
+
+#### Counting distinct values
+
+`COUNT(DISTINCT x)` is not supported. Chain two transforms: the first groups
+by the key and the value, the second counts its rows per key.
+
+```text
+TRANSFORM g_x FROM events GROUP BY g, x
+SELECT g AS g, x AS x, COUNT(*) AS n
+
+TRANSFORM g_distinct FROM g_x GROUP BY g
+SELECT g AS g, COUNT(x) AS distinct_x
+```
+
+Count `x`, not `*`: a `NULL` value is its own `(g, NULL)` row in the first
+target, and `COUNT(DISTINCT x)` skips `NULL`s.
 
 ### Join aggregate
 

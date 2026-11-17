@@ -132,6 +132,8 @@ pub use validate::{
 };
 
 #[cfg(test)]
+mod aggregate_modifier_tests;
+#[cfg(test)]
 mod arithmetic_tests;
 #[cfg(test)]
 mod date_tests;

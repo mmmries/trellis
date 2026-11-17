@@ -1653,7 +1653,7 @@ impl Parser {
                     // name rather than the parser calling it an unknown
                     // function.
                     if self.joined.is_some() && is_deferred_aggregate_name(&upper) {
-                        let args = self.parse_call_args()?;
+                        let args = self.parse_aggregate_args(&upper)?;
                         return Ok(Expr::FunctionCall { name: upper, args });
                     }
 
@@ -1689,6 +1689,7 @@ impl Parser {
                                         });
                                     }
                                 }
+                                self.refuse_filter_clause(&upper)?;
                                 return Ok(Expr::FunctionCall {
                                     name: upper,
                                     args: Vec::new(),
@@ -1706,7 +1707,7 @@ impl Parser {
                             // `count(x)` accepts any argument type in
                             // Postgres, so there is no type restriction to
                             // enforce here, unlike `SUM`/`MIN`/`MAX`/`AVG`.
-                            let args = self.parse_call_args()?;
+                            let args = self.parse_aggregate_args(&upper)?;
                             if args.len() != 1 {
                                 return Err(ParseError::FunctionArityMismatch {
                                     name: upper,
@@ -1719,7 +1720,7 @@ impl Parser {
 
                         let spec = lookup_aggregate_function(&upper)
                             .expect("every non-COUNT AGGREGATE_FUNCTIONS name is in AGGREGATE_FUNCTION_SPECS");
-                        let args = self.parse_call_args()?;
+                        let args = self.parse_aggregate_args(&upper)?;
                         if args.len() != spec.arg_types.len() {
                             return Err(ParseError::FunctionArityMismatch {
                                 name: upper,
@@ -1974,6 +1975,53 @@ impl Parser {
     /// expression syntax: each argument is a full `parse_expr`,
     /// so calls can nest.
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+        self.parse_call_args_of(None)
+    }
+
+    /// The argument list of aggregate call `name`. Postgres's call syntax
+    /// also takes `DISTINCT`/`ALL` before the arguments, `ORDER BY` after them
+    /// and `FILTER (WHERE ...)` after the `)`; none is supported, so each is
+    /// refused by name (#1739) rather than read as a column or a stray token.
+    fn parse_aggregate_args(&mut self, name: &str) -> Result<Vec<Expr>, ParseError> {
+        // `count(distinct)` / `count(all, x)` stay what they were: `DISTINCT`
+        // with no argument after it is not the modifier form.
+        if let Token::Ident(word) = self.peek() {
+            let modifier = if word.eq_ignore_ascii_case("DISTINCT") {
+                Some("DISTINCT")
+            } else if word.eq_ignore_ascii_case("ALL") {
+                Some("ALL")
+            } else {
+                None
+            };
+            if let Some(modifier) = modifier
+                && !matches!(self.peek_at(1), Token::Symbol(')' | ','))
+            {
+                return Err(Self::aggregate_modifier(name, modifier));
+            }
+        }
+        let args = self.parse_call_args_of(Some(name))?;
+        self.refuse_filter_clause(name)?;
+        Ok(args)
+    }
+
+    fn aggregate_modifier(name: &str, modifier: &'static str) -> ParseError {
+        ParseError::UnsupportedAggregateModifier {
+            function: name.to_ascii_uppercase(),
+            modifier,
+        }
+    }
+
+    /// `<aggregate>(...) FILTER (WHERE ...)`: refused by name.
+    fn refuse_filter_clause(&self, name: &str) -> Result<(), ParseError> {
+        if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("FILTER"))
+            && self.peek_at(1) == &Token::Symbol('(')
+        {
+            return Err(Self::aggregate_modifier(name, "FILTER"));
+        }
+        Ok(())
+    }
+
+    fn parse_call_args_of(&mut self, aggregate: Option<&str>) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
         let mut tallest = 0;
         if self.peek_is_symbol(')') {
@@ -1991,6 +2039,12 @@ impl Parser {
             break;
         }
         self.last_height = tallest;
+        if let Some(name) = aggregate
+            && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("ORDER"))
+            && matches!(self.peek_at(1), Token::Ident(w) if w.eq_ignore_ascii_case("BY"))
+        {
+            return Err(Self::aggregate_modifier(name, "ORDER BY"));
+        }
         match self.advance() {
             Token::Symbol(')') => Ok(args),
             Token::Eof => Err(ParseError::UnexpectedEof {

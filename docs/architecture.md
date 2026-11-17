@@ -49,7 +49,7 @@ module mainly writes. Hidden per-definition tables are in the
 | `defs::live_table`, `defs::hierarchy`, `defs::row_security`, `defs::subscription`, `defs::partition_tree` | Checks of a source table: its columns, hierarchy, row-level security, subscription, partition tree. | |
 | `defs::floor`, `defs::floor_manifest`, `defs::numeric_sums` | Definition floors, the feature-floor manifest, numeric partials for older definitions. | |
 | `defs::refusal_tables` | The test that every refusal is in a [refusal table](transforms.md#refusals). | |
-| `defs::arithmetic_tests`, `defs::date_tests`, `defs::identifier_tests`, `defs::literal_tests`, `defs::logic_tests`, `defs::table_alias_tests`, `defs::table_key_tests` | Grammar tests by feature. | |
+| `defs::aggregate_modifier_tests`, `defs::arithmetic_tests`, `defs::date_tests`, `defs::identifier_tests`, `defs::literal_tests`, `defs::logic_tests`, `defs::table_alias_tests`, `defs::table_key_tests` | Grammar tests by feature. | |
 
 ## `staging`
 
