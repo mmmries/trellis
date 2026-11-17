@@ -253,8 +253,32 @@
   },
   {
     "date": "2026-11-13",
-    "runs": 5,
-    "hours": 1.34,
-    "rows_validated": 45900000
+    "runs": 16,
+    "hours": 10.8,
+    "rows_validated": 229103458
+  },
+  {
+    "date": "2026-11-14",
+    "runs": 13,
+    "hours": 11.03,
+    "rows_validated": 797637139
+  },
+  {
+    "date": "2026-11-15",
+    "runs": 18,
+    "hours": 15.23,
+    "rows_validated": 900820454
+  },
+  {
+    "date": "2026-11-16",
+    "runs": 19,
+    "hours": 9.8,
+    "rows_validated": 333821838
+  },
+  {
+    "date": "2026-11-17",
+    "runs": 0,
+    "hours": 0.0,
+    "rows_validated": 0
   }
 ]
