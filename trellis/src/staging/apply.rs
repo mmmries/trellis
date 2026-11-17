@@ -279,9 +279,10 @@ pub enum ApplyError {
     ResumeRefused {
         transform: String,
         reason: Box<crate::defs::catalog::CatalogError>,
-        /// The definition's stored status when it was refused: the message
-        /// says what it stays.
-        status: crate::defs::model::StoredStatus,
+        /// The definition's status when it was refused: the message says
+        /// what it stays. Only a field resume is refused on a definition
+        /// that isn't frozen.
+        status: crate::defs::model::TransformStatus,
     },
     /// A folded truncate of `src_table` carries no ring `lsn`. Not
     /// reachable: the capture trigger is the only writer of a truncate's
@@ -1081,15 +1082,18 @@ pub(super) fn earliest_src_changed(
 }
 
 /// The closing sentence of a refused resume: the definition keeps the status
-/// it had. A live definition is a refused field resume, whose field stays
-/// paused.
-fn resume_refused_stays(status: crate::defs::model::StoredStatus) -> &'static str {
-    use crate::defs::model::StoredStatus;
+/// it had. A whole resume is refused only on a frozen definition, so any
+/// other status is a refused field resume (on a `live` definition, or one
+/// mid field build), whose field stays paused.
+fn resume_refused_stays(status: crate::defs::model::TransformStatus) -> &'static str {
+    use crate::defs::model::TransformStatus;
     match status {
-        StoredStatus::Quarantined => "It stays quarantined",
-        StoredStatus::Paused => "It stays paused",
-        StoredStatus::Live => "The field stays paused",
-        StoredStatus::WaitingToBackfill | StoredStatus::Backfilling => "It stays as it is",
+        TransformStatus::Quarantined => "It stays quarantined",
+        TransformStatus::Paused => "It stays paused",
+        TransformStatus::WaitingToBackfill
+        | TransformStatus::Backfilling
+        | TransformStatus::CatchingUp
+        | TransformStatus::Live => "The field stays paused",
     }
 }
 
@@ -1105,10 +1109,12 @@ mod tests {
     /// stored status, not "paused" for all.
     #[test]
     fn resume_refused_message_follows_the_stored_status() {
-        use crate::defs::model::StoredStatus;
+        use crate::defs::model::TransformStatus;
         for (status, stays) in [
-            (StoredStatus::Quarantined, "It stays quarantined"),
-            (StoredStatus::Paused, "It stays paused"),
+            (TransformStatus::Quarantined, "It stays quarantined"),
+            (TransformStatus::Paused, "It stays paused"),
+            (TransformStatus::Live, "The field stays paused"),
+            (TransformStatus::Backfilling, "The field stays paused"),
         ] {
             let refused = ApplyError::ResumeRefused {
                 transform: "totals".to_string(),
@@ -1117,7 +1123,7 @@ mod tests {
             };
             let message = refused.to_string();
             assert!(message.ends_with(stays), "{message}");
-            if status == StoredStatus::Quarantined {
+            if status == TransformStatus::Quarantined {
                 assert!(!message.contains("paused"), "{message}");
             }
         }
