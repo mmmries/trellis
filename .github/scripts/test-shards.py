@@ -253,31 +253,45 @@ RUNNING = re.compile(r"Running(?:(?:\x1b|\^\[)\[[0-9;]*m|\s)+(unittests (\S+)|(\
 FINISHED = re.compile(r"finished in ([0-9.]+)s")
 
 
+def unit_times(lines, all_units):
+    """Seconds per unit from one log. The n-th `Running` line (stderr) is paired
+    with the n-th `finished in` line (stdout): CI interleaves the two streams
+    out of step, so a result line can follow another binary's `Running` line.
+    Each stream keeps its own order. Doc-test results come after every
+    `Running` line and are left unpaired."""
+    by_norm = {u.split(":", 1)[-1].replace("-", "_"): u for u in all_units if u != "lib"}
+    running, finished = [], []
+    for line in lines:
+        m = RUNNING.search(line)
+        if m:
+            src = m.group(2) or m.group(3)
+            exe = m.group(4).replace("-", "_")
+            if m.group(2) and src.endswith("src/lib.rs"):
+                running.append("lib")
+            elif m.group(2):
+                running.append(next((u for u in all_units if u.startswith("bin:") and u[4:].replace("-", "_") == exe), None))
+            else:
+                running.append(by_norm.get(exe))
+            continue
+        m = FINISHED.search(line)
+        if m:
+            finished.append(float(m.group(1)))
+    secs = {}
+    for unit, t in zip(running, finished):
+        if unit:
+            secs[unit] = secs.get(unit, 0.0) + t
+    return secs
+
+
 def cmd_weights(paths):
     """Parse the output of `cargo test --workspace ...` (CI log prefixes and
     colour codes tolerated) into a weights file on stdout."""
     all_units = units()
-    by_norm = {u.split(":", 1)[-1].replace("-", "_"): u for u in all_units if u != "lib"}
     secs = {}
-    current = None
     for path in paths:
         with open(path, errors="replace") as f:
-            for line in f:
-                m = RUNNING.search(line)
-                if m:
-                    src = m.group(2) or m.group(3)
-                    exe = m.group(4).replace("-", "_")
-                    if m.group(2) and src.endswith("src/lib.rs"):
-                        current = "lib"
-                    elif m.group(2):
-                        current = next((u for u in all_units if u.startswith("bin:") and u[4:].replace("-", "_") == exe), None)
-                    else:
-                        current = by_norm.get(exe)
-                    continue
-                m = FINISHED.search(line)
-                if m and current:
-                    secs[current] = secs.get(current, 0.0) + float(m.group(1))
-                    current = None
+            for u, t in unit_times(f, all_units).items():
+                secs[u] = secs.get(u, 0.0) + t
     print("# Seconds each test unit took on a CI runner (`finished in`, summed), used only to")
     print("# balance the `test` shards in ci.yml; see docs/testing-strategy.md to refresh.")
     print("# A unit missing here still runs, at the median weight, with a CI warning.")
