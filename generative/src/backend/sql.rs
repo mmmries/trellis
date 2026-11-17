@@ -609,31 +609,12 @@ fn partition_action_sql(
             standalone,
         } => {
             let quoted = quote_ident(leaf);
-            let mut sql = String::new();
-            if *standalone {
-                sql.push_str(&format!("create table {quoted} (like {root}); "));
+            let mut sql = if *standalone {
+                format!("create table {quoted} (like {root}); ")
             } else {
-                sql.push_str(&format!(
-                    "create table {quoted} partition of {root} {bound}; "
-                ));
-            }
-            for row in rows {
-                let columns: Vec<String> = row.iter().map(|(c, _)| quote_ident(c)).collect();
-                let values: Vec<String> = row
-                    .iter()
-                    .map(|(c, v)| match v {
-                        Some(v) => {
-                            format!("{}::{}", quote_literal(v), column_pg_type(tables, table, c))
-                        }
-                        None => "null".to_string(),
-                    })
-                    .collect();
-                sql.push_str(&format!(
-                    "insert into {quoted} ({}) values ({}); ",
-                    columns.join(", "),
-                    values.join(", ")
-                ));
-            }
+                format!("create table {quoted} partition of {root} {bound}; ")
+            };
+            push_inserts(&mut sql, tables, table, &quoted, rows);
             if *standalone {
                 sql.push_str(&format!(
                     "alter table {root} attach partition {quoted} {bound}; "
@@ -641,6 +622,68 @@ fn partition_action_sql(
             }
             sql
         }
+        PartitionAction::CreateMiddle {
+            middle,
+            bound,
+            leaves,
+            rows,
+            standalone,
+        } => {
+            let quoted = quote_ident(middle);
+            let key = quote_ident(
+                &tables[table]
+                    .partitioning
+                    .as_ref()
+                    .expect("a middle's root is partitioned — a generator bug")
+                    .column,
+            );
+            let mut sql = if *standalone {
+                format!("create table {quoted} (like {root}) partition by list ({key}); ")
+            } else {
+                format!(
+                    "create table {quoted} partition of {root} {bound} partition by list ({key}); "
+                )
+            };
+            for (leaf, leaf_bound) in leaves {
+                sql.push_str(&format!(
+                    "create table {} partition of {quoted} {leaf_bound}; ",
+                    quote_ident(leaf)
+                ));
+            }
+            push_inserts(&mut sql, tables, table, &quoted, rows);
+            if *standalone {
+                sql.push_str(&format!(
+                    "alter table {root} attach partition {quoted} {bound}; "
+                ));
+            }
+            sql
+        }
+    }
+}
+
+/// Appends an `INSERT` into the relation `quoted` of each of `rows`, each a
+/// full row of the root `table`'s columns.
+fn push_inserts(
+    sql: &mut String,
+    tables: &HashMap<String, Table>,
+    table: &str,
+    quoted: &str,
+    rows: &[Vec<(String, Option<String>)>],
+) {
+    for row in rows {
+        let columns: Vec<String> = row.iter().map(|(c, _)| quote_ident(c)).collect();
+        let values: Vec<String> = row
+            .iter()
+            .map(|(c, v)| match v {
+                Some(v) => format!("{}::{}", quote_literal(v), column_pg_type(tables, table, c)),
+                None => "null".to_string(),
+            })
+            .collect();
+        sql.push_str(&format!(
+            "insert into {quoted} ({}) values ({}); ",
+            columns.join(", "),
+            values.join(", ")
+        ));
     }
 }
 
