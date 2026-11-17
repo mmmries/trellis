@@ -242,9 +242,10 @@ old comparison is taken out under the new one, so `SUM(CASE WHEN status =
 `'open'` row once an `'OPEN'` row leaves it. A `WHERE` comparing the column
 gets membership wrong the same way: under `WHERE status = 'open'` a 1-1
 target lacks an `'OPEN'` row until that row next changes, and an aggregate
-takes an `'OPEN'` row out of a group it was never counted in. A text function that refuses a
-nondeterministic collation (`STRPOS`) raises `0A000` on every change instead,
-and the definition is quarantined, which is reported.
+takes an `'OPEN'` row out of a group it was never counted in. A text
+function that refuses a nondeterministic collation (`STRPOS`) raises `0A000`
+on every change instead, and the definition is quarantined, which is
+reported.
 
 **Detected by:** `self_check`.
 

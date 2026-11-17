@@ -375,10 +375,8 @@ fn chunk_pick(plan: &OneToOnePlan, lo: &Option<Vec<String>>, keys_param: &str) -
         crate::defs::backfill::pk_range_where(&idents, &plan.pk, lo)
     };
     Pick {
-        src_from: format!(
-            "where {} and {k_src} = any({keys_param}::text[])",
-            qualify("s")
-        ),
+        src_join: None,
+        src_cond: format!("{} and {k_src} = any({keys_param}::text[])", qualify("s")),
         target_where: format!("{} and {k_tgt} = any({keys_param}::text[])", qualify("t")),
         keys: keys_param.to_string(),
     }
@@ -710,15 +708,16 @@ async fn rederive_keys(
 /// column names, which a user column named like a part would make ambiguous.
 pub(in crate::staging) fn sweep_pick(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> Pick {
     let arm = ArmSql::named(pk, pattern, "u", 2, |_, n| format!("__trellis_p{n}"));
-    let (src_from, target_where) = match arm.relation() {
+    let (src_join, target_where) = match arm.relation() {
         Some(keys) => (
-            format!("join {keys} on {}", arm.matches("s")),
+            Some(format!("join {keys}")),
             format!("exists (select 1 from {keys} where {})", arm.matches("t")),
         ),
-        None => (format!("where {}", arm.matches("s")), arm.matches("t")),
+        None => (None, arm.matches("t")),
     };
     Pick {
-        src_from,
+        src_join,
+        src_cond: arm.matches("s"),
         target_where,
         keys: "$1".to_string(),
     }
@@ -775,14 +774,32 @@ async fn lock_chunk_entries(
 /// How a chunk or a sweep batch picks its keys' rows in
 /// [`rederive_statement`].
 pub(in crate::staging) struct Pick {
-    /// What follows `from <source> s` in the source read: the join and
-    /// filter that pick the locked keys' rows.
-    pub(in crate::staging) src_from: String,
+    /// The join, if any, that picks the locked keys' rows in the source
+    /// read, without its `on`: [`Self::src_cond`] is its condition.
+    src_join: Option<String>,
+    /// The condition over the source aliased `s` that picks the locked
+    /// keys' rows: the join's `on`, or with no join the `where`.
+    src_cond: String,
     /// A predicate over the target aliased `t` that picks the locked keys'
     /// target rows.
     pub(in crate::staging) target_where: String,
     /// The locked keys' `text[]` parameter.
     keys: String,
+}
+
+impl Pick {
+    /// What follows `from <source> s` in the source read: the join and
+    /// filter that pick the locked keys' rows, and `member` with them.
+    pub(in crate::staging) fn src_from(&self, member: Option<&str>) -> String {
+        let cond = match member {
+            Some(member) => format!("{} and {member}", self.src_cond),
+            None => self.src_cond.clone(),
+        };
+        match &self.src_join {
+            Some(join) => format!("{join} on {cond}"),
+            None => format!("where {cond}"),
+        }
+    }
 }
 
 /// The plan settings a 1-1 chunk's or sweep batch's statement runs under,
@@ -1002,13 +1019,7 @@ fn rederive_statement(
 /// with no row (ADR-0002, Re-derive): the statement deletes its target row
 /// and makes its entry a tombstone. A field build writes member rows only.
 fn src_from(plan: &OneToOnePlan, pick: &Pick) -> String {
-    match &plan.predicate {
-        None => pick.src_from.clone(),
-        Some(member) if pick.src_from.starts_with("where ") => {
-            format!("{} and {member}", pick.src_from)
-        }
-        Some(member) => format!("{} where {member}", pick.src_from),
-    }
+    pick.src_from(plan.predicate.as_deref())
 }
 
 /// A field build's chunk statement ([`run_field_chunk`]): rewrites `fields`,
@@ -1174,5 +1185,31 @@ mod unit_tests {
             );
             assert!(SWEEP_TAGS.contains(&tag));
         }
+    }
+
+    /// A `WHERE`'s membership joins either pick's source condition: the
+    /// join's `on` of a sweep batch's keys with a value, and the `where` of
+    /// its keys that are all `NULL` (and of a chunk).
+    #[test]
+    fn a_pick_carries_the_membership_in_either_shape() {
+        use crate::defs::ddl::PrimaryKeyColumn;
+        let key = vec![PrimaryKeyColumn {
+            name: "id".to_string(),
+            data_type: "integer".to_string(),
+            nullable: true,
+            collation: None,
+        }];
+        let member = Some(r#"((s."w" > 0) is true)"#);
+        let valued = super::sweep_pick(&key, &[false]);
+        assert_eq!(
+            valued.src_from(member),
+            r#"join unnest($2::text[]::integer[]) as u(__trellis_p0) on s."id" = u.__trellis_p0 and ((s."w" > 0) is true)"#
+        );
+        let nulls = super::sweep_pick(&key, &[true]);
+        assert_eq!(nulls.src_from(None), r#"where s."id" is null"#);
+        assert_eq!(
+            nulls.src_from(member),
+            r#"where s."id" is null and ((s."w" > 0) is true)"#
+        );
     }
 }

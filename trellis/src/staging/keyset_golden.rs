@@ -64,7 +64,7 @@ fn keyset_statements_are_unchanged() {
         for pattern in &patterns {
             let p: String = pattern.iter().map(|&n| if n { 'N' } else { 'v' }).collect();
             let pick = super::build::one_to_one::sweep_pick(pk, pattern);
-            golden.add(&format!("{n} {p}: sweep source"), &pick.src_from);
+            golden.add(&format!("{n} {p}: sweep source"), &pick.src_from(None));
             golden.add(&format!("{n} {p}: sweep target"), &pick.target_where);
             let lock = super::apply::lock_statement("tgt", pk, pattern, "cols");
             golden.add(&format!("{n} {p}: lock"), &lock);
