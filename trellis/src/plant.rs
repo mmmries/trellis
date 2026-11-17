@@ -902,6 +902,49 @@ pub enum Plant {
     /// `a_release_names_groups_from_group_only_images` and
     /// `a_crossing_update_around_a_group_recompute`.
     GbWhereFilteredNaming,
+    /// ADR-0002, #1991 (`o2o_where_apply_unfiltered`): a plain 1-1 page
+    /// writes every Apply's image whatever its `WHERE` gives
+    /// (`staging::apply`'s `failing_apply_keys`), so a change that leaves a
+    /// row failing keeps a target row. Fires only on a definition with a
+    /// `WHERE`.
+    ///
+    /// Pinned by `one_to_one_where`'s
+    /// `every_transition_matches_the_filtered_query`.
+    O2oWhereApplyUnfiltered,
+    /// #1991 rule 3 (`o2o_where_null_as_true`): a plain 1-1's membership
+    /// reads `(<p>) is not false` (`staging::one_to_one_render`), so a row
+    /// whose `WHERE` is `NULL` gets a target row. Fires only on a definition
+    /// with a `WHERE`.
+    ///
+    /// Pinned by `one_to_one_where`'s
+    /// `every_transition_matches_the_filtered_query`.
+    O2oWhereNullAsTrue,
+    /// #1991 rule 12 (`o2o_where_build_unfiltered`): a plain 1-1's build
+    /// writes every source row, its `WHERE` ignored
+    /// (`staging::build::one_to_one`'s plan), so a build leaves each failing
+    /// row in the target until its next change. Fires only on a definition
+    /// with a `WHERE`.
+    ///
+    /// Pinned by `one_to_one_where`'s `request_backfill_repairs_membership`.
+    O2oWhereBuildUnfiltered,
+    /// #1991 rule 16 (`o2o_where_no_tombstone`): a change that leaves a
+    /// plain 1-1 row failing deletes its target row but records a live
+    /// entry, not a tombstone (`staging::apply`), so the ledger outgrows the
+    /// target. Fires only on a page with such a change.
+    ///
+    /// Pinned by `one_to_one_where`'s
+    /// `a_failing_apply_with_no_entry_leaves_a_tombstone`.
+    O2oWhereNoTombstone,
+    /// ADR-0019, #2042 (`join_where_m_unfiltered`): a join aggregate's
+    /// `WHERE` filters the `FROM` side's rows (`P`) but not the joined
+    /// side's (`M`) (`staging::join`'s side plans), so a joined row the
+    /// `WHERE` excludes still matches. Fires only on a definition with a
+    /// conjunct over the joined table.
+    ///
+    /// Pinned by `join_where`'s
+    /// `each_side_filters_its_own_rows_through_build_and_every_crossing` and
+    /// `truncate_and_resume_keep_the_filter`.
+    JoinWhereMUnfiltered,
 }
 
 impl Plant {
@@ -992,6 +1035,11 @@ impl Plant {
         Plant::GbWhereNullAsTrue,
         Plant::GbWhereBuildUnfiltered,
         Plant::GbWhereFilteredNaming,
+        Plant::O2oWhereApplyUnfiltered,
+        Plant::O2oWhereNullAsTrue,
+        Plant::O2oWhereBuildUnfiltered,
+        Plant::O2oWhereNoTombstone,
+        Plant::JoinWhereMUnfiltered,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -1082,6 +1130,11 @@ impl Plant {
             Plant::GbWhereNullAsTrue => "gb_where_null_as_true",
             Plant::GbWhereBuildUnfiltered => "gb_where_build_unfiltered",
             Plant::GbWhereFilteredNaming => "gb_where_filtered_naming",
+            Plant::O2oWhereApplyUnfiltered => "o2o_where_apply_unfiltered",
+            Plant::O2oWhereNullAsTrue => "o2o_where_null_as_true",
+            Plant::O2oWhereBuildUnfiltered => "o2o_where_build_unfiltered",
+            Plant::O2oWhereNoTombstone => "o2o_where_no_tombstone",
+            Plant::JoinWhereMUnfiltered => "join_where_m_unfiltered",
         }
     }
 

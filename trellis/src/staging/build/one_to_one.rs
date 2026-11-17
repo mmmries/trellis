@@ -141,6 +141,10 @@ impl OneToOnePlan {
             .predicate
             .filter()
             .map(|p| one_to_one_render::membership_sql(p, "s"));
+        // Planted bug: the build ignores the `WHERE`. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let predicate = predicate
+            .filter(|_| !crate::plant::fires(crate::plant::Plant::O2oWhereBuildUnfiltered, true));
         let fields = definition
             .def
             .fields

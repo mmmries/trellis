@@ -415,6 +415,27 @@ fn side_membership(def: &TransformDef, side: Side) -> Option<group_basis::Member
     })
 }
 
+/// Planted bug: the joined side's rows reach `M` whatever its filter gives
+/// (its arguments stay guarded), so `M` counts every row the `WHERE`
+/// excludes. See `crate::plant`.
+fn planted_unfiltered_m(
+    side: Side,
+    predicate: Option<group_basis::Membership>,
+) -> Option<group_basis::Membership> {
+    #[cfg(any(test, feature = "test-util"))]
+    if predicate.is_some()
+        && crate::plant::fires(
+            crate::plant::Plant::JoinWhereMUnfiltered,
+            matches!(side, Side::Joined(_)),
+        )
+    {
+        return None;
+    }
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = side;
+    predicate
+}
+
 /// The name of a `JOIN` working table (a session temp table, bare):
 /// `prefix`, the definition id, and a hash of the columns of the hidden
 /// table it copies (`hidden_columns`, from [`hidden_table_columns`]). The
@@ -606,7 +627,7 @@ impl JoinTargetPlan {
                             args,
                             aggs: Vec::new(),
                             fields: Vec::new(),
-                            predicate,
+                            predicate: planted_unfiltered_m(side, predicate),
                         },
                         Writer::JoinPartials {
                             deltas: deltas.clone(),

@@ -1683,12 +1683,13 @@ fn sample<T: std::fmt::Debug>(strategy: impl Strategy<Value = T>, count: usize) 
 
 /// #2043: every crossing bucket of a `WHERE` (a change that keeps a row in,
 /// takes it out, brings it in, or keeps it out) is drawn, for each key space
-/// that draws a `WHERE`: the plain aggregate (the serial and
-/// concurrent tiers) and the 1-1 `JOIN` (its two-table and star tiers). An
-/// empty bucket is coverage that dropped out. The plain 1-1 (#2038) and the
-/// join aggregate (#2042) join the list when they draw one.
+/// that draws a `WHERE`: the plain aggregate and the plain 1-1 (the serial
+/// and concurrent tiers), the join aggregate (the `JOIN` tier) and the 1-1
+/// `JOIN` (its two-table and star tiers). An empty bucket is coverage that
+/// dropped out.
 #[test]
 fn every_where_crossing_bucket_is_drawn_for_each_filtering_key_space() {
+    use generative::generate::join::join_case_strategy;
     use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
     use generative::generate::where_clause::BUCKETS;
 
@@ -1702,6 +1703,16 @@ fn every_where_crossing_bucket_is_drawn_for_each_filtering_key_space() {
         sample(hot_key_case(), 16)
             .into_iter()
             .map(|c| ("hot_key", c.program)),
+    );
+    programs.extend(
+        sample(cooling_key_case(), 16)
+            .into_iter()
+            .map(|c| ("cooling_key", c.program)),
+    );
+    programs.extend(
+        sample(join_case_strategy(), 24)
+            .into_iter()
+            .map(|c| ("join", c.program)),
     );
     programs.extend(
         sample(one_to_one_case_strategy(), 24)
@@ -1719,7 +1730,10 @@ fn every_where_crossing_bucket_is_drawn_for_each_filtering_key_space() {
     }
     for (tier, key_space) in [
         ("trivial", "Aggregate"),
+        ("trivial", "OneToOne"),
         ("hot_key", "Aggregate"),
+        ("cooling_key", "OneToOne"),
+        ("join", "Join"),
         ("join_one_to_one", "JoinOneToOne"),
         ("join_star", "JoinOneToOne"),
     ] {
@@ -1744,7 +1758,9 @@ fn every_where_crossing_bucket_is_drawn_for_each_filtering_key_space() {
 
 /// #2043: a drawn `WHERE` renders and parses back to itself (the backend
 /// installs a definition from its text), and define's checks admit every
-/// drawn aggregate's: the predicates are total (#1991 rule 4).
+/// drawn plain aggregate's and plain 1-1's: the predicates are total (#1991
+/// rule 4). The join aggregate's per-side rule is
+/// `where_clause`'s own unit test.
 #[test]
 fn every_drawn_where_round_trips_and_is_admitted() {
     use generative::generate::join_one_to_one::star_case_strategy;
@@ -1752,6 +1768,11 @@ fn every_drawn_where_round_trips_and_is_admitted() {
 
     let mut programs = sample(trivial_program(), 200);
     programs.extend(sample(hot_key_case(), 8).into_iter().map(|c| c.program));
+    programs.extend(
+        sample(generative::generate::join::join_case_strategy(), 24)
+            .into_iter()
+            .map(|c| c.program),
+    );
     programs.extend(
         sample(star_case_strategy(), 24)
             .into_iter()
@@ -1768,7 +1789,7 @@ fn every_drawn_where_round_trips_and_is_admitted() {
             let text = render_definition_text(def);
             let back = parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
             assert_eq!(back.predicate, def.predicate, "{text}");
-            if let KeySpace::Aggregate { .. } = def.key_space {
+            if let KeySpace::Aggregate { .. } | KeySpace::OneToOne = def.key_space {
                 let table = program
                     .tables
                     .iter()

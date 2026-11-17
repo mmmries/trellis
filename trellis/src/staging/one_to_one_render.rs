@@ -102,7 +102,18 @@ impl OneToOneRender {
         paused: &HashSet<String>,
     ) -> Result<Self, ApplyError> {
         let substituted = crate::defs::backfill::substitute_all_fields(def)?;
-        let predicate = def.predicate.filter().map(|p| membership_sql(p, "s"));
+        let predicate = def.predicate.filter().map(|p| {
+            // Planted bug: a `NULL` predicate makes the row a member. See
+            // `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            if crate::plant::fires(crate::plant::Plant::O2oWhereNullAsTrue, true) {
+                return format!(
+                    "(({}) is not false)",
+                    crate::defs::oracle::render_qualified_expr_sql(p, "s")
+                );
+            }
+            membership_sql(p, "s")
+        });
         let mut read: BTreeSet<String> = BTreeSet::new();
         let mut fields = Vec::with_capacity(def.fields.len());
         for (field, expr) in def.fields.iter().zip(&substituted) {

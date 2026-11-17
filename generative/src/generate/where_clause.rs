@@ -5,10 +5,9 @@
 //!
 //! # Which definitions draw one
 //!
-//! [`filters`] names the key spaces that draw one: the plain aggregate
-//! without `MIN`/`MAX` (define refuses an extreme under a filter) and the 1-1
-//! `JOIN` and star. The plain 1-1 and the join aggregate draw none yet
-//! (#2043): each needs a template set in [`with_predicates`].
+//! [`filters`] names the key spaces that draw one: every key space but the
+//! plain aggregate with `MIN`/`MAX` (define refuses an extreme under a
+//! filter).
 //!
 //! # Seeds stay what they were
 //!
@@ -25,15 +24,18 @@
 //! `COALESCE` and `%` by a nonzero literal, over the columns the generators
 //! update, so rows cross the predicate both ways. A few are degenerate
 //! (`FALSE`, `NULL`, `(TRUE)`), which define accepts (#1991 rule 6). A plain
-//! aggregate's read its source's `c1`, `c2`, flag and grain columns: a
-//! `MoveGroup` crosses and changes group at once. A 1-1 `JOIN`'s read `ja`
-//! and one or two joined tables: cross-table comparisons, an anti-join
-//! (`jb.id IS NULL`) and a column of an unmatched `LEFT` row, so a `b`
-//! change crosses every row on its key.
+//! aggregate's and a plain 1-1's read their source's `c1`, `c2`, flag and
+//! grain columns: a `MoveGroup` crosses and changes group at once. A 1-1
+//! `JOIN`'s read `ja` and one or two joined tables: cross-table comparisons,
+//! an anti-join (`jb.id IS NULL`) and a column of an unmatched `LEFT` row, so
+//! a `b` change crosses every row on its key. A join aggregate's keep
+//! ADR-0019's per-side rule ([`join_aggregate_predicate`]).
 
 use std::collections::HashMap;
 
-use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::dev::defs::ast::{
+    Expr, JoinKind, KeySpace, Operator, Predicate, TransformDef, ValueType,
+};
 
 use crate::model::{Program, Table};
 
@@ -46,10 +48,7 @@ pub fn filters(def: &TransformDef) -> bool {
     match &def.key_space {
         // #2039: `MIN`/`MAX` under a filter is refused (`FilteredExtreme`).
         KeySpace::Aggregate { .. } => !def.fields.iter().any(|f| has_extreme(&f.expr)),
-        // #2041.
-        KeySpace::JoinOneToOne(_) => true,
-        // The plain 1-1 and the join aggregate: not drawn yet (#2043).
-        KeySpace::OneToOne | KeySpace::Join(_) => false,
+        KeySpace::OneToOne | KeySpace::JoinOneToOne(_) | KeySpace::Join(_) => true,
     }
 }
 
@@ -102,7 +101,7 @@ pub fn with_predicates(mut program: Program) -> Program {
         }
         let draw = mix(draw);
         let expr = match &def.key_space {
-            KeySpace::Aggregate { .. } => tables
+            KeySpace::Aggregate { .. } | KeySpace::OneToOne => tables
                 .iter()
                 .find(|t| t.name == def.source)
                 .and_then(|table| aggregate_predicate(draw, table)),
@@ -110,8 +109,15 @@ pub fn with_predicates(mut program: Program) -> Program {
                 let joined: Vec<&str> = join.joins.iter().map(|j| j.right.as_str()).collect();
                 Some(join_one_to_one_predicate(draw, &def.source, &joined))
             }
-            // C (#2038) and G (#2042) add their templates here.
-            KeySpace::OneToOne | KeySpace::Join(_) => None,
+            KeySpace::Join(join) => {
+                let left = join.joins[0].kind == JoinKind::Left;
+                Some(join_aggregate_predicate(
+                    draw,
+                    &def.source,
+                    &join.joins[0].right,
+                    left,
+                ))
+            }
         };
         if let Some(expr) = expr {
             def.predicate = Predicate::Filter(expr);
@@ -264,6 +270,94 @@ pub fn join_one_to_one_predicate(draw: u64, source: &str, joined: &[&str]) -> Ex
         9 => binary(Operator::GreaterThanOrEqual, j("y"), qualified(other, "y")),
         _ => degenerate(draw >> 24),
     }
+}
+
+/// How many conjunct templates [`join_aggregate_predicate`] draws each
+/// conjunct from.
+pub const JOIN_AGGREGATE_CONJUNCTS: u64 = 6;
+
+/// A join aggregate's predicate over its `FROM` table `source` and its
+/// `joined` table (the JOIN tier's shape, `generate::join`: `ga`, `t`, `k`
+/// on the `FROM` side, `gb`, `t`, `k` on the joined side, all `integer`;
+/// the aggregate arguments `x` and `y` are left out, as their type varies).
+/// ADR-0019's per-side rule holds: one or two top-level `AND` conjuncts,
+/// each reading one side and at least one column, and under `LEFT` none
+/// reading the joined side ([`join_side_conjuncts`]).
+pub fn join_aggregate_predicate(draw: u64, source: &str, joined: &str, left: bool) -> Expr {
+    let conjunct = |draw: u64, table: &str, group: &str| -> Expr {
+        let c = |column: &str| qualified(table, column);
+        let g = (draw >> 8) as i64 % 4;
+        match draw % JOIN_AGGREGATE_CONJUNCTS {
+            0 => binary(Operator::NotEqual, c(group), number(g)),
+            1 => binary(Operator::Equal, c("t"), number(1)),
+            2 => is_null(c(group), true),
+            3 => binary(
+                Operator::GreaterThanOrEqual,
+                coalesce(c(group), number(0)),
+                number(g),
+            ),
+            4 => binary(
+                Operator::Equal,
+                binary(Operator::Modulo, c("k"), number(2)),
+                number(0),
+            ),
+            _ => binary(
+                Operator::Or,
+                binary(Operator::Equal, c("t"), number(0)),
+                binary(Operator::GreaterThan, c(group), number(1)),
+            ),
+        }
+    };
+    let side = |draw: u64| -> Expr {
+        if left || draw.is_multiple_of(2) {
+            conjunct(draw >> 1, source, "ga")
+        } else {
+            conjunct(draw >> 1, joined, "gb")
+        }
+    };
+    let first = side(draw >> 16);
+    // One conjunct in three; else two, of the same side or of both.
+    if (draw >> 48).is_multiple_of(3) {
+        first
+    } else {
+        binary(Operator::And, first, side(draw >> 32))
+    }
+}
+
+/// A join aggregate's `WHERE` split by side (ADR-0019): the `AND` of the
+/// top-level conjuncts that read `table`, for each table one does.
+pub fn join_side_conjuncts(predicate: &Expr) -> HashMap<String, Expr> {
+    fn collect<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                op: Operator::And,
+                lhs,
+                rhs,
+            } => {
+                collect(lhs, out);
+                collect(rhs, out);
+            }
+            _ => out.push(expr),
+        }
+    }
+    let mut conjuncts = Vec::new();
+    collect(predicate, &mut conjuncts);
+    let mut out: HashMap<String, Expr> = HashMap::new();
+    for conjunct in conjuncts {
+        let mut table = None;
+        conjunct.walk(&mut |e| {
+            if let Expr::SourceColumn { table: t, .. } = e {
+                table = Some(t.clone());
+            }
+        });
+        let Some(table) = table else { continue };
+        let joined = match out.remove(&table) {
+            Some(lhs) => binary(Operator::And, lhs, conjunct.clone()),
+            None => conjunct.clone(),
+        };
+        out.insert(table, joined);
+    }
+    out
 }
 
 /// A value in [`eval`]: SQL `NULL`, or a typed value. A column's text is
@@ -465,6 +559,35 @@ mod tests {
             Some(true)
         );
         assert_eq!(eval_on(&Expr::Null, &r), None);
+    }
+
+    #[test]
+    fn a_join_aggregate_predicate_keeps_adr_0019s_per_side_rule() {
+        let (mut both, mut joined) = (0, 0);
+        for i in 0..2000u64 {
+            let draw = mix(i);
+            for left in [false, true] {
+                let expr = join_aggregate_predicate(draw, "ja", "jb", left);
+                let sides = join_side_conjuncts(&expr);
+                assert!(!sides.is_empty(), "{expr:?} reads no column");
+                for side in sides.values() {
+                    let mut tables = std::collections::BTreeSet::new();
+                    side.walk(&mut |e| {
+                        if let Expr::SourceColumn { table, .. } = e {
+                            tables.insert(table.clone());
+                        }
+                    });
+                    assert_eq!(tables.len(), 1, "a side's conjuncts read one table");
+                }
+                assert!(
+                    !(left && sides.contains_key("jb")),
+                    "LEFT reads jb: {expr:?}"
+                );
+                joined += usize::from(sides.contains_key("jb"));
+                both += usize::from(sides.len() == 2);
+            }
+        }
+        assert!(joined > 200 && both > 100, "joined {joined}, both {both}");
     }
 
     #[test]

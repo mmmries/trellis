@@ -117,7 +117,11 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::EarlyTombstoneGc
         | Plant::ChunkWithoutEntryLock
         | Plant::HeldKeyUnlisted
-        | Plant::HeldKeyDeleteApplies => PlantPath::OneToOne,
+        | Plant::HeldKeyDeleteApplies
+        | Plant::O2oWhereApplyUnfiltered
+        | Plant::O2oWhereNullAsTrue
+        | Plant::O2oWhereBuildUnfiltered
+        | Plant::O2oWhereNoTombstone => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild
@@ -137,7 +141,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         Plant::JoinNoJLock
         | Plant::JoinOtherSideBeforeJ
         | Plant::JoinDropFlip
-        | Plant::JoinTSkipLock => PlantPath::Join,
+        | Plant::JoinTSkipLock
+        | Plant::JoinWhereMUnfiltered => PlantPath::Join,
         Plant::Join1NoJLock
         | Plant::Join1NoRecheck
         | Plant::Join1LsnOnly

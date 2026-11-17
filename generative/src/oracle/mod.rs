@@ -559,12 +559,13 @@ fn render_select(def: &TransformDef, pk_column: &str, exact: &ExactFields) -> St
     }
 }
 
-/// ` where <p>`, `def`'s `WHERE` rendered by `render` as the definition
-/// wrote it, or nothing for `TRUE`.
+/// ` where (<p>)`, `def`'s `WHERE` rendered by `render` as the definition
+/// wrote it, or nothing for `TRUE`. The parentheses let a caller append
+/// ` and <condition>`.
 fn where_sql(def: &TransformDef, render: fn(&Expr) -> String) -> String {
     match &def.predicate {
         Predicate::True => String::new(),
-        Predicate::Filter(expr) => format!(" where {}", render(expr)),
+        Predicate::Filter(expr) => format!(" where ({})", render(expr)),
     }
 }
 
@@ -874,9 +875,12 @@ pub async fn sql_oracle_per_row(
             &[],
         )
         .await?;
+    // A filtered select already ends in ` where (<p>)` ([`where_sql`]).
+    let filtered = def.predicate != Predicate::True;
     let one_row = format!(
-        "{} where {pk}::text = $1",
-        render_select(def, pk_column, &ExactFields::new())
+        "{} {} {pk}::text = $1",
+        render_select(def, pk_column, &ExactFields::new()),
+        if filtered { "and" } else { "where" }
     );
     let mut rows: Rows = BTreeMap::new();
     for key in keys {
@@ -889,6 +893,8 @@ pub async fn sql_oracle_per_row(
                 }
                 rows.insert(key, by_column);
             }
+            // The row fails the `WHERE`: it has no target row.
+            Ok(None) if filtered => {}
             // Deleted since the key list was read: the harness writes nothing
             // while it checks, so this is a bug in the oracle's own reads.
             Ok(None) => panic!("oracle: {key:?} vanished from {source} mid-check"),
@@ -1630,9 +1636,10 @@ pub fn chained_relation(
         ));
     }
     format!(
-        "(select {} from {}) as {}",
+        "(select {} from {}{}) as {}",
         select.join(", "),
         table_sql(&source.name, upstream.explicit_source_schema.as_deref()),
+        where_sql(upstream, render_expr),
         quote_ident(table)
     )
 }
@@ -2012,6 +2019,45 @@ mod tests {
         assert!(printed.contains("d0[1].total: expected=5 got=4"));
         assert!(printed.contains("program:"));
         assert!(printed.contains("Program"));
+    }
+
+    #[test]
+    fn a_chained_upstream_keeps_its_where() {
+        let mut names = crate::model::NamePool::new();
+        let table = Table::new(&mut names, &[ValueType::Numeric]);
+        let c1 = table.columns[1].name.clone();
+        let upstream = TransformDef {
+            target: "up".into(),
+            source: table.name.clone(),
+            key_space: KeySpace::OneToOne,
+            fields: vec![trellis::dev::defs::ast::FieldDef {
+                name: "v".into(),
+                expr: Expr::Column(c1.clone()),
+            }],
+            predicate: Predicate::Filter(Expr::BinaryOp {
+                op: Operator::GreaterThan,
+                lhs: Box::new(Expr::Column(c1.clone())),
+                rhs: Box::new(Expr::NumberLiteral("5".into())),
+            }),
+            without_source_index: false,
+            adopt_target: false,
+            source_key: None,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
+        };
+        let program = Program {
+            tables: vec![table.clone()],
+            defs: vec![upstream.clone()],
+            def_install_after_op: vec![0],
+            ops: Vec::new(),
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
+        };
+        let relation = chained_relation(&program, &[upstream], "up", None);
+        assert!(
+            relation.ends_with(&format!(" where ((\"{c1}\" > 5))) as \"up\"")),
+            "{relation}"
+        );
     }
 
     #[test]
