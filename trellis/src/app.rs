@@ -114,7 +114,7 @@ use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::{Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT};
 use crate::defs::source_index::{ExtremeIndexGap, SourceIndexGap};
 use crate::defs::{self, CatalogError, ParseError, StoredStatus, TransformStatus, ValueType};
-use crate::error_code::{self, ErrorCode, ErrorId, Message as _};
+use crate::error_code::{self, ErrorCode, ErrorId, Message as _, SharedCondition};
 use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
@@ -3265,7 +3265,9 @@ impl TrellisError {
             TrellisError::Client(err) => err.error_id(),
             TrellisError::Engine(err) => err.error_id(),
             TrellisError::Db(..) => ErrorId(208),
-            TrellisError::SourceTableNotFound(..) => ErrorId(209),
+            TrellisError::SourceTableNotFound(..) => {
+                SharedCondition::SourceTableNotFound.error_id()
+            }
             TrellisError::TableNotCaptured { .. } => ErrorId(210),
             TrellisError::AmbiguousSourceTable { .. } => ErrorId(211),
             TrellisError::BlockingSpawn(..) => ErrorId(212),
@@ -3274,7 +3276,7 @@ impl TrellisError {
             TrellisError::CancelledByShutdown => ErrorId(215),
             TrellisError::CalledFromAsyncContext => ErrorId(216),
             TrellisError::Apply(err) => err.error_id(),
-            TrellisError::TransformNotFound(..) => ErrorId(217),
+            TrellisError::TransformNotFound(..) => SharedCondition::TransformNotFound.error_id(),
             TrellisError::ColumnNotFound { .. } => ErrorId(218),
             TrellisError::Staging(err) => err.error_id(),
             TrellisError::SelfCheck(err) => err.error_id(),
