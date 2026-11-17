@@ -121,7 +121,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::O2oWhereApplyUnfiltered
         | Plant::O2oWhereNullAsTrue
         | Plant::O2oWhereBuildUnfiltered
-        | Plant::O2oWhereNoTombstone => PlantPath::OneToOne,
+        | Plant::O2oWhereNoTombstone
+        | Plant::O2oWhereColumnNotImaged => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild
@@ -134,7 +135,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::GbWhereOldImage
         | Plant::GbWhereNullAsTrue
         | Plant::GbWhereBuildUnfiltered
-        | Plant::GbWhereFilteredNaming => PlantPath::GroupBasis,
+        | Plant::GbWhereFilteredNaming
+        | Plant::GbWhereColumnNotImaged => PlantPath::GroupBasis,
         Plant::GbLsnNotVisibility | Plant::GbFoldSidesPerKey | Plant::GbEarlyZeroGc => {
             PlantPath::GroupBasisWriter
         }

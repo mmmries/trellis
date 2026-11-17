@@ -1838,6 +1838,26 @@ const FILTERED_NAMING_UNREACHED: (&str, &str) = (
      cases fired it); its deterministic pins gate it",
 );
 
+/// The plants of a predicate column an image lacks (#1991 rule 11), which
+/// no concurrent tier reaches: an image lacks a column only when it was
+/// staged before a capture widen, and no tier widens a source. Each
+/// `an_image_without_the_predicate_column_fails_the_page` pin
+/// (`one_to_one_where`, `group_basis_where`) gates its plant.
+const UNIMAGED_COLUMN_UNREACHED: [(&str, &str); 2] = [
+    (
+        "o2o_where_column_not_imaged",
+        "an image lacks a predicate column only when staged before a capture widen, and no \
+         tier widens a source; one_to_one_where's \
+         an_image_without_the_predicate_column_fails_the_page gates it",
+    ),
+    (
+        "gb_where_column_not_imaged",
+        "an image lacks a predicate column only when staged before a capture widen, and no \
+         tier widens a source; group_basis_where's \
+         an_image_without_the_predicate_column_fails_the_page gates it",
+    ),
+];
+
 /// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates, the
 /// `JOIN` plants and [`LEAF_UNREACHED`], with their reasons.
 fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
@@ -1852,6 +1872,7 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
         ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
         .chain([LEAF_UNREACHED, FILTERED_NAMING_UNREACHED])
+        .chain(UNIMAGED_COLUMN_UNREACHED)
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
             out.push((plant, why));

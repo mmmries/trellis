@@ -945,6 +945,24 @@ pub enum Plant {
     /// `each_side_filters_its_own_rows_through_build_and_every_crossing` and
     /// `truncate_and_resume_keep_the_filter`.
     JoinWhereMUnfiltered,
+    /// #1991 rule 11 (`o2o_where_column_not_imaged`): a plain 1-1 page reads
+    /// a column its image lacks (staged before a capture widen) as `NULL`
+    /// rather than failing the page (`staging::one_to_one_render`'s
+    /// `row_sql`), so a member row whose `WHERE` reads it drops silently.
+    /// Fires only on a definition with a `WHERE`.
+    ///
+    /// Pinned by `one_to_one_where`'s
+    /// `an_image_without_the_predicate_column_fails_the_page`.
+    O2oWhereColumnNotImaged,
+    /// #1991 rule 11 (`gb_where_column_not_imaged`): a plain aggregate's
+    /// page reads a predicate column its image lacks as `NULL` rather than
+    /// failing the page (`staging::group_basis`'s `contributes`), so a
+    /// member row drops out of its group silently. Fires only on a
+    /// definition with a `WHERE`.
+    ///
+    /// Pinned by `group_basis_where`'s
+    /// `an_image_without_the_predicate_column_fails_the_page`.
+    GbWhereColumnNotImaged,
 }
 
 impl Plant {
@@ -1040,6 +1058,8 @@ impl Plant {
         Plant::O2oWhereBuildUnfiltered,
         Plant::O2oWhereNoTombstone,
         Plant::JoinWhereMUnfiltered,
+        Plant::O2oWhereColumnNotImaged,
+        Plant::GbWhereColumnNotImaged,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -1135,6 +1155,8 @@ impl Plant {
             Plant::O2oWhereBuildUnfiltered => "o2o_where_build_unfiltered",
             Plant::O2oWhereNoTombstone => "o2o_where_no_tombstone",
             Plant::JoinWhereMUnfiltered => "join_where_m_unfiltered",
+            Plant::O2oWhereColumnNotImaged => "o2o_where_column_not_imaged",
+            Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
         }
     }
 

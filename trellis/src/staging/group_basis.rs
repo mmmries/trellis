@@ -521,6 +521,12 @@ impl GroupShape {
             return String::new();
         };
         let mut sql = member.sql.clone();
+        // Planted bug: a predicate column the image lacks reads as `NULL`.
+        // See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(crate::plant::Plant::GbWhereColumnNotImaged, true) {
+            return format!(" and {sql}");
+        }
         for column in member.columns.iter().rev() {
             let name = quote_literal(column);
             let missing = quote_literal(&format!("the row has no column {column}"));

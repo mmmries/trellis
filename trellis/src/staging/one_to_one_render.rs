@@ -193,6 +193,15 @@ impl OneToOneRender {
         if self.columns.is_empty() {
             return "(select 1 as __none) s".to_string();
         }
+        // Planted bug: a column the image lacks reads as `NULL`. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let unimaged_as_null = crate::plant::fires(
+            crate::plant::Plant::O2oWhereColumnNotImaged,
+            self.predicate.is_some(),
+        );
+        #[cfg(not(any(test, feature = "test-util")))]
+        let unimaged_as_null = false;
         let casts: Vec<String> = self
             .columns
             .iter()
@@ -203,10 +212,17 @@ impl OneToOneRender {
                     .map(|name| format!(" collate {name}"))
                     .unwrap_or_default();
                 let name = quote_literal(&c.name);
-                let missing = quote_literal(&format!("the row has no column {}", c.name));
+                let missing = if unimaged_as_null {
+                    "null".to_string()
+                } else {
+                    format!(
+                        "({} || pg_catalog.left({image}::text, 0))::integer::text",
+                        quote_literal(&format!("the row has no column {}", c.name))
+                    )
+                };
                 format!(
                     "(case when {image} operator(pg_catalog.?) {name} then {image} ->> {name} \
-                     else ({missing} || pg_catalog.left({image}::text, 0))::integer::text end)\
+                     else {missing} end)\
                      ::{}{collate} as {}",
                     c.type_sql,
                     quote_ident(&c.name)
