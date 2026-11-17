@@ -606,9 +606,10 @@ definition whose floor is above it
 
 ### `filter`
 
-The definition's [`WHERE`](expressions.md#where) as definition text, when it
-is other than `TRUE`: the target holds only the source rows it is `TRUE` for.
-Unset for an unfiltered definition.
+The definition's [`WHERE`](expressions.md#where), when it is other than a
+lone `TRUE`, as Trellis renders it (each operation parenthesized:
+`(active AND (qty > 0))`): the target holds only the source rows it is `TRUE`
+for. Unset for an unfiltered definition.
 
 ## Limits and defaults
 

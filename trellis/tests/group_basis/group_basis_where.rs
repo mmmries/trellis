@@ -604,3 +604,57 @@ async fn self_check_reports_a_failing_rows_planted_contribution() {
     d.write(&plant("-")).await;
     assert_eq!(walk(&d).await, []);
 }
+
+/// A `numeric` sum and average whose failing rows hold `NaN` and the
+/// infinities: the special-value counters count member rows only, through
+/// the build, crossing deltas and a rebuild, and `self_check` agrees.
+#[tokio::test]
+async fn special_values_count_member_rows_only() {
+    const DEF: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT SUM(x) AS sx, COUNT(f) AS cf, AVG(x) AS ax, COUNT(x) AS cx WHERE w > 0";
+    const ACTUAL: &str = "select g, sx, cf, ax, cx from public.agg order by g";
+    const EXPECTED: &str = "select g, sum(x), count(f), avg(x), count(x) from public.src \
+         where w > 0 group by g order by g";
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, x numeric, \
+             f double precision, w integer); \
+         insert into public.src values (1, 1, 'NaN', 'NaN', 0), (2, 1, 1.5, 2.5, 1), \
+             (3, 1, 'Infinity', '-Infinity', 0), (4, 2, '-Infinity', 'Infinity', null), \
+             (5, 2, 2.25, 1, 1), (6, 3, null, null, 1);",
+        &[
+            ("id", int4()),
+            ("g", int4()),
+            ("x", trellis::defs::ValueType::Numeric),
+            (
+                "f",
+                trellis::defs::ValueType::Float(trellis::float::FloatWidth::Float8),
+            ),
+            ("w", int4()),
+        ],
+        &[DEF],
+        &[SRC],
+    )
+    .await;
+    d.settle().await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "the build");
+    for sql in [
+        "update public.src set w = 1 where id = 1",
+        "update public.src set w = 0 where id = 1",
+        "update public.src set w = 2 where id = 3",
+        "update public.src set w = 0, g = 2 where id = 3",
+        "update public.src set w = 1 where id = 4",
+        "update public.src set w = 0 where id = 4",
+        "update public.src set w = 0 where id = 5",
+        "insert into public.src values (7, 3, 'NaN', 'NaN', 0)",
+        "update public.src set w = 0 where id = 6",
+    ] {
+        d.step(sql).await;
+        assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "{sql}");
+    }
+    request_rebuild(&d).await;
+    rebuild_frozen(&d, &[]).await.finish().await;
+    d.settle().await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await, "the rebuild");
+    assert_eq!(d.rows("select count(*) from poison").await, ["(0)"]);
+    assert_eq!(walk(&d).await, []);
+}

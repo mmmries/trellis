@@ -88,5 +88,16 @@ async fn define_refuses_a_filter_and_creates_nothing() {
         .expect("a filtered aggregate is accepted");
     let status = trellis.status("g1").await.unwrap().expect("g1");
     assert_eq!(status.filter.as_deref(), Some("(active AND (qty > 0))"));
+    // `WHERE (TRUE)` is a filter, with this release's floor: `status` says
+    // so as its definition text reads, not as the bare `TRUE` it isn't.
+    trellis
+        .apply(
+            "TRANSFORM g2 FROM public.s GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, COUNT(*) AS n WHERE (TRUE)",
+        )
+        .await
+        .expect("a parenthesized TRUE is accepted");
+    let status = trellis.status("g2").await.unwrap().expect("g2");
+    assert_eq!(status.filter.as_deref(), Some("(TRUE)"));
     trellis.shutdown().await.expect("shutdown");
 }

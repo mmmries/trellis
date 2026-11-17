@@ -238,9 +238,8 @@ aggregate can hold a value neither collation gives: a row counted under the
 old comparison is taken out under the new one, so `SUM(CASE WHEN status =
 'open' THEN 1 ELSE 0 END)` drops to `0` for a group that still holds an
 `'open'` row once an `'OPEN'` row leaves it. A `WHERE` comparing the column
-gets membership wrong the same way: an aggregate counts rows in and out of a
-group under two rules (`WHERE status = 'open'` adds an `'OPEN'` row it
-never took out, or takes out one it never added). A text function that refuses a
+gets membership wrong the same way: `WHERE status = 'open'` takes an `'OPEN'`
+row out of a group it was never counted in. A text function that refuses a
 nondeterministic collation (`STRPOS`) raises `0A000` on every change instead,
 and the definition is quarantined, which is reported.
 
