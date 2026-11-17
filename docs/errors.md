@@ -210,6 +210,14 @@ A stored definition was written under a grammar newer than this release
 reads: a rollback, or an older process beside a newer one. Run the newer
 release ([upgrading](upgrading.md#rolling-back)).
 
+### T0240 UnsupportedAggregateModifier
+
+An aggregate call with `DISTINCT`, `ALL`, `ORDER BY` or `FILTER (WHERE …)`.
+Postgres accepts each; Trellis supports none. For `COUNT(DISTINCT x)`,
+[count in two transforms](transforms.md#counting-distinct-values). Drop `ALL`:
+it is the default. For the others, move the condition or order out of the
+call.
+
 ## Definition checks
 
 The text parses, but what it computes isn't one Trellis maintains exactly

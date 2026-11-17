@@ -229,6 +229,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | **Aggregate functions** | | |
 | [`MIN` or `MAX` in a plain aggregate](#min-or-max-in-a-plain-aggregate) | [T0073 ExtremeOfExpression](errors.md#t0073-extremeofexpression), [T0072 UnsupportedExtremeArgument](errors.md#t0072-unsupportedextremeargument), [T0074 ChainedExtreme](errors.md#t0074-chainedextreme), [T0075 ExtremesWithoutSourceIndex](errors.md#t0075-extremeswithoutsourceindex), [T0135 ExtremeIndexMissing](errors.md#t0135-extremeindexmissing) | [Index](#index), [Retype](#retype) |
 | A field reading a column that is neither a `GROUP BY` key nor inside an aggregate, or named after a key but not that key (`GROUP BY id SELECT SUM(id) AS id`) | [T0102 UngroupedColumnReference](errors.md#t0102-ungroupedcolumnreference), [T0106 GroupingColumnFieldMustBePassthrough](errors.md#t0106-groupingcolumnfieldmustbepassthrough) | [Text](#text) |
+| `DISTINCT` or `ALL` before an aggregate's arguments, `ORDER BY` after them, or a `FILTER (WHERE …)` clause: Postgres accepts each | [T0240 UnsupportedAggregateModifier](errors.md#t0240-unsupportedaggregatemodifier) | [Text](#text) |
 | `MIN` or `MAX` in a `JOIN` transform | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) (`MIN/MAX`) | [Text](#text) |
 | `bool_and`, `bool_or`, `bit_and` or `bit_or` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
 | `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | [T0071 UnsupportedAggregateArgument](errors.md#t0071-unsupportedaggregateargument) | [Retype](#retype) |
@@ -489,8 +490,8 @@ refused when its argument:
 - is of a type other than `smallint`, `integer`, `bigint`, `numeric`, `real`,
   `double precision`, `date`, `time`, `timestamp`, `timestamptz`, `interval`
   or `oid`, so `text` is refused (`UnsupportedExtremeArgument`);
-- is a column of another transform's target (`ChainedExtreme`), which has no
-  such index and would need a long `CREATE INDEX` on a table Trellis owns.
+- is a column of another transform's target (`ChainedExtreme`), whatever
+  indexes that target has.
 
 It is also refused `WITHOUT SOURCE INDEX` (`ExtremesWithoutSourceIndex`), and
 when the source lacks, per argument, a valid, non-partial btree index leading
@@ -618,6 +619,22 @@ SELECT
 
 Throughput falls as more distinct groups receive writes at once
 ([recommendations](recommendations.md#benchmark-aggregates-over-many-concurrently-written-groups)).
+
+#### Counting distinct values
+
+`COUNT(DISTINCT x)` is not supported. Chain two transforms: the first groups
+by the key and the value, the second counts its rows per key.
+
+```text
+TRANSFORM g_x FROM events GROUP BY g, x
+SELECT g AS g, x AS x, COUNT(*) AS n
+
+TRANSFORM g_distinct FROM g_x GROUP BY g
+SELECT g AS g, COUNT(x) AS distinct_x
+```
+
+Count `x`, not `*`: a `NULL` value is its own `(g, NULL)` row in the first
+target, and `COUNT(DISTINCT x)` skips `NULL`s.
 
 ### Join aggregate
 

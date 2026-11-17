@@ -15,6 +15,7 @@ mod definition_floor;
 mod defs_aggregate_chained_composite_group_key;
 mod defs_aggregate_chained_single_column_group_key;
 mod defs_aggregate_field_named_like_source_column;
+mod defs_aggregate_modifier;
 mod defs_ambiguous_bare_name;
 mod defs_backfill;
 mod defs_bit;
