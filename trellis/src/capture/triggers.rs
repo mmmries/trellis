@@ -500,10 +500,9 @@ async fn pause_readers(
         table: table.to_string(),
         text: error.to_string(),
     };
-    for id in readers {
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
-        }
+    let pauses = readers.into_iter().map(|id| (id, reason.clone()));
+    for (id, _) in crate::defs::lifecycle::pause_many(&txn, pauses).await? {
+        crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
     }
     txn.commit().await?;
     Ok(())

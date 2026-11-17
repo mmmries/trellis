@@ -1627,6 +1627,16 @@ const ONE_TO_ONE_PINNED: &[(&str, &str)] = &[
          a_page_queues_behind_a_chunk_holding_its_key (one_to_one_build_interleavings) \
          pins the lock",
     ),
+    (
+        "held_key_unlisted",
+        "it needs a held key, and only the held-key tier draws erroring rows: \
+         held_keys.rs's held_key_planted_bugs_are_caught gates it",
+    ),
+    (
+        "held_key_delete_applies",
+        "it needs a held key, and only the held-key tier draws erroring rows: \
+         held_keys.rs's held_key_planted_bugs_are_caught gates it",
+    ),
 ];
 const NO_JOIN: &str = "the concurrent tier draws no `JOIN`; the JOIN tier \
                        (join_convergence.rs, join_planted_bugs_are_caught) gates it";

@@ -18,10 +18,11 @@ mod sql;
 mod subprocess;
 
 pub use manual::{
-    ManualApplier, ManualBackend, ManualBackendError, SEAL_ON_DEMAND_INTERVAL,
+    HeldKeyReport, ManualApplier, ManualBackend, ManualBackendError, SEAL_ON_DEMAND_INTERVAL,
     SERVER_STOP_RECLAIM_TTL, SHUTDOWN_TIMEOUT, SourceTables, activity_summary, activity_summary_on,
     await_pool_usable,
 };
+pub use sql::HeldKeys;
 pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 
 use std::collections::BTreeMap;

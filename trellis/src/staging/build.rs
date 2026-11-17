@@ -1123,14 +1123,38 @@ pub(crate) async fn bump_version_fence(
     txn: &impl GenericClient,
     source_table: &str,
 ) -> Result<(), tokio_postgres::Error> {
-    txn.execute(
-        "insert into source_table_versions (source_table, version) values ($1, 1) \
-         on conflict (source_table) \
-         do update set version = source_table_versions.version + 1",
-        &[&source_table],
-    )
-    .await?;
+    bump_version_fences(txn, &[source_table]).await?;
     Ok(())
+}
+
+/// Bumps the version fences of `tables` (inserting a fence at 1 for a table
+/// with none) in one statement, in table-name order, the order a page takes
+/// them in (`super::apply::fence_miss`), and returns each one's new version.
+///
+/// The order is byte order, Rust's `str` order, so `collate "C"`: the upsert
+/// takes each row's lock as it reaches it, in the order the sort hands them
+/// over.
+pub(crate) async fn bump_version_fences(
+    txn: &impl GenericClient,
+    tables: &[impl AsRef<str>],
+) -> Result<std::collections::BTreeMap<String, i64>, tokio_postgres::Error> {
+    let mut tables: Vec<&str> = tables.iter().map(AsRef::as_ref).collect();
+    // An upsert can't touch one row twice.
+    tables.sort_unstable();
+    tables.dedup();
+    Ok(txn
+        .query(
+            "insert into source_table_versions (source_table, version) \
+             select t, 1 from unnest($1::text[]) t order by t collate \"C\" \
+             on conflict (source_table) \
+             do update set version = source_table_versions.version + 1 \
+             returning source_table, version",
+            &[&tables],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
 }
 
 /// Whether every row staged for `table` from now on carries `columns`

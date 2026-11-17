@@ -96,24 +96,31 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
     // A state-changing call's fence (`crate::locks::fence_call_txn`):
     // `Trellis::detect_capture_disruptions` responds too.
     crate::locks::fence_call_txn(&txn).await?;
+    // Every definition's row, in one sorted statement, before the pointer
+    // (ADR-0028 I5): a build's start holds its row while it takes the
+    // pointer. These are the rows the pauses below take
+    // (`lifecycle::lock_for_pause`'s mode).
+    let definitions = txn
+        .query(
+            "select id, source_table from transform_definitions order by id for update",
+            &[],
+        )
+        .await?;
     // Two passes responding at once take turns, and a seal waits.
     txn.execute("select 1 from segment_pointer for update", &[])
         .await?;
     if recheck && !txn.query_one(STALE_RECORDS, &[]).await?.get::<_, bool>(0) {
         return Ok(false);
     }
-    let definitions = txn
-        .query(
-            "select id, source_table from transform_definitions order by id",
-            &[],
+    let pauses = definitions.iter().map(|row| {
+        let table = row.get(1);
+        (
+            row.get(0),
+            crate::staging::pause_message::PauseReason::Restore { table },
         )
-        .await?;
-    for row in &definitions {
-        let (id, table): (i64, String) = (row.get(0), row.get(1));
-        let reason = crate::staging::pause_message::PauseReason::Restore { table };
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %reason.table(), "definition paused: {reason}");
-        }
+    });
+    for (id, reason) in crate::defs::lifecycle::pause_many(&txn, pauses).await? {
+        crate::instance_log::warn!(transform_id = id, table = %reason.table(), "definition paused: {reason}");
     }
     // The registry holds the original cluster's fences and transaction ids,
     // and the seal gate compares them with this cluster's (`staging::seal`),
@@ -163,4 +170,125 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
     crate::defs::recorded_keys::retie_restored(&txn).await?;
     txn.commit().await?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A restore's response takes every definition row before the segment
+    /// pointer, as a build's start does (ADR-0028 I5, #2095): the start
+    /// takes its definition row `FOR UPDATE`, then the pointer `FOR SHARE`.
+    /// Frozen with a definition's row held by a transaction that then takes
+    /// the pointer, as a start would: had the response taken the pointer
+    /// first, the two would deadlock.
+    #[tokio::test]
+    async fn a_restore_response_locks_definitions_before_the_segment_pointer() {
+        use std::collections::HashMap;
+
+        use crate::defs::ast::ValueType;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = crate::pool::Pool::new(&config).expect("pool");
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .batch_execute(&format!(
+                    "set search_path to {}, public",
+                    crate::config::DEFAULT_SCHEMA
+                ))
+                .await
+                .expect("search path");
+            client
+        };
+        let mut responder = connect().await;
+        responder
+            .batch_execute("create table public.s (id bigint primary key, x numeric)")
+            .await
+            .expect("source");
+        let columns: HashMap<String, ValueType> = ["id", "x"]
+            .iter()
+            .map(|name| (name.to_string(), ValueType::Numeric))
+            .collect();
+        let def = crate::defs::catalog::create_definition(
+            &pool,
+            "TRANSFORM t FROM public.s SELECT x AS v",
+            &columns,
+        )
+        .await
+        .expect("define");
+        responder
+            .execute(
+                "update transform_definitions set status = 'live' where id = $1",
+                &[&def.id],
+            )
+            .await
+            .expect("live");
+
+        let mut taker = connect().await;
+        let start = taker.transaction().await.expect("txn");
+        start
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&def.id],
+            )
+            .await
+            .expect("lock the definition");
+        let start_pid: i32 = start
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let responder_pid: i32 = responder
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let responding = tokio::spawn(async move {
+            let responded = super::respond(&mut responder, false).await;
+            (responder, responded)
+        });
+        // Wait for the response to queue behind the definition's row: a
+        // lock state, which it reaches once, not a convergence.
+        let watcher = connect().await;
+        loop {
+            let blocked: bool = watcher
+                .query_one(
+                    "select $2 = any(pg_blocking_pids($1))",
+                    &[&responder_pid, &start_pid],
+                )
+                .await
+                .expect("blocking pids")
+                .get(0);
+            if blocked {
+                break;
+            }
+            assert!(
+                !responding.is_finished(),
+                "the response finished without queuing behind the definition's row"
+            );
+            tokio::task::yield_now().await;
+        }
+        start
+            .execute("select 1 from segment_pointer for share", &[])
+            .await
+            .expect("the response holds no pointer while it waits on a definition");
+        start.commit().await.expect("commit");
+        let (responder, responded) = responding.await.expect("response task");
+        assert!(responded.expect("respond"), "the response ran");
+        let status: String = responder
+            .query_one(
+                "select status from transform_definitions where id = $1",
+                &[&def.id],
+            )
+            .await
+            .expect("status")
+            .get(0);
+        assert_eq!(status, "paused");
+    }
 }

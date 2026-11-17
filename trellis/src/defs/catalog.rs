@@ -1356,22 +1356,14 @@ pub(crate) async fn store_unrunnable(
 ) -> Result<(), CatalogError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    let mut version = 1;
-    for table in std::iter::once(unparsed.source_table).chain(unparsed.joined.iter().copied()) {
-        let bumped: i64 = txn
-            .query_one(
-                "insert into source_table_versions (source_table, version) values ($1, 1) \
-                 on conflict (source_table) \
-                 do update set version = source_table_versions.version + 1 \
-                 returning version",
-                &[&table],
-            )
-            .await?
-            .get(0);
-        if table == unparsed.source_table {
-            version = bumped;
-        }
-    }
+    let fenced: Vec<&str> = std::iter::once(unparsed.source_table)
+        .chain(unparsed.joined.iter().copied())
+        .collect();
+    let version = crate::staging::build::bump_version_fences(&*txn, &fenced)
+        .await?
+        .get(unparsed.source_table)
+        .copied()
+        .unwrap_or(1);
     let source_node = resolve_node_in_txn(&txn, unparsed.source_table, NodeKind::Source).await?;
     let target_node = resolve_node_in_txn(&txn, unparsed.target_table, NodeKind::Target).await?;
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
@@ -3608,26 +3600,14 @@ async fn create_definition_inner(
     // order every taker of two fences takes them in; it records the `FROM`
     // table's version.
     let fenced: Vec<&str> = match &join_sides {
-        Some(sides) => sides.tables_in_order().to_vec(),
+        Some(sides) => sides.tables().collect(),
         None => vec![qualified_source.as_str()],
     };
-    let mut version: i64 = 0;
-    for table in fenced {
-        let bumped: i64 = txn
-            .query_one(
-                "insert into source_table_versions (source_table, version)
-                 values ($1, 1)
-                 on conflict (source_table)
-                 do update set version = source_table_versions.version + 1
-                 returning version",
-                &[&table],
-            )
-            .await?
-            .get(0);
-        if table == qualified_source {
-            version = bumped;
-        }
-    }
+    let version = crate::staging::build::bump_version_fences(&*txn, &fenced)
+        .await?
+        .get(qualified_source.as_str())
+        .copied()
+        .unwrap_or(0);
     // The column-pause lock, shared, right after the fence and before
     // the definition row or any DDL: the pause state a field reading a
     // paused column is born under (below) is read under it, so a pause
@@ -4897,14 +4877,6 @@ impl JoinSides {
                 (table, Some(side))
             })
             .collect()
-    }
-
-    /// Every table in table-name order: the order define and a resume
-    /// bump their version fences in.
-    fn tables_in_order(&self) -> Vec<&str> {
-        let mut tables: Vec<&str> = self.tables().collect();
-        tables.sort_unstable();
-        tables
     }
 
     /// Each joined table's column types by position, as
