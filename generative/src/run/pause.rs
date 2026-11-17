@@ -38,6 +38,10 @@ pub(super) enum RunKind {
     Restore,
     /// `run_two_instance_convergence`.
     TwoInstance,
+    /// `run_convergence_with_held_keys`. A held key, and the fuse that
+    /// quarantines a definition, leave it `live` or `quarantined`, never
+    /// `paused`.
+    HeldKeys,
 }
 
 /// Why a run may find a definition paused, for the allowlist's reader.
@@ -66,7 +70,8 @@ pub(super) struct Allowance {
 /// tier (an instance's definitions never read the other's source); the
 /// db-admin and restore tiers (a restart, a checkpoint or a cold copy keeps
 /// every table, oid and trigger, so nothing pauses: each of their actions
-/// leaves the converged state unchanged).
+/// leaves the converged state unchanged); the held-key tier (a held key and
+/// the whole-transform fuse end `live` or `quarantined`, not `paused`).
 pub(super) fn allowance(kind: RunKind, program: &Program) -> Option<Allowance> {
     match kind {
         RunKind::Sequential | RunKind::Bursty | RunKind::Concurrent
@@ -86,7 +91,8 @@ pub(super) fn allowance(kind: RunKind, program: &Program) -> Option<Allowance> {
         | RunKind::Noise
         | RunKind::DbAdmin
         | RunKind::Restore
-        | RunKind::TwoInstance => None,
+        | RunKind::TwoInstance
+        | RunKind::HeldKeys => None,
     }
 }
 

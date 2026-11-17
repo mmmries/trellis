@@ -2590,6 +2590,14 @@ fn key_exclusions(
                 let excluded = focus
                     .and_then(|focus| focus.excludes(source_key, &change.key, def.id))
                     .unwrap_or_else(|| poisoned_for.is_some_and(|ids| ids.contains(&def.id)));
+                // Planted bug: a held key's delete applies to the definition
+                // that holds it. See `crate::plant`.
+                #[cfg(any(test, feature = "test-util"))]
+                let excluded = excluded
+                    && !crate::plant::fires(
+                        crate::plant::Plant::HeldKeyDeleteApplies,
+                        focus.is_none() && change.new_image.is_none(),
+                    );
                 if excluded {
                     exclusion.defs.insert(def.id);
                 }

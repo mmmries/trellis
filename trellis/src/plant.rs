@@ -806,6 +806,26 @@ pub enum Plant {
     /// Pinned by `join_star_quarantine`'s
     /// `a_star_with_a_one_to_one_target_at_the_middle_position_converges`.
     StarReadsFirstOnly,
+    /// #1662 (`held_key_unlisted`): `Trellis::sample_quarantined` of a whole
+    /// definition leaves out the first key it holds, so a held key goes
+    /// unlisted while `held_keys.count` still counts it.
+    ///
+    /// Gated by the held-key tier (`generative`'s `held_keys.rs`,
+    /// `held_key_planted_bugs_are_caught`), the one tier that draws
+    /// erroring rows, and pinned by its
+    /// `erroring_inserts_and_updates_follow_the_held_key_model`.
+    HeldKeyUnlisted,
+    /// #1662 (`held_key_delete_applies`): a delete of a key a definition
+    /// holds in quarantine applies to that definition
+    /// (`staging::apply::key_exclusions`) instead of being parked, so its
+    /// target row, which should stay as it was until the key is released,
+    /// goes.
+    ///
+    /// Gated by the held-key tier (`held_key_planted_bugs_are_caught`),
+    /// whose programs hold a key that had a target row and then delete it,
+    /// and pinned by its
+    /// `erroring_inserts_and_updates_follow_the_held_key_model`.
+    HeldKeyDeleteApplies,
 }
 
 impl Plant {
@@ -886,6 +906,8 @@ impl Plant {
         Plant::StarHeldOriginFirstOnly,
         Plant::StarDefLockFirstOnly,
         Plant::StarReadsFirstOnly,
+        Plant::HeldKeyUnlisted,
+        Plant::HeldKeyDeleteApplies,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -966,6 +988,8 @@ impl Plant {
             Plant::StarHeldOriginFirstOnly => "star_held_origin_first_only",
             Plant::StarDefLockFirstOnly => "star_def_lock_first_only",
             Plant::StarReadsFirstOnly => "star_reads_first_only",
+            Plant::HeldKeyUnlisted => "held_key_unlisted",
+            Plant::HeldKeyDeleteApplies => "held_key_delete_applies",
         }
     }
 

@@ -200,10 +200,20 @@ async fn token(d: &Driver) -> tokio_postgres::types::PgLsn {
         .get(0)
 }
 
+/// Also checks the test-only wait past held keys agrees: these cases hold no
+/// key, and a pending fan-out (condition 5) gates that wait too.
 async fn converged(d: &Driver, token: tokio_postgres::types::PgLsn) -> bool {
-    trellis::staging::converge::converged_through(&d.ctl, token)
+    let converged = trellis::staging::converge::converged_through(&d.ctl, token)
         .await
-        .expect("converged_through")
+        .expect("converged_through");
+    let except_held = trellis::staging::converge::converged_through_except_held(&d.ctl, token)
+        .await
+        .expect("converged_through_except_held");
+    assert_eq!(
+        converged, except_held,
+        "with no held key, the wait past held keys agrees with converged_through"
+    );
+    converged
 }
 
 /// Ends a frozen chunk's session and waits until it has exited, so its
