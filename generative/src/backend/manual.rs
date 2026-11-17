@@ -466,10 +466,6 @@ pub enum SourceTables {
     SharedExisting,
 }
 
-/// The manual backend. Owns a raw connection (DDL, DML, watermark reads,
-/// snapshot reads) and, once [`ManualBackend::install`] has run, a live
-/// [`EngineClient`] draining sealed batches into every installed
-/// definition's target table.
 /// What one definition reports about its held keys
 /// ([`ManualBackend::held_key_report`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +478,10 @@ pub struct HeldKeyReport {
     pub keys: std::collections::BTreeSet<String>,
 }
 
+/// The manual backend. Owns a raw connection (DDL, DML, watermark reads,
+/// snapshot reads) and, once [`ManualBackend::install`] has run, a live
+/// [`EngineClient`] draining sealed batches into every installed
+/// definition's target table.
 pub struct ManualBackend {
     pool: Pool,
     raw: tokio_postgres::Client,

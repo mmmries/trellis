@@ -97,6 +97,32 @@ pub fn aim_rows(spec: &mut TableSpec, divisor: DivisorSlot, trigger: i64, hits: 
     hit_count
 }
 
+/// Holds a key that had a target row, then deletes it: the first mutate of
+/// `spec` updates a seed whose `c2` misses `trigger` onto it (the `seed`th
+/// such seed, wrapping), and a delete of that key goes in at mutate `at`
+/// (clamped to the end). Its delete is parked like every change to a held
+/// key, so the target row stays. Does nothing when every seed hits.
+pub fn hold_then_delete(spec: &mut TableSpec, trigger: i64, seed: usize, at: usize) {
+    let misses: Vec<usize> = (0..spec.seed_values.len())
+        .filter(|&i| spec.seed_values[i].1 != Some(trigger))
+        .collect();
+    if misses.is_empty() {
+        return;
+    }
+    let index = misses[seed % misses.len()];
+    let pk = index as i64 + 1;
+    spec.mutates.insert(
+        0,
+        Mutate::Update {
+            pk,
+            c1: spec.seed_values[index].0,
+            c2: Some(trigger),
+        },
+    );
+    let at = at.clamp(1, spec.mutates.len());
+    spec.mutates.insert(at, Mutate::Delete { pk });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +177,29 @@ mod tests {
         let hits = aim_rows(&mut spec, DivisorSlot::C1, VALUE_MAX, &[]);
         assert_eq!(hits, 0);
         assert_eq!(spec.mutates[1], Mutate::ToggleNull { pk: 1, value: 0 });
+    }
+
+    #[test]
+    fn hold_then_delete_updates_a_missing_seed_onto_the_trigger_then_deletes_it() {
+        let mut held = spec();
+        hold_then_delete(&mut held, 5, 1, 9);
+        // Seeds 1 and 3 hit 5 on `c2`; seed 2 is the only miss.
+        assert_eq!(
+            held.mutates[0],
+            Mutate::Update {
+                pk: 2,
+                c1: Some(1),
+                c2: Some(5),
+            }
+        );
+        assert_eq!(held.mutates.last(), Some(&Mutate::Delete { pk: 2 }));
+        assert_eq!(held.mutates.len(), 5);
+
+        let mut all_hit = spec();
+        all_hit.seed_values = vec![(None, Some(5))];
+        let before = all_hit.mutates.clone();
+        hold_then_delete(&mut all_hit, 5, 0, 1);
+        assert_eq!(all_hit.mutates, before);
     }
 
     #[test]

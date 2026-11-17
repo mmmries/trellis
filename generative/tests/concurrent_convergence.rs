@@ -1635,7 +1635,7 @@ const ONE_TO_ONE_PINNED: &[(&str, &str)] = &[
     (
         "held_key_delete_applies",
         "it needs a held key, and only the held-key tier draws erroring rows: \
-         held_keys.rs's erroring_inserts_and_updates_follow_the_held_key_model pins it",
+         held_keys.rs's held_key_planted_bugs_are_caught gates it",
     ),
 ];
 const NO_JOIN: &str = "the concurrent tier draws no `JOIN`; the JOIN tier \

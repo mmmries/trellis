@@ -149,16 +149,11 @@ fn held_key_sweep_tier() -> SweepTier {
     }
 }
 
-/// The held-key plants the tier runs but rarely catches. Of the 48 cases of
-/// seeds 1 to 4 (logbook `20261116T194446-e-sweep`), `held_key_unlisted`
-/// was caught in 44 (fired in 44, first catch in each seed's first case);
-/// these were not:
-///
-/// - `held_key_delete_applies`: fired 5, caught 0. A delete of a held key
-///   only shows when the key had a target row, so it needs a row updated
-///   onto the trigger and then deleted, which few draws do.
-///   `erroring_inserts_and_updates_follow_the_held_key_model` pins it.
-const HELD_KEY_KNOWN_MISSES: &[&str] = &["held_key_delete_applies"];
+/// The held-key plants the tier runs but rarely catches: none. Of the 48
+/// cases of seeds 1 to 4 (logbook `20261116T201534-e-sweep`),
+/// `held_key_unlisted` was caught in 46 and `held_key_delete_applies` in 11,
+/// each within its seed's first five cases.
+const HELD_KEY_KNOWN_MISSES: &[&str] = &[];
 
 /// The plants the held-key tier gates.
 const HELD_KEY_PLANTS: &[&str] = &["held_key_unlisted", "held_key_delete_applies"];

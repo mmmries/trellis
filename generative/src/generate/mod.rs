@@ -3090,6 +3090,11 @@ mod strategy {
     /// trigger value.
     const HELD_KEY_HIT_RATE: f64 = 0.4;
 
+    /// The share of [`held_key_program`]s whose first definition's table
+    /// also updates a seed with a target row onto its trigger and later
+    /// deletes it ([`held_keys::hold_then_delete`]).
+    const HELD_KEY_DELETE_RATE: f64 = 0.5;
+
     /// The share of [`held_key_program`]'s other 1-1 definitions that raise
     /// too.
     const HELD_KEY_OTHER_RAISING_RATE: f64 = 1.0 / 3.0;
@@ -3101,7 +3106,9 @@ mod strategy {
     /// to `MAX_DEFS - 1` drawn as usual, a third of whose 1-1 ones raise as
     /// well. Each table draws its trigger `K`, and about two in five of its
     /// `c2` writes are aimed at it ([`held_keys::aim_rows`]); no other write
-    /// holds it. A table holds at most [`MAX_SEED_ROWS`] keys, under either
+    /// holds it. Half the programs also hold a key that had a target row
+    /// and then delete it ([`held_keys::hold_then_delete`]), the one case a
+    /// held key's delete shows in. A table holds at most [`MAX_SEED_ROWS`] keys, under either
     /// fuse's threshold, so no definition here is quarantined
     /// ([`held_key_fuse_program`] trips the fuse).
     pub fn held_key_program() -> impl Strategy<Value = Program> {
@@ -3135,13 +3142,29 @@ mod strategy {
                     ),
                     prop::collection::vec(0..=VALUE_MAX, table_count),
                     hits,
+                    prop::option::weighted(
+                        HELD_KEY_DELETE_RATE,
+                        (0..MAX_SEED_ROWS, 1..=MAX_MUTATES + 1),
+                    ),
                 )
             })
             .prop_map(
-                |(mut tables, schedule, (first, dividend), draws, raise_others, triggers, hits)| {
-                    use held_keys::{DivisorSlot, aim_rows, raising_shape};
+                |(
+                    mut tables,
+                    schedule,
+                    (first, dividend),
+                    draws,
+                    raise_others,
+                    triggers,
+                    hits,
+                    delete_held,
+                )| {
+                    use held_keys::{DivisorSlot, aim_rows, hold_then_delete, raising_shape};
                     for ((spec, trigger), hits) in tables.iter_mut().zip(&triggers).zip(&hits) {
                         aim_rows(spec, DivisorSlot::C2, *trigger, hits);
+                    }
+                    if let Some((seed, at)) = delete_held {
+                        hold_then_delete(&mut tables[first], triggers[first], seed, at);
                     }
                     let mut defs = vec![(first, DefShape::OneToOne)];
                     let mut derived = vec![Some(raising_shape(

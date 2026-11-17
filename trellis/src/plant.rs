@@ -821,10 +821,10 @@ pub enum Plant {
     /// target row, which should stay as it was until the key is released,
     /// goes.
     ///
-    /// Pinned by the held-key tier's
-    /// `erroring_inserts_and_updates_follow_the_held_key_model`; its sweep
-    /// runs it as a known miss (it needs a held key that had a target row
-    /// to be deleted, which few draws do).
+    /// Gated by the held-key tier (`held_key_planted_bugs_are_caught`),
+    /// whose programs hold a key that had a target row and then delete it,
+    /// and pinned by its
+    /// `erroring_inserts_and_updates_follow_the_held_key_model`.
     HeldKeyDeleteApplies,
 }
 
