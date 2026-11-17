@@ -4406,12 +4406,13 @@ async fn resume_locked(
             txn.batch_execute("release savepoint resume_complete")
                 .await?;
         }
-        Err(ApplyError::ResumeRefused { reason, .. }) => {
+        Err(ApplyError::ResumeRefused { reason, status, .. }) => {
             txn.batch_execute("rollback to savepoint resume_complete")
                 .await?;
             return Err(ApplyError::ResumeRefused {
                 transform: target.to_string(),
                 reason,
+                status,
             });
         }
         Err(err) => return Err(err),
@@ -4592,7 +4593,13 @@ async fn complete_resume(
         tables.extend(joined.iter().map(|table| table.to_string()));
         discard_drained_changes(txn, &tables, gate).await?;
         if matches!(definition.def.key_space, KeySpace::OneToOne) {
-            empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
+            empty_if_keyed_by_an_enum(
+                txn,
+                source_table,
+                &definition.target_table,
+                definition.status.reported(false),
+            )
+            .await?;
         }
     }
     // Discard the definition's leftover unclaimed backfill chunks.
@@ -4761,6 +4768,7 @@ async fn empty_if_keyed_by_an_enum(
     txn: &Transaction<'_>,
     source_table: &str,
     target: &str,
+    status: crate::defs::model::TransformStatus,
 ) -> Result<(), ApplyError> {
     let key: Vec<String> = ddl::identity_key_columns(txn, source_table)
         .await?
@@ -4807,6 +4815,7 @@ async fn empty_if_keyed_by_an_enum(
                     reason => ApplyError::ResumeRefused {
                         transform: target.to_string(),
                         reason: Box::new(reason),
+                        status,
                     },
                 },
             );
