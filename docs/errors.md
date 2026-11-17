@@ -626,12 +626,6 @@ value of its operands; the message names it. Compare without it, or filter on
 a stored generated column or a [chained](transforms.md#chaining-and-cycle-detection)
 1-1 transform.
 
-### T0238 FilterNotYetSupported
-
-A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every
-one but the plain and join aggregates and the 1-1 `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
-There is no workaround in the definition yet; filter when reading the target.
-
 ### T0239 FilteredExtreme
 
 `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an
@@ -1374,3 +1368,4 @@ A retired code is no longer reported; the condition reports another code.
 | T0209 | [T0126](#t0126-sourcetablenotfound) |
 | T0217 | [T0148](#t0148-transformnotfound) |
 | T0228 | [T0220](#t0220-otherversionlive) |
+| T0238 | None: every key space applies a `WHERE` |

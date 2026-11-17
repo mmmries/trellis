@@ -21,10 +21,6 @@ async fn define_refuses_a_filter_and_creates_nothing() {
 
     for (text, expected) in [
         (
-            "TRANSFORM t1 FROM public.s SELECT qty AS q WHERE qty > 0",
-            "T0238",
-        ),
-        (
             "TRANSFORM t2 FROM public.s GROUP BY g WITHOUT SOURCE INDEX \
              SELECT g AS g, MIN(qty) AS lo WHERE active",
             "T0239",
@@ -96,6 +92,14 @@ async fn define_refuses_a_filter_and_creates_nothing() {
         .expect("WHERE TRUE is accepted");
     let status = trellis.status("t9").await.unwrap().expect("t9");
     assert_eq!(status.filter, None, "an unfiltered definition");
+
+    // A plain 1-1 transform applies its filter, and `status` says so.
+    trellis
+        .apply("TRANSFORM o1 FROM public.s SELECT qty AS q WHERE qty > 0")
+        .await
+        .expect("a filtered 1-1 transform is accepted");
+    let status = trellis.status("o1").await.unwrap().expect("o1");
+    assert_eq!(status.filter.as_deref(), Some("(qty > 0)"));
 
     // A plain aggregate applies its filter, and `status` says so.
     trellis

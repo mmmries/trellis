@@ -55,10 +55,10 @@ DROP   TRANSFORM <transform>
 - `<expression>` is the [expression grammar](expressions.md); `<field>` names
   a target column.
 - `WHERE` takes a `boolean` [expression](expressions.md#where) over source
-  columns that can't raise an error. A plain aggregate applies one: its groups
-  count only the rows it is `TRUE` for. A [join aggregate](#join-aggregate)
-  applies one per table, and a [1-1 `JOIN`](#1-1-join) one. Every other key
-  space refuses any `WHERE` but `TRUE` for now
+  columns that can't raise an error. Every key space applies one. A plain 1-1
+  transform holds only the rows it is `TRUE` for, and a plain aggregate's
+  groups count only those rows. A [join aggregate](#join-aggregate) applies one
+  per table, and a [1-1 `JOIN`](#1-1-join) one
   ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 - `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
   `<name>.<field>` pauses or resumes one field
@@ -237,7 +237,6 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | [T0071 UnsupportedAggregateArgument](errors.md#t0071-unsupportedaggregateargument) | [Retype](#retype) |
 | `array_agg`, `string_agg` or `jsonb_agg` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
 | **Filters and chaining** | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every one but the plain and join aggregates and the 1-1 `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | [T0238 FilterNotYetSupported](errors.md#t0238-filternotyetsupported) | [Text](#text) |
 | `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an extreme is read from a source index, which holds the rows the `WHERE` drops too | [T0239 FilteredExtreme](errors.md#t0239-filteredextreme) | [Text](#text) |
 | A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | [T0048 TargetEqualsSource](errors.md#t0048-targetequalssource), [T0047 TableCycle](errors.md#t0047-tablecycle) | [Text](#text) |
 | Chaining off a transform that is not `live` | [T0154 TransformNotLive](errors.md#t0154-transformnotlive) | n/a |
@@ -589,10 +588,10 @@ grant on.
 
 ### 1-1
 
-One target row per source row, keyed by the source's key: its primary key or
-the `KEY (…)` the definition names, or, over an aggregate or `JOIN` target
-whose group key can be `NULL`, a `UNIQUE NULLS NOT DISTINCT` constraint over
-the same columns. The target carries the key columns, so a field can't reuse a
+One target row per source row the `WHERE` admits, keyed by the source's key:
+its primary key or the `KEY (…)` the definition names, or, over an aggregate
+or `JOIN` target whose group key can be `NULL`, a `UNIQUE NULLS NOT DISTINCT`
+constraint over the same columns. The target carries the key columns, so a field can't reuse a
 key column's name ([expressions — Refusals](expressions.md#refusals)). It
 reads one table: one row per row of a table with columns of a second is a
 [1-1 `JOIN`](#1-1-join), and one row per group of a join a

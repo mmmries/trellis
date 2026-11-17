@@ -216,13 +216,14 @@ const DRAINED_PREFIX_SQL: &str = "\
            max(seg_seq) filter (where state = 'drained') \
     from segments";
 
-/// Every ledger table there is, schema-qualified and quoted: a
-/// definition's `<target>__ledger`, where it exists, with the definition's
-/// id, and a 1-1 `JOIN`'s hidden ledgers `R` and each position's `M`
-/// ([`crate::defs::join_one_to_one::HiddenTable::every_ledger`], in the catalog schema, as
-/// [`hidden_tables_sql`] finds the other hidden tables). An aggregate
-/// target's, a 1-1 target's and a hidden ledger carry the same
-/// ordering-state columns, so [`collect_tombstones`] collects them alike.
+/// Every ledger table there is, schema-qualified and quoted, with its
+/// definition's id and whether a build of the definition stops its GC
+/// ([`NOT_BUILDING_SQL`]): a plain 1-1 target's `<target>__ledger` (no), and
+/// a 1-1 `JOIN`'s hidden ledgers `R` and each position's `M` (yes;
+/// [`crate::defs::join_one_to_one::HiddenTable::every_ledger`], in the catalog schema, as
+/// [`hidden_tables_sql`] finds the other hidden tables). A 1-1 target's
+/// and a hidden ledger carry the same ordering-state columns, so
+/// [`collect_tombstones`] collects them alike.
 fn ledger_tables_sql() -> String {
     let names = HiddenTable::every_ledger()
         .iter()
@@ -231,13 +232,13 @@ fn ledger_tables_sql() -> String {
         .join(", ");
     format!(
         "\
-    select format('%I.%I', n.nspname, c.relname), d.id \
+    select format('%I.%I', n.nspname, c.relname), d.id, false \
     from transform_definitions d \
     join pg_catalog.pg_namespace n on n.nspname = split_part(d.target_table, '.', 1) \
     join pg_catalog.pg_class c on c.relnamespace = n.oid \
      and c.relname = split_part(d.target_table, '.', 2) || $1 \
     union all \
-    select format('%I.%I', n.nspname, c.relname), d.id \
+    select format('%I.%I', n.nspname, c.relname), d.id, true \
     from transform_definitions d \
     join pg_catalog.pg_class c on c.relname in ( \
          {names}) \
@@ -305,9 +306,12 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// (`super::one_to_one_ledger::read_rows`), a build chunk in its one
 /// statement, and the direct Re-derives stamp the latest segment there is.
 ///
-/// **Against a build.** A ledger whose definition is under a build is
-/// skipped ([`NOT_BUILDING_SQL`]): a 1-1 `JOIN` build chunk's insert of
-/// `R` entries needs the tombstones written since its read's snapshot.
+/// **Against a build.** A 1-1 `JOIN`'s hidden ledgers are skipped while
+/// their definition is under a build ([`NOT_BUILDING_SQL`]): its build
+/// chunk's insert of `R` entries needs the tombstones written since its
+/// read's snapshot. A plain 1-1 target's ledger is collected during its
+/// build: its chunks lock their entries before they read, as a page's
+/// Re-derive does (see "Against a page").
 ///
 /// **Against a page.** Each batch is a short transaction of its own. It
 /// takes the ledger's `ROW EXCLUSIVE` lock `NOWAIT`, so a build or drop of
@@ -338,17 +342,17 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
         _ => through,
     };
 
-    let ledgers: Vec<(String, i64)> = client
+    let ledgers: Vec<(String, i64, bool)> = client
         .query_typed(
             &ledger_tables_sql(),
             &[(&crate::defs::ledger::LEDGER_SUFFIX, Type::TEXT)],
         )
         .await?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
         .collect();
     let mut collected = 0;
-    for (ledger, definition_id) in &ledgers {
+    for (ledger, definition_id, build_stops_gc) in &ledgers {
         let sql = collect_statement(ledger);
         for _ in 0..TOMBSTONE_BATCHES_PER_PASS {
             let txn = client.transaction().await?;
@@ -363,11 +367,13 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
                 }
                 return Err(err.into());
             }
-            match txn.query_opt(NOT_BUILDING_SQL, &[definition_id]).await {
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(err) if is_lock_not_available(&err) => break,
-                Err(err) => return Err(err.into()),
+            if *build_stops_gc {
+                match txn.query_opt(NOT_BUILDING_SQL, &[definition_id]).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) if is_lock_not_available(&err) => break,
+                    Err(err) => return Err(err.into()),
+                }
             }
             let indexed: bool = txn
                 .query_one(
@@ -632,13 +638,14 @@ pub async fn explain_collect_zero_groups(
 /// since then, and collected before the check, would let the insert write
 /// a deleted row live, and nothing would retract it.
 ///
-/// A plain 1-1 chunk needs no skip: it locks its entries before it reads
+/// A plain 1-1 target's ledger is never checked here: its build chunk, its
+/// field build's chunk and its sweep lock their entries before they read
 /// (`super::one_to_one_ledger::lock_entries`, then one statement that takes
 /// the snapshot), as a page's Re-derive does beside the GC. A tombstone
-/// collected before the lock gets a fresh placeholder, and one collected
-/// between the placeholder insert and the `for update` fails the lock with
-/// a transient `ApplyError::LedgerEntryCollected`. Its ledger is skipped
-/// anyway, which only delays the GC (#2018).
+/// collected before the lock gets a fresh placeholder and the snapshot sees
+/// the delete; one collected between the placeholder insert and the
+/// `for update` fails the lock with a transient
+/// `ApplyError::LedgerEntryCollected`.
 ///
 /// **Why the lock makes the skip enough.** A build starts by taking the
 /// definition's row `for update` (`super::build`'s `start`), which waits

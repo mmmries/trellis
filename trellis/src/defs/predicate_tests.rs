@@ -26,13 +26,9 @@ fn validated(text: &str) -> Result<(), ValidationError> {
     validate(&parse(text).expect("parses"), &columns())
 }
 
-/// The refusal define gives `text`, past the key-space refusal: the
-/// predicate's checks come before it, so a refusal here is the predicate's.
+/// The refusal define gives `text`, if any.
 fn predicate_refusal(text: &str) -> Option<ValidationError> {
-    match validated(text) {
-        Err(ValidationError::FilterNotYetSupported { .. }) | Ok(()) => None,
-        Err(other) => Some(other),
-    }
+    validated(text).err()
 }
 
 #[test]
@@ -212,36 +208,18 @@ fn a_predicate_that_can_raise_is_refused_by_name() {
     ));
 }
 
-/// Until each key space's step lands (#1991), define refuses its filter by
-/// name, after the predicate's own checks. A plain aggregate and a join
-/// aggregate apply one.
+/// Every key space applies a filter (#1991): define admits one on each, after
+/// the predicate's own checks.
 #[test]
-fn every_key_space_refuses_a_filter_until_its_step_lands() {
-    assert_eq!(
-        validated("TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0"),
-        Err(ValidationError::FilterNotYetSupported { key_space: "1-1" }),
-    );
+fn every_key_space_admits_a_filter() {
     for text in [
+        "TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0",
         "TRANSFORM t FROM s SELECT qty AS q",
         "TRANSFORM t FROM s SELECT qty AS q WHERE TRUE",
         "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n, SUM(qty) AS total, \
          AVG(amount) AS av WHERE qty > 0",
     ] {
         assert_eq!(validated(text), Ok(()), "{text}");
-    }
-    // Both `JOIN` key spaces filter (#2041, #2042): their validators check
-    // the predicate.
-    for text in [
-        "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g \
-         SELECT s.g AS g, COUNT(*) AS n WHERE s.qty > 0",
-        "TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0",
-    ] {
-        let def = parse(text).unwrap();
-        assert_eq!(
-            super::validate::refuse_unsupported_filter(&def),
-            Ok(()),
-            "{text}"
-        );
     }
 }
 

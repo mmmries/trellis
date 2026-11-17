@@ -76,6 +76,7 @@
 //! last write.
 //!
 //! A 1-1 build chunk (`super::build::one_to_one::run_chunk`) fires
+//! [`PausePoint::AfterChunkKeyRead`] after its unlocked key read,
 //! `AfterPlaceholders` and `AfterEntryLock` around its entry lock, and
 //! `AfterRederiveRead` directly after its read-and-write statement
 //! (uncommitted). [`PausePoint::BeforeChunkTransaction`] is a chunk's alone:
@@ -353,6 +354,9 @@ pub enum PausePoint {
     /// After a Re-derive's live read of the source (on a 1-1 ledger, a
     /// forced group recompute).
     AfterRederiveRead,
+    /// After a 1-1 build chunk's unlocked read of its range's keys, before
+    /// its entry lock: nothing of theirs is locked yet.
+    AfterChunkKeyRead,
     /// After a claimed build chunk is planned, before its transaction
     /// begins (`super::build::run_rederive`): the plan read the
     /// definition, its fields and the range's keys, and holds no lock and

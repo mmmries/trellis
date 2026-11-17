@@ -267,7 +267,7 @@ ADR-0002 gives every 1-1 target a per-key ledger. Apply maintains it
 
 Every 1-1 target has one, `<target>__ledger` in the target's schema, created in the
 registration transaction and dropped with the target (`defs::ledger`). It holds
-one entry per source key (`__from_key`, in the ring's `key` encoding) with the
+one entry per member key (`__from_key`, in the ring's `key` encoding) with the
 ordering state apply will judge a change against:
 
 - `__applied_lsn` and `__applied_seg`: the `lsn` and ring segment of the last
@@ -287,6 +287,16 @@ tombstones by `__applied_seg` (the tombstone GC's index, below).
 A 1-1 target's build, and a field build, lock and stamp entries as a page
 does ([builds](builds.md)).
 
+**A `WHERE`.** A row whose predicate is not `TRUE` is a row gone from the
+source. A page decides an Apply image's membership before it locks the
+entries, and a Re-derive's from the row it read under the lock: a change that
+leaves a row failing deletes its target row and tombstones its entry, entry
+or not. A build chunk reads, locks and writes member rows only, so the ledger
+stays the size of the target. Every field is rendered
+`CASE WHEN (<p>) IS TRUE THEN … END`, so none is evaluated on a failing row.
+An image without a column the predicate reads fails the page, which holds its
+key.
+
 **Tombstone GC (I4).** Maintenance deletes each tombstone whose
 `__applied_seg` is at or below the **contiguous drained prefix**, the highest
 `seg_seq` at or below which every segment is drained, not the highest drained
@@ -299,21 +309,23 @@ tombstone it wrote outlives every change its `__basis` would refuse. A later
 change to a collected key finds no entry and gets a fresh one, where I2
 reduces to the truncate floor.
 
-The GC skips the ledgers of a definition under a build: one that is
-`backfilling`, or whose Re-derive build a pause or quarantine froze. A 1-1
-`JOIN`'s build chunk inserts the `R` entries of rows that have none from a
-read in the same statement
+The GC collects a plain 1-1 ledger during its build: a build chunk, a field
+build's chunk and a sweep lock their entries before they read, as a page's
+Re-derive does. A tombstone collected before the lock gets a fresh
+placeholder, and the read sees the delete; one collected between the
+placeholder insert and the `for update` fails the lock transiently.
+
+The GC skips a 1-1 `JOIN`'s hidden ledgers while its definition is under a
+build: `backfilling`, or with a Re-derive build a pause or quarantine froze.
+Its build chunk inserts the `R` entries of rows that have none from a read in
+the same statement
 ([ADR-0021](../decisions/0021-one-to-one-join-transforms.md#a-build-fills-every-m-then-r-and-the-target)),
-so a tombstone written after that read's snapshot must still be there at
-the insert's uniqueness check. A plain 1-1 chunk locks its entries before it
-reads, as a page's Re-derive does, and needs no skip; its ledger is skipped
-anyway, which only delays the GC
-([#2018](https://github.com/salesforce-misc/trellis/issues/2018)). A GC
-batch checks the definition and holds its row `for key share` until it
-commits, and a build's start takes that row `for update`, so a batch either
-commits before the start or sees the build and skips. The tombstones of
-deletes applied during a build therefore wait for it to finish, which bounds
-them by the write rate times the build's length.
+so a tombstone written after that read's snapshot must still be there at the
+insert's uniqueness check. A GC batch checks the definition and holds its row
+`for key share` until it commits, and a build's start takes that row
+`for update`, so a batch either commits before the start or sees the build
+and skips. Those tombstones wait for the build to finish, which bounds them by
+the write rate times the build's length.
 
 Only a tombstone carries `__applied_seg`. A write that leaves an entry
 a tombstone raises it to `greatest(old, its segment)`; one that leaves the

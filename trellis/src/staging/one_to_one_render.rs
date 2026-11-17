@@ -75,8 +75,11 @@ pub(crate) async fn image_columns(
 pub(crate) struct OneToOneRender {
     /// Each written field's name and its SQL over `s`, in definition order.
     pub fields: Vec<(String, String)>,
-    /// The source columns the fields read, in column order.
+    /// The source columns the fields and the `WHERE` read, in column order.
     columns: Vec<ImageColumn>,
+    /// The definition's `WHERE` over the source row `s`, as the two-valued
+    /// `((<p>) is true)`: whether the row is a member. `None` for `TRUE`.
+    predicate: Option<String>,
 }
 
 impl OneToOneRender {
@@ -86,6 +89,7 @@ impl OneToOneRender {
         Self {
             fields: Vec::new(),
             columns,
+            predicate: None,
         }
     }
 
@@ -98,6 +102,7 @@ impl OneToOneRender {
         paused: &HashSet<String>,
     ) -> Result<Self, ApplyError> {
         let substituted = crate::defs::backfill::substitute_all_fields(def)?;
+        let predicate = def.predicate.filter().map(|p| membership_sql(p, "s"));
         let mut read: BTreeSet<String> = BTreeSet::new();
         let mut fields = Vec::with_capacity(def.fields.len());
         for (field, expr) in def.fields.iter().zip(&substituted) {
@@ -105,10 +110,8 @@ impl OneToOneRender {
                 continue;
             }
             collect_columns(expr, &mut read);
-            fields.push((
-                field.name.clone(),
-                crate::defs::oracle::render_qualified_expr_sql(expr, "s"),
-            ));
+            let sql = crate::defs::oracle::render_qualified_expr_sql(expr, "s");
+            fields.push((field.name.clone(), guard_field(predicate.as_deref(), sql)));
         }
         // The `WHERE`'s columns, read whichever fields are paused: they
         // decide whether the row is a member.
@@ -118,7 +121,50 @@ impl OneToOneRender {
             .filter(|c| read.contains(&c.name))
             .cloned()
             .collect();
-        Ok(Self { fields, columns })
+        Ok(Self {
+            fields,
+            columns,
+            predicate,
+        })
+    }
+
+    /// Whether the definition has a `WHERE` other than `TRUE`.
+    pub(crate) fn filtered(&self) -> bool {
+        self.predicate.is_some()
+    }
+
+    /// Which of `images` (text-valued jsonb rows) are member rows, one flag
+    /// per image, in order: a page treats a row that is no member as a row
+    /// gone from the source (ADR-0002, Apply and Re-derive). One statement
+    /// over bound parameters, whose only qual is the predicate: it reads no
+    /// table and takes no lock. With no `WHERE` every row is a member and
+    /// nothing runs. A row without a column the predicate reads fails the
+    /// statement with `22P02` ([`Self::row_sql`]), so its key is held rather
+    /// than the row read as no member (#1991 rule 11).
+    pub(crate) async fn members(
+        &self,
+        client: &impl GenericClient,
+        images: &[&str],
+    ) -> Result<Vec<bool>, ApplyError> {
+        let Some(predicate) = &self.predicate else {
+            return Ok(vec![true; images.len()]);
+        };
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "select v.__ord::integer \
+             from unnest($1::text[]::jsonb[]) with ordinality as v(__img, __ord) \
+             cross join {row} where {predicate}",
+            row = self.row_sql("v.__img"),
+        );
+        let mut members = vec![false; images.len()];
+        for row in client.query(&sql, &[&images]).await? {
+            let ord: i32 = row.get(0);
+            let at = usize::try_from(ord - 1).expect("an ordinal counts from 1");
+            members[at] = true;
+        }
+        Ok(members)
     }
 
     /// A lateral subquery `s` with the columns the fields read, cast from
@@ -157,6 +203,27 @@ impl OneToOneRender {
             })
             .collect();
         format!("lateral (select {}) s", casts.join(", "))
+    }
+}
+
+/// A definition's `WHERE` as the two-valued membership test
+/// `((<p>) is true)` over the source row `source_sql` (#1991 rule 3).
+pub(crate) fn membership_sql(predicate: &Expr, source_sql: &str) -> String {
+    format!(
+        "(({}) is true)",
+        crate::defs::oracle::render_qualified_expr_sql(predicate, source_sql)
+    )
+}
+
+/// A field's SQL as a filtered definition writes it:
+/// `case when <membership> then <field> end`, so it is never evaluated on a
+/// row that is no member, whatever order the planner evaluates the
+/// statement's quals in (#1991 rule 9: `WHERE qty <> 0 SELECT amount / qty`
+/// never divides by zero). Unchanged with no `WHERE`.
+pub(crate) fn guard_field(membership: Option<&str>, sql: String) -> String {
+    match membership {
+        Some(member) => format!("(case when {member} then {sql} end)"),
+        None => sql,
     }
 }
 

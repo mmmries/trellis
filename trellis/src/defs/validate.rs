@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::ast::{
-    Expr, FieldDef, JoinOn, JoinSpec, KeySpace, Predicate, QualifiedColumn, TransformDef,
-    ValueType, render_field_expr,
+    Expr, FieldDef, JoinOn, JoinSpec, KeySpace, QualifiedColumn, TransformDef, ValueType,
+    render_field_expr,
 };
 use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
@@ -572,10 +572,6 @@ pub enum ValidationError {
     /// some value of its operand types (ADR-0004): only a total predicate
     /// is admitted (`defs::totality`).
     PredicateNotTotal { construct: String, reason: String },
-    /// A `WHERE` other than `TRUE` on a key space whose apply path doesn't
-    /// filter yet. Each key space's step of #1991 lifts it for that key
-    /// space.
-    FilterNotYetSupported { key_space: &'static str },
     /// `MIN` or `MAX` in an aggregate with a `WHERE` other than `TRUE`: an
     /// extreme is kept by probing a source index for the group's endpoint,
     /// and a filtered extreme's endpoint is no index endpoint (#1991).
@@ -1236,7 +1232,6 @@ impl ValidationError {
             ValidationError::AggregateInPredicate { .. } => ErrorId(235),
             ValidationError::PredicateColumnNotFound { .. } => ErrorId(236),
             ValidationError::PredicateNotTotal { .. } => ErrorId(237),
-            ValidationError::FilterNotYetSupported { .. } => ErrorId(238),
             ValidationError::FilteredExtreme { .. } => ErrorId(239),
             ValidationError::JoinPredicateReadsBothSides { .. } => ErrorId(243),
             ValidationError::JoinPredicateJoinedSideUnderLeft { .. } => ErrorId(244),
@@ -1929,10 +1924,6 @@ impl std::fmt::Display for FieldMessage<'_> {
                 "WHERE: {construct} can raise an error for some rows: {reason}; a WHERE must \
                  be total"
             ),
-            ValidationError::FilterNotYetSupported { key_space } => write!(
-                f,
-                "a WHERE other than TRUE is not supported on a {key_space} transform yet"
-            ),
             ValidationError::FilteredExtreme { field, function } => write!(
                 f,
                 "calculated field '{field}': {function} is not supported in an aggregate with a \
@@ -2157,8 +2148,6 @@ pub fn validate(
         check_aggregate_table_widths(def, source_columns)?;
     }
 
-    refuse_unsupported_filter(def)?;
-
     Ok(())
 }
 
@@ -2205,26 +2194,6 @@ fn validate_predicate(
             reason: refused.reason,
         }
     })
-}
-
-/// Refuses a `WHERE` other than `TRUE` on a key space whose apply path
-/// doesn't filter yet (#1991). Each key space's step removes its arm once
-/// its build, apply and `self_check` read the predicate; until then define
-/// refuses here, after every other check, so the predicate's own refusals
-/// are reported first.
-pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), ValidationError> {
-    if matches!(def.predicate, Predicate::True) {
-        return Ok(());
-    }
-    let key_space = match &def.key_space {
-        KeySpace::OneToOne => "1-1",
-        KeySpace::Aggregate { .. } => return Ok(()),
-        // Filtered per side (#2042): `validate_join` checks the predicate.
-        KeySpace::Join(_) => return Ok(()),
-        // Filtered at recompute (#2041): its validator checks the predicate.
-        KeySpace::JoinOneToOne(_) => return Ok(()),
-    };
-    Err(ValidationError::FilterNotYetSupported { key_space })
 }
 
 /// Refuses `MIN`/`MAX` in an aggregate whose `WHERE` is other than `TRUE`
@@ -3013,8 +2982,6 @@ pub fn validate_join(
     left: &HashMap<String, JoinColumnInfo>,
     joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
-    // Both `JOIN` key spaces filter: their validators check the predicate.
-    refuse_unsupported_filter(def)?;
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);
     }
@@ -5691,7 +5658,7 @@ fn visit<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defs::ast::Operator;
+    use crate::defs::ast::{Operator, Predicate};
     use crate::defs::pg_type::PgType;
     use crate::error_code::Message as _;
     use crate::float::FloatWidth;
