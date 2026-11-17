@@ -587,6 +587,16 @@ pub enum ValidationError {
     /// A top-level `AND` conjunct of a join aggregate's `WHERE` that reads
     /// no column (`WHERE FALSE`): it filters neither side (ADR-0019).
     JoinPredicateReadsNoColumn { conjunct: String },
+    /// A field of a plain aggregate passes a `char(n)` `GROUP BY` key, or an
+    /// expression that keeps its `char(n)` type, to a function that reads
+    /// the key's trailing blanks (`OCTET_LENGTH`). The aggregate keeps the
+    /// key as `text`, which drops them, so the field would hold `2` for a
+    /// `char(4)` `'ab'` where Postgres gives `4` (#2069).
+    CharKeyPaddingFunction {
+        field: String,
+        function: String,
+        column: String,
+    },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -1236,6 +1246,7 @@ impl ValidationError {
             ValidationError::JoinPredicateReadsBothSides { .. } => ErrorId(243),
             ValidationError::JoinPredicateJoinedSideUnderLeft { .. } => ErrorId(244),
             ValidationError::JoinPredicateReadsNoColumn { .. } => ErrorId(245),
+            ValidationError::CharKeyPaddingFunction { .. } => ErrorId(246),
         }
     }
 
@@ -1944,6 +1955,16 @@ impl std::fmt::Display for FieldMessage<'_> {
                 "WHERE: {conjunct} reads no column; in a JOIN with GROUP BY each AND-ed \
                  condition of a WHERE must read one table"
             ),
+            ValidationError::CharKeyPaddingFunction {
+                field,
+                function,
+                column,
+            } => write!(
+                f,
+                "calculated field '{field}': {function} reads {column}, a char(n) GROUP BY key; \
+                 the aggregate keeps the key as text without its trailing blanks, so the value \
+                 would differ from Postgres's"
+            ),
         }
     }
 }
@@ -2336,6 +2357,94 @@ pub(crate) fn check_key_collations<'c>(
             if let Some(info) = column(name) {
                 check_key_collation(role.clone(), table, name, info)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// One read [`padding_function_key_reads`] found.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PaddingFunctionRead {
+    /// The field whose own expression makes the call.
+    pub field: String,
+    pub function: String,
+    /// The column read, directly or through `COALESCE`, `NULLIF`, a `CASE`
+    /// result or another calculated field: the ways its `char(n)` type, and
+    /// so its padding, reaches the function.
+    pub column: String,
+}
+
+/// Every column a field of `def` passes to a function that reads a
+/// `char(n)`'s trailing blanks
+/// ([`super::registry::PADDING_SENSITIVE_FUNCTIONS`]), outside an
+/// aggregate's argument, which reads source rows and so the padded value.
+/// Each read is reported once, in field order.
+pub(crate) fn padding_function_key_reads(def: &TransformDef) -> Vec<PaddingFunctionRead> {
+    fn walk(
+        expr: &Expr,
+        field: &str,
+        fields_by_name: &HashMap<&str, &FieldDef>,
+        out: &mut Vec<PaddingFunctionRead>,
+    ) {
+        if let Expr::FunctionCall { name, args } = expr {
+            if super::registry::is_aggregate_name(name) {
+                return;
+            }
+            if super::registry::PADDING_SENSITIVE_FUNCTIONS.contains(&name.as_str()) {
+                let mut columns = Vec::new();
+                let mut visited = HashSet::new();
+                for arg in args {
+                    collect_value_columns(arg, field, fields_by_name, &mut visited, &mut columns);
+                }
+                out.extend(columns.into_iter().map(|(_, column)| PaddingFunctionRead {
+                    field: field.to_string(),
+                    function: name.clone(),
+                    column,
+                }));
+            }
+        }
+        for child in expr.children() {
+            walk(child, field, fields_by_name, out);
+        }
+    }
+    let fields_by_name: HashMap<&str, &FieldDef> =
+        def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut reads = Vec::new();
+    for field in &def.fields {
+        walk(&field.expr, &field.name, &fields_by_name, &mut reads);
+    }
+    let mut seen = HashSet::new();
+    reads.retain(|read| seen.insert(read.clone()));
+    reads
+}
+
+/// Refuses a plain aggregate whose field passes a `char(n)` `GROUP BY` key to
+/// a function that reads its padding ([`padding_function_key_reads`],
+/// [`ValidationError::CharKeyPaddingFunction`]): the aggregate keeps the key
+/// as `text`, without its trailing blanks. `column` gives a column's live
+/// type; `only_fields`, if given, limits the check to those fields
+/// (`ALTER TRANSFORM`'s added and altered ones). Define, an edit and a resume
+/// all validate through here.
+pub(crate) fn check_char_key_padding_reads<'c>(
+    def: &TransformDef,
+    only_fields: Option<&[FieldDef]>,
+    column: impl Fn(&str) -> Option<&'c JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let KeySpace::Aggregate { group_by } = &def.key_space else {
+        return Ok(());
+    };
+    for read in padding_function_key_reads(def) {
+        if only_fields.is_some_and(|only| !only.iter().any(|field| field.name == read.field)) {
+            continue;
+        }
+        if group_by.contains(&read.column)
+            && column(&read.column).is_some_and(|info| info.type_oid == super::pg_type::oid::BPCHAR)
+        {
+            return Err(ValidationError::CharKeyPaddingFunction {
+                field: read.field,
+                function: read.function,
+                column: read.column,
+            });
         }
     }
     Ok(())
@@ -9466,5 +9575,104 @@ mod key_collation_tests {
             Err((KeyColumnRole::GroupBy, "g".to_string()))
         );
         assert_eq!(key_of(&[]), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod char_key_padding_tests {
+    use super::*;
+
+    fn info(type_oid: u32) -> JoinColumnInfo {
+        JoinColumnInfo {
+            value_type: ValueType::Text,
+            pg_type: String::new(),
+            type_oid,
+            typmod: -1,
+            collation_oid: 0,
+            collation: None,
+            collation_deterministic: true,
+            is_enum: false,
+            enum_labels: None,
+            copy_type: String::new(),
+            copy_collation: None,
+            trellis_target: false,
+        }
+    }
+
+    /// `ch` and `other` are `char(4)`, `t` is `text`.
+    fn check(text: &str) -> Result<(), ValidationError> {
+        let def = crate::defs::parser::parse(text).expect("parse");
+        let bpchar = info(super::super::pg_type::oid::BPCHAR);
+        let plain = info(super::super::pg_type::oid::TEXT);
+        check_char_key_padding_reads(&def, None, |name| {
+            Some(if name == "t" { &plain } else { &bpchar })
+        })
+    }
+
+    #[test]
+    fn a_char_key_reaching_octet_length_is_refused() {
+        for field in [
+            "OCTET_LENGTH(ch)",
+            "OCTET_LENGTH(COALESCE(ch, 'x'))",
+            "OCTET_LENGTH(CASE WHEN other = 'a' THEN ch ELSE 'x' END)",
+            "OCTET_LENGTH(NULLIF(ch, 'x'))",
+            "OCTET_LENGTH(k) + 1",
+        ] {
+            let def = format!(
+                "TRANSFORM g FROM s GROUP BY ch, other SELECT ch AS k, {field} AS o, COUNT(*) AS n"
+            );
+            assert_eq!(
+                check(&def),
+                Err(ValidationError::CharKeyPaddingFunction {
+                    field: "o".to_string(),
+                    function: "OCTET_LENGTH".to_string(),
+                    column: "ch".to_string(),
+                }),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_keeps_no_char_padding_is_admitted() {
+        for field in [
+            "CHAR_LENGTH(ch)",
+            "STRPOS(ch, 'a')",
+            "SUM(OCTET_LENGTH(other))",
+            "MAX(OCTET_LENGTH(ch))",
+        ] {
+            let def = format!("TRANSFORM g FROM s GROUP BY ch SELECT {field} AS o, ch AS ch");
+            assert_eq!(check(&def), Ok(()), "{field}");
+        }
+        // A `text` key, and a `char(n)` column that is not a key.
+        assert_eq!(
+            check("TRANSFORM g FROM s GROUP BY t SELECT OCTET_LENGTH(t) AS o"),
+            Ok(())
+        );
+        assert_eq!(
+            check("TRANSFORM g FROM s GROUP BY t SELECT SUM(OCTET_LENGTH(ch)) AS o"),
+            Ok(())
+        );
+        // A 1-1 transform keeps the column's own type.
+        assert_eq!(
+            check("TRANSFORM g FROM s SELECT OCTET_LENGTH(ch) AS o"),
+            Ok(())
+        );
+    }
+
+    /// An `ALTER` checks only the fields it adds or changes.
+    #[test]
+    fn an_edit_checks_only_its_own_fields() {
+        let def = crate::defs::parser::parse(
+            "TRANSFORM g FROM s GROUP BY ch SELECT OCTET_LENGTH(ch) AS o, ch AS ch",
+        )
+        .expect("parse");
+        let bpchar = info(super::super::pg_type::oid::BPCHAR);
+        let new: Vec<FieldDef> = def.fields[1..].to_vec();
+        assert_eq!(
+            check_char_key_padding_reads(&def, Some(&new), |_| Some(&bpchar)),
+            Ok(())
+        );
+        assert!(check_char_key_padding_reads(&def, None, |_| Some(&bpchar)).is_err());
     }
 }
