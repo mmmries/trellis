@@ -2480,7 +2480,6 @@ pub async fn alter_transform(
     check_collation_reads(&merged, Some(&edited), |read| {
         Some((current.source_table.clone(), live.info(&read.column)?))
     })?;
-    super::validate::check_char_key_padding_reads(&merged, Some(&edited), |name| live.info(name))?;
     assert_regexp_patterns_accepted(&txn, &merged, Some(&edited)).await?;
 
     for field in &real_drops {
@@ -5065,8 +5064,10 @@ async fn qualified_table_exists(
 ///   columns, and any `GROUP BY` key, need a deterministic collation. A
 ///   table that capture can't key is refused.
 /// - **A plain definition's text functions**: any column a field's
-///   `STRPOS`/`REGEXP_COUNT` reads needs a deterministic collation. A
-///   `JOIN`'s are [`super::validate::validate_join`]'s.
+///   `STRPOS`/`REGEXP_COUNT` reads needs a deterministic collation, and
+///   `OCTET_LENGTH` can't read a `char(n)` `GROUP BY` key
+///   ([`super::validate::check_char_key_padding_reads`]). A `JOIN`'s are
+///   [`super::validate::validate_join`]'s.
 /// - **Row-level security and subscriptions**: row-level
 ///   security that applies to a role reading a table
 ///   ([`side_read_table`]) would refuse the reads (every Trellis session runs
@@ -5096,7 +5097,7 @@ pub(crate) async fn validate_live_schema(
         let source_key: Vec<&str> = key.iter().map(|column| column.name.as_str()).collect();
         check_key_collations(def, table, &source_key, |name| live.info(name))?;
         if plain {
-            super::validate::check_char_key_padding_reads(def, None, |name| live.info(name))?;
+            super::validate::check_char_key_padding_reads(def, |name| live.info(name))?;
             super::validate::check_enum_literals(def, &live.typed())?;
             check_collation_reads(def, None, |read| {
                 Some((table.to_string(), live.info(&read.column)?))

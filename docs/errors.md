@@ -664,9 +664,10 @@ transform.
 
 ### T0246 CharKeyPaddingFunction
 
-A field of an aggregate passes a `char(n)` `GROUP BY` key to `OCTET_LENGTH`,
-directly or through `COALESCE`, `NULLIF`, a `CASE` result or another field. The
-aggregate keeps the key as `text` without its trailing blanks
+A field of an aggregate passes a `char(n)` `GROUP BY` key to `OCTET_LENGTH`
+as `char(n)`: directly, or through another field or a `COALESCE`, `NULLIF` or
+`CASE` that Postgres types `char(n)`. The aggregate keeps the key as `text`
+without its trailing blanks
 ([the key's type](type-support.md#the-types-of-the-columns-trellis-creates)),
 so the length would differ from Postgres's. Group by a `text` column.
 

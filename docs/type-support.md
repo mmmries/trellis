@@ -92,7 +92,7 @@ string, unconstrained `numeric`, a temporal type at full precision. A `char(n)` 
 therefore holds `'ab'`, not `'ab  '`. A field
 reads a `char(n)` or `name` key as its source type, as Postgres's `GROUP BY`
 does, so `ch = 'ab  '` ignores trailing blanks. `OCTET_LENGTH` of such a key
-would see the missing blanks, so it is refused
+read as `char(n)` would see the missing blanks, so it is refused
 ([T0246](errors.md#t0246-charkeypaddingfunction)). A `JOIN`
 holds its `GROUP BY` and `ON` columns in each column's type and collation, in
 its target and its hidden tables, with no modifier.
