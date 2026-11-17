@@ -2632,7 +2632,26 @@ pub(crate) fn validate_live(
         .iter()
         .map(|(name, info)| (name.clone(), info.value_type))
         .collect();
-    validate(def, &value_types)?;
+    validate(def, &value_types).map_err(|err| match err {
+        // `validate` only knows the column's `ValueType`; the live model
+        // knows the declared type, which the aggregate-admission refusal
+        // names too.
+        ValidationError::UnsupportedExtremeArgument {
+            function,
+            argument,
+            pg_type,
+        } => {
+            let column = columns
+                .get(&argument)
+                .or_else(|| columns.get(argument.rsplit('.').next().unwrap_or(&argument)));
+            ValidationError::UnsupportedExtremeArgument {
+                function,
+                pg_type: column.map_or(pg_type, |info| info.pg_type.clone()),
+                argument,
+            }
+        }
+        err => err,
+    })?;
     validate_aggregate_admitted(def, columns)
 }
 
@@ -7655,6 +7674,28 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// #1895: a plain `MIN`/`MAX` refused over a column's type names the
+    /// declared type, not the `ValueType`'s.
+    #[test]
+    fn plain_extreme_refusal_names_the_declared_type() {
+        let def = parse_text("TRANSFORM t FROM s GROUP BY g SELECT g AS g, MIN(w) AS lo").unwrap();
+        let columns: HashMap<String, JoinColumnInfo> = [
+            ("g".to_string(), int4()),
+            (
+                "w".to_string(),
+                jcol(ValueType::Text, "character varying(5)", 1043, 9),
+            ),
+        ]
+        .into();
+        let err = validate_live(&def, &columns).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::UnsupportedExtremeArgument { pg_type, .. }
+                if pg_type == "character varying(5)"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("character varying(5)"), "{err}");
     }
 
     /// `MIN`/`MAX` take a plain source column (#1117 rule 5) of a table that

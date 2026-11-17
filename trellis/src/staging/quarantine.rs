@@ -3810,6 +3810,7 @@ async fn refuse_unless_valid_in(
         Err(reason) => Err(ApplyError::ResumeRefused {
             transform: transform.to_string(),
             reason: Box::new(reason),
+            status: definition.status.reported(false),
         }),
     }
 }
@@ -4372,6 +4373,7 @@ async fn resume_locked(
             return Err(ApplyError::ResumeRefused {
                 transform: target.to_string(),
                 reason: Box::new(reason),
+                status: status.reported(false),
             });
         }
     };
