@@ -108,10 +108,11 @@ source yet, so a watermark token wouldn't wait for what is missing. It reads
 ([ADR-0002](decisions/0002-async-data-flow.md#what-live-promises)).
 
 So does a `live` transform that reads a paused column of an upstream 1-1
-target (its fuse tripped, or `PAUSE TRANSFORM t.col`): an aggregate or `JOIN`
-keeps applying over the column's frozen values, exact against the target and
-stale against the source. [`paused_upstream_columns`](#paused_upstream_columns)
-names the columns. A 1-1 reader's own field is paused with the column
+target (its fuse tripped, or `PAUSE TRANSFORM t.col`): an aggregate or `JOIN`,
+and any transform whose `WHERE` reads the column, keeps applying over the
+column's frozen values, exact against the target and stale against the source.
+[`paused_upstream_columns`](#paused_upstream_columns) names the columns. A 1-1
+reader's own field is paused with the column
 ([ADR-0003](decisions/0003-quarantine-storage-and-api.md)), and an aggregate
 that reads only other columns stays `live`.
 
@@ -553,7 +554,10 @@ report [`catching_up`](#catching_up), each `target.column` as
 `quarantine_status` addresses it, sorted: the paused columns it reads, and
 those behind the definitions it reads, transitively. Empty when no such
 column is read. Nothing is paused or rebuilt: resuming the column writes
-through to the reader, the list empties and the status returns to `live`. In
+through to the reader, the list empties and the status returns to `live`. A
+non-empty list is a degraded state that, unlike ordinary catch-up, doesn't
+clear on its own: the operator
+[resumes the column](operations.md#pause-and-resume). In
 `trellis-embed` it is `PlainDefinitionStatus::paused_upstream_columns`. The
 CLI's `trellis status` prints a line under the definition.
 

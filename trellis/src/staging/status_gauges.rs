@@ -6,9 +6,9 @@
 //!
 //! The pass reads the catalog and nothing else:
 //!
-//! - **Statuses** are [`crate::defs::catalog::reported_statuses`], the read
-//!   `Trellis::definitions` makes, so a gauge and the API agree on a
-//!   `catching_up` definition. One query over the definitions, plus a
+//! - **Statuses** are [`crate::defs::catalog::reported_statuses_with_causes`],
+//!   the read `Trellis::definitions` makes, so a gauge and the API agree on a
+//!   `catching_up` definition and on which name a paused upstream column. One query over the definitions, plus a
 //!   definitions scan per paused column of a 1-1 target while there is one.
 //! - **Why paused** is one query over the paused definitions: the `kind` of
 //!   the definition's `capture_failures` record, else a failing build chunk
@@ -72,7 +72,7 @@ pub(crate) async fn read(
     floors: &Floors,
     drain_ttl: Duration,
 ) -> Result<StatusGauges, CatalogError> {
-    let reported = catalog::reported_statuses(client, floors).await?;
+    let (reported, paused_columns) = catalog::reported_statuses_with_causes(client, floors).await?;
     let paused = client
         .query(
             &format!(
@@ -106,6 +106,7 @@ pub(crate) async fn read(
             .map(|status| (status.as_str(), 0))
             .collect(),
         paused_by: CAUSES.into_iter().map(|cause| (cause, 0)).collect(),
+        reading_paused_columns: paused_columns.len() as u64,
         held_keys: counts.get::<_, i64>(0) as u64,
         quarantined_columns: counts.get::<_, i64>(1) as u64,
         drain_failures: counts.get::<_, i64>(2) as u64,
@@ -535,7 +536,8 @@ mod tests {
 
     /// A `live` definition reading an upstream that is paused, or a paused
     /// column of one, reports `catching_up`, in the gauge as in the API
-    /// (`reported_statuses`).
+    /// (`reported_statuses_with_causes`). Only the paused column is counted
+    /// as a read of one: an ordinary catch-up clears on its own.
     #[tokio::test]
     async fn a_definition_reading_a_paused_upstream_counts_as_catching_up() {
         let cluster = testkit::TestCluster::start();
@@ -569,6 +571,7 @@ mod tests {
             .expect("read");
         assert_eq!(live.definitions["live"], 2, "{live:?}");
         assert_eq!(live.definitions["catching_up"], 0, "{live:?}");
+        assert_eq!(live.reading_paused_columns, 0, "{live:?}");
 
         // A paused column it reads holds it back too.
         raw.batch_execute(
@@ -581,6 +584,7 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(column.definitions["catching_up"], 1, "{column:?}");
+        assert_eq!(column.reading_paused_columns, 1, "{column:?}");
         raw.batch_execute("delete from column_status")
             .await
             .expect("resume the column");
@@ -593,6 +597,7 @@ mod tests {
             .expect("read");
         assert_eq!(behind.definitions["paused"], 1, "{behind:?}");
         assert_eq!(behind.definitions["catching_up"], 1, "{behind:?}");
+        assert_eq!(behind.reading_paused_columns, 0, "{behind:?}");
         assert_eq!(behind.definitions["live"], 0, "{behind:?}");
         assert_eq!(behind.paused_by["operator"], 1, "{behind:?}");
     }

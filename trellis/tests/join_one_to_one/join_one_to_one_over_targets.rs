@@ -1006,6 +1006,94 @@ async fn s7_a_paused_upstream_column_the_join_reads() {
     }
 }
 
+/// S7 for a column only the `JOIN`'s `WHERE` reads (ADR-0003, "A `WHERE` is
+/// not a field"): the `JOIN` keeps applying over the column's frozen values,
+/// reports `catching_up` naming it and gets no `column_status` row; other
+/// changes keep flowing. The column's resume corrects membership.
+#[tokio::test]
+async fn s7_a_paused_upstream_column_the_join_s_where_reads() {
+    let mut d = upstreams().await;
+    let columns = HashMap::from([("tag".to_string(), ValueType::Text)]);
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM jw FROM public.ta LEFT JOIN public.tb ON ta.id = tb.id \
+         SELECT tb.tag AS tag WHERE ta.k > 15",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("define jw");
+    settle_all(&mut d).await;
+    let actual = "select id, tag from public.jw order by id";
+    let over = |a: &str, b: &str| {
+        format!(
+            "select a.id, b.tag from {a} a left join {b} b on a.id = b.id \
+             where a.k > 15 order by a.id"
+        )
+    };
+    let over_targets = over("public.ta", "public.tb");
+    let over_sources = over("public.asrc", "public.bsrc");
+    assert_eq!(
+        d.rows(actual).await,
+        d.rows(&over_targets).await,
+        "the build"
+    );
+    let trellis = facade(&d).await;
+    assert_eq!(reported(&trellis, "jw").await, ("live".to_string(), vec![]));
+
+    trellis
+        .apply("PAUSE TRANSFORM ta.k")
+        .await
+        .expect("pause the column");
+    assert_eq!(
+        reported(&trellis, "jw").await,
+        ("catching_up".to_string(), vec!["ta.k".to_string()])
+    );
+    assert_eq!(
+        d.rows("select status from transform_definitions where target_table = 'public.jw'")
+            .await,
+        ["(live)"],
+        "the stored status never moves"
+    );
+    assert!(
+        d.rows("select column_name from column_status where transform_table = 'jw'")
+            .await
+            .is_empty(),
+        "a predicate reader gets no column_status row"
+    );
+
+    // Row 1 would enter (k 10 to 40) and row 3 leave (k 20 to null), but
+    // membership follows the frozen `ta.k`; row 6's `b`-side change flows.
+    step(
+        &mut d,
+        "update public.asrc set k = 40 where id = 1; update public.asrc set k = null where id = 3; \
+         insert into public.bsrc values (6, 600, 'b6')",
+    )
+    .await;
+    assert_eq!(d.rows(actual).await, d.rows(&over_targets).await, "paused");
+    assert_ne!(
+        d.rows(actual).await,
+        d.rows(&over_sources).await,
+        "jw applies over the frozen column"
+    );
+    assert!(
+        d.rows("select tag from public.jw where id = 6")
+            .await
+            .iter()
+            .any(|tag| tag.contains("b6")),
+        "rows keep flowing"
+    );
+
+    trellis
+        .apply("RESUME TRANSFORM ta.k")
+        .await
+        .expect("resume the column");
+    settle_all(&mut d).await;
+    assert_eq!(reported(&trellis, "jw").await, ("live".to_string(), vec![]));
+    assert_eq!(d.rows(actual).await, d.rows(&over_sources).await, "resumed");
+    assert_eq!(d.rows(actual).await, d.rows(&over_targets).await, "resumed");
+}
+
 // ------------------------------------------------------------------- S8
 
 /// The keys `upstream` holds in quarantine, sorted.

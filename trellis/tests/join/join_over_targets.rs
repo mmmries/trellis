@@ -618,3 +618,88 @@ async fn a_join_reading_a_paused_column_of_a_target_reports_catching_up() {
     assert_eq!(reported("j").await, ("live".to_string(), vec![]));
     assert_exact(&mut d, "the column resumed").await;
 }
+
+/// A `JOIN` aggregate whose `WHERE` alone reads a paused column of a 1-1
+/// target (ADR-0003, "A `WHERE` is not a field") keeps applying over the
+/// column's frozen values and reports `catching_up` naming it; other changes
+/// keep flowing. The column's resume corrects membership.
+#[tokio::test]
+async fn a_join_whose_where_reads_a_paused_column_of_a_target_reports_catching_up() {
+    let mut d = start().await;
+    step(&mut d, SEED).await;
+    let columns: HashMap<String, ValueType> =
+        [("id", int4()), ("g", int4()), ("k", int4()), ("w", int4())]
+            .into_iter()
+            .map(|(name, ty)| (name.to_string(), ty))
+            .collect();
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM jw FROM public.a1 LEFT JOIN public.b1 ON a1.k = b1.k \
+         GROUP BY a1.g WITHOUT SOURCE INDEX SELECT a1.g AS g, COUNT(*) AS n WHERE a1.w > 5",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("define jw");
+    settle_all(&mut d).await;
+    const JW: &str = "select g, n from public.jw order by g";
+    const OVER_TARGETS: &str = "select a.g, count(*) from public.a1 a \
+                                left join public.b1 b on a.k = b.k \
+                                where a.w > 5 group by a.g order by a.g";
+    const OVER_SOURCES: &str = "select a.g, count(*) from public.fa a left join ( \
+                                    select k, gb from public.db group by k, gb \
+                                ) b on a.k = b.k \
+                                where a.v + a.v > 5 group by a.g order by a.g";
+    assert_eq!(d.rows(JW).await, d.rows(OVER_SOURCES).await, "the build");
+    let trellis = facade(&d).await;
+    let reported = |name: &'static str| {
+        let trellis = &trellis;
+        async move {
+            let status = trellis
+                .status(name)
+                .await
+                .expect("status")
+                .expect("the definition exists");
+            (
+                status.status.as_str().to_string(),
+                status.paused_upstream_columns,
+            )
+        }
+    };
+    assert_eq!(reported("jw").await, ("live".to_string(), vec![]));
+
+    trellis
+        .apply("PAUSE TRANSFORM a1.w")
+        .await
+        .expect("pause a1.w");
+    assert_eq!(
+        reported("jw").await,
+        ("catching_up".to_string(), vec!["a1.w".to_string()])
+    );
+    assert!(
+        d.rows("select column_name from column_status where transform_table = 'jw'")
+            .await
+            .is_empty(),
+        "a predicate reader gets no column_status row"
+    );
+
+    // Row 1 would enter (w 2 to 100), but membership follows the frozen
+    // `a1.w`; a new `b1` group for row 3's key flows into group 2.
+    let before = d.rows(JW).await;
+    step(
+        &mut d,
+        "update public.fa set v = 50 where id = 1; insert into public.db values (7, 10, 9, 1)",
+    )
+    .await;
+    assert_eq!(d.rows(JW).await, d.rows(OVER_TARGETS).await, "paused");
+    assert_ne!(d.rows(JW).await, d.rows(OVER_SOURCES).await, "frozen");
+    assert_ne!(d.rows(JW).await, before, "rows keep flowing");
+
+    trellis
+        .apply("RESUME TRANSFORM a1.w")
+        .await
+        .expect("resume a1.w");
+    settle_all(&mut d).await;
+    assert_eq!(reported("jw").await, ("live".to_string(), vec![]));
+    assert_eq!(d.rows(JW).await, d.rows(OVER_SOURCES).await, "resumed");
+}
