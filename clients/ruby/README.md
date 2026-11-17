@@ -580,6 +580,13 @@ instance and every instance of `config.trellis.instances`. Neither it nor
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
 
+`db:prepare` in development also migrates the test databases. A migration
+of a test database never uses a connected handle: the helpers and
+`with_handle` connect to the test counterpart of the development database
+the instance's `url` points at (the `database.yml` config of the same name),
+or to the migrating database when the `url` names none, with the instance's
+other options.
+
 ### Targets as models
 
 Only Trellis writes a target. Declare a model over one with
