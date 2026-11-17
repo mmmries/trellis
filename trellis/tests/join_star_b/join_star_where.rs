@@ -169,6 +169,47 @@ async fn a_hand_off_of_a_key_between_b_rows_whose_predicate_values_differ() {
     .await;
 }
 
+/// The other direction of the hand-off, checked between its two pages: the
+/// `b` row taking the key over (`w` 100) fails the predicate, the one handing
+/// it off (`w` 900) passes. Applied before the hand-off, the insert leaves two
+/// live entries on the key, and the newest (the insert's) decides: the rows
+/// on the key leave the target. Its delete and its upsert must read the same
+/// entry, or the rows stay with their old values until the second page.
+#[tokio::test]
+async fn between_the_pages_of_a_hand_off_the_newest_entry_decides_membership() {
+    for shape in SHAPES {
+        for star in shape.stars() {
+            let star = star.filtered(ON_B);
+            let mut d = star::start(
+                &[star],
+                A_ROWS,
+                "(1, 10, 900, 'ten'), (2, 20, 200, 'twenty'), (3, 40, 400, 'forty')",
+            )
+            .await;
+            star::assert_star(&d, star).await;
+            let name = star.name();
+            let on_key = format!("select count(*) from {} where id in (1, 2)", star.target());
+            assert_eq!(d.rows(&on_key).await, ["(2)"], "{name}");
+            star::write(&d, &shape.sql("update {b} set k = 60 where id = 1")).await;
+            let hand_off = d.seal().await;
+            star::write(
+                &d,
+                &shape.sql("insert into {b} values (5, 10, 100, 'handed')"),
+            )
+            .await;
+            let insert = d.seal().await;
+            d.drain(insert, "insert").await;
+            assert_eq!(
+                d.rows(&on_key).await,
+                ["(0)"],
+                "{name}: the newest entry fails"
+            );
+            d.drain(hand_off, "hand-off").await;
+            star::assert_oracle(&mut d, &[star]).await;
+        }
+    }
+}
+
 /// A fan-out left to chunks flips the rows on its key out, then back in,
 /// chunk by chunk: every kind runs the delete, `LEFT`-only included (#1991
 /// rule 18), and each chunk deletes the rows it reaches.
