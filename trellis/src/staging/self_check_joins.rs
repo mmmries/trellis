@@ -74,7 +74,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, JoinKind, Predicate, TransformDef, ValueType};
+use crate::defs::ast::{Expr, JoinKind, TransformDef, ValueType};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side as JoinSide};
@@ -254,6 +254,14 @@ pub(super) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
         .into_iter()
         .chain(spec::side_arguments(&def.def, spec::JOINED))
         .collect();
+    if let Some(predicate) = def.def.predicate.filter() {
+        render(&def.def, predicate, "a", "b").map_err(|detail| {
+            SelfCheckError::UnsupportedExpr {
+                target: def.def.target.clone(),
+                detail,
+            }
+        })?;
+    }
     for field in value_fields(&def.def) {
         render(&def.def, &field.expr, "a", "b")
             .and_then(|_| render_signed(&def.def, &field.expr, &args, &[], &[]))
@@ -591,6 +599,18 @@ impl Audit<'_> {
         )
     }
 
+    /// `side`'s conjuncts of the definition's `WHERE`, `((…) is true)` over
+    /// `alias`, its row of that side; `None` when no conjunct reads it.
+    fn side_member(&self, side: JoinSide, alias: &str) -> Result<Option<String>, SelfCheckError> {
+        spec::side_predicate(self.def, side)
+            .map(|p| {
+                render(self.def, &p, alias, alias)
+                    .map(|sql| format!("(({sql}) is true)"))
+                    .map_err(|d| self.unsupported(d))
+            })
+            .transpose()
+    }
+
     /// `P` or `M`'s page statement, and its partial columns: the side's
     /// cells against a `GROUP BY` of its table's weighted rows.
     fn side_page(
@@ -618,13 +638,19 @@ impl Audit<'_> {
         let key = keyset.columns();
         // A joined row with a `NULL` join-key part joins nothing, and has no
         // `M` cell.
-        let source_where: String = match side {
+        let mut source_where: String = match side {
             JoinSide::From => String::new(),
             JoinSide::Joined(_) => spec::join_key(self.def, side)
                 .iter()
                 .map(|c| format!(" and __s.{} is not null", quote_ident(c)))
                 .collect(),
         };
+        // The side counts only the rows its conjuncts of the `WHERE` keep
+        // (ADR-0019), and an argument is read only on such a row.
+        let member = self.side_member(side, "__s")?;
+        if let Some(member) = &member {
+            source_where.push_str(&format!(" and {member}"));
+        }
         let columns = partial_names(parts);
         let rendered: Vec<(String, &[SumPart], Option<i32>)> = self
             .render_args(args, "__s")?
@@ -637,6 +663,10 @@ impl Audit<'_> {
                     arg
                 } else {
                     summand(*kind, &arg)
+                };
+                let arg = match &member {
+                    Some(member) => format!("(case when {member} then {arg} end)"),
+                    None => arg,
                 };
                 (arg, parts, scale)
             })
@@ -665,7 +695,7 @@ impl Audit<'_> {
 
     /// `J`'s page statement: each join key's `__matches` against the joined
     /// table's weighted row count for it, read under `J`'s column names.
-    fn matches_page(&self, keyset: &Keyset, steer: bool) -> String {
+    fn matches_page(&self, keyset: &Keyset, steer: bool, member: Option<&str>) -> String {
         let j_cols = spec::join_key(self.def, JoinSide::From);
         let joined_cols = spec::join_key(self.def, spec::JOINED);
         let renamed = |alias: &str| {
@@ -676,10 +706,15 @@ impl Audit<'_> {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let not_null: String = j_cols
+        let mut not_null: String = j_cols
             .iter()
             .map(|c| format!(" and __s.{} is not null", quote_ident(c)))
             .collect();
+        // `J.matches` counts the joined rows `M` counts: those its conjuncts
+        // of the `WHERE` keep.
+        if let Some(member) = member {
+            not_null.push_str(&format!(" and {member}"));
+        }
         let key = keyset.columns();
         let ring = self.ring(spec::JOINED);
         let (ctes, weighted) = self.ring_reads(spec::JOINED, &ring, true);
@@ -759,11 +794,29 @@ impl Audit<'_> {
             .chain(&self.joined_args)
             .cloned()
             .collect();
+        // The definition's `WHERE` as written, over the joined row
+        // (ADR-0019 `self_check`): not the engine's per-side split. An
+        // argument is read only on a row it keeps.
+        let member = self
+            .def
+            .predicate
+            .filter()
+            .map(|p| render(self.def, p, "__a", "__b").map(|sql| format!("(({sql}) is true)")))
+            .transpose()
+            .map_err(|d| self.unsupported(d))?;
         let mut xs = String::new();
         for (i, arg) in all_args.iter().enumerate() {
             let rendered = render(self.def, arg, "__a", "__b").map_err(|d| self.unsupported(d))?;
+            let rendered = match &member {
+                Some(member) => format!("(case when {member} then {rendered} end)"),
+                None => rendered,
+            };
             xs.push_str(&format!(", {rendered} as __x{}", i + 1));
         }
+        let kept = member
+            .as_ref()
+            .map(|member| format!(" where {member}"))
+            .unwrap_or_default();
         let parts: Vec<&[SumPart]> = self
             .from_parts
             .iter()
@@ -849,7 +902,7 @@ impl Audit<'_> {
         let mut pairs = format!(
             "select __g.*, __a.{WEIGHT} * __b.{WEIGHT} as {WEIGHT}{xs} \
              from {wa} __a join {wb} __b on {on} \
-             cross join lateral (select {groups}) __g",
+             cross join lateral (select {groups}) __g{kept}",
             on = on.join(" and "),
             groups = groups.join(", "),
         );
@@ -893,7 +946,11 @@ impl Audit<'_> {
                  from {wa} __a \
                  cross join lateral (select (null::{b}).*) __b \
                  cross join lateral (select {groups}) __g \
-                 where not exists (select 1 from __bn where {bn_on} and __bn.{WEIGHT} <> 0)",
+                 where not exists (select 1 from __bn where {bn_on} and __bn.{WEIGHT} <> 0){kept}",
+                kept = member
+                    .as_ref()
+                    .map(|member| format!(" and {member}"))
+                    .unwrap_or_default(),
                 b = self.joined_table,
                 groups = groups.join(", "),
                 bn_on = bn_on.join(" and "),
@@ -1250,10 +1307,13 @@ impl Audit<'_> {
             }
             Part::From => audit.side_page(JoinSide::From, &keyset, steer)?,
             Part::Joined => audit.side_page(spec::JOINED, &keyset, steer)?,
-            Part::Matches => (
-                audit.matches_page(&keyset, steer),
-                vec!["__matches".to_string()],
-            ),
+            Part::Matches => {
+                let member = audit.side_member(spec::JOINED, "__b")?;
+                (
+                    audit.matches_page(&keyset, steer, member.as_deref()),
+                    vec!["__matches".to_string()],
+                )
+            }
         };
         Ok((sql, columns, steer))
     }
@@ -1309,12 +1369,6 @@ pub(super) async fn compare(
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
-    // The query has no `WHERE` for the definition's predicate; define
-    // refuses a join aggregate's until its step (#2042) renders it here.
-    match &def.def.predicate {
-        Predicate::True => {}
-        Predicate::Filter(_) => return Err(super::self_check::unaudited_filter(def)),
-    }
     let mut client = pool.get().await?;
     let (joined, joined_types) = joined_table(&client, def).await?;
     let audit = build_audit(pool, def, &joined, &joined_types).await?;

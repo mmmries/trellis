@@ -54,7 +54,8 @@ pub struct HiddenTableSize {
 pub struct PartialsWarning {
     /// `P`'s estimated rows.
     pub partials_rows: i64,
-    /// The `FROM` (fact) table's estimated rows.
+    /// The `FROM` (fact) table's estimated rows: those its conjuncts of the
+    /// `WHERE` keep, when it has any.
     pub fact_rows: i64,
 }
 
@@ -160,7 +161,7 @@ pub(crate) async fn for_definition(
             hidden_tables.push(size);
         }
     }
-    let partials_warning = partials_warning(client, &hidden_tables, source_table).await?;
+    let partials_warning = partials_warning(client, &hidden_tables, source_table, def).await?;
     let building = building(client, id, source_table, join_table).await?;
     Ok(Some(JoinStatus {
         hidden_tables,
@@ -295,11 +296,12 @@ async fn partials_warning(
     client: &impl GenericClient,
     hidden_tables: &[HiddenTableSize],
     source_table: &str,
+    def: &TransformDef,
 ) -> Result<Option<PartialsWarning>, tokio_postgres::Error> {
     let Some(p) = hidden_tables.iter().find(|t| t.table == "P") else {
         return Ok(None);
     };
-    let fact_rows: i64 = client
+    let mut fact_rows: i64 = client
         .query_opt(
             "select c.reltuples::bigint from pg_catalog.pg_class c \
              where c.oid = pg_catalog.to_regclass($1)",
@@ -307,12 +309,54 @@ async fn partials_warning(
         )
         .await?
         .map_or(0, |row| row.get::<_, i64>(0).max(0));
+    // `P` holds only the rows the `FROM` side's conjuncts of the `WHERE`
+    // keep (ADR-0019), so it compresses those rows, not the whole table.
+    if let Some(passing) = passing_rows(client, source_table, def).await {
+        fact_rows = fact_rows.min(passing);
+    }
     Ok(
         warns(p.estimated_rows, fact_rows).then_some(PartialsWarning {
             partials_rows: p.estimated_rows,
             fact_rows,
         }),
     )
+}
+
+/// The planner's estimate of the `FROM` table's rows its conjuncts of the
+/// `WHERE` keep, `None` when it has none or the estimate fails (a column
+/// gone, say: the drift check reports that). Planned, never run, under a
+/// savepoint, so a failure leaves the caller's transaction usable.
+async fn passing_rows(
+    client: &impl GenericClient,
+    source_table: &str,
+    def: &TransformDef,
+) -> Option<i64> {
+    let predicate = spec::side_predicate(def, Side::From)?;
+    let sql = format!(
+        "explain select 1 from {} s where (({}) is true)",
+        crate::defs::ddl::qualified_source_table(source_table),
+        crate::defs::oracle::render_qualified_expr_sql(&predicate, "s"),
+    );
+    client
+        .batch_execute("savepoint trellis_join_status")
+        .await
+        .ok()?;
+    let plan = client.query(sql.as_str(), &[]).await;
+    let restore = if plan.is_ok() {
+        "release savepoint trellis_join_status"
+    } else {
+        "rollback to savepoint trellis_join_status; release savepoint trellis_join_status"
+    };
+    client.batch_execute(restore).await.ok()?;
+    let first: String = plan.ok()?.first()?.get(0);
+    plan_rows(&first)
+}
+
+/// The `rows=` estimate of an `EXPLAIN` line.
+fn plan_rows(line: &str) -> Option<i64> {
+    let (_, tail) = line.split_once(" rows=")?;
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// Whether `partials` estimated `P` rows warrant a warning against
@@ -324,7 +368,20 @@ pub(crate) fn warns(partials: i64, fact_rows: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::warns;
+    use super::{plan_rows, warns};
+
+    #[test]
+    fn a_plan_line_gives_its_row_estimate() {
+        assert_eq!(
+            plan_rows("Seq Scan on orders s  (cost=0.00..35.50 rows=1270 width=4)"),
+            Some(1270)
+        );
+        assert_eq!(
+            plan_rows("Result  (cost=0.00..0.01 rows=1 width=4)"),
+            Some(1)
+        );
+        assert_eq!(plan_rows("no estimate"), None);
+    }
 
     #[test]
     fn partials_warn_at_half_the_fact_table_and_not_for_a_small_one() {

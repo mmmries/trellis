@@ -485,14 +485,16 @@ pub(crate) struct GroupShape {
     /// column ([`placeholder`]).
     pub(super) fields: Vec<(String, String, Expr)>,
     /// The definition's `WHERE` ([`Membership`]): which images contribute
-    /// and which rows an absolute read counts. `None` for `TRUE`, and for
-    /// every `JOIN` structure. Group naming never reads it (ADR-0002: "group
+    /// and which rows an absolute read counts. `None` for `TRUE`, and for a
+    /// `JOIN`'s `T`; a `JOIN` side's is its own conjuncts of the `WHERE`
+    /// (ADR-0019). Group naming never reads it (ADR-0002: "group
     /// naming is unfiltered"): naming runs on images that may hold only the
     /// group columns, and a group whose rows all fail just counts zero.
     pub(super) predicate: Option<Membership>,
 }
 
-/// A plain aggregate's `WHERE`, rendered over the source row `s`.
+/// A plain aggregate's `WHERE`, or a `JOIN` side's conjuncts of it,
+/// rendered over the source row `s`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Membership {
     /// `((<p>) is true)`: whether `s` is a member row.

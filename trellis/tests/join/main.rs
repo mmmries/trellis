@@ -12,3 +12,4 @@ mod join_schema_changes;
 mod join_self_check;
 mod join_status;
 mod join_swapped_table;
+mod join_where;

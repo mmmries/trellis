@@ -629,7 +629,7 @@ a stored generated column or a [chained](transforms.md#chaining-and-cycle-detect
 ### T0238 FilterNotYetSupported
 
 A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every
-one but the plain aggregate ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
+one but the plain and join aggregates ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 There is no workaround in the definition yet; filter when reading the target.
 
 ### T0239 FilteredExtreme
@@ -638,6 +638,29 @@ There is no workaround in the definition yet; filter when reading the target.
 extreme is read from a source index, which holds the rows the `WHERE` drops
 too. Take the `MIN`/`MAX` of a stored generated column
 `CASE WHEN <predicate> THEN <column> END` in an unfiltered transform.
+
+### T0241 JoinPredicateReadsBothSides
+
+A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'s
+`WHERE` reads both tables (`a.x > b.y`, or `a.x > 0 OR b.y > 0`); the message
+names it. Each condition filters one table's rows, so no table can apply this
+one. Split it into conditions that each read one table, or compute the value
+in a [chained](transforms.md#chaining-and-cycle-detection) 1-1 `JOIN` and
+aggregate that.
+
+### T0242 JoinPredicateJoinedSideUnderLeft
+
+A `LEFT` [join aggregate](transforms.md#join-aggregate)'s `WHERE` has a
+condition on the joined table; the message names it. In SQL it also drops the
+`FROM` rows with no match, which the `LEFT` keeps, so the query is an `INNER`
+one: write `INNER JOIN`.
+
+### T0243 JoinPredicateReadsNoColumn
+
+A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'s
+`WHERE` reads no column (`WHERE FALSE`, `1 = 1`); the message names it. Each
+condition filters one table's rows. Drop it, or, to keep nothing, drop the
+transform.
 
 ## Tables and keys
 

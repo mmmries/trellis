@@ -213,7 +213,8 @@ fn a_predicate_that_can_raise_is_refused_by_name() {
 }
 
 /// Until each key space's step lands (#1991), define refuses its filter by
-/// name, after the predicate's own checks. A plain aggregate applies one.
+/// name, after the predicate's own checks. A plain aggregate and a join
+/// aggregate apply one.
 #[test]
 fn every_key_space_refuses_a_filter_until_its_step_lands() {
     assert_eq!(
@@ -228,28 +229,15 @@ fn every_key_space_refuses_a_filter_until_its_step_lands() {
     ] {
         assert_eq!(validated(text), Ok(()), "{text}");
     }
-    for (text, key_space) in [
-        (
-            "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g SELECT s.g AS g, COUNT(*) AS n \
-             WHERE s.qty > 0",
-            "JOIN aggregate",
-        ),
-        (
-            "TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0",
-            "1-1 JOIN",
-        ),
-    ] {
-        let def = parse(text).unwrap();
-        assert!(matches!(
-            def.key_space,
-            KeySpace::Join(_) | KeySpace::JoinOneToOne(_)
-        ));
-        assert_eq!(
-            super::validate::validate_join(&def, &HashMap::new(), &[]),
-            Err(ValidationError::FilterNotYetSupported { key_space }),
-            "{text}"
-        );
-    }
+    let text = "TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0";
+    let def = parse(text).unwrap();
+    assert!(matches!(def.key_space, KeySpace::JoinOneToOne(_)));
+    assert_eq!(
+        super::validate::validate_join(&def, &HashMap::new(), &[]),
+        Err(ValidationError::FilterNotYetSupported {
+            key_space: "1-1 JOIN"
+        }),
+    );
 }
 
 /// A plain aggregate's `MIN`/`MAX` is refused under any `WHERE` other than

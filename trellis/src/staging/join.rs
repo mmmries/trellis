@@ -408,6 +408,21 @@ pub(crate) fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Optio
 /// column types and collations: a definition whose key column was re-typed
 /// or re-collated under the same id gets a new table, and the old one is
 /// never touched again. Within Postgres's 63 bytes for any `i64` id.
+/// `side`'s filter of a join aggregate's rows, rendered over the source row
+/// `s` ([`spec::side_predicate`]): `None` when no conjunct of the `WHERE`
+/// reads `side`.
+fn side_membership(def: &TransformDef, side: Side) -> Option<group_basis::Membership> {
+    let predicate = spec::side_predicate(def, side)?;
+    let columns: std::collections::BTreeSet<String> = spec::expr_columns(def, &predicate)
+        .into_iter()
+        .map(|(_, column)| column)
+        .collect();
+    Some(group_basis::Membership {
+        sql: format!("(({}) is true)", render_qualified_expr_sql(&predicate, "s")),
+        columns: columns.into_iter().collect(),
+    })
+}
+
 fn working_table_name(prefix: &str, id: i64, hidden_columns: &str) -> String {
     format!(
         "trellis_join_{prefix}_{id}_{:016x}",
@@ -534,10 +549,25 @@ impl JoinTargetPlan {
         }
         let side_plan =
             |side: Side, table: HiddenTable, source: &str, pk: Vec<PrimaryKeyColumn>, tag: &str| {
+                // The side's conjuncts of the `WHERE` (ADR-0019): which of its
+                // rows reach its partials, on every image and every read.
+                let predicate = side_membership(def, side);
                 let args: Vec<Arg> = match side {
                     Side::From => t_shape.args[..from_args.len()].to_vec(),
                     Side::Joined(_) => t_shape.args[from_args.len()..].to_vec(),
                 };
+                // An argument is never evaluated on a row that is no member
+                // (#1991), whatever order the planner evaluates quals in.
+                let args: Vec<Arg> = args
+                    .into_iter()
+                    .map(|arg| match &predicate {
+                        Some(member) => Arg {
+                            sql: format!("(case when {} then {} end)", member.sql, arg.sql),
+                            ..arg
+                        },
+                        None => arg,
+                    })
+                    .collect();
                 let key_cols = spec::side_key_columns(def, side);
                 let join_cols = spec::join_key(def, side);
                 // A joined row with a `NULL` key part joins nothing: no `M` cell.
@@ -576,7 +606,7 @@ impl JoinTargetPlan {
                             args,
                             aggs: Vec::new(),
                             fields: Vec::new(),
-                            predicate: None,
+                            predicate,
                         },
                         Writer::JoinPartials {
                             deltas: deltas.clone(),
