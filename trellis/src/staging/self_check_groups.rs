@@ -442,7 +442,11 @@ fn page_sql(
     let mut args = Vec::with_capacity(shape.args.len());
     for arg in &shape.args {
         let sql = render_leaf(&arg.expr);
-        let sql = if arg.summed { summand(arg.kind, &sql) } else { sql };
+        let sql = if arg.summed {
+            summand(arg.kind, &sql)
+        } else {
+            sql
+        };
         let sql = match &member {
             Some(member) => format!("(case when {member} then {sql} end)"),
             None => sql,
