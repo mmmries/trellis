@@ -156,6 +156,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1TruncateDefAfterLock
         | Plant::Join1FanOutHeldRow
         | Plant::Join1ReleaseNoRederive
+        | Plant::Join1WhereFanOutNoDelete
+        | Plant::Join1WhereDeletePresenceOnly
         | Plant::StarJUnsorted
         | Plant::StarRootSkipJLast
         | Plant::StarRootSkipJFirst

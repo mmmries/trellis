@@ -55,9 +55,9 @@ DROP   TRANSFORM <transform>
 - `<expression>` is the [expression grammar](expressions.md); `<field>` names
   a target column.
 - `WHERE` takes a `boolean` [expression](expressions.md#where) over source
-  columns that can't raise an error. No key space applies one yet, so define
-  refuses any `WHERE` but `TRUE`
-  ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
+  columns that can't raise an error. A [1-1 `JOIN`](#1-1-join) applies one;
+  on every other key space define refuses any `WHERE` but `TRUE` until it
+  does ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 - `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
   `<name>.<field>` pauses or resumes one field
   ([Changing a definition](#changing-a-definition)).
@@ -232,7 +232,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | `UnsupportedAggregateArgument` | [Retype](#retype) | A number or `interval` column |
 | `array_agg`, `string_agg` or `jsonb_agg` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1040](https://github.com/salesforce-misc/trellis/issues/1040) |
 | **Filters and chaining** | | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every key space today ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | `FilterNotYetSupported` | [Text](#text) | None yet |
+| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every key space but the 1-1 `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | `FilterNotYetSupported` | [Text](#text) | None yet |
 | A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | `TargetEqualsSource`, `TableCycle` | [Text](#text) | Another target |
 | Chaining off a transform that is not `live` | `TransformNotLive` | n/a | Wait for the upstream to go `live` |
 | **Target names** | | | |
@@ -686,6 +686,14 @@ field is any expression a 1-1 field admits over columns of either table,
 written as in a join aggregate; it has no aggregate and reads no other field.
 Each row is recomputed from its current inputs, so no aggregate restriction
 applies.
+
+A `WHERE` may read any table of the join, as SQL applies it after the joins:
+a row is in the target while the joined row passes it, and no field is
+evaluated on a row that doesn't. The anti-join (`WHERE customers.id IS NULL`)
+and predicates over two tables are admitted. Trellis still copies and applies
+every row of every table, so a `WHERE` saves no work, and a change of a joined
+row can remove or add every row on its key
+([ADR-0021](decisions/0021-one-to-one-join-transforms.md#a-1-1-join-keeps-one-row-per-row-of-a-joined-to-at-most-one-row-of-each-joined-table)).
 
 A **star** joins up to four tables to `a`, each `JOIN` clause one more
 **position** (1 for the first), each `LEFT` or `INNER` on its own, on its own

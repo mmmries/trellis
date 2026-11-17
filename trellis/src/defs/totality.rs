@@ -108,8 +108,16 @@ fn text_columns(expr: &Expr, columns: &ColumnTypes<'_>, out: &mut BTreeSet<Strin
         return;
     }
     match expr {
-        Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+        Expr::Column(name) => {
             out.insert(name.clone());
+        }
+        // A `JOIN`'s tables can share a column name: two tables' columns
+        // are two columns, which may carry conflicting collations.
+        Expr::SourceColumn { table, column, .. } => {
+            out.insert(match columns {
+                ColumnTypes::Join { .. } => format!("{table}.{column}"),
+                ColumnTypes::Source(_) | ColumnTypes::Live(_) => column.clone(),
+            });
         }
         _ => {
             for child in expr.children() {

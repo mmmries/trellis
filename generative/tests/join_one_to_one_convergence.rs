@@ -514,6 +514,16 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
          draws no held row; `join_one_to_one_quarantine` pins it",
     ),
     (
+        "join1_where_fan_out_no_delete",
+        "it needs a definition with a WHERE, and the tier draws none until #2043 adds \
+         predicate generation; `join_star_where` pins it",
+    ),
+    (
+        "join1_where_delete_presence_only",
+        "it needs a definition with a WHERE, and the tier draws none until #2043 adds \
+         predicate generation; `join_star_where` pins it",
+    ),
+    (
         "join1_m_pass_b_only",
         "it needs a b row deleted past capture before a rebuild in place (an uncaptured \
          write), and every write the runner issues is captured: it fired in 24 of 24 \

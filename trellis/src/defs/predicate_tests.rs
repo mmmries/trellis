@@ -235,28 +235,22 @@ fn every_key_space_refuses_a_filter_until_its_step_lands() {
     ] {
         assert_eq!(validated(text), Ok(()), "{text}");
     }
-    for (text, key_space) in [
-        (
-            "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g SELECT s.g AS g, COUNT(*) AS n \
-             WHERE s.qty > 0",
-            "JOIN aggregate",
-        ),
-        (
-            "TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0",
-            "1-1 JOIN",
-        ),
-    ] {
-        let def = parse(text).unwrap();
-        assert!(matches!(
-            def.key_space,
-            KeySpace::Join(_) | KeySpace::JoinOneToOne(_)
-        ));
-        assert_eq!(
-            super::validate::validate_join(&def, &HashMap::new(), &[]),
-            Err(ValidationError::FilterNotYetSupported { key_space }),
-            "{text}"
-        );
-    }
+    let text = "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g \
+                SELECT s.g AS g, COUNT(*) AS n WHERE s.qty > 0";
+    let def = parse(text).unwrap();
+    assert!(matches!(def.key_space, KeySpace::Join(_)));
+    assert_eq!(
+        super::validate::validate_join(&def, &HashMap::new(), &[]),
+        Err(ValidationError::FilterNotYetSupported {
+            key_space: "JOIN aggregate"
+        }),
+        "{text}"
+    );
+    // The 1-1 `JOIN` filters at recompute (#2041): its validator checks
+    // the predicate (`validate_join_one_to_one`'s tests).
+    let def =
+        parse("TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0").unwrap();
+    assert_eq!(super::validate::refuse_unsupported_filter(&def), Ok(()));
 }
 
 /// The predicate's columns are read whatever the fields read: imaged by

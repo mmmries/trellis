@@ -498,6 +498,27 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_quarantine`'s
     /// `a_release_before_a_pending_fan_out_of_its_key_stays_released`.
     Join1ReleaseNoRederive,
+    /// #1991 rule 18, #2040 (`join1_where_fan_out_no_delete`): a `LEFT`-only
+    /// 1-1 `JOIN` with a `WHERE` skips its fan-out's delete
+    /// (`staging::join_one_to_one::Entries::may_delete`), as one without a
+    /// `WHERE` may, so a `b` change that makes rows stop qualifying leaves
+    /// them in the target. Fires only on a `LEFT`-only definition with a
+    /// `WHERE`, at a fan-out.
+    ///
+    /// Pinned by `join_star_where`'s
+    /// `a_left_only_fan_out_deletes_the_rows_that_stop_qualifying` and
+    /// `a_b_change_of_no_key_races_an_a_change_of_its_row`.
+    Join1WhereFanOutNoDelete,
+    /// ADR-0021 (`join1_where_delete_presence_only`): a 1-1 `JOIN` with a
+    /// `WHERE` deletes by the presence test alone, not by the membership the
+    /// upsert reads (`staging::join_one_to_one::write_target`), so a row that
+    /// stops qualifying stays as it was. Fires only on a definition with a
+    /// `WHERE`.
+    ///
+    /// Pinned by `join_star_where`'s
+    /// `an_a_change_of_no_key_races_a_b_change_of_its_row` and
+    /// `a_left_only_fan_out_deletes_the_rows_that_stop_qualifying`.
+    Join1WhereDeletePresenceOnly,
     /// #1464 U1 (`star_j_unsorted`): a 1-1 `JOIN` page's `J` statements,
     /// the insert of its keys and their lock
     /// (`staging::join_one_to_one::j_statements`), run unsorted, so two
@@ -854,6 +875,8 @@ impl Plant {
         Plant::Join1TruncateDefAfterLock,
         Plant::Join1FanOutHeldRow,
         Plant::Join1ReleaseNoRederive,
+        Plant::Join1WhereFanOutNoDelete,
+        Plant::Join1WhereDeletePresenceOnly,
         Plant::StarJUnsorted,
         Plant::StarRootSkipJLast,
         Plant::StarRootSkipJFirst,
@@ -934,6 +957,8 @@ impl Plant {
             Plant::Join1TruncateDefAfterLock => "join1_truncate_def_after_lock",
             Plant::Join1FanOutHeldRow => "join1_fan_out_held_row",
             Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
+            Plant::Join1WhereFanOutNoDelete => "join1_where_fan_out_no_delete",
+            Plant::Join1WhereDeletePresenceOnly => "join1_where_delete_presence_only",
             Plant::StarJUnsorted => "star_j_unsorted",
             Plant::StarRootSkipJLast => "star_root_skip_j_last",
             Plant::StarRootSkipJFirst => "star_root_skip_j_first",

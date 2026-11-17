@@ -40,8 +40,7 @@ The root `a` is joined to one or more tables, a star. Each joined table has a
 tables, the root included. Below, `b` names the joined table at any one
 position, and a rule stated for `b` holds at every position. The two-table
 JOIN is the one-position case of the same design: it takes the same locks
-and has no rules of its own. A non-unique `b` key and `WHERE` are out of
-scope.
+and has no rules of its own. A non-unique `b` key is out of scope.
 
 ## Decisions
 
@@ -50,6 +49,15 @@ scope.
 - **No `GROUP BY`.** The target is keyed by `a`'s primary key. `INNER` drops an
   `a` row with no match; `LEFT` keeps it with `NULL` `b` columns. Each
   position has its own kind.
+- **`WHERE`.** Any predicate [ADR-0004](0004-transform-definition-grammar.md)
+  admits, over `a` and every position, cross-table and anti-join included,
+  with SQL's meaning: it applies after the joins. A row is in the target when
+  its `R` entry is live, every `INNER` position has a live `M` entry on its
+  key, and the predicate is `TRUE` on the row joined to the newest live `M`
+  entry at every position. The predicate is evaluated only on a row that
+  passes the rest, as Postgres evaluates it only on a row the join produced.
+  `R` and every `M` keep every row, passing or not, so a change that moves no
+  key can add or remove a target row, at any position and of any kind.
 - **A star of at most 5 tables.** `a` is joined to up to 4 tables, each
   `INNER` or `LEFT`, and each `ON` compares columns of `a` to a unique key of
   that table. Define refuses, by name:
@@ -117,7 +125,8 @@ below holds for them as it does for a captured side.
   filled from captured images and has one index per position, on that
   position's join key and then the entry key, which is how a `b` change finds
   its rows and its chunks walk them. It is about the size of `a`, plus one
-  key index per position.
+  key index per position. With a `WHERE`, `R` still holds every `a` row:
+  membership is decided when a row is recomputed, not by which entries exist.
 - **`M`**, one per position, one entry per `b` row, keyed by `b`'s primary key
   and indexed on the join key: the ledger's ordering state plus the `b`
   columns the fields read. It is about the size of `b`. Keyed by `b`'s
@@ -238,7 +247,11 @@ a writer of an `M` entry on one of its keys, a recompute of it) both hold the
 row's `R` entry across their reads and their write. The entry orders them,
 and under READ COMMITTED the later one reads everything the earlier one
 committed, so on every commit a target row is the join of its `R` entry with
-the newest live `M` entry on its key at every position. The lock that orders
+the newest live `M` entry on its key at every position, and it exists
+exactly when that join passes the presence test and the predicate.
+Presence reads nothing a row's values don't, so a `WHERE` adds no lock: a
+change that makes a row leave or join the target, at a `LEFT` or an `INNER`
+position, takes the locks a change of its values takes. The lock that orders
 a pair names at most one position, never a third, so the argument doesn't
 depend on the number of positions, and no writer needs another position's
 `J`.
@@ -254,7 +267,13 @@ row doesn't exist yet), or read another `M` before its `R` lock. Locking
 every other position's `J` for the rows a fan-out reaches is also exact, but
 holds them for the whole fan-out (every `J` row of the other position over
 a 1M-row fan-out), which stalls every `a` writer and every writer of that
-position until it ends.
+position until it ends. With a `WHERE` that adds and removes target rows from
+every writer kind, at `LEFT` and `INNER` positions, the same rules were exact
+in 577,404 deterministic schedules at `n = 2` and 3 on PG 16, 17 and 18 and
+128 soak runs, and every ablation above still failed. Locking the target rows
+instead of the `R` entries failed at `LEFT` positions too, since a `LEFT` row
+may now not exist yet, and a `LEFT`-only fan-out that skipped its delete was
+wrong (#2040).
 
 With one position the `R` entry lock is redundant, since `J[1, k]` already
 orders the only two writer kinds: in a model on PG 16.8, 17.10 and 18.2,
@@ -297,9 +316,10 @@ in the same batch applies to the emptied table:
   id order, before its first lock row, and starts the rebuilds after it has
   marked its segments drained, since seal phase 1 takes a segment's row
   before the pointer. From the commit the transform reads `backfilling` and
-  keeps applying. A `LEFT` row keeps the `b` columns it held until the
-  build's chunk reaches it, an `INNER` row stays, and a change of `a` before
-  then joins the emptied `M`. A definition that does not apply (paused since
+  keeps applying. Until the build's chunk reaches it, a target row stays as it
+  was, its `b` columns and its membership included (a row the emptied `M`
+  admits, as an anti-join's does, appears only then), and a change of `a`
+  before then joins the emptied `M`. A definition that does not apply (paused since
   the page began) starts no rebuild, and its `RESUME` re-derives every row.
 - A page that truncates several tables does each. However many joined tables
   it truncates, it takes the definition row once, before the lock row, and
@@ -378,8 +398,10 @@ join) measures the page at 0.03 s and the whole fan-out at about 10.6 s, from
 the `b` commit to the last chunk: about 10 µs per row, against 4.3 s in one
 transaction, with the same 340 B of WAL per row. An `a` change on the key
 lands in a median 0.17 s, against 4.4 s behind one transaction. An `INNER`
-join's fan-out costs more, since each batch also deletes the target rows of
-entries whose key has lost its last live `b` row.
+join's fan-out, and any fan-out of a definition with a `WHERE`, costs more:
+each batch also deletes the target rows that no longer qualify. A `LEFT`-only
+fan-out with a `WHERE` that skipped it kept rows the predicate excludes
+(#2040).
 
 - A `status()` warning names, per position, the position and the join key
   with the most `a` rows when it holds more than 250k, a key whose `b` change takes seconds to reach every
@@ -456,7 +478,8 @@ in chunks of `a`'s primary-key range. Each chunk:
    `pg_current_snapshot()` as their basis.
 3. Locks and re-derives the remaining entries.
 4. Writes each row's target row from `R` and the newest live entry of each
-   `M` on its key at that position.
+   `M` on its key at that position, or deletes it when the row doesn't
+   qualify.
 5. Retries if any read finds a key outside its locked set at any position.
    Without the retry, 378 of 1,716 schedules were wrong. A chunk that left
    out one position's keys would move a row's key at that position without
@@ -499,9 +522,10 @@ Re-derives a producer stages, through the page that drains them.
 `self_check` reads each table as its copy has applied it, which is the source minus the ring rows the
 copy hasn't applied yet, as the 1-1 and aggregate checks do (ADR-0013). It audits, in order:
 
-- **The target**: each row against the full query, every `JOIN` of it: `a` as `R` has applied it,
-  joined at every position to `b` as that position's `M` has applied it, on the newest live `M`
-  entry of a key when there are several.
+- **The target**: each row against the full query, every `JOIN` of it and the definition's
+  `WHERE` verbatim: `a` as `R` has applied it, joined at every position to `b` as that position's
+  `M` has applied it, on the newest live `M` entry of a key when there are several. A target row
+  the predicate excludes is an extra row.
 - **`R` and every `M`**: each against its source, in both directions: a row with no live entry or other
   values, and a live entry with no row.
 - **A join key with more than one live entry in any `M`.** The target reads the newest entry of a key, which
@@ -530,7 +554,7 @@ position's. The staging worker's
 pass, or the drain on a write that marks a missing column, pauses the whole
 transform with a `capture_failure` naming the table and the column when:
 
-- a column the fields or an `ON` read from any table is dropped or renamed;
+- a column the fields, an `ON` or the `WHERE` read from any table is dropped or renamed;
 - a key column of any table (`a`'s primary key, an `ON` column) is
   retyped so the keys Trellis stored render differently, or one column of an
   `ON` pair is retyped so the pair no longer has one type;
@@ -577,3 +601,6 @@ its `ON` pairs' new types, and rebuilds as above.
   plus that position's `M` and `J`). A star is cheaper than a chain of two-table
   JOINs over the same tables: at `n = 4`, 2.3x the chain's throughput and
   0.42x its hidden state.
+- **A `WHERE` doesn't shrink a 1-1 `JOIN`.** `R` and every `M` keep every
+  row, every change is applied, and a `b` change's fan-out recomputes the rows
+  on its key whether they qualify or not, with a delete pass at every kind.
