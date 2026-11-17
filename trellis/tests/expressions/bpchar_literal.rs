@@ -180,23 +180,27 @@ async fn an_affected_definition_is_rebuilt_once_on_upgrade() {
         "TRANSFORM a FROM s SELECT ch = 'ab  ' AS same",
         "TRANSFORM u FROM s SELECT t = 'ab' AS same",
         "TRANSFORM g FROM s GROUP BY t SELECT COUNT(CASE WHEN ch = 'ab  ' THEN 1 END) AS n",
+        "TRANSFORM p FROM s SELECT ch = 'ab  ' AS same",
     ] {
         trellis.apply(statement).await.expect(statement);
     }
-    for target in ["a", "u", "g"] {
+    for target in ["a", "u", "g", "p"] {
         wait_for_live(&trellis, target).await;
     }
+    trellis.apply("PAUSE TRANSFORM p").await.expect("pause");
     assert_eq!(floor_of(&raw, "a").await, "0.4.0");
     assert_eq!(floor_of(&raw, "g").await, "0.4.0");
     assert_eq!(floor_of(&raw, "u").await, "0.2.0");
     trellis.shutdown().await.expect("shutdown");
 
-    // As 0.3.x left them: its floors, and `a` holding the value its
-    // `'ab  '::text` computed. `u`'s row is changed too, so a rebuild of it
-    // would show.
+    // As 0.3.x left them: its floors, and `a` and `g` holding the values
+    // its `'ab  '::text` computed. `u`'s row is changed too, so a rebuild of
+    // it would show.
     raw.batch_execute(
         "update transform_definitions set floor_version = '0.3.0'; \
          update a set same = false where id = 1; \
+         update g set n = 0 where t = 'ab'; \
+         update p set same = false where id = 1; \
          update u set same = null where id = 1",
     )
     .await
@@ -206,6 +210,8 @@ async fn an_affected_definition_is_rebuilt_once_on_upgrade() {
     assert_eq!(floor_of(&raw, "a").await, "0.4.0", "re-stamped at attach");
     assert_eq!(floor_of(&raw, "g").await, "0.4.0", "re-stamped at attach");
     assert_eq!(floor_of(&raw, "u").await, "0.3.0", "left alone");
+    // A paused one is stamped, and its resume rebuilds it.
+    assert_eq!(floor_of(&raw, "p").await, "0.4.0", "re-stamped at attach");
     let trellis = connect_trellis().await;
     for target in ["a", "u", "g"] {
         wait_for_live(&trellis, target).await;
@@ -222,6 +228,16 @@ async fn an_affected_definition_is_rebuilt_once_on_upgrade() {
             .get(0)
     };
     assert_eq!(same("a").await, Some(true), "rebuilt");
+    let n: i64 = raw
+        .query_one("select n from g where t = 'ab'", &[])
+        .await
+        .expect("group")
+        .get(0);
+    assert_eq!(n, 1, "the aggregate rebuilt");
+    assert_eq!(same("p").await, Some(false), "paused, not rebuilt");
+    trellis.apply("RESUME TRANSFORM p").await.expect("resume");
+    wait_for_live(&trellis, "p").await;
+    assert_eq!(same("p").await, Some(true), "rebuilt by its resume");
     assert_eq!(same("u").await, None, "not rebuilt");
     trellis.shutdown().await.expect("shutdown");
 
