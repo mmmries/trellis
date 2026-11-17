@@ -2290,11 +2290,14 @@ mod tests {
     /// closed a cycle (`40P01`, returned to the `DEFINE`).
     ///
     /// The interleaving is forced: a blocker holds the first fence, the
-    /// define bumps every fence in name order and queues behind it, and the
+    /// define bumps every fence in one statement and queues behind it, and the
     /// page queues behind the define. A page that took any fence before the
     /// first one holds it when the blocker lets the define go. The fences
     /// are many, and the scenario runs a few rounds, so a page taking them
-    /// in any other order holds one in some round.
+    /// in any other order holds one in some round. Their names mix case, so
+    /// a statement that sorts them by the database's collation rather than
+    /// byte order deadlocks; a last scenario forces that for the define's
+    /// bump.
     #[tokio::test]
     async fn a_page_takes_its_fences_in_the_order_a_define_bumps_them() {
         let cluster = testkit::TestCluster::start();
@@ -2321,7 +2324,16 @@ mod tests {
             (client, pid)
         };
         let (raw, _) = connect().await;
-        let tables: Vec<String> = (0..8).map(|i| format!("public.f{i}")).collect();
+        // Mixed case, so the test database's ICU order is not byte order:
+        // a fence statement that sorts by the default collation takes them
+        // out of the order the define bumps them in.
+        let mut tables: Vec<String> = (0..8)
+            .map(|i| match i % 2 {
+                0 => format!("public.f{i}"),
+                _ => format!("public.F{i}"),
+            })
+            .collect();
+        tables.sort_unstable();
         let waiting_on_lock = async |pid: i32| {
             for _ in 0..500 {
                 let waiting: bool = raw
@@ -2367,9 +2379,7 @@ mod tests {
                 let tables = tables.clone();
                 async move {
                     let txn = definer.transaction().await.expect("begin");
-                    for table in &tables {
-                        super::super::build::bump_version_fence(&txn, table).await?;
-                    }
+                    super::super::build::bump_version_fences(&txn, &tables).await?;
                     txn.commit().await
                 }
             });
@@ -2397,6 +2407,80 @@ mod tests {
                 "round {round}: the page waits out the define and misses its fence, got {paged:?}"
             );
         }
+
+        // The other way round: the define bumps in the page's order too. A
+        // blocker shares the first fence, so the define queues on it holding
+        // nothing, and the page shares every fence beside the blocker. A
+        // define that bumped any other fence first would hold it while the
+        // page queued on it, and wait on the page's share of the first
+        // once the blocker let it go.
+        let held: BTreeMap<String, Option<i64>> =
+            tables.iter().map(|t| (t.clone(), Some(4))).collect();
+        let (mut blocker, _) = connect().await;
+        let blocking = blocker.transaction().await.expect("begin");
+        blocking
+            .execute(
+                "select 1 from source_table_versions where source_table = $1 for share",
+                &[&tables[0]],
+            )
+            .await
+            .expect("share the first fence");
+        let (mut definer, define_pid) = connect().await;
+        let defining = tokio::spawn({
+            let tables = tables.clone();
+            async move {
+                let txn = definer.transaction().await.expect("begin");
+                super::super::build::bump_version_fences(&txn, &tables).await?;
+                txn.commit().await
+            }
+        });
+        waiting_on_lock(define_pid).await;
+        let (mut pager, page_pid) = connect().await;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let took_fences = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paging = tokio::spawn({
+            let took_fences = Arc::clone(&took_fences);
+            async move {
+                let txn = pager.transaction().await.expect("begin");
+                let held = hold_version_fences(&txn, &held).await;
+                took_fences.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = released.await;
+                txn.commit().await.expect("commit the page");
+                held
+            }
+        });
+        // The page has taken its fences, or queues on one. (An idle
+        // transaction is not enough: the page is idle right after `begin`,
+        // before it has asked for any fence.)
+        let mut parked = false;
+        for _ in 0..1000 {
+            let queued: bool = raw
+                .query_one(
+                    "select coalesce((select wait_event_type = 'Lock' \
+                     from pg_stat_activity where pid = $1), false)",
+                    &[&page_pid],
+                )
+                .await
+                .expect("read pg_stat_activity")
+                .get(0);
+            if queued || took_fences.load(std::sync::atomic::Ordering::SeqCst) {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(parked, "the page never took or queued on its fences");
+        blocking.commit().await.expect("let the define go");
+        let _ = release.send(());
+        defining
+            .await
+            .expect("join")
+            .unwrap_or_else(|err| panic!("the define failed: {err:?}"));
+        let paged = paging.await.expect("join");
+        assert!(
+            paged.is_ok(),
+            "the page holds its fences beside the blocker, got {paged:?}"
+        );
     }
 }
 
@@ -4275,26 +4359,42 @@ async fn hold_version_fences(
     txn: &Transaction<'_>,
     versions: &BTreeMap<String, Option<i64>>,
 ) -> Result<(), ApplyError> {
-    for (source_key, loaded_version) in versions {
-        let row = txn
-            .query_opt(
-                "select version from source_table_versions \
-                 where source_table = $1 for share",
-                &[source_key],
-            )
-            .await?;
-        let current: Option<i64> = row.map(|r| r.get(0));
-        if current != *loaded_version {
-            crate::instance_log::debug!(
-                src_table = %source_key,
-                "version fence miss: source table's definitions changed mid-drain"
-            );
-            return Err(ApplyError::VersionFenceMiss {
-                src_table: source_key.clone(),
-            });
-        }
+    if let Some(source_key) = fence_miss(txn, versions).await? {
+        crate::instance_log::debug!(
+            src_table = %source_key,
+            "version fence miss: source table's definitions changed mid-drain"
+        );
+        return Err(ApplyError::VersionFenceMiss {
+            src_table: source_key,
+        });
     }
     Ok(())
+}
+
+/// Takes the fences of `versions` (a table and the version read for it,
+/// `None` for no fence) `for share` in one statement, in table-name order,
+/// and returns the first, in that order, whose version is no longer the one
+/// read. The order is byte order, Rust's `str` order, so `collate "C"`, the
+/// order `super::build::bump_version_fences` bumps them in.
+pub(crate) async fn fence_miss<'a>(
+    txn: &impl GenericClient,
+    versions: impl IntoIterator<Item = (&'a String, &'a Option<i64>)> + Clone,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    let tables: Vec<&String> = versions.clone().into_iter().map(|(t, _)| t).collect();
+    let current: HashMap<String, i64> = txn
+        .query(
+            "select source_table, version from source_table_versions \
+             where source_table = any($1) order by source_table collate \"C\" for share",
+            &[&tables],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    Ok(versions
+        .into_iter()
+        .find(|(table, version)| current.get(*table) != version.as_ref())
+        .map(|(table, _)| table.clone()))
 }
 
 /// Takes the definition rows `definitions` names, each `FOR UPDATE` when

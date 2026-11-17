@@ -2667,8 +2667,9 @@ fn star_fence_planted(joined: Vec<String>) -> Vec<String> {
     joined
 }
 
-/// Bumps each of `sources`' version fences (`super::build::bump_version_fence`),
-/// in the order given, in the transaction that writes a `column_status` pause:
+/// Bumps `sources`' version fences in one statement, in table-name order
+/// (`super::build::bump_version_fences`), in the transaction that writes a
+/// `column_status` pause:
 /// [`pause_column`], [`trip_column_fuse`] and each pair [`cascade_pause`]
 /// reaches. The pause holds the column out of every write from
 /// its commit on, not just out of the writers that start after it:
@@ -2688,9 +2689,7 @@ fn star_fence_planted(joined: Vec<String>) -> Vec<String> {
 /// waits for the writers in flight, and holding anything they might wait on
 /// meanwhile could close a cycle.
 async fn bump_pause_fence(txn: &impl GenericClient, sources: &[String]) -> Result<(), ApplyError> {
-    for source in sources {
-        super::build::bump_version_fence(txn, source).await?;
-    }
+    super::build::bump_version_fences(txn, sources).await?;
     Ok(())
 }
 
@@ -4024,13 +4023,10 @@ async fn lock_frozen(
         .map(|row| row.get(0))
         .unwrap_or_default();
     let bumped = star_fence_planted(fenced_join.clone());
-    let mut fenced: Vec<&str> = std::iter::once(fenced_source)
+    let fenced: Vec<&str> = std::iter::once(fenced_source)
         .chain(bumped.iter().map(String::as_str))
         .collect();
-    fenced.sort_unstable();
-    for table in fenced {
-        super::build::bump_version_fence(txn, table).await?;
-    }
+    super::build::bump_version_fences(txn, &fenced).await?;
     let row = txn
         .query_opt(
             &format!(
