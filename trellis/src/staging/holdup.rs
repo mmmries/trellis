@@ -107,6 +107,10 @@ async fn try_record(
     folded: &[FoldedChange],
     err: &ApplyError,
 ) -> Result<(), ApplyError> {
+    // One statement per segment, in `seg_seq` order: the order a page's
+    // completion takes the same claims in (ADR-0028 I5; the exception is in
+    // stage 05's lock-order table).
+    debug_assert!(steps.windows(2).all(|w| w[0].seg_seq < w[1].seg_seq));
     let tables = page_tables(pool, folded).await?;
     let error = err.to_string();
     let sqlstate = sqlstate(err);

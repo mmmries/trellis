@@ -1884,6 +1884,10 @@ async fn a_revoked_schema_usage_leaves_a_joins_usable_table_in_the_staging_pass(
     capture_pass(&mut it.raw, &it.pool).await;
     harness::settle_builds(&it.pool).await;
 
+    let stops = trellis::staging::halting_stop_stats(&it.pool)
+        .await
+        .expect("halting_stop_stats")
+        .stop_count;
     it.admin
         .batch_execute("revoke usage on schema app from rls_trellis")
         .await
@@ -1905,6 +1909,15 @@ async fn a_revoked_schema_usage_leaves_a_joins_usable_table_in_the_staging_pass(
     assert_eq!(
         halted(&it.trellis, "app.c_into").await.source_table,
         "app.c_into"
+    );
+    let stop = trellis::staging::halting_stop_stats(&it.pool)
+        .await
+        .expect("halting_stop_stats");
+    assert_eq!(stop.stop_count, stops + 1, "one halt, one halting stop");
+    let reason = stop.last_reason.expect("the stop's reason");
+    assert!(
+        reason.contains("app.c_into") && reason.contains("app.x"),
+        "the stop names both refused tables: {reason}"
     );
     assert_eq!(
         status(&it.trellis, "c_note").await.status,

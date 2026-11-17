@@ -113,9 +113,11 @@ pub fn plant_path(plant: Plant) -> PlantPath {
     match plant {
         // The tombstone GC collects a 1-1 target's ledger, and a
         // plain 1-1 target takes the Re-derive build's chunks.
-        Plant::StaleOneToOneWrite | Plant::EarlyTombstoneGc | Plant::ChunkWithoutEntryLock => {
-            PlantPath::OneToOne
-        }
+        Plant::StaleOneToOneWrite
+        | Plant::EarlyTombstoneGc
+        | Plant::ChunkWithoutEntryLock
+        | Plant::HeldKeyUnlisted
+        | Plant::HeldKeyDeleteApplies => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild

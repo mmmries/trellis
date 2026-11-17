@@ -628,17 +628,15 @@ async fn chunk_in(
     held: &held::Held,
 ) -> Result<Chunk, ApplyError> {
     let shape = &*loaded.shape;
-    for (table, version) in &loaded.versions {
-        let current: Option<i64> = txn
-            .query_opt(
-                "select version from source_table_versions where source_table = $1 for share",
-                &[table],
-            )
-            .await?
-            .map(|row| row.get(0));
-        if current != *version {
-            return Ok(Chunk::Stale);
-        }
+    let versions = loaded
+        .versions
+        .iter()
+        .map(|(table, version)| (table, version));
+    if super::super::apply::fence_miss(txn, versions)
+        .await?
+        .is_some()
+    {
+        return Ok(Chunk::Stale);
     }
     let dispatchable = StoredStatus::dispatchable();
     let applies = txn

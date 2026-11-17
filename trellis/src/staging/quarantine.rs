@@ -2667,8 +2667,9 @@ fn star_fence_planted(joined: Vec<String>) -> Vec<String> {
     joined
 }
 
-/// Bumps each of `sources`' version fences (`super::build::bump_version_fence`),
-/// in the order given, in the transaction that writes a `column_status` pause:
+/// Bumps `sources`' version fences in one statement, in table-name order
+/// (`super::build::bump_version_fences`), in the transaction that writes a
+/// `column_status` pause:
 /// [`pause_column`], [`trip_column_fuse`] and each pair [`cascade_pause`]
 /// reaches. The pause holds the column out of every write from
 /// its commit on, not just out of the writers that start after it:
@@ -2688,9 +2689,7 @@ fn star_fence_planted(joined: Vec<String>) -> Vec<String> {
 /// waits for the writers in flight, and holding anything they might wait on
 /// meanwhile could close a cycle.
 async fn bump_pause_fence(txn: &impl GenericClient, sources: &[String]) -> Result<(), ApplyError> {
-    for source in sources {
-        super::build::bump_version_fence(txn, source).await?;
-    }
+    super::build::bump_version_fences(txn, sources).await?;
     Ok(())
 }
 
@@ -3810,6 +3809,7 @@ async fn refuse_unless_valid_in(
         Err(reason) => Err(ApplyError::ResumeRefused {
             transform: transform.to_string(),
             reason: Box::new(reason),
+            status: definition.status.reported(false),
         }),
     }
 }
@@ -4023,13 +4023,10 @@ async fn lock_frozen(
         .map(|row| row.get(0))
         .unwrap_or_default();
     let bumped = star_fence_planted(fenced_join.clone());
-    let mut fenced: Vec<&str> = std::iter::once(fenced_source)
+    let fenced: Vec<&str> = std::iter::once(fenced_source)
         .chain(bumped.iter().map(String::as_str))
         .collect();
-    fenced.sort_unstable();
-    for table in fenced {
-        super::build::bump_version_fence(txn, table).await?;
-    }
+    super::build::bump_version_fences(txn, &fenced).await?;
     let row = txn
         .query_opt(
             &format!(
@@ -4372,6 +4369,7 @@ async fn resume_locked(
             return Err(ApplyError::ResumeRefused {
                 transform: target.to_string(),
                 reason: Box::new(reason),
+                status: status.reported(false),
             });
         }
     };
@@ -4408,12 +4406,13 @@ async fn resume_locked(
             txn.batch_execute("release savepoint resume_complete")
                 .await?;
         }
-        Err(ApplyError::ResumeRefused { reason, .. }) => {
+        Err(ApplyError::ResumeRefused { reason, status, .. }) => {
             txn.batch_execute("rollback to savepoint resume_complete")
                 .await?;
             return Err(ApplyError::ResumeRefused {
                 transform: target.to_string(),
                 reason,
+                status,
             });
         }
         Err(err) => return Err(err),
@@ -4594,7 +4593,13 @@ async fn complete_resume(
         tables.extend(joined.iter().map(|table| table.to_string()));
         discard_drained_changes(txn, &tables, gate).await?;
         if matches!(definition.def.key_space, KeySpace::OneToOne) {
-            empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
+            empty_if_keyed_by_an_enum(
+                txn,
+                source_table,
+                &definition.target_table,
+                definition.status.reported(false),
+            )
+            .await?;
         }
     }
     // Discard the definition's leftover unclaimed backfill chunks.
@@ -4763,6 +4768,7 @@ async fn empty_if_keyed_by_an_enum(
     txn: &Transaction<'_>,
     source_table: &str,
     target: &str,
+    status: crate::defs::model::TransformStatus,
 ) -> Result<(), ApplyError> {
     let key: Vec<String> = ddl::identity_key_columns(txn, source_table)
         .await?
@@ -4809,6 +4815,7 @@ async fn empty_if_keyed_by_an_enum(
                     reason => ApplyError::ResumeRefused {
                         transform: target.to_string(),
                         reason: Box::new(reason),
+                        status,
                     },
                 },
             );

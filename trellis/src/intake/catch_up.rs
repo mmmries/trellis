@@ -79,8 +79,9 @@ pub(crate) async fn park_table_catch_ups(
 }
 
 /// Rebuilds `readers` ([`build::start_rebuilds`]) under their
-/// row locks, taken in id order.
-async fn rebuild(
+/// row locks, taken in id order. The capture pass's drift check
+/// (`capture::baseline`) calls it with readers whose rows it already holds.
+pub(crate) async fn rebuild(
     client: &impl GenericClient,
     mut readers: Vec<i64>,
 ) -> Result<BuildStarts, IntakeError> {

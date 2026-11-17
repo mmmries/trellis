@@ -249,7 +249,9 @@ async fn drain(pool: &trellis::pool::Pool, seg_seq: i64, claimed_by: &str) -> ap
 /// `origin_lsn`, so [`converge::converged_through`] never reports converged
 /// across it. Release moves the row back onto the active batch (still
 /// pending, now as an ordinary ring row) rather than discarding it — only an
-/// actual drain of the released row clears the predicate.
+/// actual drain of the released row clears the predicate. The test-only
+/// [`converge::converged_through_except_held`] settles past the parked row
+/// but not past the released one.
 #[tokio::test]
 async fn quarantine_release_preserves_origin_position_so_convergence_stays_blocked() {
     let cluster = TestCluster::start();
@@ -275,6 +277,12 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
             .expect("converged_through"),
         "a parked poison_held row with origin_lsn <= token must gate convergence"
     );
+    assert!(
+        converge::converged_through_except_held(&client, token)
+            .await
+            .expect("converged_through_except_held"),
+        "the test-only wait past held keys settles with only a parked row pending"
+    );
 
     let replayed = trellis::staging::release_key(&db.pool, "order_totals", "orders", "1")
         .await
@@ -285,6 +293,12 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
             .await
             .expect("converged_through"),
         "the released row is now an ordinary pending ring row; the predicate must still block"
+    );
+    assert!(
+        !converge::converged_through_except_held(&client, token)
+            .await
+            .expect("converged_through_except_held"),
+        "a pending ring row gates the wait past held keys too"
     );
 
     let seg_seq = pipeline::seal(&mut client).await;

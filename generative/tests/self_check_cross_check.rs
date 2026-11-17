@@ -794,7 +794,8 @@ enum ExtremeTamper {
     LostRow,
     /// A zero group's hidden row deleted (#1117's F6 shape, settled): a zero
     /// group is the same as no row, so `self_check` must report nothing.
-    /// Falls back to [`ExtremeTamper::Alike`] when no zero group is left.
+    /// Falls back to [`ExtremeTamper::Alike`] when no zero group is left,
+    /// and is what every tamper falls back to when no live group is.
     LostZeroRow,
 }
 
@@ -849,9 +850,9 @@ fn extreme_tamper_case() -> impl Strategy<Value = ExtremeTamperCase> {
         )
 }
 
-/// The draws of a `MIN`/`MAX` program run serially: no `TRUNCATE` (the
-/// floor of live rows then keeps a group to tamper with) and no deferred
-/// install. The concurrency draws are the concurrent tier's and unused here.
+/// The draws of a `MIN`/`MAX` program run serially: no `TRUNCATE` and no
+/// deferred install. The program may still delete every row (#2033). The
+/// concurrency draws are the concurrent tier's and unused here.
 fn serial_min_max_draws(
     seed: u64,
     defs: Vec<MinMaxDefDraw>,
@@ -999,6 +1000,13 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
+            // No housekeeping pass runs while the program settles: it collects
+            // zero groups (Rx7), which would race a `LostZeroRow` for the
+            // group it reads (#2072). Takes effect at `install`.
+            // The engine clamps the interval to a sixth of `reclaim_ttl`, so
+            // both are raised.
+            backend.set_reclaim_ttl(Duration::from_secs(6 * 3600));
+            backend.set_housekeeping_interval(Duration::from_secs(3600));
             let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
             let pool = Pool::new(&config).expect("pool");
             backend.install(&program).await.expect("install program");
@@ -1056,8 +1064,13 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
                 .filter(|(_, n)| *n == 0)
                 .map(|(g, _)| g)
                 .collect();
+            // The program can delete every row of the source (a scheduled
+            // delete or a whole-group delete past the generator's floor of
+            // live rows, #2033), leaving only zero groups: those cases test
+            // a `LostZeroRow`, the one tamper with a group to act on.
             let tamper = match case.tamper {
                 ExtremeTamper::LostZeroRow if zero.is_empty() => ExtremeTamper::Alike,
+                _ if live.is_empty() && !zero.is_empty() => ExtremeTamper::LostZeroRow,
                 other => other,
             };
             let candidates = if tamper == ExtremeTamper::LostZeroRow {
@@ -1066,9 +1079,9 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
                 &live
             };
             if candidates.is_empty() {
-                // The floor of live rows keeps a group; a serial program
-                // never empties the table.
-                return Err(format!("no live group in {} to tamper with", def.target));
+                // No group at all: the settled targets already matched the
+                // oracle, and there is nothing to tamper with.
+                return Ok(ExtremeTamper::Alike);
             }
             let group = candidates[case.group % candidates.len()].clone();
             // The group, by its columns' text: `$1`… bind each, `NULL` too.
@@ -1283,6 +1296,35 @@ fn self_check_catches_each_tamper_of_the_hidden_extremes() {
             Err(message) => panic!("{message}"),
         }
     }
+}
+
+/// #2033's shrunk case: a serial program whose deletes empty the source, so
+/// every hidden group ends at zero and there is no live group to tamper with.
+/// The tamper falls back to a `LostZeroRow`, which `self_check` must find
+/// converged.
+#[test]
+fn self_check_tolerates_a_program_that_empties_the_table() {
+    let case = ExtremeTamperCase {
+        draws: serial_min_max_draws(
+            18147390410044313247,
+            vec![MinMaxDefDraw {
+                grouping: Grouping::G2,
+                extremes: vec![(true, Arg::V)],
+                partials: false,
+            }],
+            48,
+            276,
+        ),
+        tamper: ExtremeTamper::Alike,
+        def: 0,
+        group: 0,
+        column: 0,
+        to_null: false,
+    };
+    assert_eq!(
+        run_extreme_tamper_case(&case),
+        Ok(ExtremeTamper::LostZeroRow)
+    );
 }
 
 proptest! {
