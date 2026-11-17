@@ -57,7 +57,8 @@ DROP   TRANSFORM <transform>
 - `WHERE` takes a `boolean` [expression](expressions.md#where) over source
   columns that can't raise an error. A plain 1-1 transform holds only the rows
   it is `TRUE` for, and a plain aggregate's groups count only those rows. A
-  `JOIN` refuses any `WHERE` but `TRUE` for now
+  [1-1 `JOIN`](#1-1-join) applies one too. A join aggregate refuses any
+  `WHERE` but `TRUE` for now
   ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 - `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
   `<name>.<field>` pauses or resumes one field
@@ -235,7 +236,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | [T0071 UnsupportedAggregateArgument](errors.md#t0071-unsupportedaggregateargument) | [Retype](#retype) |
 | `array_agg`, `string_agg` or `jsonb_agg` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
 | **Filters and chaining** | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: a `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | [T0238 FilterNotYetSupported](errors.md#t0238-filternotyetsupported) | [Text](#text) |
+| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a join aggregate ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | [T0238 FilterNotYetSupported](errors.md#t0238-filternotyetsupported) | [Text](#text) |
 | `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an extreme is read from a source index, which holds the rows the `WHERE` drops too | [T0239 FilteredExtreme](errors.md#t0239-filteredextreme) | [Text](#text) |
 | A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | [T0048 TargetEqualsSource](errors.md#t0048-targetequalssource), [T0047 TableCycle](errors.md#t0047-tablecycle) | [Text](#text) |
 | Chaining off a transform that is not `live` | [T0154 TransformNotLive](errors.md#t0154-transformnotlive) | n/a |
@@ -244,6 +245,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | [T0142 TargetNameHasReaders](errors.md#t0142-targetnamehasreaders), naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it ([T0153 DependentsBlockDrop](errors.md#t0153-dependentsblockdrop)) |
 | A target name ending in `__ledger`, or over 55 bytes: its ledger, `<target>__ledger`, must fit Postgres's 63 | [T0076 ReservedTargetSuffix](errors.md#t0076-reservedtargetsuffix), [T0077 TargetNameTooLong](errors.md#t0077-targetnametoolong) | [Text](#text) |
 | A target in this instance's catalog schema, or in a schema holding another instance's `trellis_instance` table, whose uninstall would drop it ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)) | [T0139 TargetInCatalogSchema](errors.md#t0139-targetincatalogschema) | [Resume only](#resume-only) |
+| Objects outside Trellis depend on a target that `DROP TRANSFORM` drops, `ALTER TRANSFORM … DROP` drops a field of, or a 1-1 `RESUME` empties: another table's foreign key into it, or a view over it or the column. Trellis never cascades; the statement rolls back whole and the definition is unchanged | [T0242 OutsideDependentsBlock](errors.md#t0242-outsidedependentsblock), naming the dependents Postgres reports | n/a |
 
 ### Details
 
@@ -676,6 +678,14 @@ written as in a join aggregate; it has no aggregate and reads no other field.
 Each row is recomputed from its current inputs, so no aggregate restriction
 applies.
 
+A `WHERE` may read any table of the join, as SQL applies it after the joins:
+a row is in the target while the joined row passes it, and no field is
+evaluated on a row that doesn't. The anti-join (`WHERE customers.id IS NULL`)
+and predicates over two tables are admitted. Trellis still copies and applies
+every row of every table, so a `WHERE` saves no work, and a change of a joined
+row can remove or add every row on its key
+([ADR-0021](decisions/0021-one-to-one-join-transforms.md#a-1-1-join-keeps-one-row-per-row-of-a-joined-to-at-most-one-row-of-each-joined-table)).
+
 A **star** joins up to four tables to `a`, each `JOIN` clause one more
 **position** (1 for the first), each `LEFT` or `INNER` on its own, on its own
 unique key, with an `ON` that reads `a` and that table only. The two-table
@@ -744,8 +754,10 @@ While a transform is `backfilling`, its target is partial
 ([status reference](status-reference.md#backfilling)).
 
 Indexes, grants, constraints, triggers, rules and foreign keys are yours to
-add, to a target define created or adopted; `DROP TRANSFORM` takes them with
-the table. What they do to Trellis's writes:
+add, to a target define created or adopted. `DROP TRANSFORM` drops the
+target's own indexes, grants, constraints and triggers with the table, and
+refuses while another table's foreign key into it, or a view over it, exists
+([refusal table](#refusals)). What they do to Trellis's writes:
 
 * A unique index, constraint or trigger that refuses a row Trellis writes
   fails that row's key like any value the target refuses: the key is held
@@ -756,9 +768,8 @@ the table. What they do to Trellis's writes:
   value for a moment though the source never does.
 * Another table's foreign key referencing the target holds the key of a
   referenced row Trellis deletes, and a source `TRUNCATE`'s page while any row
-  is referenced. `DROP TRANSFORM`, and the `RESUME` that empties a 1-1 target
-  keyed by a relabelled enum, fail with the database's error while it exists:
-  drop it first.
+  is referenced. It also refuses a `RESUME` that empties a 1-1 target
+  ([refusal table](#refusals)).
 * An `INSERT` or `UPDATE` rule, or most `DELETE` rules (`DO INSTEAD NOTHING`
   among them), make Postgres refuse the `INSERT … ON CONFLICT` and
   `DELETE … RETURNING` Trellis writes with: a build pauses, and each key a

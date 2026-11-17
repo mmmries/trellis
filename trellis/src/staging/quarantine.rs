@@ -4386,7 +4386,11 @@ async fn resume_locked(
         }
         return Ok(ResumeStep::Retyping(labels));
     }
-    complete_resume(
+    // Under a savepoint too: a refusal it makes (a target objects outside
+    // Trellis depend on, whose emptying they refuse) keeps none of its
+    // writes, so a caller can still record the refusal in `txn`.
+    txn.batch_execute("savepoint resume_complete").await?;
+    match complete_resume(
         txn,
         schema,
         floors,
@@ -4396,7 +4400,23 @@ async fn resume_locked(
         &definition,
         &revalidated,
     )
-    .await?;
+    .await
+    {
+        Ok(()) => {
+            txn.batch_execute("release savepoint resume_complete")
+                .await?;
+        }
+        Err(ApplyError::ResumeRefused { reason, status, .. }) => {
+            txn.batch_execute("rollback to savepoint resume_complete")
+                .await?;
+            return Err(ApplyError::ResumeRefused {
+                transform: target.to_string(),
+                reason,
+                status,
+            });
+        }
+        Err(err) => return Err(err),
+    }
     Ok(ResumeStep::Resumed)
 }
 
@@ -4573,7 +4593,13 @@ async fn complete_resume(
         tables.extend(joined.iter().map(|table| table.to_string()));
         discard_drained_changes(txn, &tables, gate).await?;
         if matches!(definition.def.key_space, KeySpace::OneToOne) {
-            empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
+            empty_if_keyed_by_an_enum(
+                txn,
+                source_table,
+                &definition.target_table,
+                definition.status.reported(false),
+            )
+            .await?;
         }
     }
     // Discard the definition's leftover unclaimed backfill chunks.
@@ -4742,6 +4768,7 @@ async fn empty_if_keyed_by_an_enum(
     txn: &Transaction<'_>,
     source_table: &str,
     target: &str,
+    status: crate::defs::model::TransformStatus,
 ) -> Result<(), ApplyError> {
     let key: Vec<String> = ddl::identity_key_columns(txn, source_table)
         .await?
@@ -4776,8 +4803,23 @@ async fn empty_if_keyed_by_an_enum(
         }
     }
     if !tables.is_empty() {
-        txn.batch_execute(&format!("truncate {}", tables.join(", ")))
-            .await?;
+        // A foreign key into the target refuses the truncate: the one
+        // refusal for objects outside Trellis depending on it.
+        if let Err(err) = txn
+            .batch_execute(&format!("truncate {}", tables.join(", ")))
+            .await
+        {
+            return Err(
+                match catalog::CatalogError::from_truncate_failure(err, target) {
+                    catalog::CatalogError::Db(err) => err.into(),
+                    reason => ApplyError::ResumeRefused {
+                        transform: target.to_string(),
+                        reason: Box::new(reason),
+                        status,
+                    },
+                },
+            );
+        }
     }
     Ok(())
 }

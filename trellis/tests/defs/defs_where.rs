@@ -32,8 +32,8 @@ async fn define_refuses_a_filter_and_creates_nothing() {
         ),
         (
             "TRANSFORM t4 FROM public.s JOIN public.u ON s.id = u.id \
-             SELECT s.qty AS q WHERE u.flag",
-            "T0238",
+             SELECT s.qty AS q WHERE s.qty",
+            "T0234",
         ),
         (
             "TRANSFORM t5 FROM public.s SELECT qty AS q WHERE amount / qty > 5",
@@ -65,6 +65,15 @@ async fn define_refuses_a_filter_and_creates_nothing() {
         .unwrap()
         .get(0);
     assert_eq!(targets, 0, "nothing is created");
+
+    // A 1-1 `JOIN` applies its filter (#2041).
+    trellis
+        .apply(
+            "TRANSFORM j1 FROM public.s JOIN public.u ON s.id = u.id \
+             SELECT s.qty AS q WHERE u.flag",
+        )
+        .await
+        .expect("a 1-1 JOIN takes a WHERE");
 
     // `WHERE TRUE` keeps its meaning.
     trellis

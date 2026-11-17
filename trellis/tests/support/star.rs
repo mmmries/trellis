@@ -152,7 +152,11 @@ impl Shape {
     pub fn stars(self) -> Vec<Star> {
         self.tuples()
             .iter()
-            .map(|kinds| Star { shape: self, kinds })
+            .map(|kinds| Star {
+                shape: self,
+                kinds,
+                filter: None,
+            })
             .collect()
     }
 
@@ -261,14 +265,34 @@ impl Shape {
     }
 }
 
-/// One defined star: a shape and a kind per position (`kinds[p - 1]`).
+/// One defined star: a shape, a kind per position (`kinds[p - 1]`) and
+/// its `WHERE`, if it has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Star {
     pub shape: Shape,
     pub kinds: &'static [Kind],
+    /// The `WHERE`, over `a` and `b{p}` as the definition and the live
+    /// query both name the tables.
+    pub filter: Option<&'static str>,
 }
 
 impl Star {
+    /// This star with `filter` as its `WHERE`, `{b}` in it the table at the
+    /// position under test (`b{at}`).
+    pub fn filtered(self, filter: &str) -> Star {
+        let filter = filter.replace("{b}", &format!("b{}", self.shape.at));
+        Star {
+            filter: Some(Box::leak(filter.into_boxed_str())),
+            ..self
+        }
+    }
+
+    /// ` WHERE <filter>`, or nothing.
+    fn where_clause(self) -> String {
+        self.filter
+            .map_or_else(String::new, |filter| format!(" WHERE {filter}"))
+    }
+
     /// The transform's name: `j` and a letter per position, `jl`, `jli`.
     pub fn name(self) -> String {
         std::iter::once('j')
@@ -320,9 +344,10 @@ impl Star {
             .map(|p| format!("{} public.b{p} ON a.k{p} = b{p}.k", self.kind(p).word()))
             .collect();
         format!(
-            "TRANSFORM {} FROM public.a {} SELECT {select}",
+            "TRANSFORM {} FROM public.a {} SELECT {select}{}",
             self.name(),
-            joins.join(" ")
+            joins.join(" "),
+            self.where_clause()
         )
     }
 
@@ -352,10 +377,11 @@ impl Star {
             .collect();
         let tags: Vec<String> = self.shape.all().map(|p| format!(", b{p}.tag")).collect();
         format!(
-            "select a.id, a.x{} as total{}, a.y from public.a a {}",
+            "select a.id, a.x{} as total{}, a.y from public.a a {}{}",
             total.concat(),
             tags.concat(),
-            self.live_joins()
+            self.live_joins(),
+            self.where_clause()
         )
     }
 

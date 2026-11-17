@@ -474,6 +474,53 @@ async fn a_one_to_one_resume_refuses_what_re_keying_would_take() {
     assert_eq!(rows(&raw, COPY_ACTUAL).await, rows(&raw, COPY_ORACLE).await);
 }
 
+/// A new key column empties the target before the re-keying, and a foreign
+/// key into one of the user's other unique constraints refuses that delete:
+/// the resume fails with the one refusal for objects outside Trellis
+/// depending on the target, naming the foreign key. The re-keying rolls back
+/// whole and the definition stays paused.
+#[tokio::test]
+async fn a_one_to_one_resume_that_empties_the_target_refuses_a_foreign_key_into_it() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[COPY]).await;
+    raw.batch_execute(
+        "alter table public.c_copy add constraint c_copy_amount_key unique (amount); \
+         create table public.refs (amount int references public.c_copy (amount)); \
+         insert into public.refs select amount from public.c_copy limit 1",
+    )
+    .await
+    .unwrap();
+    raw.batch_execute(RECREATED).await.unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    let err = trellis
+        .apply("RESUME TRANSFORM c_copy")
+        .await
+        .expect_err("a foreign key references the target");
+    assert_eq!(err.code(), trellis::ErrorCode::Conflict, "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("objects outside Trellis depend on") && text.contains("refs_amount_fkey"),
+        "{text}"
+    );
+    assert!(!text.contains("define would refuse"), "{text}");
+    assert_eq!(
+        key_of(&raw, "public.c_copy").await,
+        [
+            [Some("UNIQUE (amount)".into())],
+            [Some("PRIMARY KEY (id)".into())]
+        ],
+        "the key is unchanged"
+    );
+    assert_eq!(
+        status(&trellis, "c_copy").await.status,
+        TransformStatus::Paused
+    );
+    raw.batch_execute("drop table public.refs").await.unwrap();
+    trellis.apply("RESUME TRANSFORM c_copy").await.unwrap();
+    bring_live(&mut raw, &db.pool, &trellis, &["c_copy"]).await;
+    assert_eq!(rows(&raw, COPY_ACTUAL).await, rows(&raw, COPY_ORACLE).await);
+}
+
 /// The re-keying deletes the rows no new key can hold while the target still
 /// has its old key and columns. A target published for its deletes (as a
 /// `FOR ALL TABLES` publication publishes every table) needs its replica

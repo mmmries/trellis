@@ -628,8 +628,8 @@ a stored generated column or a [chained](transforms.md#chaining-and-cycle-detect
 
 ### T0238 FilterNotYetSupported
 
-A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: a
-`JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
+A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: a join
+aggregate ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 Filter a source with a [chained](transforms.md#chaining-and-cycle-detection)
 1-1 transform and join that, or filter when reading the target.
 
@@ -639,6 +639,12 @@ Filter a source with a [chained](transforms.md#chaining-and-cycle-detection)
 extreme is read from a source index, which holds the rows the `WHERE` drops
 too. Take the `MIN`/`MAX` of a stored generated column
 `CASE WHEN <predicate> THEN <column> END` in an unfiltered transform.
+
+### T0241 EnumLiteralNotALabel
+
+An enum column compared with a string literal that is not one of its labels:
+Postgres fails every statement that reads it. Use a label of the enum. After a
+label was renamed, rename it back, or drop the transform and define it again.
 
 ## Tables and keys
 
@@ -981,6 +987,16 @@ message lists the fields. Fix the name. A two-part address reads as
 `target_select_sql` was passed a target column that is neither a field nor a
 key column of the definition (a column you added, say). Pass only the
 definition's columns.
+
+### T0242 OutsideDependentsBlock
+
+Objects outside Trellis depend on the target: another table's foreign key
+into it, or a view over it or over the field's column. `DROP TRANSFORM`,
+`ALTER TRANSFORM … DROP` and a 1-1 `RESUME` that empties the target refuse
+while they exist: Trellis never drops what it doesn't own, and never cascades.
+The message names the dependents. Drop or alter them (`DROP VIEW …`,
+`ALTER TABLE … DROP CONSTRAINT …`), then retry; the failed statement changed
+nothing.
 
 ## Builds and drains
 

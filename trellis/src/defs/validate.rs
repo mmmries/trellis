@@ -383,6 +383,16 @@ pub enum ValidationError {
     /// known at define time so Postgres can judge it once (`CatalogError::InvalidRegexPattern`)
     /// — a column-sourced pattern is out of scope.
     NonLiteralRegexPattern { field: String },
+    /// A string literal compared with an enum column (`status = 'open'`) is
+    /// not a label of the column's enum. Postgres reads the literal as a
+    /// value of the enum and fails the statement on a label it lacks.
+    /// Define checks it against the live labels, and a `RESUME` checks it
+    /// again, so a relabelled value fails the definition.
+    EnumLiteralNotALabel {
+        field: String,
+        enum_type: String,
+        label: String,
+    },
     /// A typed literal's text isn't in its family's **canonical**
     /// Postgres output spelling — `DATE '2024-1-5'`, `DATE 'today'`,
     /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
@@ -1195,6 +1205,7 @@ impl ValidationError {
             ValidationError::UnsupportedLiteralType { .. } => {
                 SharedCondition::UnsupportedLiteralType.error_id()
             }
+            ValidationError::EnumLiteralNotALabel { .. } => ErrorId(241),
             ValidationError::UnresolvedGroupByColumn { .. } => ErrorId(99),
             ValidationError::UnsupportedGroupByKeyType { .. } => ErrorId(100),
             ValidationError::GroupByKeysShareTargetColumn { .. } => ErrorId(101),
@@ -1250,16 +1261,19 @@ impl ValidationError {
 
 crate::error_code::coded_display!(ValidationError);
 
-/// The site the field-level refusals name for a check of the `WHERE`
+/// The sites the field-level refusals name for a check of the `WHERE`
 /// predicate, which they carry as the field `WHERE`.
-const PREDICATE_SITE: &str = "calculated field 'WHERE'";
+const PREDICATE_SITES: [&str; 2] = ["calculated field 'WHERE'", "field 'WHERE'"];
 
 impl crate::error_code::Message for ValidationError {
     /// A field-level refusal raised over the `WHERE` predicate names the
     /// predicate, not a "calculated field 'WHERE'".
     fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = FieldMessage(self).to_string();
-        match text.strip_prefix(PREDICATE_SITE) {
+        match PREDICATE_SITES
+            .iter()
+            .find_map(|site| text.strip_prefix(site))
+        {
             Some(rest) => write!(f, "the WHERE predicate{rest}"),
             None => f.write_str(&text),
         }
@@ -1698,6 +1712,16 @@ impl std::fmt::Display for FieldMessage<'_> {
                 f,
                 "calculated field '{field}': {value_type} literal '{text}' is not in canonical \
                  form: {detail}"
+            ),
+            ValidationError::EnumLiteralNotALabel {
+                field,
+                enum_type,
+                label,
+            } => write!(
+                f,
+                "calculated field '{field}': '{label}' is not a label of the enum type \
+                 {enum_type}; a string literal compared with an enum column must be one of its \
+                 labels"
             ),
             ValidationError::UnsupportedLiteralType { field, value_type } => write!(
                 f,
@@ -2166,7 +2190,8 @@ pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), Valida
     let key_space = match &def.key_space {
         KeySpace::OneToOne | KeySpace::Aggregate { .. } => return Ok(()),
         KeySpace::Join(_) => "JOIN aggregate",
-        KeySpace::JoinOneToOne(_) => "1-1 JOIN",
+        // Filtered at recompute (#2041): its validator checks the predicate.
+        KeySpace::JoinOneToOne(_) => return Ok(()),
     };
     Err(ValidationError::FilterNotYetSupported { key_space })
 }
@@ -2429,6 +2454,9 @@ pub struct JoinColumnInfo {
     pub collation_deterministic: bool,
     /// The type is a live enum, which is a text-stable join key too.
     pub is_enum: bool,
+    /// The labels of the enum type, in sort order: `Some` for an enum column
+    /// read live, `None` for any other column.
+    pub enum_labels: Option<Vec<String>>,
     /// The type a copy of the column is declared and cast as: no modifier,
     /// qualified ([`super::copy_type::type_sql`]).
     pub copy_type: String,
@@ -2651,7 +2679,29 @@ pub(crate) fn validate_live(
         }
         err => err,
     })?;
+    check_enum_literals(def, columns)?;
     validate_aggregate_admitted(def, columns)
+}
+
+/// Refuses a string literal compared with an enum column that is not a label
+/// of the enum, in a field or the `WHERE`, over the live `columns` (which
+/// carry the labels). [`validate`] types the definition over types alone, so
+/// it can't; define and every `RESUME` make this check
+/// ([`super::catalog::validate_live_schema`]).
+pub(crate) fn check_enum_literals(
+    def: &TransformDef,
+    columns: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let live = ColumnTypes::Live(columns);
+    infer_fields(&def.fields, &live)?;
+    // A lone `NULL` has no type of its own; `validate` admits it as a
+    // `boolean` by position, and it holds no literal to check.
+    if let Some(predicate) = def.predicate.filter()
+        && !matches!(predicate, Expr::Null)
+    {
+        infer_expr_type_in("WHERE", predicate, &live)?;
+    }
+    Ok(())
 }
 
 /// [`validate_aggregate_admitted`]'s walk of one field's expression.
@@ -2932,8 +2982,8 @@ pub fn validate_join(
     left: &HashMap<String, JoinColumnInfo>,
     joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
-    // A `JOIN`'s predicate reads qualified columns of either table, which
-    // the steps that apply it check (#1991); until then it is refused here.
+    // A join aggregate's predicate is refused until its step (#2042) applies
+    // it; a 1-1 `JOIN`'s validator checks its own.
     refuse_unsupported_filter(def)?;
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);
@@ -3899,13 +3949,32 @@ pub(crate) enum ColumnTypes<'a> {
     },
 }
 
-impl ColumnTypes<'_> {
+impl<'a> ColumnTypes<'a> {
     /// The type of the bare column `name`, if it is one.
     fn bare(&self, name: &str) -> Option<ValueType> {
         match self {
             ColumnTypes::Source(columns) => columns.get(name).copied(),
             ColumnTypes::Live(columns) => columns.get(name).map(|info| info.value_type),
             ColumnTypes::Join { .. } => None,
+        }
+    }
+
+    /// The labels of the enum type `ty`, as some column of that type carries
+    /// them live. `None` when no column of the type does (a `Source` read
+    /// has only types).
+    fn enum_labels(&self, ty: ValueType) -> Option<&[String]> {
+        let find = |columns: &'a HashMap<String, JoinColumnInfo>| {
+            columns
+                .values()
+                .find(|info| info.value_type == ty)
+                .and_then(|info| info.enum_labels.as_deref())
+        };
+        match self {
+            ColumnTypes::Source(_) => None,
+            ColumnTypes::Live(columns) => find(columns),
+            ColumnTypes::Join { root, joined, .. } => {
+                find(root).or_else(|| joined.iter().find_map(|columns| find(columns)))
+            }
         }
     }
 
@@ -4316,6 +4385,83 @@ fn comparison_type(
     })
 }
 
+/// The enum column and string literal of `lhs op rhs` when it is that
+/// comparison: `=` with an enum on one side and a string literal on the
+/// other. Postgres types the literal from the column (`unknown` resolves to
+/// the enum), so the pair is an enum comparison. `<>`, the ordering
+/// operators and `NULLIF` don't take it.
+fn enum_beside_string_literal<'e>(
+    op: super::ast::Operator,
+    lhs: &'e Expr,
+    rhs: &'e Expr,
+    lhs_t: ValueType,
+    rhs_t: ValueType,
+) -> Option<(ValueType, &'e str)> {
+    if op != super::ast::Operator::Equal {
+        return None;
+    }
+    match (lhs_t, lhs, rhs_t, rhs) {
+        (ty @ ValueType::Other(PgType::Enum(_)), _, _, Expr::StringLiteral(label))
+        | (_, Expr::StringLiteral(label), ty @ ValueType::Other(PgType::Enum(_)), _) => {
+            Some((ty, label))
+        }
+        _ => None,
+    }
+}
+
+/// [`enum_beside_string_literal`]'s comparison type: a `boolean`.
+fn enum_literal_comparison(
+    op: super::ast::Operator,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_t: ValueType,
+    rhs_t: ValueType,
+) -> Option<ValueType> {
+    enum_beside_string_literal(op, lhs, rhs, lhs_t, rhs_t)?;
+    Some(
+        super::registry::Admitted::new(
+            ValueType::Boolean,
+            super::registry::TypeRule::Comparison(
+                super::registry::ComparisonRule::EnumBesideStringLiteral,
+            ),
+        )
+        .into_type(),
+    )
+}
+
+/// Refuses an enum compared with a string literal that is not a label of
+/// the enum, over the labels the live columns carry. A read with no labels
+/// (`ColumnTypes::Source`) is not checked.
+fn check_enum_literal(
+    op: super::ast::Operator,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_t: Option<ValueType>,
+    rhs_t: Option<ValueType>,
+    columns: &ColumnTypes<'_>,
+    field_name: &str,
+) -> Result<(), ValidationError> {
+    let (Some(lhs_t), Some(rhs_t)) = (lhs_t, rhs_t) else {
+        return Ok(());
+    };
+    let Some((ty, label)) = enum_beside_string_literal(op, lhs, rhs, lhs_t, rhs_t) else {
+        return Ok(());
+    };
+    match columns.enum_labels(ty) {
+        Some(labels) if !labels.iter().any(|l| l == label) => {
+            Err(ValidationError::EnumLiteralNotALabel {
+                field: field_name.to_string(),
+                enum_type: match ty {
+                    ValueType::Other(pg) => pg.enum_qualified_name().unwrap_or("").to_string(),
+                    _ => String::new(),
+                },
+                label: label.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The type of `expr`, or the refusal naming why it has none this grammar
 /// admits. Inference never evaluates a constant: an expression Postgres
 /// fails while planning it (`2147483647 + 1`) types like any other, and its
@@ -4517,7 +4663,9 @@ fn infer_expr(
                 infer_operand(lhs, field_name, columns, fields_by_name, types, in_progress)?;
             let rhs_t =
                 infer_operand(rhs, field_name, columns, fields_by_name, types, in_progress)?;
-            infer_binary_op(expr, *op, lhs, rhs, lhs_t, rhs_t, field_name)
+            let result = infer_binary_op(expr, *op, lhs, rhs, lhs_t, rhs_t, field_name)?;
+            check_enum_literal(*op, lhs, rhs, lhs_t, rhs_t, columns, field_name)?;
+            Ok(result)
         }
         Expr::Negate(operand) => {
             // Postgres finds prefix `-` over `NULL` ambiguous.
@@ -4815,6 +4963,9 @@ fn infer_binary_op(
         return Ok(result);
     }
     if op.is_comparison() {
+        if let Some(result) = enum_literal_comparison(op, lhs, rhs, lhs_t, rhs_t) {
+            return Ok(result);
+        }
         return comparison_type(op, lhs, rhs, lhs_t, rhs_t, field_name);
     }
     // No operator takes the other operand's type on both sides (or
@@ -7360,6 +7511,7 @@ mod tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            enum_labels: None,
             copy_type: pg_type.split('(').next().unwrap_or(pg_type).to_string(),
             copy_collation: None,
             trellis_target: false,
@@ -8712,6 +8864,172 @@ mod tests {
             Err(ValidationError::JoinNeedsBothTables)
         );
     }
+
+    // ---- An enum column beside a string literal ----
+
+    const STATUS: ValueType = ValueType::Other(PgType::Enum("enum:public.status"));
+
+    fn status_column(labels: &[&str]) -> JoinColumnInfo {
+        let mut info = jcol(STATUS, "status", 90000, -1);
+        info.is_enum = true;
+        info.enum_labels = Some(labels.iter().map(|l| l.to_string()).collect());
+        info
+    }
+
+    fn status_table() -> HashMap<String, JoinColumnInfo> {
+        side(&[
+            ("id", int4()),
+            ("status", status_column(&["open", "closed"])),
+            ("other", jcol(ValueType::Text, "text", 25, -1)),
+        ])
+    }
+
+    fn live(text: &str) -> Result<(), ValidationError> {
+        validate_live(&parse_text(text).unwrap(), &status_table())
+    }
+
+    /// An enum column `=` a label of its enum is a `boolean`, in either
+    /// order and anywhere a boolean is read: a field, a `CASE` condition.
+    #[test]
+    fn an_enum_equals_one_of_its_labels_is_admitted() {
+        for text in [
+            "TRANSFORM t FROM s SELECT id AS id, status = 'open' AS is_open",
+            "TRANSFORM t FROM s SELECT id AS id, 'closed' = status AS is_closed",
+            "TRANSFORM t FROM s SELECT id AS id, \
+             CASE WHEN status = 'open' THEN 1 ELSE 0 END AS n",
+            "TRANSFORM t FROM s SELECT id AS id, status AS st, st = 'open' AS is_open",
+            "TRANSFORM t FROM s GROUP BY other SELECT other AS other, \
+             COUNT(CASE WHEN status = 'open' THEN 1 END) AS n",
+        ] {
+            assert_eq!(live(text), Ok(()), "{text}");
+        }
+    }
+
+    /// The comparison's type is `boolean`, so `NOT` and `AND` read it.
+    #[test]
+    fn an_enum_comparison_is_boolean() {
+        assert_eq!(
+            live("TRANSFORM t FROM s SELECT id AS id, NOT status = 'open' AND id > 1 AS x"),
+            Ok(())
+        );
+    }
+
+    /// Postgres fails a statement that reads a literal that is no label, so
+    /// define names it.
+    #[test]
+    fn a_literal_that_is_not_a_label_is_refused() {
+        for text in [
+            "TRANSFORM t FROM s SELECT id AS id, status = 'Open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, 'nope' = status AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = '' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = 'open ' AS x",
+        ] {
+            assert!(
+                matches!(
+                    live(text),
+                    Err(ValidationError::EnumLiteralNotALabel { .. })
+                ),
+                "{text}: {:?}",
+                live(text)
+            );
+        }
+        let Err(refusal) = live("TRANSFORM t FROM s SELECT id AS id, status = 'x' AS v") else {
+            panic!("refused");
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "T0241: calculated field 'v': 'x' is not a label of the enum type public.status; a string \
+             literal compared with an enum column must be one of its labels"
+        );
+    }
+
+    /// Only `=` takes the literal: the other comparisons, `NULLIF` and an
+    /// enum against `text` stay refused.
+    #[test]
+    fn only_equals_takes_the_literal() {
+        for text in [
+            "TRANSFORM t FROM s SELECT id AS id, status <> 'open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status < 'open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status IS DISTINCT FROM 'open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, NULLIF(status, 'open') AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = other AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = status AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = 1 AS x",
+        ] {
+            let refusal = live(text).expect_err(text);
+            assert!(
+                !matches!(refusal, ValidationError::EnumLiteralNotALabel { .. }),
+                "{text}: {refusal:?}"
+            );
+        }
+    }
+
+    /// A type-only read (no live labels) admits the pair: the labels are
+    /// the live validators' to check.
+    #[test]
+    fn a_type_only_read_does_not_check_labels() {
+        let types = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("status".to_string(), STATUS),
+        ]);
+        let def = parse_text("TRANSFORM t FROM s SELECT id AS id, status = 'nope' AS x").unwrap();
+        assert_eq!(validate(&def, &types), Ok(()));
+    }
+
+    /// The `WHERE` is checked wherever its comparison sits: either order,
+    /// under `NOT`, nested `AND`/`OR`, a `CASE` condition. A lone `NULL`
+    /// holds no literal and stays admitted.
+    #[test]
+    fn a_where_checks_its_enum_literals_in_every_position() {
+        let aggregate = "TRANSFORM t FROM s GROUP BY other SELECT other AS other, COUNT(*) AS n";
+        for predicate in [
+            "NULL",
+            "(NULL)",
+            "status = 'open'",
+            "'closed' = status AND id > 1",
+        ] {
+            let text = format!("{aggregate} WHERE {predicate}");
+            assert_eq!(live(&text), Ok(()), "{text}");
+        }
+        for predicate in [
+            "'nope' = status",
+            "NOT (status = 'nope')",
+            "id > 1 OR (id < 0 AND status = 'nope')",
+            "CASE WHEN status = 'nope' THEN TRUE ELSE FALSE END",
+        ] {
+            let text = format!("{aggregate} WHERE {predicate}");
+            assert!(
+                matches!(
+                    live(&text),
+                    Err(ValidationError::EnumLiteralNotALabel { ref field, .. }) if field == "WHERE"
+                ),
+                "{text}: {:?}",
+                live(&text)
+            );
+        }
+    }
+
+    /// A `JOIN` reads the enum through its qualified side's labels.
+    #[test]
+    fn a_join_checks_the_label_against_the_side_that_has_the_enum() {
+        let (mut left, right) = tables();
+        left.insert("status".to_string(), status_column(&["open"]));
+        let ok = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             SELECT items.sku AS sku, orders.status = 'open' AS is_open",
+        )
+        .unwrap();
+        assert_eq!(validate_join(&ok, &left, &[&right]), Ok(()));
+        let bad = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             SELECT items.sku AS sku, orders.status = 'closed' AS is_open",
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_join(&bad, &left, &[&right]),
+            Err(ValidationError::EnumLiteralNotALabel { .. })
+        ));
+    }
 }
 
 /// The pure key-collation check, over hand-built
@@ -8731,6 +9049,7 @@ mod key_collation_tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            enum_labels: None,
             copy_type: "text".to_string(),
             copy_collation: None,
             trellis_target: false,
