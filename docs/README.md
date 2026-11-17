@@ -1,6 +1,7 @@
 # Trellis documentation
 
-Start with the reader you are. Terms are in the [glossary](glossary.md).
+Start with the reader you are. Terms are in the [glossary](glossary.md). An
+error's code (`T0042`) is in [errors](errors.md), with what to do.
 
 ## I write definitions
 
