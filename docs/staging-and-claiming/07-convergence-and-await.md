@@ -174,8 +174,10 @@ A read of "every pending ring row" that is not fenced can include a straggler th
 will attribute to a later batch. Over-exempting and over-reporting are both
 conservative for a consumer that subtracts or reports unapplied rows, so
 `self_check` reads the source's unapplied ring rows with its own predicate to subtract
-them from a comparison (ADR-0013, "Quiescence"). A 1-1 page expects a key as the old
-image of its earliest unapplied change, and can't vouch for a key with no ledger entry
-whose earliest unapplied change has one: a build read the source past that change. That read is never wired into
+them from a comparison (ADR-0013, "Quiescence"). That read is never wired into
 `converged_through` or any other fenced read: the strict predicate above and a loose
 view stay separate.
+
+A 1-1 page expects a key as the old image of its earliest unapplied change. It can't
+vouch for a key with no ledger entry whose earliest unapplied change has one: a build
+read the source past that change.
