@@ -58,7 +58,8 @@ use crate::backend::Backend;
 use crate::model::{Column, OpOutcome, PRIMARY_KEY_VALUE_TYPE, Program, Table};
 use crate::oracle;
 
-use super::{Divergence, Outcome, RunError, check_program};
+use super::pause::RunKind;
+use super::{Divergence, Outcome, RunError, check_program, settled_states};
 
 /// Which of the two side-by-side instances something happened on. Carried on
 /// every error this module produces so a failure message never leaves the
@@ -160,10 +161,19 @@ impl<B: Backend> InstanceRun<'_, B> {
             .await
             .map_err(|e| self.tag(RunError::Snapshot(format!("{e:?}"))))?;
 
+        let states = settled_states(
+            self.backend,
+            self.program,
+            op_index,
+            &self.program.defs,
+            RunKind::TwoInstance,
+        )
+        .await
+        .map_err(|e| self.tag(e))?;
         let checked = check_program(self.pool, self.program, &snapshot)
             .await
             .map_err(|e| self.tag(RunError::Oracle(e)))?;
-        if let Some(divergence) = Divergence::from_checked(op_index, checked) {
+        if let Some(divergence) = Divergence::from_checked(op_index, checked, states) {
             return Err(self.tag(RunError::Diverged(divergence)));
         }
         Ok(())

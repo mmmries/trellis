@@ -371,10 +371,33 @@ pub struct OracleReport {
     /// `persisted target ≠ SQL oracle`: a pipeline/apply/fold/ordering bug, or
     /// a rendering bug in the engine's compiler.
     pub target_vs_sql: Vec<Divergence>,
+    /// One line per definition of the program: its status and, if it has
+    /// one, why it paused. Filled in by the run that found the divergence
+    /// ([`OracleReport::with_definition_states`]), so a target that stopped
+    /// following its source says so in the report.
+    definition_states: Vec<String>,
     program: String,
 }
 
 impl OracleReport {
+    /// This report with `states` (one rendered line per definition) printed
+    /// beside the divergences.
+    pub fn with_definition_states(mut self, states: Vec<String>) -> Self {
+        self.definition_states = states;
+        self
+    }
+
+    /// A report over `target_vs_sql` and no program, for the tests of what
+    /// wraps one.
+    #[cfg(test)]
+    pub(crate) fn for_test(target_vs_sql: Vec<Divergence>) -> Self {
+        OracleReport {
+            target_vs_sql,
+            definition_states: Vec::new(),
+            program: "<program>".to_string(),
+        }
+    }
+
     /// Whether the comparison diverged.
     pub fn diverged(&self) -> bool {
         !self.target_vs_sql.is_empty()
@@ -389,6 +412,12 @@ impl fmt::Display for OracleReport {
         writeln!(f, "target != SQL oracle:")?;
         for divergence in &self.target_vs_sql {
             writeln!(f, "  {divergence}")?;
+        }
+        if !self.definition_states.is_empty() {
+            writeln!(f, "definitions:")?;
+            for state in &self.definition_states {
+                writeln!(f, "  {state}")?;
+            }
         }
         write!(f, "program:\n{}", self.program)
     }
@@ -780,6 +809,7 @@ pub fn compare(
 
     OracleReport {
         target_vs_sql: diff(&def.target, sql, target, &comparison_for),
+        definition_states: Vec::new(),
         program: format!("{program:#?}"),
     }
 }
@@ -1398,6 +1428,7 @@ pub async fn check_over(
         let sql = join_sql_oracle(pool, def, &relation).await?;
         return Ok(OracleReport {
             target_vs_sql: diff(&def.target, &sql, target, &|_| Comparison::Exact),
+            definition_states: Vec::new(),
             program: format!("{program:#?}"),
         });
     }
@@ -1408,6 +1439,7 @@ pub async fn check_over(
         let target = target_fields(target, pk_column);
         return Ok(OracleReport {
             target_vs_sql: diff(&def.target, &sql, &target, &|_| Comparison::Exact),
+            definition_states: Vec::new(),
             program: format!("{program:#?}"),
         });
     }
@@ -1715,6 +1747,7 @@ mod tests {
                 expected: Some("5".into()),
                 got: Some("4".into()),
             }],
+            definition_states: Vec::new(),
             program: format!("{program:#?}"),
         };
         let printed = report.to_string();

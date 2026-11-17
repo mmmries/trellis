@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 use trellis::dev::defs::ast::TransformDef;
 use trellis::dev::pool::Pool;
 
+use super::pause::RunKind;
 use super::{Outcome, RunError, check_op_outcome, quiesce_snapshot_and_check};
 use crate::backend::{ConcurrentBackend, DrainAudit, OpApplier};
 use crate::invariant::{self, InRunInvariant, SampleStats};
@@ -303,8 +304,16 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
             return Err(e);
         }
 
-        quiesce_snapshot_and_check(backend, pool, program, last_op, &installed, timing_enabled)
-            .await?;
+        quiesce_snapshot_and_check(
+            backend,
+            pool,
+            program,
+            last_op,
+            &installed,
+            timing_enabled,
+            RunKind::Concurrent,
+        )
+        .await?;
         if invariant.is_some() {
             for target in join1_targets(&installed) {
                 let failure = match invariant::sample(pool, &target, &mut stats).await {

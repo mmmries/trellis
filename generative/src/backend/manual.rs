@@ -47,9 +47,9 @@ use trellis::dev::staging::{
 };
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config};
 
-use super::Snapshot;
 use super::ring_wait::{ProgressDeadline, QuiesceBudget};
 use super::sql::{self, quote_ident};
+use super::{DefinitionState, Snapshot};
 use crate::model::{
     BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
 };
@@ -1388,6 +1388,13 @@ impl super::Backend for ManualBackend {
             );
         }
         Ok(result?)
+    }
+
+    async fn definition_states(
+        &mut self,
+        defs: &[TransformDef],
+    ) -> Result<Vec<DefinitionState>, ManualBackendError> {
+        Ok(sql::definition_states(&self.raw, defs).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, ManualBackendError> {

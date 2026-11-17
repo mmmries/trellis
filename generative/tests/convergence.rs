@@ -1007,3 +1007,49 @@ async fn avg_and_sum_over_the_same_column_share_a_partial_and_stay_correct_throu
         "final avg: expected 50, got {avg}"
     );
 }
+
+/// A definition an operator paused reads back as `paused` through the seam's
+/// state read, which is what the divergence report and the unexpected-pause
+/// check print, and a live one reads `live` with no reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_definition_reads_back_as_paused() {
+    use generative::backend::ConcurrentBackend;
+    use generative::model::BurstAction;
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let program = build_program(&[(Some(10), Some(1)), (Some(20), Some(2))], &[]);
+    let target = program.defs[0].target.clone();
+
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    run_convergence(&mut backend, &pool, &program)
+        .await
+        .expect("converges");
+
+    let live = backend
+        .definition_states(&program.defs)
+        .await
+        .expect("states");
+    assert_eq!(live.len(), program.defs.len());
+    assert_eq!((live[0].status.as_str(), &live[0].reason), ("live", &None));
+
+    backend
+        .act(
+            &program,
+            &BurstAction::Pause {
+                target: target.clone(),
+                column: None,
+            },
+        )
+        .await
+        .expect("pause");
+    let paused = backend
+        .definition_states(&program.defs)
+        .await
+        .expect("states");
+    assert_eq!(paused[0].target, target);
+    assert!(paused[0].is_paused(), "{:?}", paused[0]);
+}

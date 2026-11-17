@@ -736,6 +736,24 @@ designed out — but we still enforce the shape:
 - **Print the resolved connection target**; refuse to run against a database the
   run did not name.
 
+**A pause is a failure unless the tier provokes it.** Quiescing treats a `paused`
+definition as settled, so the run ends promptly rather than waiting on it. The
+check that follows reads every definition's catalog state, and a definition
+`paused` there fails the run as `unexpected pause: <definition>: <reason>`
+(`RunError::UnexpectedPause`), ahead of the oracle comparison, which a pause
+would also fail without naming the cause. The reason is the definition's
+`capture_failures` row or its poisoned keys' error.
+
+The allowlist is `run::pause::allowance`: a tier on it may find a definition
+paused, and a tier not on it treats any pause as a failure. On it: the
+disruption runners (`run_convergence_with_db_admin`, and the original side of
+`run_convergence_with_restore`, whose restored side must not pause at all), and
+any program with partition maintenance (`Op::Partition`). A tier that starts
+provoking pauses (a source schema change, say) is added there, with its reason.
+
+Every divergence report, in every backend, prints each definition's status and
+pause reason under `definitions:` beside the cell diffs.
+
 **Findings terminate as deterministic pins; generative runs are lead generation.**
 A seed reproduces the *program*, not reliably a *race*, and does not survive
 generator refactors. Three artifact kinds:
