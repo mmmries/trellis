@@ -49,7 +49,7 @@
 //!
 //! A plain aggregate (every `GROUP BY` key a source column) whose every value field
 //! composes the admitted aggregates (`COUNT(*)`, `COUNT(x)`, `SUM`/`AVG` over
-//! an integer or `numeric` argument, and `MIN`/`MAX` over a plain source
+//! a number or `interval` argument, and `MIN`/`MAX` over a plain source
 //! column of an ordered type with no collation, "Extremes" below) with
 //! literals, operators, functions and its `GROUP BY` keys. A `SUM`/`AVG`
 //! argument may be an expression over the row (`SUM(a + b)`). Define refuses
@@ -105,6 +105,13 @@
 //! `AVG` divides that by the count. An integer argument keeps its sum alone
 //! ([`INTEGER_PARTS`]). The maps are merged in SQL with no function of
 //! Trellis's own, so the catalog needs none.
+//!
+//! # Float and interval sums
+//!
+//! A float or `interval` argument keeps [`NUMERIC_PARTS`] too, each value
+//! converted exactly to one `numeric` by its [`SumKind`] ([`exact_sums`]),
+//! under a reference scale no finite value leaves, so its map counts only
+//! the special values. Its `SUM` and `AVG` are read from the exact sum.
 //!
 //! # Zero groups
 //!
@@ -297,9 +304,11 @@ use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType, group_by_contain
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::oracle::{render_expr_sql, render_qualified_expr_sql};
 use crate::defs::registry::is_aggregate_name;
+#[cfg(test)]
 use crate::integer::IntWidth;
 use crate::pool::{jsonb_build_object_sql, quote_ident, quote_literal};
 
+use self::exact_sums::SumKind;
 use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
 use super::target_mutations::TargetMutations;
@@ -441,6 +450,10 @@ pub(crate) struct Arg {
     /// `None` for any other argument, and for an unconstrained `numeric`
     /// one, whose map counts every value.
     pub(super) scale: Option<i32>,
+    /// How its values enter its partials ([`SumKind`]): exactly, or a
+    /// float or `interval` converted to one exact `numeric` each
+    /// ("Float and interval sums" in the module doc).
+    pub(super) kind: SumKind,
     /// Whether [`Self::scale`] was set ([`GroupShape::set_scales`]): a plan
     /// over a `numeric` sum whose reference scale nobody read would misread
     /// its maps, so building one is a bug ([`GroupShape::check_scales_read`]).
@@ -457,6 +470,14 @@ pub(crate) struct GroupShape {
     /// by a `JOIN`'s writers, whose working tables copy the hidden table's
     /// columns ([`Writer`]).
     pub(super) group_types: Vec<String>,
+    /// The type a field reads each `GROUP BY` column as, where it isn't
+    /// [`Self::group_types`]' (#2053), aligned with them: a `char(n)` or
+    /// `name` key is kept as `text`, its value family, and read as its
+    /// source type, as Postgres's own `GROUP BY` reads it, so a field's
+    /// `ch = 'ab  '` ignores trailing blanks. Read from the type
+    /// `definition_key_types` records for the key ([`Self::read_key_types`]);
+    /// `None` until read. A `JOIN`'s fields read no key.
+    pub(super) key_reads: Option<Vec<Option<&'static str>>>,
     pub(super) args: Vec<Arg>,
     pub(super) aggs: Vec<Agg>,
     /// Each value field: its name, its type in the target, and its
@@ -541,6 +562,20 @@ impl GroupShape {
     }
 }
 
+/// The type a field reads a `GROUP BY` column whose source type is
+/// `type_oid` as, where it isn't the `text` the key is kept as
+/// ([`GroupShape::key_reads`]): a `char(n)`'s `=` ignores trailing blanks,
+/// and a string Postgres types `name` is truncated to 63 bytes. `text` and
+/// `varchar` read alike, and every other key is kept as its own type.
+fn key_read(type_oid: Option<u32>) -> Option<&'static str> {
+    use crate::defs::pg_type::oid;
+    match type_oid? {
+        oid::BPCHAR => Some("pg_catalog.bpchar"),
+        oid::NAME => Some("pg_catalog.name"),
+        _ => None,
+    }
+}
+
 /// The plain source column `MIN`/`MAX` reads, if `arg` is one.
 fn extreme_column(arg: &Expr) -> Option<&str> {
     match arg {
@@ -576,6 +611,7 @@ pub(crate) fn route(
     let mut shape = GroupShape {
         group_cols,
         group_types,
+        key_reads: None,
         args: distinct
             .iter()
             .map(|arg| Arg {
@@ -584,6 +620,7 @@ pub(crate) fn route(
                 summed: false,
                 numeric: false,
                 scale: None,
+                kind: SumKind::Exact,
                 scale_read: false,
             })
             .collect(),
@@ -654,14 +691,10 @@ fn rewrite_with(
                 (function @ ("SUM" | "AVG"), [arg]) => {
                     let i = arg_of(arg)?;
                     let value_type = type_of(arg)?;
-                    let cast = match value_type {
-                        ValueType::Integer(IntWidth::Int2 | IntWidth::Int4) => "bigint",
-                        ValueType::Integer(IntWidth::Int8) => "numeric",
-                        ValueType::Numeric => "numeric",
-                        _ => return None,
-                    };
+                    let (kind, cast) = SumKind::of(value_type)?;
                     shape.args[i].summed = true;
-                    shape.args[i].numeric |= value_type == ValueType::Numeric;
+                    shape.args[i].numeric |= kind.keeps_map(value_type);
+                    shape.args[i].kind = kind;
                     if function == "SUM" {
                         Agg::Sum(i, cast)
                     } else {
@@ -1569,7 +1602,7 @@ pub(crate) async fn source_scales(
     }
     let columns: Vec<&str> = args.iter().filter_map(column).collect();
     if columns.is_empty() {
-        return Ok(vec![None; args.len()]);
+        return Ok(args.iter().map(|arg| arg.kind.reference_scale()).collect());
     }
     let typmods: HashMap<String, i32> = client
         .query(
@@ -1590,6 +1623,8 @@ pub(crate) async fn source_scales(
             let typmod = typmods.get(column(arg)?)?;
             Some(numeric_scale(*typmod).max(0))
         })
+        .zip(args)
+        .map(|(scale, arg)| arg.kind.reference_scale().or(scale))
         .collect())
 }
 
@@ -1665,6 +1700,56 @@ impl GroupShape {
             arg.scale = *scale;
             arg.scale_read = true;
         }
+    }
+
+    /// Sets the type each field reads each `GROUP BY` column as
+    /// ([`Self::key_reads`]), from the type definition `id` records for it
+    /// on its source `source` (`definition_key_types`, ADR-0020).
+    pub(crate) async fn read_key_types(
+        &mut self,
+        client: &impl tokio_postgres::GenericClient,
+        id: i64,
+        source: &str,
+    ) -> Result<(), tokio_postgres::Error> {
+        let oids: HashMap<String, u32> = client
+            .query(
+                "select column_name, type_oid from definition_key_types \
+                 where transform_id = $1 and table_name = $2 and column_name = any($3)",
+                &[&id, &source, &self.group_cols],
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        self.key_reads = Some(
+            self.group_cols
+                .iter()
+                .map(|column| key_read(oids.get(column).copied()))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    /// Whether a field reads a `GROUP BY` column.
+    fn a_field_reads_a_key(&self) -> bool {
+        fn reads(expr: &Expr, keys: &[String]) -> bool {
+            match expr {
+                Expr::Column(column) | Expr::SourceColumn { column, .. } => keys.contains(column),
+                _ => expr.children().into_iter().any(|e| reads(e, keys)),
+            }
+        }
+        self.fields
+            .iter()
+            .any(|(_, _, expr)| reads(expr, &self.group_cols))
+    }
+
+    /// Asserts, in a debug build, that the types a field reads the keys as
+    /// were read ([`Self::key_reads`]) when a field reads one.
+    pub(super) fn check_key_types_read(&self) {
+        debug_assert!(
+            self.key_reads.is_some() || !self.a_field_reads_a_key(),
+            "a group-basis plan with a field over a key whose type was never read"
+        );
     }
 
     /// Asserts, in a debug build, that every `numeric` sum's reference
@@ -1908,6 +1993,7 @@ impl GroupTargetPlan {
         shape: GroupShape,
     ) -> Self {
         shape.check_scales_read();
+        shape.check_key_types_read();
         Self {
             target: target.to_string(),
             target_ident: ddl::qualified_target_table_ident(target),
@@ -1972,6 +2058,9 @@ impl GroupTargetPlan {
                 client,
                 &hidden_table_qualified(catalog_schema, definition.id),
             )
+            .await?;
+        shape
+            .read_key_types(client, definition.id, &definition.source_table)
             .await?;
         let source_pk = ddl::source_primary_key_in_txn(client, &definition.source_table).await?;
         let identity = ddl::identity_key_columns(client, &definition.target_table).await?;
@@ -2476,12 +2565,20 @@ impl GroupTargetPlan {
         for (i, arg) in self.shape.args.iter().enumerate() {
             let i = i + 1;
             values.push(format!("{} as __a{i}", arg.sql));
+            // A float or `interval` sum's exact summand, beside the value an
+            // extreme of the same argument reads.
+            let x = if arg.kind == SumKind::Exact {
+                format!("__a{i}")
+            } else {
+                values.push(format!("{} as __x{i}", arg.kind.summand(&arg.sql)));
+                format!("__x{i}")
+            };
             let count = format!("sum(__sgn * (__a{i} is not null)::int)::bigint");
             sums.push(count.clone());
             for part in arg.parts() {
                 sums.push(match part {
                     SumPart::Scales => {
-                        let key = staged_key(&format!("__a{i}"), arg.scale);
+                        let key = staged_key(&x, arg.scale);
                         scale_keys.push_str(&format!(", {key}"));
                         format!(
                             "(case when {key} is null or {count} = 0 then {NO_SCALES} \
@@ -2492,10 +2589,10 @@ impl GroupTargetPlan {
                     // sum is the plain sum unless the key is a special value.
                     SumPart::Sum if arg.numeric => format!(
                         "(case when {key} in {SPECIAL_KEYS} then 0::numeric \
-                               else coalesce(sum(__sgn * __a{i}), 0) end)",
-                        key = staged_key(&format!("__a{i}"), arg.scale),
+                               else coalesce(sum(__sgn * {x}), 0) end)",
+                        key = staged_key(&x, arg.scale),
                     ),
-                    _ => part.of_rows(&format!("__a{i}"), arg.numeric, "__sgn", arg.scale),
+                    _ => part.of_rows(&x, arg.numeric, "__sgn", arg.scale),
                 });
             }
         }
@@ -2666,14 +2763,14 @@ impl GroupTargetPlan {
             Agg::CountStar => partial(Partial::Rows),
             Agg::Count(i) => count(i + 1),
             Agg::Sum(i, cast) => format!(
-                "case when {c} = 0 then null else ({s})::{cast} end",
+                "case when {c} = 0 then null else {s} end",
                 c = count(i + 1),
-                s = value(*i)
+                s = args[*i].kind.sum(&value(*i), cast)
             ),
             Agg::Avg(i) => format!(
-                "case when {c} = 0 then null else ({s}) / ({c})::numeric end",
+                "case when {c} = 0 then null else {s} end",
                 c = count(i + 1),
-                s = value(*i)
+                s = args[*i].kind.avg(&value(*i), &count(i + 1))
             ),
         }
     }
@@ -2700,6 +2797,16 @@ impl GroupTargetPlan {
                 )
             })
             .collect();
+        // Each key a field reads as another type, under its own name, so
+        // the field reads it from here.
+        let mut aggs = aggs;
+        let reads = self.shape.key_reads.as_deref().unwrap_or_default();
+        for (column, read) in self.shape.group_cols.iter().zip(reads) {
+            if let Some(read) = read {
+                let column = quote_ident(column);
+                aggs.push(format!("({column})::{read} as {column}"));
+            }
+        }
         let fields: Vec<String> = self
             .shape
             .fields
@@ -4037,6 +4144,7 @@ impl GroupTargetPlan {
                 ),
                 format!("coalesce(sum({count}), 0)::bigint"),
             ));
+            let x = arg.kind.summand(&arg.sql);
             for part in arg.parts() {
                 let name = part.name("__r", i);
                 let fold = match part {
@@ -4047,8 +4155,8 @@ impl GroupTargetPlan {
                     _ => part.total(&name, None),
                 };
                 let agg = match (part, arg.scale) {
-                    (SumPart::Scales, Some(s)) if strict => strict_build_scales(&arg.sql, s),
-                    _ => part.of_rows(&arg.sql, arg.numeric, "1", arg.scale),
+                    (SumPart::Scales, Some(s)) if strict => strict_build_scales(&x, s),
+                    _ => part.of_rows(&x, arg.numeric, "1", arg.scale),
                 };
                 partials.push((name, agg, fold));
             }
@@ -4086,7 +4194,8 @@ impl GroupTargetPlan {
         }
         let mut inner: Vec<String> = values.to_vec();
         for &i in &scaled {
-            inner.push(format!("{} as __g{}", exception_key(&args[i].sql), i + 1));
+            let x = args[i].kind.summand(&args[i].sql);
+            inner.push(format!("{} as __g{}", exception_key(&x), i + 1));
         }
         let keys = inner.len();
         // The maps the exception keys fold are computed by the outer step
@@ -5844,6 +5953,7 @@ pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<Str
         .join("\n"))
 }
 
+pub(crate) mod exact_sums;
 #[cfg(test)]
 pub(super) mod golden;
 
@@ -6013,15 +6123,19 @@ mod tests {
             // `MIN`/`MAX` over an expression, or a collatable column.
             "TRANSFORM t FROM s GROUP BY g SELECT MIN(a + 1) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT MAX(h) AS n",
-            "TRANSFORM t FROM s GROUP BY g SELECT SUM(f) AS n",
-            "TRANSFORM t FROM s GROUP BY g SELECT AVG(f) AS n",
             "TRANSFORM t FROM s SELECT a AS a",
         ] {
             assert!(shape(text).is_none(), "{text}");
         }
         // A `numeric` expression keeps a `numeric` argument's partials.
-        let shape = shape("TRANSFORM t FROM s GROUP BY g SELECT SUM(m + a) AS n").expect("taken");
-        assert!(shape.args[0].numeric);
+        let taken = shape("TRANSFORM t FROM s GROUP BY g SELECT SUM(m + a) AS n").expect("taken");
+        assert!(taken.args[0].numeric);
+        // So does a float, converted exactly (`exact_sums`), whose `SUM` is
+        // its own type and whose `AVG` is `double precision`.
+        let taken =
+            shape("TRANSFORM t FROM s GROUP BY g SELECT SUM(f) AS n, AVG(f) AS m").expect("taken");
+        assert!(taken.args[0].numeric);
+        assert!(matches!(taken.args[0].kind, SumKind::Float(_)));
     }
 
     /// `MIN`/`MAX` over a plain column of an ordered, uncollated type is one
@@ -6844,6 +6958,7 @@ mod tests {
                     summed: true,
                     numeric: false,
                     scale: None,
+                    kind: SumKind::Exact,
                     scale_read: false,
                 },
                 Arg {
@@ -6852,6 +6967,7 @@ mod tests {
                     summed: false,
                     numeric: false,
                     scale: None,
+                    kind: SumKind::Exact,
                     scale_read: false,
                 },
             ]

@@ -99,7 +99,10 @@ Nothing in the binding uses it.
   While this binary is below the catalog floor, `status` reports that this
   process stands by (`below_catalog_floor`, a `Trellis::BelowCatalogFloor`
   with `floor` and `this_version`), and state-changing calls raise a
-  `version_floor` error.
+  `version_floor` error. A process that leads the staging worker lists the
+  maintenance steps its role is refused (`maintenance_refusals`, each a
+  `Trellis::RefusedStep` with `step`, `role`, `object`, `missing` and
+  `error`).
   For a `JOIN` definition `status` reports its hidden tables (`join`, a
   `Trellis::JoinStatus`): `hidden_tables`, each a `Trellis::HiddenTable` with
   `table`, `name`, `estimated_rows` and `bytes`, the `P`-size warning
@@ -579,6 +582,13 @@ instance and every instance of `config.trellis.instances`. Neither it nor
 `trellis:migrate` needs ActiveRecord.
 Outside Rails, `require "trellis/migration"` and `Trellis.connect` before
 migrating.
+
+`db:prepare` in development also migrates the test databases. A migration
+of a test database never uses a connected handle: the helpers and
+`with_handle` connect to the test counterpart of the development database
+the instance's `url` points at (the `database.yml` config of the same name),
+or to the migrating database when the `url` names none, with the instance's
+other options.
 
 ### Targets as models
 

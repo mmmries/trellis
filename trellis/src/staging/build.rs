@@ -410,13 +410,7 @@ pub async fn start_ready_builds(
             // (`fail_chunk`); a resume rebuilds it, or refuses with the
             // repair.
             Err(err) => {
-                match super::halt::halt_failed_start(
-                    pool,
-                    &definition.target_table,
-                    &err.to_string(),
-                )
-                .await
-                {
+                match super::halt::halt_failed_start(pool, &definition.target_table, &err).await {
                     Ok(paused) => crate::instance_log::warn!(
                         definition_id = id,
                         paused = ?paused,

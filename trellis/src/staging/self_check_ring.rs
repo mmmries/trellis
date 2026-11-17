@@ -16,7 +16,9 @@
 //! change* ([`Ring::one_to_one_ctes`]), or no row for an insert, and the live
 //! row when the key has none. A change its page would refuse is not counted:
 //! at or below the truncate floor, at or below its key's ledger entry's
-//! `applied_lsn`, or seen by that entry's `basis`.
+//! `applied_lsn`, or seen by that entry's `basis`. A key with no ledger entry
+//! whose earliest unapplied change has an old image is uncertain
+//! ([`Ring::uncertain_keys_sql`]): a build read the source past that change.
 //!
 //! "Unapplied" is a ring row of the source that
 //!
@@ -189,6 +191,9 @@ impl Ring<'_> {
     /// live row after it), and one at or below the target's truncate floor.
     /// The changes I2 refuses are always a prefix of a key's in `lsn` order,
     /// so the earliest one it doesn't is the first the target hasn't applied.
+    ///
+    /// `__unledgered` says the key has no entry on `ledger` at all, which
+    /// [`Self::uncertain_keys_sql`] reads.
     pub(super) fn one_to_one_ctes(&self, ledger: &super::one_to_one_ledger::LedgerRef) -> String {
         let rows = self.cte("rows");
         let pend = self.cte("pend");
@@ -198,7 +203,8 @@ impl Ring<'_> {
              {pend} as materialized ( \
                  select distinct on (d.__key) d.__key as __k, \
                         case when jsonb_typeof(d.__x) = 'object' then d.__x -> 'old' \
-                             else d.__o end as __i \
+                             else d.__o end as __i, \
+                        l.{key_col} is null as __unledgered \
                  from {rows} d \
                  left join {ledger} l on l.{key_col} = d.__key \
                  where d.__kind = 'side' \
@@ -230,14 +236,22 @@ impl Ring<'_> {
     }
 
     /// The keys (`(__k)`) of a 1-1 page the comparison can't vouch for: those
-    /// with an unapplied row that isn't subtractable, and held keys whose
-    /// parked origin is unknown.
+    /// with an unapplied row that isn't subtractable, held keys whose parked
+    /// origin is unknown, and keys with no ledger entry whose earliest
+    /// unapplied change has an old image. Applying a change always leaves an
+    /// entry (a delete its tombstone), so only a build makes the last kind:
+    /// it read the source past a change still in the ring, and wrote no entry
+    /// for a row that change had already changed or deleted. Until the change
+    /// drains, its old image is not what the target holds. In a statement
+    /// with [`Self::one_to_one_ctes`]'s CTEs.
     pub(super) fn uncertain_keys_sql(&self) -> String {
         format!(
             "select __key as __k from {rows} where __kind = 'uncertain' \
              union select ph.key from poison_held ph \
-             where ph.transform_id = {id} and ph.src_table = {src} and ph.origin_lsn is null",
+             where ph.transform_id = {id} and ph.src_table = {src} and ph.origin_lsn is null \
+             union select __k from {pend} where __unledgered and jsonb_typeof(__i) = 'object'",
             rows = self.cte("rows"),
+            pend = self.cte("pend"),
             id = self.transform_id,
             src = quote_literal(self.src_table),
         )

@@ -123,6 +123,7 @@ impl PooledClient {
 /// The most background-pool connections one task may hold at once: the
 /// background pools are sized on it (`2N + ...`, see [`Pool::background`]).
 /// A debug build aborts the process when a task holds more.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub const MAX_BACKGROUND_HELD: usize = 2;
 
 /// Debug-build accounting of how many background-pool connections each task
@@ -388,6 +389,7 @@ pub struct Pool {
     wait_timeout: Duration,
     /// Whether this is a background pool ([`Pool::background`]), whose
     /// checkouts are counted per task in debug builds.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     background: bool,
     /// Stops the idle sweep when the last clone of the pool goes.
     _sweep: Arc<SweepTask>,

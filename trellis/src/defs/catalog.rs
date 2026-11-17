@@ -83,7 +83,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use crate::error_code::{self, ErrorCode, ErrorId};
+use crate::error_code::{self, ErrorCode, ErrorId, SharedCondition};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
@@ -624,7 +624,9 @@ impl CatalogError {
             CatalogError::Pool(err) => err.error_id(),
             CatalogError::UnknownValueType { .. } => ErrorId(125),
             CatalogError::Backfill(err) => err.error_id(),
-            CatalogError::SourceTableNotFound(..) => ErrorId(126),
+            CatalogError::SourceTableNotFound(..) => {
+                SharedCondition::SourceTableNotFound.error_id()
+            }
             CatalogError::InvalidRegexPattern { .. } => ErrorId(127),
             CatalogError::TableNotAccessible { .. } => ErrorId(128),
             CatalogError::KeyRepairBlocked { .. } => ErrorId(129),
@@ -648,7 +650,7 @@ impl CatalogError {
             CatalogError::Subscribed(..) => ErrorId(147),
             CatalogError::Ddl(err) => err.error_id(),
             CatalogError::DirectBackfill(err) => err.error_id(),
-            CatalogError::TransformNotFound { .. } => ErrorId(148),
+            CatalogError::TransformNotFound { .. } => SharedCondition::TransformNotFound.error_id(),
             CatalogError::NameCaseMismatch { .. } => ErrorId(149),
             CatalogError::TransformNotPaused { .. } => ErrorId(150),
             CatalogError::AboveRunningRelease { .. } => ErrorId(151),

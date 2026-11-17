@@ -275,6 +275,92 @@ when "off_in_rake"
     end
     rake.top_level
   end
+when "db_prepare", "db_prepare_connected"
+  # `bin/rails db:prepare` in development, with Trellis on in test too
+  # (off_in = []), over an app of two databases (primary and reports) in two
+  # environments, with structure.sql: both Trellis instances, the default
+  # and :reports, live in the primary database. It also migrates the test
+  # environment's databases. The primary database's pending migration
+  # defines with the default instance's helper and with :reports; the
+  # reports database's reads :reports' status. Each must reach the primary
+  # database of the environment it migrates. db_prepare_connected connects
+  # the app's instances to development's database as it boots, as a boot
+  # handle would: the test databases' migrations must not use them.
+  require "rake"
+  require "pg"
+  info = PG::Connection.conninfo_parse(ENV.fetch("TRELLIS_TEST_DSN")).to_h { |e| [e[:keyword], e[:val]] }
+  admin = PG.connect(ENV.fetch("TRELLIS_TEST_DSN"))
+  names = %w[primary reports].product(%w[development test]).to_h do |db, env|
+    [[db, env], "bp_#{db}_#{env}_#{Process.pid}"]
+  end
+  root = Dir.mktmpdir("db-prepare-app")
+  FileUtils.mkdir_p([File.join(root, "config"), File.join(root, "db/migrate"), File.join(root, "db/reports_migrate")])
+  connection = %w[host port user].map { |key| info[key] && "#{key == "user" ? "username" : key}: #{info[key].inspect}" }.compact
+  database_yml = %w[development test].map do |env|
+    ["#{env}:", "  primary:", "    adapter: postgresql", "    database: #{names.fetch(["primary", env])}",
+     *connection.map { |line| "    #{line}" },
+     "  reports:", "    adapter: postgresql", "    database: #{names.fetch(["reports", env])}",
+     "    migrations_paths: #{File.join(root, "db/reports_migrate")}", *connection.map { |line| "    #{line}" }]
+  end
+  File.write(File.join(root, "config/database.yml"), "#{database_yml.flatten.join("\n")}\n")
+  migration = lambda do |dir, version, klass, body|
+    File.write(File.join(root, dir, "#{version}_#{klass.gsub(/([a-z])([A-Z])/, '\1_\2').downcase}.rb"), <<~RUBY)
+      class #{klass} < ActiveRecord::Migration[#{ActiveRecord::Migration.current_version}]
+        include Trellis::Migration
+        disable_ddl_transaction!
+
+        def up
+          #{body}
+        end
+      end
+    RUBY
+  end
+  migration.call("db/migrate", "20260101000000", "DefinePrimary", <<~RUBY.gsub("\n", "\n    "))
+    create_table(:pb_source) { |t| t.integer :price }
+    define "TRANSFORM pb_target FROM pb_source SELECT price AS price"
+    Trellis::Railtie.with_handle(:reports) { |r| r.define "TRANSFORM pb_reports_target FROM pb_source SELECT price AS price" }
+  RUBY
+  migration.call("db/reports_migrate", "20260101000001", "ReadReports", <<~RUBY.gsub("\n", "\n    "))
+    create_table(:pb_reports_only) { |t| t.integer :price }
+    Trellis::Railtie.with_handle(:reports) { |r| r.status("pb_reports_target") } or raise "pb_reports_target is not defined"
+  RUBY
+
+  ENV.delete("DATABASE_URL") # with it set, Rails prepares only development
+  url = ->(database) { ENV.fetch("TRELLIS_TEST_DSN").sub(/dbname=\S+/, "dbname=#{database}") }
+  BootApp.config.root = root
+  BootApp.config.active_record.schema_format = :sql
+  BootApp.config.trellis.off_in = []
+  BootApp.config.trellis.connect = { "url" => url.call(names.fetch(["primary", "development"])) }
+  BootApp.config.trellis.instances = { reports: { url: url.call(names.fetch(["primary", "development"])), schema: "reports" } }
+  stdout = $stdout
+  begin
+    $stdout = StringIO.new
+    Rake.with_application do |rake|
+      rake.init("rails", ["db:prepare"])
+      BootApp.load_tasks
+      Rake::Task["environment"].enhance do
+        BootApp.initialize!
+        Trellis::Railtie.connect if ARGV.fetch(0) == "db_prepare_connected"
+      end
+      rake.top_level
+    end
+    $stdout = stdout
+    seen[:databases] = names.to_h do |(db, env), name|
+      pg = PG.connect(url.call(name))
+      tables = pg.exec("select table_name from information_schema.tables where table_name like 'pb\\_%' order by 1")
+                 .map { |row| row.fetch("table_name") }
+      [name.sub("_#{Process.pid}", ""), tables]
+    ensure
+      pg&.close
+    end
+    seen[:unused_database_tables] = admin.exec("select table_name from information_schema.tables where table_name like 'pb\\_%'").map { |row| row.fetch("table_name") }
+  ensure
+    $stdout = stdout
+    Trellis::Instance.shutdown_all
+    ActiveRecord::Base.connection_handler.clear_all_connections!
+    names.each_value { |name| admin.exec("drop database if exists #{name} with (force)") }
+    admin.close
+  end
 when "release_check"
   # `rails trellis:release_check BASE=<ref>`, in an app that is a git
   # repository of its own, whose second database keeps its migrations in a
