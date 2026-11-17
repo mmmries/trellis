@@ -130,7 +130,12 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   as Prometheus text, for a `/metrics` route the host already serves (the
   binding opens no port). It needs no handle. Every series carries the
   `trellis_instance` label (`<database>/<catalog schema>`, as in the log
-  lines), so handles in one VM stay apart.
+  lines), so handles in one VM stay apart. With `:plug` in your deps,
+  `Trellis.Metrics.Plug` serves it (`forward "/metrics/trellis", Trellis.Metrics.Plug`),
+  and `Trellis.Metrics.Appender` (`plug Trellis.Metrics.Appender, path: "/metrics"`,
+  ahead of `PromEx.Plug` or another exporter plug) appends it to that
+  exporter's response. The status gauges come with it; see the "Alerting"
+  table in `docs/observability.md`.
 - `Trellis.LogBridge`: started with the `:trellis_pg` application, it forwards
   the engine's log lines to `Logger` (`domain: [:trellis]`, the Rust module
   as `:target` metadata). Every line names its instance in the text, as
