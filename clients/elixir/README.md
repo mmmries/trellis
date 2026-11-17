@@ -319,6 +319,8 @@ Build the test database with `mix ecto.load` (aliased to `trellis.load`),
 not `mix ecto.migrate`: a skipped define creates no target table.
 `Trellis.enabled?/0` reports the setting.
 
+With Trellis off, `Trellis.TestSupport.refresh_target(MyApp.Repo, "event_counts")` fills a target from its definition's own query (upstream targets first, one transaction). It needs `allow_target_writes: true`.
+
 ## Target schemas are read-only
 
 Only Trellis writes a target. Mark an Ecto schema over one, and add the guard to the repo:
