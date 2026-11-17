@@ -2635,7 +2635,8 @@ pub struct DefinitionStatus {
     /// reports the same list. Nothing is paused: no definition's correctness
     /// waits on these steps, but the ring isn't housekept until the
     /// privilege is granted. An entry clears itself once a pass of its step
-    /// succeeds. Empty on a handle that runs no staging worker.
+    /// succeeds. Empty on a handle that doesn't lead the staging worker: it
+    /// is this process's knowledge, not the catalog's.
     pub maintenance_refusals: Vec<crate::refused_steps::RefusedStep>,
     /// The oldest Trellis release that can run the definition, as
     /// `major.minor.patch` (ADR-0024): the latest release any grammar

@@ -91,7 +91,10 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   gone. While this binary is below the catalog floor, `status/2` reports
   that this process stands by (`below_catalog_floor`, a
   `Trellis.BelowCatalogFloor` with `floor` and `this_version`), and
-  state-changing calls refuse with a `version_floor` error. For a `JOIN` transform `status/2` reports its hidden tables
+  state-changing calls refuse with a `version_floor` error. A process that
+  leads the staging worker lists the maintenance steps its role is refused
+  (`maintenance_refusals`, each a `Trellis.RefusedStep` with `step`, `role`,
+  `object`, `missing` and `error`). For a `JOIN` transform `status/2` reports its hidden tables
   (`join`, a `Trellis.JoinStatus`): `hidden_tables`, each a
   `Trellis.HiddenTable` with `table`, `name`, `estimated_rows` and `bytes`,
   the `P`-size warning (`partials_warning`, a `Trellis.PartialsWarning`),

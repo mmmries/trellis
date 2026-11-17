@@ -592,6 +592,17 @@ names the floor and this binary's version
 ([observability — Below the catalog floor](observability.md#below-the-catalog-floor)).
 The Elixir and Ruby bindings report it as `below_catalog_floor`.
 
+### `maintenance_refusals`
+
+The ring and maintenance steps the staging worker's role is refused, such as
+retiring a drained segment without `TRUNCATE`: each names the step, the role,
+the table and the privileges it lacks. It pauses nothing and clears itself
+once a pass of the step succeeds. Only the process that leads the staging
+worker knows it, so every other handle reports it empty
+([operations — Other stops and waits](operations.md#other-stops-and-waits)).
+The Elixir and Ruby bindings report it as `maintenance_refusals`, each a
+`RefusedStep`.
+
 ### `floor`
 
 The oldest Trellis release that can run the definition, as
