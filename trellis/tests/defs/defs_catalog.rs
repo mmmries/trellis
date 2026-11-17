@@ -690,7 +690,7 @@ async fn an_unresolved_column_reference_is_rejected() {
 }
 
 #[tokio::test]
-async fn unresolvable_join_and_partial_data_definitions_are_rejected_cleanly() {
+async fn unresolvable_join_and_where_definitions_are_rejected_cleanly() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
@@ -709,14 +709,21 @@ async fn unresolvable_join_and_partial_data_definitions_are_rejected_cleanly() {
         "{unresolved_join:?}"
     );
 
-    let partial_data = create_definition(
+    // A WHERE parses; a predicate naming a column the source lacks is
+    // refused at validation.
+    let unresolved_predicate = create_definition(
         &db.pool,
         "TRANSFORM t FROM s SELECT a AS x WHERE a = b",
         &numeric_columns(&["a"]),
     )
     .await
     .unwrap_err();
-    assert!(matches!(partial_data, CatalogError::Parse(_)));
+    match unresolved_predicate {
+        CatalogError::Validate(ValidationError::PredicateColumnNotFound { column }) => {
+            assert_eq!(column, "b");
+        }
+        other => panic!("expected PredicateColumnNotFound, got {other:?}"),
+    }
 
     // None of the rejected attempts should have left a row behind.
     let subscribers = transforms_for_source(&db.pool, "s")

@@ -27,6 +27,7 @@ use trellis::dev::defs::ast::{
 };
 use trellis::dev::staging::{StagingError, converged_through, watermark_token};
 
+use super::DefinitionState;
 use super::ring_wait::{
     Expiry, ProgressDeadline, QuiesceBudget, await_ring, dump_state, expiry_reason,
 };
@@ -992,6 +993,54 @@ async fn unsettled_definitions(
         }
     }
     Ok(unsettled)
+}
+
+/// Each of `defs`' catalog status and, when it has one, why it stopped: what
+/// `capture_failures` records for it (its kind and error, and each reason
+/// beyond that error) and its poisoned keys' latest error. Read in `defs`'
+/// order; a definition with no catalog row reads as `<missing>`.
+pub(super) async fn definition_states(
+    raw: &tokio_postgres::Client,
+    defs: &[TransformDef],
+) -> Result<Vec<DefinitionState>, tokio_postgres::Error> {
+    let targets: Vec<String> = defs.iter().map(|d| d.target.clone()).collect();
+    let rows = raw
+        .query(
+            "select split_part(d.target_table, '.', 2), d.status, \
+                    nullif(concat_ws('; ', \
+                        (select f.kind || ': ' || f.error \
+                           || coalesce(' (caused by definition ' || f.caused_by || ')', '') \
+                           from capture_failures f where f.transform_id = d.id), \
+                        (select string_agg(r.reason, '; ' order by r.position) \
+                           from capture_failure_reasons r \
+                           join capture_failures f on f.transform_id = r.transform_id \
+                          where r.transform_id = d.id and r.reason <> f.error), \
+                        (select 'poisoned ' || count(*) || ' key(s), last error: ' \
+                                || max(p.last_error) \
+                           from poison p where p.transform_id = d.id \
+                          having count(*) > 0)), '') \
+               from transform_definitions d \
+              where split_part(d.target_table, '.', 2) = any($1)",
+            &[&targets],
+        )
+        .await?;
+    let mut found: HashMap<String, (String, Option<String>)> = rows
+        .iter()
+        .map(|row| (row.get(0), (row.get(1), row.get(2))))
+        .collect();
+    Ok(targets
+        .into_iter()
+        .map(|target| {
+            let (status, reason) = found
+                .remove(&target)
+                .unwrap_or_else(|| ("<missing>".to_string(), None));
+            DefinitionState {
+                target,
+                status,
+                reason,
+            }
+        })
+        .collect())
 }
 
 /// Every partitioned source (ADR-0017) whose partition maintenance a target

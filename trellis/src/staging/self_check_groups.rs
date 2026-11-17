@@ -68,13 +68,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::Predicate;
+use crate::defs::ast::Expr;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
 
+use super::group_basis::exact_sums::{self, FLOAT_SCALE, SumKind};
 use super::group_basis::{self, Agg, GroupShape, SumPart};
-use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
+use super::self_check::{
+    AuditRender, ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_audit, render_leaf,
+};
 use super::self_check_keyset::{BYTE_ORDER, Keyset};
 use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
 
@@ -210,6 +213,136 @@ pub(super) fn sum_value(
     )
 }
 
+/// The exact `numeric` a summed argument of kind `kind` adds to its
+/// partials for the value `x`: `x` for an exact argument; a float's exact
+/// value at scale [`FLOAT_SCALE`] or its special value; an `interval`'s
+/// fields packed (written apart from `exact_sums::SumKind::summand`: the
+/// float as an integer over `10^1074`, the `interval`'s fields from its
+/// binary form).
+pub(super) fn summand(kind: SumKind, x: &str) -> String {
+    match kind {
+        SumKind::Exact => x.to_string(),
+        SumKind::Float(_) => {
+            let f = format!("(({x})::double precision)");
+            let byte = |i: usize| format!("get_byte(float8send(abs{f}), {i})");
+            let exponent = format!("(({} << 4) | ({} >> 4))", byte(0), byte(1));
+            let fraction: Vec<String> = (2..8)
+                .map(|i| format!("{}::numeric * {}", byte(i), 1u64 << (8 * (7 - i))))
+                .collect();
+            let fraction = format!(
+                "(({} & 15)::numeric * {} + {})",
+                byte(1),
+                1u64 << 48,
+                fraction.join(" + ")
+            );
+            // `|x| = m × 2^(e - 1075)`, an integer over `2^1074`, which is
+            // `m × 2^(e - 1) × 5^1074` over `10^1074`.
+            format!(
+                "(case when {f} = 'NaN'::double precision then 'NaN'::numeric \
+                       when {f} in ('Infinity'::double precision, '-Infinity'::double precision) \
+                            then {f}::text::numeric \
+                       else round(sign{f}::numeric \
+                                  * (case when {exponent} = 0 then {fraction} \
+                                          else ({fraction} + {hidden}) \
+                                               * power(2::numeric, {exponent} - 1) end) \
+                                  * power(5::numeric, {FLOAT_SCALE}) * 1e-{FLOAT_SCALE}, \
+                                  {FLOAT_SCALE}) end)",
+                hidden = 1u64 << 52,
+            )
+        }
+        SumKind::Interval => {
+            let x = format!("(({x})::interval)");
+            let hex = format!("encode(interval_send({x}), 'hex')");
+            format!(
+                "(case when not isfinite({x}) \
+                       then (case when {x} < interval '0' then '-Infinity' else 'Infinity' end)::numeric \
+                       else ('x' || substr({hex}, 25, 8))::bit(32)::int::numeric * 1e120 \
+                            + ('x' || substr({hex}, 17, 8))::bit(32)::int::numeric * 1e60 \
+                            + ('x' || substr({hex}, 1, 16))::bit(64)::bigint::numeric end)"
+            )
+        }
+    }
+}
+
+/// The fields of the packed `interval` sum `value` ([`summand`]), finite,
+/// each a `numeric` integer: `(months, days, microseconds)` columns of a
+/// lateral subquery aliased `__f` (written apart from `exact_sums`'s).
+fn interval_fields(value: &str) -> String {
+    format!(
+        "(select __m0 as __m, __d0 as __d, __u0 as __u from ( \
+              select (__q - __d0) / 1e60 as __m0, __d0, __u0 from ( \
+                  select __q, __q - 1e60 * round(__q / 1e60) as __d0, __u0 from ( \
+                      select (__v - __u0) / 1e60 as __q, __u0 from ( \
+                          select __v, __v - 1e60 * round(__v / 1e60) as __u0 \
+                          from (select ({value})::numeric as __v) as __f0) as __f1) as __f2) as __f3) \
+                as __f4) as __f"
+    )
+}
+
+/// An `interval` sum's or average's value over its packed sum `value`: as
+/// `finite` builds it from [`interval_fields`]' `__f`, the infinity it
+/// counts, or an error while it counts both.
+fn interval_of(value: &str, finite: &str) -> String {
+    format!(
+        "(case when ({value}) = 'NaN'::numeric \
+                    then (case when ({value}) = 'NaN' then 'infinity' end)::interval \
+                         + (case when ({value}) = 'NaN' then '-infinity' end)::interval \
+               when ({value}) in ('Infinity'::numeric, '-Infinity'::numeric) \
+                    then (case when ({value}) < 0 then '-infinity' else 'infinity' end)::interval \
+               else (select {finite} from {fields}) end)",
+        fields = interval_fields(value),
+    )
+}
+
+/// The `interval` of the fields `__f`, through its text form, which fails
+/// out of range.
+const INTERVAL_TEXT: &str =
+    "format('%s mons %s days %s microseconds', __f.__m, __f.__d, __f.__u)::interval";
+
+/// A summed argument's `SUM` from its value `value` (as [`sum_value`]),
+/// cast to `cast` (written apart from `exact_sums::SumKind::sum`).
+pub(super) fn sum_of(kind: SumKind, value: &str, cast: &str) -> String {
+    match kind {
+        SumKind::Exact | SumKind::Float(_) => format!("({value})::{cast}"),
+        SumKind::Interval => interval_of(value, INTERVAL_TEXT),
+    }
+}
+
+/// A summed argument's `AVG` from its value `value` and its non-null count
+/// `count`: an exact one's `numeric` quotient; a float's exact quotient
+/// rounded once, 0 at most half the smallest subnormal (which a cast from
+/// `numeric` refuses); and an `interval`'s Postgres's own `interval /
+/// float8` over its sum, or where the sum is out of an `interval`'s range
+/// or its fields are an infinity's (text Postgres 17 reads as that
+/// infinity), the apply's own division of the fields
+/// (`exact_sums::interval_avg`).
+pub(super) fn avg_of(kind: SumKind, value: &str, count: &str) -> String {
+    match kind {
+        SumKind::Exact => format!("({value}) / ({count})::numeric"),
+        SumKind::Float(_) => format!(
+            "(case when ({value}) in ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric) \
+                   then ({value})::double precision \
+                   when abs(({value}) / ({count})) * power(2::numeric, 1075) <= 1 \
+                   then 0::double precision \
+                   else (div(({value}) * 1e1100, ({count})) * 1e-1100)::double precision end)"
+        ),
+        SumKind::Interval => interval_of(
+            value,
+            &format!(
+                "(case when __f.__m between -2147483648 and 2147483647 \
+                        and __f.__d between -2147483648 and 2147483647 \
+                        and __f.__u between -9223372036854775808 and 9223372036854775807 \
+                        and (__f.__m, __f.__d, __f.__u) not in \
+                            ((2147483647, 2147483647, 9223372036854775807), \
+                             (-2147483648, -2147483648, -9223372036854775808)) \
+                       then {INTERVAL_TEXT} / ({count})::double precision \
+                       else {} end)",
+                exact_sums::interval_avg("__f.__m", "__f.__d", "__f.__u", count)
+            ),
+        ),
+    }
+}
+
 /// The aggregate `agg` of a group over its hidden partials' columns.
 fn agg_sql(agg: &Agg, shape: &GroupShape) -> String {
     let value = |i: usize| {
@@ -224,14 +357,18 @@ fn agg_sql(agg: &Agg, shape: &GroupShape) -> String {
         Agg::CountStar => "__n".to_string(),
         Agg::Count(i) => format!("__count_{}", i + 1),
         Agg::Sum(i, cast) => format!(
-            "case when __count_{n} = 0 then null else ({s})::{cast} end",
+            "case when __count_{n} = 0 then null else {s} end",
             n = i + 1,
-            s = value(*i)
+            s = sum_of(shape.args[*i].kind, &value(*i), cast)
         ),
         Agg::Avg(i) => format!(
-            "case when __count_{n} = 0 then null else ({s}) / (__count_{n})::numeric end",
+            "case when __count_{n} = 0 then null else {s} end",
             n = i + 1,
-            s = value(*i)
+            s = avg_of(
+                shape.args[*i].kind,
+                &value(*i),
+                &format!("__count_{}", i + 1)
+            )
         ),
         // The hidden extreme, which side 7 compares with the source.
         Agg::Extreme { max, arg, .. } => {
@@ -266,8 +403,10 @@ pub(super) fn bound(keyset: &Keyset, refs: &[String], end: &[String], bounded: b
 /// Side 5 names each group an unapplied ring row may touch but can't be
 /// subtracted from, and a row of side 6 (with no key) says every group may
 /// ([`super::self_check_ring`]).
+#[allow(clippy::too_many_arguments)]
 fn page_sql(
     shape: &GroupShape,
+    predicate: Option<&Expr>,
     keyset: &Keyset,
     ring: &Ring<'_>,
     hidden: &str,
@@ -295,11 +434,28 @@ fn page_sql(
         .join(", ");
 
     // Side 1: the source's partials per group, as the target has applied
-    // them: over the weighted rows (`super::self_check_ring`).
+    // them: over the weighted rows (`super::self_check_ring`) the
+    // definition's `WHERE` keeps, rendered here as written (ADR-0013), on
+    // live rows and unapplied images alike. An argument is read only on a
+    // member row, as the write path reads it.
+    let member = predicate.map(|p| format!("(({}) is true)", render_leaf(p)));
     let mut args = Vec::with_capacity(shape.args.len());
     for arg in &shape.args {
-        args.push((render_leaf(&arg.expr), arg.parts(), arg.scale));
+        let sql = render_leaf(&arg.expr);
+        let sql = if arg.summed {
+            summand(arg.kind, &sql)
+        } else {
+            sql
+        };
+        let sql = match &member {
+            Some(member) => format!("(case when {member} then {sql} end)"),
+            None => sql,
+        };
+        args.push((sql, arg.parts(), arg.scale));
     }
+    let members = member
+        .map(|member| format!(" and {member}"))
+        .unwrap_or_default();
     let (src_parts, nonzero) = weighted_partials(&args);
     let lands = Lands {
         floor_key,
@@ -323,7 +479,7 @@ fn page_sql(
     let src = keyset.side(&refs, |cond| {
         format!(
             "select {key} as __k{carried}, array[{}]::text[] as __v from {weighted} as __s \
-             where {cond} and {within_hid} \
+             where {cond} and {within_hid}{members} \
              group by {group_cols} having {nonzero} order by {order} limit $1",
             src_parts.join(", "),
         )
@@ -353,7 +509,10 @@ fn page_sql(
         .collect();
     let mut implied = Vec::with_capacity(shape.fields.len());
     for (_, pg_type, expr) in &shape.fields {
-        implied.push(format!("(({})::{pg_type})::text", render_leaf(expr)));
+        implied.push(format!(
+            "(({})::{pg_type})::text",
+            render_field(shape, expr)
+        ));
     }
     let lateral = if aggs.is_empty() {
         String::new()
@@ -430,6 +589,35 @@ fn page_sql(
         bounds.push(7);
     }
     Ok(keyset.ranked_by_value(&ctes, &sides, &bounds, &extra))
+}
+
+/// A field over the hidden row's partials and keys, each key read as the
+/// type the field reads it as (`GroupShape::key_reads`): a `char(n)` key,
+/// kept as `text`, compares as a `char(n)` (#2053).
+fn render_field(shape: &GroupShape, expr: &Expr) -> String {
+    struct Field<'s>(&'s GroupShape);
+    impl AuditRender<'_> for Field<'_> {
+        type Error = std::convert::Infallible;
+        fn column(&mut self, expr: &Expr) -> Result<String, Self::Error> {
+            let (Expr::Column(name) | Expr::SourceColumn { column: name, .. }) = expr else {
+                unreachable!("a column read")
+            };
+            let shape = self.0;
+            let read = shape
+                .group_cols
+                .iter()
+                .position(|key| key == name)
+                .and_then(|i| shape.key_reads.as_ref()?.get(i).copied().flatten());
+            Ok(match read {
+                Some(read) => format!("cast({} as {read})", quote_ident(name)),
+                None => quote_ident(name),
+            })
+        }
+    }
+    match render_audit(&mut Field(shape), expr, 0) {
+        Ok(text) => text,
+        Err(never) => match never {},
+    }
 }
 
 /// The hidden extremes, one per column ([`group_basis::Extreme::column`]),
@@ -618,6 +806,7 @@ async fn statement(
     keyset.set_cursor(after)?;
     let sql = page_sql(
         shape,
+        def.def.predicate.filter(),
         &keyset,
         &ring,
         &hidden,
@@ -682,11 +871,6 @@ pub(super) async fn compare(
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
-    // The source's `GROUP BY` has no `WHERE` for the definition's predicate,
-    // sound only while `Predicate` has one variant (as the 1-1 comparison's).
-    match def.def.predicate {
-        Predicate::True => {}
-    }
     let mut client = pool.get().await?;
     let steer = steers(&client, def, shape).await?;
     let sql = statement(

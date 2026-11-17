@@ -7,8 +7,11 @@
 //! types it as it types the user's text. A release before 0.4.0 cast it to
 //! `text`, which reads differently beside two types: `char(n)`, whose `=`
 //! ignores trailing blanks and whose values lose them as `text`, and
-//! `name`, which truncates a literal over 63 bytes. [`affected`] finds a
-//! definition that differs, over its tables' live column types.
+//! `name`, which truncates a literal over 63 bytes. An aggregate's field
+//! reads a `char(n)` or `name` `GROUP BY` key, kept as `text`, as its source
+//! type too (#2053, `crate::staging::group_basis::GroupShape::key_reads`),
+//! which changes the same fields. [`affected`] finds a definition that
+//! differs, over its tables' live column types.
 //!
 //! Such a definition carries [`super::floor::Feature::NeighbourTypedLiteral`],
 //! so a release before it pauses it on rollback. At attach
@@ -302,6 +305,8 @@ mod tests {
             format!("TRANSFORM t FROM s SELECT nm = '{long}' AS f"),
             "TRANSFORM g FROM s GROUP BY t SELECT COUNT(CASE WHEN ch = 'a' THEN 1 END) AS n"
                 .to_string(),
+            "TRANSFORM g FROM s GROUP BY ch SELECT ch = 'ab' AS f, COUNT(*) AS n".to_string(),
+            format!("TRANSFORM g FROM s GROUP BY nm SELECT NULLIF(nm, '{long}') AS f"),
         ] {
             assert!(affected_text(&text), "{text}");
         }

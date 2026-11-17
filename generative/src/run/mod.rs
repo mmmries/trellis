@@ -20,6 +20,7 @@ mod concurrent;
 mod coverage;
 mod db_admin;
 mod noise;
+mod pause;
 mod restore;
 mod two_instance;
 
@@ -41,9 +42,11 @@ use std::fmt;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 use trellis::dev::pool::Pool;
 
-use crate::backend::{Backend, Snapshot};
+use crate::backend::{Backend, DefinitionState, Snapshot};
 use crate::model::{BurstAction, DbAdminAction, Op, OpOutcome, Program};
 use crate::oracle::{self, OracleReport};
+
+use self::pause::{RunKind, allowance, check_no_unexpected_pause};
 
 /// Classifies whether a property run counted as evidence at all (design doc
 /// §6 "What keeps a green run meaningful"). This is deliberately a *separate*
@@ -125,19 +128,31 @@ pub struct Divergence {
     /// bug needs every diverging target, not just the first, or an unplanted
     /// divergence earlier in definition order hides the plant's own.
     pub also_diverged: Vec<(String, OracleReport)>,
+    /// Every checked definition's catalog status and pause reason when the
+    /// divergence was found, so a target that stopped following its source
+    /// shows why. Empty only if the catalog read itself failed.
+    pub states: Vec<DefinitionState>,
 }
 
 impl Divergence {
     /// The divergence [`check_defs`]' result describes at `op_index`, or
     /// `None` if every target converged.
-    pub fn from_checked(op_index: usize, checked: Vec<(String, OracleReport)>) -> Option<Self> {
-        let mut checked = checked.into_iter();
+    pub fn from_checked(
+        op_index: usize,
+        checked: Vec<(String, OracleReport)>,
+        states: Vec<DefinitionState>,
+    ) -> Option<Self> {
+        let lines: Vec<String> = states.iter().map(ToString::to_string).collect();
+        let mut checked = checked
+            .into_iter()
+            .map(|(target, report)| (target, report.with_definition_states(lines.clone())));
         let (def_target, report) = checked.next()?;
         Some(Divergence {
             op_index,
             def_target,
             report: Box::new(report),
             also_diverged: checked.collect(),
+            states,
         })
     }
 
@@ -182,6 +197,14 @@ pub enum RunError {
         op_index: usize,
         expected: OpOutcome,
         actual: OpOutcome,
+    },
+    /// A definition was `paused` at a settled check in a run that never
+    /// expects one (the allowlist is `pause::allowance`). `message` is one
+    /// `unexpected pause: <definition>: <reason>` line per paused definition.
+    UnexpectedPause {
+        op_index: usize,
+        message: String,
+        paused: Vec<DefinitionState>,
     },
     /// A scheduled [`Backend::restart`] failed.
     Restart(String),
@@ -357,6 +380,7 @@ pub async fn run_convergence<B: Backend>(
             op_index,
             &installed_defs,
             timing_enabled,
+            RunKind::Sequential,
         )
         .await?;
     }
@@ -433,11 +457,13 @@ async fn quiesce_snapshot_and_check<B: Backend>(
     op_index: usize,
     defs: &[TransformDef],
     timing_enabled: bool,
+    kind: RunKind,
 ) -> Result<(), RunError> {
     backend
         .quiesce()
         .await
         .map_err(|e| RunError::Quiesce(format!("{e:?}")))?;
+    let states = settled_states(backend, program, op_index, defs, kind).await?;
 
     let start = timing_enabled.then(std::time::Instant::now);
     let snapshot = backend.snapshot().await;
@@ -451,11 +477,31 @@ async fn quiesce_snapshot_and_check<B: Backend>(
     if let Some(start) = start {
         eprintln!("COST_TIMING oracle {}", start.elapsed().as_millis());
     }
-    if let Some(divergence) = Divergence::from_checked(op_index, checked.map_err(RunError::Oracle)?)
+    if let Some(divergence) =
+        Divergence::from_checked(op_index, checked.map_err(RunError::Oracle)?, states)
     {
         return Err(RunError::Diverged(divergence));
     }
     Ok(())
+}
+
+/// `defs`' [`DefinitionState`]s once the engine has settled, after checking
+/// that none is paused in a run of `kind` that never expects a pause (see
+/// [`pause::allowance`]). Quiescing counts `paused` as settled, so this is
+/// the one place a pause is told apart from a definition that caught up.
+async fn settled_states<B: Backend>(
+    backend: &mut B,
+    program: &Program,
+    op_index: usize,
+    defs: &[TransformDef],
+    kind: RunKind,
+) -> Result<Vec<DefinitionState>, RunError> {
+    let states = backend
+        .definition_states(defs)
+        .await
+        .map_err(|e| RunError::Snapshot(format!("definition states: {e:?}")))?;
+    check_no_unexpected_pause(op_index, &states, allowance(kind, program))?;
+    Ok(states)
 }
 
 /// The concurrent runtime: like [`run_convergence`],
@@ -530,6 +576,7 @@ pub async fn run_convergence_bursty<B: Backend>(
             last_index_in_burst,
             &program.defs,
             timing_enabled,
+            RunKind::Bursty,
         )
         .await?;
     }
@@ -686,7 +733,7 @@ pub fn source_table(
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, bursts};
+    use super::{DefinitionState, Divergence, OracleReport, Outcome, bursts};
     use crate::model::{Op, OpOutcome, PartitionAction, PartitionStrategy, Program};
 
     /// A one-table program partitioned by `strategy`, its ops replaced by
@@ -798,5 +845,56 @@ mod tests {
             }
             .as_pass()
         );
+    }
+
+    use crate::oracle::Divergence as CellDivergence;
+
+    fn missing_row(table: &str) -> OracleReport {
+        OracleReport::for_test(vec![CellDivergence::MissingRow {
+            table: table.to_string(),
+            pk: "1".to_string(),
+        }])
+    }
+
+    /// The report a failing test prints carries each definition's status,
+    /// and a paused one's reason, on every diverging target's report.
+    #[test]
+    fn a_divergence_report_prints_each_definitions_status_and_pause_reason() {
+        let states = vec![
+            DefinitionState {
+                target: "t0".to_string(),
+                status: "live".to_string(),
+                reason: None,
+            },
+            DefinitionState {
+                target: "t1".to_string(),
+                status: "paused".to_string(),
+                reason: Some("disruption: the capture trigger was dropped".to_string()),
+            },
+        ];
+        let divergence = Divergence::from_checked(
+            3,
+            vec![
+                ("t1".to_string(), missing_row("t1")),
+                ("t2".to_string(), missing_row("t2")),
+            ],
+            states.clone(),
+        )
+        .expect("a divergence");
+        assert_eq!(divergence.states, states);
+        for (target, report) in divergence.all() {
+            let printed = report.to_string();
+            assert!(printed.contains("definitions:"), "{target}: {printed}");
+            assert!(printed.contains("  t0: live\n"), "{target}: {printed}");
+            assert!(
+                printed.contains("  t1: paused (disruption: the capture trigger was dropped)\n"),
+                "{target}: {printed}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_divergence_is_none() {
+        assert!(Divergence::from_checked(0, Vec::new(), Vec::new()).is_none());
     }
 }

@@ -245,11 +245,14 @@ fn type_rules() -> Vec<TypeRule> {
         T::Aggregate(AggregateRule::SumInterval),
         T::Aggregate(AggregateRule::AvgFloat),
         T::Aggregate(AggregateRule::AvgExact),
+        T::Aggregate(AggregateRule::AvgInterval),
         T::Aggregate(AggregateRule::Extreme),
         T::AggregateAdmission(AggregateAdmissionRule::Count),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgInteger),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgScaledNumeric),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgNumeric),
+        T::AggregateAdmission(AggregateAdmissionRule::SumAvgFloat),
+        T::AggregateAdmission(AggregateAdmissionRule::SumAvgInterval),
         T::AggregateAdmission(AggregateAdmissionRule::Extreme),
         T::GroupByKey(GroupByKeyRule::Integer),
         T::GroupByKey(GroupByKeyRule::Numeric),
@@ -323,6 +326,7 @@ fn type_rules() -> Vec<TypeRule> {
             AggregateRule::AvgFloat => 34,
             AggregateRule::AvgExact => 35,
             AggregateRule::Extreme => 57,
+            AggregateRule::AvgInterval => 60,
         },
         T::AggregateAdmission(r) => match r {
             AggregateAdmissionRule::Count => 36,
@@ -330,6 +334,8 @@ fn type_rules() -> Vec<TypeRule> {
             AggregateAdmissionRule::SumAvgScaledNumeric => 38,
             AggregateAdmissionRule::Extreme => 58,
             AggregateAdmissionRule::SumAvgNumeric => 59,
+            AggregateAdmissionRule::SumAvgFloat => 61,
+            AggregateAdmissionRule::SumAvgInterval => 62,
         },
         T::GroupByKey(r) => match r {
             GroupByKeyRule::Integer => 39,
@@ -383,10 +389,11 @@ fn features() -> Vec<Feature> {
         .into_iter()
         .map(Feature::JoinKind),
     );
-    let predicates = [PredicateKind::True];
+    let predicates = [PredicateKind::True, PredicateKind::Filter];
     features.extend(
         every(&predicates, |p| match p {
             PredicateKind::True => 0,
+            PredicateKind::Filter => 1,
         })
         .into_iter()
         .map(Feature::Predicate),
@@ -428,6 +435,7 @@ fn features() -> Vec<Feature> {
         Layout::Join,
         Layout::JoinOneToOne,
         Layout::NumericSums,
+        Layout::FloatIntervalSums,
     ];
     features.extend(
         every(&layouts, |l| match l {
@@ -438,6 +446,7 @@ fn features() -> Vec<Feature> {
             Layout::JoinOneToOne => 4,
             Layout::GroupBasisExtremes => 5,
             Layout::NumericSums => 6,
+            Layout::FloatIntervalSums => 7,
         })
         .into_iter()
         .map(Feature::Layout),

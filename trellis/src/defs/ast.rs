@@ -833,13 +833,32 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
         .collect();
     out.push_str(&fields.join(", "));
 
-    // `def.predicate` is always `Predicate::True` (the grammar's only
-    // variant, and the same value an omitted `WHERE` parses to) — omitting
-    // the clause entirely round-trips identically to writing `WHERE TRUE`,
-    // so there is nothing this render ever needs to spell out.
-    let Predicate::True = def.predicate;
+    // An omitted `WHERE` and a lone `WHERE TRUE` parse to the same
+    // `Predicate::True`, so it renders nothing.
+    if let Predicate::Filter(expr) = &def.predicate {
+        out.push_str(" WHERE ");
+        out.push_str(&render_filter(expr, &aliases));
+    }
 
     out
+}
+
+/// A `WHERE` filter as [`render_definition_text`] renders it. A filter that
+/// is the lone literal keeps its parentheses: a bare `WHERE TRUE` would read
+/// back as `Predicate::True`, with the older floor.
+fn render_filter(expr: &Expr, aliases: &Aliases<'_>) -> String {
+    if matches!(expr, Expr::BooleanLiteral(true)) {
+        "(TRUE)".to_string()
+    } else {
+        render_expr(expr, aliases)
+    }
+}
+
+/// `def`'s `WHERE` as its definition text reads it
+/// ([`render_definition_text`]), or `None` for `TRUE`.
+pub(crate) fn render_filter_text(def: &TransformDef) -> Option<String> {
+    let expr = def.predicate.filter()?;
+    Some(render_filter(expr, &Aliases::of(def)))
 }
 
 /// `name` as definition text: bare when the grammar reads the bare word as
@@ -1103,12 +1122,24 @@ fn typed_literal_keyword(value_type: ValueType) -> &'static str {
         })
 }
 
-/// The partial-data predicate slot (`docs/transforms.md#a-where-other-than-true`, #804).
-///
-/// This slice accepts only a trivially-true predicate — either `WHERE` is
-/// omitted, or written as the literal `WHERE TRUE`. General predicate
-/// expressions are deferred to a later issue.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The partial-data predicate (ADR-0004): which source rows the target
+/// holds.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
+    /// Every row: `WHERE` omitted, or the lone unquoted token `TRUE`.
     True,
+    /// A `boolean` expression over source columns; a row is a member when
+    /// `(<expr>) IS TRUE`. Every other accepted text, `WHERE (TRUE)`
+    /// included, so its floor is the predicate's (ADR-0024).
+    Filter(Expr),
+}
+
+impl Predicate {
+    /// The filter's expression, `None` for [`Predicate::True`].
+    pub fn filter(&self) -> Option<&Expr> {
+        match self {
+            Predicate::True => None,
+            Predicate::Filter(expr) => Some(expr),
+        }
+    }
 }

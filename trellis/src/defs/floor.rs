@@ -142,6 +142,8 @@ pub enum KeySpaceKind {
 pub enum PredicateKind {
     /// None, or `WHERE TRUE`.
     True,
+    /// Any other `WHERE`, `WHERE (TRUE)` included.
+    Filter,
 }
 
 /// A kind of expression node whose since has no further detail: the nodes
@@ -193,6 +195,13 @@ pub enum Layout {
     /// validator as it admits such an argument, since the key space alone
     /// doesn't tell.
     NumericSums,
+    /// [`Layout::NumericSums`]'s partials holding a `real`, `double
+    /// precision` or `interval` argument's exact sum, each value converted
+    /// exactly to one `numeric` (an `interval`'s fields packed into it), under
+    /// a reference scale of its own (`crate::staging::group_basis::exact_sums`):
+    /// a release without them refuses the definition. Recorded by the
+    /// validator as it admits such an argument.
+    FloatIntervalSums,
 }
 
 impl Layout {
@@ -310,6 +319,7 @@ impl Feature {
             Feature::NeighbourTypedLiteral => Some(Release::new(0, 4, 0)),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
+                PredicateKind::Filter => Release::new(0, 4, 0),
             }),
             Feature::Expr(node) => Some(match node {
                 ExprNode::Column
@@ -360,6 +370,7 @@ impl Feature {
                 | Layout::Join
                 | Layout::JoinOneToOne
                 | Layout::NumericSums => BASELINE,
+                Layout::FloatIntervalSums => DEVELOPING,
             }),
             Feature::TypeRule(rule) => Some(rule.since()),
             Feature::Value(value) => value.since(),
@@ -489,6 +500,7 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
     }
     used.add(Feature::Predicate(match predicate {
         Predicate::True => PredicateKind::True,
+        Predicate::Filter(_) => PredicateKind::Filter,
     }));
     if *without_source_index {
         used.add(Feature::WithoutSourceIndex);
@@ -500,6 +512,9 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         used.add(Feature::PartitionedSource);
     }
     for FieldDef { name: _, expr } in fields {
+        used.expr(expr);
+    }
+    if let Predicate::Filter(expr) = predicate {
         used.expr(expr);
     }
     let extremes = used

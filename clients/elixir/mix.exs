@@ -50,6 +50,9 @@ defmodule Trellis.MixProject do
       # `Trellis.Migration` is compiled only when the host depends on
       # `ecto_sql`; nothing else here uses it.
       {:ecto_sql, "~> 3.13", optional: true},
+      # `Trellis.Metrics.Plug` and `Trellis.Metrics.Appender` are compiled
+      # only when the host depends on `plug`.
+      {:plug, "~> 1.16", optional: true},
       # The integration suite writes source rows and reads target rows over
       # its own connection, the way a host app would.
       {:postgrex, "~> 0.22", only: :test},
