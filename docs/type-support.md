@@ -64,15 +64,8 @@ filter role.
 | array, range, composite, domain, geometric, extension types (`citext`) | no | no | no | no | no | no |
 
 `COUNT(*)` and `COUNT(<expr>)` are type-agnostic and typed `bigint`, as in
-Postgres; they are omitted from the aggregate column. An aggregate or `JOIN`
-transform admits `COUNT`, and `SUM` and `AVG` over the types above, the
-aggregates Trellis keeps exact from each change alone. A plain aggregate (not
-a `JOIN`) also admits `MIN` and `MAX` over the types above, which re-read
-the source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
-Every other aggregate is refused at define, named by its family: `MIN`/`MAX`
-on a `JOIN`, `bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over a
-float, an `interval` or another type, and `array_agg`/`string_agg`/`jsonb_agg`
-([Aggregates that are not supported](#aggregates-that-are-not-supported)).
+Postgres; they are omitted from the aggregate column. Which aggregates are
+admitted is in [Aggregates that are not supported](#aggregates-that-are-not-supported).
 
 ### The types of the columns Trellis creates
 
@@ -493,7 +486,8 @@ never joinable.
   and primary keys; the join/primary-key check reads the type's `typtype` from the catalog
   rather than a static list.
 - There is no typed-literal syntax: a literal's keyword would be a per-schema
-  identifier.
+  identifier. A string literal beside an enum column under `=` is read as a
+  value of the enum, as in Postgres ([expressions](expressions.md#comparison-and-logic)).
 
 Postgres refuses a `DROP TYPE` of an enum while a column Trellis created
 uses it, and the retype or drop of the source column that has to come first
@@ -555,11 +549,15 @@ divergence
 
 ## Aggregates that are not supported
 
-An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`
-over `smallint`, `integer`, `bigint` and `numeric`; a plain aggregate also
-admits `MIN` and `MAX` ([above](#min-and-max)). Every other aggregate is
-refused at define, by name, with the issue that tracks it: see
-[transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
+An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or
+`AVG` over a number or an `interval`: the aggregates Trellis keeps exact from
+each change alone. A plain aggregate (not a `JOIN`)
+also admits `MIN` and `MAX` over the types the matrix marks, which re-read the
+source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
+Every other aggregate is refused at define, named by its family
+([refusals](transforms.md#refusals)): `MIN`/`MAX` on a `JOIN`,
+`bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over another type, and
+`array_agg`/`string_agg`/`jsonb_agg`.
 
 ## Typed literals and casts
 

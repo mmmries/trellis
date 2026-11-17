@@ -179,6 +179,7 @@ feature TypeRule(GroupByKey(MacAddr8)) 0.2.0
 feature TypeRule(GroupByKey(Inet)) 0.2.0
 feature TypeRule(GroupByKey(VarBit)) 0.2.0
 feature TypeRule(GroupByKey(Enum)) 0.2.0
+feature TypeRule(Comparison(EnumBesideStringLiteral)) 0.4.0
 feature Value(ExtractField("year")) 0.2.0
 feature Value(ExtractField("quarter")) 0.2.0
 feature Value(ExtractField("month")) 0.2.0
@@ -1020,3 +1021,4 @@ admit comparison(Equal, Float(Float8), number literal) = Ok(()) by Comparison(Fl
 admit comparison(NotEqual, Float(Float8), number literal) = Ok(()) by Comparison(FloatBesideNumberLiteral) 0.2.0
 admit comparison(IsDistinctFrom, Float(Float8), number literal) = Ok(()) by Comparison(FloatBesideNumberLiteral) 0.2.0
 admit comparison(IsNotDistinctFrom, Float(Float8), number literal) = Ok(()) by Comparison(FloatBesideNumberLiteral) 0.2.0
+admit comparison(Equal, Other(Enum("enum:public.e")), string literal) = Ok(()) by Comparison(EnumBesideStringLiteral) 0.4.0

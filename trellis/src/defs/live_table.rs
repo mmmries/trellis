@@ -104,7 +104,11 @@ impl LiveTable {
                         {VIRTUAL_EXPRESSION_SQL},
                         n.nspname::text,
                         t.typname::text,
-                        exists (select 1 from transform_definitions where target_table = $2)
+                        exists (select 1 from transform_definitions where target_table = $2),
+                        case when t.typtype = 'e' then
+                            array(select e.enumlabel::text from pg_catalog.pg_enum e
+                                  where e.enumtypid = t.oid order by e.enumsortorder)
+                        end
                  from pg_catalog.pg_attribute a
                  join pg_catalog.pg_type t on t.oid = a.atttypid
                  join pg_catalog.pg_namespace n on n.oid = t.typnamespace
@@ -147,6 +151,7 @@ impl LiveTable {
                         collation: row.get(5),
                         collation_deterministic: row.get(6),
                         is_enum,
+                        enum_labels: row.get(14),
                         copy_type: row.get(8),
                         copy_collation: row.get(9),
                         // A column of a table Trellis creates has no type

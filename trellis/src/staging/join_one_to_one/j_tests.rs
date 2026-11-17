@@ -31,6 +31,7 @@ fn info(pg_type: &str, value_type: ValueType) -> JoinColumnInfo {
         collation: None,
         collation_deterministic: true,
         is_enum: false,
+        enum_labels: None,
         copy_type: pg_type.to_string(),
         copy_collation: None,
         trellis_target: false,

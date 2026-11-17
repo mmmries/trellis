@@ -239,14 +239,17 @@ computed before keep the old result, so a 1-1 target mixes the two. An
 aggregate can hold a value neither collation gives: a row counted under the
 old comparison is taken out under the new one, so `SUM(CASE WHEN status =
 'open' THEN 1 ELSE 0 END)` drops to `0` for a group that still holds an
-`'open'` row once an `'OPEN'` row leaves it. A text function that refuses a
+`'open'` row once an `'OPEN'` row leaves it. A `WHERE` comparing the column
+gets membership wrong the same way: `WHERE status = 'open'` takes an `'OPEN'`
+row out of a group it was never counted in. A text function that refuses a
 nondeterministic collation (`STRPOS`) raises `0A000` on every change instead,
 and the definition is quarantined, which is reported.
 
 **Detected by:** `self_check`.
 
 **Repair:** `ALTER TRANSFORM` the definition so it no longer compares or
-searches the column, or change the column back to a deterministic collation,
+searches the column (a `WHERE` can't be altered: drop the definition and
+define it again), or change the column back to a deterministic collation,
 then `request_backfill` the table. To avoid it, pause the transforms that
 read the column before changing its collation.
 

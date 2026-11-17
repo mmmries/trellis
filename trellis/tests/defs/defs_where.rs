@@ -1,7 +1,6 @@
-//! A `WHERE` other than `TRUE` through define (#1991 step A): the
-//! predicate's own refusals come first, then the key-space refusal every key
-//! space but the 1-1 `JOIN` gives until its step applies a filter. Nothing
-//! is created.
+//! A `WHERE` other than `TRUE` through define (#1991): the predicate's own
+//! refusals come first, then the key-space refusal each key space gives
+//! until its step applies a filter. A refused definition creates nothing.
 
 use testkit::TestCluster;
 
@@ -26,8 +25,9 @@ async fn define_refuses_a_filter_and_creates_nothing() {
             "T0238",
         ),
         (
-            "TRANSFORM t2 FROM public.s GROUP BY g SELECT g AS g, COUNT(*) AS n WHERE active",
-            "T0238",
+            "TRANSFORM t2 FROM public.s GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, MIN(qty) AS lo WHERE active",
+            "T0239",
         ),
         (
             "TRANSFORM t3 FROM public.s JOIN public.u ON s.id = u.id GROUP BY s.g \
@@ -84,5 +84,29 @@ async fn define_refuses_a_filter_and_creates_nothing() {
         .apply("TRANSFORM t9 FROM public.s SELECT qty AS q WHERE TRUE")
         .await
         .expect("WHERE TRUE is accepted");
+    let status = trellis.status("t9").await.unwrap().expect("t9");
+    assert_eq!(status.filter, None, "an unfiltered definition");
+
+    // A plain aggregate applies its filter, and `status` says so.
+    trellis
+        .apply(
+            "TRANSFORM g1 FROM public.s GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, COUNT(*) AS n WHERE active AND qty > 0",
+        )
+        .await
+        .expect("a filtered aggregate is accepted");
+    let status = trellis.status("g1").await.unwrap().expect("g1");
+    assert_eq!(status.filter.as_deref(), Some("(active AND (qty > 0))"));
+    // `WHERE (TRUE)` is a filter, with this release's floor: `status` says
+    // so as its definition text reads, not as the bare `TRUE` it isn't.
+    trellis
+        .apply(
+            "TRANSFORM g2 FROM public.s GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, COUNT(*) AS n WHERE (TRUE)",
+        )
+        .await
+        .expect("a parenthesized TRUE is accepted");
+    let status = trellis.status("g2").await.unwrap().expect("g2");
+    assert_eq!(status.filter.as_deref(), Some("(TRUE)"));
     trellis.shutdown().await.expect("shutdown");
 }
