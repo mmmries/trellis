@@ -201,14 +201,14 @@ const ENTRY: &str = "__entry";
 /// values are all `NULL` still differs from no row.
 const LIVE: &str = "live";
 
-/// Refuses a 1-1 `JOIN` definition with a field the comparison can't render.
+/// Refuses a 1-1 `JOIN` definition with a field or a `WHERE` the comparison
+/// can't render.
 pub(super) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
-    for field in &def.def.fields {
-        render(&def.def, &field.expr, "a", "b").map_err(|detail| {
-            SelfCheckError::UnsupportedExpr {
-                target: def.def.target.clone(),
-                detail,
-            }
+    let exprs = def.def.fields.iter().map(|field| &field.expr);
+    for expr in exprs.chain(def.def.predicate.filter()) {
+        render(&def.def, expr, "a", "b").map_err(|detail| SelfCheckError::UnsupportedExpr {
+            target: def.def.target.clone(),
+            detail,
         })?;
     }
     Ok(())
@@ -303,6 +303,10 @@ struct Audit<'a> {
     joined: Vec<Joined>,
     /// The fields the page compares: not the paused ones.
     fields: Vec<Field>,
+    /// The definition's `WHERE`, rendered by this audit's renderer over `a`
+    /// and the positions' aliases, as the fields are; `None` without one.
+    /// Only the target part reads it: `R` and every `M` hold every row.
+    predicate: Option<String>,
 }
 
 impl Audit<'_> {
@@ -407,8 +411,16 @@ impl Audit<'_> {
                 )
             })
             .collect();
+        // A row the predicate excludes is absent from the expected target,
+        // so a target row of it is an extra row. The fields are in the
+        // select list of the level whose `WHERE` is the predicate: none is
+        // evaluated on an excluded row.
+        let filter = self
+            .predicate
+            .as_ref()
+            .map_or_else(String::new, |p| format!(" where ({p}) is true"));
         format!(
-            "(select {columns} from {a_applied} a {laterals}) e",
+            "(select {columns} from {a_applied} a {laterals}{filter}) e",
             columns = columns.join(", "),
             a_applied = self.a.applied(&a_ring),
             laterals = laterals.join(" "),
@@ -747,11 +759,16 @@ async fn build<'a>(
             sql,
         });
     }
+    let predicate = match def.def.predicate.filter() {
+        Some(predicate) => Some(render(&def.def, predicate, "a", "b").map_err(unsupported)?),
+        None => None,
+    };
     Ok(Audit {
         def,
         a,
         joined,
         fields,
+        predicate,
     })
 }
 

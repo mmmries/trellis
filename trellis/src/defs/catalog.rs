@@ -492,6 +492,17 @@ pub enum CatalogError {
         /// resolved this precisely.
         column_detail: Vec<String>,
     },
+    /// A statement's DDL on a target, or a `RESUME`'s emptying of it, failed
+    /// because objects outside Trellis depend on it: another table's foreign
+    /// key, or a view over the table or a column. Trellis never cascades (ADR-0014; what a user adds to a
+    /// target is the user's), so the statement rolls back whole.
+    OutsideDependentsBlock {
+        /// What the statement acts on: the target, or `target.column`.
+        subject: String,
+        /// Postgres's own list of the dependents, one per line, from the
+        /// dependency failure's DETAIL.
+        dependents: Vec<String>,
+    },
     /// `alter_transform` was asked to edit a target that doesn't apply
     /// (`staging::build::takes_field_build`): one still
     /// `waiting_to_backfill`, `backfilling` behind an old-path build, or
@@ -597,6 +608,7 @@ impl CatalogError {
             // precondition.
             CatalogError::TransformNotPaused { .. } => ErrorCode::Conflict,
             CatalogError::DependentsBlockDrop { .. } => ErrorCode::Conflict,
+            CatalogError::OutsideDependentsBlock { .. } => ErrorCode::Conflict,
             // Only another version gets past it, like a catalog floor.
             CatalogError::AboveRunningRelease { .. } => ErrorCode::VersionFloor,
             CatalogError::CannotRun { .. } => ErrorCode::VersionFloor,
@@ -656,6 +668,7 @@ impl CatalogError {
             CatalogError::AboveRunningRelease { .. } => ErrorId(151),
             CatalogError::CannotRun { .. } => ErrorId(152),
             CatalogError::DependentsBlockDrop { .. } => ErrorId(153),
+            CatalogError::OutsideDependentsBlock { .. } => ErrorId(242),
             CatalogError::TransformNotLive { .. } => ErrorId(154),
             CatalogError::AlterFieldNotFound { .. } => ErrorId(155),
             CatalogError::AlterFieldAlreadyExists { .. } => ErrorId(156),
@@ -678,6 +691,8 @@ impl CatalogError {
     /// schema that holds the target, whose uninstall drops the target with
     /// it: its repair is also to drop the definition and define it again,
     /// in an ordinary schema, and its own message says so.
+    /// [`CatalogError::OutsideDependentsBlock`] is no define refusal either:
+    /// define never sees the user's objects on a target.
     pub(crate) fn is_define_refusal(&self) -> bool {
         !matches!(
             self,
@@ -690,6 +705,7 @@ impl CatalogError {
                 | CatalogError::LedgerTableMissing { .. }
                 | CatalogError::TargetTableMissing { .. }
                 | CatalogError::TargetInCatalogSchema { .. }
+                | CatalogError::OutsideDependentsBlock { .. }
         )
     }
 }
@@ -1019,6 +1035,15 @@ impl crate::error_code::Message for CatalogError {
                 }
                 Ok(())
             }
+            CatalogError::OutsideDependentsBlock {
+                subject,
+                dependents,
+            } => write!(
+                f,
+                "objects outside Trellis depend on '{subject}': {} (Trellis refuses rather \
+                 than cascading)",
+                dependents.join("; ")
+            ),
             CatalogError::TransformNotLive { transform, status } => write!(
                 f,
                 "'{transform}' is {}, not live; only a fully-built, live definition can be \
@@ -1090,6 +1115,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AboveRunningRelease { .. } => None,
             CatalogError::CannotRun { .. } => None,
             CatalogError::DependentsBlockDrop { .. } => None,
+            CatalogError::OutsideDependentsBlock { .. } => None,
             CatalogError::TransformNotLive { .. } => None,
             CatalogError::AlterFieldNotFound { .. } => None,
             CatalogError::AlterFieldAlreadyExists { .. } => None,
@@ -1118,6 +1144,57 @@ impl From<crate::locks::ColumnPauseLockError> for CatalogError {
                 CatalogError::ColumnPauseLockTimeout(err)
             }
             crate::locks::ColumnPauseLockError::Db(err) => CatalogError::Db(err),
+        }
+    }
+}
+
+impl CatalogError {
+    /// Lifts a dependency failure (`2BP01`, or `23503` on a delete a foreign
+    /// key refuses) of Trellis's own DDL on `subject` into
+    /// [`CatalogError::OutsideDependentsBlock`], naming the dependents from
+    /// Postgres's DETAIL. Any other error stays a database error.
+    pub(crate) fn from_dependency_failure(err: tokio_postgres::Error, subject: &str) -> Self {
+        Self::lift_dependency_failure(err, subject, false)
+    }
+
+    /// [`CatalogError::from_dependency_failure`] for a `TRUNCATE` of
+    /// `subject`, which a foreign key into it refuses with `0A000`, naming
+    /// the referencing table in its DETAIL. Only a `TRUNCATE` site lifts
+    /// `0A000`: elsewhere it means an unsupported statement, not dependents.
+    pub(crate) fn from_truncate_failure(err: tokio_postgres::Error, subject: &str) -> Self {
+        Self::lift_dependency_failure(err, subject, true)
+    }
+
+    fn lift_dependency_failure(err: tokio_postgres::Error, subject: &str, truncate: bool) -> Self {
+        use tokio_postgres::error::SqlState;
+        let lines: Option<Vec<String>> = err.as_db_error().and_then(|db| {
+            // A dependency failure's DETAIL lists the dependents; a foreign
+            // key's refusal of a delete or a truncate names it in its
+            // message, and its DETAIL names the referenced row or table.
+            let head = if db.code() == &SqlState::FOREIGN_KEY_VIOLATION
+                || (truncate && db.code() == &SqlState::FEATURE_NOT_SUPPORTED)
+            {
+                Some(db.message())
+            } else if db.code() == &SqlState::DEPENDENT_OBJECTS_STILL_EXIST {
+                None
+            } else {
+                return None;
+            };
+            Some(
+                head.into_iter()
+                    .chain(db.detail().unwrap_or_default().lines())
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
+        });
+        match lines.filter(|lines| !lines.is_empty()) {
+            Some(dependents) => CatalogError::OutsideDependentsBlock {
+                subject: subject.to_string(),
+                dependents,
+            },
+            None => CatalogError::Db(err),
         }
     }
 }
@@ -2410,7 +2487,10 @@ pub async fn alter_transform(
             "alter table {target_ident} drop column if exists {}",
             quote_ident(field)
         ))
-        .await?;
+        .await
+        .map_err(|err| {
+            CatalogError::from_dependency_failure(err, &format!("{}.{field}", alter.target))
+        })?;
     }
     // An added bare passthrough takes its source column's type, as at
     // `DEFINE`: the same rule, not a second copy of it.
@@ -5015,6 +5095,7 @@ pub(crate) async fn validate_live_schema(
         let source_key: Vec<&str> = key.iter().map(|column| column.name.as_str()).collect();
         check_key_collations(def, table, &source_key, |name| live.info(name))?;
         if plain {
+            super::validate::check_enum_literals(def, &live.typed())?;
             check_collation_reads(def, None, |read| {
                 Some((table.to_string(), live.info(&read.column)?))
             })?;

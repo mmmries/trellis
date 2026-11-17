@@ -105,6 +105,7 @@ fn a_star_renders_every_position() {
     let star = Star {
         shape,
         kinds: &[Kind::Inner, Kind::Left],
+        filter: None,
     };
     assert_eq!(star.name(), "jil");
     assert_eq!(

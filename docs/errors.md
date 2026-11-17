@@ -629,7 +629,7 @@ a stored generated column or a [chained](transforms.md#chaining-and-cycle-detect
 ### T0238 FilterNotYetSupported
 
 A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every
-one but the plain and join aggregates ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
+one but the plain and join aggregates and the 1-1 `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 There is no workaround in the definition yet; filter when reading the target.
 
 ### T0239 FilteredExtreme
@@ -639,7 +639,13 @@ extreme is read from a source index, which holds the rows the `WHERE` drops
 too. Take the `MIN`/`MAX` of a stored generated column
 `CASE WHEN <predicate> THEN <column> END` in an unfiltered transform.
 
-### T0241 JoinPredicateReadsBothSides
+### T0241 EnumLiteralNotALabel
+
+An enum column compared with a string literal that is not one of its labels:
+Postgres fails every statement that reads it. Use a label of the enum. After a
+label was renamed, rename it back, or drop the transform and define it again.
+
+### T0243 JoinPredicateReadsBothSides
 
 A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'s
 `WHERE` reads both tables (`a.x > b.y`, or `a.x > 0 OR b.y > 0`); the message
@@ -648,14 +654,14 @@ one. Split it into conditions that each read one table, or compute the value
 in a [chained](transforms.md#chaining-and-cycle-detection) 1-1 `JOIN` and
 aggregate that.
 
-### T0242 JoinPredicateJoinedSideUnderLeft
+### T0244 JoinPredicateJoinedSideUnderLeft
 
 A `LEFT` [join aggregate](transforms.md#join-aggregate)'s `WHERE` has a
 condition on the joined table; the message names it. In SQL it also drops the
 `FROM` rows with no match, which the `LEFT` keeps, so the query is an `INNER`
 one: write `INNER JOIN`.
 
-### T0243 JoinPredicateReadsNoColumn
+### T0245 JoinPredicateReadsNoColumn
 
 A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'s
 `WHERE` reads no column (`WHERE FALSE`, `1 = 1`); the message names it. Each
@@ -1003,6 +1009,16 @@ message lists the fields. Fix the name. A two-part address reads as
 `target_select_sql` was passed a target column that is neither a field nor a
 key column of the definition (a column you added, say). Pass only the
 definition's columns.
+
+### T0242 OutsideDependentsBlock
+
+Objects outside Trellis depend on the target: another table's foreign key
+into it, or a view over it or over the field's column. `DROP TRANSFORM`,
+`ALTER TRANSFORM … DROP` and a 1-1 `RESUME` that empties the target refuse
+while they exist: Trellis never drops what it doesn't own, and never cascades.
+The message names the dependents. Drop or alter them (`DROP VIEW …`,
+`ALTER TABLE … DROP CONSTRAINT …`), then retry; the failed statement changed
+nothing.
 
 ## Builds and drains
 

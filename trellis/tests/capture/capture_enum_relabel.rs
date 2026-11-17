@@ -120,9 +120,10 @@ async fn an_enum_keyed_one_to_one_with_nothing_pending_rebuilds_and_backfills_la
 
 /// A 1-1 keyed by an enum that another table's foreign key references: the
 /// resume empties the target with `TRUNCATE`, which Postgres refuses while
-/// the foreign key exists, so the resume fails with that error and leaves
-/// the transform paused, its rows as they were (`docs/transforms.md`,
-/// "Target tables are Trellis-owned").
+/// the foreign key exists, so the resume fails with the one refusal for
+/// objects outside Trellis depending on a target, naming the referencing
+/// table, and leaves the transform paused, its rows as they were. Dropping
+/// the foreign key lets it resume.
 #[tokio::test]
 async fn an_enum_keyed_one_to_one_referenced_by_a_foreign_key_refuses_its_resume() {
     let mut h = H::new(ENUM_KEYED, &["TRANSFORM kt FROM public.k SELECT n AS n"]).await;
@@ -139,15 +140,23 @@ async fn an_enum_keyed_one_to_one_referenced_by_a_foreign_key_refuses_its_resume
         .apply("RESUME TRANSFORM kt")
         .await
         .expect_err("the truncate is refused");
+    assert_eq!(err.code(), trellis::ErrorCode::Conflict, "{err}");
+    let text = err.to_string();
     assert!(
-        format!("{err:?}").contains("cannot truncate a table referenced in a foreign key"),
-        "{err:?}"
+        text.contains("objects outside Trellis depend on") && text.contains("kchild"),
+        "{text}"
     );
+    assert!(!text.contains("define would refuse"), "{text}");
     assert_eq!(h.status("kt").await, TransformStatus::Paused);
     assert_eq!(
         h.rows("select * from public.kt").await,
         ["(calm,2)", "(zippy,1)"]
     );
+    h.write("drop table public.kchild").await;
+    h.resume(&["kt"]).await;
+    h.converge("after resume").await;
+    h.assert_exact("kt", ENUM_KEYED_TARGET, ENUM_KEYED_ORACLE)
+        .await;
 }
 
 /// A 1-1 keyed by an enum with changes to the relabelled key staged across

@@ -14,3 +14,4 @@ mod join_star_recollation;
 mod join_star_root;
 mod join_star_schema_changes;
 mod join_star_shared_columns;
+mod join_star_where;

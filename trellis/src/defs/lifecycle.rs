@@ -818,7 +818,8 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         quote_qualified(&qualified),
         quote_qualified(&super::ledger::ledger_table_name(&qualified)),
     ))
-    .await?;
+    .await
+    .map_err(|err| CatalogError::from_dependency_failure(err, target))?;
     // The hidden tables Trellis keeps in its catalog
     // schema for a definition are named by its id, and go with it: a JOIN's
     // and a group-basis aggregate's.

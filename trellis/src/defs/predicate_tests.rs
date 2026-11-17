@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use super::ast::{Expr, KeySpace, Operator, Predicate, ValueType, render_definition_text};
+use super::ast::{Expr, Operator, Predicate, ValueType, render_definition_text};
 use super::floor::{Floors, Release};
 use super::validate::{ValidationError, validate};
 use super::{grammar, parse};
@@ -229,15 +229,20 @@ fn every_key_space_refuses_a_filter_until_its_step_lands() {
     ] {
         assert_eq!(validated(text), Ok(()), "{text}");
     }
-    let text = "TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0";
-    let def = parse(text).unwrap();
-    assert!(matches!(def.key_space, KeySpace::JoinOneToOne(_)));
-    assert_eq!(
-        super::validate::validate_join(&def, &HashMap::new(), &[]),
-        Err(ValidationError::FilterNotYetSupported {
-            key_space: "1-1 JOIN"
-        }),
-    );
+    // Both `JOIN` key spaces filter (#2041, #2042): their validators check
+    // the predicate.
+    for text in [
+        "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g \
+         SELECT s.g AS g, COUNT(*) AS n WHERE s.qty > 0",
+        "TRANSFORM t FROM s JOIN u ON s.k = u.k SELECT s.a AS a WHERE u.b > 0",
+    ] {
+        let def = parse(text).unwrap();
+        assert_eq!(
+            super::validate::refuse_unsupported_filter(&def),
+            Ok(()),
+            "{text}"
+        );
+    }
 }
 
 /// A plain aggregate's `MIN`/`MAX` is refused under any `WHERE` other than

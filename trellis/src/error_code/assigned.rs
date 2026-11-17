@@ -247,9 +247,11 @@ const ASSIGNED: &[&str] = &[
     "T0238 ValidationError::FilterNotYetSupported",
     "T0239 ValidationError::FilteredExtreme",
     "T0240 ParseError::UnsupportedAggregateModifier",
-    "T0241 ValidationError::JoinPredicateReadsBothSides",
-    "T0242 ValidationError::JoinPredicateJoinedSideUnderLeft",
-    "T0243 ValidationError::JoinPredicateReadsNoColumn",
+    "T0241 ValidationError::EnumLiteralNotALabel",
+    "T0242 CatalogError::OutsideDependentsBlock",
+    "T0243 ValidationError::JoinPredicateReadsBothSides",
+    "T0244 ValidationError::JoinPredicateJoinedSideUnderLeft",
+    "T0245 ValidationError::JoinPredicateReadsNoColumn",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

@@ -13,6 +13,7 @@ mod builtin_shadowing;
 mod cast_aliases;
 mod cast_identity;
 mod date_key_spaces;
+mod enum_literal_equality;
 mod fold;
 mod ledger_xmloption;
 mod logic_key_spaces;

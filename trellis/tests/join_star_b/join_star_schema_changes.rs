@@ -538,6 +538,72 @@ async fn a_column_either_side_reads_renamed_or_dropped_pauses_naming_it() {
     }
 }
 
+/// A column only the `WHERE` reads (`a.y` and the position's `tag`; the
+/// fields read `x` and `w`) is watched as a field's is: renamed, dropped or
+/// retyped so the predicate no longer types, it pauses the transform naming
+/// it, and `RESUME` rebuilds once it is back.
+#[tokio::test]
+async fn a_column_only_the_where_reads_pauses_like_a_fields() {
+    for shape in SHAPES {
+        for star in stars(shape) {
+            let star = star.filtered("{b}.tag <> 'x' AND a.y <> 'z'");
+            let b = shape.b();
+            let at = format!("b{}", shape.at);
+            let mut d = built_with(
+                star,
+                &star.definition_with(&format!("a.x + COALESCE({at}.w, 0) AS total")),
+            )
+            .await;
+            let target = star.target();
+            pass(&mut d).await;
+            assert_unpaused(&d, &target, "the first pass").await;
+
+            write(&d, &format!("alter table {b} rename column tag to tag2")).await;
+            pass(&mut d).await;
+            let error = paused_for(&d, &target, &b, &["tag"]).await;
+            assert!(error.contains("renamed or dropped"), "{error}");
+            write(&d, &format!("alter table {b} rename column tag2 to tag")).await;
+            pass(&mut d).await;
+            resume(&d, &star.name()).await;
+            pass(&mut d).await;
+            d.settle().await;
+            assert_unpaused(&d, &target, "the resume after a rename").await;
+
+            if root_at(shape) {
+                write(&d, "alter table public.a drop column y").await;
+                pass(&mut d).await;
+                let error = paused_for(&d, &target, "public.a", &["y"]).await;
+                assert!(error.contains("renamed or dropped"), "{error}");
+                write(
+                    &d,
+                    "alter table public.a add column y text; update public.a set y = id::text",
+                )
+                .await;
+                pass(&mut d).await;
+                resume(&d, &star.name()).await;
+                pass(&mut d).await;
+                d.settle().await;
+                assert_unpaused(&d, &target, "the resume after a drop").await;
+
+                write(
+                    &d,
+                    "alter table public.a alter column y type integer using y::integer",
+                )
+                .await;
+                pass(&mut d).await;
+                // Define would refuse the predicate now (`<>` of an integer
+                // with text), so the pause says so.
+                let error = paused_for(&d, &target, "public.a", &["y"]).await;
+                assert!(
+                    error.contains("changed type") && error.contains("WHERE predicate"),
+                    "{}: {error}",
+                    star.name()
+                );
+            }
+        }
+    }
+}
+
 /// A column a field passes through retyped to another family (`a.y`, `text`
 /// to `integer`), which the transform evaluates as another type: the pass
 /// pauses it, naming the column, and `RESUME` re-types the target's copy and

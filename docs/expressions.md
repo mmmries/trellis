@@ -73,6 +73,15 @@ it; a field that is only `NULL` is a `text` column ([type
 support](type-support.md#comparison-and-logic)). A comparison, `IS NULL` or
 logic field is a `boolean` column, and another field may read it.
 
+An enum column compares with a string literal under `=`, in either order
+(`status = 'open'`). Postgres reads the literal as a value of the enum, so
+define refuses one that is not a label of it. The label is fixed in the
+definition's text: after `ALTER TYPE … RENAME VALUE` renames it, the definition
+pauses and its `RESUME` refuses until the label is renamed back or the
+definition is dropped and defined again. Nothing else takes a literal beside an
+enum: `<>`, `IS [NOT] DISTINCT FROM`, the orderings, `COALESCE`, `NULLIF` and a
+`CASE` result are refused.
+
 Binding, loosest first: `OR`, `AND`, `NOT`, `IS ...`, the comparisons, `+` and
 `-`, `*` `/` `%`, prefix `-`; so `NOT a = b` is `NOT (a = b)` and
 `a = b IS NULL` is `(a = b) IS NULL`. `NOT` and `CASE` are keywords wherever
@@ -191,7 +200,8 @@ an entry under [Details](#details) where it needs more room.
 | A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`): a conversion to or from `timestamptz` reads the session time zone | [T0080 MixedTemporalComparison](errors.md#t0080-mixedtemporalcomparison) | [Retype](transforms.md#retype) |
 | `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` are admitted | [T0081 TextOrderingComparison](errors.md#t0081-textorderingcomparison) | [Retype](transforms.md#retype) |
 | A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` over text columns of two different collations, neither the database default, directly or through `COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and fails every row where both are not `NULL` | [T0233 ConflictingCollations](errors.md#t0233-conflictingcollations) | A column re-collated later holds each key written ([releasing held keys](operations.md#releasing-held-keys)), and `RESUME` refuses it |
-| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, enums, `inet`, …) | [T0082 ComparisonTypeMismatch](errors.md#t0082-comparisontypemismatch) | [Retype](transforms.md#retype) |
+| An enum column compared with a string literal that is not one of its labels | [T0241 EnumLiteralNotALabel](errors.md#t0241-enumliteralnotalabel) | [Retype](transforms.md#retype) |
+| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, an enum with anything but a string literal under `=`, `inet`, …) | [T0082 ComparisonTypeMismatch](errors.md#t0082-comparisontypemismatch) | [Retype](transforms.md#retype) |
 | Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | [T0024 NonAssociativeComparison](errors.md#t0024-nonassociativecomparison) | [Text](transforms.md#text) |
 | **Grammar forms and typing** | | |
 | `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, the simple `CASE <operand> WHEN <value> THEN …`, `<expr>::<type>`, and `--` (a comment) | [T0025 UnsupportedIsForm](errors.md#t0025-unsupportedisform), [T0027 SimpleCaseUnsupported](errors.md#t0027-simplecaseunsupported), [T0029 UnsupportedCastOperator](errors.md#t0029-unsupportedcastoperator), [T0021 DoubleMinus](errors.md#t0021-doubleminus) | [Text](transforms.md#text) |
