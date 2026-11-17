@@ -239,8 +239,10 @@ pub(crate) fn side_columns(def: &TransformDef, side: Side) -> BTreeSet<String> {
     let mut columns: BTreeSet<String> = join_key(def, side).into_iter().collect();
     columns.extend(group_columns(def, side));
     if let Some(join) = spec(def) {
-        for field in &def.fields {
-            walk_columns(&field.expr, &mut |column| {
+        // The `WHERE`'s columns too: they decide membership.
+        let predicate = def.predicate.filter();
+        for expr in def.fields.iter().map(|field| &field.expr).chain(predicate) {
+            walk_columns(expr, &mut |column| {
                 if side_of_written(def, join, &column.table) == Some(side) {
                     columns.insert(column.column.clone());
                 }

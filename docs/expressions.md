@@ -144,6 +144,36 @@ row (current time, timezone, collation, session settings, random values) is
 disallowed: incremental maintenance requires that re-evaluating a formula on
 unchanged inputs always yields the same result.
 
+## WHERE
+
+A transform's `WHERE` is an expression of this grammar, of type `boolean`,
+read as Postgres reads it ([ADR-0004](decisions/0004-transform-definition-grammar.md)).
+A row is a member when it is `TRUE`; `FALSE` and `NULL` exclude it. Every name
+is a source column, never a field, and it calls no aggregate.
+
+It must be **total**: no construct in it may raise an error for any value of
+its operand types, since a predicate that raised would stop every statement
+reading the row. Admitted:
+
+* column reads, literals, `IS [NOT] NULL`, `AND`, `OR`, `NOT`;
+* every comparison and `NULLIF`, except between two text columns (their
+  collations can conflict) and a number literal beside a float that the float
+  can't hold;
+* `CASE` and `COALESCE`, unless they mix `numeric` with a float;
+* the casts but `date` to `timestamp`;
+* `-`, `ABS`, `TRUNC` of a `numeric` or a float, and `CEIL`, `FLOOR` of a
+  float;
+* `EXTRACT`, `AT TIME ZONE 'UTC'`, `DATE_TRUNC` to a `week` or less,
+  `CHAR_LENGTH`, `OCTET_LENGTH`, `STRPOS` reading at most one text column;
+* `%` by a nonzero number literal.
+
+Everything else is refused by name: `+`, `-`, `*`, `/` (overflow, division by
+zero), date arithmetic, `-` and `ABS` of an integer, `CEIL`, `FLOOR` and
+`ROUND` of a `numeric`, `DATE_TRUNC` to a month or more, and `REGEXP_COUNT`.
+Compare without the arithmetic where algebra allows (`amount > discount`), or
+compute the value in a stored generated column or a [chained](transforms.md#chaining-and-cycle-detection)
+1-1 transform and filter on that.
+
 ## Refusals
 
 The columns are those of [transforms' table](transforms.md#refusals); "After
@@ -185,6 +215,9 @@ an entry under [Details](#details) where it needs more room.
 | `DATE_TRUNC` of a `date` or `timestamptz`, `EXTRACT` of any type but `date` and `timestamp`, and `date_part` (an unsupported function) | `TemporalOperand` | [Retype](transforms.md#retype) | `DATE_TRUNC('month', CAST(d AS timestamp))`; `… tz AT TIME ZONE 'UTC'`; `EXTRACT` for `date_part` |
 | [A `DATE_TRUNC` unit or `EXTRACT` field that is not admitted](#a-date_trunc-unit-or-extract-field-that-is-not-admitted) | `TemporalLiteral` | [Text](transforms.md#text) | A listed spelling |
 | `AT TIME ZONE` with a zone other than the literal `'UTC'`, or over anything but a `timestamptz`: zone offsets change with time zone database releases | `TemporalLiteral` (the zone), `TemporalOperand` (the operand) | [Retype](transforms.md#retype) | Convert in the source; `CAST(d AS timestamp)` for a date |
+| **`WHERE`** | | | |
+| A `WHERE` that isn't `boolean`, or that calls an aggregate | `PredicateNotBoolean`, `AggregateInPredicate` | [Retype](transforms.md#retype); an aggregate, [Text](transforms.md#text) | A comparison: `qty > 0` |
+| A [`WHERE` construct that can raise an error](#where) | `PredicateNotTotal` | [Retype](transforms.md#retype) | Compare without it, or filter on a generated column or a chained transform |
 | **Field, column and table names** | | | |
 | Two fields with one name, or fields that read each other in a cycle | `DuplicateFieldName`, `Cycle` | [Text](transforms.md#text) | Rename a field; break the cycle |
 | A field named after a 1-1 source key column or a 1-1 `JOIN`'s `a` key column (`id AS id`; `id AS order_id` is fine), or a field or `GROUP BY` column whose name starts with `__` | `FieldNamedAfterPrimaryKey`, `ReservedFieldName`, `ReservedGroupByColumnName` | [Text](transforms.md#text) | Rename the field |

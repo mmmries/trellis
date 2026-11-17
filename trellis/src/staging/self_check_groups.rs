@@ -853,10 +853,11 @@ pub(super) async fn compare(
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
-    // The source's `GROUP BY` has no `WHERE` for the definition's predicate,
-    // sound only while `Predicate` has one variant (as the 1-1 comparison's).
-    match def.def.predicate {
+    // The source's `GROUP BY` has no `WHERE` for the definition's predicate;
+    // define refuses an aggregate's until its step (#2039) renders it here.
+    match &def.def.predicate {
         Predicate::True => {}
+        Predicate::Filter(_) => return Err(super::self_check::unaudited_filter(def)),
     }
     let mut client = pool.get().await?;
     let steer = steers(&client, def, shape).await?;

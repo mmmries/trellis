@@ -162,9 +162,6 @@ fn select_sql(
     outputs: &[Output<'_>],
     as_text: bool,
 ) -> Result<String, TargetSelectError> {
-    // Every definition reads its whole source: a predicate other than `TRUE`
-    // has to be rendered here before it can be stored.
-    let super::ast::Predicate::True = def.predicate;
     let join = match &def.key_space {
         KeySpace::Join(join) | KeySpace::JoinOneToOne(join) => Some(join),
         KeySpace::OneToOne | KeySpace::Aggregate { .. } => None,
@@ -264,6 +261,12 @@ fn select_sql(
                 on.join(" and ")
             ));
         }
+    }
+    // The definition's `WHERE` as written: in SQL it filters the rows
+    // before they are grouped, and a select-list alias never shadows a
+    // column there.
+    if let Some(predicate) = def.predicate.filter() {
+        sql.push_str(&format!(" where {}", expr_sql(predicate)));
     }
     let group_by: Vec<String> = match &def.key_space {
         KeySpace::Aggregate { group_by } => group_by.iter().map(|k| quote_ident(k)).collect(),
@@ -367,6 +370,23 @@ pub(crate) fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
             &mut aggregate_args,
         );
         columns.extend(aggregate_args);
+    }
+    columns
+}
+
+/// The source columns `def`'s `WHERE` reads, by name (a `JOIN`'s on any
+/// side). Every name in a predicate is a source column, never a field, so
+/// unlike [`referenced_source_columns`] this has no field carve-out. Kept
+/// out of that set on purpose: it answers which columns the fields read,
+/// for `ALTER`'s per-field checks.
+pub(crate) fn predicate_columns(def: &TransformDef) -> std::collections::BTreeSet<String> {
+    let mut columns = std::collections::BTreeSet::new();
+    if let Some(predicate) = def.predicate.filter() {
+        predicate.walk(&mut |e| {
+            if let Expr::Column(name) | Expr::SourceColumn { column: name, .. } = e {
+                columns.insert(name.clone());
+            }
+        });
     }
     columns
 }

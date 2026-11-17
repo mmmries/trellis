@@ -527,8 +527,9 @@ fn render_expr(expr: &Expr) -> String {
 /// (a non-trivial predicate is a later slice), naming the follow-up that
 /// widens it.
 fn render_select(def: &TransformDef, pk_column: &str) -> String {
-    match def.predicate {
+    match &def.predicate {
         Predicate::True => {}
+        Predicate::Filter(_) => unreachable!("the generator never produces a WHERE (#2043)"),
     }
 
     match &def.key_space {

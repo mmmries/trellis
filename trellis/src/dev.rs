@@ -304,6 +304,7 @@ pub mod fixtures {
             below_catalog_floor: None,
             maintenance_refusals: Vec::new(),
             floor: "0.2.0".to_string(),
+            filter: None,
         }
     }
 

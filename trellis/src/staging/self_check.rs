@@ -1175,6 +1175,16 @@ fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
     }
 }
 
+/// The refusal of a definition whose `WHERE` this release's comparison
+/// doesn't render. Define refuses such a definition, so only a catalog this
+/// release didn't write can hold one.
+pub(super) fn unaudited_filter(def: &Definition) -> SelfCheckError {
+    SelfCheckError::UnsupportedExpr {
+        target: def.def.target.clone(),
+        detail: "its WHERE is not audited by this release".to_string(),
+    }
+}
+
 /// The bounded comparison itself (ADR-0013: the target read and the
 /// recompute share one snapshot). Reads one keyset page of `def`'s source
 /// (recomputed via [`render_leaf`]) and of the persisted target in a single
@@ -1216,14 +1226,13 @@ async fn compare_once(
         .await;
     }
     // The recompute `SELECT` below carries no `WHERE` for the definition's
-    // own partial-data predicate, which is sound only because `Predicate`
-    // has exactly one variant today. Matched exhaustively (rather than
-    // ignored) so that adding a real predicate variant breaks *here* — a
-    // silently unfiltered recompute would report every predicate-excluded
-    // source row as a `MissingRow`. `defs::oracle` and `generative::oracle`
-    // pin the same assumption the same way.
-    match def.def.predicate {
+    // own partial-data predicate: an unfiltered recompute would report every
+    // excluded source row as a `MissingRow`. Define refuses a 1-1 `WHERE`
+    // until its step (#2038) renders it here, so a filter is refused rather
+    // than audited wrong.
+    match &def.def.predicate {
         Predicate::True => {}
+        Predicate::Filter(_) => return Err(unaudited_filter(def)),
     }
 
     let comparable: Vec<&FieldDef> = def
