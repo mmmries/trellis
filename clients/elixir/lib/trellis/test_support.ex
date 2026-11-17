@@ -37,6 +37,10 @@ defmodule Trellis.TestSupport do
 
   alias Trellis.{CaptureFailure, Error, Status}
 
+  # `refresh_target/3` runs its SQL over `ecto_sql`, an optional dependency
+  # a host that calls it has.
+  @compile {:no_warn_undefined, Ecto.Adapters.SQL}
+
   @default_schema "trellis"
 
   defmodule ResumeRefused do
@@ -125,8 +129,8 @@ defmodule Trellis.TestSupport do
   end
 
   @doc """
-  Fills the target `target` (`"table"` or `"schema.table"`, or an Ecto
-  schema module) from its definition's own query: `DELETE` then
+  Fills the target `target` (`"table"` or `"schema.table"`, an atom, or an
+  Ecto schema module) from its definition's own query: `DELETE` then
   `INSERT ... SELECT` in one transaction on `repo`, after refreshing each
   target it reads that has a definition of its own. For a suite that runs
   with Trellis off (`config :trellis_pg, enabled: false`), where nothing
@@ -139,12 +143,13 @@ defmodule Trellis.TestSupport do
   Raises `Trellis.ReadOnlyTarget` unless
   `config :trellis_pg, allow_target_writes` is `true`, and `ArgumentError`
   when no definition is recorded for `target`, its name is ambiguous, or
-  the target is no table.
+  the target is no table, and `Trellis.Error` when the definition computes
+  nothing for one of the target's columns. A raise writes nothing.
 
   Options: `:schemas`, the schemas holding Trellis's tables (default
   `["trellis"]`).
   """
-  @spec refresh_target(module(), String.t() | module(), schemas: [String.t()]) :: :ok
+  @spec refresh_target(module(), String.t() | atom(), schemas: [String.t()]) :: :ok
   def refresh_target(repo, target, opts \\ []) do
     unless Trellis.Target.writes_allowed?() do
       raise Trellis.ReadOnlyTarget,
@@ -167,7 +172,18 @@ defmodule Trellis.TestSupport do
     :ok
   end
 
-  defp target_name(schema) when is_atom(schema), do: schema.__schema__(:source)
+  # An Ecto schema's source, qualified by its `@schema_prefix` when it has one.
+  defp target_name(target) when is_atom(target) do
+    if Code.ensure_loaded?(target) and function_exported?(target, :__schema__, 1) do
+      case target.__schema__(:prefix) do
+        nil -> target.__schema__(:source)
+        prefix -> "#{prefix}.#{target.__schema__(:source)}"
+      end
+    else
+      Atom.to_string(target)
+    end
+  end
+
   defp target_name(name) when is_binary(name), do: name
 
   # Refreshes each target `definition` reads that has a definition of its
@@ -200,8 +216,11 @@ defmodule Trellis.TestSupport do
           "the target #{definition.target} of a recorded definition is no table"
         )
 
-    {:ok, select} =
-      Trellis.Native.target_select_sql(definition.text, definition.grammar_version, columns)
+    select =
+      case Trellis.Native.target_select_sql(definition.text, definition.grammar_version, columns) do
+        {:ok, select} -> select
+        {:error, error} -> raise Error.from_native(error)
+      end
 
     column_list = Enum.map_join(columns, ", ", &quote_ident/1)
     sql!(repo, "delete from #{quoted}", [])
