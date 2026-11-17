@@ -279,6 +279,9 @@ pub enum ApplyError {
     ResumeRefused {
         transform: String,
         reason: Box<crate::defs::catalog::CatalogError>,
+        /// The definition's stored status when it was refused: the message
+        /// says what it stays.
+        status: crate::defs::model::StoredStatus,
     },
     /// A folded truncate of `src_table` carries no ring `lsn`. Not
     /// reachable: the capture trigger is the only writer of a truncate's
@@ -504,20 +507,26 @@ impl crate::error_code::Message for ApplyError {
                  and the key is still held: retry the release"
             ),
             ApplyError::ColumnPauseLockTimeout(err) => write!(f, "{err}"),
-            ApplyError::ResumeRefused { transform, reason } if reason.is_define_refusal() => {
-                write!(
-                    f,
-                    "'{transform}' can't resume: define would refuse it as the schema stands now: \
-                 {}. It stays paused",
-                    reason.message()
-                )
-            }
-            ApplyError::ResumeRefused { transform, reason } => {
-                write!(
-                    f,
-                    "'{transform}' can't resume: {}. It stays paused",
-                    reason.message()
-                )
+            ApplyError::ResumeRefused {
+                transform,
+                reason,
+                status,
+            } => {
+                let stays = resume_refused_stays(*status);
+                if reason.is_define_refusal() {
+                    write!(
+                        f,
+                        "'{transform}' can't resume: define would refuse it as the schema \
+                         stands now: {}. {stays}",
+                        reason.message()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "'{transform}' can't resume: {}. {stays}",
+                        reason.message()
+                    )
+                }
             }
             ApplyError::TruncateWithoutLsn { src_table } => write!(
                 f,
@@ -1071,6 +1080,19 @@ pub(super) fn earliest_src_changed(
     }
 }
 
+/// The closing sentence of a refused resume: the definition keeps the status
+/// it had. A live definition is a refused field resume, whose field stays
+/// paused.
+fn resume_refused_stays(status: crate::defs::model::StoredStatus) -> &'static str {
+    use crate::defs::model::StoredStatus;
+    match status {
+        StoredStatus::Quarantined => "It stays quarantined",
+        StoredStatus::Paused => "It stays paused",
+        StoredStatus::Live => "The field stays paused",
+        StoredStatus::WaitingToBackfill | StoredStatus::Backfilling => "It stays as it is",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,6 +1100,28 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
+
+    /// #1848: a refused resume's closing sentence follows the definition's
+    /// stored status, not "paused" for all.
+    #[test]
+    fn resume_refused_message_follows_the_stored_status() {
+        use crate::defs::model::StoredStatus;
+        for (status, stays) in [
+            (StoredStatus::Quarantined, "It stays quarantined"),
+            (StoredStatus::Paused, "It stays paused"),
+        ] {
+            let refused = ApplyError::ResumeRefused {
+                transform: "totals".to_string(),
+                reason: Box::new(crate::CatalogError::SourceTableNotFound("w".to_string())),
+                status,
+            };
+            let message = refused.to_string();
+            assert!(message.ends_with(stays), "{message}");
+            if status == StoredStatus::Quarantined {
+                assert!(!message.contains("paused"), "{message}");
+            }
+        }
+    }
 
     #[test]
     fn earliest_src_changed_picks_the_lesser_of_two_known_origins() {
