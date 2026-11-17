@@ -22,7 +22,7 @@ TRANSFORM <table> [ADOPT EXISTING TABLE]
   [GROUP BY <column>, ...]
   [WITHOUT SOURCE INDEX]
   SELECT <expression> AS <field>, ...
-  [WHERE TRUE]
+  [WHERE <expression>]
 
 <table> ::= [<schema>.]<name>
 <join>  ::= [INNER | LEFT [OUTER]] JOIN <table> [KEY (<column>, ...)] [[AS] <alias>]
@@ -54,8 +54,11 @@ DROP   TRANSFORM <transform>
   [the index `self_check` pages by](#a-source-without-the-index-its-self_check-walk-pages-by).
 - `<expression>` is the [expression grammar](expressions.md); `<field>` names
   a target column.
-- `WHERE` takes only `TRUE`: every source row participates
-  ([#804](https://github.com/salesforce-misc/trellis/issues/804)).
+- `WHERE` takes a `boolean` [expression](expressions.md#where) over source
+  columns that can't raise an error. A plain aggregate applies one: its groups
+  count only the rows it is `TRUE` for. Every other key space refuses any
+  `WHERE` but `TRUE` for now
+  ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 - `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
   `<name>.<field>` pauses or resumes one field
   ([Changing a definition](#changing-a-definition)).
@@ -228,10 +231,11 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A field reading a column that is neither a `GROUP BY` key nor inside an aggregate, or named after a key but not that key (`GROUP BY id SELECT SUM(id) AS id`) | [T0102 UngroupedColumnReference](errors.md#t0102-ungroupedcolumnreference), [T0106 GroupingColumnFieldMustBePassthrough](errors.md#t0106-groupingcolumnfieldmustbepassthrough) | [Text](#text) |
 | `MIN` or `MAX` in a `JOIN` transform | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) (`MIN/MAX`) | [Text](#text) |
 | `bool_and`, `bool_or`, `bit_and` or `bit_or` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
-| `SUM` or `AVG` over anything but `smallint`, `integer`, `bigint` and `numeric`: a running float sum drifts from Postgres's | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) (`float and interval SUM/AVG`), [T0071 UnsupportedAggregateArgument](errors.md#t0071-unsupportedaggregateargument) for another type | [Retype](#retype) |
+| `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | [T0071 UnsupportedAggregateArgument](errors.md#t0071-unsupportedaggregateargument) | [Retype](#retype) |
 | `array_agg`, `string_agg` or `jsonb_agg` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
 | **Filters and chaining** | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE`: partial data is not supported ([#804](https://github.com/salesforce-misc/trellis/issues/804)) | [T0010 UnsupportedPredicate](errors.md#t0010-unsupportedpredicate) | [Text](#text) |
+| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every one but the plain aggregate ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | [T0238 FilterNotYetSupported](errors.md#t0238-filternotyetsupported) | [Text](#text) |
+| `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an extreme is read from a source index, which holds the rows the `WHERE` drops too | [T0239 FilteredExtreme](errors.md#t0239-filteredextreme) | [Text](#text) |
 | A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | [T0048 TargetEqualsSource](errors.md#t0048-targetequalssource), [T0047 TableCycle](errors.md#t0047-tablecycle) | [Text](#text) |
 | Chaining off a transform that is not `live` | [T0154 TransformNotLive](errors.md#t0154-transformnotlive) | n/a |
 | **Target names** | | |

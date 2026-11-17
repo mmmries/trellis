@@ -477,9 +477,9 @@ sorted_words() { local w; for w in "$@"; do echo "$w"; done | sort | tr '\n' ' '
 # `|`, the definition over the shapes tables. The step fails a candidate-only
 # manifest line no entry covers. A feature that needs a table the shapes
 # schema lacks (a new primary-key or partition-key type) adds one to
-# shapes_schema below. Empty for 0.2.0: floors arrive in it, and
-# v0.1.0, which carries none, refuses its database.
+# shapes_schema below.
 rollback_new_defs=(
+  "feature NeighbourTypedLiteral|codes_same|TRANSFORM codes_same FROM codes SELECT code = 'ab  ' AS same, COALESCE(code, 'zz  ') AS filled"
 )
 # What a release before 0.2.0 says when a later release has migrated the
 # database. Its `migrate`, which its `run` and `apply` call first, refuses the
@@ -495,6 +495,7 @@ create index on orders(customer_id);
 create table ledger(id bigint primary key, "order" bigint not null, n bigint not null);
 create table nan_orders(id bigint primary key, customer_id bigint not null, amount numeric(12,2) not null, note text);
 create index on nan_orders(customer_id);
+create table codes(id bigint primary key, code character(4));
 create table events(id bigint not null, tenant bigint not null, v bigint not null, primary key (id, tenant)) partition by hash (tenant);
 create table events_0 partition of events for values with (modulus 4, remainder 0);
 create table events_1 partition of events for values with (modulus 4, remainder 1);
@@ -506,10 +507,11 @@ insert into orders select g, 1 + g % 50, g, 'n' from generate_series(1,2000) g;
 insert into ledger select g, g, g % 7 from generate_series(1,100) g;
 insert into events select g, g % 20, 1 from generate_series(1,1000) g;
 insert into nan_orders values (3000, 7, 10.00, 'n'), (3003, 8, 20.00, 'n');
+insert into codes select g, case when g % 3 = 0 then null when g % 3 = 1 then 'ab' else 'zz' end from generate_series(1,20) g;
 EOF
 )
 sql "$port" shapes <<<"$shapes_schema"
-seed_rows=$((50 + 2000 + 100 + 1000 + 2))
+seed_rows=$((50 + 2000 + 100 + 1000 + 2 + 20))
 
 deep_chain="n"; for _ in $(seq 1 130); do deep_chain="$deep_chain + 1"; done
 deep_nested="n"; for _ in $(seq 1 130); do deep_nested="($deep_nested) + 1"; done
@@ -1256,12 +1258,12 @@ if want mixed; then
   sleep 15
   workers=$(scalar "$port" mixed "select count(*) from trellis.worker_registry where last_seen > now() - interval '30 seconds'")
   paused_n=$(scalar "$port" mixed "select count(*) from trellis.capture_failures")
-  # ADR-0023: the candidate's `trellis run` stands by, with this message, and
-  # runs no migration while the old instance is live.
-  standby_msg='trellis standing by: migrations are pending and Trellis processes are live on this instance'
-  if run_alive new-mixed && grep -qF "$standby_msg" "$logs/run-new-mixed.log" &&
+  # ADR-0023: the candidate's `trellis run` stands by, logging this message,
+  # and runs no migration while the old instance is live.
+  standby_msg='standing by: .*migrations are pending and Trellis processes are live'
+  if run_alive new-mixed && grep -qE "$standby_msg" "$logs/run-new-mixed.log" &&
      [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && [ "$paused_n" -eq 0 ]; then
-    record PASS mixed "the candidate stands by beside a live $old_tag instance: no migration ran, nothing paused ($(grep -F "$standby_msg" "$logs/run-new-mixed.log" | head -1 | cut -c1-200))"
+    record PASS mixed "the candidate stands by beside a live $old_tag instance: no migration ran, nothing paused ($(grep -E "$standby_msg" "$logs/run-new-mixed.log" | head -1 | cut -c1-200))"
   else
     record FAIL mixed "the candidate did not stand by beside a live $old_tag instance ($workers workers registered, $paused_n paused, candidate process $(run_alive new-mixed && echo running || echo exited), history $( [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixed.log" | cut -c1-300))"
   fi
@@ -1289,7 +1291,7 @@ if want mixed; then
   taken=0
   for _ in $(seq 1 120); do
     if [ "$(history "$port" mixed | wc -l)" -gt "$(wc -l <<<"$pre_mixed_history")" ] &&
-       grep -q 'migrated, taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
+       grep -q 'pending migrations (.*); taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
     sleep 0.5
   done
   if [ "$taken" -eq 1 ] && run_alive new-mixed; then
@@ -1436,7 +1438,7 @@ rollback_with_floors() {
   local cand_only="" shared="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join"
   sql "$port" postgres -c "create database $db"
   sql "$port" "$db" <<<"$shapes_schema"
-  seed_rows=$((seed_rows + 3150))
+  seed_rows=$((seed_rows + 3170))
   # Every manifest line after the old release is covered by a definition.
   if [ -f "$cand_src/.github/feature-floors.txt" ]; then
     covered=$(for e in ${rollback_new_defs[@]+"${rollback_new_defs[@]}"}; do echo "${e%%|*}" | tr ';' '\n'; done)

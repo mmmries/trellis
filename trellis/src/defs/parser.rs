@@ -237,6 +237,9 @@ fn resolve_aliases(def: &mut TransformDef, identifiers: Identifiers) -> Result<(
     for field in &mut def.fields {
         resolve_expr_aliases(&mut field.expr, &resolve)?;
     }
+    if let Predicate::Filter(expr) = &mut def.predicate {
+        resolve_expr_aliases(expr, &resolve)?;
+    }
     Ok(())
 }
 
@@ -2027,13 +2030,22 @@ impl Parser {
         }
     }
 
+    /// The expression after `WHERE`. Only the lone unquoted token `TRUE`
+    /// ending the text is [`Predicate::True`], the text 0.2.0 accepted; any
+    /// other expression, `(TRUE)` included, is a filter, which the validator
+    /// types and checks. Grammar 1 had no `TRUE` literal and read only that
+    /// token, so its text keeps the old rule.
     fn parse_predicate(&mut self) -> Result<Predicate, ParseError> {
+        let lone_true = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("true"))
+            && matches!(self.peek_at(1), Token::Eof);
+        if self.identifiers == Identifiers::Folded && !lone_true {
+            return Ok(Predicate::Filter(self.parse_expr()?));
+        }
         match self.advance() {
             Token::Ident(s) if s.eq_ignore_ascii_case("true") => Ok(Predicate::True),
             other => Err(ParseError::UnsupportedPredicate {
                 detail: format!(
-                    "only a literal TRUE is accepted (general predicates are not supported; \
-                        see docs/transforms.md); found {}",
+                    "grammar 1 accepts only a literal TRUE; found {}",
                     other.describe()
                 ),
             }),

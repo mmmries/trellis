@@ -65,9 +65,9 @@ the application, or store it in a source column.
 
 ### T0010 UnsupportedPredicate
 
-A `WHERE` other than `TRUE`: partial data is not supported
-([#804](https://github.com/salesforce-misc/trellis/issues/804)). There is no
-workaround in a definition; filter when reading the target.
+A `WHERE` other than `TRUE` in a [grammar-1](transforms.md#grammar-versions)
+definition, which 0.1.x wrote and which reads only `TRUE`. Drop the transform
+and define it again, which writes the current grammar.
 
 ### T0011 AtLeastOneArgumentRequired
 
@@ -588,6 +588,49 @@ the name.
 
 A `string_agg` separator that isn't a string literal. Not reached while
 `string_agg` itself is refused ([T0070](#t0070-deferredaggregate)).
+
+### T0233 ConflictingCollations
+
+A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` over text columns of two
+different collations, neither the database default, directly or through
+`COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and
+fails every row where both are not `NULL`. Give the two columns one collation
+(`ALTER COLUMN … TYPE text COLLATE …`).
+
+### T0234 PredicateNotBoolean
+
+A [`WHERE`](expressions.md#where) whose type isn't `boolean`. Write a
+comparison: `qty > 0`.
+
+### T0235 AggregateInPredicate
+
+A [`WHERE`](expressions.md#where) that calls an aggregate: it filters source
+rows, not groups. Compare source columns: `qty > 0`.
+
+### T0236 PredicateColumnNotFound
+
+A [`WHERE`](expressions.md#where) names a column the source table doesn't
+have; the message names it. A `WHERE` reads source columns, never fields.
+
+### T0237 PredicateNotTotal
+
+A [`WHERE` construct that can raise an error](expressions.md#where) for some
+value of its operands; the message names it. Compare without it, or filter on
+a stored generated column or a [chained](transforms.md#chaining-and-cycle-detection)
+1-1 transform.
+
+### T0238 FilterNotYetSupported
+
+A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every
+one but the plain aggregate ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
+There is no workaround in the definition yet; filter when reading the target.
+
+### T0239 FilteredExtreme
+
+`MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an
+extreme is read from a source index, which holds the rows the `WHERE` drops
+too. Take the `MIN`/`MAX` of a stored generated column
+`CASE WHEN <predicate> THEN <column> END` in an unfiltered transform.
 
 ## Tables and keys
 

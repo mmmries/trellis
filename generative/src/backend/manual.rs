@@ -47,9 +47,9 @@ use trellis::dev::staging::{
 };
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config};
 
-use super::Snapshot;
 use super::ring_wait::{ProgressDeadline, QuiesceBudget};
 use super::sql::{self, quote_ident};
+use super::{DefinitionState, Snapshot};
 use crate::model::{
     BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
 };
@@ -1390,6 +1390,13 @@ impl super::Backend for ManualBackend {
         Ok(result?)
     }
 
+    async fn definition_states(
+        &mut self,
+        defs: &[TransformDef],
+    ) -> Result<Vec<DefinitionState>, ManualBackendError> {
+        Ok(sql::definition_states(&self.raw, defs).await?)
+    }
+
     async fn snapshot(&mut self) -> Result<Snapshot, ManualBackendError> {
         let mut snapshot: Snapshot = BTreeMap::new();
 
@@ -1659,7 +1666,7 @@ impl super::ConcurrentBackend for ManualBackend {
                         // Not a verdict on correctness: a definition an
                         // operator action left paused, or one reading it
                         // (reported `catching_up`), is checked by the
-                        // run's end-of-run `live` check.
+                        // run's unexpected-pause check (`run::pause`).
                         trellis::SelfCheckOutcome::NotLive(_) => {}
                         _ => failures.push(format!("{target}: {report:#?}")),
                     },

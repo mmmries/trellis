@@ -44,8 +44,13 @@ context:
   that each of a JOIN transform's source columns is qualified by its side.
 * **Calculated-field expressions** — the scalar-expression language, reused for
   every calculated field.
-* **Partial-data predicate** — the same expression grammar with a `-> bool`
-  requirement, restricting which source rows participate.
+* **Partial-data predicate.** A `WHERE` over source columns in the
+  calculated-field grammar, of type `boolean` and total: define refuses any
+  construct that can raise for some value of its operand types. A row is a
+  member when the predicate is `TRUE`. The predicate is fixed at creation. In a
+  join aggregate, each top-level `AND` conjunct reads one side and filters that
+  side's rows before they reach its partials; a conjunct reading both sides, or
+  reading `b` under `LEFT`, is refused.
 
 ## Why our own grammar, not the Postgres parser
 
@@ -108,8 +113,7 @@ so does `orders.order AS order`. `AT TIME ZONE`
 binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
-definition time. `<predicate>` accepts only the
-literal `TRUE`; any other `WHERE` is refused at definition time.
+definition time. `<predicate>` follows the partial-data predicate rule above.
 
 ### Typed literals spell constants in canonical Postgres form
 
@@ -192,7 +196,7 @@ shape:
 * `GROUP BY <col1>[, <col2>...]` (at most 32 columns, Postgres's cap on an
   index key) produces a `KeySpace::Aggregate` whose
   calculated fields may reference a grouping column directly or wrap any other
-  column in `SUM` or `AVG` (over an integer or `numeric`), or in `MIN` or
+  column in `SUM` or `AVG` (over a number or an `interval`), or in `MIN` or
   `MAX` (over a number, date or time column; see `docs/type-support.md`),
   resolved against a separate aggregate-function registry. The grammar also
   parses `bool_*`, `bit_*`, `array_agg`, `string_agg` and `jsonb_agg`, and
@@ -223,9 +227,9 @@ shape:
   name are refused. The `GROUP BY` columns, the `ON` columns of a side, and a
   side's `ON` and `GROUP BY` columns together each number at most 32, Postgres's
   cap on an index key. An aggregate argument reads one side; one mixing both
-  sides is refused, and the admitted aggregates are ADR-0019's. `WHERE` stays
-  `TRUE`-only; a future `WHERE` applies after the join, as in SQL, so adding it
-  changes nothing a JOIN transform already means. Recognized and refused by
+  sides is refused, and the admitted aggregates are ADR-0019's. A `WHERE`
+  follows the [partial-data predicate](#the-grammar-is-split-by-concern) rule.
+  Recognized and refused by
   name: two sides sharing a bare table name (which covers self-joins);
   `RIGHT`, `FULL`, `CROSS`, a comma join and a second `JOIN`; an expression
   key, a non-equality condition, `OR`, a one-side predicate, an equality

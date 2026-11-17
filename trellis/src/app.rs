@@ -1118,6 +1118,11 @@ impl Trellis {
             match (self.read_status(&mut client, target_table).await, pending) {
                 (Ok(status), pending) => Ok(status.map(|mut status| {
                     status.migrations_pending = pending;
+                    status.maintenance_refusals = self
+                        .client
+                        .as_ref()
+                        .map(Client::refused_steps)
+                        .unwrap_or_default();
                     status
                 })),
                 // Only pending migrations explain a catalog it can't read:
@@ -1237,6 +1242,7 @@ impl Trellis {
             let mut source_index_gaps = Vec::new();
             let mut extreme_index_gaps = Vec::new();
             let mut join = None;
+            let mut filter = None;
             let mut correcting = Vec::new();
             if let Some(row) = &row {
                 let status_text: String = row.get(0);
@@ -1314,6 +1320,7 @@ impl Trellis {
                         row.get("source_table"),
                     )
                     .await?;
+                    filter = crate::defs::ast::render_filter_text(&def);
                     join = crate::staging::join_status::for_definition(
                         &*txn,
                         self.config.schema(),
@@ -1366,7 +1373,9 @@ impl Trellis {
                 version_handover,
                 migrations_pending: None,
                 below_catalog_floor,
+                maintenance_refusals: Vec::new(),
                 floor: row.get("floor_version"),
+                filter,
             }))
         }
         .await
@@ -2622,6 +2631,16 @@ pub struct DefinitionStatus {
     /// state-changing calls refuse ([`ErrorCode::VersionFloor`]). Names the
     /// floor and this binary's version. Run a version at or above the floor.
     pub below_catalog_floor: Option<crate::catalog_floor::BelowCatalogFloor>,
+    /// The ring and maintenance steps this handle's staging worker is
+    /// refused (`42501`), such as retiring a drained segment without
+    /// `TRUNCATE`: each names the step, the role, the table and the
+    /// privileges the role lacks. Instance-level, so every definition
+    /// reports the same list. Nothing is paused: no definition's correctness
+    /// waits on these steps, but the ring isn't housekept until the
+    /// privilege is granted. An entry clears itself once a pass of its step
+    /// succeeds. Empty on a handle that doesn't lead the staging worker: it
+    /// is this process's knowledge, not the catalog's.
+    pub maintenance_refusals: Vec<crate::refused_steps::RefusedStep>,
     /// The oldest Trellis release that can run the definition, as
     /// `major.minor.patch` (ADR-0024): the latest release any grammar
     /// construct, key space, option or hidden-table layout it uses arrived
@@ -2631,6 +2650,11 @@ pub struct DefinitionStatus {
     /// whose floor is above it, under this release
     /// (`docs/upgrading.md`, rolling back).
     pub floor: String,
+    /// The definition's `WHERE`, as definition text, when it is other than
+    /// `TRUE`: the target holds only the source rows it is `TRUE` for.
+    /// `None` for an unfiltered definition, and for one this release can't
+    /// run, which it doesn't parse.
+    pub filter: Option<String>,
 }
 
 /// Why capture of a table a definition reads is broken; see [`DefinitionStatus::capture_failure`].

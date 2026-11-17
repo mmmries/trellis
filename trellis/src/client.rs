@@ -534,6 +534,8 @@ pub struct Client {
     /// Why this client's background process last failed to run this
     /// binary's pending migrations (ADR-0023, rule 3).
     cannot_migrate: CannotMigrate,
+    /// The maintenance steps this client's role is refused.
+    refused_steps: crate::refused_steps::RefusedSteps,
     /// Keeps `trellis_instance_up` at 1 for this client's instance until the
     /// client is dropped or shut down.
     _running: crate::metrics::RunningInstance,
@@ -601,6 +603,8 @@ impl Client {
         let instance_name = Arc::clone(&instance);
         let cannot_migrate = CannotMigrate::default();
         let process_cannot_migrate = cannot_migrate.clone();
+        let refused_steps = crate::refused_steps::RefusedSteps::default();
+        let process_refused_steps = refused_steps.clone();
         let thread = std::thread::Builder::new()
             .name("trellis-client".to_string())
             .spawn(move || {
@@ -617,6 +621,7 @@ impl Client {
                     config,
                     options,
                     process_cannot_migrate,
+                    process_refused_steps,
                     shutdown_rx,
                     ready_tx,
                 )));
@@ -628,6 +633,7 @@ impl Client {
                 shutdown_tx,
                 thread: Some(thread),
                 cannot_migrate,
+                refused_steps,
                 _running: crate::metrics::RunningInstance::new(&instance_name),
             }),
             Ok(Err(err)) => {
@@ -652,6 +658,12 @@ impl Client {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// The ring and maintenance steps this client's staging worker is
+    /// refused now, each until a pass of it succeeds.
+    pub(crate) fn refused_steps(&self) -> Vec<crate::RefusedStep> {
+        self.refused_steps.snapshot()
     }
 
     /// Signals shutdown and waits for the background thread to exit
@@ -772,6 +784,7 @@ async fn run(
     config: Config,
     options: ClientOptions,
     cannot_migrate: CannotMigrate,
+    refused_steps: crate::refused_steps::RefusedSteps,
     mut shutdown_rx: watch::Receiver<bool>,
     ready_tx: std::sync::mpsc::Sender<Result<(), ClientError>>,
 ) {
@@ -802,6 +815,7 @@ async fn run(
         staging_pid: Arc::new(AtomicI32::new(0)),
         migrate: Some(config.clone()),
         cannot_migrate: cannot_migrate.clone(),
+        refused_steps: refused_steps.clone(),
         migrate_backoff: MigrateBackoff::default(),
     };
 
@@ -1379,7 +1393,6 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         drain_batch_cap,
     } = config;
 
-    let seal_config = SealConfig::default();
     // The capture pass rate-limits its logs in memory under the instance's
     // database and schema; the loop forgets them when it stops. Read from the
     // first session this loop leads on (a standby has none yet).
@@ -1410,18 +1423,19 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         LockSchedule::lost(Instant::now())
     };
     let mut failures = StepFailures::default();
-    let mut housekeeping = HousekeepingSchedule::new(housekeeping_interval(
-        housekeeping_interval_option,
+    let mut leader = Leader::new(LeaderConfig {
+        pool: pool.clone(),
+        schema: schema.clone(),
+        wake_channel,
+        housekeeping_interval: housekeeping_interval(housekeeping_interval_option, reclaim_ttl),
         reclaim_ttl,
-    ));
-    // Whether the last tombstone collection may have stopped at its
-    // per-ledger cap ([`staging::retire::may_leave_backlog`]).
-    let mut tombstone_backlog = false;
-    // Due immediately on the very first tick rather than waiting a full
-    // `reconcile_interval` after startup — `setup_staging` already ran one
-    // reconciliation pass at that point, but this makes the loop's own
-    // cadence not depend on when it happens to first observe `Instant::now()`.
-    let mut next_reconcile = Instant::now();
+        drainer_window,
+        reconcile_interval,
+        held_key_retry,
+        drain_batch_cap,
+        refused: process.refused_steps.clone(),
+        refused_backoff: crate::refused_steps::REFUSED_STEP_BACKOFF,
+    });
     // What `trellis_staging_leader` was last set to, so it is set on a change
     // and not on every tick.
     let mut reported_leader: Option<bool> = None;
@@ -1449,6 +1463,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 release_singleton(session.take(), &process).await;
             }
             report_leader(&mut reported_leader, false);
+            // A standby runs no step, so it reports no refusal of one.
+            process.refused_steps.clear_all();
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     stop(database, session).await;
@@ -1484,11 +1500,14 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     }
                     session = Some(taken);
                     // A new leader's first pass is a capture pass, at once.
-                    next_reconcile = Instant::now();
+                    leader.reconcile_now();
                 }
                 // Another worker leads: not a failure of this one.
                 Err(StagingError::ProducerAlreadyRunning) => {
                     lock_schedule.refused(Instant::now());
+                    // Another worker runs the steps now: what this one was
+                    // refused says nothing about them.
+                    process.refused_steps.clear_all();
                 }
                 Err(err) => {
                     let _ = failures.check("connect", Err::<(), _>(err));
@@ -1500,157 +1519,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         report_leader(&mut reported_leader, session.is_some());
 
         if let Some(held) = session.as_mut() {
-            let c = held.client_mut();
-            let sealed = staging::seal_if_active_nonempty(c, &wake_channel).await;
-            // A refused seal (`RingFull`, after its own retirement retry) is
-            // backpressure on a working connection, not a failure of it: the
-            // rest of the tick still runs. The housekeeping pass is what
-            // reclaims a dead claimant's hold on the oldest segment, the one
-            // thing that can keep retirement from freeing a slot, so skipping
-            // it here would keep the ring full for good.
-            let ring_full = matches!(sealed, Err(StagingError::RingFull { .. }));
-            let mut failed = failures.check("seal", sealed).is_err() && !ring_full;
-            // Issue #273: everything but the seal
-            // runs on the housekeeping cadence, not every tick. See
-            // [`HousekeepingSchedule`] for what each step's added latency is.
-            let housekeeping_due = !failed && housekeeping.due(Instant::now());
-            if housekeeping_due {
-                if !failed {
-                    let recovered =
-                        staging::recover_stuck_seals(c, &seal_config, &wake_channel).await;
-                    failed = failures.check("recover_stuck_seals", recovered).is_err();
-                }
-                if !failed {
-                    let reclaimed = staging::reclaim_stale(c, reclaim_ttl).await;
-                    failed = failures.check("reclaim_stale", reclaimed).is_err();
-                }
-                if !failed {
-                    // Backfill chunks' own reclaim-stale sweep (ADR-0002):
-                    // a drain worker that died mid-chunk leaves a
-                    // stale claim here, freed the same way a stale `seg_claims`
-                    // row is above.
-                    let reclaimed = chunk_queue::reclaim_stale_chunks(c, reclaim_ttl).await;
-                    failed = failures.check("reclaim_stale_chunks", reclaimed).is_err();
-                }
-                if !failed {
-                    // Table hygiene for `worker_registry` after an
-                    // unclean shutdown elsewhere in the fleet — a crashed
-                    // drain-only client's row would otherwise sit forever.
-                    // `staging::has_live_workers` never depends on this having
-                    // run (see `staging::worker_registry`'s doc comment); this
-                    // is purely about bounding the table's size over time. Kept
-                    // at least `DEFAULT_RECLAIM_TTL`, the TTL
-                    // `has_live_drain_workers` reads: a peer with the default
-                    // `reclaim_ttl` refreshes its row only every third of that
-                    // (`upkeep_interval`), so this client's shorter `reclaim_ttl`
-                    // would delete a live peer's row between two refreshes.
-                    let reclaimed = staging::reclaim_stale_workers(
-                        c,
-                        reclaim_ttl.max(staging::DEFAULT_RECLAIM_TTL),
-                    )
-                    .await;
-                    failed = failures.check("reclaim_stale_workers", reclaimed).is_err();
-                }
-                if !failed {
-                    // The same hygiene for `drainers`. Worker ids are
-                    // unique per process start, so a restarted or crashed
-                    // process's drainer rows would otherwise sit forever. Kept at
-                    // least a drainer window, so no row a claim still counts goes.
-                    let reclaimed =
-                        staging::reclaim_stale_drainers(c, reclaim_ttl.max(drainer_window)).await;
-                    failed = failures.check("reclaim_stale_drainers", reclaimed).is_err();
-                }
-                if !failed {
-                    let retired = staging::retire_drained_segments(c).await;
-                    failed = failures.check("retire_drained_segments", retired).is_err();
-                }
-                if !failed {
-                    let collected = staging::collect_tombstones(c).await;
-                    match failures.check("collect_tombstones", collected) {
-                        Ok(n) => tombstone_backlog = staging::retire::may_leave_backlog(n),
-                        Err(_) => failed = true,
-                    }
-                }
-                if !failed {
-                    // ADR-0009 decision 5's staging_segments{state} gauge and
-                    // the ring's gauges (rows, bytes, oldest undrained age,
-                    // undrained bytes per source table): one statement on this
-                    // connection, which maintenance_loop already ticks on
-                    // regardless, so the gauges add no transaction to the
-                    // pass. A failed read just skips a gauge refresh rather
-                    // than derailing the tick's other work.
-                    let reading = staging::ring_gauges::read(c).await;
-                    if let Ok(reading) = failures.check("ring_gauges", reading) {
-                        for (state, count) in reading.segments {
-                            crate::metrics::set_staging_segments(state.as_sql(), count as u64);
-                        }
-                        crate::metrics::set_ring_gauges(reading.ring);
-                    }
-                    // The status and liveness gauges, read in the same pass,
-                    // in one read-only snapshot so a definition resumed or
-                    // dropped between its reads isn't counted paused for an
-                    // `unknown` cause.
-                    let reading = async {
-                        let txn = c
-                            .build_transaction()
-                            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-                            .read_only(true)
-                            .start()
-                            .await?;
-                        let reading = staging::status_gauges::read(
-                            &txn,
-                            pool.floors(),
-                            staging::DEFAULT_RECLAIM_TTL,
-                        )
-                        .await?;
-                        txn.commit().await?;
-                        Ok::<_, crate::defs::catalog::CatalogError>(reading)
-                    }
-                    .await;
-                    if let Ok(reading) = failures.check("status_gauges", reading) {
-                        crate::metrics::set_status_gauges(reading);
-                    }
-                }
-                if !failed
-                    && !c.is_closed()
-                    && let Some(policy) = &held_key_retry
-                {
-                    // Its own pool connections, and a failure is logged
-                    // and tried again at the next housekeeping, not a reason
-                    // to reconnect this session. Skipped once the session has
-                    // closed: the lock is gone, and the next leader's pass
-                    // does this step (it is safe to overlap with ours, but
-                    // there's no point starting it).
-                    if let Err(err) =
-                        staging::quarantine::retry_held_keys(&pool, policy, drain_batch_cap, None)
-                            .await
-                    {
-                        crate::instance_log::warn!(
-                            error = %err,
-                            "couldn't retry the held keys that are due; trying again next pass"
-                        );
-                    }
-                }
-                // A failed pass is retried on the next tick, not a cadence later.
-                housekeeping.finished(Instant::now(), !failed);
-            } else if !failed && tombstone_backlog {
-                // A pass capped per ledger keeps collecting every tick until
-                // it runs dry, so a delete-heavy workload's tombstones are
-                // collected at the rate they were before the cadence, not
-                // capped at one pass per housekeeping interval.
-                let collected = staging::collect_tombstones(c).await;
-                match failures.check("collect_tombstones", collected) {
-                    Ok(n) => tombstone_backlog = staging::retire::may_leave_backlog(n),
-                    Err(_) => failed = true,
-                }
-            }
-            if !failed && Instant::now() >= next_reconcile {
-                let reconciled = reconcile_source_tables(c, &pool, &schema).await;
-                failed = failures
-                    .check("reconcile_source_tables", reconciled)
-                    .is_err();
-                next_reconcile = Instant::now() + reconcile_interval;
-            }
+            let failed = leader.tick(held.client_mut()).await;
             if failed {
                 // Drop and reconnect next tick rather than spin on a wedged
                 // connection; every one of these operations is naturally
@@ -1680,8 +1549,399 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     }
 }
 
+/// What a [`Leader`] needs from the maintenance loop's configuration.
+struct LeaderConfig {
+    pool: Pool,
+    schema: String,
+    wake_channel: String,
+    /// [`housekeeping_interval`]'s clamped interval.
+    housekeeping_interval: Duration,
+    reclaim_ttl: Duration,
+    drainer_window: Duration,
+    reconcile_interval: Duration,
+    held_key_retry: Option<crate::staging::quarantine::HeldKeyRetry>,
+    drain_batch_cap: usize,
+    /// Where refused steps are reported for `status()`.
+    refused: crate::refused_steps::RefusedSteps,
+    /// How long a refused step waits before it runs again.
+    refused_backoff: Duration,
+}
+
+/// What the staging-worker leader does each tick on its session: seal, then
+/// the housekeeping steps on their cadence, then the capture pass on its.
+///
+/// A step the role is refused (`42501`) doesn't end the tick: the rest runs,
+/// and the refused step backs off and is reported ([`crate::refused_steps`]).
+/// Any other failure ends the tick and the caller drops the session, so a
+/// wedged connection isn't spun on.
+struct Leader {
+    config: LeaderConfig,
+    seal_config: SealConfig,
+    failures: StepFailures,
+    housekeeping: HousekeepingSchedule,
+    /// Whether the last tombstone collection may have stopped at its
+    /// per-ledger cap ([`staging::retire::may_leave_backlog`]).
+    tombstone_backlog: bool,
+    /// Due immediately on the very first tick rather than waiting a full
+    /// `reconcile_interval` after startup — `setup_staging` already ran one
+    /// reconciliation pass at that point, but this makes the loop's own
+    /// cadence not depend on when it happens to first observe `Instant::now()`.
+    next_reconcile: Instant,
+    backoff: crate::refused_steps::StepBackoff,
+    limiter: crate::refused_steps::LogLimiter,
+}
+
+impl Leader {
+    fn new(config: LeaderConfig) -> Self {
+        Self {
+            housekeeping: HousekeepingSchedule::new(config.housekeeping_interval),
+            config,
+            seal_config: SealConfig::default(),
+            failures: StepFailures::default(),
+            tombstone_backlog: false,
+            next_reconcile: Instant::now(),
+            backoff: Default::default(),
+            limiter: Default::default(),
+        }
+    }
+
+    /// A new leader's first pass is a capture pass, at once.
+    fn reconcile_now(&mut self) {
+        self.next_reconcile = Instant::now();
+    }
+
+    /// Records `result` as `step`'s outcome and hands back its value. A
+    /// refusal is reported and backs the step off; any other failure sets
+    /// `failed`, which ends the tick.
+    async fn settle<T, E: std::error::Error + 'static>(
+        &mut self,
+        c: &tokio_postgres::Client,
+        step: &'static str,
+        result: Result<T, E>,
+        failed: &mut bool,
+    ) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.failures.succeeded(step);
+                if self.config.refused.clear(step) {
+                    self.backoff.recovered(step);
+                    self.limiter.forget(step);
+                    crate::instance_log::info!(step, "maintenance step recovered");
+                }
+                Some(value)
+            }
+            Err(err) if staging::quarantine::is_insufficient_privilege(&err) => {
+                let message =
+                    staging::quarantine::pg_message(&err).unwrap_or_else(|| err.to_string());
+                drop(err);
+                self.refuse(c, step, message).await;
+                None
+            }
+            Err(err) => {
+                let _ = self.failures.check(step, Err::<(), _>(err));
+                *failed = true;
+                None
+            }
+        }
+    }
+
+    async fn refuse(&mut self, c: &tokio_postgres::Client, step: &'static str, message: String) {
+        use crate::refused_steps::{REFUSAL_LOG_INTERVAL, diagnose};
+        let refused = diagnose(c, &self.config.schema, step, &message).await;
+        let now = Instant::now();
+        self.backoff.refused(step, now, self.config.refused_backoff);
+        let table = refused.object.clone().unwrap_or_default();
+        if self.limiter.allow(step, &table, now, REFUSAL_LOG_INTERVAL) {
+            crate::instance_log::warn!(
+                step,
+                role = refused.role.as_deref().unwrap_or("unknown"),
+                table = %table,
+                missing = %refused.missing.join(", "),
+                error = %message,
+                "maintenance step refused to the worker's role; the rest of the pass runs, \
+                 and it is tried again later (grant the privilege)"
+            );
+        }
+        self.config.refused.set(refused);
+    }
+
+    /// One tick on the leader's session `c`; whether a step failed in a way
+    /// that calls for dropping the session.
+    async fn tick(&mut self, c: &mut tokio_postgres::Client) -> bool {
+        // Runs `$call` (which borrows `c`) unless the step is backing off.
+        macro_rules! step {
+            ($name:literal, $failed:ident, $call:expr) => {{
+                if self.backoff.due($name, Instant::now()) {
+                    let result = $call;
+                    self.settle(c, $name, result, &mut $failed).await
+                } else {
+                    None
+                }
+            }};
+        }
+        let mut failed = false;
+        let wake_channel = self.config.wake_channel.clone();
+        let sealed = if self.backoff.due("seal", Instant::now()) {
+            Some(staging::seal_if_active_nonempty(c, &wake_channel).await)
+        } else {
+            None
+        };
+        // A refused seal (`RingFull`, after its own retirement retry) is
+        // backpressure on a working connection, not a failure of it: the
+        // rest of the tick still runs. The housekeeping pass is what
+        // reclaims a dead claimant's hold on the oldest segment, the one
+        // thing that can keep retirement from freeing a slot, so skipping
+        // it here would keep the ring full for good.
+        let ring_full = matches!(sealed, Some(Err(StagingError::RingFull { .. })));
+        if let Some(sealed) = sealed {
+            self.settle(c, "seal", sealed, &mut failed).await;
+        }
+        if ring_full {
+            failed = false;
+        }
+        // Issue #273: everything but the seal runs on the housekeeping
+        // cadence, not every tick. See [`HousekeepingSchedule`] for what each
+        // step's added latency is.
+        if !failed && self.housekeeping.due(Instant::now()) {
+            let (reclaim_ttl, drainer_window) =
+                (self.config.reclaim_ttl, self.config.drainer_window);
+            if !failed {
+                let seal_config = self.seal_config.clone();
+                step!(
+                    "recover_stuck_seals",
+                    failed,
+                    staging::recover_stuck_seals(c, &seal_config, &wake_channel).await
+                );
+            }
+            if !failed {
+                step!(
+                    "reclaim_stale",
+                    failed,
+                    staging::reclaim_stale(c, reclaim_ttl).await
+                );
+            }
+            if !failed {
+                // Backfill chunks' own reclaim-stale sweep (ADR-0002):
+                // a drain worker that died mid-chunk leaves a
+                // stale claim here, freed the same way a stale `seg_claims`
+                // row is above.
+                step!(
+                    "reclaim_stale_chunks",
+                    failed,
+                    chunk_queue::reclaim_stale_chunks(c, reclaim_ttl).await
+                );
+            }
+            if !failed {
+                // Table hygiene for `worker_registry` after an
+                // unclean shutdown elsewhere in the fleet — a crashed
+                // drain-only client's row would otherwise sit forever.
+                // `staging::has_live_workers` never depends on this having
+                // run (see `staging::worker_registry`'s doc comment); this
+                // is purely about bounding the table's size over time. Kept
+                // at least `DEFAULT_RECLAIM_TTL`, the TTL
+                // `has_live_drain_workers` reads: a peer with the default
+                // `reclaim_ttl` refreshes its row only every third of that
+                // (`upkeep_interval`), so this client's shorter `reclaim_ttl`
+                // would delete a live peer's row between two refreshes.
+                step!(
+                    "reclaim_stale_workers",
+                    failed,
+                    staging::reclaim_stale_workers(
+                        c,
+                        reclaim_ttl.max(staging::DEFAULT_RECLAIM_TTL),
+                    )
+                    .await
+                );
+            }
+            if !failed {
+                // The same hygiene for `drainers`. Worker ids are
+                // unique per process start, so a restarted or crashed
+                // process's drainer rows would otherwise sit forever. Kept at
+                // least a drainer window, so no row a claim still counts goes.
+                step!(
+                    "reclaim_stale_drainers",
+                    failed,
+                    staging::reclaim_stale_drainers(c, reclaim_ttl.max(drainer_window)).await
+                );
+            }
+            if !failed {
+                step!(
+                    "retire_drained_segments",
+                    failed,
+                    staging::retire_drained_segments(c).await
+                );
+            }
+            if !failed
+                && let Some(n) = step!(
+                    "collect_tombstones",
+                    failed,
+                    staging::collect_tombstones(c).await
+                )
+            {
+                self.tombstone_backlog = staging::retire::may_leave_backlog(n);
+            }
+            if !failed {
+                // ADR-0009 decision 5's staging_segments{state} gauge and
+                // the ring's gauges (rows, bytes, oldest undrained age,
+                // undrained bytes per source table): one statement on this
+                // connection, which maintenance_loop already ticks on
+                // regardless, so the gauges add no transaction to the
+                // pass. A failed read just skips a gauge refresh rather
+                // than derailing the tick's other work.
+                let mut ignored = false;
+                if let Some(reading) =
+                    step!("ring_gauges", ignored, staging::ring_gauges::read(c).await)
+                {
+                    for (state, count) in reading.segments {
+                        crate::metrics::set_staging_segments(state.as_sql(), count as u64);
+                    }
+                    crate::metrics::set_ring_gauges(reading.ring);
+                }
+                // The status and liveness gauges, read in the same pass,
+                // in one read-only snapshot so a definition resumed or
+                // dropped between its reads isn't counted paused for an
+                // `unknown` cause.
+                let floors = self.config.pool.floors().clone();
+                let reading = async {
+                    let txn = c
+                        .build_transaction()
+                        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                        .read_only(true)
+                        .start()
+                        .await?;
+                    let reading =
+                        staging::status_gauges::read(&txn, &floors, staging::DEFAULT_RECLAIM_TTL)
+                            .await?;
+                    txn.commit().await?;
+                    Ok::<_, crate::defs::catalog::CatalogError>(reading)
+                }
+                .await;
+                if let Some(reading) = self.settle(c, "status_gauges", reading, &mut ignored).await
+                {
+                    crate::metrics::set_status_gauges(reading);
+                }
+            }
+            if !failed
+                && !c.is_closed()
+                && let Some(policy) = &self.config.held_key_retry
+            {
+                // Its own pool connections, and a failure is logged
+                // and tried again at the next housekeeping, not a reason
+                // to reconnect this session. Skipped once the session has
+                // closed: the lock is gone, and the next leader's pass
+                // does this step (it is safe to overlap with ours, but
+                // there's no point starting it).
+                if let Err(err) = staging::quarantine::retry_held_keys(
+                    &self.config.pool,
+                    policy,
+                    self.config.drain_batch_cap,
+                    None,
+                )
+                .await
+                {
+                    crate::instance_log::warn!(
+                        error = %err,
+                        "couldn't retry the held keys that are due; trying again next pass"
+                    );
+                }
+            }
+            // A failed pass is retried on the next tick, not a cadence later.
+            self.housekeeping.finished(Instant::now(), !failed);
+        } else if !failed && self.tombstone_backlog {
+            // A pass capped per ledger keeps collecting every tick until
+            // it runs dry, so a delete-heavy workload's tombstones are
+            // collected at the rate they were before the cadence, not
+            // capped at one pass per housekeeping interval.
+            if let Some(n) = step!(
+                "collect_tombstones",
+                failed,
+                staging::collect_tombstones(c).await
+            ) {
+                self.tombstone_backlog = staging::retire::may_leave_backlog(n);
+            }
+        }
+        if !failed
+            && Instant::now() >= self.next_reconcile
+            && self.backoff.due("reconcile_source_tables", Instant::now())
+        {
+            let reconciled =
+                reconcile_source_tables(c, &self.config.pool, &self.config.schema).await;
+            self.settle(c, "reconcile_source_tables", reconciled, &mut failed)
+                .await;
+            self.next_reconcile = Instant::now() + self.config.reconcile_interval;
+        }
+        failed
+    }
+}
+
+/// [`Leader`]'s tick on a session of the caller's own, for tests that step
+/// the staging worker by hand.
+#[cfg(feature = "internals")]
+pub struct LeaderTick(Leader);
+
+#[cfg(feature = "internals")]
+impl LeaderTick {
+    /// A leader with every interval at zero, so each tick runs every step,
+    /// reporting its refused steps in `refused`.
+    pub fn new(pool: Pool, schema: &str) -> Self {
+        Self(Leader::new(LeaderConfig {
+            pool,
+            schema: schema.to_string(),
+            wake_channel: "leader_tick".to_string(),
+            housekeeping_interval: Duration::ZERO,
+            reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,
+            drainer_window: staging::DEFAULT_RECLAIM_TTL,
+            reconcile_interval: Duration::ZERO,
+            held_key_retry: None,
+            drain_batch_cap: 1,
+            refused: Default::default(),
+            refused_backoff: Duration::ZERO,
+        }))
+    }
+
+    /// One tick on `client`; whether a step failed in a way that would have
+    /// dropped the session.
+    pub async fn tick(&mut self, client: &mut tokio_postgres::Client) -> bool {
+        self.0.tick(client).await
+    }
+
+    /// The steps the role is refused now.
+    pub fn refused(&self) -> Vec<crate::RefusedStep> {
+        self.0.config.refused.snapshot()
+    }
+}
+
 /// How often a standby tries to take the staging-worker singleton.
 const STANDBY_POLL: Duration = Duration::from_secs(5);
+
+/// The environment variable that replaces the standby poll, and the wait
+/// after a refused `migrate`, with this many milliseconds, so an end-to-end
+/// test of a process that stands by needn't wait out 5 or 60 seconds. Read
+/// only in builds with the `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
+const TEST_STANDBY_POLL_ENV: &str = "TRELLIS_TEST_STANDBY_POLL_MS";
+
+/// The standby poll: [`STANDBY_POLL`], or the test override.
+fn standby_poll() -> Duration {
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(ms) = std::env::var(TEST_STANDBY_POLL_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    STANDBY_POLL
+}
+
+/// The wait after a refused `migrate` that waits on an operator:
+/// [`MIGRATE_REFUSED_RETRY`], or the test override.
+fn migrate_refused_retry() -> Duration {
+    #[cfg(any(test, feature = "test-util"))]
+    if std::env::var_os(TEST_STANDBY_POLL_ENV).is_some() {
+        return standby_poll();
+    }
+    MIGRATE_REFUSED_RETRY
+}
 
 /// How soon a leader that lost its session retries the singleton, then again,
 /// before it falls back to [`STANDBY_POLL`]. Its lock frees as soon as the
@@ -1707,7 +1967,7 @@ impl LockSchedule {
     fn standby(now: Instant) -> Self {
         Self {
             refused: LOST_LEADER_RETRIES.len(),
-            next: now + STANDBY_POLL,
+            next: now + standby_poll(),
         }
     }
 
@@ -1742,7 +2002,7 @@ impl LockSchedule {
         let delay = LOST_LEADER_RETRIES
             .get(self.refused)
             .copied()
-            .unwrap_or(STANDBY_POLL);
+            .unwrap_or_else(standby_poll);
         self.next = now + delay;
     }
 }
@@ -2055,6 +2315,17 @@ impl fmt::Display for ReconcileError {
             ReconcileError::Intake(err) => write!(f, "{err}"),
             ReconcileError::Capture(err) => write!(f, "{err}"),
             ReconcileError::Build(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ReconcileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReconcileError::Catalog(err) => Some(err),
+            ReconcileError::Intake(err) => Some(err),
+            ReconcileError::Capture(err) => Some(err),
+            ReconcileError::Build(err) => Some(err),
         }
     }
 }
@@ -2817,7 +3088,7 @@ async fn worker_upkeep_pass(pool: &Pool, reclaim_ttl: Duration) {
 /// often as [`upkeep_interval`], so the registry row stays live across two
 /// missed passes.
 fn handover_interval(reclaim_ttl: Duration) -> Duration {
-    STANDBY_POLL.min(upkeep_interval(reclaim_ttl))
+    standby_poll().min(upkeep_interval(reclaim_ttl))
 }
 
 /// A background process's identity in the worker registry: what its
@@ -2843,6 +3114,9 @@ struct BackgroundProcess {
     /// what [`crate::DefinitionStatus::migrations_pending`] reports as
     /// `cannot_run`.
     cannot_migrate: CannotMigrate,
+    /// The maintenance steps its role is refused, while they stay refused
+    /// ([`crate::RefusedStep`]).
+    refused_steps: crate::refused_steps::RefusedSteps,
     /// When its `migrate` may run again after a refusal that waits on an
     /// operator ([`migrate_retry_after`]), with the standby it reported:
     /// until then each pass reports that standby without trying.
@@ -2869,7 +3143,7 @@ fn migrate_retry_after(err: &crate::error::Error) -> Option<Duration> {
             | Error::MigrationHistory(_)
             | Error::RestoreDefinition { .. }
     ) || crate::error::permission_denied(err);
-    waits_on_an_operator.then_some(MIGRATE_REFUSED_RETRY)
+    waits_on_an_operator.then(migrate_refused_retry)
 }
 
 /// How long a background process waits to try `migrate` again after a
@@ -2919,6 +3193,7 @@ impl BackgroundProcess {
             staging_pid: Arc::new(AtomicI32::new(0)),
             migrate: None,
             cannot_migrate: CannotMigrate::default(),
+            refused_steps: Default::default(),
             migrate_backoff: MigrateBackoff::default(),
         };
         process.register_for_test().await;
@@ -3200,6 +3475,7 @@ pub async fn handover_pass_as(
         staging_pid: Arc::new(AtomicI32::new(0)),
         migrate: Some(config.clone()),
         cannot_migrate: CannotMigrate::default(),
+        refused_steps: Default::default(),
         migrate_backoff: MigrateBackoff::default(),
     };
     handover_pass(&process, true)

@@ -592,6 +592,17 @@ names the floor and this binary's version
 ([observability — Below the catalog floor](observability.md#below-the-catalog-floor)).
 The Elixir and Ruby bindings report it as `below_catalog_floor`.
 
+### `maintenance_refusals`
+
+The ring and maintenance steps the staging worker's role is refused, such as
+retiring a drained segment without `TRUNCATE`: each names the step, the role,
+the table and the privileges it lacks. It pauses nothing and clears itself
+once a pass of the step succeeds. Only the process that leads the staging
+worker knows it, so every other handle reports it empty
+([operations — Other stops and waits](operations.md#other-stops-and-waits)).
+The Elixir and Ruby bindings report it as `maintenance_refusals`, each a
+`RefusedStep`.
+
 ### `floor`
 
 The oldest Trellis release that can run the definition, as
@@ -603,6 +614,13 @@ never changes it. `trellis status` prints it as `floor=`, and the bindings
 report it as `floor`. Before rolling back to an earlier release, drop each
 definition whose floor is above it
 ([upgrading — Before rolling back](upgrading.md#before-rolling-back)).
+
+### `filter`
+
+The definition's [`WHERE`](expressions.md#where), when it is other than a
+lone `TRUE`, as Trellis renders it (each operation parenthesized:
+`(active AND (qty > 0))`): the target holds only the source rows it is `TRUE`
+for. Unset for an unfiltered definition.
 
 ## Limits and defaults
 

@@ -44,9 +44,12 @@ use std::collections::{BTreeSet, HashMap};
 use super::ast::{
     Expr, JoinOn, JoinSpec, JoinedTable, KeySpace, QualifiedColumn, TransformDef, ValueType,
 };
+use super::pg_type::PgType;
 use super::validate::{JoinColumnInfo, ValidationError};
+use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::quote_ident;
+use crate::staging::group_basis::exact_sums::SumKind;
 use crate::staging::group_basis::{Partial, partials_of, sum_parts};
 
 /// Which table of a `JOIN` definition a column or table is.
@@ -236,8 +239,10 @@ pub(crate) fn side_columns(def: &TransformDef, side: Side) -> BTreeSet<String> {
     let mut columns: BTreeSet<String> = join_key(def, side).into_iter().collect();
     columns.extend(group_columns(def, side));
     if let Some(join) = spec(def) {
-        for field in &def.fields {
-            walk_columns(&field.expr, &mut |column| {
+        // The `WHERE`'s columns too: they decide membership.
+        let predicate = def.predicate.filter();
+        for expr in def.fields.iter().map(|field| &field.expr).chain(predicate) {
+            walk_columns(expr, &mut |column| {
                 if side_of_written(def, join, &column.table) == Some(side) {
                     columns.insert(column.column.clone());
                 }
@@ -514,8 +519,9 @@ fn target_partials_tail(numeric: &[bool]) -> Vec<String> {
     columns
 }
 
-/// Whether each of `side`'s aggregate arguments ([`side_arguments`]) is
-/// `numeric`, so its partials keep a map of exceptions.
+/// Whether each of `side`'s aggregate arguments ([`side_arguments`]) keeps
+/// a map of exceptions in its partials: a `numeric` one, and a float or
+/// `interval` one a `SUM` or `AVG` reads (`staging::group_basis::exact_sums`).
 pub(crate) fn numeric_arguments(
     def: &TransformDef,
     side: Side,
@@ -524,13 +530,30 @@ pub(crate) fn numeric_arguments(
 ) -> Vec<bool> {
     side_arguments(def, side)
         .iter()
-        .map(|arg| {
-            matches!(
-                argument_type(def, arg, from, joined),
-                Ok(ValueType::Numeric)
-            )
+        .map(|arg| match argument_type(def, arg, from, joined) {
+            Ok(ValueType::Numeric) => true,
+            Ok(value_type @ (ValueType::Float(_) | ValueType::Other(PgType::Interval))) => {
+                summed(def, arg) && SumKind::of(value_type).is_some()
+            }
+            _ => false,
         })
         .collect()
+}
+
+/// Whether a `SUM` or `AVG` of `def`'s fields reads the argument `arg`.
+fn summed(def: &TransformDef, arg: &Expr) -> bool {
+    fn walk(expr: &Expr, arg: &Expr) -> bool {
+        match expr {
+            Expr::FunctionCall { name, args }
+                if matches!(name.to_ascii_uppercase().as_str(), "SUM" | "AVG")
+                    && args.first() == Some(arg) =>
+            {
+                true
+            }
+            _ => expr.children().into_iter().any(|child| walk(child, arg)),
+        }
+    }
+    def.fields.iter().any(|field| walk(&field.expr, arg))
 }
 
 /// The fields of a `JOIN` target that are not one of its `GROUP BY` keys, in
@@ -718,6 +741,14 @@ pub(crate) fn reference_scales(
     side_arguments(def, side)
         .iter()
         .map(|arg| {
+            // A float or `interval` sum's reference scale is its kind's.
+            if summed(def, arg)
+                && let Ok(value_type) = argument_type(def, arg, from, joined)
+                && let Some((kind, _)) = SumKind::of(value_type)
+                && let Some(scale) = kind.reference_scale()
+            {
+                return Some(scale);
+            }
             let Expr::SourceColumn { column, .. } = arg else {
                 return None;
             };
@@ -763,13 +794,19 @@ pub(crate) fn field_pg_type(
     if let Expr::FunctionCall { name, args } = &field.expr {
         match (name.to_ascii_uppercase().as_str(), args.as_slice()) {
             ("COUNT", _) => return Ok("bigint".to_string()),
-            ("AVG", _) => return Ok("numeric".to_string()),
-            ("SUM", [arg]) => {
-                let narrow = matches!(
-                    argument_type(def, arg, from, joined)?,
-                    ValueType::Integer(IntWidth::Int2 | IntWidth::Int4)
-                );
-                return Ok(if narrow { "bigint" } else { "numeric" }.to_string());
+            (function @ ("SUM" | "AVG"), [arg]) => {
+                let value_type = argument_type(def, arg, from, joined)?;
+                return Ok(match (function, value_type) {
+                    ("AVG", ValueType::Float(_)) => "double precision",
+                    ("AVG", ValueType::Other(PgType::Interval)) => "interval",
+                    ("AVG", _) => "numeric",
+                    (_, ValueType::Integer(IntWidth::Int2 | IntWidth::Int4)) => "bigint",
+                    (_, ValueType::Float(FloatWidth::Float4)) => "real",
+                    (_, ValueType::Float(FloatWidth::Float8)) => "double precision",
+                    (_, ValueType::Other(PgType::Interval)) => "interval",
+                    _ => "numeric",
+                }
+                .to_string());
             }
             _ => {}
         }

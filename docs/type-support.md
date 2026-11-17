@@ -25,7 +25,7 @@ ordered floor to ceiling:
    Needs an immutable operator or function in the registry and, for a
    constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field has this type: `COUNT`,
-   `SUM` or `AVG` over an integer or `numeric` column or expression, and, on a plain
+   `SUM` or `AVG` over a number or `interval` column or expression, and, on a plain
    aggregate, `MIN` or `MAX` over a column of a number, date or time type
    ([`MIN` and `MAX`](#min-and-max)).
 
@@ -46,13 +46,13 @@ filter role.
 | `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` `MIN` `MAX` |
 | `oid` | yes | yes | yes | yes | typed literal only | `MIN` `MAX` (no arithmetic in Postgres) |
 | `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG`; `MIN` `MAX` |
-| `real` `double precision` | yes | no | no | no | yes | `MIN` `MAX` |
+| `real` `double precision` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` |
 | `boolean` | yes | no | yes | no | yes | no |
 | `uuid` | yes | yes | yes | yes | yes | no |
 | `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | no |
 | `bytea` | yes | yes | yes | yes | typed literal | no |
 | `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | `MIN` `MAX`, but not over `timetz` |
-| `interval` | yes | no | no | no | yes | `MIN` `MAX` |
+| `interval` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` |
 | `jsonb` | yes | no | no | no | typed literal | no |
 | `inet` | yes | no | yes | no | typed literal | no |
 | `cidr` | yes | yes | yes | yes | typed literal | no |
@@ -88,7 +88,9 @@ modifiers. A 1-1 copy holds the source's exact rendering: a `numeric` rewritten 
 `1.25` to `1.2500`, an `interval` from `'1 day'` to `'24 hours'` and a float
 from `-0` to `0` reach the copy, though each pair is equal as a value
 ([ADR-0020](decisions/0020-type-identity.md)). A `GROUP BY` key's column (in the target and its hidden table) takes its value family's type: `integer` or `bigint` by width, `text` for any
-string, unconstrained `numeric`, a temporal type at full precision. A `JOIN`
+string, unconstrained `numeric`, a temporal type at full precision. A field
+reads a `char(n)` or `name` key as its source type, as Postgres's `GROUP BY`
+does, so `ch = 'ab  '` ignores trailing blanks. A `JOIN`
 holds its `GROUP BY` and `ON` columns in each column's type and collation, in
 its target and its hidden tables, with no modifier.
 
@@ -186,7 +188,9 @@ per value. So:
   through `COALESCE`, a `CASE` result or another field: such a collation's `=`
   calls two different texts equal. `IS [NOT] NULL` accepts any column.
 - **`char(n)`** is treated as `text` but is not on the key allowlist: its
-  blank-padding is a hazard, not a volatility one.
+  blank-padding is a hazard, not a volatility one. A string literal compared
+  with one, or beside one in `COALESCE`, `NULLIF` or a `CASE`, is a `char(n)`,
+  as Postgres types it: `ch = 'ab  '` ignores trailing blanks.
 
 What happens when a collation changes after define is in
 [capture drift](staging-and-claiming/capture-drift.md#a-re-typed-key-column-or-an-outgrown-copy),
@@ -255,10 +259,13 @@ is widened to `double precision`, so the comparison runs in `double precision`:
 with `r = 0.1::real`, `r > 0.1` is true (the widened `r` is 0.10000000149...),
 `r = 0.1` is false and `r > 0.1::real` is false. Floats are refused as every
 key role: `-0` and `0` are equal but render as `'-0'` and `'0'`, which would
-split one group into two target rows. `SUM` and `AVG` over a float are refused
-at define ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
-float addition is not associative, and `NaN`/`Infinity` are absorbing, so
-there is no exact inverse. `extra_float_digits >= 1` is pinned for the
+split one group into two target rows. `SUM` and `AVG` over a float are the
+exact sum of the values, rounded once to the result type, with `NaN` and the
+infinities counted. This departs from Postgres's `sum()`, which adds in scan
+order (`{1e20, 1, -1e20}` sums to 0 or 1; the exact sum is 1), adds `real`s
+in `real`, and keeps a `-0` sum that the exact sum reads as `0`
+([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
+`extra_float_digits >= 1` is pinned for the
 shortest-round-trip rendering `trellis::float::render` reproduces. Checked in
 `trellis/tests/defs/defs_floats.rs`.
 
@@ -401,10 +408,11 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
   disagrees with `::text` (a `T` separator), which is why no engine read uses
   it. `defs_temporal.rs` sweeps the whole key allowlist for render agreement.
 - **`interval`** is refused as a key: `'24 hours' = '1 day'` is true but they
-  render differently, and no renderer fix helps. `SUM`/`AVG(interval)` is
-  refused ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
-  `interval` addition is exact but partial (`infinity + -infinity` raises, and
-  overflow depends on scan order), which a delta cannot represent.
+  render differently, and no renderer fix helps. `SUM(interval)` is the
+  exact fieldwise sum and raises `interval out of range` only when the final
+  value is, where Postgres's `sum()` raises by scan order; `AVG(interval)`
+  is Postgres's `avg()` wherever the sum is in range
+  ([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
 - Typed literals exist for `DATE`, `TIMESTAMP`, `TIME` and `TIMETZ`, not
   `TIMESTAMPTZ` (no canonical-form checker) or `INTERVAL` (`interval_in` reads
   `IntervalStyle`). The text must be in Postgres's canonical output spelling.

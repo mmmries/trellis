@@ -51,6 +51,46 @@ defmodule Trellis.StructureDumpTest do
     assert_loads(cluster, pg, path, "new")
   end
 
+  test "a structure file dumped where Trellis is on loads plain targets where it is off",
+       %{cluster: cluster, pg: pg, tmp_dir: dir} do
+    source = define_widgets(cluster, pg, "off")
+    on_exit(fn -> Trellis.shutdown(source) end)
+    path = Path.join(dir, "structure.sql")
+    Mix.Tasks.Trellis.Dump.run(~w(-r Trellis.TestRepo --dump-path #{path} --quiet))
+    assert File.read!(path) =~ "restore_queue"
+
+    Application.put_env(:trellis_pg, :enabled, false)
+    on_exit(fn -> Application.delete_env(:trellis_pg, :enabled) end)
+
+    database = "dump_loaded_off"
+    Postgrex.query!(pg, "create database #{database}", [])
+    stop_supervised!(TestRepo)
+    # Off, nothing connects to the :trellis url, so one at a database that
+    # doesn't exist is neither refused nor reached.
+    url = String.replace(cluster["dsn"], cluster["dbname"], "elsewhere")
+    put_repo_config(cluster, database: database, dump_path: path, trellis: [url: url])
+    Mix.Tasks.Trellis.Load.run(~w(-r Trellis.TestRepo --quiet))
+
+    loaded = TestCluster.postgrex!(Map.put(cluster, "dbname", database))
+
+    # The target is a plain table: no definition was restored, so there is
+    # no catalog, no ledger and no capture trigger, and both tables take
+    # writes directly.
+    assert %{rows: [[true, false, false, 0]]} =
+             Postgrex.query!(
+               loaded,
+               "select to_regclass('public.dump_widget_prices_off') is not null, " <>
+                 "to_regclass('public.dump_widget_prices_off__ledger') is not null, " <>
+                 "to_regclass('trellis.transform_definitions') is not null, " <>
+                 "(select count(*)::int from pg_trigger where not tgisinternal)",
+               []
+             )
+
+    Postgrex.query!(loaded, "insert into dump_widgets_off values (1, 5)", [])
+    Postgrex.query!(loaded, "insert into dump_widget_prices_off (id, price) values (1, 5)", [])
+    GenServer.stop(loaded)
+  end
+
   test "a structure file in the older format still loads",
        %{cluster: cluster, pg: pg, tmp_dir: dir} do
     source = define_widgets(cluster, pg, "old")

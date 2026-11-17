@@ -158,7 +158,11 @@ doesn't rewrite a key whose text alone changed.
 A sum or average kept from partials carries exactly the scale Postgres's own
 `sum()` and `avg()` show
 ([ADR-0002](0002-async-data-flow.md#numeric-sums-count-their-scales-and-special-values)).
-`SUM`/`AVG` over `real` or `interval` is refused at define. A `MIN` or `MAX`
+A float or `interval` sum is compared exactly against an exact recompute
+from the source, the same conversion rendered apart, not against Postgres's
+`sum()`
+([ADR-0002](0002-async-data-flow.md#float-and-interval-sums-are-exact)).
+A `MIN` or `MAX`
 column is compared by its type's `=`: over a float, an `interval` or an
 unconstrained `numeric` the target holds one of the equal values (`1.0` or
 `1.00`, `-0` or `0`, `'1 day'` or `'24 hours'`), as Postgres's own `min()`
@@ -210,13 +214,15 @@ and the target may not have applied it yet. Two comparisons handle that lag:
   earliest one (no row, for an insert), and the live source row for any other
   key. A change its page would refuse is no unapplied change there: at or below
   the target's truncate floor, at or below its key's applied `lsn` (a later batch
-  of the key drained first), or seen by its key's basis. The comparison is exact for every key and group with no lag window, so a
+  of the key drained first), or seen by its key's basis. The comparison is exact for every key and group with no lag window, except a
+  key with no ledger entry whose earliest unapplied change has an old image, so a
   divergence is reported from one pass.
 - **Otherwise a divergence is re-checked.** A divergence is reported as real only if it
   **survives a re-check after a fresh await** — a genuine divergence is stable; a
   convergence race resolves. This applies to a divergence on a key or group the
-  subtraction can't vouch for: one an unapplied change with no usable image (a `Recompute`) may touch, or a held key
-  whose parked origin is unknown. An unapplied op of the source that touches every
+  subtraction can't vouch for: one an unapplied change with no usable image (a `Recompute`) may touch, a held key
+  whose parked origin is unknown, or a key with no ledger entry whose earliest unapplied
+  change has an old image (a build read the source past it). An unapplied op of the source that touches every
   key or group (a `TRUNCATE`, a partition's truncate, a schema change) makes the whole
   page re-check, as does any image-less unapplied change of either table for a JOIN's
   target part.

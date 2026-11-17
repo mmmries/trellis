@@ -29,8 +29,8 @@ class TrellisTest < Minitest::Test
                                      capture_failure: nil, held_keys: nil, drain_failure: nil,
                                      source_index_gaps: [], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
                                      build_wait_xid: nil, version_handover: nil,
-                                     below_catalog_floor: nil, join: nil,
-                                     floor: "0.2.0"),
+                                     below_catalog_floor: nil, maintenance_refusals: [], join: nil,
+                                     floor: "0.2.0", filter: nil),
                  status
 
     # The backfill carried the existing row across.

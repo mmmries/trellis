@@ -110,6 +110,9 @@ impl OneToOneRender {
                 crate::defs::oracle::render_qualified_expr_sql(expr, "s"),
             ));
         }
+        // The `WHERE`'s columns, read whichever fields are paused: they
+        // decide whether the row is a member.
+        read.extend(crate::defs::oracle::predicate_columns(def));
         let columns = source_columns
             .iter()
             .filter(|c| read.contains(&c.name))

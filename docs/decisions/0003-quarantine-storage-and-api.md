@@ -199,7 +199,7 @@ for just that column's formula, without touching other columns or the
 transform's lifecycle status.
 
 **What the column fuse counts.** Postgres evaluates every field in the
-statement that writes it ([ADR-0002](0002-async-data-flow.md#the-1-1-ledger-one-target-owned-entry-per-source-row)),
+statement that writes it ([ADR-0002](0002-async-data-flow.md#the-1-1-ledger-one-target-owned-entry-per-member-row)),
 so a value one field can't be computed from fails the page's whole statement.
 Such a failure is a data exception, SQLSTATE class 22: an overflow, an invalid
 regex, an out-of-range or invalid cast. It takes the isolation path: the page

@@ -30,8 +30,10 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert %Trellis.Status{
@@ -76,8 +78,10 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert %Trellis.Status{
@@ -129,8 +133,10 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -168,8 +174,10 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.source_index_gaps == [
@@ -207,8 +215,10 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.extreme_index_gaps == [struct!(Trellis.ExtremeIndexGap, gap)]
@@ -233,8 +243,10 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.paused_upstream_columns == ["t.total"]
@@ -269,8 +281,10 @@ defmodule Trellis.StatusTest do
         build_wait_xid: 4_294_967_301,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.build_wait_xid == 4_294_967_301
@@ -301,8 +315,10 @@ defmodule Trellis.StatusTest do
           migrations_pending: false
         },
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.build_wait_xid == nil
@@ -334,14 +350,57 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: %{floor: "0.3.0", this_version: "0.2.0"},
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.below_catalog_floor == %Trellis.BelowCatalogFloor{
              floor: "0.3.0",
              this_version: "0.2.0"
            }
+  end
+
+  test "a refused maintenance step becomes a struct naming what to grant" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        extreme_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil,
+        below_catalog_floor: nil,
+        maintenance_refusals: [
+          %{
+            step: "retire_drained_segments",
+            role: "worker",
+            object: "seg_0",
+            missing: ["TRUNCATE"],
+            error: "permission denied for table seg_0"
+          }
+        ],
+        join: nil,
+        floor: "0.2.0",
+        filter: nil
+      })
+
+    assert status.maintenance_refusals == [
+             %Trellis.RefusedStep{
+               step: "retire_drained_segments",
+               role: "worker",
+               object: "seg_0",
+               missing: ["TRUNCATE"],
+               error: "permission denied for table seg_0"
+             }
+           ]
   end
 
   test "a join status keeps its tables, warnings and build step" do
@@ -360,6 +419,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: %{
           hidden_tables: [
             %{table: "P", name: "join_7_p", estimated_rows: 5_000_000_011, bytes: 9_000_000_017},
@@ -379,7 +439,8 @@ defmodule Trellis.StatusTest do
             position: nil
           }
         },
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.join == %Trellis.JoinStatus{
@@ -437,6 +498,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: %{
           hidden_tables: [],
           partials_warning: nil,
@@ -450,7 +512,8 @@ defmodule Trellis.StatusTest do
             position: nil
           }
         },
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.join == %Trellis.JoinStatus{
@@ -489,7 +552,7 @@ defmodule Trellis.StatusTest do
            }
   end
 
-  test "a transform's floor keeps the release it names" do
+  test "a transform's floor and filter keep what the engine reports" do
     status =
       Trellis.Status.from_native(%{
         status: :live,
@@ -505,11 +568,14 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
-        floor: "0.3.1"
+        floor: "0.3.1",
+        filter: "(qty > 0)"
       })
 
     assert status.floor == "0.3.1"
+    assert status.filter == "(qty > 0)"
     assert status.paused_upstream_columns == ["upstream.amount"]
   end
 

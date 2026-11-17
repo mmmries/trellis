@@ -125,7 +125,8 @@ there is no `interval`. `infinity` and `-infinity` follow Postgres
 (`infinity + 1` is `infinity`, `EXTRACT(year FROM 'infinity'::date)` is
 `Infinity`, `EXTRACT(day FROM ...)` of it is `NULL`), and a row whose date
 leaves the range (`date + n` past 5874897-12-31, two dates one of which is
-infinite, a date past 294276-12-31 cast to `timestamp`) raises `22008` for
+infinite, a date past 294276-12-31 cast to `timestamp`, a `DATE_TRUNC` that
+truncates below the `timestamp` range) raises `22008` for
 that row's record, which is quarantined; a constant that does fails every row.
 
 A bucket for an aggregate is computed in a 1-1 transform and grouped by in
@@ -143,6 +144,36 @@ row (current time, timezone, collation, session settings, random values) is
 disallowed: incremental maintenance requires that re-evaluating a formula on
 unchanged inputs always yields the same result.
 
+## WHERE
+
+A transform's `WHERE` is an expression of this grammar, of type `boolean`,
+read as Postgres reads it ([ADR-0004](decisions/0004-transform-definition-grammar.md)).
+A row is a member when it is `TRUE`; `FALSE` and `NULL` exclude it. Every name
+is a source column, never a field, and it calls no aggregate.
+
+It must be **total**: no construct in it may raise an error for any value of
+its operand types, since a predicate that raised would stop every statement
+reading the row. Admitted:
+
+* column reads, literals, `IS [NOT] NULL`, `AND`, `OR`, `NOT`;
+* every comparison and `NULLIF`, except between two text columns (their
+  collations can conflict) and a number literal beside a float that the float
+  can't hold;
+* `CASE` and `COALESCE`, unless they mix `numeric` with a float;
+* the casts but `date` to `timestamp`;
+* `-`, `ABS`, `TRUNC` of a `numeric` or a float, and `CEIL`, `FLOOR` of a
+  float;
+* `EXTRACT`, `AT TIME ZONE 'UTC'`, `DATE_TRUNC` to a `week` or less,
+  `CHAR_LENGTH`, `OCTET_LENGTH`, `STRPOS` reading at most one text column;
+* `%` by a nonzero number literal.
+
+Everything else is refused by name: `+`, `-`, `*`, `/` (overflow, division by
+zero), date arithmetic, `-` and `ABS` of an integer, `CEIL`, `FLOOR` and
+`ROUND` of a `numeric`, `DATE_TRUNC` to a month or more, and `REGEXP_COUNT`.
+Compare without the arithmetic where algebra allows (`amount > discount`), or
+compute the value in a stored generated column or a [chained](transforms.md#chaining-and-cycle-detection)
+1-1 transform and filter on that.
+
 ## Refusals
 
 The columns are those of [transforms' table](transforms.md#refusals); "After
@@ -159,6 +190,7 @@ an entry under [Details](#details) where it needs more room.
 | [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | [T0079 MixedFloatExactComparison](errors.md#t0079-mixedfloatexactcomparison) | [Retype](transforms.md#retype) |
 | A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`): a conversion to or from `timestamptz` reads the session time zone | [T0080 MixedTemporalComparison](errors.md#t0080-mixedtemporalcomparison) | [Retype](transforms.md#retype) |
 | `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` are admitted | [T0081 TextOrderingComparison](errors.md#t0081-textorderingcomparison) | [Retype](transforms.md#retype) |
+| A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` over text columns of two different collations, neither the database default, directly or through `COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and fails every row where both are not `NULL` | [T0233 ConflictingCollations](errors.md#t0233-conflictingcollations) | A column re-collated later holds each key written ([releasing held keys](operations.md#releasing-held-keys)), and `RESUME` refuses it |
 | A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, enums, `inet`, …) | [T0082 ComparisonTypeMismatch](errors.md#t0082-comparisontypemismatch) | [Retype](transforms.md#retype) |
 | Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | [T0024 NonAssociativeComparison](errors.md#t0024-nonassociativecomparison) | [Text](transforms.md#text) |
 | **Grammar forms and typing** | | |
@@ -183,6 +215,9 @@ an entry under [Details](#details) where it needs more room.
 | `DATE_TRUNC` of a `date` or `timestamptz`, `EXTRACT` of any type but `date` and `timestamp`, and `date_part` (an unsupported function) | [T0090 TemporalOperand](errors.md#t0090-temporaloperand) | [Retype](transforms.md#retype) |
 | [A `DATE_TRUNC` unit or `EXTRACT` field that is not admitted](#a-date_trunc-unit-or-extract-field-that-is-not-admitted) | [T0091 TemporalLiteral](errors.md#t0091-temporalliteral) | [Text](transforms.md#text) |
 | `AT TIME ZONE` with a zone other than the literal `'UTC'`, or over anything but a `timestamptz`: zone offsets change with time zone database releases | [T0091 TemporalLiteral](errors.md#t0091-temporalliteral) (the zone), [T0090 TemporalOperand](errors.md#t0090-temporaloperand) (the operand) | [Retype](transforms.md#retype) |
+| **`WHERE`** | | |
+| A `WHERE` that isn't `boolean`, or that calls an aggregate | [T0234 PredicateNotBoolean](errors.md#t0234-predicatenotboolean), [T0235 AggregateInPredicate](errors.md#t0235-aggregateinpredicate) | [Retype](transforms.md#retype); an aggregate, [Text](transforms.md#text) |
+| A [`WHERE` construct that can raise an error](#where) | [T0237 PredicateNotTotal](errors.md#t0237-predicatenottotal) | [Retype](transforms.md#retype) |
 | **Field, column and table names** | | |
 | Two fields with one name, or fields that read each other in a cycle | [T0040 DuplicateFieldName](errors.md#t0040-duplicatefieldname), [T0045 Cycle](errors.md#t0045-cycle) | [Text](transforms.md#text) |
 | A field named after a 1-1 source key column or a 1-1 `JOIN`'s `a` key column (`id AS id`; `id AS order_id` is fine), or a field or `GROUP BY` column whose name starts with `__` | [T0043 FieldNamedAfterPrimaryKey](errors.md#t0043-fieldnamedafterprimarykey), [T0041 ReservedFieldName](errors.md#t0041-reservedfieldname), [T0042 ReservedGroupByColumnName](errors.md#t0042-reservedgroupbycolumnname) | [Text](transforms.md#text) |
