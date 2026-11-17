@@ -68,13 +68,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::Predicate;
+use crate::defs::ast::{Expr, Predicate};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
 
 use super::group_basis::{self, Agg, GroupShape, SumPart};
-use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
+use super::self_check::{
+    AuditRender, ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_audit, render_leaf,
+};
 use super::self_check_keyset::{BYTE_ORDER, Keyset};
 use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
 
@@ -353,7 +355,10 @@ fn page_sql(
         .collect();
     let mut implied = Vec::with_capacity(shape.fields.len());
     for (_, pg_type, expr) in &shape.fields {
-        implied.push(format!("(({})::{pg_type})::text", render_leaf(expr)));
+        implied.push(format!(
+            "(({})::{pg_type})::text",
+            render_field(shape, expr)
+        ));
     }
     let lateral = if aggs.is_empty() {
         String::new()
@@ -430,6 +435,35 @@ fn page_sql(
         bounds.push(7);
     }
     Ok(keyset.ranked_by_value(&ctes, &sides, &bounds, &extra))
+}
+
+/// A field over the hidden row's partials and keys, each key read as the
+/// type the field reads it as (`GroupShape::key_reads`): a `char(n)` key,
+/// kept as `text`, compares as a `char(n)` (#2053).
+fn render_field(shape: &GroupShape, expr: &Expr) -> String {
+    struct Field<'s>(&'s GroupShape);
+    impl AuditRender<'_> for Field<'_> {
+        type Error = std::convert::Infallible;
+        fn column(&mut self, expr: &Expr) -> Result<String, Self::Error> {
+            let (Expr::Column(name) | Expr::SourceColumn { column: name, .. }) = expr else {
+                unreachable!("a column read")
+            };
+            let shape = self.0;
+            let read = shape
+                .group_cols
+                .iter()
+                .position(|key| key == name)
+                .and_then(|i| shape.key_reads.as_ref()?.get(i).copied().flatten());
+            Ok(match read {
+                Some(read) => format!("cast({} as {read})", quote_ident(name)),
+                None => quote_ident(name),
+            })
+        }
+    }
+    match render_audit(&mut Field(shape), expr, 0) {
+        Ok(text) => text,
+        Err(never) => match never {},
+    }
 }
 
 /// The hidden extremes, one per column ([`group_basis::Extreme::column`]),

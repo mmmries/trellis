@@ -726,7 +726,8 @@ fn group_shape(def: &Definition) -> Option<super::group_basis::GroupShape> {
 
 /// [`group_shape`] with each `numeric` sum's reference scale, as the hidden
 /// table records it (`super::group_basis::stored_scales`): the audit reads
-/// the stored maps by it.
+/// the stored maps by it. And the type a field reads each key as, from the
+/// type recorded for it (`GroupShape::read_key_types`).
 async fn read_group_shape(
     pool: &Pool,
     def: &Definition,
@@ -740,6 +741,9 @@ async fn read_group_shape(
             &**client,
             &super::group_basis::hidden_table_qualified(pool.schema(), def.id),
         )
+        .await?;
+    shape
+        .read_key_types(&**client, def.id, &def.source_table)
         .await?;
     Ok(Some(shape))
 }

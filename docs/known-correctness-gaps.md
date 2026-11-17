@@ -45,6 +45,8 @@ Postgres, hidden tables included, detects and never repairs
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
+| **Values Trellis computes differently from Postgres** | | |
+| [A `char(n)` `GROUP BY` key without its padding](#a-charn-group-by-key-without-its-padding) | not detected | [#2069](https://github.com/salesforce-misc/trellis/issues/2069) (decision) |
 
 ## Preconditions
 
@@ -518,6 +520,33 @@ ring held.
 TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
+
+## Values Trellis computes differently from Postgres
+
+### A `char(n)` `GROUP BY` key without its padding
+
+**When:** an aggregate groups by a `char(n)` column, and a field reads the
+padding of the key:
+
+```sql
+TRANSFORM g FROM s GROUP BY ch SELECT OCTET_LENGTH(ch) AS o, COUNT(*) AS n
+```
+
+**What goes wrong:** the aggregate keeps the key as `text`, which drops the
+trailing blanks. For a `char(4)` holding `'ab'`, `o` is `2` where Postgres's
+`GROUP BY ch` gives `4`, and the target's key is `'ab'` where Postgres's is
+`'ab  '`. A comparison of the key is unaffected: a field reads it as
+`char(n)`
+([type support](type-support.md#the-types-of-the-columns-trellis-creates)).
+
+**Detected by:** not detected. `self_check`'s recompute reads the same
+unpadded key.
+
+**Repair:** none. Avoid a function that reads the padding over such a key,
+or group by a `text` column.
+
+**Ends with:** [#2069](https://github.com/salesforce-misc/trellis/issues/2069),
+a design decision.
 
 ## Repairing a gap
 
