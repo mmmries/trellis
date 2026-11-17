@@ -21,6 +21,7 @@ mod defs_bit;
 mod defs_boolean;
 mod defs_bytea;
 mod defs_catalog;
+mod defs_collation_conflict;
 mod defs_count_column;
 mod defs_ddl;
 mod defs_deleted_oneone_target_reduces_chained_aggregate;

@@ -1,0 +1,273 @@
+//! A comparison of two text columns whose collations conflict is refused at
+//! define. Postgres raises `42P22` ("could not determine which collation to
+//! use") on every row where both are not `NULL`, so a definition over an
+//! empty table would define, then fail each write (confirmed against the
+//! engine before the refusal: every drain failed with that error).
+//!
+//! `"C"` and `"POSIX"` are two deterministic collations with different OIDs.
+//! The database default yields to either, so it never conflicts.
+
+use crate::support::pipeline;
+
+use pipeline::columns;
+
+use testkit::TestCluster;
+use trellis::defs::{
+    CatalogError, ConflictingCollations, Statement, ValidationError, ValueType, alter_transform,
+    install_definition, parse_statement,
+};
+
+const DDL: &str = r#"create table s (id bigint primary key, g integer, a text collate "C",
+                         p text collate "POSIX", d text, a2 text collate "C");
+                     create table o (id bigint primary key, p text collate "POSIX")"#;
+
+async fn batch(pool: &trellis::pool::Pool, sql: &str) {
+    pool.get()
+        .await
+        .expect("get connection")
+        .batch_execute(sql)
+        .await
+        .expect("set up tables");
+}
+
+fn s_columns() -> std::collections::HashMap<String, ValueType> {
+    columns(&[
+        ("id", ValueType::Numeric),
+        ("g", ValueType::Numeric),
+        ("a", ValueType::Text),
+        ("p", ValueType::Text),
+        ("d", ValueType::Text),
+        ("a2", ValueType::Text),
+    ])
+}
+
+fn assert_conflict(err: CatalogError, field: &str, construct: &str, first: &str, second: &str) {
+    let message = err.to_string();
+    let CatalogError::Validate(ValidationError::ConflictingCollations(conflict)) = err else {
+        panic!("expected ConflictingCollations, got {err:?}");
+    };
+    let ConflictingCollations {
+        field: got_field,
+        construct: got_construct,
+        first_column,
+        second_column,
+        ..
+    } = *conflict;
+    assert_eq!(
+        (got_field.as_str(), got_construct.as_str()),
+        (field, construct),
+        "{message}"
+    );
+    assert_eq!(
+        (first_column.as_str(), second_column.as_str()),
+        (first, second),
+        "{message}"
+    );
+    assert!(message.starts_with("T0233"), "{message}");
+}
+
+/// A 1-1 refuses `a = p` over an empty table, where no row has failed yet,
+/// and leaves no target behind.
+#[tokio::test]
+async fn a_one_to_one_comparing_two_collations_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    batch(&db.pool, DDL).await;
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM one FROM s SELECT a = p AS same",
+        &s_columns(),
+        "public",
+    )
+    .await
+    .expect_err("a conflict between collations must be refused");
+    assert_conflict(err, "same", "=", "trellis.s.a", "trellis.s.p");
+    let exists: bool = db
+        .pool
+        .get()
+        .await
+        .expect("get connection")
+        .query_one("select to_regclass('public.one') is not null", &[])
+        .await
+        .expect("probe target")
+        .get(0);
+    assert!(!exists, "a refused definition leaves no target");
+}
+
+/// An aggregate's argument and a 1-1 `JOIN`'s two sides conflict the same way.
+#[tokio::test]
+async fn an_aggregate_and_a_one_to_one_join_comparing_two_collations_are_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    batch(&db.pool, DDL).await;
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM agg FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT COUNT(CASE WHEN a = p THEN 1 END) AS n",
+        &s_columns(),
+        "public",
+    )
+    .await
+    .expect_err("an aggregate argument that conflicts must be refused");
+    assert_conflict(err, "n", "=", "trellis.s.a", "trellis.s.p");
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM j FROM s JOIN o ON s.id = o.id \
+         SELECT s.a = o.p AS same",
+        &std::collections::HashMap::new(),
+        "public",
+    )
+    .await
+    .expect_err("a JOIN comparing a column of each side must be refused");
+    assert_conflict(err, "same", "=", "s.a", "o.p");
+}
+
+/// Comparisons Postgres accepts still define: one collation, the database
+/// default beside another collation, and a conflicting pair nothing compares.
+#[tokio::test]
+async fn comparisons_with_a_single_collation_define() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    batch(&db.pool, DDL).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM ok FROM s SELECT a = a2 AS same, a = d AS vs_default, \
+         COALESCE(a, p) AS merged, CHAR_LENGTH(COALESCE(a, p)) AS len",
+        &s_columns(),
+        "public",
+    )
+    .await
+    .expect("none of these has conflicting collations");
+}
+
+/// `ALTER TRANSFORM ... ADD` refuses the same, and adds no column.
+#[tokio::test]
+async fn an_added_field_comparing_two_collations_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    batch(&db.pool, DDL).await;
+    install_definition(
+        &db.pool,
+        "TRANSFORM ok FROM s SELECT a = a2 AS same",
+        &s_columns(),
+        "public",
+    )
+    .await
+    .expect("defines");
+    batch(
+        &db.pool,
+        "update transform_definitions set status = 'live' where target_table = 'public.ok'",
+    )
+    .await;
+    let Statement::AlterTransform(alter) =
+        parse_statement("ALTER TRANSFORM ok ADD NULLIF(a, p) AS n").expect("parse")
+    else {
+        panic!("expected an ALTER TRANSFORM statement");
+    };
+    let err = alter_transform(&db.pool, &alter)
+        .await
+        .expect_err("an added conflicting field must be refused");
+    assert_conflict(err, "n", "NULLIF", "trellis.s.a", "trellis.s.p");
+}
+
+/// A column re-collated after define into a conflict is refused at `RESUME`
+/// with define's error: define's validations hold for the definition's life.
+#[tokio::test]
+async fn a_conflict_made_after_define_is_refused_at_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = pipeline::connect(db.dsn()).await;
+    raw.batch_execute(
+        r#"create table public.r (id bigint primary key, a text collate "C", p text collate "C")"#,
+    )
+    .await
+    .expect("create the source");
+    let trellis = pipeline::definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM rc FROM r SELECT a = p AS same")
+        .await
+        .expect("one collation defines");
+    trellis.apply("PAUSE TRANSFORM rc").await.expect("pause");
+    raw.batch_execute(r#"alter table public.r alter column p type text collate "POSIX""#)
+        .await
+        .expect("re-collate p");
+    let err = trellis
+        .apply("RESUME TRANSFORM rc")
+        .await
+        .expect_err("a resume into a conflict must be refused")
+        .to_string();
+    assert!(
+        err.starts_with("T0233") && err.contains("public.r.a") && err.contains("public.r.p"),
+        "{err}"
+    );
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A column re-collated into a conflict while the definition is live is
+/// reported, not silent: every key written to it fails with `42P22`, is held
+/// after the drain's retries (`held_keys`, status still `live`), and
+/// definitions reading other tables keep draining. Not a known correctness
+/// gap: it is the documented held-key stop, released once the cause is fixed.
+#[tokio::test]
+async fn a_conflict_made_while_live_holds_each_written_key() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = pipeline::connect(db.dsn()).await;
+    raw.batch_execute(
+        r#"create table public.r (id bigint primary key, a text collate "C", p text collate "C");
+           create table public.u (id bigint primary key, v int)"#,
+    )
+    .await
+    .expect("create the sources");
+    let trellis = pipeline::definer(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM rc FROM r SELECT a = p AS same")
+        .await
+        .expect("one collation defines");
+    trellis
+        .apply("TRANSFORM un FROM u SELECT v AS v")
+        .await
+        .expect("defines");
+    pipeline::bring_live_all(&mut raw, &db.pool).await;
+    raw.batch_execute(r#"alter table public.r alter column p type text collate "POSIX""#)
+        .await
+        .expect("re-collate p");
+    pipeline::reconcile_pass(&mut raw, &db.pool).await;
+    raw.batch_execute("insert into r values (1, 'x', 'x'); insert into u values (1, 1)")
+        .await
+        .expect("write both sources");
+    let batch = pipeline::seal(&mut raw).await;
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match trellis::staging::apply::drain_once(&db.pool, batch, "probe", 1, pipeline::WAKE).await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => last_error = e.to_string(),
+        }
+    }
+    assert!(
+        last_error.contains("could not determine which collation"),
+        "{last_error}"
+    );
+    let status = trellis
+        .status("rc")
+        .await
+        .expect("status")
+        .expect("defined");
+    assert_eq!(status.status, trellis::TransformStatus::Live, "{status:?}");
+    assert_eq!(status.held_keys.as_ref().expect("the key is held").count, 1);
+    assert!(status.drain_failure.is_none(), "{status:?}");
+    assert_eq!(
+        pipeline::rows(&raw, "select sqlstate from poison").await,
+        ["(42P22)"]
+    );
+    assert_eq!(
+        pipeline::rows(&raw, "select count(*) from public.rc").await,
+        ["(0)"]
+    );
+    assert_eq!(
+        pipeline::rows(&raw, "select v::text from public.un").await,
+        ["(1)"]
+    );
+    trellis.shutdown().await.expect("shutdown");
+}

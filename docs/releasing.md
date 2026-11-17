@@ -288,7 +288,7 @@ over 1600 columns. Add each new case to the script when you find one.
 started beside a running old instance stands by until the old one stops, then
 takes over ([version handover](decisions/0023-version-handover.md)). The step
 starts the candidate's `trellis run` beside the old build's, expects it to stay
-up and print that it is standing by (its migrations are pending and a process
+up and log that it is standing by (its migrations are pending and a process
 is live), with the history unchanged and nothing paused, then stops the old
 build and expects the candidate to migrate and converge. It then does the
 same with an embedded application's worker as the candidate (the library

@@ -1,26 +1,20 @@
 //! `trellis run [--staging|--no-staging] [--drain-threads N]` — runs the live
 //! CDC/apply pipeline until interrupted.
 //!
-//! Unlike `apply`, this command can't just call `.migrate()` right after
-//! connecting: [`trellis::Trellis::connect`] with `staging: true` starts the
-//! staging worker *during* connect, and the worker reads the catalog for the
-//! tables to capture before this module gets a chance to run anything. On a
-//! genuinely fresh database (no Trellis tables at all) that read would fail
-//! with a raw "relation does not exist" error. So this module opens a
-//! short-lived, no-options connection first, migrates on it, and shuts it
-//! down — that guarantees the catalog tables exist by the time the real
-//! `staging`/`drain_threads` connect runs, so a fresh database doesn't need a
-//! separate `migrate` step any more than `apply` does.
+//! `run` migrates first, once, on a connection with no background work: the
+//! staging worker reads the catalog as it starts, so on a fresh database (no
+//! Trellis tables at all) the catalog has to exist before the pipeline
+//! connects, and a fresh database needs no separate `migrate` step.
 //!
-//! While a Trellis process of another version is live on the instance and
-//! this binary carries migrations it hasn't run, `migrate` refuses
-//! (ADR-0023, version handover: migrations never run beside a live process),
-//! and `run` stands by instead of exiting: it says why, tries again every 5
-//! seconds, and goes on as soon as the other version's processes have
-//! stopped. Once running, the pipeline itself stands by the same way while
-//! another version is live. Below the catalog floor (ADR-0024), `migrate`
-//! refuses too, and `run` stands by the same way until the floor no longer
-//! refuses it, rather than exit and restart under a supervisor.
+//! When that `migrate` is refused, `run` connects the pipeline anyway and
+//! leaves the rest to the handle's background process, the one an embedded
+//! handle runs ([ADR-0023](../../../docs/decisions/0023-version-handover.md),
+//! rule 3): it stands by, says why and tries again, instead of exiting, while
+//! another version of Trellis is live, while the binary is below the catalog
+//! floor, and while the role can't alter Trellis's tables or the history
+//! doesn't fit ([`stands_by_on`]). It starts the pipeline once the refusal is
+//! gone. Any other `migrate` error exits. The process's log goes to stderr
+//! (see [`init_logging`]).
 //!
 //! No definitions need to be registered yet: the staging worker
 //! captures nothing until `trellis apply` registers something, then picks
@@ -60,10 +54,11 @@ Usage: trellis run [--staging|--no-staging] [--drain-threads N]
 Runs the live CDC/apply pipeline (staging worker and/or drain workers) until
 interrupted with Ctrl-C. Migrates the database first if needed. Definitions
 registered later (via `trellis apply`) are picked up without a restart.
-While a Trellis process of another version is live on the database, stands
-by (stages, drains and migrates nothing) and takes over once it has stopped.
-Below the catalog floor (a later release's catalog it can't read), stands by
-the same way.
+Stands by (stages, drains and migrates nothing, and logs why) while a Trellis
+process of another version is live on the database, below the catalog floor
+(a later release's catalog it can't read), and while the migrations it
+needs can't run under this role. It starts the pipeline once that is
+resolved, for the last case after another role has run `trellis apply`.
 
 Options:
   --staging                  Run the staging worker: installs capture triggers
@@ -190,26 +185,28 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
     })
 }
 
-/// Connects (migrating a throwaway connection first — see the module doc
-/// comment for why), prints a startup message, blocks until Ctrl-C (while
+/// Migrates, connects, prints a startup message, blocks until Ctrl-C (while
 /// also serving `--prometheus-bind`'s listener, if given), then shuts down
 /// cleanly. Returns the shutdown message on success.
 pub async fn run(args: Args, database_url: Option<String>) -> Result<String, String> {
     let config = Config::resolve(database_url).map_err(|err| err.to_string())?;
+    init_logging();
 
     // Migrate on a plain, no-background-work connection first, so the
-    // catalog query the staging worker runs during `connect` finds its
-    // tables on a genuinely fresh database. See the module doc comment.
+    // catalog the staging worker reads as it starts exists on a fresh
+    // database. See the module doc comment.
     let migrator = Trellis::connect(config.clone(), TrellisOptions::default())
         .await
         .map_err(|err| err.to_string())?;
-    let migration_outcome = migrate_once_no_other_version_is_live(&migrator).await;
-    let migrator_shutdown = migrator.shutdown().await.map_err(|err| err.to_string());
-    let migrated = migration_outcome?;
-    migrator_shutdown?;
-    if !migrated {
-        return Ok("stopped while standing by".to_string());
-    }
+    let refused = match migrator.migrate().await {
+        Ok(()) => None,
+        Err(err) if stands_by_on(&err) => Some(err),
+        Err(err) => {
+            let _ = migrator.shutdown().await;
+            return Err(err.to_string());
+        }
+    };
+    migrator.shutdown().await.map_err(|err| err.to_string())?;
 
     let options = TrellisOptions {
         staging: args.staging,
@@ -218,7 +215,12 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     };
     let trellis = Trellis::connect(config, options)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| match &refused {
+            // A refused `migrate` on a database with no catalog yet: the
+            // pipeline can't start, and the refusal says what to do.
+            Some(refused) => format!("{refused} (and the pipeline couldn't start: {err})"),
+            None => err.to_string(),
+        })?;
 
     let metrics_listener = match args.prometheus_bind {
         Some(bind) => match TcpListener::bind(bind).await {
@@ -271,57 +273,49 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     Ok("shut down cleanly".to_string())
 }
 
-/// How often [`migrate_once_no_other_version_is_live`] tries again: the
-/// standby poll of the pipeline's own handover check.
-const STANDBY_POLL: Duration = Duration::from_secs(5);
-
-/// Runs `migrate`, standing by while it refuses because a process of another
-/// Trellis version is live (ADR-0023, rule 3) or this binary is below the
-/// catalog floor (ADR-0024, rule 2): says so once, then tries again every
-/// [`STANDBY_POLL`] until it succeeds. `Ok(false)` when Ctrl-C came first.
-async fn migrate_once_no_other_version_is_live(migrator: &Trellis) -> Result<bool, String> {
-    let mut standing_by = None;
-    loop {
-        match migrator.migrate().await {
-            Ok(()) => {
-                match standing_by {
-                    Some(ErrorCode::VersionHandover) => {
-                        println!("no other Trellis version is live any more; migrated, taking over")
-                    }
-                    Some(_) => {
-                        println!("this version meets the catalog floor now; migrated, taking over")
-                    }
-                    None => {}
-                }
-                return Ok(true);
-            }
-            Err(err)
-                if matches!(
-                    err.code(),
-                    ErrorCode::VersionHandover | ErrorCode::VersionFloor
-                ) =>
-            {
-                if standing_by != Some(err.code()) {
-                    standing_by = Some(err.code());
-                    match &err {
-                        TrellisError::OtherVersionLive(seen) => {
-                            println!("trellis standing by: {seen}")
-                        }
-                        other => println!("trellis standing by: {other}"),
-                    }
-                    println!(
-                        "trying again every {} seconds; press Ctrl-C to stop",
-                        STANDBY_POLL.as_secs()
-                    );
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(STANDBY_POLL) => {}
-                    _ = tokio::signal::ctrl_c() => return Ok(false),
-                }
-            }
-            Err(err) => return Err(err.to_string()),
-        }
+/// Whether `err`, from `migrate`, is a refusal the pipeline stands by on
+/// (ADR-0023, rule 3): another version is live, the binary is below the catalog
+/// floor, the role can't create or alter Trellis's tables, or the migration
+/// history doesn't fit. The pipeline's own pass tries `migrate` again and
+/// says why it stands by. Any other error ends `run`, as it always has.
+fn stands_by_on(err: &TrellisError) -> bool {
+    if matches!(
+        err.code(),
+        ErrorCode::VersionHandover | ErrorCode::VersionFloor
+    ) {
+        return true;
     }
+    match err {
+        TrellisError::Engine(trellis::Error::MigrationHistory(_)) => true,
+        TrellisError::Engine(engine) => permission_denied(engine),
+        _ => false,
+    }
+}
+
+/// Whether `err`'s chain carries Postgres's permission refusal (SQLSTATE
+/// 42501).
+fn permission_denied(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(current) = source {
+        if let Some(db) = current.downcast_ref::<tokio_postgres::Error>()
+            && db.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// Sends the engine's log events (a standby and its reason, a takeover,
+/// the pipeline's warnings) to stderr, as the handle's background process
+/// emits them. Only the first call installs a subscriber.
+fn init_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 /// Blocks until Ctrl-C. If `listener` is `Some`, also accepts and serves
