@@ -1152,7 +1152,11 @@ impl StarCase {
             .enumerate()
             .map(|(i, spec)| {
                 let text = star_definition_text(&format!("j{i}"), spec, &self.join_order);
-                trellis::dev::defs::parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
+                let mut def =
+                    trellis::dev::defs::parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+                // The `WHERE` names its tables, not positions: the twin keeps it.
+                def.predicate = self.case.program.defs[i].predicate.clone();
+                def
             })
             .collect();
         program
@@ -1192,6 +1196,9 @@ pub fn star_case(
         stall: std::time::Duration::ZERO,
         group_lock_stall: false,
     });
+    // A `WHERE` (#2043), derived from the program, so the draws are what
+    // they were.
+    case.program = super::where_clause::with_predicates(case.program);
     StarCase {
         case,
         tables,
@@ -1427,6 +1434,9 @@ pub(crate) mod strategy {
                             workers,
                             seal_interval_ms,
                         );
+                        // A `WHERE` (#2043), derived from the program, so
+                        // the draws are what they were.
+                        case.program = crate::generate::where_clause::with_predicates(case.program);
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
                         if racing {

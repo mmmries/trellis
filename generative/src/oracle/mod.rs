@@ -508,17 +508,14 @@ fn render_expr(expr: &Expr) -> String {
 /// each row's key (see its doc comment), so no separate "leading pk
 /// expression" is needed here the way the 1-1 arm needs one for `pk_column`.
 ///
+/// A `WHERE` is the definition's own, verbatim (#2043): `SELECT … WHERE
+/// <p> [GROUP BY …]`.
+///
 /// # Panics
 ///
-/// On any shape beyond the numeric-`+`/aggregate slice this oracle models
-/// (a non-trivial predicate is a later slice), naming the follow-up that
-/// widens it.
+/// On a `JOIN` (its own renderers).
 fn render_select(def: &TransformDef, pk_column: &str, exact: &ExactFields) -> String {
-    match &def.predicate {
-        Predicate::True => {}
-        Predicate::Filter(_) => unreachable!("the generator never produces a WHERE (#2043)"),
-    }
-
+    let filter = where_sql(def, render_expr);
     match &def.key_space {
         KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {
             unreachable!("the generator never produces a JOIN definition")
@@ -533,7 +530,7 @@ fn render_select(def: &TransformDef, pk_column: &str, exact: &ExactFields) -> St
                 ));
             }
             format!(
-                "select {} from {}",
+                "select {} from {}{filter}",
                 select_list.join(", "),
                 table_sql(&def.source, def.explicit_source_schema.as_deref())
             )
@@ -553,12 +550,21 @@ fn render_select(def: &TransformDef, pk_column: &str, exact: &ExactFields) -> St
             let group_cols: Vec<String> =
                 group_by.iter().map(|k| quote_ident(k.as_str())).collect();
             format!(
-                "select {} from {} group by {}",
+                "select {} from {}{filter} group by {}",
                 select_list.join(", "),
                 table_sql(&def.source, def.explicit_source_schema.as_deref()),
                 group_cols.join(", ")
             )
         }
+    }
+}
+
+/// ` where <p>`, `def`'s `WHERE` rendered by `render` as the definition
+/// wrote it, or nothing for `TRUE`.
+fn where_sql(def: &TransformDef, render: fn(&Expr) -> String) -> String {
+    match &def.predicate {
+        Predicate::True => String::new(),
+        Predicate::Filter(expr) => format!(" where {}", render(expr)),
     }
 }
 
@@ -1274,9 +1280,10 @@ fn render_join_select_over(
         .map(|key| column(&key.table, &key.column))
         .collect();
     format!(
-        "select {} from {} group by {}",
+        "select {} from {}{} group by {}",
         select.join(", "),
         join_from(def, relation),
+        where_sql(def, render_join_expr),
         group_by.join(", ")
     )
 }
@@ -1383,10 +1390,11 @@ fn render_join_one_to_one_select_over(
         })
         .collect();
     format!(
-        "select {} from {} {}",
+        "select {} from {} {}{}",
         select.join(", "),
         relation(&def.source, def.explicit_source_schema.as_deref()),
-        joins.join(" ")
+        joins.join(" "),
+        where_sql(def, render_join_expr)
     )
 }
 

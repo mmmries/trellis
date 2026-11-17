@@ -17,6 +17,7 @@ use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
 use trellis::dev::defs::registry;
 
 use crate::backend::{DrainAudit, SPLIT_THRESHOLD_ROWS};
+use crate::generate::where_clause;
 use crate::model::{
     BurstAction, ConcurrentPlan, Op, OpOutcome, PartitionAction, PartitionStrategy, Program,
 };
@@ -137,6 +138,18 @@ pub struct Coverage {
     /// (`"split_across_workers"`), and a key sealed into several batches
     /// within one burst (`"key_in_several_batches"`).
     pub drain_cases: HashMap<&'static str, usize>,
+    /// How many definitions the recorded programs give a `WHERE` (#2043),
+    /// by key space ([`key_space_name`]).
+    pub filtered_defs: HashMap<&'static str, usize>,
+    /// How many changes cross each filtered definition's `WHERE`, keyed
+    /// `(key space, bucket)` ([`where_clause::bucket`]: `in_in`, `in_out`,
+    /// `out_in`, `out_out`), replayed from the program alone
+    /// ([`where_crossings`]). A plain aggregate's are its source's updates
+    /// of a live row; a 1-1 `JOIN`'s are its target rows whose inputs (the
+    /// `a` row or a matched row) a write changes, `a`'s updates and every
+    /// joined table's writes alike. An empty bucket is coverage that dropped
+    /// out.
+    pub where_crossings: HashMap<(&'static str, &'static str), usize>,
 }
 
 impl Coverage {
@@ -218,6 +231,18 @@ impl Coverage {
         }
         for shape in aggregate_calls {
             *self.aggregate_call_cases.entry(shape).or_insert(0) += 1;
+        }
+
+        for def in &program.defs {
+            if def.predicate.filter().is_some() {
+                *self
+                    .filtered_defs
+                    .entry(key_space_name(&def.key_space))
+                    .or_insert(0) += 1;
+            }
+        }
+        for (key, n) in where_crossings(program) {
+            *self.where_crossings.entry(key).or_insert(0) += n;
         }
     }
 
@@ -429,6 +454,164 @@ fn apply_to_rows(op: &Op, pk_col: &str, rows: &mut HashMap<String, SimRow>) {
         Op::Leaf { op, .. } => apply_to_rows(op, pk_col, rows),
         Op::Partition { .. } => {}
     }
+}
+
+/// Every change that crosses a filtered definition's `WHERE` in `program`,
+/// keyed `(key space, bucket)` ([`Coverage::where_crossings`]). Replays
+/// each filtered definition's tables from the ops alone and evaluates its
+/// predicate with [`where_clause::eval`] before and after each write.
+pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str), usize> {
+    let mut out = HashMap::new();
+    for def in &program.defs {
+        let Some(predicate) = def.predicate.filter() else {
+            continue;
+        };
+        let key_space = key_space_name(&def.key_space);
+        let mut add = |before: bool, after: bool| {
+            *out.entry((key_space, where_clause::bucket(before, after)))
+                .or_insert(0) += 1;
+        };
+        match &def.key_space {
+            KeySpace::Aggregate { .. } | KeySpace::OneToOne => {
+                let Some(table) = program.tables.iter().find(|t| t.name == def.source) else {
+                    continue;
+                };
+                let member = |row: &SimRow| {
+                    where_clause::eval(predicate, &|_, c| row.get(c).cloned().flatten())
+                        == Some(true)
+                };
+                let mut rows: HashMap<String, SimRow> = HashMap::new();
+                for op in program.ops.iter().filter(|op| op.table() == def.source) {
+                    let write = match op {
+                        Op::Leaf { op, .. } => op,
+                        op => op,
+                    };
+                    if let Op::Update { pk, .. } = write
+                        && let Some(row) = rows.get(pk)
+                    {
+                        let before = member(row);
+                        apply_to_rows(op, &table.pk_col, &mut rows);
+                        if let Some(row) = rows.get(pk) {
+                            add(before, member(row));
+                        }
+                        continue;
+                    }
+                    apply_to_rows(op, &table.pk_col, &mut rows);
+                }
+            }
+            KeySpace::JoinOneToOne(_) => {
+                let mut tables: HashMap<&str, (&str, HashMap<String, SimRow>)> = program
+                    .tables
+                    .iter()
+                    .map(|t| (t.name.as_str(), (t.pk_col.as_str(), HashMap::new())))
+                    .collect();
+                let mut view = join_view(def, predicate, &tables);
+                for op in &program.ops {
+                    let Some((pk_col, rows)) = tables.get_mut(op.table()) else {
+                        continue;
+                    };
+                    apply_to_rows(op, pk_col, rows);
+                    if matches!(op, Op::Truncate { .. }) {
+                        view = join_view(def, predicate, &tables);
+                        continue;
+                    }
+                    let next = join_view(def, predicate, &tables);
+                    for (key, (inputs, member)) in &next {
+                        if let Some((was, was_member)) = view.get(key)
+                            && was != inputs
+                        {
+                            add(*was_member, *member);
+                        }
+                    }
+                    view = next;
+                }
+            }
+            KeySpace::Join(_) => {}
+        }
+    }
+    out
+}
+
+/// One position of [`join_view`]: the root's `ON` columns, and the joined
+/// table's rows by their `ON` key.
+type Position<'a> = (Vec<String>, HashMap<Vec<String>, &'a SimRow>);
+
+/// A 1-1 `JOIN`'s target as the crossing replay sees it: per root row, its
+/// inputs (the row, then the matched row at each position) and whether it
+/// has a target row (every `INNER` position matched, and `predicate`
+/// `TRUE`).
+fn join_view(
+    def: &trellis::dev::defs::ast::TransformDef,
+    predicate: &Expr,
+    tables: &HashMap<&str, (&str, HashMap<String, SimRow>)>,
+) -> HashMap<String, (Vec<Option<SimRow>>, bool)> {
+    let KeySpace::JoinOneToOne(join) = &def.key_space else {
+        unreachable!("a 1-1 JOIN");
+    };
+    let empty = HashMap::new();
+    let rows_of = |table: &str| tables.get(table).map_or(&empty, |(_, rows)| rows);
+    // Each position's `(root columns, joined columns)` and its rows by key.
+    let positions: Vec<Position<'_>> = join
+        .joins
+        .iter()
+        .map(|joined| {
+            let (mut a_cols, mut b_cols) = (Vec::new(), Vec::new());
+            for on in &joined.on {
+                let (a, b) = if on.lhs.table == def.source {
+                    (&on.lhs, &on.rhs)
+                } else {
+                    (&on.rhs, &on.lhs)
+                };
+                a_cols.push(a.column.clone());
+                b_cols.push(b.column.clone());
+            }
+            let index = rows_of(&joined.right)
+                .values()
+                .filter_map(|row| {
+                    let key: Option<Vec<String>> = b_cols
+                        .iter()
+                        .map(|c| row.get(c).cloned().flatten())
+                        .collect();
+                    key.map(|key| (key, row))
+                })
+                .collect();
+            (a_cols, index)
+        })
+        .collect();
+    rows_of(&def.source)
+        .iter()
+        .map(|(pk, a)| {
+            let matched: Vec<Option<&SimRow>> = positions
+                .iter()
+                .map(|(a_cols, index)| {
+                    let key: Option<Vec<String>> =
+                        a_cols.iter().map(|c| a.get(c).cloned().flatten()).collect();
+                    key.and_then(|key| index.get(&key).copied())
+                })
+                .collect();
+            let present = join
+                .joins
+                .iter()
+                .zip(&matched)
+                .all(|(j, m)| j.kind == trellis::dev::defs::ast::JoinKind::Left || m.is_some());
+            let read = |table: Option<&str>, column: &str| -> Option<String> {
+                let row = match table {
+                    None => Some(a),
+                    Some(t) if t == def.source => Some(a),
+                    Some(t) => join
+                        .joins
+                        .iter()
+                        .position(|j| j.right == t)
+                        .and_then(|p| matched[p]),
+                };
+                row.and_then(|r| r.get(column).cloned().flatten())
+            };
+            let member = present && where_clause::eval(predicate, &read) == Some(true);
+            let mut inputs = vec![Some(a.clone())];
+            inputs.extend(matched.iter().map(|m| m.cloned()));
+            (pk.clone(), (inputs, member))
+        })
+        .collect()
 }
 
 fn op_table_name(op: &Op) -> &str {
@@ -1052,6 +1235,18 @@ impl fmt::Display for Coverage {
         write!(f, "drain_cases:")?;
         for (name, count) in sorted_counts(&self.drain_cases) {
             write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+        write!(f, "filtered_defs:")?;
+        for (name, count) in sorted_counts(&self.filtered_defs) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+        write!(f, "where_crossings:")?;
+        let mut crossings: Vec<_> = self.where_crossings.iter().collect();
+        crossings.sort_unstable();
+        for ((key_space, bucket), count) in crossings {
+            write!(f, " {key_space}:{bucket}={count}")?;
         }
         writeln!(f)
     }

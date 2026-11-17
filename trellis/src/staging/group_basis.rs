@@ -662,11 +662,22 @@ pub(crate) fn route(
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
     let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;
     let distinct = distinct_arguments(&def.fields, group_by, &substituted);
-    let predicate = def.predicate.filter().map(|p| Membership {
-        sql: format!("(({}) is true)", render_qualified_expr_sql(p, "s")),
-        columns: crate::defs::oracle::predicate_columns(def)
-            .into_iter()
-            .collect(),
+    let predicate = def.predicate.filter().map(|p| {
+        // Planted bug: a `NULL` predicate counts the row. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let test = if crate::plant::fires(crate::plant::Plant::GbWhereNullAsTrue, true) {
+            "is not false"
+        } else {
+            "is true"
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
+        let test = "is true";
+        Membership {
+            sql: format!("(({}) {test})", render_qualified_expr_sql(p, "s")),
+            columns: crate::defs::oracle::predicate_columns(def)
+                .into_iter()
+                .collect(),
+        }
     });
     // An argument is never evaluated on a row that is no member (#1991):
     // each statement filters by the predicate already, and the guard keeps
@@ -2597,7 +2608,7 @@ impl GroupTargetPlan {
                  union all \
                  select s.* from unnest({arrays}) as u({parts}) \
                  cross join lateral (select * from {src} s where {on}) as s \
-             ) as s where true{filter}",
+             ) as s where true{filter}{planted}",
             rc = self.recomputed,
             values = self.group_values().join(", "),
             src = self.source_row,
@@ -2605,7 +2616,31 @@ impl GroupTargetPlan {
             parts = parts.join(", "),
             on = on.join(" and "),
             filter = self.stage_filter,
+            planted = self.planted_filtered_naming(),
         )
+    }
+
+    /// Planted bug: the build's `GROUP BY` of the source reads every row,
+    /// its `WHERE` ignored. See `crate::plant`.
+    fn planted_unfiltered_build(&self, fresh: String) -> String {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(member) = &self.shape.predicate
+            && crate::plant::fires(crate::plant::Plant::GbWhereBuildUnfiltered, true)
+        {
+            return fresh.replace(&member.sql, "true");
+        }
+        fresh
+    }
+
+    /// Planted bug: group naming filtered by the `WHERE`. See `crate::plant`.
+    fn planted_filtered_naming(&self) -> String {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(member) = &self.shape.predicate
+            && crate::plant::fires(crate::plant::Plant::GbWhereFilteredNaming, true)
+        {
+            return format!(" and {}", member.sql);
+        }
+        String::new()
     }
 
     /// Step 0's statement ([`stage_sides`]): parses `$1`'s ring rows, splits
@@ -2703,7 +2738,7 @@ impl GroupTargetPlan {
         } else {
             String::new()
         };
-        format!(
+        let sql = format!(
             "with {sides}, \
              bad as ( \
                  select count(*) as __bad from raw \
@@ -2745,7 +2780,16 @@ impl GroupTargetPlan {
                     flags.join(", ")
                 )
             },
-        )
+        );
+        // Planted bug: an old image counts whatever its `WHERE` gives. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(member) = &self.shape.predicate
+            && crate::plant::fires(crate::plant::Plant::GbWhereOldImage, true)
+        {
+            return sql.replace(&member.sql, &format!("(sd.__sgn = -1 or {})", member.sql));
+        }
+        sql
     }
 
     /// The (1-based) arguments [`Self::stage_sql`]'s flags are of
@@ -4142,7 +4186,8 @@ impl GroupTargetPlan {
                  select {keyed} from c where not exists (select from up where {uc}) \
              ), \
              {tail}",
-            fresh = self.fresh_select(&self.group_values(), from, false),
+            fresh =
+                self.planted_unfiltered_build(self.fresh_select(&self.group_values(), from, false)),
             col_list = cols.join(", "),
             enumeration = self.rebuild_groups_select(routed, "$1", false),
             c_cols = c_cols.join(", "),

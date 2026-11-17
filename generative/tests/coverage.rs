@@ -1667,3 +1667,124 @@ async fn drawn_aggregate_definitions_land_on_the_group_basis() {
     }
     assert!(group_basis_defs >= PROGRAMS);
 }
+
+/// Samples `count` values of `strategy` with the default runner.
+fn sample<T: std::fmt::Debug>(strategy: impl Strategy<Value = T>, count: usize) -> Vec<T> {
+    let mut runner = TestRunner::default();
+    (0..count)
+        .map(|_| {
+            strategy
+                .new_tree(&mut runner)
+                .expect("strategy must produce a value")
+                .current()
+        })
+        .collect()
+}
+
+/// #2043: every crossing bucket of a `WHERE` (a change that keeps a row in,
+/// takes it out, brings it in, or keeps it out) is drawn, for each key space
+/// that draws a `WHERE`: the plain aggregate (the serial and
+/// concurrent tiers) and the 1-1 `JOIN` (its two-table and star tiers). An
+/// empty bucket is coverage that dropped out. The plain 1-1 (#2038) and the
+/// join aggregate (#2042) join the list when they draw one.
+#[test]
+fn every_where_crossing_bucket_is_drawn_for_each_filtering_key_space() {
+    use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
+    use generative::generate::where_clause::BUCKETS;
+
+    let mut programs: Vec<(&str, Program)> = Vec::new();
+    programs.extend(
+        sample(trivial_program(), 200)
+            .into_iter()
+            .map(|p| ("trivial", p)),
+    );
+    programs.extend(
+        sample(hot_key_case(), 16)
+            .into_iter()
+            .map(|c| ("hot_key", c.program)),
+    );
+    programs.extend(
+        sample(one_to_one_case_strategy(), 24)
+            .into_iter()
+            .map(|c| ("join_one_to_one", c.program)),
+    );
+    programs.extend(
+        sample(star_case_strategy(), 24)
+            .into_iter()
+            .map(|c| ("join_star", c.case.program)),
+    );
+    let mut by_tier: std::collections::BTreeMap<&str, Coverage> = Default::default();
+    for (tier, program) in &programs {
+        by_tier.entry(tier).or_default().record_program(program);
+    }
+    for (tier, key_space) in [
+        ("trivial", "Aggregate"),
+        ("hot_key", "Aggregate"),
+        ("join_one_to_one", "JoinOneToOne"),
+        ("join_star", "JoinOneToOne"),
+    ] {
+        let coverage = &by_tier[tier];
+        assert!(
+            coverage.filtered_defs.get(key_space).copied().unwrap_or(0) > 0,
+            "{tier}: no {key_space} definition drew a WHERE:\n{coverage}"
+        );
+        for bucket in BUCKETS {
+            assert!(
+                coverage
+                    .where_crossings
+                    .get(&(key_space, bucket))
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                "{tier}: no {key_space} change is {bucket}:\n{coverage}"
+            );
+        }
+    }
+}
+
+/// #2043: a drawn `WHERE` renders and parses back to itself (the backend
+/// installs a definition from its text), and define's checks admit every
+/// drawn aggregate's: the predicates are total (#1991 rule 4).
+#[test]
+fn every_drawn_where_round_trips_and_is_admitted() {
+    use generative::generate::join_one_to_one::star_case_strategy;
+    use trellis::dev::defs::{parse, render_definition_text, validate};
+
+    let mut programs = sample(trivial_program(), 200);
+    programs.extend(sample(hot_key_case(), 8).into_iter().map(|c| c.program));
+    programs.extend(
+        sample(star_case_strategy(), 24)
+            .into_iter()
+            .map(|c| c.case.program),
+    );
+    let mut filtered = 0;
+    for program in &programs {
+        for def in program
+            .defs
+            .iter()
+            .filter(|d| d.predicate.filter().is_some())
+        {
+            filtered += 1;
+            let text = render_definition_text(def);
+            let back = parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert_eq!(back.predicate, def.predicate, "{text}");
+            if let KeySpace::Aggregate { .. } = def.key_space {
+                let table = program
+                    .tables
+                    .iter()
+                    .find(|t| t.name == def.source)
+                    .expect("the source");
+                let columns = table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.value_type))
+                    .collect();
+                validate(def, &columns).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            }
+        }
+    }
+    assert!(
+        filtered > 50,
+        "only {filtered} drawn definitions have a WHERE"
+    );
+}

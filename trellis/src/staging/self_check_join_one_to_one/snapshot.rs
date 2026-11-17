@@ -80,6 +80,11 @@ pub struct JoinedRow {
     pub key: String,
     /// The `M` entry it was read with, or `None` when its key has no live one.
     pub joined: Option<String>,
+    /// Whether the definition's `WHERE` is `TRUE` on the row (always, with
+    /// none): a row that fails has no target row.
+    pub passes: bool,
+    /// The fields, `NULL` where [`Self::passes`] is false: a field is never
+    /// evaluated on a row that isn't a member (#1991 rule 9).
     pub values: Vec<Option<String>>,
 }
 
@@ -179,6 +184,10 @@ pub struct StarJoinedRow {
     /// The entry read at each position (`joined[p - 1]`), or `None` when the
     /// key has no live one there.
     pub joined: Vec<Option<String>>,
+    /// Whether the definition's `WHERE` is `TRUE` on the row (always, with
+    /// none): a row that fails has no target row.
+    pub passes: bool,
+    /// The fields, `NULL` where [`Self::passes`] is false (#1991 rule 9).
     pub values: Vec<Option<String>>,
 }
 
@@ -240,6 +249,7 @@ impl From<&HiddenSnapshot> for StarSnapshot {
                 .map(|j| StarJoinedRow {
                     key: j.key.clone(),
                     joined: vec![j.joined.clone()],
+                    passes: j.passes,
                     values: j.values.clone(),
                 })
                 .collect(),
@@ -280,6 +290,7 @@ impl StarSnapshot {
                 .map(|j| JoinedRow {
                     key: j.key,
                     joined: j.joined.into_iter().next().flatten(),
+                    passes: j.passes,
                     values: j.values,
                 })
                 .collect(),
@@ -482,15 +493,25 @@ async fn read(
         .iter()
         .map(|joined| format!("{}.{key_col}", joined.alias()))
         .collect();
+    // The `WHERE` by the audit's renderer, over the same aliases as the
+    // fields; a field is evaluated only where it passes.
+    let passes = audit
+        .predicate
+        .as_ref()
+        .map_or_else(|| "true".to_string(), |p| format!("(({p}) is true)"));
     let joined_values: Vec<String> = audit
         .fields
         .iter()
-        .map(|f| format!("({})::text", f.sql))
+        .map(|f| match &audit.predicate {
+            Some(_) => format!("(case when {passes} then ({})::text end)", f.sql),
+            None => format!("({})::text", f.sql),
+        })
         .collect();
     let joined_rows = txn
         .query(
             &format!(
-                "select a.{key_col}, array[{picked}]::text[], array[{values}]::text[] \
+                "select a.{key_col}, array[{picked}]::text[], {passes}, \
+                        array[{values}]::text[] \
                  from {r} a {laterals} \
                  where not a.{tomb}",
                 picked = picked.join(", "),
@@ -504,7 +525,8 @@ async fn read(
         .map(|row| StarJoinedRow {
             key: row.get(0),
             joined: row.get(1),
-            values: row.get(2),
+            passes: row.get(2),
+            values: row.get(3),
         })
         .collect();
 

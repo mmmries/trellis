@@ -98,7 +98,6 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         .iter()
         .map(|field| format!("{} AS {}", render_expr(&field.expr), field.name))
         .collect();
-    debug_assert_eq!(def.predicate, Predicate::True);
     let key_space_clause = match &def.key_space {
         // The JOIN tier: `FROM a [LEFT|INNER] JOIN b ON … GROUP BY …`.
         KeySpace::Join(join) => {
@@ -162,8 +161,14 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
     } else {
         ""
     };
+    // Parenthesized, so a drawn `(TRUE)` stays a filter rather than reading
+    // back as an omitted `WHERE` (#1991 rule 8).
+    let filter = match &def.predicate {
+        Predicate::True => String::new(),
+        Predicate::Filter(expr) => format!(" WHERE ({})", render_expr(expr)),
+    };
     format!(
-        "TRANSFORM {} FROM {}{key_space_clause}{opt_out} SELECT {}",
+        "TRANSFORM {} FROM {}{key_space_clause}{opt_out} SELECT {}{filter}",
         def.target,
         def.source,
         fields.join(", ")

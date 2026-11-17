@@ -431,6 +431,20 @@ pub(crate) async fn run_chunk(
     // The rows reach the target's readers in the chunk's transaction, with
     // an unknown origin, as a plain 1-1 build's do.
     let mut mutations = TargetMutations::new();
+    // Planted bug: the chunk writes every row of the join, its `WHERE`
+    // ignored. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let unfiltered = crate::plant::fires(
+        crate::plant::Plant::Join1WhereBuildUnfiltered,
+        shape.predicate.is_some(),
+    )
+    .then(|| {
+        let mut unfiltered = shape.clone();
+        unfiltered.predicate = None;
+        unfiltered
+    });
+    #[cfg(any(test, feature = "test-util"))]
+    let shape = unfiltered.as_ref().unwrap_or(shape);
     let (written, deleted) = write_target(
         txn,
         shape,

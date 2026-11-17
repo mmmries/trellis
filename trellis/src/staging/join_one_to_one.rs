@@ -474,8 +474,18 @@ impl JoinShape {
         let predicate = match def.predicate.filter() {
             Some(predicate) => {
                 let expr = qualify(def, &target, predicate, &mut reads)?;
+                // Planted bug: a `NULL` predicate keeps the row. See
+                // `crate::plant`.
+                #[cfg(any(test, feature = "test-util"))]
+                let test = if crate::plant::fires(crate::plant::Plant::Join1WhereNullAsTrue, true) {
+                    "is not false"
+                } else {
+                    "is true"
+                };
+                #[cfg(not(any(test, feature = "test-util")))]
+                let test = "is true";
                 Some(format!(
-                    "(({}) is true)",
+                    "(({}) {test})",
                     render_qualified_expr_sql(&expr, "s")
                 ))
             }

@@ -39,14 +39,18 @@ fn fnv(hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// A digest of what a case runs: its ops, its definitions' text, its plan,
-/// and its engine settings.
+/// and its engine settings. A definition's `WHERE` is left out: the arm that
+/// draws it (#2043, `generate::where_clause`) is derived from the program,
+/// so the rest of every case is what it was before the arm existed.
 fn digest(cases: &[JoinCase]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     for case in cases {
         for def in &case.program.defs {
+            let mut def = def.clone();
+            def.predicate = trellis::dev::defs::ast::Predicate::True;
             hash = fnv(
                 hash,
-                trellis::dev::defs::render_definition_text(def).as_bytes(),
+                trellis::dev::defs::render_definition_text(&def).as_bytes(),
             );
         }
         let rest = format!(

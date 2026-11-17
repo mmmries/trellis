@@ -1825,6 +1825,19 @@ const LEAF_UNREACHED: (&str, &str) = (
      partitioned source; its deterministic pin gates it",
 );
 
+/// The plant of a filtered aggregate's group naming (#1991 rule 17), which
+/// no concurrent tier reaches: naming reads only the group-only images of a
+/// parked change's release or a partition correction, and the tiers draw
+/// neither (0 of 48 hot-key cases fired it, logbook
+/// `20261117T083652-e-sweep`). `group_basis_where`'s
+/// `a_release_names_groups_from_group_only_images` gates it.
+const FILTERED_NAMING_UNREACHED: (&str, &str) = (
+    "gb_where_filtered_naming",
+    "it filters the group naming of a release's or a partition correction's group-only \
+     images, and no concurrent tier holds a key or corrects a partition (0 of 48 hot-key \
+     cases fired it); its deterministic pins gate it",
+);
+
 /// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates, the
 /// `JOIN` plants and [`LEAF_UNREACHED`], with their reasons.
 fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
@@ -1838,7 +1851,7 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             plant_sweep::NO_EXTREMES,
         ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
-        .chain(std::iter::once(LEAF_UNREACHED))
+        .chain([LEAF_UNREACHED, FILTERED_NAMING_UNREACHED])
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
             out.push((plant, why));
