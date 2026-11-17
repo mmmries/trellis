@@ -457,6 +457,14 @@ pub(crate) struct GroupShape {
     /// by a `JOIN`'s writers, whose working tables copy the hidden table's
     /// columns ([`Writer`]).
     pub(super) group_types: Vec<String>,
+    /// The type a field reads each `GROUP BY` column as, where it isn't
+    /// [`Self::group_types`]' (#2053), aligned with them: a `char(n)` or
+    /// `name` key is kept as `text`, its value family, and read as its
+    /// source type, as Postgres's own `GROUP BY` reads it, so a field's
+    /// `ch = 'ab  '` ignores trailing blanks. Read from the type
+    /// `definition_key_types` records for the key ([`Self::read_key_types`]);
+    /// `None` until read. A `JOIN`'s fields read no key.
+    pub(super) key_reads: Option<Vec<Option<&'static str>>>,
     pub(super) args: Vec<Arg>,
     pub(super) aggs: Vec<Agg>,
     /// Each value field: its name, its type in the target, and its
@@ -541,6 +549,20 @@ impl GroupShape {
     }
 }
 
+/// The type a field reads a `GROUP BY` column whose source type is
+/// `type_oid` as, where it isn't the `text` the key is kept as
+/// ([`GroupShape::key_reads`]): a `char(n)`'s `=` ignores trailing blanks,
+/// and a string Postgres types `name` is truncated to 63 bytes. `text` and
+/// `varchar` read alike, and every other key is kept as its own type.
+fn key_read(type_oid: Option<u32>) -> Option<&'static str> {
+    use crate::defs::pg_type::oid;
+    match type_oid? {
+        oid::BPCHAR => Some("pg_catalog.bpchar"),
+        oid::NAME => Some("pg_catalog.name"),
+        _ => None,
+    }
+}
+
 /// The plain source column `MIN`/`MAX` reads, if `arg` is one.
 fn extreme_column(arg: &Expr) -> Option<&str> {
     match arg {
@@ -576,6 +598,7 @@ pub(crate) fn route(
     let mut shape = GroupShape {
         group_cols,
         group_types,
+        key_reads: None,
         args: distinct
             .iter()
             .map(|arg| Arg {
@@ -1667,6 +1690,56 @@ impl GroupShape {
         }
     }
 
+    /// Sets the type each field reads each `GROUP BY` column as
+    /// ([`Self::key_reads`]), from the type definition `id` records for it
+    /// on its source `source` (`definition_key_types`, ADR-0020).
+    pub(crate) async fn read_key_types(
+        &mut self,
+        client: &impl tokio_postgres::GenericClient,
+        id: i64,
+        source: &str,
+    ) -> Result<(), tokio_postgres::Error> {
+        let oids: HashMap<String, u32> = client
+            .query(
+                "select column_name, type_oid from definition_key_types \
+                 where transform_id = $1 and table_name = $2 and column_name = any($3)",
+                &[&id, &source, &self.group_cols],
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        self.key_reads = Some(
+            self.group_cols
+                .iter()
+                .map(|column| key_read(oids.get(column).copied()))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    /// Whether a field reads a `GROUP BY` column.
+    fn a_field_reads_a_key(&self) -> bool {
+        fn reads(expr: &Expr, keys: &[String]) -> bool {
+            match expr {
+                Expr::Column(column) | Expr::SourceColumn { column, .. } => keys.contains(column),
+                _ => expr.children().into_iter().any(|e| reads(e, keys)),
+            }
+        }
+        self.fields
+            .iter()
+            .any(|(_, _, expr)| reads(expr, &self.group_cols))
+    }
+
+    /// Asserts, in a debug build, that the types a field reads the keys as
+    /// were read ([`Self::key_reads`]) when a field reads one.
+    pub(super) fn check_key_types_read(&self) {
+        debug_assert!(
+            self.key_reads.is_some() || !self.a_field_reads_a_key(),
+            "a group-basis plan with a field over a key whose type was never read"
+        );
+    }
+
     /// Asserts, in a debug build, that every `numeric` sum's reference
     /// scale was read ([`Arg::scale_read`]).
     pub(super) fn check_scales_read(&self) {
@@ -1908,6 +1981,7 @@ impl GroupTargetPlan {
         shape: GroupShape,
     ) -> Self {
         shape.check_scales_read();
+        shape.check_key_types_read();
         Self {
             target: target.to_string(),
             target_ident: ddl::qualified_target_table_ident(target),
@@ -1972,6 +2046,9 @@ impl GroupTargetPlan {
                 client,
                 &hidden_table_qualified(catalog_schema, definition.id),
             )
+            .await?;
+        shape
+            .read_key_types(client, definition.id, &definition.source_table)
             .await?;
         let source_pk = ddl::source_primary_key_in_txn(client, &definition.source_table).await?;
         let identity = ddl::identity_key_columns(client, &definition.target_table).await?;
@@ -2700,6 +2777,16 @@ impl GroupTargetPlan {
                 )
             })
             .collect();
+        // Each key a field reads as another type, under its own name, so
+        // the field reads it from here.
+        let mut aggs = aggs;
+        let reads = self.shape.key_reads.as_deref().unwrap_or_default();
+        for (column, read) in self.shape.group_cols.iter().zip(reads) {
+            if let Some(read) = read {
+                let column = quote_ident(column);
+                aggs.push(format!("({column})::{read} as {column}"));
+            }
+        }
         let fields: Vec<String> = self
             .shape
             .fields

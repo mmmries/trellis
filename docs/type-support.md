@@ -95,7 +95,9 @@ modifiers. A 1-1 copy holds the source's exact rendering: a `numeric` rewritten 
 `1.25` to `1.2500`, an `interval` from `'1 day'` to `'24 hours'` and a float
 from `-0` to `0` reach the copy, though each pair is equal as a value
 ([ADR-0020](decisions/0020-type-identity.md)). A `GROUP BY` key's column (in the target and its hidden table) takes its value family's type: `integer` or `bigint` by width, `text` for any
-string, unconstrained `numeric`, a temporal type at full precision. A `JOIN`
+string, unconstrained `numeric`, a temporal type at full precision. A field
+reads a `char(n)` or `name` key as its source type, as Postgres's `GROUP BY`
+does, so `ch = 'ab  '` ignores trailing blanks. A `JOIN`
 holds its `GROUP BY` and `ON` columns in each column's type and collation, in
 its target and its hidden tables, with no modifier.
 

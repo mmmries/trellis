@@ -2986,6 +2986,9 @@ pub(super) async fn compute_page(
                                     ),
                                 )
                                 .await?;
+                            shape
+                                .read_key_types(&**client, def.id, &def.source_table)
+                                .await?;
                             ddl::identity_key_columns(&**client, &def.target_table).await?
                         };
                         entry.insert(super::group_basis::GroupTargetPlan::new(
