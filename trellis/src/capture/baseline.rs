@@ -832,12 +832,24 @@ pub(crate) async fn check(
     // The readers whose read column changed type and that stay valid, whose
     // floor is stamped again over the new types (ADR-0024).
     let mut restamp: BTreeMap<i64, &crate::defs::ast::TransformDef> = BTreeMap::new();
+    // The table's applying readers now, which a rebuild below takes.
+    let mut candidates: Vec<i64> = Vec::new();
     if !found.changes.is_empty() {
-        let readers: Vec<i64> = readers_of(catalog, table, &BTreeSet::new(), true);
-        if !readers.is_empty() {
+        // Every definition row this transaction locks, first and in one
+        // sorted statement (ADR-0028 I5): the readers in `catalog`, which a
+        // pause or a restamp takes, and the rebuild's candidates. The
+        // catalog is the pass's snapshot, so a reader registered since
+        // (with an id lower than one the catalog holds, when two defines
+        // commit out of id order) is a candidate it doesn't name.
+        candidates = crate::staging::build::rebuild_candidates(&txn, &[table.to_string()]).await?;
+        let mut held: Vec<i64> = readers_of(catalog, table, &BTreeSet::new(), true);
+        held.extend(&candidates);
+        held.sort_unstable();
+        held.dedup();
+        if !held.is_empty() {
             txn.execute(
                 "select 1 from transform_definitions where id = any($1) order by id for update",
-                &[&readers],
+                &[&held],
             )
             .await?;
         }
@@ -912,13 +924,9 @@ pub(crate) async fn check(
             .filter(|r| applying.contains(&r.id))
             .map(|r| r.target.clone())
             .collect();
-        let rebuilt = crate::intake::catch_up::park_table_catch_ups(
-            &txn,
-            floors,
-            &[table.to_string()],
-            false,
-        )
-        .await?;
+        // `park_table_catch_ups` over the candidates read before the
+        // lock: a fresh read could name a row the lock statement didn't.
+        let rebuilt = crate::intake::catch_up::rebuild(&txn, candidates).await?;
         rebuilt.stamp(&txn).await?;
     }
     write(&txn, table, &found.rewrite).await?;
@@ -1455,5 +1463,150 @@ mod tests {
         assert!(matches!(found.changes["a"], Change::Readded { .. }));
         assert_eq!(found.gone, vec![(3, "a".to_string())]);
         assert_eq!(found.rewrite.len(), 2);
+    }
+
+    /// The drift check takes every definition row it locks in one sorted
+    /// statement, first (ADR-0028 I5, #2023): a reader of the table its
+    /// catalog snapshot doesn't name, registered since with a lower id, is
+    /// locked with the readers it does, not in a later statement. Frozen with
+    /// that reader's row held by another transaction, which then takes the
+    /// named reader's row, as a sorted taker of both would: had the check
+    /// locked the named reader first, the two would deadlock.
+    #[tokio::test]
+    async fn the_drift_check_locks_a_reader_its_snapshot_misses_with_the_rest() {
+        use std::collections::HashMap;
+
+        use crate::defs::ast::ValueType;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = crate::pool::Pool::new(&config).expect("pool");
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .batch_execute(&format!(
+                    "set search_path to {}, public",
+                    crate::config::DEFAULT_SCHEMA
+                ))
+                .await
+                .expect("search path");
+            client
+        };
+        let mut checker = connect().await;
+        checker
+            .batch_execute("create table public.s (id bigint primary key, x numeric)")
+            .await
+            .expect("source");
+        let columns: HashMap<String, ValueType> = ["id", "x"]
+            .iter()
+            .map(|name| (name.to_string(), ValueType::Numeric))
+            .collect();
+        let mut ids = Vec::new();
+        for text in [
+            "TRANSFORM unseen FROM public.s SELECT x AS v",
+            "TRANSFORM seen FROM public.s SELECT x AS v",
+        ] {
+            let def = crate::defs::catalog::create_definition(&pool, text, &columns)
+                .await
+                .expect(text);
+            ids.push(def.id);
+        }
+        let (unseen, seen) = (ids[0], ids[1]);
+        assert!(unseen < seen);
+        checker
+            .execute(
+                "update transform_definitions set status = 'live' where id = any($1)",
+                &[&ids],
+            )
+            .await
+            .expect("live");
+        record(&checker, "public.s", &["x".to_string()])
+            .await
+            .expect("baseline");
+        // The pass's snapshot, taken before `unseen` was registered.
+        let mut catalog = crate::capture::columns::load_catalog(&checker)
+            .await
+            .expect("catalog");
+        catalog.definitions.retain(|r| r.id != unseen);
+        checker
+            .batch_execute("alter table public.s alter column x type numeric using x + 1")
+            .await
+            .expect("a same-type rewrite");
+
+        let mut taker = connect().await;
+        let other = taker.transaction().await.expect("txn");
+        other
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&unseen],
+            )
+            .await
+            .expect("lock unseen");
+        let other_pid: i32 = other
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let checker_pid: i32 = checker
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let floors = crate::defs::floor::Floors::of_this_binary();
+        let check = tokio::spawn(async move {
+            let paused = check(
+                &mut checker,
+                crate::config::DEFAULT_SCHEMA,
+                &floors,
+                &catalog,
+                "public.s",
+            )
+            .await;
+            (checker, paused)
+        });
+        // Wait for the check to queue behind `unseen`'s row: a lock state,
+        // which it reaches once, not a convergence.
+        let watcher = connect().await;
+        loop {
+            let blocked: bool = watcher
+                .query_one(
+                    "select $2 = any(pg_blocking_pids($1))",
+                    &[&checker_pid, &other_pid],
+                )
+                .await
+                .expect("blocking pids")
+                .get(0);
+            if blocked {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        other
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&seen],
+            )
+            .await
+            .expect("the check holds no row past the one it waits on");
+        other.commit().await.expect("commit");
+        let (checker, paused) = check.await.expect("check task");
+        assert!(!paused.expect("check"), "a rewrite pauses nobody");
+        let statuses: Vec<String> = checker
+            .query(
+                "select status from transform_definitions where id = any($1) order by id",
+                &[&ids],
+            )
+            .await
+            .expect("statuses")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(statuses, ["backfilling", "backfilling"], "both rebuilt");
     }
 }
