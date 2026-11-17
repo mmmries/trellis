@@ -86,9 +86,10 @@ const WORKLOAD: &[&str] = &[
     "update s set state = 'it''s', g = 3 where id = 5",
 ];
 
-/// A 1-1 field and an aggregate argument compare the enum with a label, in
-/// either order, under `NOT`, in a `CASE` and read by another field; the
-/// target matches the hand-written query across inserts, updates and deletes.
+/// A 1-1 field, an aggregate argument and an aggregate's `WHERE` compare the
+/// enum with a label, in either order, under `NOT`, in a `CASE` and read by
+/// another field; the target matches the hand-written query across inserts,
+/// updates and deletes.
 #[tokio::test]
 async fn an_enum_equals_a_label_in_a_one_to_one_field_and_an_aggregate() {
     let cluster = TestCluster::start();
@@ -104,6 +105,7 @@ async fn an_enum_equals_a_label_in_a_one_to_one_field_and_an_aggregate() {
         "TRANSFORM a FROM s GROUP BY g SELECT g AS g, \
            COUNT(CASE WHEN state = 'open' THEN 1 END) AS n_open, \
            SUM(CASE WHEN 'closed' = state THEN id ELSE 0 END) AS closed_ids",
+        "TRANSFORM w FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n WHERE 'open' = state",
     ] {
         definer
             .apply(statement)
@@ -114,6 +116,7 @@ async fn an_enum_equals_a_label_in_a_one_to_one_field_and_an_aggregate() {
     let trellis = connect_trellis(db.dsn(), true).await;
     wait_live::wait_for_live(&trellis, "t").await;
     wait_live::wait_for_live(&trellis, "a").await;
+    wait_live::wait_for_live(&trellis, "w").await;
     for sql in &WORKLOAD[1..] {
         raw.execute(*sql, &[])
             .await
@@ -143,8 +146,20 @@ async fn an_enum_equals_a_label_in_a_one_to_one_field_and_an_aggregate() {
         .await,
         0
     );
+    // As in Postgres, a group with no member row has no target row.
+    assert_eq!(
+        differences(
+            &raw,
+            "w",
+            "g, n",
+            "select g, count(*) from s where 'open' = state group by g",
+        )
+        .await,
+        0
+    );
     audit_converges(&trellis, "t").await;
     audit_converges(&trellis, "a").await;
+    audit_converges(&trellis, "w").await;
     trellis.shutdown().await.expect("shutdown");
 }
 
@@ -160,6 +175,8 @@ async fn a_literal_that_is_no_label_is_refused_at_define() {
         "TRANSFORM t FROM s SELECT state = 'Open' AS x",
         "TRANSFORM t FROM s SELECT 'pending' = state AS x",
         "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(CASE WHEN state = 'nope' THEN 1 END) AS n",
+        // A `WHERE` reads the literal on every row too.
+        "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n WHERE state = 'nope'",
     ] {
         let refusal = trellis.apply(text).await.expect_err(text).to_string();
         assert!(

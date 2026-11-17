@@ -2662,14 +2662,20 @@ pub(crate) fn validate_live(
 }
 
 /// Refuses a string literal compared with an enum column that is not a label
-/// of the enum, over the live `columns` (which carry the labels). [`validate`]
-/// types the fields over types alone, so it can't; define and every `RESUME`
-/// make this check ([`super::catalog::validate_live_schema`]).
+/// of the enum, in a field or the `WHERE`, over the live `columns` (which
+/// carry the labels). [`validate`] types the definition over types alone, so
+/// it can't; define and every `RESUME` make this check
+/// ([`super::catalog::validate_live_schema`]).
 pub(crate) fn check_enum_literals(
     def: &TransformDef,
     columns: &HashMap<String, JoinColumnInfo>,
 ) -> Result<(), ValidationError> {
-    infer_fields(&def.fields, &ColumnTypes::Live(columns)).map(|_| ())
+    let live = ColumnTypes::Live(columns);
+    infer_fields(&def.fields, &live)?;
+    if let Some(predicate) = def.predicate.filter() {
+        infer_expr_type_in("WHERE", predicate, &live)?;
+    }
+    Ok(())
 }
 
 /// [`validate_aggregate_admitted`]'s walk of one field's expression.
