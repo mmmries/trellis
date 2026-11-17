@@ -2476,6 +2476,9 @@ pub async fn alter_transform(
     // `REGEXP_COUNT` can't read a nondeterministic-collation column, exactly
     // as at install. Before any DDL, like the rechecks above.
     let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
+    // A field that reads an edited one sees its new collation, so it is
+    // checked too, as a fresh define of the merged text would.
+    let edited = with_transitive_readers(&merged, edited);
     let live = LiveTable::read(&*txn, &current.source_table).await?;
     check_collation_reads(&merged, Some(&edited), |read| {
         Some((current.source_table.clone(), live.info(&read.column)?))
@@ -3336,6 +3339,28 @@ pub struct AlterOutcome {
     pub added: Vec<String>,
     pub dropped: Vec<String>,
     pub altered: Vec<String>,
+}
+
+/// `edited` plus every field of `def` that reads, directly or through other
+/// fields, one of them.
+fn with_transitive_readers(def: &TransformDef, mut edited: Vec<FieldDef>) -> Vec<FieldDef> {
+    fn reads(expr: &Expr, names: &HashSet<&str>) -> bool {
+        matches!(expr, Expr::Column(name) if names.contains(name.as_str()))
+            || expr.children().into_iter().any(|child| reads(child, names))
+    }
+    loop {
+        let names: HashSet<&str> = edited.iter().map(|f| f.name.as_str()).collect();
+        let more: Vec<FieldDef> = def
+            .fields
+            .iter()
+            .filter(|f| !names.contains(f.name.as_str()) && reads(&f.expr, &names))
+            .cloned()
+            .collect();
+        if more.is_empty() {
+            return edited;
+        }
+        edited.extend(more);
+    }
 }
 
 /// [`alter_transform`]'s pre-transaction, best-effort half of the `DROP

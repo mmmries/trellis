@@ -325,6 +325,58 @@ async fn altering_in_a_substring_search_on_a_nondeterministic_column_is_refused(
     assert!(!added, "a refused ALTER must not add its column");
 }
 
+/// An `ALTER ... ALTER` of a field that another, unedited field passes to
+/// `STRPOS` changes what that reader sees, so the reader is checked too: the
+/// same final text is refused at define.
+#[tokio::test]
+async fn altering_a_field_an_unedited_strpos_reads_to_a_nondeterministic_column_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_case_insensitive_collation(&db.pool).await;
+    batch(
+        &db.pool,
+        "create table notes (id bigint primary key, title text collate case_insensitive, \
+                             body text)",
+    )
+    .await;
+    let note_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("title", ValueType::Text),
+        ("body", ValueType::Text),
+    ]);
+    install_definition(
+        &db.pool,
+        "TRANSFORM note_calc FROM notes SELECT body AS b, strpos(b, 'x') AS pos",
+        &note_columns,
+        "public",
+    )
+    .await
+    .expect("a deterministic column's strpos installs");
+    batch(
+        &db.pool,
+        "update transform_definitions set status = 'live' where target_table = 'public.note_calc'",
+    )
+    .await;
+    // The final text, as a fresh define: refused.
+    install_definition(
+        &db.pool,
+        "TRANSFORM fresh_calc FROM notes SELECT title AS b, strpos(b, 'x') AS pos",
+        &note_columns,
+        "public",
+    )
+    .await
+    .expect_err("a fresh define of the final text is refused");
+    let Statement::AlterTransform(alter) =
+        parse_statement("ALTER TRANSFORM note_calc ALTER b AS title").expect("parse the ALTER")
+    else {
+        panic!("expected an ALTER TRANSFORM statement");
+    };
+    let err = alter_transform(&db.pool, &alter)
+        .await
+        .expect_err("the unedited reader's strpos now reads a nondeterministic column");
+    assert_text_function_refused(err, "pos", "STRPOS", "trellis.notes", "title");
+}
+
 /// A nondeterministic collation's `=` calls `'A'` and `'a'` equal, so a text
 /// comparison (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `NULLIF`) that reads such
 /// a column is refused like the text functions: directly, through `COALESCE`
