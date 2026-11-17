@@ -98,8 +98,9 @@ pub enum MaintenanceKind {
     /// new leaves over its remainders at a multiple of its modulus, each
     /// with `rows` rows.
     Resplit { rows: u8 },
-    /// A new middle for a bound no leaf holds (for `LIST`, a free value and
-    /// up to two more free values above it), partitioned `BY LIST` of the
+    /// A new middle for a bound no leaf holds, never the `DEFAULT` (#2106)
+    /// (for `LIST`, a free value and up to two more free values above it),
+    /// partitioned `BY LIST` of the
     /// grain: a leaf for each of `leaves` of the grains its bound holds, and
     /// a `DEFAULT` when `default` or `leaves` is zero. It holds `rows` rows
     /// (primary keys `1..=rows`) spread over the grains its leaves take;
@@ -472,6 +473,18 @@ impl PartitionSim {
             .bounds()
             .into_iter()
             .filter(|b| self.free(b))
+            .collect()
+    }
+
+    /// The free bounds a middle may take: any but the `DEFAULT`. A leaf
+    /// under a partitioned `DEFAULT` keeps a stale partition constraint in
+    /// a backend that loaded it once a sibling of the `DEFAULT` is detached
+    /// or dropped, and refuses rows the `DEFAULT` now takes (a Postgres bug,
+    /// #2106), which no model of the tree can predict.
+    fn middle_bounds(&self) -> Vec<BTreeSet<usize>> {
+        self.free_bounds()
+            .into_iter()
+            .filter(|b| !self.layout.default_slot().is_some_and(|d| b.contains(&d)))
             .collect()
     }
 
@@ -1110,7 +1123,11 @@ fn maintenance(
         MaintenanceKind::Create { .. } | MaintenanceKind::Middle { .. } => {
             // A new leaf needs a bound no leaf holds: with none free, it
             // replaces a leaf, dropped first.
-            if sim.free_bounds().is_empty()
+            let free = match kind {
+                MaintenanceKind::Middle { .. } => sim.middle_bounds(),
+                _ => sim.free_bounds(),
+            };
+            if free.is_empty()
                 && let Some(op) = maintenance_op(sim, table, pick, MaintenanceKind::Drop)
             {
                 emit(sim, op, out);
@@ -1163,8 +1180,14 @@ fn maintenance(
                 return;
             };
             let others = |sim: &PartitionSim| -> Vec<BTreeSet<usize>> {
-                let own = &sim.tables[sim.table_named(&leaf)].slots;
-                sim.free_bounds().into_iter().filter(|b| b != own).collect()
+                let t = sim.table_named(&leaf);
+                let free = if sim.tables[t].sub.is_empty() {
+                    sim.free_bounds()
+                } else {
+                    sim.middle_bounds()
+                };
+                let own = &sim.tables[t].slots;
+                free.into_iter().filter(|b| b != own).collect()
             };
             if others(sim).is_empty() {
                 drop_other(sim, out, &leaf, &|_, _| true);
@@ -1383,20 +1406,15 @@ fn new_middle(
     default: bool,
     standalone: bool,
 ) -> Option<Op> {
-    let free = sim.free_bounds();
+    let free = sim.middle_bounds();
     let mut slots = (!free.is_empty()).then(|| free[pick % free.len()].clone())?;
-    if matches!(sim.layout.0, PartitionStrategy::List { .. })
-        && !sim
-            .layout
-            .default_slot()
-            .is_some_and(|d| slots.contains(&d))
-    {
+    if matches!(sim.layout.0, PartitionStrategy::List { .. }) {
         // A `LIST` bound is one value: up to two more free values above it
         // give the middle's leaves values to split.
         let first = *slots.first().expect("a bound holds a slot");
         for bound in &free {
             let s = *bound.first().expect("a bound holds a slot");
-            if slots.len() < 3 && s > first && Some(s) != sim.layout.default_slot() {
+            if slots.len() < 3 && s > first {
                 slots.insert(s);
             }
         }
@@ -2491,6 +2509,69 @@ mod tests {
         assert_eq!(
             tree_change_names(&program),
             vec!["detach_middle", "attach_middle", "middle_leaf_write"]
+        );
+    }
+
+    /// A middle never takes the root's `DEFAULT` slot (#2106): with only
+    /// the `DEFAULT` free, a `Middle` draw drops a leaf and takes its bound.
+    #[test]
+    fn a_middle_never_takes_the_default() {
+        let list = PartitionStrategy::List {
+            values: 2,
+            default: true,
+        };
+        let middle = |then| PartitionDraw::Maintenance {
+            at: 0,
+            pick: 0,
+            kind: MaintenanceKind::Middle {
+                rows: 1,
+                leaves: 1,
+                default: true,
+                standalone: false,
+                then,
+            },
+        };
+        let program = add_partition_maintenance(
+            program(list, &[], vec![]),
+            0,
+            &[
+                PartitionDraw::Maintenance {
+                    at: 0,
+                    pick: 2,
+                    kind: MaintenanceKind::Drop,
+                },
+                middle(MiddleThen::Detach {
+                    concurrently: false,
+                }),
+                // Only the `DEFAULT` and t0_m1's bound are free: the rebound
+                // of the detached middle drops a leaf for another bound.
+                PartitionDraw::Maintenance {
+                    at: 0,
+                    pick: 0,
+                    kind: MaintenanceKind::Rebound {
+                        concurrently: false,
+                    },
+                },
+            ],
+        );
+        let bounds: Vec<&str> = program
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Partition {
+                    action:
+                        PartitionAction::CreateMiddle { bound, .. }
+                        | PartitionAction::Attach { bound, .. },
+                    ..
+                } => Some(bound.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bounds,
+            vec!["for values in (0)", "for values in (1)"],
+            "{:#?}",
+            program.ops
         );
     }
 }

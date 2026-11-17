@@ -692,8 +692,8 @@ beside them run on every `cargo test`.
   widened by a detach and an attach; a `HASH` leaf re-split into leaves at
   a multiple of its modulus, so one tree mixes moduli), middles (a leaf
   partitioned again by `LIST` of the grain, with a leaf for up to two of
-  its grains and a `DEFAULT` or not, under any free bound, the root's
-  `DEFAULT` included, created in the tree or attached with rows, then
+  its grains and a `DEFAULT` or not, under any free bound but the root's
+  `DEFAULT`, created in the tree or attached with rows, then
   detached, also `CONCURRENTLY`, attached again or dropped like any leaf,
   with writes and truncates named on its own leaves),
   partition-key updates that move a row to another partition (or are

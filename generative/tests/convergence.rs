@@ -458,8 +458,8 @@ async fn middles_converge_end_to_end() {
                 then,
             },
         };
-        // pick 3 drops the `DEFAULT` of the `LIST` tree, so its first middle
-        // is a partitioned `DEFAULT`, and later detaches that middle.
+        // pick 3 drops the `DEFAULT` of the `LIST` tree, and later detaches
+        // the first middle.
         let maintenance = |at, pick, kind| PartitionDraw::Maintenance { at, pick, kind };
         let program = add_partition_maintenance(
             base,
