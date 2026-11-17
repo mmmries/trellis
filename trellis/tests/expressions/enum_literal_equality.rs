@@ -163,7 +163,7 @@ async fn a_literal_that_is_no_label_is_refused_at_define() {
     ] {
         let refusal = trellis.apply(text).await.expect_err(text).to_string();
         assert!(
-            refusal.contains("T0233") && refusal.contains(".ticket_state"),
+            refusal.contains("T0241") && refusal.contains(".ticket_state"),
             "{text}: {refusal}"
         );
     }
@@ -198,7 +198,7 @@ async fn a_relabelled_value_fails_the_definition_at_resume() {
         .expect_err("the literal is no longer a label")
         .to_string();
     assert!(
-        refusal.contains("T0233") && refusal.contains("'brisk'"),
+        refusal.contains("T0241") && refusal.contains("'brisk'"),
         "{refusal}"
     );
     assert_eq!(h.status("t").await, TransformStatus::Paused);

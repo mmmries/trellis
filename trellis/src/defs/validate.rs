@@ -955,7 +955,7 @@ impl ValidationError {
             ValidationError::NonLiteralRegexPattern { .. } => ErrorId(96),
             ValidationError::InvalidTypedLiteral { .. } => ErrorId(97),
             ValidationError::UnsupportedLiteralType { .. } => ErrorId(98),
-            ValidationError::EnumLiteralNotALabel { .. } => ErrorId(233),
+            ValidationError::EnumLiteralNotALabel { .. } => ErrorId(241),
             ValidationError::UnresolvedGroupByColumn { .. } => ErrorId(99),
             ValidationError::UnsupportedGroupByKeyType { .. } => ErrorId(100),
             ValidationError::GroupByKeysShareTargetColumn { .. } => ErrorId(101),
@@ -8419,7 +8419,7 @@ mod tests {
         };
         assert_eq!(
             refusal.to_string(),
-            "T0233: calculated field 'v': 'x' is not a label of the enum type public.status; a string \
+            "T0241: calculated field 'v': 'x' is not a label of the enum type public.status; a string \
              literal compared with an enum column must be one of its labels"
         );
     }
