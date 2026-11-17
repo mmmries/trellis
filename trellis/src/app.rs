@@ -1118,6 +1118,11 @@ impl Trellis {
             match (self.read_status(&mut client, target_table).await, pending) {
                 (Ok(status), pending) => Ok(status.map(|mut status| {
                     status.migrations_pending = pending;
+                    status.maintenance_refusals = self
+                        .client
+                        .as_ref()
+                        .map(Client::refused_steps)
+                        .unwrap_or_default();
                     status
                 })),
                 // Only pending migrations explain a catalog it can't read:
@@ -1366,6 +1371,7 @@ impl Trellis {
                 version_handover,
                 migrations_pending: None,
                 below_catalog_floor,
+                maintenance_refusals: Vec::new(),
                 floor: row.get("floor_version"),
             }))
         }
@@ -2622,6 +2628,15 @@ pub struct DefinitionStatus {
     /// state-changing calls refuse ([`ErrorCode::VersionFloor`]). Names the
     /// floor and this binary's version. Run a version at or above the floor.
     pub below_catalog_floor: Option<crate::catalog_floor::BelowCatalogFloor>,
+    /// The ring and maintenance steps this handle's staging worker is
+    /// refused (`42501`), such as retiring a drained segment without
+    /// `TRUNCATE`: each names the step, the role, the table and the
+    /// privileges the role lacks. Instance-level, so every definition
+    /// reports the same list. Nothing is paused: no definition's correctness
+    /// waits on these steps, but the ring isn't housekept until the
+    /// privilege is granted. An entry clears itself once a pass of its step
+    /// succeeds. Empty on a handle that runs no staging worker.
+    pub maintenance_refusals: Vec<crate::refused_steps::RefusedStep>,
     /// The oldest Trellis release that can run the definition, as
     /// `major.minor.patch` (ADR-0024): the latest release any grammar
     /// construct, key space, option or hidden-table layout it uses arrived

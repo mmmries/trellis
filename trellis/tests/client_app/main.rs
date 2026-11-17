@@ -18,6 +18,7 @@ mod client_e2e;
 mod connectivity;
 mod converge;
 mod cross_instance_target_source;
+mod dml_only_worker;
 mod identity;
 mod instance_metrics;
 mod live_means_steady_state;
