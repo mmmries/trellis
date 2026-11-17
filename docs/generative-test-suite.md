@@ -117,8 +117,6 @@ the same expression in Postgres. So the oracle *is Postgres*: render a
 definition's formulas (and predicate, and grain) back to a `SELECT` against the
 source, run it in the same cluster, and assert the persisted target equals it.
 
-A definition's `WHERE` goes into its `SELECT` as written.
-
 - **1-1:** `SELECT pk, (price + tax) AS total FROM orders` → compare row-by-row.
 - **Aggregate:** `SELECT grain, sum(measure) FROM src GROUP BY grain` → compare.
 - **Join aggregate:** the definition's own `SELECT keys, aggregates FROM a [LEFT]
@@ -319,19 +317,13 @@ with no database (`run::coverage::where_crossings`, over the evaluator
 (`in_in`, `in_out`, `out_in`, `out_out`) no change lands in. The coverage
 report prints the same tally as `where_crossings`.
 
-The `WHERE` plants are gated where their key space is drawn. Every
-concurrent tier but `min_max` (which draws no filtered definition) catches
-`gb_where_old_image`, `gb_where_null_as_true` and `gb_where_build_unfiltered`
-in 20 to 33 cases of 48. `gb_where_filtered_naming` fires in none: only a
-held key's release or a partition correction names groups from group-only
-images, which its deterministic pins cover. The 1-1 `JOIN` tier gates
-`join1_where_fan_out_no_delete`, `join1_where_delete_presence_only`,
-`join1_where_null_as_true` and `join1_where_build_unfiltered` (6 to 11 of
-24); the star tier gates the last and runs the others as known misses.
+The `WHERE` plants are gated where their key space is drawn: the aggregate
+ones in every concurrent tier but `min_max`, the 1-1 `JOIN` ones in the
+two-table tier (the star tier gates `join1_where_build_unfiltered`).
+`gb_where_filtered_naming` needs a held key's release or a
+partition correction, which no tier draws; its deterministic pins gate it.
 
-The plain 1-1 (#2038) and the join aggregate (#2042) join `filters`, with
-templates of their own in `with_predicates`, once define applies their
-`WHERE`.
+The plain 1-1 and the join aggregate draw no predicate.
 
 ## 4. The properties
 

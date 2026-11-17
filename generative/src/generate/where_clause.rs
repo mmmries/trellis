@@ -5,12 +5,10 @@
 //!
 //! # Which definitions draw one
 //!
-//! [`filters`] names the key spaces whose `WHERE` the engine applies today:
-//! the plain aggregate without `MIN`/`MAX` (#2039; define refuses an extreme
-//! under a filter) and the 1-1 `JOIN` and star (#2041). The plain 1-1 (#2038)
-//! and the join aggregate (#2042) plug in there, with a template set of their
-//! own in [`with_predicates`]: until then define refuses their filter, so
-//! drawing one would fail the install.
+//! [`filters`] names the key spaces that draw one: the plain aggregate
+//! without `MIN`/`MAX` (define refuses an extreme under a filter) and the 1-1
+//! `JOIN` and star. The plain 1-1 and the join aggregate draw none yet
+//! (#2043): each needs a template set in [`with_predicates`].
 //!
 //! # Seeds stay what they were
 //!
@@ -42,15 +40,15 @@ use crate::model::{Program, Table};
 /// How many filtering definitions in 256 draw a predicate.
 pub const WHERE_SHARE: u64 = 128;
 
-/// Whether the engine applies a `WHERE` on `def`'s key space today, so the
-/// generators may draw one on it (the module doc).
+/// Whether the generators draw a `WHERE` on `def`'s key space (the module
+/// doc).
 pub fn filters(def: &TransformDef) -> bool {
     match &def.key_space {
         // #2039: `MIN`/`MAX` under a filter is refused (`FilteredExtreme`).
         KeySpace::Aggregate { .. } => !def.fields.iter().any(|f| has_extreme(&f.expr)),
         // #2041.
         KeySpace::JoinOneToOne(_) => true,
-        // #2038 (plain 1-1) and #2042 (join aggregate): not yet applied.
+        // The plain 1-1 and the join aggregate: not drawn yet (#2043).
         KeySpace::OneToOne | KeySpace::Join(_) => false,
     }
 }

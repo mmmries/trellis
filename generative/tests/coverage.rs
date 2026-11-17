@@ -1683,10 +1683,10 @@ fn sample<T: std::fmt::Debug>(strategy: impl Strategy<Value = T>, count: usize) 
 
 /// #2043: every crossing bucket of a `WHERE` (a change that keeps a row in,
 /// takes it out, brings it in, or keeps it out) is drawn, for each key space
-/// whose `WHERE` the engine applies: the plain aggregate (the serial and
+/// that draws a `WHERE`: the plain aggregate (the serial and
 /// concurrent tiers) and the 1-1 `JOIN` (its two-table and star tiers). An
 /// empty bucket is coverage that dropped out. The plain 1-1 (#2038) and the
-/// join aggregate (#2042) join the list when their key spaces filter.
+/// join aggregate (#2042) join the list when they draw one.
 #[test]
 fn every_where_crossing_bucket_is_drawn_for_each_filtering_key_space() {
     use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
