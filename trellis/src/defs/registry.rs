@@ -451,6 +451,10 @@ pub enum ComparisonRule {
     /// A float beside a bare number literal (`validate`'s
     /// `comparison_type`).
     FloatBesideNumberLiteral,
+    /// An enum column beside a string literal, under `=` only: Postgres
+    /// reads the literal as a value of the enum, and a label the enum lacks
+    /// fails the statement, so define checks it against the live labels.
+    EnumBesideStringLiteral,
     /// Two booleans.
     Boolean,
     /// Two uuids.
@@ -588,6 +592,7 @@ impl TypeRule {
                 | ComparisonRule::Uuid
                 | ComparisonRule::TextEquality
                 | ComparisonRule::Temporal => BASELINE,
+                ComparisonRule::EnumBesideStringLiteral => Release::new(0, 4, 0),
             },
             TypeRule::Cast(rule) => match rule {
                 CastRule::IntegerWidening

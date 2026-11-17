@@ -1770,8 +1770,16 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = registry::operator_spec(*op).symbol;
-            let l = sub(lhs)?;
-            let r = sub(rhs)?;
+            // A string literal beside a non-literal under `=` is bare, so
+            // Postgres types it from that operand, an enum column included.
+            let mut operand = |e: &'e Expr, other: &Expr| match e {
+                Expr::StringLiteral(text) if bare_beside_equal(*op, other) => {
+                    Ok(format!("'{}'", text.replace('\'', "''")))
+                }
+                _ => sub(e),
+            };
+            let l = operand(lhs, rhs)?;
+            let r = operand(rhs, lhs)?;
             format!("({l} {symbol} {r})")
         }
         Expr::Negate(operand) => format!("(-({}))", sub(operand)?),
@@ -1815,6 +1823,13 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
     })
+}
+
+/// Whether a string literal beside `other` under `op` is bare: an operand of
+/// `=` whose other operand is not a literal. Written here, not shared with
+/// the write path (ADR-0013).
+fn bare_beside_equal(op: crate::defs::ast::Operator, other: &Expr) -> bool {
+    op == crate::defs::ast::Operator::Equal && !matches!(other, Expr::StringLiteral(_))
 }
 
 /// Renders a calculated-field expression to Postgres SQL text — the "small"

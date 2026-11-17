@@ -73,6 +73,13 @@ it; a field that is only `NULL` is a `text` column ([type
 support](type-support.md#comparison-and-logic)). A comparison, `IS NULL` or
 logic field is a `boolean` column, and another field may read it.
 
+An enum column compares with a string literal under `=`, in either order
+(`status = 'open'`). Postgres reads the literal as a value of the enum, so
+define refuses one that is not a label of it. The labels are fixed into the
+definition's text: after `ALTER TYPE … RENAME VALUE` the definition pauses and
+its `RESUME` fails, and the remedy is `DROP TRANSFORM` and define again. `<>`,
+the orderings and `NULLIF` stay refused.
+
 Binding, loosest first: `OR`, `AND`, `NOT`, `IS ...`, the comparisons, `+` and
 `-`, `*` `/` `%`, prefix `-`; so `NOT a = b` is `NOT (a = b)` and
 `a = b IS NULL` is `(a = b) IS NULL`. `NOT` and `CASE` are keywords wherever
@@ -160,7 +167,8 @@ an entry under [Details](#details) where it needs more room.
 | [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | `MixedFloatExactComparison` | [Retype](transforms.md#retype) | Compare two floats or two exact values |
 | A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`): a conversion to or from `timestamptz` reads the session time zone | `MixedTemporalComparison` | [Retype](transforms.md#retype) | Cast one side so both are one type |
 | `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` are admitted | `TextOrderingComparison` | [Retype](transforms.md#retype) | Order by a non-text value, or by `CHAR_LENGTH` |
-| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, enums, `inet`, …) | `ComparisonTypeMismatch` | [Retype](transforms.md#retype) | Compare values of one family; `IS NULL` takes any type |
+| An enum column compared with a string literal that is not one of its labels | `EnumLiteralNotALabel` | [Retype](transforms.md#retype) | A label of the enum; after a rename, drop the transform and define it again |
+| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, an enum with anything but a string literal under `=`, `inet`, …) | `ComparisonTypeMismatch` | [Retype](transforms.md#retype) | Compare values of one family; `IS NULL` takes any type |
 | Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | `NonAssociativeComparison` | [Text](transforms.md#text) | Join them with `AND`, or add parentheses |
 | **Grammar forms and typing** | | | |
 | `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, the simple `CASE <operand> WHEN <value> THEN …`, `<expr>::<type>`, and `--` (a comment) | `UnsupportedIsForm`, `SimpleCaseUnsupported`, `UnsupportedCastOperator`, `DoubleMinus` | [Text](transforms.md#text) | `x IS NOT DISTINCT FROM TRUE` (`IS DISTINCT FROM` for the `NOT` forms), `x IS NULL`; `CASE WHEN <operand> = <value> THEN …`; `CAST`; `- -x` |

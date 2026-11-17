@@ -1685,6 +1685,7 @@ mod tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            enum_labels: None,
             copy_type: pg_type.to_string(),
             copy_collation: None,
             trellis_target: false,

@@ -477,9 +477,9 @@ sorted_words() { local w; for w in "$@"; do echo "$w"; done | sort | tr '\n' ' '
 # `|`, the definition over the shapes tables. The step fails a candidate-only
 # manifest line no entry covers. A feature that needs a table the shapes
 # schema lacks (a new primary-key or partition-key type) adds one to
-# shapes_schema below. Empty for 0.2.0: floors arrive in it, and
-# v0.1.0, which carries none, refuses its database.
+# shapes_schema below.
 rollback_new_defs=(
+  "feature TypeRule(Comparison(EnumBesideStringLiteral));admit comparison(Equal, Other(Enum(\"enum:public.e\")), string literal) = Ok(())|tickets_open|TRANSFORM tickets_open FROM tickets SELECT id AS id, state = 'open' AS is_open"
 )
 # What a release before 0.2.0 says when a later release has migrated the
 # database. Its `migrate`, which its `run` and `apply` call first, refuses the
@@ -495,6 +495,8 @@ create index on orders(customer_id);
 create table ledger(id bigint primary key, "order" bigint not null, n bigint not null);
 create table nan_orders(id bigint primary key, customer_id bigint not null, amount numeric(12,2) not null, note text);
 create index on nan_orders(customer_id);
+create type ticket_state as enum ('open', 'closed');
+create table tickets(id bigint primary key, state ticket_state not null);
 create table events(id bigint not null, tenant bigint not null, v bigint not null, primary key (id, tenant)) partition by hash (tenant);
 create table events_0 partition of events for values with (modulus 4, remainder 0);
 create table events_1 partition of events for values with (modulus 4, remainder 1);
@@ -506,10 +508,11 @@ insert into orders select g, 1 + g % 50, g, 'n' from generate_series(1,2000) g;
 insert into ledger select g, g, g % 7 from generate_series(1,100) g;
 insert into events select g, g % 20, 1 from generate_series(1,1000) g;
 insert into nan_orders values (3000, 7, 10.00, 'n'), (3003, 8, 20.00, 'n');
+insert into tickets select g, case when g % 2 = 0 then 'open'::ticket_state else 'closed'::ticket_state end from generate_series(1,10) g;
 EOF
 )
 sql "$port" shapes <<<"$shapes_schema"
-seed_rows=$((50 + 2000 + 100 + 1000 + 2))
+seed_rows=$((50 + 2000 + 100 + 1000 + 2 + 10))
 
 deep_chain="n"; for _ in $(seq 1 130); do deep_chain="$deep_chain + 1"; done
 deep_nested="n"; for _ in $(seq 1 130); do deep_nested="($deep_nested) + 1"; done
@@ -1436,7 +1439,7 @@ rollback_with_floors() {
   local cand_only="" shared="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join"
   sql "$port" postgres -c "create database $db"
   sql "$port" "$db" <<<"$shapes_schema"
-  seed_rows=$((seed_rows + 3150))
+  seed_rows=$((seed_rows + 3160))
   # Every manifest line after the old release is covered by a definition.
   if [ -f "$cand_src/.github/feature-floors.txt" ]; then
     covered=$(for e in ${rollback_new_defs[@]+"${rollback_new_defs[@]}"}; do echo "${e%%|*}" | tr ';' '\n'; done)

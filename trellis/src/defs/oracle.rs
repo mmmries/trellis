@@ -422,7 +422,13 @@ fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> St
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = super::registry::operator_spec(*op).symbol;
-            format!("({} {symbol} {})", render(lhs), render(rhs))
+            let operand = |e: &Expr, other: &Expr| match e {
+                Expr::StringLiteral(text) if is_bare_beside_equal(*op, other) => {
+                    bare_string_literal(text)
+                }
+                _ => render(e),
+            };
+            format!("({} {symbol} {})", operand(lhs, rhs), operand(rhs, lhs))
         }
         Expr::Negate(operand) => format!("(-({}))", render(operand)),
         Expr::Cast { expr, target } => format!("cast({} as {target})", render(expr)),
@@ -452,6 +458,19 @@ fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> St
             }
         },
     }
+}
+
+/// Whether a string literal beside `other` under `op` is rendered bare: an
+/// operand of `=` whose other operand is not a literal, so Postgres types it
+/// from that operand. Beside an enum column a bare literal is a value of the
+/// enum, which a `::text` one is not (`enum = text` has no operator).
+pub(crate) fn is_bare_beside_equal(op: super::ast::Operator, other: &Expr) -> bool {
+    op == super::ast::Operator::Equal && !matches!(other, Expr::StringLiteral(_))
+}
+
+/// A string literal with no cast, typed by its context.
+pub(crate) fn bare_string_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }
 
 /// A searched `CASE` as SQL text, each condition and result rendered by
