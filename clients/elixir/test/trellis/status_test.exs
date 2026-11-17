@@ -388,7 +388,8 @@ defmodule Trellis.StatusTest do
           }
         ],
         join: nil,
-        floor: "0.2.0"
+        floor: "0.2.0",
+        filter: nil
       })
 
     assert status.maintenance_refusals == [
