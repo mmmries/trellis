@@ -549,14 +549,14 @@ divergence
 ## Aggregates that are not supported
 
 An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or
-`AVG` over `smallint`, `integer`, `bigint` and `numeric`: the aggregates
-Trellis keeps exact from each change alone. A plain aggregate (not a `JOIN`)
+`AVG` over a number or an `interval`: the aggregates Trellis keeps exact from
+each change alone. A plain aggregate (not a `JOIN`)
 also admits `MIN` and `MAX` over the types the matrix marks, which re-read the
 source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
 Every other aggregate is refused at define, named by its family
 ([refusals](transforms.md#refusals)): `MIN`/`MAX` on a `JOIN`,
-`bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over a float, an
-`interval` or another type, and `array_agg`/`string_agg`/`jsonb_agg`.
+`bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over another type, and
+`array_agg`/`string_agg`/`jsonb_agg`.
 
 ## Typed literals and casts
 
