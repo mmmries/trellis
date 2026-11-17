@@ -917,15 +917,21 @@ pub(crate) async fn check(
     }
     let mut rebuilt_targets: Vec<String> = Vec::new();
     if !causes.is_empty() {
-        let applying = crate::defs::catalog::applying_readers(&txn, table).await?;
-        rebuilt_targets = catalog
-            .definitions
-            .iter()
-            .filter(|r| applying.contains(&r.id))
-            .map(|r| r.target.clone())
-            .collect();
         // `park_table_catch_ups` over the candidates read before the
         // lock: a fresh read could name a row the lock statement didn't.
+        rebuilt_targets = txn
+            .query(
+                &format!(
+                    "select target_table from transform_definitions \
+                     where id = any($1) and {} order by id",
+                    crate::defs::model::APPLYING_SQL
+                ),
+                &[&candidates],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
         let rebuilt = crate::intake::catch_up::rebuild(&txn, candidates).await?;
         rebuilt.stamp(&txn).await?;
     }
@@ -1585,6 +1591,10 @@ mod tests {
             if blocked {
                 break;
             }
+            assert!(
+                !check.is_finished(),
+                "the check finished without queuing behind the unseen reader's row"
+            );
             tokio::task::yield_now().await;
         }
         other
