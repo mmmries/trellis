@@ -572,6 +572,39 @@ mod tests {
             .expect("an average in range")
             .get(0);
         assert_eq!(avg, "2147483647 days");
+        // A finite sum whose fields are an infinity's (in range on 15 and
+        // 16, `interval out of range` on 17+): its average divides the
+        // fields, in the apply and the audit alike, where Postgres 17 reads
+        // the fields' text as the infinity.
+        for (values, avg) in [
+            (
+                [
+                    "178956970 years 7 mons 2147483647 days",
+                    "2562047788:00:54.775807",
+                ],
+                "89478485 years 3 mons 1073741838 days 1281023906:00:27.387904",
+            ),
+            (
+                [
+                    "-178956970 years -8 mons -2147483648 days",
+                    "-9223372036854775808 microseconds",
+                ],
+                "-89478485 years -4 mons -1073741824 days -1281023894:00:27.387904",
+            ),
+        ] {
+            let sql = format!(
+                "select ({})::text, ({})::text from (select sum({}) as v, count(x) as n \
+                 from (values ('{}'::interval), ('{}'::interval)) as __t(x)) as __g",
+                SumKind::Interval.avg("v", "n"),
+                audit::avg_of(SumKind::Interval, "v", "n"),
+                SumKind::Interval.summand("x"),
+                values[0],
+                values[1],
+            );
+            let row = client.query_one(&sql, &[]).await.expect(&sql);
+            let read: (String, String) = (row.get(0), row.get(1));
+            assert_eq!(read, (avg.to_string(), avg.to_string()), "{values:?}");
+        }
         // Infinite intervals exist from Postgres 17.
         let version: i32 = client
             .query_one("select current_setting('server_version_num')::int", &[])

@@ -310,8 +310,10 @@ pub(super) fn sum_of(kind: SumKind, value: &str, cast: &str) -> String {
 /// `count`: an exact one's `numeric` quotient; a float's exact quotient
 /// rounded once, 0 at most half the smallest subnormal (which a cast from
 /// `numeric` refuses); and an `interval`'s Postgres's own `interval /
-/// float8` over its sum, or where the sum is out of an `interval`'s range,
-/// the apply's own division of the fields (`exact_sums::interval_avg`).
+/// float8` over its sum, or where the sum is out of an `interval`'s range
+/// or its fields are an infinity's (text Postgres 17 reads as that
+/// infinity), the apply's own division of the fields
+/// (`exact_sums::interval_avg`).
 pub(super) fn avg_of(kind: SumKind, value: &str, count: &str) -> String {
     match kind {
         SumKind::Exact => format!("({value}) / ({count})::numeric"),
@@ -328,6 +330,9 @@ pub(super) fn avg_of(kind: SumKind, value: &str, count: &str) -> String {
                 "(case when __f.__m between -2147483648 and 2147483647 \
                         and __f.__d between -2147483648 and 2147483647 \
                         and __f.__u between -9223372036854775808 and 9223372036854775807 \
+                        and (__f.__m, __f.__d, __f.__u) not in \
+                            ((2147483647, 2147483647, 9223372036854775807), \
+                             (-2147483648, -2147483648, -9223372036854775808)) \
                        then {INTERVAL_TEXT} / ({count})::double precision \
                        else {} end)",
                 exact_sums::interval_avg("__f.__m", "__f.__d", "__f.__u", count)

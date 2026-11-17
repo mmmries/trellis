@@ -25,7 +25,7 @@ ordered floor to ceiling:
    Needs an immutable operator or function in the registry and, for a
    constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field has this type: `COUNT`,
-   `SUM` or `AVG` over an integer or `numeric` column or expression, and, on a plain
+   `SUM` or `AVG` over a number or `interval` column or expression, and, on a plain
    aggregate, `MIN` or `MAX` over a column of a number, date or time type
    ([`MIN` and `MAX`](#min-and-max)).
 
@@ -46,13 +46,13 @@ filter role.
 | `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` `MIN` `MAX` |
 | `oid` | yes | yes | yes | yes | typed literal only | `MIN` `MAX` (no arithmetic in Postgres) |
 | `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG`; `MIN` `MAX` |
-| `real` `double precision` | yes | no | no | no | yes | `MIN` `MAX` |
+| `real` `double precision` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` |
 | `boolean` | yes | no | yes | no | yes | no |
 | `uuid` | yes | yes | yes | yes | yes | no |
 | `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | no |
 | `bytea` | yes | yes | yes | yes | typed literal | no |
 | `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | `MIN` `MAX`, but not over `timetz` |
-| `interval` | yes | no | no | no | yes | `MIN` `MAX` |
+| `interval` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` |
 | `jsonb` | yes | no | no | no | typed literal | no |
 | `inet` | yes | no | yes | no | typed literal | no |
 | `cidr` | yes | yes | yes | yes | typed literal | no |
