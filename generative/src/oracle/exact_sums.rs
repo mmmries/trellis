@@ -161,16 +161,9 @@ fn float_result(values: &[f64], kind: Kind, func: Func) -> Result<f64, &'static 
             r
         }
         Func::Sum => round(&magnitude, 1, 53, 0),
-        Func::Avg => {
-            // The exact quotient is at most `2^-1075` (half a unit of ours)
-            // when twice the magnitude is at most the count.
-            let mut twice = magnitude.clone();
-            twice.add_big(&magnitude);
-            if twice.cmp(&Big::from(count)) != Ordering::Greater {
-                return Ok(0.0);
-            }
-            round(&magnitude, count, 53, 0)
-        }
+        // A quotient of at most `2^-1075` (half a unit of ours) rounds to
+        // `0` with the rest.
+        Func::Avg => round(&magnitude, count, 53, 0),
     };
     if rounded.is_infinite() {
         return Err("value out of range: overflow");
@@ -231,12 +224,6 @@ fn compose(mantissa: u64, exponent: i32) -> f64 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Big(Vec<u64>);
 
-impl From<u64> for Big {
-    fn from(value: u64) -> Self {
-        Big(vec![value])
-    }
-}
-
 impl Big {
     fn trim(&mut self) {
         while self.0.last() == Some(&0) {
@@ -264,12 +251,6 @@ impl Big {
             self.0[limb] = sum as u64;
             carry = sum >> 64;
             limb += 1;
-        }
-    }
-
-    fn add_big(&mut self, other: &Big) {
-        for (i, &limb) in other.0.iter().enumerate() {
-            self.add_shifted(limb, (i * 64) as u32);
         }
     }
 
@@ -654,6 +635,10 @@ mod tests {
         assert_eq!(avg(&[5e-324, 0.0]), 0.0);
         assert_eq!(avg(&[5e-324, 5e-324, 5e-324, 0.0]), 5e-324);
         assert_eq!(avg(&[-5e-324, -5e-324, -5e-324, 0.0]), -5e-324);
+        // A tie below the smallest normal goes to the even unit: 2.5 units
+        // to 2, 3.5 to 4.
+        assert_eq!(avg(&[5.0 * 5e-324, 0.0]), 2.0 * 5e-324);
+        assert_eq!(avg(&[7.0 * 5e-324, 0.0]), 4.0 * 5e-324);
         assert_eq!(avg(&[f64::MAX, f64::MAX]), f64::MAX);
     }
 
@@ -767,6 +752,9 @@ mod tests {
             avg(&[iv(1, 0, 0), iv(0, 0, 0), iv(0, 0, 0)]),
             Ok(iv(0, 10, 0))
         );
+        // Microseconds round half to even, as `rint` does: 2.5 to 2, 3.5 to 4.
+        assert_eq!(avg(&[iv(0, 0, 5), iv(0, 0, 0)]), Ok(iv(0, 0, 2)));
+        assert_eq!(avg(&[iv(0, 0, 7), iv(0, 0, 0)]), Ok(iv(0, 0, 4)));
         // Two days of the maximum average to it.
         let max = iv(0, i64::from(i32::MAX), 0);
         assert_eq!(avg(&[max, max]), Ok(max));
