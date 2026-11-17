@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::SimpleQueryMessage;
 use tokio_postgres::types::PgLsn;
-use trellis::dev::staging::{StagingError, await_converged};
+use trellis::dev::staging::{StagingError, await_converged, await_converged_except_held};
+
+use super::sql::HeldKeys;
 
 /// A quiesce's time budget.
 #[derive(Clone, Copy, Debug)]
@@ -157,12 +159,17 @@ pub(super) async fn await_ring(
     raw: &tokio_postgres::Client,
     token: PgLsn,
     deadline: &mut ProgressDeadline,
+    held: HeldKeys,
 ) -> Result<(), StagingError> {
     let started = Instant::now();
     let mut expired = None;
     let result = loop {
         let slice = deadline.remaining(Instant::now()).min(PROGRESS_SAMPLE);
-        match await_converged(raw, token, slice).await {
+        let waited = match held {
+            HeldKeys::Block => await_converged(raw, token, slice).await,
+            HeldKeys::Settle => await_converged_except_held(raw, token, slice).await,
+        };
+        match waited {
             Ok(()) => break Ok(()),
             Err(StagingError::ConvergenceTimeout { .. }) => {}
             Err(other) => break Err(other),

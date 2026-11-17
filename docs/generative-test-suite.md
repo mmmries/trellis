@@ -199,10 +199,9 @@ written by hand, each with a test that fails when it falls behind:
 A `Profile` sets the literal magnitude and nesting depth. The conformance
 properties draw boundary literals (`NaN`, `±Infinity`, range edges, numbers
 wider than any type) to depth 3. The end-to-end tiers draw small literals to
-depth 2 and divide only by `NULLIF(divisor, 0)`, so a program the engine
-accepts also runs: Postgres computes every field, and one that raised for some
-row (a column divisor that is zero there) would hold its key in quarantine and
-keep the program from converging.
+depth 2 and divide only by `NULLIF(divisor, 0)`, so a drawn expression never
+raises for a row. Erroring rows are drawn on purpose instead, by the held-key
+tier (§10, "The oracle and erroring rows").
 
 #### Expression conformance
 
@@ -335,6 +334,9 @@ beside them run on every `cargo test`.
 - **Untracked-table noise and checkpoints** (`tests/noise.rs`). Writes and DDL on
   tables Trellis doesn't track, and `CHECKPOINT`s, interleaved with the program
   never change the converged state.
+- **Held keys** (`tests/held_keys.rs`). Programs whose rows make a plain 1-1
+  field raise, and the fuse that quarantines a definition (§10, "The oracle
+  and erroring rows").
 - **Out-of-band tampering** (`tests/self_check_cross_check.rs`). Direct writes to
   derived tables are found by `self_check`, whose SQL renderer is independently
   authored from the oracle's; the suite asserts the two agree on every generated
@@ -778,14 +780,16 @@ The planted-bug sweep (`generative::plant_sweep`; `planted_bugs_are_caught` in
 `chained_join_planted_bugs_are_caught` in
 `generative/tests/join_chained_convergence.rs` for the chained-reader tier,
 `extremes_tamper_planted_bugs_are_caught` in
-`generative/tests/self_check_cross_check.rs` for the `MIN`/`MAX` tampering tier) runs a tier's seeded cases once unplanted, as the baseline, then
+`generative/tests/self_check_cross_check.rs` for the `MIN`/`MAX` tampering tier,
+`held_key_planted_bugs_are_caught` in `generative/tests/held_keys.rs` for the
+held-key tier) runs a tier's seeded cases once unplanted, as the baseline, then
 once per planted bug, and judges each plant only on cases the baseline passed.
 **No unknown failure is accepted in a generative case**: the baseline passes
 only with **zero failures outside the quarantine list**,
 `generative/baseline-quarantine.txt`. The rule is the same for every tier
 (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
 `min_max`, `join`, `join_one_to_one`, `join_star`, `join_chained`,
-`extremes_tamper`).
+`extremes_tamper`, `held_keys`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
   The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
@@ -969,7 +973,23 @@ judges a run:
   strategies and the shrinking.
 - **Concurrent-runtime shrink trust.** A concurrent-mode shrink is advisory:
   when a failure reproduces under the manual runtime, re-shrink it there.
-- **The oracle and erroring rows.** The Postgres-SQL oracle must model
-  quarantine once erroring operations exist (a row that makes a formula error is
-  kept out of the target, whereas one `SELECT` over the source aborts on it): it
-  computes per row and excludes the erroring rows, or renders error to `NULL`.
+- **The oracle and erroring rows.** The held-key tier
+  (`generate::held_keys`, `run::run_convergence_with_held_keys`) draws
+  erroring rows on purpose: a plain 1-1 field divides by `c2 - K`, with no
+  `NULLIF`, and a drawn share of the table's `c2` writes is set to `K`. Its
+  oracle computes per row (one `SELECT` aborts on the first row that raises)
+  and models the engine's contract ([ADR-0003](decisions/0003-quarantine-storage-and-api.md),
+  [`held_keys`](status-reference.md#held_keys)): a raising row's key is held,
+  its target row stays as the last check expected it (absent if it had none)
+  through every later change to the key, a `TRUNCATE` clears it while the key
+  stays held, and five held keys quarantine the definition and freeze its
+  target. After every op it checks each target against that, and that
+  `status()`'s `held_keys.count` and `sample_quarantined` name exactly the
+  held keys. A held key blocks every engine convergence wait, so the tier
+  waits with a test-only check that skips held keys' parked changes
+  (`trellis::dev::staging::await_converged_except_held`): a case settles as
+  fast with a held key as without, and shrinking pays no timeout per step.
+  Its fuse family gives one definition two raising fields, four rows at most
+  each, so the whole-transform fuse trips before either column fuse. Only
+  the plain 1-1 key space is modelled; every other tier keeps its draws
+  raise-free.

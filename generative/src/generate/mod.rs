@@ -126,6 +126,7 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
+pub mod held_keys;
 pub mod join;
 pub mod join_chained;
 pub mod join_one_to_one;
@@ -1066,8 +1067,8 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 /// from the dialect-common pool, and every `/` and `%` divides by
 /// `NULLIF(divisor, 0)` (`Profile::guard_divisors`), since a divisor can be a
 /// column or a `CASE` that is zero for some row. Postgres computes every
-/// field, so a shape that could raise for some row would hold its key in
-/// quarantine and the program would never converge: its quiesce times out.
+/// field, so no key is held. Only the held-key tier draws a field that
+/// raises, on purpose ([`held_keys`]), and models the keys it holds.
 ///
 /// **Slots, not names.** The expression is drawn before the table's column
 /// names exist (names are minted by the table), so it refers to the four
@@ -3062,6 +3063,232 @@ mod strategy {
         trivial_program_with(true)
     }
 
+    /// A raising field's dividend: `COALESCE(<e>, 1.5)`, `<e>` a raise-free
+    /// numeric expression over the [`DERIVED_SLOTS`]
+    /// ([`crate::expr_gen::Profile::END_TO_END`]). A `NULL` dividend gives
+    /// `NULL` rather than raise, and the end-to-end draws are often `NULL`
+    /// (a typed `NULL` leaf, a `NULL` column), so without the `COALESCE`
+    /// most aimed rows wouldn't raise.
+    fn numeric_dividend() -> BoxedStrategy<Expr> {
+        let slots: Vec<crate::expr_gen::Column> = DERIVED_SLOTS
+            .iter()
+            .map(|(name, ty)| ((*name).to_string(), *ty))
+            .collect();
+        crate::expr_gen::strategy::expr_of(
+            &slots,
+            crate::expr_gen::Profile::END_TO_END,
+            ValueType::Numeric,
+        )
+        .prop_map(|expr| Expr::FunctionCall {
+            name: "COALESCE".to_string(),
+            args: vec![expr, Expr::NumberLiteral("1.5".to_string())],
+        })
+        .boxed()
+    }
+
+    /// The share of a table's `c2` writes [`held_key_program`] aims at its
+    /// trigger value.
+    const HELD_KEY_HIT_RATE: f64 = 0.4;
+
+    /// The share of [`held_key_program`]s whose first definition's table
+    /// also updates a seed with a target row onto its trigger and later
+    /// deletes it ([`held_keys::hold_then_delete`]).
+    const HELD_KEY_DELETE_RATE: f64 = 0.5;
+
+    /// The share of [`held_key_program`]'s other 1-1 definitions that raise
+    /// too.
+    const HELD_KEY_OTHER_RAISING_RATE: f64 = 1.0 / 3.0;
+
+    /// The held-key tier's programs ([`crate::run::run_convergence_with_held_keys`]):
+    /// a [`trivial_program_with`] program (awkward values on) whose first
+    /// definition is a plain 1-1 one with a raising derived field
+    /// ([`held_keys::raising_shape`], dividing by `c2 - K`), followed by up
+    /// to `MAX_DEFS - 1` drawn as usual, a third of whose 1-1 ones raise as
+    /// well. Each table draws its trigger `K`, and about two in five of its
+    /// `c2` writes are aimed at it ([`held_keys::aim_rows`]); no other write
+    /// holds it. Half the programs also hold a key that had a target row
+    /// and then delete it ([`held_keys::hold_then_delete`]), the one case a
+    /// held key's delete shows in. A table holds at most [`MAX_SEED_ROWS`] keys, under either
+    /// fuse's threshold, so no definition here is quarantined
+    /// ([`held_key_fuse_program`] trips the fuse).
+    pub fn held_key_program() -> impl Strategy<Value = Program> {
+        prop::collection::vec(table_spec(true), 1..=MAX_TABLES)
+            .prop_flat_map(|tables| {
+                let table_count = tables.len();
+                let op_count = tables
+                    .iter()
+                    .map(|t| t.seed_values.len() + t.mutates.len())
+                    .sum();
+                let hits: Vec<_> = tables
+                    .iter()
+                    .map(|t| {
+                        prop::collection::vec(
+                            prop::bool::weighted(HELD_KEY_HIT_RATE),
+                            t.seed_values.len() + t.mutates.len(),
+                        )
+                    })
+                    .collect();
+                (
+                    Just(tables),
+                    interleave_schedule(op_count),
+                    (0..table_count, numeric_dividend()),
+                    prop::collection::vec(def_draw(table_count), 0..MAX_DEFS),
+                    prop::collection::vec(
+                        (
+                            prop::bool::weighted(HELD_KEY_OTHER_RAISING_RATE),
+                            numeric_dividend(),
+                        ),
+                        MAX_DEFS,
+                    ),
+                    prop::collection::vec(0..=VALUE_MAX, table_count),
+                    hits,
+                    prop::option::weighted(
+                        HELD_KEY_DELETE_RATE,
+                        (0..MAX_SEED_ROWS, 1..=MAX_MUTATES + 1),
+                    ),
+                )
+            })
+            .prop_map(
+                |(
+                    mut tables,
+                    schedule,
+                    (first, dividend),
+                    draws,
+                    raise_others,
+                    triggers,
+                    hits,
+                    delete_held,
+                )| {
+                    use held_keys::{DivisorSlot, aim_rows, hold_then_delete, raising_shape};
+                    for ((spec, trigger), hits) in tables.iter_mut().zip(&triggers).zip(&hits) {
+                        aim_rows(spec, DivisorSlot::C2, *trigger, hits);
+                    }
+                    if let Some((seed, at)) = delete_held {
+                        hold_then_delete(&mut tables[first], triggers[first], seed, at);
+                    }
+                    let mut defs = vec![(first, DefShape::OneToOne)];
+                    let mut derived = vec![Some(raising_shape(
+                        dividend,
+                        DivisorSlot::C2,
+                        triggers[first],
+                    ))];
+                    for ((idx, shape, drawn), (raise, dividend)) in
+                        draws.into_iter().zip(raise_others)
+                    {
+                        let drawn = match (&shape, raise) {
+                            (DefShape::OneToOne, true) => {
+                                Some(raising_shape(dividend, DivisorSlot::C2, triggers[idx]))
+                            }
+                            _ => drawn,
+                        };
+                        defs.push((idx, shape));
+                        derived.push(drawn);
+                    }
+                    interleave_tables(
+                        build_program_multi_with_shapes_and_derived(&tables, &defs, &derived),
+                        &schedule,
+                    )
+                },
+            )
+    }
+
+    /// The fewest and most rows [`held_key_fuse_program`] seeds: enough for
+    /// [`crate::run::TRANSFORM_FUSE`] held keys.
+    const FUSE_SEED_ROWS: std::ops::RangeInclusive<usize> = 5..=7;
+
+    /// The most keys one field of [`held_key_fuse_program`] raises for: one
+    /// under the column fuse (`DEFAULT_COLUMN_DEATH_THRESHOLD`, 5 distinct
+    /// rows), which would otherwise pause the field before the
+    /// whole-transform fuse trips.
+    const FUSE_PER_FIELD: usize = 4;
+
+    /// The held-key tier's fuse family: one table of
+    /// [`FUSE_SEED_ROWS`] seeds (awkward values off, so every value is a
+    /// number), read by a plain 1-1 definition with two raising fields,
+    /// `derived` = `c1 / (c2 - K)` and `derived_b` = `c2 / (c1 - K)`, and
+    /// optionally one more definition drawn as usual. Between
+    /// [`crate::run::TRANSFORM_FUSE`] and every seed raise, at most
+    /// [`FUSE_PER_FIELD`] per field and never both fields on one row, so the
+    /// whole-transform fuse trips and quarantines the definition while
+    /// neither column fuse does. No mutate aims at `K`.
+    pub fn held_key_fuse_program() -> impl Strategy<Value = Program> {
+        FUSE_SEED_ROWS
+            .prop_flat_map(|seed_count| {
+                let most = seed_count.min(2 * FUSE_PER_FIELD);
+                let split = (crate::run::TRANSFORM_FUSE..=most).prop_flat_map(|total| {
+                    let fewest = total.saturating_sub(FUSE_PER_FIELD).max(1);
+                    (fewest..=FUSE_PER_FIELD.min(total - 1)).prop_map(move |a| (a, total - a))
+                });
+                (
+                    prop::collection::vec((value(false), value(false)), seed_count),
+                    prop::collection::vec(text_value(false), seed_count),
+                    prop::collection::vec(bool_value(false), seed_count),
+                    prop::collection::vec(uuid_value(false), seed_count),
+                    prop::collection::vec(grain_value(), seed_count),
+                    prop::collection::vec(mutate(seed_count, false), 0..=MAX_MUTATES),
+                    split,
+                    Just((0..seed_count).collect::<Vec<_>>()).prop_shuffle(),
+                    0..=VALUE_MAX,
+                    prop::option::of(def_draw(1)),
+                )
+            })
+            .prop_map(
+                |(
+                    seed_values,
+                    text_values,
+                    bool_values,
+                    uuid_values,
+                    grain_values,
+                    mutates,
+                    (on_c2, on_c1),
+                    order,
+                    trigger,
+                    other,
+                )| {
+                    use held_keys::{DivisorSlot, aim_rows, raising_shape};
+                    let mut spec = TableSpec {
+                        seed_values,
+                        text_values,
+                        bool_values,
+                        uuid_values,
+                        grain_values,
+                        mutates,
+                    };
+                    let seeds = spec.seed_values.len();
+                    let hits_c2: Vec<bool> =
+                        (0..seeds).map(|i| order[..on_c2].contains(&i)).collect();
+                    let hits_c1: Vec<bool> = (0..seeds)
+                        .map(|i| order[on_c2..on_c2 + on_c1].contains(&i))
+                        .collect();
+                    aim_rows(&mut spec, DivisorSlot::C2, trigger, &hits_c2);
+                    aim_rows(&mut spec, DivisorSlot::C1, trigger, &hits_c1);
+                    let c1 = || Expr::Column(DERIVED_SLOTS[0].0.to_string());
+                    let c2 = || Expr::Column(DERIVED_SLOTS[1].0.to_string());
+                    let mut defs = vec![(0, DefShape::OneToOne)];
+                    let mut derived = vec![Some(raising_shape(c1(), DivisorSlot::C2, trigger))];
+                    if let Some((_, shape, drawn)) = other {
+                        defs.push((0, shape));
+                        derived.push(drawn);
+                    }
+                    let mut program = build_program_multi_with_shapes_and_derived(
+                        std::slice::from_ref(&spec),
+                        &defs,
+                        &derived,
+                    );
+                    let columns: Vec<String> = program.tables[0].columns[1..=4]
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let second = raising_shape(c2(), DivisorSlot::C1, trigger);
+                    program.defs[0].fields.push(FieldDef {
+                        name: "derived_b".to_string(),
+                        expr: second.build_expr(&columns[0], &columns[1], &columns[2], &columns[3]),
+                    });
+                    program
+                },
+            )
+    }
+
     /// One hot-key mutate against `seed_count` seeded rows:
     /// half the draws pick a pk from the first [`HOT_CORE_KEYS`], so a few
     /// keys are much hotter than the rest. Mostly value updates, with enough
@@ -4114,10 +4341,11 @@ mod strategy {
 pub use strategy::{
     COOLING_BACKFILL_AT, COOLING_BACKFILL_LAG, LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS,
     MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, cooling_backfill_case,
-    cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for,
-    partitioned_hot_key_case, partitioned_program, program_with_client_restart,
-    program_with_mid_stream_def_install, program_with_scale_out, restore_plan_for,
-    steady_load_case, trivial_one_to_one_program_with, trivial_program, trivial_program_with,
+    cooling_key_case, db_admin_plan_for, held_key_fuse_program, held_key_program, hot_key_case,
+    mid_burst_case, noise_plan_for, partitioned_hot_key_case, partitioned_program,
+    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
+    restore_plan_for, steady_load_case, trivial_one_to_one_program_with, trivial_program,
+    trivial_program_with,
 };
 
 #[cfg(test)]

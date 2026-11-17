@@ -374,6 +374,7 @@ mod tests {
         let refused = crate::ApplyError::ResumeRefused {
             transform: "totals".to_string(),
             reason: Box::new(reason),
+            status: crate::defs::model::TransformStatus::Paused,
         };
         assert_eq!(refused.error_id(), id);
         assert!(

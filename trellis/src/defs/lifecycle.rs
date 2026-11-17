@@ -461,6 +461,47 @@ pub(crate) async fn pause(
     Ok(pause_unless_frozen(txn, id).await?)
 }
 
+/// Locks definitions `ids`' rows `FOR UPDATE`, the mode [`pause`] takes, in
+/// one statement in id order (ADR-0028 I5), in the caller's transaction. A
+/// transaction that pauses more than one definition calls it before any
+/// pause, with every id it pauses, so it never holds one row while waiting on
+/// a lower one. An id with no row is skipped. It locks a frozen row too,
+/// which is sound for a caller that takes no version fence: a resume holding
+/// the row has finished its fence wait (ADR-0002).
+pub(crate) async fn lock_for_pause(
+    txn: &Transaction<'_>,
+    ids: &[i64],
+) -> Result<(), tokio_postgres::Error> {
+    if !ids.is_empty() {
+        txn.execute(
+            "select 1 from transform_definitions where id = any($1) order by id for update",
+            &[&ids],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// [`pause`] for each of `pauses`, in id order, once [`lock_for_pause`] has
+/// locked all their rows. Returns the pauses that moved their definition to
+/// `paused`, for the caller to log.
+pub(crate) async fn pause_many(
+    txn: &Transaction<'_>,
+    pauses: impl IntoIterator<Item = (i64, PauseReason)>,
+) -> Result<Vec<(i64, PauseReason)>, CatalogError> {
+    let mut pauses: Vec<(i64, PauseReason)> = pauses.into_iter().collect();
+    pauses.sort_by_key(|(id, _)| *id);
+    let ids: Vec<i64> = pauses.iter().map(|(id, _)| *id).collect();
+    lock_for_pause(txn, &ids).await?;
+    let mut paused = Vec::new();
+    for (id, reason) in pauses {
+        if pause(txn, id, &reason).await? {
+            paused.push((id, reason));
+        }
+    }
+    Ok(paused)
+}
+
 /// Moves definition `id` to `paused` unless it's frozen (a quarantined one
 /// stays quarantined), in the caller's transaction. Returns whether it did.
 pub(crate) async fn pause_unless_frozen(
@@ -604,7 +645,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // A `JOIN` reads several tables, and a page of any may have planned it.
     // The names are read without a lock and bumped in table-name
     // order, the order every taker of two fences takes them in.
-    let mut fences: Vec<String> = txn
+    let fences: Vec<String> = txn
         .query(
             &format!(
                 "select distinct f from transform_definitions d, \
@@ -619,10 +660,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    fences.sort_unstable();
-    for source in &fences {
-        crate::staging::build::bump_version_fence(&*txn, source).await?;
-    }
+    crate::staging::build::bump_version_fences(&*txn, &fences).await?;
 
     // The column-pause lock, exclusive: this deletes the
     // target's pause rows and the cascade edges into and out of them, which

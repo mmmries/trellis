@@ -66,10 +66,11 @@ pub struct Profile {
     /// Draw every `/` and `%` divisor as `NULLIF(divisor, 0)`, so a divisor
     /// that is zero for some row (`42 % c1`, a `CASE` that picks `REAL '0'`
     /// on one branch) gives `NULL` instead of raising. On for the end-to-end
-    /// tiers: Postgres raises `division by zero` for that row, the engine
-    /// holds its key in quarantine, and a held key blocks every convergence
-    /// wait, so the program never settles. The oracle doesn't model held
-    /// keys. Off for the conformance properties, which check the raise.
+    /// tiers: Postgres would raise `division by zero` for that row and the
+    /// engine hold its key, which only the held-key tier models, and it
+    /// draws its erroring rows on purpose (`crate::generate::held_keys`), not
+    /// by accident of the draw. Off for the conformance properties, which
+    /// check the raise.
     pub guard_divisors: bool,
 }
 
