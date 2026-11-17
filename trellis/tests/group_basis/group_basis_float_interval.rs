@@ -220,6 +220,50 @@ async fn self_check_reports_a_sum_off_by_its_last_digit() {
     assert_eq!(self_check(&d, "agg").await, Vec::<String>::new());
 }
 
+/// A plain aggregate with a `WHERE`: each member's value is summed exactly
+/// and a failing row's, special values included, is not, through changes
+/// that cross the predicate both ways; `self_check` sums the same members
+/// exactly.
+#[tokio::test]
+async fn filtered_sums_read_member_rows_exactly() {
+    const DDL: &str = "create table public.src (id integer primary key, g integer, \
+                                                r real, f double precision, i interval, w integer); \
+                       create index on public.src (g)";
+    const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+                       SELECT g AS g, SUM(r) AS sr, AVG(r) AS ar, SUM(f) AS sf, AVG(f) AS af, \
+                              SUM(i) AS si, AVG(i) AS ai, COUNT(f) AS cf, COUNT(*) AS n \
+                       WHERE w > 0";
+    const ROWS: &str = "select g, sr::text, ar::text, sf::text, af::text, si::text, ai::text, \
+                               cf, n from public.agg";
+    const EXPECTED: &str = "select g, sum(r)::text, avg(r)::text, sum(f)::text, avg(f)::text, \
+                                   sum(i)::text, avg(i)::text, count(f), count(*) \
+                            from public.src where w > 0 group by g";
+    let mut columns = columns().to_vec();
+    columns.push(("w", int4()));
+    let mut d = Driver::start(DDL, &columns, &[AGG], &["public.src"]).await;
+    run(
+        &mut d,
+        &[
+            // 0.1 is no binary fraction: its exact summand is not its
+            // `numeric` cast.
+            "insert into public.src values \
+                 (1, 1, 0.1, 0.1, '1 day 00:00:00.5', 1), \
+                 (2, 1, 'NaN', 'Infinity', '-7 days', 0), \
+                 (3, 1, 1.5, 0.25, '3 hours', null), \
+                 (4, 2, 0.1, 0.1, '1 mon', 2), \
+                 (5, 2, '-Infinity', 'NaN', '2 years', -1)",
+            "update public.src set w = 1 where id = 3",
+            "update public.src set w = 0 where id = 1",
+            "update public.src set w = 3, f = 0.5, r = 2 where id = 2",
+            "update public.src set g = 2, w = 0 where id = 3",
+            "update public.src set w = 0 where id = 4",
+            "delete from public.src where id = 2",
+        ],
+        &[("agg", ROWS, EXPECTED)],
+    )
+    .await;
+}
+
 const JOIN_DDL: &str = "create table public.o (id integer primary key, k integer, \
                                                f double precision, i interval); \
                         create table public.c (id integer primary key, k integer, region text, \
