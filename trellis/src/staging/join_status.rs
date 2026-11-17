@@ -324,8 +324,10 @@ async fn partials_warning(
 
 /// The planner's estimate of the `FROM` table's rows its conjuncts of the
 /// `WHERE` keep, `None` when it has none or the estimate fails (a column
-/// gone, say: the drift check reports that). Planned, never run, under a
-/// savepoint, so a failure leaves the caller's transaction usable.
+/// gone, say: the drift check reports that, or the table's lock is held or
+/// queued for). Planned, never run, under a savepoint that is always rolled
+/// back: a failure leaves the caller's transaction usable, and the status
+/// read keeps no lock on the table and never waits behind a migration.
 async fn passing_rows(
     client: &impl GenericClient,
     source_table: &str,
@@ -338,16 +340,20 @@ async fn passing_rows(
         crate::defs::oracle::render_qualified_expr_sql(&predicate, "s"),
     );
     client
-        .batch_execute("savepoint trellis_join_status")
+        .batch_execute(
+            "savepoint trellis_join_status; \
+             select pg_catalog.set_config('lock_timeout', '10ms', true)",
+        )
         .await
         .ok()?;
     let plan = client.query(sql.as_str(), &[]).await;
-    let restore = if plan.is_ok() {
-        "release savepoint trellis_join_status"
-    } else {
-        "rollback to savepoint trellis_join_status; release savepoint trellis_join_status"
-    };
-    client.batch_execute(restore).await.ok()?;
+    client
+        .batch_execute(
+            "rollback to savepoint trellis_join_status; \
+             release savepoint trellis_join_status",
+        )
+        .await
+        .ok()?;
     let first: String = plan.ok()?.first()?.get(0);
     plan_rows(&first)
 }

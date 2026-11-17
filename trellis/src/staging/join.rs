@@ -400,14 +400,6 @@ pub(crate) fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Optio
     })
 }
 
-/// The name of a `JOIN` working table (a session temp table, bare):
-/// `prefix`, the definition id, and a hash of the columns of the hidden
-/// table it copies (`hidden_columns`, from [`hidden_table_columns`]). The
-/// pool keeps its connections, and a connection keeps the temp table it
-/// first created under a name, so the name follows the hidden table's
-/// column types and collations: a definition whose key column was re-typed
-/// or re-collated under the same id gets a new table, and the old one is
-/// never touched again. Within Postgres's 63 bytes for any `i64` id.
 /// `side`'s filter of a join aggregate's rows, rendered over the source row
 /// `s` ([`spec::side_predicate`]): `None` when no conjunct of the `WHERE`
 /// reads `side`.
@@ -423,6 +415,14 @@ fn side_membership(def: &TransformDef, side: Side) -> Option<group_basis::Member
     })
 }
 
+/// The name of a `JOIN` working table (a session temp table, bare):
+/// `prefix`, the definition id, and a hash of the columns of the hidden
+/// table it copies (`hidden_columns`, from [`hidden_table_columns`]). The
+/// pool keeps its connections, and a connection keeps the temp table it
+/// first created under a name, so the name follows the hidden table's
+/// column types and collations: a definition whose key column was re-typed
+/// or re-collated under the same id gets a new table, and the old one is
+/// never touched again. Within Postgres's 63 bytes for any `i64` id.
 fn working_table_name(prefix: &str, id: i64, hidden_columns: &str) -> String {
     format!(
         "trellis_join_{prefix}_{id}_{:016x}",
