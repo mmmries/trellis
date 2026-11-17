@@ -987,6 +987,16 @@ message lists the fields. Fix the name. A two-part address reads as
 key column of the definition (a column you added, say). Pass only the
 definition's columns.
 
+### T0242 OutsideDependentsBlock
+
+Objects outside Trellis depend on the target: another table's foreign key
+into it, or a view over it or over the field's column. `DROP TRANSFORM`,
+`ALTER TRANSFORM … DROP` and a 1-1 `RESUME` that empties the target refuse
+while they exist: Trellis never drops what it doesn't own, and never cascades.
+The message names the dependents. Drop or alter them (`DROP VIEW …`,
+`ALTER TABLE … DROP CONSTRAINT …`), then retry; the failed statement changed
+nothing.
+
 ## Builds and drains
 
 A failure every key reproduces. It pauses the definitions it reaches, with

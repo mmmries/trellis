@@ -763,9 +763,69 @@ async fn a_foreign_key_referencing_an_adopted_target_fails_trellis_deletes_of_it
         .apply("DROP TRANSFORM t")
         .await
         .expect_err("the foreign key depends on the target");
-    assert!(err.to_string().contains("child_tid_fkey"), "{err}");
+    assert_outside_dependents(&err, "child_tid_fkey");
     assert_eq!(
         d.rows("select count(*) from transform_definitions").await,
         ["(1)"]
+    );
+    assert_eq!(d.rows("select count(*) from public.t").await, ["(0)"]);
+    assert_eq!(
+        status_of_t(&d).await.status,
+        trellis::TransformStatus::Paused
+    );
+}
+
+/// The one refusal for objects outside Trellis depending on a target: a
+/// `conflict` naming the dependent, not a raw database error.
+fn assert_outside_dependents(err: &trellis::TrellisError, dependent: &str) {
+    assert_eq!(err.code(), ErrorCode::Conflict, "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("objects outside Trellis depend on") && text.contains(dependent),
+        "{text}"
+    );
+    assert!(!text.contains("database error"), "{text}");
+}
+
+/// A user's view over an adopted target refuses `DROP TRANSFORM`, and a view
+/// over one field's column refuses `ALTER TRANSFORM ... DROP` of it. Each
+/// rolls back whole: the definition and the column are unchanged.
+#[tokio::test]
+async fn a_view_over_a_target_refuses_drop_transform_and_a_field_drop() {
+    let d = adopted_with("create view public.v_all as select * from public.t").await;
+    let config = Config::with_schema(d.db.dsn().to_string(), trellis::config::DEFAULT_SCHEMA)
+        .expect("config");
+    let trellis = Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect");
+
+    let err = trellis
+        .apply("ALTER TRANSFORM t DROP x")
+        .await
+        .expect_err("the view reads the column");
+    assert_outside_dependents(&err, "v_all");
+    assert_eq!(
+        d.rows(
+            "select count(*) from information_schema.columns \
+             where table_name = 't' and column_name = 'x'"
+        )
+        .await,
+        ["(1)"]
+    );
+    assert_eq!(status_of_t(&d).await.status, trellis::TransformStatus::Live);
+
+    trellis.apply("PAUSE TRANSFORM t").await.expect("pause");
+    let err = trellis
+        .apply("DROP TRANSFORM t")
+        .await
+        .expect_err("the view depends on the target");
+    assert_outside_dependents(&err, "v_all");
+    assert_eq!(
+        d.rows("select count(*) from transform_definitions").await,
+        ["(1)"]
+    );
+    assert_eq!(
+        status_of_t(&d).await.status,
+        trellis::TransformStatus::Paused
     );
 }

@@ -1307,7 +1307,9 @@ pub(crate) async fn repair_target_key(
     txn.batch_execute(&format!("lock table {table} in access exclusive mode"))
         .await?;
     if !added.is_empty() {
-        txn.batch_execute(&format!("delete from {table}")).await?;
+        txn.batch_execute(&format!("delete from {table}"))
+            .await
+            .map_err(|err| CatalogError::from_dependency_failure(err, target))?;
     } else {
         let same = key
             .iter()
@@ -1318,7 +1320,8 @@ pub(crate) async fn repair_target_key(
             "delete from {table} t using (select {key_list} from {table} \
              group by {key_list} having count(*) > 1) r where {same}"
         ))
-        .await?;
+        .await
+        .map_err(|err| CatalogError::from_dependency_failure(err, target))?;
     }
     txn.batch_execute(&format!("alter table {table} {}", actions.join(", ")))
         .await?;

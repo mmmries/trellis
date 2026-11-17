@@ -244,6 +244,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | [T0142 TargetNameHasReaders](errors.md#t0142-targetnamehasreaders), naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it ([T0153 DependentsBlockDrop](errors.md#t0153-dependentsblockdrop)) |
 | A target name ending in `__ledger`, or over 55 bytes: its ledger, `<target>__ledger`, must fit Postgres's 63 | [T0076 ReservedTargetSuffix](errors.md#t0076-reservedtargetsuffix), [T0077 TargetNameTooLong](errors.md#t0077-targetnametoolong) | [Text](#text) |
 | A target in this instance's catalog schema, or in a schema holding another instance's `trellis_instance` table, whose uninstall would drop it ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)) | [T0139 TargetInCatalogSchema](errors.md#t0139-targetincatalogschema) | [Resume only](#resume-only) |
+| Objects outside Trellis depend on a target that `DROP TRANSFORM` drops, `ALTER TRANSFORM … DROP` drops a field of, or a 1-1 `RESUME` empties: another table's foreign key into it, or a view over it or the column. Trellis never cascades; the statement rolls back whole and the definition is unchanged | [T0242 OutsideDependentsBlock](errors.md#t0242-outsidedependentsblock), naming the dependents Postgres reports | n/a |
 
 ### Details
 
@@ -744,8 +745,10 @@ While a transform is `backfilling`, its target is partial
 ([status reference](status-reference.md#backfilling)).
 
 Indexes, grants, constraints, triggers, rules and foreign keys are yours to
-add, to a target define created or adopted; `DROP TRANSFORM` takes them with
-the table. What they do to Trellis's writes:
+add, to a target define created or adopted. `DROP TRANSFORM` drops the
+target's own indexes, grants, constraints and triggers with the table, and
+refuses while another table's foreign key into it, or a view over it, exists
+([refusal table](#refusals)). What they do to Trellis's writes:
 
 * A unique index, constraint or trigger that refuses a row Trellis writes
   fails that row's key like any value the target refuses: the key is held
@@ -756,9 +759,8 @@ the table. What they do to Trellis's writes:
   value for a moment though the source never does.
 * Another table's foreign key referencing the target holds the key of a
   referenced row Trellis deletes, and a source `TRUNCATE`'s page while any row
-  is referenced. `DROP TRANSFORM`, and the `RESUME` that empties a 1-1 target
-  keyed by a relabelled enum, fail with the database's error while it exists:
-  drop it first.
+  is referenced. It also refuses a `RESUME` that empties a 1-1 target
+  ([refusal table](#refusals)).
 * An `INSERT` or `UPDATE` rule, or most `DELETE` rules (`DO INSTEAD NOTHING`
   among them), make Postgres refuse the `INSERT … ON CONFLICT` and
   `DELETE … RETURNING` Trellis writes with: a build pauses, and each key a

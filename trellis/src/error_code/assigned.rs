@@ -248,6 +248,7 @@ const ASSIGNED: &[&str] = &[
     "T0239 ValidationError::FilteredExtreme",
     "T0240 ParseError::UnsupportedAggregateModifier",
     "T0241 ValidationError::EnumLiteralNotALabel",
+    "T0242 CatalogError::OutsideDependentsBlock",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test
