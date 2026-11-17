@@ -204,7 +204,7 @@ impl ParseError {
             ParseError::ReservedTableName { .. } => ErrorId(37),
             ParseError::GrammarVersionTooOld { .. } => ErrorId(38),
             ParseError::GrammarVersionTooNew { .. } => ErrorId(39),
-            ParseError::UnsupportedAggregateModifier { .. } => ErrorId(233),
+            ParseError::UnsupportedAggregateModifier { .. } => ErrorId(240),
         }
     }
 }

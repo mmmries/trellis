@@ -239,7 +239,7 @@ const ASSIGNED: &[&str] = &[
     "T0230 Error::MigrationHistory",
     "T0231 Error::RestoreDefinition",
     "T0232 Error::SchemaDump",
-    "T0233 ParseError::UnsupportedAggregateModifier",
+    "T0240 ParseError::UnsupportedAggregateModifier",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

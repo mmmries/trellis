@@ -43,7 +43,7 @@ async fn count_distinct_is_refused_by_name_and_points_at_the_two_transform_recip
             ),
             "{call}: {err:?}"
         );
-        assert!(err.to_string().starts_with("T0233"), "{call}: {err}");
+        assert!(err.to_string().starts_with("T0240"), "{call}: {err}");
         assert!(!err.to_string().contains("reserved word"), "{call}: {err}");
     }
 
