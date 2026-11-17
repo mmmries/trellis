@@ -133,6 +133,7 @@ defmodule Trellis.MetricsPlugTest do
 
       {:ok, conn} = chunk(conn, "app_metric 1\n")
       assert conn.state == :chunked
+      assert conn.resp_body == "app_metric 1\n"
     end
 
     test "does not append twice when the plug runs twice" do

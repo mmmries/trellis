@@ -2,9 +2,11 @@ if Code.ensure_loaded?(Plug) do
   defmodule Trellis.Metrics.Appender do
     @moduledoc """
     A Plug that appends `Trellis.Metrics.render_prometheus/0` to the Prometheus
-    text another exporter (PromEx, TelemetryMetricsPrometheus) serves at
-    `:path`, so one scrape returns both. Compiled only when `:plug` is a
-    dependency of the host.
+    text another exporter's plug in the host's pipeline (`PromEx.Plug`, or one
+    serving `TelemetryMetricsPrometheus.Core.scrape/1`) serves at `:path`, so
+    one scrape returns both. `TelemetryMetricsPrometheus`'s own server takes
+    no plugs: scrape `Trellis.Metrics.Plug` as a second target instead.
+    Compiled only when `:plug` is a dependency of the host.
 
     It registers a `Plug.Conn.register_before_send/2` callback, so it must run
     before the exporter's plug in the pipeline:

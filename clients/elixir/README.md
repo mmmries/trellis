@@ -133,7 +133,7 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   lines), so handles in one VM stay apart. With `:plug` in your deps,
   `Trellis.Metrics.Plug` serves it (`forward "/metrics/trellis", Trellis.Metrics.Plug`),
   and `Trellis.Metrics.Appender` (`plug Trellis.Metrics.Appender, path: "/metrics"`,
-  ahead of PromEx or TelemetryMetricsPrometheus) appends it to that
+  ahead of `PromEx.Plug` or another exporter plug) appends it to that
   exporter's response. The status gauges come with it; see the "Alerting"
   table in `docs/observability.md`.
 - `Trellis.LogBridge`: started with the `:trellis_pg` application, it forwards
