@@ -40,7 +40,9 @@ beside the old release changes nothing: it succeeds, or refuses with the same
 code when it would have to pause a definition. Keep the step when your
 workers' database role can read and write Trellis's tables but not alter them:
 their `migrate` is refused, and they stand by until a role that can runs it.
-A process that can't migrate logs why, `status()` carries it in
+That holds for `trellis run` as for an embedded handle: it stays up, and
+starts its pipeline once a role that can has run `migrate`. A process that
+can't migrate logs why, `status()` carries it in
 `migrations_pending.cannot_run`, and the process tries again every minute.
 
 A state-changing call an old-release process is in the middle of when the new
@@ -53,7 +55,7 @@ While the new release stands by, `status()` carries `version_handover`, naming
 this binary's version and each live process of the old release by worker id
 ([observability](observability.md#another-version-is-live)); `trellis status`
 prints it as a `Standing by:` line above the definitions, and `trellis run`
-prints `trellis standing by: …`. The definitions keep the statuses the old
+logs it to stderr. The definitions keep the statuses the old
 release gives them. While the new release's migrations are pending,
 `status()` carries `migrations_pending`, naming them; where the catalog can't
 be read until they run, `status()` and `definitions()` refuse with the
@@ -111,13 +113,13 @@ floor changes nothing:
   the floor and its own version:
 
   ```
-  refusing to attach: the catalog floor is 0.3.0, the oldest Trellis version that can read this catalog, and this binary is version 0.2.0; run Trellis 0.3.0 or later
+  T0229: refusing to attach: the catalog floor is 0.5.0, the oldest Trellis version that can read this catalog, and this binary is version 0.4.0; run Trellis 0.5.0 or later
   ```
 
 - Its background processes connect and stand by: they stage, drain and
   build nothing, register nowhere, and check again every 5 seconds, so an
   orchestrator doesn't restart them in a loop. `trellis run` stands by the
-  same way, printing `trellis standing by: …`.
+  same way, logging why to stderr.
 - `status()` and the listings keep working. `status()` carries
   `below_catalog_floor`, naming the floor and this binary's version
   ([observability](observability.md#below-the-catalog-floor)), and

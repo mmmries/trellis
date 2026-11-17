@@ -173,8 +173,11 @@ fn select_sql(
     // a `JOIN`'s keeps its columns' tables, and a reference to a `GROUP BY`
     // key's field reads the key.
     let substituted: HashMap<&str, Expr> = match join {
-        None => super::backfill::substitute_all_fields(def)
-            .map_err(|err| TargetSelectError::Unsubstitutable(err.to_string()))?,
+        None => super::backfill::substitute_all_fields(def).map_err(|err| {
+            TargetSelectError::Unsubstitutable(
+                crate::error_code::Message::message(&err).to_string(),
+            )
+        })?,
         Some(_) => def
             .fields
             .iter()
@@ -393,8 +396,10 @@ fn collect_columns(
 /// Postgres computes the field (ADR-0002) — the ADR-0004 claim ("our grammar
 /// is an immutable subset of Postgres semantics") made literal for every
 /// expression. Column references are quoted identifiers, since a source
-/// column name could collide with a SQL keyword; literals carry an explicit
-/// cast so the rendered text is unambiguous regardless of context.
+/// column name could collide with a SQL keyword. A literal carries an
+/// explicit cast, except a string literal where Postgres types it from its
+/// neighbour ([`neighbour_typed`]), which is left bare so Postgres types it
+/// as it types the user's text.
 pub fn render_expr_sql(expr: &Expr) -> String {
     render_with(expr, &|_, name| quote_ident(name))
 }
@@ -404,6 +409,11 @@ pub fn render_expr_sql(expr: &Expr) -> String {
 /// any, and its name).
 fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> String {
     let render = |e: &Expr| render_with(e, column);
+    // An operand, argument or result Postgres types from its neighbour.
+    let beside = |e: &Expr| match e {
+        Expr::StringLiteral(text) => quoted(text),
+        _ => render(e),
+    };
     match expr {
         Expr::Column(name) => column(None, name),
         Expr::SourceColumn {
@@ -412,11 +422,15 @@ fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> St
             ..
         } => column(Some(table), name),
         Expr::NumberLiteral(text) => number_literal_sql(text),
-        Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::StringLiteral(text) => format!("{}::text", quoted(text)),
         Expr::BooleanLiteral(value) => value.to_string(),
         // Bare, so Postgres types it from the same context `validate` did.
         Expr::Null => "null".to_string(),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
+        Expr::BinaryOp { op, lhs, rhs } if neighbour_typed(*op) => {
+            let symbol = super::registry::operator_spec(*op).symbol;
+            format!("({} {symbol} {})", beside(lhs), beside(rhs))
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = super::registry::operator_spec(*op).symbol;
             format!("({} {symbol} {})", render(lhs), render(rhs))
@@ -432,7 +446,7 @@ fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> St
         Expr::Case {
             branches,
             otherwise,
-        } => render_case_sql(branches, otherwise.as_deref(), render),
+        } => render_case_sql(branches, otherwise.as_deref(), render, beside),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             // `COUNT(*)`: the parser's only accepted `COUNT`
             // shape, but its AST has no argument to render — `count()` is
@@ -444,30 +458,51 @@ fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> St
         Expr::FunctionCall { name, args } => match super::ast::as_extract(name, args) {
             Some((field, operand)) => format!("extract({field} from {})", render(operand)),
             None => {
-                let rendered: Vec<String> = args.iter().map(render).collect();
+                let rendered: Vec<String> = if matches!(name.as_str(), "COALESCE" | "NULLIF") {
+                    args.iter().map(beside).collect()
+                } else {
+                    args.iter().map(render).collect()
+                };
                 format!("{}({})", name.to_lowercase(), rendered.join(", "))
             }
         },
     }
 }
 
-/// A searched `CASE` as SQL text, each condition and result rendered by
-/// `render`. Shared by every renderer so they spell the construct alike.
-pub(crate) fn render_case_sql(
+/// `text` as a bare SQL string literal.
+fn quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// Whether Postgres types a string literal operand of `op` from the other
+/// operand (#2000): the equality comparisons. A `COALESCE` or `NULLIF`
+/// argument and a `CASE` result are typed from their neighbours too. Beside
+/// a `char(n)` operand the literal is `char(n)`, whose `=` ignores trailing
+/// blanks; `'…'::text` would compare the operand cast to `text` instead. So
+/// the write path leaves such a literal bare, and Postgres types it as it
+/// types the user's text.
+fn neighbour_typed(op: super::ast::Operator) -> bool {
+    op.is_comparison() && !op.is_ordering()
+}
+
+/// A searched `CASE` as SQL text, each condition rendered by `render` and
+/// each result, which Postgres types from the other results, by `result`.
+fn render_case_sql(
     branches: &[(Expr, Expr)],
     otherwise: Option<&Expr>,
-    mut render: impl FnMut(&Expr) -> String,
+    render: impl Fn(&Expr) -> String,
+    result: impl Fn(&Expr) -> String,
 ) -> String {
     let mut text = String::from("(case");
-    for (condition, result) in branches {
+    for (condition, value) in branches {
         text.push_str(&format!(
             " when {} then {}",
             render(condition),
-            render(result)
+            result(value)
         ));
     }
     if let Some(otherwise) = otherwise {
-        text.push_str(&format!(" else {}", render(otherwise)));
+        text.push_str(&format!(" else {}", result(otherwise)));
     }
     text.push_str(" end)");
     text
@@ -507,7 +542,7 @@ pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::defs::ast::{FieldDef, KeySpace, Operator, Predicate};
 
@@ -796,5 +831,138 @@ mod tests {
         );
         let err = target_select_sql("TRANSFORM oops", 2, &["id"]).expect_err("refused");
         assert_eq!(err.code(), crate::ErrorCode::Parse, "{err}");
+    }
+
+    /// The constructs that type a string literal from its neighbour, as
+    /// Trellis grammar with `{c}` for the neighbour column and `{l}` for the
+    /// literal.
+    const NEIGHBOUR_TYPED: &[&str] = &[
+        "{c} = {l}",
+        "{l} = {c}",
+        "{c} <> {l}",
+        "{c} IS DISTINCT FROM {l}",
+        "{c} IS NOT DISTINCT FROM {l}",
+        "NULLIF({c}, {l})",
+        "NULLIF({l}, {c})",
+        "COALESCE({c}, {l})",
+        "COALESCE({l}, {c})",
+        "CASE WHEN id = 1 THEN {c} ELSE {l} END",
+        "CASE WHEN id = 1 THEN {l} ELSE {c} END",
+        "COALESCE({c}, {l}) = {l}",
+    ];
+
+    /// The truth table of #2000 on a scratch Postgres: each of
+    /// [`NEIGHBOUR_TYPED`] beside a `char(4)`, `name`, `text` and `varchar`
+    /// column, with a padded, an unpadded and a 70-byte literal, rendered by
+    /// `render` and as written, over rows holding each literal's value,
+    /// padded or not, and `NULL` (the `char(4)` column holds `NULL` for the
+    /// long value). Every rendering must give Postgres's
+    /// answer for the text as written. Returns how many of the cells the
+    /// `'…'::text` rendering of a release before 0.4.0 gets wrong, by
+    /// neighbour type.
+    pub(crate) async fn neighbour_typed_truth_table(
+        render: impl Fn(&Expr) -> String,
+    ) -> HashMap<&'static str, usize> {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        let long = "y".repeat(70);
+        client
+            .batch_execute(&format!(
+                "create table s (id bigint primary key, b character(4), n name, t text, \
+                     v varchar); \
+                 insert into s select g, case when length(x) <= 4 then x end, x, x, x from (values \
+                     (1, 'ab'), (2, 'ab  '), (3, null), (4, 'zz'), (5, '{long}')) r(g, x)"
+            ))
+            .await
+            .expect("table");
+        let mut old_wrong = HashMap::new();
+        for column in ["b", "n", "t", "v"] {
+            for literal in ["'ab'", "'ab  '", &format!("'{long}'")] {
+                for construct in NEIGHBOUR_TYPED {
+                    let text = construct.replace("{c}", column).replace("{l}", literal);
+                    let def = crate::defs::parse(&format!("TRANSFORM x FROM s SELECT {text} AS f"))
+                        .unwrap_or_else(|e| panic!("{text}: {e}"));
+                    let expr = &def.fields[0].expr;
+                    let rendered = render(expr);
+                    let old = rendered
+                        .replace("'ab'", "'ab'::text")
+                        .replace("'ab  '", "'ab  '::text")
+                        .replace(&format!("'{long}'"), &format!("'{long}'::text"))
+                        .replace("::text::text", "::text");
+                    let sql = format!(
+                        "select ({text})::text, ({rendered})::text, ({old})::text \
+                         from s order by id"
+                    );
+                    for row in client
+                        .query(&sql, &[])
+                        .await
+                        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                    {
+                        let (want, got, was): (Option<String>, Option<String>, Option<String>) =
+                            (row.get(0), row.get(1), row.get(2));
+                        assert_eq!(got, want, "{text} rendered as {rendered}");
+                        if was != want {
+                            let t: &'static str = match column {
+                                "b" => "bpchar",
+                                "n" => "name",
+                                "t" => "text",
+                                _ => "varchar",
+                            };
+                            *old_wrong.entry(t).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        old_wrong
+    }
+
+    /// The write path's renderer gives Postgres's answer in every cell of
+    /// the truth table; the `'…'::text` rendering it replaces was wrong
+    /// beside `char(n)` and a long `name`, and right beside `text` and
+    /// `varchar`.
+    #[tokio::test]
+    async fn the_write_path_types_a_literal_from_its_neighbour_as_postgres_does() {
+        let old_wrong = neighbour_typed_truth_table(render_expr_sql).await;
+        assert!(
+            old_wrong.get("bpchar").is_some_and(|n| *n > 0),
+            "{old_wrong:?}"
+        );
+        assert!(
+            old_wrong.get("name").is_some_and(|n| *n > 0),
+            "{old_wrong:?}"
+        );
+        assert_eq!(old_wrong.get("text"), None, "{old_wrong:?}");
+        assert_eq!(old_wrong.get("varchar"), None, "{old_wrong:?}");
+    }
+
+    /// Only a literal Postgres types from its neighbour is bare.
+    #[test]
+    fn a_literal_is_bare_only_where_postgres_types_it_from_its_neighbour() {
+        let def = crate::defs::parse(
+            "TRANSFORM t FROM s SELECT a = 'x' AS e, COALESCE(a, 'x') AS c, \
+             NULLIF('x', a) AS n, CASE WHEN a = 'x' THEN 'y' ELSE a END AS w, \
+             STRPOS(a, 'x') AS p",
+        )
+        .expect("parses");
+        let rendered: Vec<String> = def
+            .fields
+            .iter()
+            .map(|f| render_expr_sql(&f.expr))
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                "(\"a\" = 'x')",
+                "coalesce(\"a\", 'x')",
+                "nullif('x', \"a\")",
+                "(case when (\"a\" = 'x') then 'y' else \"a\" end)",
+                "strpos(\"a\", 'x'::text)",
+            ]
+        );
     }
 }

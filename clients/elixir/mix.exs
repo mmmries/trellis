@@ -4,7 +4,7 @@ defmodule Trellis.MixProject do
   # Kept equal to the NIF crate's version (native/trellis_nif/Cargo.toml).
   # The precompiled NIFs are downloaded from the `v<version>` GitHub
   # release; see Trellis.Native and docs/releasing.md.
-  @version "0.2.0"
+  @version "0.3.0"
   @source_url "https://github.com/salesforce-misc/trellis"
 
   def project do
@@ -50,6 +50,9 @@ defmodule Trellis.MixProject do
       # `Trellis.Migration` is compiled only when the host depends on
       # `ecto_sql`; nothing else here uses it.
       {:ecto_sql, "~> 3.13", optional: true},
+      # `Trellis.Metrics.Plug` and `Trellis.Metrics.Appender` are compiled
+      # only when the host depends on `plug`.
+      {:plug, "~> 1.16", optional: true},
       # The integration suite writes source rows and reads target rows over
       # its own connection, the way a host app would.
       {:postgrex, "~> 0.22", only: :test},

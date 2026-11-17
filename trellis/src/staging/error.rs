@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tokio_postgres::types::PgLsn;
 
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId};
 
 /// Failure modes specific to the staging ring: resolving the
 /// active ring slot, appending, and the producer singleton.
@@ -92,10 +92,29 @@ impl StagingError {
             StagingError::Db(err) => error_code::classify_pg_error(err),
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            StagingError::InvalidRingSlot(..) => ErrorId(183),
+            StagingError::ProducerAlreadyRunning => ErrorId(184),
+            StagingError::RingFull { .. } => ErrorId(185),
+            StagingError::SealGateBlocked => ErrorId(186),
+            StagingError::Raced => ErrorId(187),
+            StagingError::UnfencedSealedSegment { .. } => ErrorId(188),
+            StagingError::ConvergenceTimeout { .. } => ErrorId(189),
+            StagingError::Config(err) => err.error_id(),
+            StagingError::Db(..) => ErrorId(190),
+        }
+    }
 }
 
-impl fmt::Display for StagingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(StagingError);
+
+impl crate::error_code::Message for StagingError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StagingError::InvalidRingSlot(slot) => {
                 write!(f, "ring slot {slot} is outside the valid range")
@@ -127,7 +146,7 @@ impl fmt::Display for StagingError {
                 f,
                 "convergence through {token} was not reached after waiting {waited:?}"
             ),
-            StagingError::Config(err) => write!(f, "{err}"),
+            StagingError::Config(err) => err.fmt_message(f),
             StagingError::Db(err) => {
                 write!(f, "staging ring database error: ")?;
                 crate::error::write_pg_error(f, err)

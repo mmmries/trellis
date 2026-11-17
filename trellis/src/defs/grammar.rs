@@ -245,6 +245,9 @@ pub(crate) async fn pause_unloadable_in(
     // The numeric partials of each `SUM`/`AVG` an earlier release stored
     // its sum alone for.
     super::numeric_sums::convert_in(txn, floors).await?;
+    // A rebuild of each definition an earlier release read a string literal
+    // in differently, beside a `char(n)` or `name` value (#2000).
+    super::neighbour_literals::rebuild_in(txn, floors).await?;
     Ok((paused, unrunnable))
 }
 
@@ -347,7 +350,7 @@ pub(crate) async fn pause_unrunnable_in(
 
 /// A catalog failure of the attach's pauses, as the attach reports it.
 fn incompatible(e: super::catalog::CatalogError) -> crate::Error {
-    crate::Error::IncompatibleInstance(e.to_string())
+    crate::Error::IncompatibleInstance(crate::error_code::Message::message(&e).to_string())
 }
 
 /// The `capture_failure` of a transform whose stored text this release refuses.

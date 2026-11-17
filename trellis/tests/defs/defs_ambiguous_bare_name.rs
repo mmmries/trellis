@@ -51,7 +51,7 @@ async fn an_ambiguous_bare_name_is_refused_at_define() {
     .expect_err("SUM(val) could mean the source column or the field");
     assert_eq!(
         err.to_string(),
-        "definition failed validation: calculated field 'total' reads 'val', which is ambiguous: it names both the source \
+        "T0104: definition failed validation: calculated field 'total' reads 'val', which is ambiguous: it names both the source \
          column 'val' of 'amb_src' and the calculated field 'val' (`(grp + 1)`). Write \
          `amb_src.val` or `public.amb_src.val` to read the source column, or rename the field \
          'val' and read it by its new name"

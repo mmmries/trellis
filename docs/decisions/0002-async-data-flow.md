@@ -30,7 +30,8 @@ own transaction. The ring row's transaction id is therefore the source
 commit's, and that identity is what makes every derived write orderable.
 
 **Ordering is owned by the target, at the grain the target is kept at.** A
-1-1 target keeps a slim ledger with one entry per source row: the ring
+1-1 target keeps a slim ledger with one entry per member row (every source row
+when the transform has no `WHERE`): the ring
 position last applied to the row and the snapshot it was last derived under.
 An aggregate target keeps the same ordering state once per *group*, beside
 hidden per-group partials (a row count, non-null counts and sums)
@@ -135,7 +136,7 @@ never-fail rule).
 
 The design is these invariants; every element below exists to hold one of
 them. I0 to I5 are the ordering rules as my experiments refined them, stated
-for both grains: a 1-1 target's ledger entry per source row, and an aggregate
+for both grains: a 1-1 target's ledger entry per member row, and an aggregate
 target's group. I6 to I8 are the rules the capture and build experiments
 forced. I1 and I5 are defined in
 [ADR-0028](0028-locking-and-writing.md), the one definition of how writers
@@ -259,14 +260,14 @@ A ring writer is the application, at whatever isolation level it chose.
 - Nothing relies on what drains before or after a seal, or on which process
   seals.
 
-## The 1-1 ledger: one target-owned entry per source row
+## The 1-1 ledger: one target-owned entry per member row
 
 **Decision point.** The target, not the ring and not a projection, owns the
-state that orders its writes. A 1-1 target owns it per source row
+state that orders its writes. A 1-1 target owns it per member row
 ([stage 05](../staging-and-claiming/05-apply-and-exactly-once-deltas.md#the-ledger)).
 
 - **Must:** a 1-1 target's ledger is a slim side table beside an unchanged
-  target table, one entry per source key holding the position and segment
+  target table, one entry per member key holding the position and segment
   last applied, the basis snapshot and a tombstone flag; the target row holds
   the values. It is written in the same transaction as the target, entries
   locked in key order before any target row is touched. A tombstone row in
@@ -279,7 +280,8 @@ state that orders its writes. A 1-1 target owns it per source row
     In one statement: take the snapshot and read r's source row. Then write
     the target row and replace the entry's basis with the snapshot, leaving
     `applied_lsn` as it was; a row gone from the source deletes the target
-    row and makes the entry a tombstone. It never stores the read's position
+    row and makes the entry a tombstone. A row whose predicate is not `TRUE` is
+    treated as a row gone from the source. It never stores the read's position
     as `applied_lsn`: a change whose trigger ran before the read but which
     committed after it would sit below that position, invisible to the
     basis, and be skipped for good. The basis alone, the full `pg_snapshot`
@@ -287,7 +289,8 @@ state that orders its writes. A 1-1 target owns it per source row
   - **Apply(r, C, image).** Lock r's entry. If C is visible in the entry's
     basis, or C's position is at or below `applied_lsn`, stop (I2).
     Otherwise write the target row from C's new image and set `applied_lsn`
-    to C's position, basis unchanged. A delete makes the entry a tombstone.
+    to C's position, basis unchanged. A delete makes the entry a tombstone. A row
+    whose predicate is not `TRUE` is treated as a row gone from the source.
 - **Must:** Postgres evaluates every field, over the source row cast back to
   the source columns' own types and collations, and Rust computes no
   values, so a field means over the row what it means over the source
@@ -315,7 +318,8 @@ only: a retraction that removes a group's current `MIN` or `MAX` re-reads
 that group's extreme with one index probe, after the group's lock
 ([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
 Every other admitted aggregate is kept from the changes alone and needs no
-source index to stay exact.
+source index to stay exact. Partials count member rows only; the predicate
+filters every staged image and every source read; group naming is unfiltered.
 
 A per-row ledger is not needed for old values: the ring carries every
 change's old image. It exists for ordering, and one row's changes form a
@@ -340,8 +344,9 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
 - **Must:** a plain aggregate, or a JOIN transform
   ([ADR-0019](0019-join-transforms.md)), admits exactly these aggregates:
   - `COUNT(*)` and `COUNT(col)`;
-  - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8` or
-    `numeric`, with or without a declared scale (next section);
+  - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8`,
+    `numeric` (with or without a declared scale), `real`, `double precision`
+    or `interval` (next section);
   - on a plain aggregate only, `MIN(col)` and `MAX(col)`, kept by recompute
     on retract under rules Rx1 to Rx8
     ([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
@@ -356,17 +361,21 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
   the group's row is written. Neither expression arguments nor composed
   fields change lock order or apply order.
 - **Must:** result types match Postgres: `count` is `bigint`,
-  `sum(int2|int4)` is `bigint`, `sum(int8|numeric)` is `numeric`, and `avg`
-  is `numeric`.
+  `sum(int2|int4)` is `bigint`, `sum(int8|numeric)` is `numeric`,
+  `sum(real)` is `real`, `sum(double precision)` and `avg(real|double
+  precision)` are `double precision`, `sum(interval)` and `avg(interval)`
+  are `interval`, and any other `avg` is `numeric`.
 - **Must:** every admitted aggregate but `MIN` and `MAX` is a function of
   per-group partials: the row count, each argument's non-null count, and
   each `SUM` or `AVG` argument's sum, kept as `numeric` whatever the
   argument type so a sum (or, on a JOIN, a product of a sum and a count)
-  never overflows where Postgres's own `sum()` wouldn't; a `numeric`
-  argument adds counts of its scales and special values (next section).
+  never overflows where Postgres's own `sum()` wouldn't; a `numeric`, float
+  or `interval` argument adds counts of its scales and special values (next
+  section).
 - **Must:** every other aggregate is refused at define, named by family:
   `MIN`/`MAX` on a JOIN; `bool_and`/`bool_or` and `bit_and`/`bit_or`;
-  `SUM`/`AVG` over a float, `interval` or any other type; and `array_agg`, `string_agg` and `jsonb_agg`. The
+  and `array_agg`, `string_agg` and `jsonb_agg`. `SUM`/`AVG` over any other
+  type is refused by its argument's type. The
   [Supported sources and targets](../transforms.md#supported-sources-and-targets)
   table is the reference. Each can be added later, through hidden counters,
   a value-count table or a recompute, without changing what is admitted
@@ -487,6 +496,37 @@ reason.
   stored maps keep their reference scale, so nothing pauses or rebuilds:
   values at other scales are counted from then on. A change between two
   declared scales re-renders values, so its readers rebuild.
+
+### Float and `interval` sums are exact
+
+Postgres's float `sum()` adds in scan order, and float addition isn't
+associative: `{1e20, 1, -1e20}` sums to 0 or 1 by order, and `sum(real)`
+adds in `real`, so a million `0.1::real` sum to 100958.34. No delta can
+follow an order. `interval` addition is exact per field, but Postgres's
+`sum(interval)` raises `interval out of range` by order too:
+`{2147483647 days, 1 day, -1 day}` raises in one order and not the other.
+Exact sums commute like the integer and `numeric` ones, so no new
+interleaving argument is needed (I2); only the read-time rounding is new.
+
+- **Must:** a float (`real`, `double precision`) `SUM` or `AVG` is the
+  exact sum of the values, rounded once to the result type: each value
+  converts exactly to `numeric` (a `real` widens to `double precision`
+  first), an `AVG` divides that exact sum by the count, and `NaN`,
+  `Infinity` and `-Infinity` are counted, not summed, resolving as Postgres
+  resolves them (`NaN` while it counts a `NaN` or both infinities, else the
+  infinity). This is a stated departure from Postgres's order-dependent
+  `sum()`.
+- **Must:** an `interval` `SUM` is the exact fieldwise sum (months, days,
+  microseconds), with `infinity` and `-infinity` counted (Postgres 17 and
+  later). It raises only when its final value is out of range, as an
+  evaluation error of its group, whatever order its values came in.
+- **Must:** an `interval` `AVG` divides the exact fieldwise sums as
+  Postgres's `interval_div` does (month fractions carry into days, then into
+  microseconds), so a group whose sum is in range has Postgres's own
+  `avg()`.
+- **Must:** these partials are the `numeric` ones above, each value its
+  exact `numeric`; the layout has a compatibility floor of its own
+  ([ADR-0024](0024-compatibility-floors-and-rollback.md)).
 
 ### Apply sums sides per group and transaction
 
@@ -959,7 +999,7 @@ Each alternative below is recorded with the number that rejected it.
   application can queue behind is a bug, and a condition that fails the
   application's statement is a bug. Both get a written rule and a test.
 - **Storage grows with the source only for 1-1 targets.** A 1-1 target
-  carries a slim ledger of one row per source row; an aggregate target
+  carries a slim ledger of one row per member row; an aggregate target
   carries state per group (5 MB for 50k groups, whatever the source's
   size). No full old row is ever staged and `REPLICA IDENTITY FULL` is not
   required anywhere.

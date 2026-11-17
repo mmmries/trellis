@@ -114,7 +114,7 @@ use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::{Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT};
 use crate::defs::source_index::{ExtremeIndexGap, SourceIndexGap};
 use crate::defs::{self, CatalogError, ParseError, StoredStatus, TransformStatus, ValueType};
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId, Message as _, SharedCondition};
 use crate::intake::IntakeError;
 use crate::pool::Pool;
 use crate::staging::apply::ApplyError;
@@ -641,7 +641,7 @@ impl Trellis {
         .await;
         match found {
             Some(found) => TrellisError::Catalog(CatalogError::NameCaseMismatch {
-                error: err.to_string(),
+                error: err.message().to_string(),
                 code: err.code(),
                 found,
             }),
@@ -1118,6 +1118,11 @@ impl Trellis {
             match (self.read_status(&mut client, target_table).await, pending) {
                 (Ok(status), pending) => Ok(status.map(|mut status| {
                     status.migrations_pending = pending;
+                    status.maintenance_refusals = self
+                        .client
+                        .as_ref()
+                        .map(Client::refused_steps)
+                        .unwrap_or_default();
                     status
                 })),
                 // Only pending migrations explain a catalog it can't read:
@@ -1366,6 +1371,7 @@ impl Trellis {
                 version_handover,
                 migrations_pending: None,
                 below_catalog_floor,
+                maintenance_refusals: Vec::new(),
                 floor: row.get("floor_version"),
             }))
         }
@@ -2622,6 +2628,16 @@ pub struct DefinitionStatus {
     /// state-changing calls refuse ([`ErrorCode::VersionFloor`]). Names the
     /// floor and this binary's version. Run a version at or above the floor.
     pub below_catalog_floor: Option<crate::catalog_floor::BelowCatalogFloor>,
+    /// The ring and maintenance steps this handle's staging worker is
+    /// refused (`42501`), such as retiring a drained segment without
+    /// `TRUNCATE`: each names the step, the role, the table and the
+    /// privileges the role lacks. Instance-level, so every definition
+    /// reports the same list. Nothing is paused: no definition's correctness
+    /// waits on these steps, but the ring isn't housekept until the
+    /// privilege is granted. An entry clears itself once a pass of its step
+    /// succeeds. Empty on a handle that doesn't lead the staging worker: it
+    /// is this process's knowledge, not the catalog's.
+    pub maintenance_refusals: Vec<crate::refused_steps::RefusedStep>,
     /// The oldest Trellis release that can run the definition, as
     /// `major.minor.patch` (ADR-0024): the latest release any grammar
     /// construct, key space, option or hidden-table layout it uses arrived
@@ -3253,15 +3269,49 @@ impl TrellisError {
             }
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            TrellisError::Parse(err) => err.error_id(),
+            TrellisError::MigrationsPending { .. } => ErrorId(207),
+            TrellisError::Catalog(err) => err.error_id(),
+            TrellisError::Client(err) => err.error_id(),
+            TrellisError::Engine(err) => err.error_id(),
+            TrellisError::Db(..) => ErrorId(208),
+            TrellisError::SourceTableNotFound(..) => {
+                SharedCondition::SourceTableNotFound.error_id()
+            }
+            TrellisError::TableNotCaptured { .. } => ErrorId(210),
+            TrellisError::AmbiguousSourceTable { .. } => ErrorId(211),
+            TrellisError::BlockingSpawn(..) => ErrorId(212),
+            TrellisError::BlockingThreadExitedBeforeReady => ErrorId(213),
+            TrellisError::BlockingThreadGone => ErrorId(214),
+            TrellisError::CancelledByShutdown => ErrorId(215),
+            TrellisError::CalledFromAsyncContext => ErrorId(216),
+            TrellisError::Apply(err) => err.error_id(),
+            TrellisError::TransformNotFound(..) => SharedCondition::TransformNotFound.error_id(),
+            TrellisError::ColumnNotFound { .. } => ErrorId(218),
+            TrellisError::Staging(err) => err.error_id(),
+            TrellisError::SelfCheck(err) => err.error_id(),
+            TrellisError::CallTimeout { .. } => ErrorId(219),
+            TrellisError::OtherVersionLive(seen) => seen.error_id(),
+            TrellisError::TargetSelect { .. } => ErrorId(221),
+        }
+    }
 }
 
-impl std::fmt::Display for TrellisError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+crate::error_code::coded_display!(TrellisError);
+
+impl crate::error_code::Message for TrellisError {
+    fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TrellisError::Parse(err) => write!(f, "{err}"),
-            TrellisError::Catalog(err) => write!(f, "{err}"),
-            TrellisError::Client(err) => write!(f, "{err}"),
-            TrellisError::Engine(err) => write!(f, "{err}"),
+            TrellisError::Parse(err) => err.fmt_message(f),
+            TrellisError::Catalog(err) => err.fmt_message(f),
+            TrellisError::Client(err) => err.fmt_message(f),
+            TrellisError::Engine(err) => err.fmt_message(f),
             TrellisError::Db(err) => {
                 write!(f, "database error: ")?;
                 crate::error::write_pg_error(f, err)
@@ -3300,7 +3350,7 @@ impl std::fmt::Display for TrellisError {
                 "BlockingTrellis was called from a thread that already has a tokio runtime \
                  entered; call the async Trellis directly in that context instead"
             ),
-            TrellisError::Apply(err) => write!(f, "{err}"),
+            TrellisError::Apply(err) => err.fmt_message(f),
             TrellisError::TransformNotFound(target) => {
                 write!(f, "no transform named \"{target}\" is registered")
             }
@@ -3317,8 +3367,8 @@ impl std::fmt::Display for TrellisError {
                     declared.join(", ")
                 }
             ),
-            TrellisError::Staging(err) => write!(f, "{err}"),
-            TrellisError::SelfCheck(err) => write!(f, "{err}"),
+            TrellisError::Staging(err) => err.fmt_message(f),
+            TrellisError::SelfCheck(err) => err.fmt_message(f),
             TrellisError::CallTimeout {
                 budget,
                 abandoned: false,
@@ -3345,7 +3395,8 @@ impl std::fmt::Display for TrellisError {
             TrellisError::MigrationsPending { pending, error } => {
                 write!(
                     f,
-                    "refused: {pending}; the catalog can't be read until they run: {error}"
+                    "refused: {pending}; the catalog can't be read until they run: {}",
+                    error.message()
                 )
             }
         }

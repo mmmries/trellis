@@ -285,3 +285,48 @@ async fn pending_changes_are_subtracted_by_key_value_after_a_source_key_re_colla
     let (found, _, _) = compare(&d, 2).await;
     assert_eq!(found, [cell("k03", "total", "1033", "33")]);
 }
+
+/// A build reads the source as it is now (#2032). After `RESUME`, a row
+/// inserted and drained while the definition waits for its build, then
+/// updated and deleted with those changes still in the ring, gets no ledger
+/// entry from the build: the comparison expects it as the update's old
+/// image. Until the changes drain it can't vouch for that key (ADR-0013), so
+/// `Standard` re-checks it rather than reporting it from one pass; once
+/// they drain, every key is exact.
+#[tokio::test]
+async fn a_key_the_build_read_past_its_undrained_change_is_uncertain_until_it_drains() {
+    let mut d = start().await;
+    d.step("insert into public.src values (1, 10, 1), (2, 20, 2)")
+        .await;
+    let t = trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    t.apply("PAUSE TRANSFORM t").await.expect("pause");
+    t.apply("RESUME TRANSFORM t").await.expect("resume");
+    d.step("insert into public.src values (9, 90, 9)").await;
+    d.write("update public.src set v = 91 where id = 9; delete from public.src where id = 9")
+        .await;
+    let pending = d.seal().await;
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the resumed build");
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    let status = d
+        .rows("select status from transform_definitions where target_table = 'public.t'")
+        .await;
+    assert_eq!(status, ["(live)"]);
+    assert_eq!(
+        compare(&d, 10).await,
+        (
+            vec![Divergence::MissingRow { key: "9".into() }],
+            vec!["9".to_string()],
+            false
+        ),
+        "at the flip, 9 is expected as its update's old image and is uncertain"
+    );
+    d.drain(pending, "page").await;
+    assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
+}

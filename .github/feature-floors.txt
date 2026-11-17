@@ -45,6 +45,7 @@ feature Layout(GroupBasisExtremes) 0.2.0
 feature Layout(Join) 0.2.0
 feature Layout(JoinOneToOne) 0.2.0
 feature Layout(NumericSums) 0.2.0
+feature Layout(FloatIntervalSums) 0.4.0
 feature QualifiedTable 0.2.0
 feature WithoutSourceIndex 0.2.0
 feature AdoptTarget 0.2.0
@@ -52,6 +53,7 @@ feature PartitionedSource 0.2.0
 feature TableAlias 0.2.0
 feature TableKey 0.2.0
 feature StarJoin 0.2.0
+feature NeighbourTypedLiteral 0.4.0
 feature Function("STRPOS") 0.2.0
 feature Function("OCTET_LENGTH") 0.2.0
 feature Function("CHAR_LENGTH") 0.2.0
@@ -149,11 +151,14 @@ feature TypeRule(Aggregate(SumFloat)) 0.2.0
 feature TypeRule(Aggregate(SumInterval)) 0.2.0
 feature TypeRule(Aggregate(AvgFloat)) 0.2.0
 feature TypeRule(Aggregate(AvgExact)) 0.2.0
+feature TypeRule(Aggregate(AvgInterval)) 0.4.0
 feature TypeRule(Aggregate(Extreme)) 0.2.0
 feature TypeRule(AggregateAdmission(Count)) 0.2.0
 feature TypeRule(AggregateAdmission(SumAvgInteger)) 0.2.0
 feature TypeRule(AggregateAdmission(SumAvgScaledNumeric)) 0.2.0
 feature TypeRule(AggregateAdmission(SumAvgNumeric)) 0.2.0
+feature TypeRule(AggregateAdmission(SumAvgFloat)) 0.4.0
+feature TypeRule(AggregateAdmission(SumAvgInterval)) 0.4.0
 feature TypeRule(AggregateAdmission(Extreme)) 0.2.0
 feature TypeRule(GroupByKey(Integer)) 0.2.0
 feature TypeRule(GroupByKey(Numeric)) 0.2.0
@@ -743,8 +748,14 @@ admit aggregate(SUM, Integer(Int8)) = Some(Numeric) by Aggregate(SumWideExact) 0
 admit aggregate_admitted(SUM, Integer(Int8) typmod -1) = Ok(()) by AggregateAdmission(SumAvgInteger) 0.2.0
 admit aggregate_admitted(SUM, Integer(Int8) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgInteger) 0.2.0
 admit aggregate(SUM, Float(Float4)) = Some(Float(Float4)) by Aggregate(SumFloat) 0.2.0
+admit aggregate_admitted(SUM, Float(Float4) typmod -1) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
+admit aggregate_admitted(SUM, Float(Float4) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
 admit aggregate(SUM, Float(Float8)) = Some(Float(Float8)) by Aggregate(SumFloat) 0.2.0
+admit aggregate_admitted(SUM, Float(Float8) typmod -1) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
+admit aggregate_admitted(SUM, Float(Float8) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
 admit aggregate(SUM, Other(Interval)) = Some(Other(Interval)) by Aggregate(SumInterval) 0.2.0
+admit aggregate_admitted(SUM, Other(Interval) typmod -1) = Ok(()) by AggregateAdmission(SumAvgInterval) 0.4.0
+admit aggregate_admitted(SUM, Other(Interval) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgInterval) 0.4.0
 admit aggregate_admitted(COUNT, *) = Ok(()) by AggregateAdmission(Count) 0.2.0
 admit aggregate_admitted(COUNT, Numeric typmod -1) = Ok(()) by AggregateAdmission(Count) 0.2.0
 admit aggregate_admitted(COUNT, Numeric typmod 786438) = Ok(()) by AggregateAdmission(Count) 0.2.0
@@ -823,7 +834,14 @@ admit aggregate(AVG, Integer(Int8)) = Some(Numeric) by Aggregate(AvgExact) 0.2.0
 admit aggregate_admitted(AVG, Integer(Int8) typmod -1) = Ok(()) by AggregateAdmission(SumAvgInteger) 0.2.0
 admit aggregate_admitted(AVG, Integer(Int8) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgInteger) 0.2.0
 admit aggregate(AVG, Float(Float4)) = Some(Float(Float8)) by Aggregate(AvgFloat) 0.2.0
+admit aggregate_admitted(AVG, Float(Float4) typmod -1) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
+admit aggregate_admitted(AVG, Float(Float4) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
 admit aggregate(AVG, Float(Float8)) = Some(Float(Float8)) by Aggregate(AvgFloat) 0.2.0
+admit aggregate_admitted(AVG, Float(Float8) typmod -1) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
+admit aggregate_admitted(AVG, Float(Float8) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgFloat) 0.4.0
+admit aggregate(AVG, Other(Interval)) = Some(Other(Interval)) by Aggregate(AvgInterval) 0.4.0
+admit aggregate_admitted(AVG, Other(Interval) typmod -1) = Ok(()) by AggregateAdmission(SumAvgInterval) 0.4.0
+admit aggregate_admitted(AVG, Other(Interval) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgInterval) 0.4.0
 admit aggregate(MIN, Numeric) = Some(Numeric) by Aggregate(Extreme) 0.2.0
 admit aggregate_admitted(MIN, Numeric typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
 admit aggregate_admitted(MIN, Numeric typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0

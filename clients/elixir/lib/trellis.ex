@@ -278,11 +278,39 @@ defmodule Trellis do
   when it is garbage collected.
   """
   @spec start_link([start_option()]) :: GenServer.on_start()
-  def start_link(options) when is_list(options), do: Trellis.Owner.start_link(options)
+  def start_link(options) when is_list(options) do
+    if enabled?(), do: Trellis.Owner.start_link(options), else: :ignore
+  end
+
+  @doc """
+  Whether Trellis is on: `config :trellis_pg, enabled: false` turns it off,
+  and the default is `true`. Read from the application's configuration, so
+  it is one setting per environment (`config/test.exs` sets it for tests):
+
+      # config/test.exs
+      config :trellis_pg, enabled: false
+
+  Off, the host runs as if Trellis were not installed:
+
+  - `{Trellis, options}` in a supervision tree starts nothing (its child
+    spec's `start_link/1` returns `:ignore`), and the log bridge isn't
+    installed. Nothing connects and nothing runs in the background.
+  - The `Trellis.Migration` helpers skip with a log message, so a migration
+    still records as run.
+  - `mix trellis.load` is `mix ecto.load` and `mix trellis.dump` is
+    `mix ecto.dump`: target tables load as plain tables.
+  - Nothing is refused at boot.
+
+  Calls made through a handle that was connected explicitly with
+  `connect/1` are not affected.
+  """
+  @spec enabled?() :: boolean()
+  def enabled?, do: Application.get_env(:trellis_pg, :enabled, true) != false
 
   @doc """
   The child spec `{Trellis, options}` stands for in a supervision tree. Its
-  id is the `:name` option, so one tree can hold several.
+  id is the `:name` option, so one tree can hold several. Where Trellis is
+  off (`enabled?/0`), starting it returns `:ignore`.
   """
   @spec child_spec([start_option()]) :: Supervisor.child_spec()
   def child_spec(options) when is_list(options) do
@@ -929,7 +957,7 @@ defmodule Trellis do
 
   defp local_ref(ref) do
     {:error,
-     {"validation",
+     {"validation", nil,
       "this Trellis handle was connected on node #{node(ref)}; " <>
         "a handle works only on the node that connected it, so call it there"}}
   end

@@ -23,7 +23,8 @@
 //!   and every chunk are done, it walks the ledger and re-derives each live
 //!   entry the chunks didn't (its `basis` is null or older than the start),
 //!   which is a key deleted while the definition was frozen. A fresh build's
-//!   ledger is empty at its start, so it gets no sweep.
+//!   ledger is empty at its start, so it gets no sweep, but a 1-1 `JOIN`'s
+//!   build always does (`join_one_to_one`).
 //! - **Rebuild of an applying definition**. `Trellis::request_backfill`
 //!   and a capture re-install repair a table's `live` readers by rebuilding
 //!   them ([`start_rebuilds`]): the call's own
@@ -409,13 +410,7 @@ pub async fn start_ready_builds(
             // (`fail_chunk`); a resume rebuilds it, or refuses with the
             // repair.
             Err(err) => {
-                match super::halt::halt_failed_start(
-                    pool,
-                    &definition.target_table,
-                    &err.to_string(),
-                )
-                .await
-                {
+                match super::halt::halt_failed_start(pool, &definition.target_table, &err).await {
                     Ok(paused) => crate::instance_log::warn!(
                         definition_id = id,
                         paused = ?paused,
@@ -589,11 +584,12 @@ pub(crate) async fn resume_released_dependents(
 /// change committed before it is visible to every chunk's snapshot.
 ///
 /// A definition whose ledger isn't empty (a resumed one) also gets a
-/// sweep job ([`run_sweep`]); a 1-1 `JOIN` gets one whenever its target
-/// isn't empty, since its resume recreates `R` and `M` empty and keeps the
-/// target (`join_one_to_one`). Both rows carry the start's transaction id,
-/// which the sweep's filter reads: every chunk's snapshot is taken after
-/// the start commits, so its `xmax` is past that id.
+/// sweep job ([`run_sweep`]); a 1-1 `JOIN` always gets one
+/// (`join_one_to_one`). Both rows carry the start's transaction id. The
+/// sweep row's is the bound of its stale filter: every chunk's snapshot is
+/// taken after the start commits, so its `xmax` is past that id. A 1-1
+/// `JOIN`'s plan job moves its sweep's bound past the `M` pass
+/// ([`run_plan`]).
 ///
 /// **The start's segment.** Pages drain batches out of order, so a
 /// page that ran before the start can drain a key's later change while an
@@ -654,9 +650,12 @@ async fn start(
         &definition.target_table,
     ));
     // A group-basis definition has no ledger, and nothing to sweep. A 1-1
-    // JOIN's sweep is needed whenever its target has rows: a resume
-    // recreates `R` and `M` empty and keeps the target, whose rows of `a`
-    // rows deleted while it was paused only the sweep's orphan pass removes.
+    // JOIN is always swept: a resume recreates `R` and `M` empty and keeps
+    // the target, whose rows of `a` rows deleted while it was paused only
+    // the sweep's orphan pass removes; and in any build a page can re-derive
+    // an `R` entry against the `M` the `M` pass then replaces, whose `a` row
+    // is gone when its chunk reads the range, which only the sweep's stale
+    // pass reaches (#2027).
     let join1 = crate::defs::join::is_one_to_one(&definition.def);
     // A plain 1-1 target with rows and an empty ledger is swept too: a
     // resume that re-keyed it (`recorded_keys::repair_target_key`) emptied
@@ -689,7 +688,7 @@ async fn start(
     // The caller found any field awaiting capture ready, so it
     // applies from this commit, and the build's chunks write it.
     let dependents = release_awaiting_capture(&txn, &definition.def.target, None).await?;
-    let sweep = (!empty).then_some(chunk_queue::KIND_SWEEP);
+    let sweep = (join1 || !empty).then_some(chunk_queue::KIND_SWEEP);
     for kind in std::iter::once(chunk_queue::KIND_PLAN).chain(sweep) {
         txn.execute(
             "insert into backfill_chunks (definition_id, kind, fuse_rearmed_at, start_xid) \
@@ -2107,6 +2106,34 @@ async fn run_plan(
             txn.rollback().await?;
             return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
         }
+        // A 1-1 `JOIN`'s sweep re-derives the `R` entries whose basis could
+        // predate the end of the `M` pass, not only the build's start: a page
+        // that re-derived an entry in between joined it to an `M` the pass
+        // has since replaced without a fan-out, and when its `a` row is gone
+        // at its chunk's read, no chunk rewrites it (#2027). So the first
+        // walk transaction stores its own id as the sweep's bound. It began
+        // after the `M` pass's last batch committed, so a snapshot whose
+        // `xmax` is past it saw every batch; the chunks it enqueues claim
+        // after it commits, so the sweep leaves their entries alone. The
+        // guard (the sweep row still holds the start's id) makes it fire
+        // once, so a walk resumed after a failure keeps the first bound.
+        // Planted bug: the sweep keeps the start's id as its bound. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let start_bound = crate::plant::fires(crate::plant::Plant::Join1SweepStartBound, join1);
+        #[cfg(not(any(test, feature = "test-util")))]
+        let start_bound = false;
+        if join1 && !start_bound {
+            txn.execute(
+                "update backfill_chunks s set start_xid = pg_current_xact_id() \
+                 from backfill_chunks p \
+                 where p.id = $1 and s.definition_id = p.definition_id \
+                   and s.kind = $2 and not s.done \
+                   and s.start_xid is not distinct from p.start_xid",
+                &[&chunk.id, &chunk_queue::KIND_SWEEP],
+            )
+            .await?;
+        }
         // Test-only pause point. See `super::interleave`.
         #[cfg(any(test, feature = "test-util"))]
         super::interleave::pause_at(
@@ -2946,7 +2973,8 @@ async fn run_group_structure(
 }
 
 /// Runs a claimed sweep job (see the module doc): [`sweep_batch`]es
-/// of [`WorkerOptions::chunk_rows`] entries from the job's cursor, each in
+/// of [`WorkerOptions::chunk_rows`] entries from the job's cursor, its stale
+/// filter bounded by the sweep row's `start_xid` ([`start`]), each in
 /// its own `read committed` transaction with the cursor's advance, fenced by
 /// the claim ([`ClaimFence`]), so a job that dies resumes after its last
 /// committed batch. The batch that reads the ledger's end marks the job done.
@@ -2989,7 +3017,9 @@ async fn run_sweep(
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
     let mut client = pool.get().await?;
-    let start_xid: String = client
+    // The bound of the stale filter: the build's start, or for a 1-1 `JOIN`
+    // an id past its `M` pass ([`run_plan`]).
+    let bound: String = client
         .query_one(
             "select start_xid::text from backfill_chunks where id = $1",
             &[&chunk.id],
@@ -3027,13 +3057,12 @@ async fn run_sweep(
                     .as_deref()
                     .map(one_to_one::SweepCursor::parse)
                     .transpose()?;
-                one_to_one::sweep_batch(&txn, plan, &start_xid, cursor, scan)
+                one_to_one::sweep_batch(&txn, plan, &bound, cursor, scan)
                     .await
                     .map_err(build_error)?
             }
             SweepPlan::Join(plan) => {
-                join_one_to_one::sweep_batch(&txn, plan, &start_xid, cursor.as_deref(), scan)
-                    .await?
+                join_one_to_one::sweep_batch(&txn, plan, &bound, cursor.as_deref(), scan).await?
             }
         };
         let next = outcome.next.clone().or(cursor.clone());

@@ -43,7 +43,7 @@ class ParityTest < Minitest::Test
     Parity.fixture.fetch("conversions").each do |conversion|
       native = Parity.native(conversion.fetch("native"))
       value = if conversion.fetch("type") == "Error"
-                Trellis::Error.from_native(native.fetch(:code), native.fetch(:message))
+                Trellis::Error.from_native(native.fetch(:code), native[:error_id], native.fetch(:message))
               else
                 Trellis.const_get(conversion.fetch("type")).from_native(native)
               end

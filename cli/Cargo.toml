@@ -1,6 +1,6 @@
 [package]
 name = "trellis-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 description = "The trellis command-line tool: define streaming SQL transforms, run the pipeline and check status"
 license = "Apache-2.0"
@@ -17,7 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 trellis = { path = "../trellis" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }
+# Only to tell a `migrate` the role lacks the rights for (SQLSTATE 42501)
+# from one that failed (`run`'s `stands_by_on`); the crate `trellis` uses.
+tokio-postgres = "0.7.13"
 
 [dev-dependencies]
 # `test-util` opens `trellis::dev::metrics`, which the metrics-endpoint test
@@ -28,4 +33,3 @@ trellis = { path = "../trellis", features = ["test-util"] }
 # The dump/restore tests spawn the binary against a database on a test
 # cluster and read it back with a plain connection.
 testkit = { path = "../testkit" }
-tokio-postgres = "0.7.13"

@@ -91,6 +91,12 @@ defmodule Trellis.Status do
   state-changing calls refuse with a `version_floor` error. Run a version at
   or above the floor. `nil` when this binary meets it.
 
+  `maintenance_refusals` lists the ring and maintenance steps this process's
+  staging worker is refused (each a `Trellis.RefusedStep`), such as retiring
+  a drained segment without `TRUNCATE`. Nothing is paused for them; each
+  clears itself once a pass of its step succeeds. Only the process that runs
+  the staging worker reports them; empty otherwise.
+
   `join` is set for a `JOIN` transform, aggregate or 1-1, and `nil` for any
   other (a `Trellis.JoinStatus`). It never holds anything up: it changes
   nothing about the transform's status. It reports the estimated size of the
@@ -125,6 +131,7 @@ defmodule Trellis.Status do
           build_wait_xid: integer() | nil,
           version_handover: Trellis.VersionHandover.t() | nil,
           below_catalog_floor: Trellis.BelowCatalogFloor.t() | nil,
+          maintenance_refusals: [Trellis.RefusedStep.t()],
           join: Trellis.JoinStatus.t() | nil,
           floor: String.t()
         }
@@ -143,6 +150,7 @@ defmodule Trellis.Status do
     :build_wait_xid,
     :version_handover,
     :below_catalog_floor,
+    :maintenance_refusals,
     :join,
     :floor
   ]
@@ -163,6 +171,7 @@ defmodule Trellis.Status do
         build_wait_xid: build_wait_xid,
         version_handover: version_handover,
         below_catalog_floor: below_catalog_floor,
+        maintenance_refusals: maintenance_refusals,
         join: join,
         floor: floor
       }) do
@@ -181,6 +190,7 @@ defmodule Trellis.Status do
       version_handover: version_handover && Trellis.VersionHandover.from_native(version_handover),
       below_catalog_floor:
         below_catalog_floor && Trellis.BelowCatalogFloor.from_native(below_catalog_floor),
+      maintenance_refusals: Enum.map(maintenance_refusals, &Trellis.RefusedStep.from_native/1),
       join: join && Trellis.JoinStatus.from_native(join),
       floor: floor
     }
@@ -430,6 +440,33 @@ defmodule Trellis.BelowCatalogFloor do
   @doc false
   def from_native(%{floor: floor, this_version: this_version}) do
     %__MODULE__{floor: floor, this_version: this_version}
+  end
+end
+
+defmodule Trellis.RefusedStep do
+  @moduledoc """
+  A ring or maintenance step the staging worker's role is refused, in a
+  `Trellis.Status`'s `maintenance_refusals`: the step (`step`), the role
+  (`role`), the table or sequence refused (`object`), the privileges the
+  role lacks on it (`missing`) and Postgres's message (`error`). `role` and
+  `object` are `nil`, and `missing` is empty, when they couldn't be read.
+  Grant what it names.
+  """
+
+  @type t :: %__MODULE__{
+          step: String.t(),
+          role: String.t() | nil,
+          object: String.t() | nil,
+          missing: [String.t()],
+          error: String.t()
+        }
+
+  @enforce_keys [:step, :role, :object, :missing, :error]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{step: step, role: role, object: object, missing: missing, error: error}) do
+    %__MODULE__{step: step, role: role, object: object, missing: missing, error: error}
   end
 end
 

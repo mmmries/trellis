@@ -62,7 +62,7 @@ use std::fmt;
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId};
 use crate::pool::{Pool, quote_ident};
 
 use super::ast::{FieldDef, KeySpace, TransformDef, ValueType};
@@ -368,6 +368,28 @@ impl DdlError {
             DdlError::Pool(err) => err.code(),
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            DdlError::NoPrimaryKey { .. } => ErrorId(113),
+            DdlError::DeferrablePrimaryKey { .. } => ErrorId(114),
+            DdlError::KeyOnTrellisTarget { .. } => ErrorId(115),
+            DdlError::KeyNotBacked { .. } => ErrorId(116),
+            DdlError::KeyDiffersFromReaders { .. } => ErrorId(117),
+            DdlError::RecordedKeyMissing { .. } => ErrorId(118),
+            DdlError::NoPrimaryKeyToRecord { .. } => ErrorId(119),
+            DdlError::MalformedCompositeKey { .. } => ErrorId(120),
+            DdlError::UnsupportedPrimaryKeyType { .. } => ErrorId(121),
+            DdlError::InvalidDefinition(err) => err.error_id(),
+            DdlError::AliasSubstitution(err) => err.error_id(),
+            DdlError::UnroutedAggregate { .. } => ErrorId(122),
+            DdlError::Db(..) => ErrorId(123),
+            DdlError::Pool(err) => err.error_id(),
+        }
+    }
 }
 
 /// "its unique indexes are ...", or that it has none, for a key refusal.
@@ -392,8 +414,10 @@ fn deferrable_key_remedy(table: &str, constraint: &str, key: &[String]) -> Strin
     )
 }
 
-impl fmt::Display for DdlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(DdlError);
+
+impl crate::error_code::Message for DdlError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DdlError::NoPrimaryKey { source_table } => write!(
                 f,
@@ -537,12 +561,13 @@ impl fmt::Display for DdlError {
                  basis keeps"
             ),
             DdlError::InvalidDefinition(err) => {
-                write!(f, "cannot generate target-table DDL: {err}")
+                write!(f, "cannot generate target-table DDL: {}", err.message())
             }
             DdlError::AliasSubstitution(err) => write!(
                 f,
                 "cannot generate target-table DDL: calculated-field alias substitution \
-                 error: {err}"
+                 error: {}",
+                err.message()
             ),
             DdlError::Db(err) => {
                 write!(f, "target-table DDL database error: ")?;
@@ -550,7 +575,7 @@ impl fmt::Display for DdlError {
             }
             // `err` already says what failed (a pool checkout reads
             // "failed to acquire a connection: ...").
-            DdlError::Pool(err) => write!(f, "{err}"),
+            DdlError::Pool(err) => err.fmt_message(f),
         }
     }
 }

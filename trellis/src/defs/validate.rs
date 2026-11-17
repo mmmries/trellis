@@ -22,7 +22,7 @@ use super::ast::{
 use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
 use super::pg_type::PgType;
-use crate::error_code::ErrorCode;
+use crate::error_code::{ErrorCode, ErrorId, SharedCondition};
 use crate::integer::IntWidth;
 
 /// Which key a [`ValidationError::NondeterministicKeyCollation`] column
@@ -514,6 +514,13 @@ pub enum ValidationError {
     /// exact text, so the engine and Postgres would disagree. Refused at
     /// define time, as for join and key columns.
     NondeterministicCollationTextFunction(Box<NondeterministicCollationTextFunction>),
+    /// A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` whose text operands
+    /// carry different collations, none the database default, with none to
+    /// choose between them. Postgres raises `42P22` ("could not determine
+    /// which collation to use") on every row where both operands are not
+    /// `NULL`, so the definition would define and then fail every write.
+    /// The grammar has no `COLLATE` clause to pick one.
+    ConflictingCollations(Box<ConflictingCollations>),
     /// An explicitly-qualified `FROM <schema>.<table>` source reference
     /// (ADR-0011) named a schema that does not
     /// actually contain a table by that name, as introspected live against
@@ -571,6 +578,21 @@ pub struct NondeterministicCollationTextFunction {
     pub collation: String,
 }
 
+/// Payload of [`ValidationError::ConflictingCollations`], boxed out of the
+/// enum like [`NondeterministicKeyCollation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictingCollations {
+    /// The calculated field whose own expression makes the comparison.
+    pub field: String,
+    /// The comparison operator, `NULLIF`, `STRPOS` or `REGEXP_COUNT`.
+    pub construct: String,
+    /// The two columns whose collations conflict, as `table.column`.
+    pub first_column: String,
+    pub first_collation: String,
+    pub second_column: String,
+    pub second_collation: String,
+}
+
 /// The registry functions whose Postgres implementation refuses a
 /// nondeterministic collation with `0A000`, so the engine can't compute them
 /// the way Postgres would on such a column: `strpos` ("not supported for
@@ -596,7 +618,7 @@ pub(crate) struct CollationRefusingRead {
 }
 
 /// A column an expression reads, with the qualifier it was written with.
-type ReadColumn = (Option<QualifiedColumn>, String);
+pub(crate) type ReadColumn = (Option<QualifiedColumn>, String);
 
 /// Every column an argument of a `STRPOS`/`REGEXP_COUNT` call in `def`'s
 /// fields reads, for the catalog to check each
@@ -708,7 +730,7 @@ fn collect_text_comparison(
 /// calculated field it reads, and the arguments of `COALESCE` and `NULLIF`
 /// and the results (not the conditions) of a `CASE`. Anything else (a call,
 /// an operator) returns a value of another type or a computed one.
-fn collect_value_columns<'a>(
+pub(crate) fn collect_value_columns<'a>(
     expr: &Expr,
     field: &str,
     fields_by_name: &HashMap<&str, &'a FieldDef>,
@@ -835,7 +857,208 @@ pub(crate) fn check_collation_reads<'a>(
             ));
         }
     }
+    check_collation_conflicts(def, only_fields, &resolve)
+}
+
+/// The database default's `pg_collation` OID.
+const DEFAULT_COLLATION_OID: u32 = 100;
+
+/// The collation an expression's text carries, as Postgres derives it
+/// (`assign_collations`): a column's own, the database default for a
+/// constant or a computed value, and a conflict where two different
+/// collations meet. The database default yields to any other collation.
+enum Derived {
+    Collation {
+        oid: u32,
+        /// `table.column` of a column that carries it, and the collation's name.
+        column: String,
+        name: String,
+    },
+    Default,
+    Conflict(Box<ConflictingCollations>),
+}
+
+impl Derived {
+    fn merge(self, other: Derived) -> Derived {
+        match (self, other) {
+            (Derived::Default, other) | (other, Derived::Default) => other,
+            (conflict @ Derived::Conflict(_), _) | (_, conflict @ Derived::Conflict(_)) => conflict,
+            (Derived::Collation { oid, .. }, other @ Derived::Collation { oid: other_oid, .. })
+                if oid == other_oid =>
+            {
+                other
+            }
+            (
+                Derived::Collation {
+                    column: first_column,
+                    name: first_collation,
+                    ..
+                },
+                Derived::Collation {
+                    column: second_column,
+                    name: second_collation,
+                    ..
+                },
+            ) => Derived::Conflict(Box::new(ConflictingCollations {
+                field: String::new(),
+                construct: String::new(),
+                first_column,
+                first_collation,
+                second_column,
+                second_collation,
+            })),
+        }
+    }
+}
+
+/// Refuses a definition whose comparison (`=`, `<>`, `IS [NOT] DISTINCT
+/// FROM`), `NULLIF`, `STRPOS` or `REGEXP_COUNT` has text operands of
+/// conflicting collations ([`ConflictingCollations`]). An operand's
+/// collation comes from the columns under it, directly or through
+/// `COALESCE`, a `CASE` result or a calculated field, read
+/// from the live catalog through `resolve` as [`check_collation_reads`]
+/// reads its columns. A read `resolve` can't place passes.
+fn check_collation_conflicts<'a>(
+    def: &TransformDef,
+    only_fields: Option<&[FieldDef]>,
+    resolve: &impl Fn(&CollationRefusingRead) -> Option<(String, &'a JoinColumnInfo)>,
+) -> Result<(), ValidationError> {
+    let fields_by_name: HashMap<&str, &FieldDef> =
+        def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    for field in &def.fields {
+        if only_fields.is_some_and(|only| !only.iter().any(|f| f.name == field.name)) {
+            continue;
+        }
+        derive_collation(
+            &field.expr,
+            &field.name,
+            &fields_by_name,
+            &mut HashSet::new(),
+            resolve,
+        )?;
+    }
     Ok(())
+}
+
+fn derive_collation<'a, 'f>(
+    expr: &Expr,
+    field: &str,
+    fields_by_name: &HashMap<&'f str, &'f FieldDef>,
+    visiting: &mut HashSet<&'f str>,
+    resolve: &impl Fn(&CollationRefusingRead) -> Option<(String, &'a JoinColumnInfo)>,
+) -> Result<Derived, ValidationError> {
+    let aggregate_scope;
+    let mut fields_by_name = fields_by_name;
+    if let Expr::FunctionCall { name, .. } = expr
+        && super::registry::is_aggregate_name(name)
+    {
+        // An aggregate's argument reads source columns, not aggregate
+        // fields (see `aggregate_field_names`).
+        let aggregates = aggregate_field_names(fields_by_name.iter().map(|(n, f)| (*n, &f.expr)));
+        aggregate_scope = without_aggregate_fields(fields_by_name, &aggregates);
+        fields_by_name = &aggregate_scope;
+    }
+    let mut children = Vec::new();
+    for child in expr.children() {
+        children.push(derive_collation(
+            child,
+            field,
+            fields_by_name,
+            visiting,
+            resolve,
+        )?);
+    }
+    let column = |qualifier: Option<QualifiedColumn>, name: &str| {
+        let read = CollationRefusingRead {
+            field: field.to_string(),
+            function: String::new(),
+            column: name.to_string(),
+            qualifier,
+        };
+        match resolve(&read) {
+            Some((table, info)) if !matches!(info.collation_oid, 0 | DEFAULT_COLLATION_OID) => {
+                Derived::Collation {
+                    oid: info.collation_oid,
+                    column: format!("{table}.{name}"),
+                    name: info.collation.clone().unwrap_or_default(),
+                }
+            }
+            _ => Derived::Default,
+        }
+    };
+    // The operands of a collation-sensitive construct, which must agree.
+    let check = |construct: &str, operands: Vec<Derived>| match operands
+        .into_iter()
+        .fold(Derived::Default, Derived::merge)
+    {
+        Derived::Conflict(mut conflict) => {
+            conflict.field = field.to_string();
+            conflict.construct = construct.to_string();
+            Err(ValidationError::ConflictingCollations(conflict))
+        }
+        merged => Ok(merged),
+    };
+    let merge_all =
+        |results: Vec<Derived>| results.into_iter().fold(Derived::Default, Derived::merge);
+    Ok(match expr {
+        Expr::Column(name) => match fields_by_name.get(name.as_str()) {
+            Some(other) if name != field => {
+                if visiting.insert(other.name.as_str()) {
+                    let derived = derive_collation(
+                        &other.expr,
+                        &other.name,
+                        fields_by_name,
+                        visiting,
+                        resolve,
+                    );
+                    visiting.remove(other.name.as_str());
+                    derived?
+                } else {
+                    Derived::Default
+                }
+            }
+            _ => column(None, name),
+        },
+        Expr::SourceColumn {
+            schema,
+            table,
+            column: name,
+        } => column(
+            Some(QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: name.clone(),
+            }),
+            name,
+        ),
+        Expr::BinaryOp { op, .. } if op.is_comparison() => {
+            check(super::registry::operator_spec(*op).symbol, children)?;
+            Derived::Default
+        }
+        Expr::FunctionCall { name, .. } => match name.as_str() {
+            "NULLIF" => check("NULLIF", children)?,
+            "STRPOS" | "REGEXP_COUNT" => {
+                check(name, children)?;
+                Derived::Default
+            }
+            "COALESCE" => merge_all(children),
+            _ => Derived::Default,
+        },
+        Expr::Case { branches, .. } => {
+            // `children` is each branch's condition and result in order, then
+            // the `ELSE`; only the results carry a value out.
+            let count = branches.len() * 2;
+            merge_all(
+                children
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i >= count || i % 2 == 1)
+                    .map(|(_, derived)| derived)
+                    .collect(),
+            )
+        }
+        _ => Derived::Default,
+    })
 }
 
 /// [`check_collation_reads`] for a `JOIN`: each read resolves against the
@@ -881,6 +1104,90 @@ impl ValidationError {
         ErrorCode::Validation
     }
 
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            ValidationError::DuplicateFieldName { .. } => ErrorId(40),
+            ValidationError::ReservedFieldName { .. } => ErrorId(41),
+            ValidationError::ReservedGroupByColumnName { .. } => ErrorId(42),
+            ValidationError::FieldNamedAfterPrimaryKey { .. } => ErrorId(43),
+            ValidationError::UnresolvedColumn { .. } => ErrorId(44),
+            ValidationError::Cycle { .. } => ErrorId(45),
+            ValidationError::FieldExpansionTooLarge => ErrorId(46),
+            ValidationError::TableCycle { .. } => ErrorId(47),
+            ValidationError::TargetEqualsSource { .. } => ErrorId(48),
+            ValidationError::JoinNeedsBothTables => ErrorId(49),
+            ValidationError::JoinSelf { .. } => ErrorId(50),
+            ValidationError::JoinTooManyTables => ErrorId(51),
+            ValidationError::JoinUnknownTable { .. } => ErrorId(52),
+            ValidationError::JoinUnqualifiedColumn { .. } => ErrorId(53),
+            ValidationError::JoinUnresolvedColumn { .. } => ErrorId(54),
+            ValidationError::JoinOnSameSide { .. } => ErrorId(55),
+            ValidationError::JoinMixedSideArgument { .. } => ErrorId(56),
+            ValidationError::JoinOnRepeatedPair { .. } => ErrorId(57),
+            ValidationError::JoinOnRepeatedColumn { .. } => ErrorId(58),
+            ValidationError::IndexKeyTooWide { .. } => ErrorId(59),
+            ValidationError::TableTooWide { .. } => ErrorId(60),
+            ValidationError::JoinKeyTypeMismatch { .. } => ErrorId(61),
+            ValidationError::JoinUnsupportedKeyType { .. } => ErrorId(62),
+            ValidationError::JoinNondeterministicCollation { .. } => ErrorId(63),
+            ValidationError::JoinFieldShape { .. } => ErrorId(64),
+            ValidationError::OneToOneJoinAggregate { .. } => ErrorId(65),
+            ValidationError::OneToOneJoinKeyNotUnique { .. } => ErrorId(66),
+            ValidationError::OneToOneJoinUnsupported { .. } => ErrorId(67),
+            ValidationError::StarJoinTooManyTables { .. } => ErrorId(68),
+            ValidationError::JoinOnReadsAnotherJoinedTable { .. } => ErrorId(69),
+            ValidationError::DeferredAggregate { .. } => ErrorId(70),
+            ValidationError::UnsupportedAggregateArgument { .. } => ErrorId(71),
+            ValidationError::UnsupportedExtremeArgument { .. } => ErrorId(72),
+            ValidationError::ExtremeOfExpression { .. } => ErrorId(73),
+            ValidationError::ChainedExtreme { .. } => ErrorId(74),
+            ValidationError::ExtremesWithoutSourceIndex { .. } => ErrorId(75),
+            ValidationError::ReservedTargetSuffix { .. } => ErrorId(76),
+            ValidationError::TargetNameTooLong { .. } => ErrorId(77),
+            ValidationError::TypeMismatch { .. } => ErrorId(78),
+            ValidationError::MixedFloatExactComparison { .. } => ErrorId(79),
+            ValidationError::MixedTemporalComparison { .. } => ErrorId(80),
+            ValidationError::TextOrderingComparison { .. } => ErrorId(81),
+            ValidationError::ComparisonTypeMismatch { .. } => ErrorId(82),
+            ValidationError::NullIfFirstArgumentCast { .. } => ErrorId(83),
+            ValidationError::CaseConditionNotBoolean { .. } => ErrorId(84),
+            ValidationError::CaseResultTypeMismatch { .. } => ErrorId(85),
+            ValidationError::UntypedNull { .. } => ErrorId(86),
+            ValidationError::ConstantDivisorZero { .. } => ErrorId(87),
+            ValidationError::IntegerDivision { .. } => ErrorId(88),
+            ValidationError::FloatModulo { .. } => ErrorId(89),
+            ValidationError::TemporalOperand { .. } => ErrorId(90),
+            ValidationError::TemporalLiteral { .. } => ErrorId(91),
+            ValidationError::UnsupportedCast { .. } => ErrorId(92),
+            ValidationError::NumericFunctionArgument { .. } => ErrorId(93),
+            ValidationError::ScaleNotIntegerLiteral { .. } => ErrorId(94),
+            ValidationError::FunctionArgTypeMismatch { .. } => ErrorId(95),
+            ValidationError::NonLiteralRegexPattern { .. } => ErrorId(96),
+            ValidationError::InvalidTypedLiteral { .. } => ErrorId(97),
+            ValidationError::UnsupportedLiteralType { .. } => {
+                SharedCondition::UnsupportedLiteralType.error_id()
+            }
+            ValidationError::UnresolvedGroupByColumn { .. } => ErrorId(99),
+            ValidationError::UnsupportedGroupByKeyType { .. } => ErrorId(100),
+            ValidationError::GroupByKeysShareTargetColumn { .. } => ErrorId(101),
+            ValidationError::UngroupedColumnReference { .. } => ErrorId(102),
+            ValidationError::AggregateOfAggregateField { .. } => ErrorId(103),
+            ValidationError::AmbiguousColumnReference(..) => ErrorId(104),
+            ValidationError::QualifiedColumnNotFromSource { .. } => ErrorId(105),
+            ValidationError::GroupingColumnFieldMustBePassthrough { .. } => ErrorId(106),
+            ValidationError::CalculatedFieldShadowsSourceColumn { .. } => ErrorId(107),
+            ValidationError::NondeterministicKeyCollation(..) => ErrorId(108),
+            ValidationError::NondeterministicCollationTextFunction(..) => ErrorId(109),
+            ValidationError::ConflictingCollations(..) => ErrorId(233),
+            ValidationError::QualifiedSourceTableNotFound { .. } => ErrorId(110),
+            ValidationError::QualifiedTargetTableNotFound { .. } => ErrorId(111),
+            ValidationError::StringAggSeparatorNotLiteral { .. } => ErrorId(112),
+        }
+    }
+
     /// Fills in the `FROM` table's schema for an
     /// [`ValidationError::AmbiguousColumnReference`] that doesn't have it yet,
     /// so its message spells the three-part qualified name. `schema` comes
@@ -910,8 +1217,10 @@ impl ValidationError {
     }
 }
 
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(ValidationError);
+
+impl crate::error_code::Message for ValidationError {
+    fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidationError::DuplicateFieldName { name } => {
                 write!(f, "duplicate calculated field name '{name}'")
@@ -1108,7 +1417,7 @@ impl fmt::Display for ValidationError {
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
                  the supported aggregates are COUNT(*), COUNT(col), SUM/AVG over \
-                 smallint, integer, bigint or numeric, and, in a GROUP BY without a \
+                 a number or an interval, and, in a GROUP BY without a \
                  JOIN, MIN/MAX of a number, date or time column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
             ),
@@ -1119,7 +1428,7 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "{function}({column}) is over {pg_type}; SUM and AVG are supported over \
-                 smallint, integer, bigint and numeric only"
+                 numbers and intervals only"
             ),
             ValidationError::UnsupportedExtremeArgument {
                 function,
@@ -1475,6 +1784,24 @@ impl fmt::Display for ValidationError {
                     "calculated field '{field}': {function} reads {table}.{column}, whose \
                      collation \"{collation}\" is nondeterministic; {reason}, so the column \
                      needs a deterministic collation"
+                )
+            }
+            ValidationError::ConflictingCollations(refused) => {
+                let ConflictingCollations {
+                    field,
+                    construct,
+                    first_column,
+                    first_collation,
+                    second_column,
+                    second_collation,
+                } = refused.as_ref();
+                write!(
+                    f,
+                    "calculated field '{field}': {construct} compares {first_column}, whose \
+                     collation is \"{first_collation}\", with {second_column}, whose collation \
+                     is \"{second_collation}\"; Postgres can't tell which collation to use \
+                     (42P22) and fails every row where both are not NULL; give the two columns \
+                     one collation"
                 )
             }
             ValidationError::QualifiedSourceTableNotFound { schema, table } => write!(
@@ -2060,10 +2387,19 @@ pub(crate) fn check_aggregate_admitted(
                         AggregateAdmissionRule::SumAvgNumeric
                     })
                 }
+                // Exact sums in a `numeric` argument's partials, each value
+                // converted exactly (`staging::group_basis::exact_sums`).
                 ValueType::Float(_) | ValueType::Other(PgType::Interval) => {
-                    Err(ValidationError::DeferredAggregate {
-                        function,
-                        family: "float and interval SUM/AVG",
+                    for layout in [
+                        super::floor::Layout::NumericSums,
+                        super::floor::Layout::FloatIntervalSums,
+                    ] {
+                        super::floor::record(super::floor::Feature::Layout(layout));
+                    }
+                    admitted(if matches!(arg.value_type, ValueType::Float(_)) {
+                        AggregateAdmissionRule::SumAvgFloat
+                    } else {
+                        AggregateAdmissionRule::SumAvgInterval
                     })
                 }
                 _ => Err(ValidationError::UnsupportedAggregateArgument {
@@ -4879,6 +5215,7 @@ mod tests {
     use super::*;
     use crate::defs::ast::Operator;
     use crate::defs::pg_type::PgType;
+    use crate::error_code::Message as _;
     use crate::float::FloatWidth;
 
     fn def(fields: Vec<FieldDef>) -> TransformDef {
@@ -6495,7 +6832,7 @@ mod tests {
     /// way to read the field.
     #[test]
     fn the_ambiguity_message_names_both_meanings_and_both_spellings() {
-        let message = ambiguity("total", "val", "(grp + 1)").to_string();
+        let message = ambiguity("total", "val", "(grp + 1)").message().to_string();
         assert_eq!(
             message,
             "calculated field 'total' reads 'val', which is ambiguous: it names both the \
@@ -6676,7 +7013,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, refused("c"));
         assert_eq!(
-            err.to_string(),
+            err.message().to_string(),
             "calculated field 'c' reads 'product.cost', but a qualified column must name this \
              transform's FROM table ('s'); a second table is read with a JOIN"
         );
@@ -7001,8 +7338,6 @@ mod tests {
             ("BOOL_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_AND(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
-            ("SUM(items.weight)", "float and interval SUM/AVG"),
-            ("AVG(items.weight)", "float and interval SUM/AVG"),
             ("ARRAY_AGG(items.sku)", "array_agg/string_agg/jsonb_agg"),
             (
                 "STRING_AGG(items.sku, ',')",
@@ -7274,8 +7609,6 @@ mod tests {
         for (call, family) in [
             ("BOOL_AND(qty > 1)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_OR(qty)", "bool_and/bool_or/bit_and/bit_or"),
-            ("SUM(weight)", "float and interval SUM/AVG"),
-            ("AVG(wait)", "float and interval SUM/AVG"),
             ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg"),
             ("STRING_AGG(note, ',')", "array_agg/string_agg/jsonb_agg"),
             // Inside a composed field too.
@@ -7332,9 +7665,9 @@ mod tests {
             }
         }
         // An argument that names a calculated field is typed as that field's
-        // expression: an integer one is admitted, a float one is refused by
-        // family. (This check doesn't look at `GROUP BY`; `validate` refuses
-        // a calculated field over an ungrouped column.)
+        // expression, an integer one and a float one alike. (This check
+        // doesn't look at `GROUP BY`; `validate` refuses a calculated field
+        // over an ungrouped column.)
         let grouped = |fields: &str| {
             let def = parse_text(&format!(
                 "TRANSFORM t FROM items GROUP BY sku, qty \
@@ -7343,23 +7676,45 @@ mod tests {
             .unwrap_or_else(|e| panic!("{fields}: {e}"));
             validate_aggregate_admitted(&def, &items)
         };
-        assert!(
-            matches!(
-                grouped("(weight + weight) AS w2, SUM(w2) AS s"),
-                Err(ValidationError::DeferredAggregate {
-                    family: "float and interval SUM/AVG",
-                    ..
-                })
-            ),
-            "a float calculated field's SUM"
-        );
         for fields in [
+            "(weight + weight) AS w2, SUM(w2) AS s",
             "(qty + 1) AS q, SUM(q) AS s",
             "(qty + qty) AS q, COUNT(*) AS n, AVG(q) AS a",
         ] {
             if let Err(err) = grouped(fields) {
                 panic!("{fields}: {err:?}");
             }
+        }
+    }
+
+    /// `SUM` and `AVG` over a float or an `interval` are admitted as exact
+    /// sums (#1119), on a `JOIN` and a plain aggregate, recording the
+    /// layout their partials need.
+    #[test]
+    fn sum_and_avg_over_a_float_or_an_interval_are_admitted() {
+        let (_, mut items) = tables();
+        items.insert(
+            "wait".into(),
+            jcol(ValueType::Other(PgType::Interval), "interval", 1186, -1),
+        );
+        for call in ["SUM(items.weight)", "AVG(items.weight)"] {
+            check(&format!("orders.region AS region, {call} AS v"))
+                .unwrap_or_else(|err| panic!("{call}: {err:?}"));
+        }
+        for call in ["SUM(weight)", "AVG(weight)", "SUM(wait)", "AVG(wait)"] {
+            let def = parse_text(&format!(
+                "TRANSFORM t FROM items GROUP BY sku SELECT sku AS sku, {call} AS v"
+            ))
+            .unwrap_or_else(|e| panic!("{call}: {e}"));
+            let (result, used) =
+                super::super::floor::collect(|| validate_aggregate_admitted(&def, &items));
+            result.unwrap_or_else(|err| panic!("{call}: {err:?}"));
+            assert!(
+                used.contains(&super::super::floor::Feature::Layout(
+                    super::super::floor::Layout::FloatIntervalSums
+                )),
+                "{call}: {used:?}"
+            );
         }
     }
 
@@ -7763,7 +8118,7 @@ mod tests {
             Err(ValidationError::JoinTooManyTables)
         );
         assert_eq!(
-            ValidationError::JoinTooManyTables.to_string(),
+            ValidationError::JoinTooManyTables.message().to_string(),
             "a JOIN transform joins exactly two tables; a second JOIN is not supported"
         );
     }
@@ -8130,6 +8485,7 @@ mod tests {
 #[cfg(test)]
 mod key_collation_tests {
     use super::*;
+    use crate::error_code::Message as _;
 
     fn column() -> JoinColumnInfo {
         JoinColumnInfo {
@@ -8178,7 +8534,7 @@ mod key_collation_tests {
                     }
                 ))
             );
-            let message = err.to_string();
+            let message = err.message().to_string();
             assert!(
                 message.starts_with(&format!("shop.orders.code is {role}, and its collation"))
                     && message.contains(r#""case_insensitive" is nondeterministic"#),
@@ -8217,6 +8573,108 @@ mod key_collation_tests {
         assert_eq!(check_collation_reads(&def, Some(&new), resolve), Ok(()));
         let old: Vec<FieldDef> = def.fields[..1].to_vec();
         assert!(check_collation_reads(&def, Some(&old), resolve).is_err());
+        assert!(check_collation_reads(&def, None, resolve).is_err());
+    }
+
+    fn with_collation(oid: u32, name: &str) -> JoinColumnInfo {
+        let mut info = collated(column(), name);
+        info.collation_oid = oid;
+        info
+    }
+
+    /// Checks `body` (the `SELECT` list) against columns `a` (`"C"`), `p`
+    /// (`"POSIX"`), `a2` (`"C"`), `d` (the database default) and `n`
+    /// (`integer`, not collatable).
+    fn conflict_check(body: &str) -> Result<(), ValidationError> {
+        let def = crate::defs::parser::parse(&format!("TRANSFORM t FROM s SELECT {body}"))
+            .expect("parse");
+        let columns: HashMap<&str, JoinColumnInfo> = [
+            ("a", with_collation(950, "pg_catalog.\"C\"")),
+            ("p", with_collation(951, "pg_catalog.\"POSIX\"")),
+            ("a2", with_collation(950, "pg_catalog.\"C\"")),
+            ("d", with_collation(100, "pg_catalog.\"default\"")),
+            ("n", column_with_no_collation()),
+        ]
+        .into_iter()
+        .collect();
+        check_collation_reads(&def, None, |read| {
+            Some(("public.s".to_string(), columns.get(read.column.as_str())?))
+        })
+    }
+
+    fn column_with_no_collation() -> JoinColumnInfo {
+        let mut info = column();
+        info.value_type = ValueType::Integer(IntWidth::Int4);
+        info
+    }
+
+    /// Postgres raises `42P22` for each of these on a row where both
+    /// collations are present (confirmed on PG 17).
+    #[test]
+    fn operands_with_conflicting_collations_are_refused() {
+        for body in [
+            "a = p AS f",
+            "a <> p AS f",
+            "a IS DISTINCT FROM p AS f",
+            "NULLIF(a, p) AS f",
+            "STRPOS(a, p) AS f",
+            "REGEXP_COUNT(a, p) AS f",
+            "COALESCE(a, p) = 'x' AS f",
+            "STRPOS(COALESCE(a, p), 'x') AS f",
+            "CASE WHEN n = 1 THEN a ELSE p END = 'x' AS f",
+            "CASE WHEN a = p THEN 1 END AS f",
+            "a = COALESCE(d, p) AS f",
+            "p AS q, a = q AS f",
+        ] {
+            let err = conflict_check(body).expect_err(body);
+            let ValidationError::ConflictingCollations(conflict) = &err else {
+                panic!("{body}: {err:?}");
+            };
+            assert_eq!(conflict.field, "f", "{body}");
+            let message = err.message().to_string();
+            assert!(
+                message.contains("public.s.a") && message.contains("public.s.p"),
+                "{body}: {message}"
+            );
+        }
+    }
+
+    /// Each of these Postgres accepts: one collation, the database default
+    /// (which yields to any other), a value with no collation, or a
+    /// conflicting pair no collation-sensitive construct reads.
+    #[test]
+    fn operands_with_one_collation_pass() {
+        for body in [
+            "a = a2 AS f",
+            "a = d AS f",
+            "a = 'x' AS f",
+            "COALESCE(a, a2) = p2 AS f",
+            "a = CAST(n AS bigint) AS f",
+            "COALESCE(a, p) AS f",
+            "CHAR_LENGTH(COALESCE(a, p)) AS f",
+            "CASE WHEN a = 'x' THEN p ELSE d END AS f",
+            "a = a2 AND d = p AS f",
+        ] {
+            // `p2` is not a column: an unresolved read passes.
+            assert_eq!(conflict_check(body), Ok(()), "{body}");
+        }
+    }
+
+    /// `ALTER TRANSFORM ... ADD` checks only the fields it adds.
+    #[test]
+    fn only_the_listed_fields_conflicts_are_checked() {
+        let def =
+            crate::defs::parser::parse("TRANSFORM t FROM s SELECT a = p AS old, a = a2 AS new")
+                .expect("parse");
+        let (a, p) = (with_collation(950, "C"), with_collation(951, "POSIX"));
+        let resolve = |read: &CollationRefusingRead| {
+            Some((
+                "public.s".to_string(),
+                if read.column == "p" { &p } else { &a },
+            ))
+        };
+        let new: Vec<FieldDef> = def.fields[1..].to_vec();
+        assert_eq!(check_collation_reads(&def, Some(&new), resolve), Ok(()));
         assert!(check_collation_reads(&def, None, resolve).is_err());
     }
 

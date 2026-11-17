@@ -168,7 +168,7 @@ use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::{Definition, StoredStatus, TransformStatus};
 use crate::defs::registry;
 use crate::defs::typed_literal;
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId, SharedCondition};
 use crate::pool::{Pool, quote_ident};
 
 use super::capture_audit::{self, CaptureFault};
@@ -468,10 +468,31 @@ impl SelfCheckError {
             SelfCheckError::Pool(err) => err.code(),
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            SelfCheckError::TargetNotFound(..) => SharedCondition::TransformNotFound.error_id(),
+            SelfCheckError::UnsupportedKeySpace { .. } => ErrorId(192),
+            SelfCheckError::InvalidScope { .. } => ErrorId(193),
+            SelfCheckError::UnsupportedExpr { .. } => ErrorId(194),
+            SelfCheckError::PageTimedOut { .. } => ErrorId(195),
+            SelfCheckError::UnreadableJob { .. } => ErrorId(196),
+            SelfCheckError::Ddl(err) => err.error_id(),
+            SelfCheckError::Catalog(err) => err.error_id(),
+            SelfCheckError::Staging(err) => err.error_id(),
+            SelfCheckError::Db(..) => ErrorId(197),
+            SelfCheckError::Pool(err) => err.error_id(),
+        }
+    }
 }
 
-impl fmt::Display for SelfCheckError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(SelfCheckError);
+
+impl crate::error_code::Message for SelfCheckError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SelfCheckError::TargetNotFound(target) => {
                 write!(f, "no transform named \"{target}\" is registered")
@@ -499,16 +520,16 @@ impl fmt::Display for SelfCheckError {
                 f,
                 "self_check needs a positive SelfCheckScope::limit; got {limit}"
             ),
-            SelfCheckError::Ddl(err) => write!(f, "{err}"),
-            SelfCheckError::Catalog(err) => write!(f, "{err}"),
-            SelfCheckError::Staging(err) => write!(f, "{err}"),
+            SelfCheckError::Ddl(err) => err.fmt_message(f),
+            SelfCheckError::Catalog(err) => err.fmt_message(f),
+            SelfCheckError::Staging(err) => err.fmt_message(f),
             SelfCheckError::Db(err) => {
                 write!(f, "self_check database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
             // `err` already says what failed (a pool checkout reads
             // "failed to acquire a connection: ...").
-            SelfCheckError::Pool(err) => write!(f, "{err}"),
+            SelfCheckError::Pool(err) => err.fmt_message(f),
         }
     }
 }
@@ -705,7 +726,8 @@ fn group_shape(def: &Definition) -> Option<super::group_basis::GroupShape> {
 
 /// [`group_shape`] with each `numeric` sum's reference scale, as the hidden
 /// table records it (`super::group_basis::stored_scales`): the audit reads
-/// the stored maps by it.
+/// the stored maps by it. And the type a field reads each key as, from the
+/// type recorded for it (`GroupShape::read_key_types`).
 async fn read_group_shape(
     pool: &Pool,
     def: &Definition,
@@ -719,6 +741,9 @@ async fn read_group_shape(
             &**client,
             &super::group_basis::hidden_table_qualified(pool.schema(), def.id),
         )
+        .await?;
+    shape
+        .read_key_types(&**client, def.id, &def.source_table)
         .await?;
     Ok(Some(shape))
 }
@@ -1738,7 +1763,17 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
     if let Some(text) = renderer.special(expr, depth)? {
         return Ok(text);
     }
-    let mut sub = |e: &'e Expr| render_audit(renderer, e, depth + 1);
+    // A string literal Postgres types from its neighbour (an equality's
+    // operand, a `COALESCE` or `NULLIF` argument, a `CASE` result) is left
+    // bare (`beside`), so beside a `char(n)` value it is `char(n)`, as in
+    // the user's text, not `text` (#2000). It is charged as any node is.
+    let mut sub = |e: &'e Expr, beside: bool| match e {
+        Expr::StringLiteral(text) if beside => Ok(match renderer.special(e, depth + 1)? {
+            Some(special) => special,
+            None => format!("'{}'", text.replace('\'', "''")),
+        }),
+        _ => render_audit(renderer, e, depth + 1),
+    };
     Ok(match expr {
         Expr::Column(_) | Expr::SourceColumn { .. } => return renderer.column(expr),
         Expr::NumberLiteral(text) => number_literal(text),
@@ -1749,16 +1784,17 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = registry::operator_spec(*op).symbol;
-            let l = sub(lhs)?;
-            let r = sub(rhs)?;
+            let beside = op.is_comparison() && !op.is_ordering();
+            let l = sub(lhs, beside)?;
+            let r = sub(rhs, beside)?;
             format!("({l} {symbol} {r})")
         }
-        Expr::Negate(operand) => format!("(-({}))", sub(operand)?),
-        Expr::Cast { expr, target } => format!("cast({} as {target})", sub(expr)?),
-        Expr::Not(operand) => format!("(not {})", sub(operand)?),
+        Expr::Negate(operand) => format!("(-({}))", sub(operand, false)?),
+        Expr::Cast { expr, target } => format!("cast({} as {target})", sub(expr, false)?),
+        Expr::Not(operand) => format!("(not {})", sub(operand, false)?),
         Expr::IsNull { expr, negated } => {
             let test = if *negated { "is not null" } else { "is null" };
-            format!("({} {test})", sub(expr)?)
+            format!("({} {test})", sub(expr, false)?)
         }
         Expr::Case {
             branches,
@@ -1766,12 +1802,12 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
         } => {
             let mut sql = String::from("(case");
             for (condition, result) in branches {
-                let c = sub(condition)?;
-                let r = sub(result)?;
+                let c = sub(condition, false)?;
+                let r = sub(result, true)?;
                 sql.push_str(&format!(" when {c} then {r}"));
             }
             if let Some(otherwise) = otherwise {
-                sql.push_str(&format!(" else {}", sub(otherwise)?));
+                sql.push_str(&format!(" else {}", sub(otherwise, true)?));
             }
             sql.push_str(" end)");
             sql
@@ -1781,14 +1817,14 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
         }
         Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
             let (field, operand) = as_extract(name, args).expect("checked");
-            format!("extract({field} from {})", sub(operand)?)
+            format!("extract({field} from {})", sub(operand, false)?)
         }
         Expr::FunctionCall { name, args } => {
             let mut rendered = Vec::with_capacity(args.len());
             for (i, arg) in args.iter().enumerate() {
                 rendered.push(match arg {
                     Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
-                    _ => sub(arg)?,
+                    _ => sub(arg, matches!(name.as_str(), "COALESCE" | "NULLIF"))?,
                 });
             }
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
@@ -2121,6 +2157,14 @@ mod tests {
             render_leaf(&Expr::StringLiteral("o'clock".to_string())),
             "'o''clock'::text"
         );
+    }
+
+    /// The audit's renderer gives Postgres's answer in every cell of #2000's
+    /// truth table: a literal beside a `char(n)`, `name`, `text` or
+    /// `varchar` value reads as the user's text does.
+    #[tokio::test]
+    async fn render_leaf_types_a_literal_from_its_neighbour_as_postgres_does() {
+        crate::defs::oracle::tests::neighbour_typed_truth_table(render_leaf).await;
     }
 
     #[test]

@@ -61,7 +61,7 @@ reads what a page's plan needs (the definitions reading each source, the keys
 poisoned for them, their paused columns, the source's key and columns) and
 renders each 1-1 definition's fields to SQL. Postgres evaluates the fields in
 Phase 3, in the upsert that writes the target rows
-([ADR-0002](../decisions/0002-async-data-flow.md#the-1-1-ledger-one-target-owned-entry-per-source-row)),
+([ADR-0002](../decisions/0002-async-data-flow.md#the-1-1-ledger-one-target-owned-entry-per-member-row)),
 so evaluation runs inside the transaction that holds the page's entry and
 target-row locks. What bounds that is the page: at most `drain_batch_cap`
 records, one upsert statement per few thousand rows of a target, every lock

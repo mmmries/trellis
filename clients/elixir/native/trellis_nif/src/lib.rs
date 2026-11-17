@@ -16,12 +16,13 @@
 //!   engine sends `{call_ref, reply}` to the calling process when the call
 //!   ends, from a thread of this crate's ([`reply_runtime`]) that waits for
 //!   every pending call at once, so no thread or scheduler is dedicated to a
-//!   call. `reply` is `{:ok, value}` or `{:error, {code, message}}`, as below.
-//!   `Trellis.Native.call/3` is the `receive` for it, with a backstop of its
-//!   own. A reply to a process that has exited is dropped (`send_and_clear`
+//!   call. `reply` is `{:ok, value}` or `{:error, {code, error_id,
+//!   message}}`, as below. `Trellis.Native.call/3` is the `receive` for it,
+//!   with a backstop of its own. A reply to a process that has exited is dropped (`send_and_clear`
 //!   reports the failure, which is ignored). A call refused before it was
 //!   submitted (a handle that has been shut down, a malformed argument) is
-//!   `{:error, {code, message}}` at once, with no message to wait for.
+//!   `{:error, {code, error_id, message}}` at once, with no message to wait
+//!   for.
 //! - **The NIFs that touch no handle are dirty IO**, the constant lookups
 //!   included, so there is no rule to remember about which ones are "cheap".
 //!   Plus `connect` and `shutdown`, the handle's lifecycle, which wait on a
@@ -38,9 +39,11 @@
 //!     `Trellis.LogBridge` keeps small. It runs every 100 ms.
 //!   - `config` runs on a **normal** scheduler. It reads the configuration
 //!     the handle connected with, from memory.
-//! - **Every result is `{:ok, value}` or `{:error, {code, message}}`**, whether
-//!   a NIF returns it or sends it as a call's reply, where `code` is
-//!   [`trellis_embed::PlainError::code`] as a binary. Elixir maps it to an
+//! - **Every result is `{:ok, value}` or `{:error, {code, error_id,
+//!   message}}`**, whether a NIF returns it or sends it as a call's reply,
+//!   where `code` is [`trellis_embed::PlainError::code`] as a binary and
+//!   `error_id` is [`trellis_embed::PlainError::error_id`] (`"T0042"`, or
+//!   `nil`). Elixir maps it to an
 //!   atom from a closed set, with a fallback for a code it doesn't know. A
 //!   call that a shutdown cancelled is a `validation` error, like a call made
 //!   after the shutdown.
@@ -72,22 +75,26 @@ use trellis_embed::{
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainExtremeIndexGap,
     PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
     PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
-    PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    index_role_names, quarantine_state_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    PlainRefusedStep, PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport,
+    PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
+    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
-/// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
-type NifReply<T> = Result<T, (&'static str, String)>;
+/// An error as it crosses: `{code, error_id, message}`, `error_id` `nil` for
+/// an error this crate raises itself.
+type NifError = (&'static str, Option<String>, String);
 
-fn plain(err: impl Into<PlainError>) -> (&'static str, String) {
+/// What every NIF returns: `{:ok, T}` or `{:error, {code, error_id, message}}`.
+type NifReply<T> = Result<T, NifError>;
+
+fn plain(err: impl Into<PlainError>) -> NifError {
     let err = err.into();
-    (err.code, err.message)
+    (err.code, err.error_id, err.message)
 }
 
-fn error(code: ErrorCode, message: impl Into<String>) -> (&'static str, String) {
+fn error(code: ErrorCode, message: impl Into<String>) -> NifError {
     plain(PlainError::new(code, message))
 }
 
@@ -143,7 +150,7 @@ impl Handle {
     /// at once with `{:ok, call_ref}`, or reports why there isn't an instance
     /// to submit to. When the call ends, `encode` turns its value into the
     /// term the caller gets, and `{call_ref, {:ok, term} | {:error, {code,
-    /// message}}}` is sent to the calling process (see the module docs).
+    /// error_id, message}}}` is sent to the calling process (see the module docs).
     fn submit<'a, R, T>(
         &self,
         env: Env<'a>,
@@ -204,14 +211,14 @@ impl Handle {
     }
 }
 
-fn shut_down() -> (&'static str, String) {
+fn shut_down() -> NifError {
     error(
         ErrorCode::Validation,
         "this Trellis handle has been shut down",
     )
 }
 
-fn poisoned() -> (&'static str, String) {
+fn poisoned() -> NifError {
     error(
         ErrorCode::Internal,
         "a call on this Trellis handle panicked; connect a new handle",
@@ -234,6 +241,7 @@ struct StatusTerm {
     build_wait_xid: Option<i64>,
     version_handover: Option<VersionHandoverTerm>,
     below_catalog_floor: Option<BelowCatalogFloorTerm>,
+    maintenance_refusals: Vec<RefusedStepTerm>,
     join: Option<JoinStatusTerm>,
     floor: String,
 }
@@ -392,6 +400,29 @@ impl From<PlainBelowCatalogFloor> for BelowCatalogFloorTerm {
         BelowCatalogFloorTerm {
             floor: seen.floor,
             this_version: seen.this_version,
+        }
+    }
+}
+
+/// A maintenance step the staging worker's role is refused, as `status/2`
+/// reports it.
+#[derive(NifMap)]
+struct RefusedStepTerm {
+    step: String,
+    role: Option<String>,
+    object: Option<String>,
+    missing: Vec<String>,
+    error: String,
+}
+
+impl From<PlainRefusedStep> for RefusedStepTerm {
+    fn from(seen: PlainRefusedStep) -> Self {
+        RefusedStepTerm {
+            step: seen.step,
+            role: seen.role,
+            object: seen.object,
+            missing: seen.missing,
+            error: seen.error,
         }
     }
 }
@@ -1225,6 +1256,11 @@ fn status<'a>(
                 build_wait_xid: status.build_wait_xid,
                 version_handover: status.version_handover.map(VersionHandoverTerm::from),
                 below_catalog_floor: status.below_catalog_floor.map(BelowCatalogFloorTerm::from),
+                maintenance_refusals: status
+                    .maintenance_refusals
+                    .into_iter()
+                    .map(RefusedStepTerm::from)
+                    .collect(),
                 join: status
                     .join
                     .map(|join| JoinStatusTerm::new(env, join))

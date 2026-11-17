@@ -49,6 +49,7 @@ use crate::defs::catalog::{self, CatalogError};
 use crate::defs::floor::Floors;
 use crate::defs::lifecycle::ResumeNeeds;
 use crate::defs::recorded_keys;
+use crate::error_code::Message as _;
 
 /// What joins one reason, ended with a full stop, to the older one after
 /// it.
@@ -1170,7 +1171,11 @@ fn rekey_step(repair: &recorded_keys::TargetRepair) -> String {
 /// one only a resume makes.
 fn refusal(reason: &CatalogError) -> String {
     if reason.is_define_refusal() {
-        format!("define would refuse the definition as the schema stands now: {reason}")
+        format!(
+            "{}: define would refuse the definition as the schema stands now: {}",
+            reason.error_id(),
+            reason.message()
+        )
     } else {
         reason.to_string()
     }

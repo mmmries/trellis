@@ -30,6 +30,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -76,6 +77,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -129,6 +131,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -168,6 +171,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -207,6 +211,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -233,6 +238,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -269,6 +275,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: 4_294_967_301,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -301,6 +308,7 @@ defmodule Trellis.StatusTest do
           migrations_pending: false
         },
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -334,6 +342,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: %{floor: "0.3.0", this_version: "0.2.0"},
+        maintenance_refusals: [],
         join: nil,
         floor: "0.2.0"
       })
@@ -342,6 +351,46 @@ defmodule Trellis.StatusTest do
              floor: "0.3.0",
              this_version: "0.2.0"
            }
+  end
+
+  test "a refused maintenance step becomes a struct naming what to grant" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        extreme_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil,
+        below_catalog_floor: nil,
+        maintenance_refusals: [
+          %{
+            step: "retire_drained_segments",
+            role: "worker",
+            object: "seg_0",
+            missing: ["TRUNCATE"],
+            error: "permission denied for table seg_0"
+          }
+        ],
+        join: nil,
+        floor: "0.2.0"
+      })
+
+    assert status.maintenance_refusals == [
+             %Trellis.RefusedStep{
+               step: "retire_drained_segments",
+               role: "worker",
+               object: "seg_0",
+               missing: ["TRUNCATE"],
+               error: "permission denied for table seg_0"
+             }
+           ]
   end
 
   test "a join status keeps its tables, warnings and build step" do
@@ -360,6 +409,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: %{
           hidden_tables: [
             %{table: "P", name: "join_7_p", estimated_rows: 5_000_000_011, bytes: 9_000_000_017},
@@ -437,6 +487,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: %{
           hidden_tables: [],
           partials_warning: nil,
@@ -505,6 +556,7 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
+        maintenance_refusals: [],
         join: nil,
         floor: "0.3.1"
       })

@@ -34,7 +34,7 @@
 //!   (statuses, quarantine states, `apply` outcome kinds, `self_check` outcomes and divergence kinds), but only
 //!   words from the closed sets `trellis-embed` lists, which [`init`] interns
 //!   up front, never a string read from the database.
-//! - **Errors cross as `(code, message)`.** Ruby's `Trellis::Error.from_native`
+//! - **Errors cross as `(code, error_id, message)`.** Ruby's `Trellis::Error.from_native`
 //!   picks the exception class for the code, so the code-to-class map lives in
 //!   one place, `lib/trellis/error.rb`.
 //!
@@ -67,11 +67,11 @@ use trellis_embed::{
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainExtremeIndexGap,
     PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
     PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
-    PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    index_role_names, quarantine_state_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    PlainRefusedStep, PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport,
+    PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
+    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -830,7 +830,9 @@ fn trellis_module(ruby: &Ruby) -> Result<RModule, Error> {
 fn raise(ruby: &Ruby, err: PlainError) -> Error {
     let exception = trellis_module(ruby)
         .and_then(|module| module.const_get::<_, RClass>("Error"))
-        .and_then(|class| class.funcall::<_, _, Exception>("from_native", (err.code, err.message)));
+        .and_then(|class| {
+            class.funcall::<_, _, Exception>("from_native", (err.code, err.error_id, err.message))
+        });
     match exception {
         Ok(exception) => exception.into(),
         Err(err) => err,
@@ -947,6 +949,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .below_catalog_floor
         .map(|seen| below_catalog_floor_hash(ruby, seen))
         .transpose()?;
+    let maintenance_refusals = array(ruby, status.maintenance_refusals, refused_step_hash)?;
     let join = status
         .join
         .map(|join| join_status_hash(ruby, join))
@@ -970,6 +973,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("build_wait_xid", ruby.into_value(status.build_wait_xid)),
             ("version_handover", ruby.into_value(version_handover)),
             ("below_catalog_floor", ruby.into_value(below_catalog_floor)),
+            ("maintenance_refusals", maintenance_refusals.as_value()),
             ("join", ruby.into_value(join)),
             ("floor", ruby.into_value(status.floor)),
         ],
@@ -1086,6 +1090,20 @@ fn below_catalog_floor_hash(ruby: &Ruby, seen: PlainBelowCatalogFloor) -> Result
         [
             ("floor", ruby.into_value(seen.floor)),
             ("this_version", ruby.into_value(seen.this_version)),
+        ],
+    )
+}
+
+/// A maintenance step the staging worker's role is refused.
+fn refused_step_hash(ruby: &Ruby, refused: PlainRefusedStep) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("step", ruby.into_value(refused.step)),
+            ("role", ruby.into_value(refused.role)),
+            ("object", ruby.into_value(refused.object)),
+            ("missing", ruby.ary_from_iter(refused.missing).as_value()),
+            ("error", ruby.into_value(refused.error)),
         ],
     )
 }

@@ -37,7 +37,7 @@ use crate::defs::ast::KeySpace;
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::validate::ValidationError;
-use crate::error_code::{self, ErrorCode};
+use crate::error_code::{self, ErrorCode, ErrorId, SharedCondition};
 use crate::pool::{Pool, jsonb_build_object_sql, quote_ident, quote_literal};
 
 use super::append;
@@ -344,19 +344,67 @@ impl ApplyError {
             ApplyError::ResumeRefused { reason, .. } => reason.code(),
         }
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            ApplyError::Staging(err) => err.error_id(),
+            ApplyError::Catalog(err) => err.error_id(),
+            ApplyError::Ddl(err) => err.error_id(),
+            ApplyError::Validate(err) => err.error_id(),
+            ApplyError::Backfill(err) => err.error_id(),
+            ApplyError::Db(..) => ErrorId(162),
+            ApplyError::Pool(err) => err.error_id(),
+            ApplyError::ClaimLost => ErrorId(163),
+            ApplyError::PageAlreadyCommitted => ErrorId(164),
+            ApplyError::VersionFenceMiss { .. } => ErrorId(165),
+            ApplyError::LedgerEntryCollected { .. } => ErrorId(166),
+            ApplyError::JoinKeyMoved { .. } => ErrorId(167),
+            ApplyError::JoinOneToOneHalt { .. } => ErrorId(168),
+            ApplyError::HopBoundExceeded { .. } => ErrorId(169),
+            ApplyError::GroupBasisUnsupported { .. } => ErrorId(170),
+            ApplyError::GroupLockGap { .. } => ErrorId(171),
+            ApplyError::SourceTableDropped { .. } => ErrorId(172),
+            ApplyError::ColumnNotPaused { .. } => ErrorId(173),
+            ApplyError::DefinitionNotLive { .. } => ErrorId(174),
+            ApplyError::ColumnAwaitingCapture { .. } => ErrorId(175),
+            ApplyError::Intake(err) => err.error_id(),
+            ApplyError::TransformNotFound { .. } => SharedCondition::TransformNotFound.error_id(),
+            ApplyError::TransformNotPaused { .. } => ErrorId(177),
+            ApplyError::KeyNotHeld { .. } => ErrorId(178),
+            ApplyError::ReleaseLockTimeout { .. } => ErrorId(179),
+            ApplyError::ColumnPauseLockTimeout(err) => err.error_id(),
+            ApplyError::ResumeRefused { reason, .. } => reason.error_id(),
+            ApplyError::TruncateWithoutLsn { .. } => ErrorId(182),
+        }
+    }
 }
 
-impl fmt::Display for ApplyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(ApplyError);
+
+impl crate::error_code::Message for ApplyError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ApplyError::Staging(err) => write!(f, "staging ring error: {err}"),
-            ApplyError::Catalog(err) => write!(f, "transform catalog error: {err}"),
-            ApplyError::Ddl(err) => write!(f, "target-table DDL error: {err}"),
+            ApplyError::Staging(err) => write!(f, "staging ring error: {}", err.message()),
+            ApplyError::Catalog(err) => {
+                write!(f, "transform catalog error: {}", err.message())
+            }
+            ApplyError::Ddl(err) => write!(f, "target-table DDL error: {}", err.message()),
             ApplyError::Validate(err) => {
-                write!(f, "calculated-field type inference error: {err}")
+                write!(
+                    f,
+                    "calculated-field type inference error: {}",
+                    err.message()
+                )
             }
             ApplyError::Backfill(err) => {
-                write!(f, "calculated-field alias substitution error: {err}")
+                write!(
+                    f,
+                    "calculated-field alias substitution error: {}",
+                    err.message()
+                )
             }
             ApplyError::Db(err) => {
                 write!(f, "apply database error: ")?;
@@ -364,7 +412,7 @@ impl fmt::Display for ApplyError {
             }
             // `err` already says what failed (a pool checkout reads
             // "failed to acquire a connection: ...").
-            ApplyError::Pool(err) => write!(f, "{err}"),
+            ApplyError::Pool(err) => err.fmt_message(f),
             ApplyError::ClaimLost => write!(
                 f,
                 "this worker's claim was gone by completion time; nothing was applied twice, \
@@ -427,7 +475,7 @@ impl fmt::Display for ApplyError {
                  what holds that up); RESUME it then only if it was also paused for another \
                  reason"
             ),
-            ApplyError::Intake(err) => write!(f, "intake error: {err}"),
+            ApplyError::Intake(err) => write!(f, "intake error: {}", err.message()),
             ApplyError::TransformNotFound { transform } => {
                 write!(f, "no transform named '{transform}' is registered")
             }
@@ -460,11 +508,16 @@ impl fmt::Display for ApplyError {
                 write!(
                     f,
                     "'{transform}' can't resume: define would refuse it as the schema stands now: \
-                 {reason}. It stays paused"
+                 {}. It stays paused",
+                    reason.message()
                 )
             }
             ApplyError::ResumeRefused { transform, reason } => {
-                write!(f, "'{transform}' can't resume: {reason}. It stays paused")
+                write!(
+                    f,
+                    "'{transform}' can't resume: {}. It stays paused",
+                    reason.message()
+                )
             }
             ApplyError::TruncateWithoutLsn { src_table } => write!(
                 f,
@@ -3007,6 +3060,9 @@ pub(super) async fn compute_page(
                                         def.id,
                                     ),
                                 )
+                                .await?;
+                            shape
+                                .read_key_types(&**client, def.id, &def.source_table)
                                 .await?;
                             ddl::identity_key_columns(&**client, &def.target_table).await?
                         };

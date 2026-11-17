@@ -482,6 +482,7 @@ impl JoinTargetPlan {
                 summed: false,
                 numeric: false,
                 scale: None,
+                kind: group_basis::exact_sums::SumKind::Exact,
                 scale_read: false,
             })
             .collect();
@@ -500,6 +501,7 @@ impl JoinTargetPlan {
         let group_cols: Vec<String> = t_groups.iter().map(|(_, c)| c.clone()).collect();
         let mut t_shape = GroupShape {
             group_types: vec![String::new(); group_cols.len()],
+            key_reads: Some(vec![None; group_cols.len()]),
             group_cols,
             args: all_args,
             aggs: Vec::new(),
@@ -568,6 +570,7 @@ impl JoinTargetPlan {
                         Vec::new(),
                         GroupShape {
                             group_types: vec![String::new(); key_cols.len()],
+                            key_reads: Some(vec![None; key_cols.len()]),
                             group_cols: key_cols,
                             args,
                             aggs: Vec::new(),

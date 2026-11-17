@@ -270,6 +270,19 @@ pub(crate) fn is_insufficient_privilege(err: &(dyn std::error::Error + 'static))
     false
 }
 
+/// The server's own message of the first [`tokio_postgres::Error`] on
+/// `err`'s source chain, if it has one.
+pub(crate) fn pg_message(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = link {
+        if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
+            return pg.as_db_error().map(|db| db.message().to_string());
+        }
+        link = err.source();
+    }
+    None
+}
+
 /// The SQLSTATE of the first [`tokio_postgres::Error`] on `err`'s
 /// [`std::error::Error::source`] chain, if it has one: what `poison.sqlstate`
 /// records for a held key, so [`release_retyped_keys`] can tell a

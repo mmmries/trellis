@@ -147,6 +147,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1NoOrphanPass
         | Plant::Join1OrphanDelete
         | Plant::Join1MPassBOnly
+        | Plant::Join1SweepStartBound
         | Plant::Join1TruncateNoFloor
         | Plant::Join1TruncateShareLock
         | Plant::Join1TruncateKeepsR
@@ -266,8 +267,25 @@ pub struct SweepCase {
     /// case failed without diverging (an error or a quiesce timeout). `true`
     /// for a pass.
     pub reachable: bool,
+    /// Whether the case failed by a quiesce or convergence timeout
+    /// ([`is_quiesce_timeout`]). Such a case counts as caught when the plant
+    /// fired, so a plant whose effect is a hang is credited; the report's
+    /// "timed out" column says how much of "caught" that is.
+    pub timed_out: bool,
     pub secs: f64,
     pub reason: String,
+}
+
+/// Whether a failure's report is a quiesce or convergence timeout: the
+/// engine never settled, which says the plant hung it, not what it wrote.
+pub fn is_quiesce_timeout(message: &str) -> bool {
+    [
+        "ConvergenceTimeout",
+        "DefinitionsUnsettled",
+        "PartitionsUnsettled",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 impl SweepCase {
@@ -281,28 +299,31 @@ impl SweepCase {
     /// failure in the planted run, since the schedule isn't replayed, only
     /// the case. The target check narrows that, and a plant can still be
     /// credited with an unplanted failure in a target it writes, at the
-    /// baseline's rate.
+    /// baseline's rate. A quiesce timeout counts: it is a failure with no
+    /// diverging target, so it is reachable, and a plant that hangs the
+    /// engine is caught by the hang (`timed_out` counts them).
     pub fn caught(&self) -> bool {
         self.failed && (self.plant == "baseline" || (self.fired > 0 && self.reachable))
     }
 
     pub fn to_line(&self) -> String {
         format!(
-            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}",
+            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}",
             self.plant,
             self.seed,
             self.case,
             if self.failed { "FAIL" } else { "pass" },
             self.fired,
             self.reachable,
+            self.timed_out,
             self.secs,
             self.reason
         )
     }
 
     pub fn from_line(line: &str) -> Option<SweepCase> {
-        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(8, '\t');
-        let mut next = || fields.next().expect("a sweep line has 8 fields");
+        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(9, '\t');
+        let mut next = || fields.next().expect("a sweep line has 9 fields");
         Some(SweepCase {
             plant: next().to_string(),
             seed: next().parse().ok()?,
@@ -310,6 +331,7 @@ impl SweepCase {
             failed: next() == "FAIL",
             fired: next().parse().ok()?,
             reachable: next().parse().ok()?,
+            timed_out: next().parse().ok()?,
             secs: next().parse().ok()?,
             reason: next().to_string(),
         })
@@ -407,6 +429,9 @@ fn run_cases<C>(
                 failed: result.is_err(),
                 fired: trellis::dev::plant::fired() - fired_before,
                 reachable,
+                timed_out: result
+                    .as_ref()
+                    .is_err_and(|f| is_quiesce_timeout(&f.message)),
                 secs: started.elapsed().as_secs_f64(),
                 reason,
             }
@@ -563,7 +588,7 @@ fn judge(test: &str, tier: &SweepTier, requested: &str) {
 }
 
 /// The sweep's summary: per plant, how many cases it was caught in, how many
-/// cases it fired in, and each seed's cases-to-first-catch.
+/// of those failed by timeout, how many cases it fired in, and each seed's cases-to-first-catch.
 /// `excluded` are the cases the baseline failed or the quarantine list
 /// names, left out of every plant's row.
 fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) -> String {
@@ -578,7 +603,7 @@ fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) ->
     let mut out = format!(
         "planted-bug sweep ({} tier; plant rows leave out the {} case(s) the baseline \
          failed or the quarantine list names):\n\
-         plant | caught | fired in | failed, not attributable | cases to first catch, per seed | \
+         plant | caught | timed out | fired in | failed, not attributable | cases to first catch, per seed | \
          mean case secs\n",
         tier.name,
         excluded.len()
@@ -591,6 +616,8 @@ fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) ->
             })
             .collect();
         let caught = rows.iter().filter(|r| r.caught()).count();
+        // The caught cases that failed by timeout: liveness, not a wrong row.
+        let timed_out = rows.iter().filter(|r| r.caught() && r.timed_out).count();
         let fired = rows.iter().filter(|r| r.fired > 0).count();
         // Failures a plant can't have caused: see `SweepCase::caught`.
         let unattributable = rows.iter().filter(|r| r.failed && !r.caught()).count();
@@ -616,7 +643,7 @@ fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) ->
         };
         let _ = writeln!(
             out,
-            "{plant}{known} | {caught}/{} | {fired}/{} | {unattributable} | {} | {secs:.1}",
+            "{plant}{known} | {caught}/{} | {timed_out} | {fired}/{} | {unattributable} | {} | {secs:.1}",
             rows.len(),
             rows.len(),
             firsts.join(", ")
@@ -672,6 +699,48 @@ pub fn not_on_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn case(plant: &str, case: usize, failed: bool, timed_out: bool) -> SweepCase {
+        SweepCase {
+            plant: plant.to_string(),
+            seed: 1,
+            case,
+            failed,
+            fired: 1,
+            reachable: true,
+            timed_out,
+            secs: 1.0,
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_timed_out_case_counts_in_caught_and_in_timed_out() {
+        let tier = SweepTier {
+            name: "test",
+            known_misses: &[],
+            not_gated: Vec::new(),
+        };
+        let results = [
+            case("p", 1, true, true),
+            case("p", 2, true, false),
+            case("p", 3, false, false),
+        ];
+        assert!(results[0].caught() && results[1].caught());
+        let out = report(&tier, &results, &[]);
+        assert!(out.contains("timed out"), "{out}");
+        assert!(out.contains("p | 2/3 | 1 | 3/3 | 0 |"), "{out}");
+        let line = results[0].to_line();
+        assert!(SweepCase::from_line(&line).unwrap().timed_out);
+    }
+
+    #[test]
+    fn quiesce_timeouts_are_told_from_other_failures() {
+        assert!(is_quiesce_timeout(
+            "Quiesce(Staging(ConvergenceTimeout { .. }))"
+        ));
+        assert!(!is_quiesce_timeout("concurrent case diverged in the burst"));
+    }
 
     #[test]
     fn a_plants_divergence_is_credited_behind_an_unplanted_one() {

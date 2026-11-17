@@ -149,6 +149,7 @@ pub mod otel;
 mod pool;
 #[cfg(feature = "internals")]
 pub mod pool;
+pub(crate) mod refused_steps;
 pub(crate) mod release_version;
 pub(crate) mod tls;
 
@@ -229,12 +230,13 @@ pub use app::{
 pub use blocking::{BlockingTrellis, PendingCall, Shutdown};
 pub use catalog_floor::BelowCatalogFloor;
 pub use client::{Client, ClientError, ClientOptions};
+pub use refused_steps::RefusedStep;
 
 // --- Tier 2: composable primitives ----------------------------------------
 pub use config::Config;
 pub use dump::SchemaDump;
 pub use error::Error;
-pub use error_code::ErrorCode;
+pub use error_code::{ErrorCode, ErrorId};
 pub use handover::{MigrationsPending, OtherProcess, OtherVersionLive};
 pub use metrics::Metrics;
 pub use migrate::migrate;

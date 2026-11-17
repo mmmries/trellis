@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::error_code::ErrorCode;
+use crate::error_code::{ErrorCode, ErrorId, SharedCondition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -153,10 +153,61 @@ impl ParseError {
     pub fn code(&self) -> ErrorCode {
         ErrorCode::Parse
     }
+
+    /// This error's stable per-error code, the one its message starts with
+    /// ([`ErrorId`]). A variant that wraps another error reports that
+    /// error's code.
+    pub fn error_id(&self) -> ErrorId {
+        match self {
+            ParseError::UnexpectedChar { .. } => ErrorId(1),
+            ParseError::UnterminatedString => ErrorId(2),
+            ParseError::UnexpectedToken { .. } => ErrorId(3),
+            ParseError::UnexpectedEof { .. } => ErrorId(4),
+            ParseError::UnsupportedKeySpace { .. } => ErrorId(5),
+            ParseError::UnsupportedOperator { .. } => ErrorId(6),
+            ParseError::UnsupportedFunction { .. } => ErrorId(7),
+            ParseError::FunctionArityMismatch { .. } => ErrorId(8),
+            ParseError::NonImmutableConstruct { .. } => ErrorId(9),
+            ParseError::UnsupportedPredicate { .. } => ErrorId(10),
+            ParseError::AtLeastOneArgumentRequired { .. } => ErrorId(11),
+            ParseError::TooManyQualifiedNameParts { .. } => ErrorId(12),
+            ParseError::TooManyColumnNameParts { .. } => ErrorId(13),
+            ParseError::GroupByKeyNotFromSource { .. } => ErrorId(14),
+            ParseError::TableAlias { .. } => ErrorId(15),
+            ParseError::AliasedTableName { .. } => ErrorId(16),
+            ParseError::UnsupportedCastTarget { .. } => ErrorId(17),
+            ParseError::PrefixMinusChainTooLong { .. } => ErrorId(18),
+            ParseError::ReservedWord { .. } => ErrorId(19),
+            ParseError::SplitOperator { .. } => ErrorId(20),
+            ParseError::DoubleMinus => ErrorId(21),
+            ParseError::NumericTrailingJunk { .. } => ErrorId(22),
+            ParseError::UnsupportedNumericForm { .. } => ErrorId(23),
+            ParseError::NonAssociativeComparison { .. } => ErrorId(24),
+            ParseError::UnsupportedIsForm { .. } => ErrorId(25),
+            ParseError::NotChainTooLong { .. } => ErrorId(26),
+            ParseError::SimpleCaseUnsupported => ErrorId(27),
+            ParseError::UnsupportedLiteralType { .. } => {
+                SharedCondition::UnsupportedLiteralType.error_id()
+            }
+            ParseError::UnsupportedCastOperator => ErrorId(29),
+            ParseError::ExpressionTooDeep { .. } => ErrorId(30),
+            ParseError::MalformedDefinitionAddress { .. } => ErrorId(31),
+            ParseError::UnterminatedQuotedIdentifier => ErrorId(32),
+            ParseError::ZeroLengthQuotedIdentifier => ErrorId(33),
+            ParseError::UnicodeEscapeIdentifier => ErrorId(34),
+            ParseError::UnsupportedQuotedIdentifier { .. } => ErrorId(35),
+            ParseError::NameTooLong { .. } => ErrorId(36),
+            ParseError::ReservedTableName { .. } => ErrorId(37),
+            ParseError::GrammarVersionTooOld { .. } => ErrorId(38),
+            ParseError::GrammarVersionTooNew { .. } => ErrorId(39),
+        }
+    }
 }
 
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+crate::error_code::coded_display!(ParseError);
+
+impl crate::error_code::Message for ParseError {
+    fn fmt_message(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::GrammarVersionTooOld { stored, oldest } => write!(
                 f,

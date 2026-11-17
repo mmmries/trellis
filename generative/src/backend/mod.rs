@@ -35,6 +35,34 @@ use crate::model::{BurstAction, Op, Program, RestartMode};
 /// stably regardless of physical row/column order (design doc §1).
 pub type Snapshot = BTreeMap<String, BTreeMap<String, BTreeMap<String, Option<String>>>>;
 
+/// One definition's catalog state at a check: its `status` as stored
+/// (`live`, `paused`, ...) and, when something recorded why it stopped, the
+/// `reason` (its `capture_failures` row, or its poisoned keys' error). What a
+/// divergence report and the unexpected-pause check read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionState {
+    pub target: String,
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+impl DefinitionState {
+    /// Whether the definition is `paused`.
+    pub fn is_paused(&self) -> bool {
+        self.status == "paused"
+    }
+}
+
+impl std::fmt::Display for DefinitionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.target, self.status)?;
+        if let Some(reason) = &self.reason {
+            write!(f, " ({reason})")?;
+        }
+        Ok(())
+    }
+}
+
 /// A backend that can install a [`Program`]'s schema and definitions, apply
 /// its ops as raw source DML, wait for the engine to catch up, and read
 /// back merged state. See the module doc comment and design doc §1 for the
@@ -65,6 +93,14 @@ pub trait Backend {
 
     /// Blocks until the engine has caught up with every op applied so far.
     fn quiesce(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Each of `defs`' [`DefinitionState`], in `defs`' order, read from the
+    /// catalog. A divergence report prints them, and a run fails on a
+    /// paused one in a tier that never expects a pause.
+    fn definition_states(
+        &mut self,
+        defs: &[trellis::dev::defs::ast::TransformDef],
+    ) -> impl Future<Output = Result<Vec<DefinitionState>, Self::Error>> + Send;
 
     /// Reads back merged source+derived state as a [`Snapshot`].
     fn snapshot(&mut self) -> impl Future<Output = Result<Snapshot, Self::Error>> + Send;

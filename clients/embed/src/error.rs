@@ -1,11 +1,11 @@
-//! Errors cross as `(code, message)`: exactly [`ErrorCode::as_str`] plus the
-//! error's `Display` text, with no error chain, no `source()` walking and no
+//! Errors cross as `(code, error_id, message)`: exactly [`ErrorCode::as_str`],
+//! the error's [`ErrorId`] (`T0042`) and its `Display` text, with no error chain, no `source()` walking and no
 //! internal variant names (ADR-0010 decision 4).
 
 use std::fmt;
 
 use trellis::{
-    ApplyError, CatalogError, ClientError, DdlError, ErrorCode, IntakeError, ParseError,
+    ApplyError, CatalogError, ClientError, DdlError, ErrorCode, ErrorId, IntakeError, ParseError,
     SelfCheckError, StagingError, TrellisError, ValidationError,
 };
 
@@ -32,21 +32,26 @@ pub const ERROR_CODES: [&str; 9] = [
     "internal",
 ];
 
-/// An error flattened for an FFI boundary: the stable code and the message.
+/// An error flattened for an FFI boundary: the stable codes and the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainError {
     /// [`ErrorCode::as_str`]. A host maps each of [`ERROR_CODES`] to its own
     /// name and falls back for anything else.
     pub code: &'static str,
+    /// The error's [`ErrorId`] as text (`T0042`), the code its message
+    /// starts with. `None` for an error the binding raises itself.
+    pub error_id: Option<String>,
     /// The error's `Display` text.
     pub message: String,
 }
 
 impl PlainError {
-    /// A plain error with `code`'s stable name and `message`.
+    /// A plain error with `code`'s stable name and `message`, raised by the
+    /// binding itself, so with no [`ErrorId`].
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         PlainError {
             code: code.as_str(),
+            error_id: None,
             message: message.into(),
         }
     }
@@ -66,6 +71,9 @@ impl std::error::Error for PlainError {}
 pub trait CodedError: fmt::Display {
     /// The error's stable category, as its inherent `code()` reports it.
     fn code(&self) -> ErrorCode;
+
+    /// The error's per-error code, as its inherent `error_id()` reports it.
+    fn error_id(&self) -> ErrorId;
 }
 
 /// Implements [`CodedError`] by delegating to each type's inherent `code()`.
@@ -75,6 +83,10 @@ macro_rules! coded_error {
             impl CodedError for $ty {
                 fn code(&self) -> ErrorCode {
                     <$ty>::code(self)
+                }
+
+                fn error_id(&self) -> ErrorId {
+                    <$ty>::error_id(self)
                 }
             }
         )*
@@ -100,7 +112,11 @@ coded_error!(
 
 impl<E: CodedError> From<E> for PlainError {
     fn from(err: E) -> Self {
-        PlainError::new(err.code(), err.to_string())
+        PlainError {
+            code: err.code().as_str(),
+            error_id: Some(err.error_id().to_string()),
+            message: err.to_string(),
+        }
     }
 }
 
@@ -148,6 +164,8 @@ mod tests {
         let plain = PlainError::from(err);
 
         assert_eq!(plain.code, "not_found");
+        assert_eq!(plain.error_id.as_deref(), Some("T0126"));
+        assert!(message.starts_with("T0126: "), "{message}");
         assert_eq!(plain.message, message);
         assert_eq!(plain.to_string(), message);
     }
@@ -158,12 +176,14 @@ mod tests {
     fn a_nested_error_crosses_as_the_outer_display_with_the_inner_code() {
         let inner = CatalogError::SourceTableNotFound("orders".to_string());
         let inner_code = inner.code();
+        let inner_id = inner.error_id().to_string();
         let outer = TrellisError::Catalog(inner);
         let message = outer.to_string();
 
         let plain = PlainError::from(outer);
 
         assert_eq!(plain.code, inner_code.as_str());
+        assert_eq!(plain.error_id, Some(inner_id));
         assert_eq!(plain.message, message);
     }
 
@@ -202,6 +222,7 @@ mod tests {
             plain,
             PlainError {
                 code: "conflict",
+                error_id: None,
                 message: "taken".to_string(),
             }
         );

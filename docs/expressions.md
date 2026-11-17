@@ -125,7 +125,8 @@ there is no `interval`. `infinity` and `-infinity` follow Postgres
 (`infinity + 1` is `infinity`, `EXTRACT(year FROM 'infinity'::date)` is
 `Infinity`, `EXTRACT(day FROM ...)` of it is `NULL`), and a row whose date
 leaves the range (`date + n` past 5874897-12-31, two dates one of which is
-infinite, a date past 294276-12-31 cast to `timestamp`) raises `22008` for
+infinite, a date past 294276-12-31 cast to `timestamp`, a `DATE_TRUNC` that
+truncates below the `timestamp` range) raises `22008` for
 that row's record, which is quarantined; a constant that does fails every row.
 
 A bucket for an aggregate is computed in a 1-1 transform and grouped by in
@@ -159,6 +160,7 @@ an entry under [Details](#details) where it needs more room.
 | [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | `MixedFloatExactComparison` | [Retype](transforms.md#retype) | Compare two floats or two exact values |
 | A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`): a conversion to or from `timestamptz` reads the session time zone | `MixedTemporalComparison` | [Retype](transforms.md#retype) | Cast one side so both are one type |
 | `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` are admitted | `TextOrderingComparison` | [Retype](transforms.md#retype) | Order by a non-text value, or by `CHAR_LENGTH` |
+| A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` over text columns of two different collations, neither the database default, directly or through `COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and fails every row where both are not `NULL` | `ConflictingCollations` (T0233) | A column re-collated later holds each key written ([releasing held keys](operations.md#releasing-held-keys)), and `RESUME` refuses it | Give the two columns one collation (`ALTER COLUMN … TYPE text COLLATE …`) |
 | A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, enums, `inet`, …) | `ComparisonTypeMismatch` | [Retype](transforms.md#retype) | Compare values of one family; `IS NULL` takes any type |
 | Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | `NonAssociativeComparison` | [Text](transforms.md#text) | Join them with `AND`, or add parentheses |
 | **Grammar forms and typing** | | | |

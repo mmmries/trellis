@@ -11,7 +11,7 @@ defmodule Trellis.ErrorTest do
     assert codes != []
 
     for code <- codes do
-      assert %Error{code: atom, message: "boom"} = Error.from_native({code, "boom"})
+      assert %Error{code: atom, message: "boom"} = Error.from_native({code, "T0001", "boom"})
 
       assert Atom.to_string(atom) == code,
              "error code #{inspect(code)} has no atom in Trellis.Error; add it"
@@ -20,15 +20,16 @@ defmodule Trellis.ErrorTest do
 
   test "a code this binding doesn't know becomes :unknown and keeps the code in the message" do
     assert %Error{code: :unknown, message: message} =
-             Error.from_native({"brand_new_code", "something broke"})
+             Error.from_native({"brand_new_code", nil, "something broke"})
 
     assert message =~ "brand_new_code"
     assert message =~ "something broke"
   end
 
   test "is an exception carrying the engine's message" do
-    error = Error.from_native({"conflict", "already defined"})
-    assert Exception.message(error) == "already defined"
-    assert_raise Error, "already defined", fn -> raise error end
+    error = Error.from_native({"conflict", "T0001", "T0001: already defined"})
+    assert error.error_id == "T0001"
+    assert Exception.message(error) == "T0001: already defined"
+    assert_raise Error, "T0001: already defined", fn -> raise error end
   end
 end

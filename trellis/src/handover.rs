@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use tokio_postgres::GenericClient;
 
+use crate::error_code::ErrorId;
 use crate::pool::quote_ident;
 
 /// This build's version: the crate version, compared as an exact string
@@ -245,6 +246,18 @@ fn version_name(version: Option<&str>) -> String {
     match version {
         Some(version) => version.to_string(),
         None => "a release before 0.2.0".to_string(),
+    }
+}
+
+impl OtherVersionLive {
+    /// The code of the error variants that carry this, one in each of
+    /// `TrellisError` and `Error`: one condition, one code. Written as a `match` arm,
+    /// the form `error_code::assigned`'s test reads.
+    #[allow(clippy::match_single_binding)]
+    pub(crate) fn error_id(&self) -> ErrorId {
+        match self {
+            OtherVersionLive { .. } => ErrorId(220),
+        }
     }
 }
 

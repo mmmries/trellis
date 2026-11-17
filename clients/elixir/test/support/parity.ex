@@ -94,6 +94,7 @@ defmodule Trellis.Parity do
     %{
       "child_spec" => "`{Trellis, options}` in a supervision tree",
       "start_link" => "`{Trellis, options}` in a supervision tree",
+      "enabled?" => "a predicate on application config, with no handle to call it on",
       "dump_definitions_sql" => "SQL text for the older schema-dump format",
       "schema_dump" => "pg_dump arguments and SQL text for `mix trellis.dump`",
       "filter_schema_dump" => "rewrites pg_dump output for `mix trellis.dump`"

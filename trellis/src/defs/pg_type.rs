@@ -342,7 +342,7 @@ pub(crate) fn columns_pair(
 // Well-known builtin `pg_type.oid` values this registry classifies. Every
 // one of these is a fixed Postgres catalog constant (`src/include/catalog/pg_type.dat`
 // upstream), not something that varies by server version or installation.
-mod oid {
+pub(crate) mod oid {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
     pub const NAME: u32 = 19;

@@ -126,7 +126,7 @@ pub const BASELINE: Release = Release::new(0, 2, 0);
 /// release commit sets it to the release's own (`bump-version.sh`), and the
 /// first commit after a final release's tag raises it to the next minor
 /// (`start-next-release.sh`; docs/releasing.md). Never below [`BASELINE`].
-pub const DEVELOPING: Release = Release::new(0, 3, 0);
+pub const DEVELOPING: Release = Release::new(0, 4, 0);
 
 /// Which key space a definition is (see [`KeySpace`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +193,13 @@ pub enum Layout {
     /// validator as it admits such an argument, since the key space alone
     /// doesn't tell.
     NumericSums,
+    /// [`Layout::NumericSums`]'s partials holding a `real`, `double
+    /// precision` or `interval` argument's exact sum, each value converted
+    /// exactly to one `numeric` (an `interval`'s fields packed into it), under
+    /// a reference scale of its own (`crate::staging::group_basis::exact_sums`):
+    /// a release without them refuses the definition. Recorded by the
+    /// validator as it admits such an argument.
+    FloatIntervalSums,
 }
 
 impl Layout {
@@ -238,6 +245,12 @@ pub enum Feature {
     /// A release before it would read such a definition over its first
     /// joined table alone.
     StarJoin,
+    /// A string literal Postgres types from a `char(n)` neighbour, or from a
+    /// `name` one when it is over 63 bytes, which this release renders bare
+    /// and a release before it cast to `text`
+    /// ([`super::neighbour_literals`]). Recorded over the live column types
+    /// with the validation's features ([`on_retype`]).
+    NeighbourTypedLiteral,
     /// An expression node of this kind.
     Expr(ExprNode),
     /// An operator.
@@ -301,6 +314,7 @@ impl Feature {
             Feature::TableKey => Some(BASELINE),
             // Arrives in 0.2.0, the release floors arrive in.
             Feature::StarJoin => Some(BASELINE),
+            Feature::NeighbourTypedLiteral => Some(Release::new(0, 4, 0)),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
             }),
@@ -353,6 +367,7 @@ impl Feature {
                 | Layout::Join
                 | Layout::JoinOneToOne
                 | Layout::NumericSums => BASELINE,
+                Layout::FloatIntervalSums => DEVELOPING,
             }),
             Feature::TypeRule(rule) => Some(rule.since()),
             Feature::Value(value) => value.since(),
@@ -990,6 +1005,9 @@ pub(crate) fn on_retype(
     match validated_features(def, from, joined) {
         Ok(mut validated) => {
             validated.extend_from_slice(keys);
+            if super::neighbour_literals::affected(def, from, joined) {
+                validated.push(Feature::NeighbourTypedLiteral);
+            }
             OnRetype::Restamp(floors.of(def, partitioned, Some(&validated)))
         }
         Err(refusal) => OnRetype::Pause(refusal),

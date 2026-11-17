@@ -51,6 +51,7 @@ mod lexer;
 pub mod lifecycle;
 pub(crate) mod live_table;
 pub mod model;
+pub(crate) mod neighbour_literals;
 pub(crate) mod numeric_sums;
 pub mod oracle;
 mod parser;
@@ -127,8 +128,8 @@ pub use ddl::{PrimaryKeyColumn, neighbor_table_name};
 pub use model::{EdgeKind, NodeKind, SchemaEdge, SchemaNode};
 #[cfg(any(test, feature = "internals"))]
 pub use validate::{
-    KeyColumnRole, NondeterministicCollationTextFunction, NondeterministicKeyCollation,
-    ValidationError,
+    ConflictingCollations, KeyColumnRole, NondeterministicCollationTextFunction,
+    NondeterministicKeyCollation, ValidationError,
 };
 
 #[cfg(test)]
@@ -153,6 +154,7 @@ mod table_key_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error_code::Message as _;
 
     #[test]
     fn parses_a_binary_add_expression() {
@@ -1204,7 +1206,7 @@ mod tests {
             }
         );
         assert_eq!(
-            err.to_string(),
+            err.message().to_string(),
             "GROUP BY key 'product.kind' does not name this transform's FROM table ('orders'); \
              a qualified key must name the FROM table, and a second table is read with a JOIN"
         );

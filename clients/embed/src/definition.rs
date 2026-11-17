@@ -18,7 +18,8 @@ use trellis::{
     BackfillFailure, BelowCatalogFloor, BuildWait, CaptureFailure, CaptureFailureKind, CaptureWait,
     CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, ExtremeIndexGap,
     FanOutWarning, HiddenTableSize, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus,
-    OneToOneBuildStep, OtherProcess, OtherVersionLive, PartialsWarning, SourceIndexGap,
+    OneToOneBuildStep, OtherProcess, OtherVersionLive, PartialsWarning, RefusedStep,
+    SourceIndexGap,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -101,6 +102,9 @@ pub struct PlainDefinitionStatus {
     /// its state-changing calls refuse; see
     /// [`DefinitionStatus::below_catalog_floor`].
     pub below_catalog_floor: Option<PlainBelowCatalogFloor>,
+    /// The ring and maintenance steps this handle's staging worker is
+    /// refused; see [`DefinitionStatus::maintenance_refusals`].
+    pub maintenance_refusals: Vec<PlainRefusedStep>,
     /// A `JOIN` transform's hidden tables, warnings and build step; see
     /// [`DefinitionStatus::join`]. `None` for any other transform.
     pub join: Option<PlainJoinStatus>,
@@ -242,6 +246,34 @@ impl From<&BelowCatalogFloor> for PlainBelowCatalogFloor {
         PlainBelowCatalogFloor {
             floor: seen.floor.clone(),
             this_version: seen.this_version.clone(),
+        }
+    }
+}
+
+/// A [`RefusedStep`] flattened to plain data: a maintenance step the
+/// staging worker's role is refused, until a pass of it succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainRefusedStep {
+    /// The step, such as `retire_drained_segments`.
+    pub step: String,
+    /// The role the staging worker runs as, when it could be read.
+    pub role: Option<String>,
+    /// The table or sequence refused, as Postgres names it.
+    pub object: Option<String>,
+    /// The privileges the role lacks on `object`, when they could be read.
+    pub missing: Vec<String>,
+    /// Postgres's own message.
+    pub error: String,
+}
+
+impl From<&RefusedStep> for PlainRefusedStep {
+    fn from(seen: &RefusedStep) -> Self {
+        PlainRefusedStep {
+            step: seen.step.clone(),
+            role: seen.role.clone(),
+            object: seen.object.clone(),
+            missing: seen.missing.clone(),
+            error: seen.error.clone(),
         }
     }
 }
@@ -453,6 +485,11 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .below_catalog_floor
                 .as_ref()
                 .map(PlainBelowCatalogFloor::from),
+            maintenance_refusals: status
+                .maintenance_refusals
+                .iter()
+                .map(PlainRefusedStep::from)
+                .collect(),
             join: status.join.as_ref().map(PlainJoinStatus::from),
             floor: status.floor.clone(),
         }
@@ -774,6 +811,7 @@ mod tests {
                 build_wait_xid: None,
                 version_handover: None,
                 below_catalog_floor: None,
+                maintenance_refusals: Vec::new(),
                 join: None,
                 floor: "0.3.1".to_string(),
             }
@@ -1003,6 +1041,7 @@ mod tests {
                 build_wait_xid: None,
                 version_handover: None,
                 below_catalog_floor: None,
+                maintenance_refusals: Vec::new(),
                 join: None,
                 floor: "0.2.0".to_string(),
             }
@@ -1095,6 +1134,32 @@ mod tests {
                 floor: "0.3.0".to_string(),
                 this_version: "0.2.0".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn a_refused_maintenance_step_crosses_with_its_role_table_and_privileges() {
+        let status = trellis::fixture!(DefinitionStatus {
+            maintenance_refusals: vec![trellis::fixture!(RefusedStep {
+                step: "retire_drained_segments".to_string(),
+                role: Some("worker".to_string()),
+                object: Some("seg_0".to_string()),
+                missing: vec!["TRUNCATE".to_string()],
+                error: "permission denied for table seg_0".to_string(),
+            })],
+        });
+
+        let plain = PlainDefinitionStatus::from(&status);
+
+        assert_eq!(
+            plain.maintenance_refusals,
+            vec![PlainRefusedStep {
+                step: "retire_drained_segments".to_string(),
+                role: Some("worker".to_string()),
+                object: Some("seg_0".to_string()),
+                missing: vec!["TRUNCATE".to_string()],
+                error: "permission denied for table seg_0".to_string(),
+            }]
         );
     }
 
