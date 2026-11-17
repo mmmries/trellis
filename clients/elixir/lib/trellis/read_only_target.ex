@@ -2,7 +2,9 @@ defmodule Trellis.ReadOnlyTarget do
   @moduledoc """
   Raised for a write to an Ecto schema marked with `use Trellis.Target`,
   through a repo that has `use Trellis.Repo`, while
-  `config :trellis_pg, allow_target_writes` is not `true`.
+  `config :trellis_pg, allow_target_writes` is not `true`, and by
+  `Trellis.TestSupport.refresh_target/3` then (`schema` is `nil`, `write` is
+  `:refresh_target`).
 
   A client-side error: it carries no Trellis error code.
   """
