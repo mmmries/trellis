@@ -145,7 +145,7 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
         &txn,
         pool.schema(),
         pool.floors(),
-        seed,
+        vec![(seed, text.clone())],
         "the drain halted",
         &text,
     )
@@ -183,32 +183,40 @@ pub(crate) async fn halt_failed_start(
     } else {
         failure.to_string()
     };
-    let err = err.as_str();
     let paused = pause_closure(
         &txn,
         pool.schema(),
         pool.floors(),
-        Some(Seed::Target(target.to_string())),
+        vec![(Some(Seed::Target(target.to_string())), err.clone())],
         &halted,
-        err,
+        &err,
     )
     .await?;
     txn.commit().await?;
     Ok(paused)
 }
 
-/// Pauses, in `txn`, every unfrozen definition `seed` reaches, or, with no
-/// seed (a refused read or write, `42501`), every one the [`refusals`] read
-/// as `txn`'s role reaches; and records the halting stop if that paused any.
-/// `halted` opens each record's sentence: what halted, and `err`, the
-/// failure's text, follows it.
+/// Pauses, in `txn`, every unfrozen definition each of `halts`' seeds
+/// reaches, or, for a halt with no seed (a refused read or write, `42501`),
+/// every one the [`refusals`] read as `txn`'s role reaches; and records the
+/// halting stop, with `stop`, if that paused any. `halted` opens each
+/// record's sentence: what halted, and the halt's failure text follows it.
+///
+/// Every row it pauses is locked in one sorted statement before the first
+/// pause ([`lifecycle::pause_many`], ADR-0028 I5), across every halt and
+/// every refused table, since their closures interleave in id. A definition
+/// an earlier halt reaches is left to it, as if each halt ran after the
+/// last; within one halt, each refused table's reason is recorded on every
+/// definition it reaches.
+///
+/// [`lifecycle::pause_many`]: crate::defs::lifecycle::pause_many
 async fn pause_closure(
     txn: &Transaction<'_>,
     schema: &str,
     floors: &crate::defs::floor::Floors,
-    seed: Option<Seed>,
+    halts: Vec<(Option<Seed>, String)>,
     halted: &str,
-    err: &str,
+    stop: &str,
 ) -> Result<Vec<String>, ApplyError> {
     let catalog = load_catalog_for(txn, floors).await?;
     let unfrozen: HashSet<i64> = txn
@@ -221,48 +229,65 @@ async fn pause_closure(
         .map(|row| row.get(0))
         .collect();
 
-    // Each seed, with the table its records name and the sentence they carry.
-    let episodes: Vec<(Seed, String, String)> = match seed {
-        Some(seed) => {
-            let source_table = match &seed {
-                Seed::Tables(tables) => tables.join(", "),
-                Seed::Target(target) => target.clone(),
-            };
-            let error = format!(
-                "{halted}: {err}; fix the cause, then resume the definition to rebuild it, or \
-                 drop the definition"
-            );
-            vec![(seed, source_table, error)]
-        }
-        None => refusals(txn, schema, &catalog, &unfrozen)
-            .await?
-            .into_iter()
-            .map(|refusal| {
+    let mut pauses = Vec::new();
+    let mut reached = HashSet::new();
+    for (seed, err) in halts {
+        // Each seed, with the table its records name and the sentence they
+        // carry.
+        let episodes: Vec<(Seed, String, String)> = match seed {
+            Some(seed) => {
+                let source_table = match &seed {
+                    Seed::Tables(tables) => tables.join(", "),
+                    Seed::Target(target) => target.clone(),
+                };
                 let error = format!(
-                    "{halted}: {err}; {}; then resume the definition to rebuild it, or drop the \
-                     definition",
-                    refusal.reason
+                    "{halted}: {err}; fix the cause, then resume the definition to rebuild it, or \
+                     drop the definition"
                 );
-                (refusal.seed, refusal.table, error)
-            })
-            .collect(),
-    };
-
-    let mut paused = Vec::new();
-    for (seed, source_table, error) in &episodes {
-        for id in closure(&catalog, seed, &unfrozen) {
-            let reason = super::pause_message::PauseReason::Halt {
-                table: source_table.clone(),
-                text: error.clone(),
-            };
-            if crate::defs::lifecycle::pause(txn, id, &reason).await? {
-                let reader = catalog.definitions.iter().find(|r| r.id == id);
-                paused.push(reader.map_or_else(|| id.to_string(), |r| r.def.target.clone()));
+                vec![(seed, source_table, error)]
+            }
+            None => refusals(txn, schema, &catalog, &unfrozen)
+                .await?
+                .into_iter()
+                .map(|refusal| {
+                    let error = format!(
+                        "{halted}: {err}; {}; then resume the definition to rebuild it, or drop \
+                         the definition",
+                        refusal.reason
+                    );
+                    (refusal.seed, refusal.table, error)
+                })
+                .collect(),
+        };
+        let mut members = HashSet::new();
+        for (seed, source_table, error) in &episodes {
+            for id in closure(&catalog, seed, &unfrozen) {
+                if reached.contains(&id) {
+                    continue;
+                }
+                members.insert(id);
+                pauses.push((
+                    id,
+                    super::pause_message::PauseReason::Halt {
+                        table: source_table.clone(),
+                        text: error.clone(),
+                    },
+                ));
             }
         }
+        reached.extend(members);
     }
+
+    let paused: Vec<String> = crate::defs::lifecycle::pause_many(txn, pauses)
+        .await?
+        .into_iter()
+        .map(|(id, _)| {
+            let reader = catalog.definitions.iter().find(|r| r.id == id);
+            reader.map_or_else(|| id.to_string(), |r| r.def.target.clone())
+        })
+        .collect();
     if !paused.is_empty() {
-        quarantine::record_halting_stop(txn, err).await?;
+        quarantine::record_halting_stop(txn, stop).await?;
     }
     Ok(paused)
 }
@@ -470,7 +495,10 @@ pub(crate) async fn halt_unusable_schemas(pool: &Pool) -> Result<Unusable, Apply
             .collect(),
         tables: refused.iter().cloned().collect(),
     };
-    let mut paused = Vec::new();
+    // Every refused table's halt pauses under one sorted lock of every row
+    // it pauses ([`pause_closure`]), and is one halting stop.
+    let mut halts = Vec::new();
+    let mut reasons = Vec::new();
     for table in &refused {
         let reason = missing_privileges(&*txn, table, &[])
             .await?
@@ -479,20 +507,19 @@ pub(crate) async fn halt_unusable_schemas(pool: &Pool) -> Result<Unusable, Apply
             Seed::Tables(vec![table.clone()]),
             Seed::Target(table.clone()),
         ] {
-            let halted = "the staging pass halted";
-            paused.extend(
-                pause_closure(
-                    &txn,
-                    pool.schema(),
-                    pool.floors(),
-                    Some(seed),
-                    halted,
-                    &reason,
-                )
-                .await?,
-            );
+            halts.push((Some(seed), reason.clone()));
         }
+        reasons.push(reason);
     }
+    let paused = pause_closure(
+        &txn,
+        pool.schema(),
+        pool.floors(),
+        halts,
+        "the staging pass halted",
+        &reasons.join("; "),
+    )
+    .await?;
     txn.commit().await?;
     if !paused.is_empty() {
         crate::instance_log::error!(
@@ -777,5 +804,142 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    /// A refused read's halt pauses every episode's closure under one sorted
+    /// lock of their rows, first (ADR-0028 I5, #2094), not episode by
+    /// episode: refusals go table by table in name order, so `a`'s reader,
+    /// the higher id, comes before `z`'s, the lower one, and pausing it first
+    /// would hold its row while waiting on the lower one. Frozen with the
+    /// lower id's row held by another transaction, which then takes the
+    /// higher id's, as a sorted taker of both would: had the pauses gone
+    /// episode by episode, the two would deadlock.
+    #[tokio::test]
+    async fn a_refusal_halt_locks_every_episodes_closure_in_id_order() {
+        use std::collections::HashMap;
+
+        use crate::defs::ast::ValueType;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = crate::pool::Pool::new(&config).expect("pool");
+        let schema = crate::config::DEFAULT_SCHEMA;
+        let connect = |dsn: String| async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .batch_execute(&format!("set search_path to {schema}, public"))
+                .await
+                .expect("search path");
+            client
+        };
+        let admin = connect(db.dsn().to_string()).await;
+        admin
+            .batch_execute(&format!(
+                "create table public.z (id bigint primary key, x numeric); \
+                 create table public.a (id bigint primary key, x numeric); \
+                 create role drainer login; \
+                 grant usage on schema {schema} to drainer; \
+                 grant all on all tables in schema {schema} to drainer; \
+                 grant all on all sequences in schema {schema} to drainer"
+            ))
+            .await
+            .expect("sources, and a role that can't read them");
+        let columns: HashMap<String, ValueType> = ["id", "x"]
+            .iter()
+            .map(|name| (name.to_string(), ValueType::Numeric))
+            .collect();
+        let mut ids = Vec::new();
+        for text in [
+            "TRANSFORM low FROM public.z SELECT x AS v",
+            "TRANSFORM high FROM public.a SELECT x AS v",
+        ] {
+            let def = crate::defs::catalog::create_definition(&pool, text, &columns)
+                .await
+                .expect(text);
+            ids.push(def.id);
+        }
+        let (low, high) = (ids[0], ids[1]);
+        assert!(low < high);
+        admin
+            .execute(
+                "update transform_definitions set status = 'live' where id = any($1)",
+                &[&ids],
+            )
+            .await
+            .expect("live");
+
+        let mut taker = connect(db.dsn().to_string()).await;
+        let other = taker.transaction().await.expect("txn");
+        other
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&low],
+            )
+            .await
+            .expect("lock low");
+        let other_pid: i32 = other
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let mut pauser = connect(db.dsn().replace("user=postgres", "user=drainer")).await;
+        let pauser_pid: i32 = pauser
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let floors = pool.floors().clone();
+        let pausing = tokio::spawn(async move {
+            let txn = pauser.transaction().await.expect("txn");
+            let paused = pause_closure(
+                &txn,
+                schema,
+                &floors,
+                vec![(None, "denied".to_string())],
+                "the drain halted",
+                "denied",
+            )
+            .await;
+            if paused.is_ok() {
+                txn.commit().await.expect("commit");
+            }
+            paused
+        });
+        // Wait for the pauses to queue behind `low`'s row: a lock state,
+        // which they reach once, not a convergence.
+        loop {
+            let blocked: bool = admin
+                .query_one(
+                    "select $2 = any(pg_blocking_pids($1))",
+                    &[&pauser_pid, &other_pid],
+                )
+                .await
+                .expect("blocking pids")
+                .get(0);
+            if blocked {
+                break;
+            }
+            assert!(
+                !pausing.is_finished(),
+                "the pauses finished without queuing behind the low reader's row"
+            );
+            tokio::task::yield_now().await;
+        }
+        other
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&high],
+            )
+            .await
+            .expect("the pauses hold no row past the one they wait on");
+        other.commit().await.expect("commit");
+        let paused = pausing.await.expect("pause task").expect("pauses");
+        assert_eq!(paused, ["low", "high"], "both paused, in id order");
     }
 }
