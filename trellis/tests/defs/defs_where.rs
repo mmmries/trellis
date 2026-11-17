@@ -21,18 +21,24 @@ async fn define_refuses_a_filter_and_creates_nothing() {
 
     for (text, expected) in [
         (
-            "TRANSFORM t1 FROM public.s SELECT qty AS q WHERE qty > 0",
-            "T0238",
-        ),
-        (
             "TRANSFORM t2 FROM public.s GROUP BY g WITHOUT SOURCE INDEX \
              SELECT g AS g, MIN(qty) AS lo WHERE active",
             "T0239",
         ),
         (
-            "TRANSFORM t3 FROM public.s JOIN public.u ON s.id = u.id GROUP BY s.g \
+            "TRANSFORM t3 FROM public.s LEFT JOIN public.u ON s.id = u.id GROUP BY s.g \
              SELECT s.g AS g, COUNT(*) AS n WHERE u.flag",
-            "T0238",
+            "T0244",
+        ),
+        (
+            "TRANSFORM tb FROM public.s JOIN public.u ON s.id = u.id GROUP BY s.g \
+             SELECT s.g AS g, COUNT(*) AS n WHERE s.active AND s.qty > u.id",
+            "T0243",
+        ),
+        (
+            "TRANSFORM tc FROM public.s JOIN public.u ON s.id = u.id GROUP BY s.g \
+             SELECT s.g AS g, COUNT(*) AS n WHERE FALSE",
+            "T0245",
         ),
         (
             "TRANSFORM t4 FROM public.s JOIN public.u ON s.id = u.id \
@@ -87,6 +93,14 @@ async fn define_refuses_a_filter_and_creates_nothing() {
     let status = trellis.status("t9").await.unwrap().expect("t9");
     assert_eq!(status.filter, None, "an unfiltered definition");
 
+    // A plain 1-1 transform applies its filter, and `status` says so.
+    trellis
+        .apply("TRANSFORM o1 FROM public.s SELECT qty AS q WHERE qty > 0")
+        .await
+        .expect("a filtered 1-1 transform is accepted");
+    let status = trellis.status("o1").await.unwrap().expect("o1");
+    assert_eq!(status.filter.as_deref(), Some("(qty > 0)"));
+
     // A plain aggregate applies its filter, and `status` says so.
     trellis
         .apply(
@@ -97,6 +111,16 @@ async fn define_refuses_a_filter_and_creates_nothing() {
         .expect("a filtered aggregate is accepted");
     let status = trellis.status("g1").await.unwrap().expect("g1");
     assert_eq!(status.filter.as_deref(), Some("(active AND (qty > 0))"));
+    // A join aggregate applies one conjunct per table.
+    trellis
+        .apply(
+            "TRANSFORM ja FROM public.s JOIN public.u ON s.id = u.id GROUP BY s.g \
+             WITHOUT SOURCE INDEX SELECT s.g AS g, COUNT(*) AS n WHERE s.active AND u.flag",
+        )
+        .await
+        .expect("a filtered join aggregate is accepted");
+    let status = trellis.status("ja").await.unwrap().expect("ja");
+    assert_eq!(status.filter.as_deref(), Some("(s.active AND u.flag)"));
     // `WHERE (TRUE)` is a filter, with this release's floor: `status` says
     // so as its definition text reads, not as the bare `TRUE` it isn't.
     trellis

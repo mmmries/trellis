@@ -626,12 +626,6 @@ value of its operands; the message names it. Compare without it, or filter on
 a stored generated column or a [chained](transforms.md#chaining-and-cycle-detection)
 1-1 transform.
 
-### T0238 FilterNotYetSupported
-
-A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every
-one but the plain aggregate and the 1-1 `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
-There is no workaround in the definition yet; filter when reading the target.
-
 ### T0239 FilteredExtreme
 
 `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an
@@ -644,6 +638,29 @@ too. Take the `MIN`/`MAX` of a stored generated column
 An enum column compared with a string literal that is not one of its labels:
 Postgres fails every statement that reads it. Use a label of the enum. After a
 label was renamed, rename it back, or drop the transform and define it again.
+
+### T0243 JoinPredicateReadsBothSides
+
+A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'s
+`WHERE` reads both tables (`a.x > b.y`, or `a.x > 0 OR b.y > 0`); the message
+names it. Each condition filters one table's rows, so no table can apply this
+one. Split it into conditions that each read one table, or compute the value
+in a [chained](transforms.md#chaining-and-cycle-detection) 1-1 `JOIN` and
+aggregate that.
+
+### T0244 JoinPredicateJoinedSideUnderLeft
+
+A `LEFT` [join aggregate](transforms.md#join-aggregate)'s `WHERE` has a
+condition on the joined table; the message names it. In SQL it also drops the
+`FROM` rows with no match, which the `LEFT` keeps, so the query is an `INNER`
+one: write `INNER JOIN`.
+
+### T0245 JoinPredicateReadsNoColumn
+
+A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'s
+`WHERE` reads no column (`WHERE FALSE`, `1 = 1`); the message names it. Each
+condition filters one table's rows. Drop it, or, to keep nothing, drop the
+transform.
 
 ## Tables and keys
 
@@ -1351,3 +1368,4 @@ A retired code is no longer reported; the condition reports another code.
 | T0209 | [T0126](#t0126-sourcetablenotfound) |
 | T0217 | [T0148](#t0148-transformnotfound) |
 | T0228 | [T0220](#t0220-otherversionlive) |
+| T0238 | None: every key space applies a `WHERE` |

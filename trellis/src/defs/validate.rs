@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::ast::{
-    Expr, FieldDef, JoinOn, JoinSpec, KeySpace, Predicate, QualifiedColumn, TransformDef,
-    ValueType, render_field_expr,
+    Expr, FieldDef, JoinOn, JoinSpec, KeySpace, QualifiedColumn, TransformDef, ValueType,
+    render_field_expr,
 };
 use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
@@ -572,14 +572,21 @@ pub enum ValidationError {
     /// some value of its operand types (ADR-0004): only a total predicate
     /// is admitted (`defs::totality`).
     PredicateNotTotal { construct: String, reason: String },
-    /// A `WHERE` other than `TRUE` on a key space whose apply path doesn't
-    /// filter yet. Each key space's step of #1991 lifts it for that key
-    /// space.
-    FilterNotYetSupported { key_space: &'static str },
     /// `MIN` or `MAX` in an aggregate with a `WHERE` other than `TRUE`: an
     /// extreme is kept by probing a source index for the group's endpoint,
     /// and a filtered extreme's endpoint is no index endpoint (#1991).
     FilteredExtreme { field: String, function: String },
+    /// A top-level `AND` conjunct of a join aggregate's `WHERE` that reads
+    /// both tables: each conjunct filters one side's rows before they reach
+    /// its partials, and no one side can apply this one (ADR-0019).
+    JoinPredicateReadsBothSides { conjunct: String },
+    /// A top-level `AND` conjunct of a `LEFT` join aggregate's `WHERE` that
+    /// reads the joined table: in SQL it also drops the unmatched `FROM` rows
+    /// the `LEFT` keeps, which makes the join an `INNER` one (ADR-0019).
+    JoinPredicateJoinedSideUnderLeft { conjunct: String, table: String },
+    /// A top-level `AND` conjunct of a join aggregate's `WHERE` that reads
+    /// no column (`WHERE FALSE`): it filters neither side (ADR-0019).
+    JoinPredicateReadsNoColumn { conjunct: String },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -1225,8 +1232,10 @@ impl ValidationError {
             ValidationError::AggregateInPredicate { .. } => ErrorId(235),
             ValidationError::PredicateColumnNotFound { .. } => ErrorId(236),
             ValidationError::PredicateNotTotal { .. } => ErrorId(237),
-            ValidationError::FilterNotYetSupported { .. } => ErrorId(238),
             ValidationError::FilteredExtreme { .. } => ErrorId(239),
+            ValidationError::JoinPredicateReadsBothSides { .. } => ErrorId(243),
+            ValidationError::JoinPredicateJoinedSideUnderLeft { .. } => ErrorId(244),
+            ValidationError::JoinPredicateReadsNoColumn { .. } => ErrorId(245),
         }
     }
 
@@ -1915,14 +1924,25 @@ impl std::fmt::Display for FieldMessage<'_> {
                 "WHERE: {construct} can raise an error for some rows: {reason}; a WHERE must \
                  be total"
             ),
-            ValidationError::FilterNotYetSupported { key_space } => write!(
-                f,
-                "a WHERE other than TRUE is not supported on a {key_space} transform yet"
-            ),
             ValidationError::FilteredExtreme { field, function } => write!(
                 f,
                 "calculated field '{field}': {function} is not supported in an aggregate with a \
                  WHERE; an extreme of the rows the WHERE keeps can't be read from a source index"
+            ),
+            ValidationError::JoinPredicateReadsBothSides { conjunct } => write!(
+                f,
+                "WHERE: {conjunct} reads both tables; in a JOIN with GROUP BY each AND-ed \
+                 condition of a WHERE must read one table"
+            ),
+            ValidationError::JoinPredicateJoinedSideUnderLeft { conjunct, table } => write!(
+                f,
+                "WHERE: {conjunct} reads {table}, the LEFT JOIN's table; it would drop the rows \
+                 with no match the LEFT JOIN keeps, so write INNER JOIN"
+            ),
+            ValidationError::JoinPredicateReadsNoColumn { conjunct } => write!(
+                f,
+                "WHERE: {conjunct} reads no column; in a JOIN with GROUP BY each AND-ed \
+                 condition of a WHERE must read one table"
             ),
         }
     }
@@ -2128,8 +2148,6 @@ pub fn validate(
         check_aggregate_table_widths(def, source_columns)?;
     }
 
-    refuse_unsupported_filter(def)?;
-
     Ok(())
 }
 
@@ -2176,25 +2194,6 @@ fn validate_predicate(
             reason: refused.reason,
         }
     })
-}
-
-/// Refuses a `WHERE` other than `TRUE` on a key space whose apply path
-/// doesn't filter yet (#1991). Each key space's step removes its arm once
-/// its build, apply and `self_check` read the predicate; until then define
-/// refuses here, after every other check, so the predicate's own refusals
-/// are reported first.
-pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), ValidationError> {
-    if matches!(def.predicate, Predicate::True) {
-        return Ok(());
-    }
-    let key_space = match &def.key_space {
-        KeySpace::OneToOne => "1-1",
-        KeySpace::Aggregate { .. } => return Ok(()),
-        KeySpace::Join(_) => "JOIN aggregate",
-        // Filtered at recompute (#2041): its validator checks the predicate.
-        KeySpace::JoinOneToOne(_) => return Ok(()),
-    };
-    Err(ValidationError::FilterNotYetSupported { key_space })
 }
 
 /// Refuses `MIN`/`MAX` in an aggregate whose `WHERE` is other than `TRUE`
@@ -2983,9 +2982,6 @@ pub fn validate_join(
     left: &HashMap<String, JoinColumnInfo>,
     joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
-    // A join aggregate's predicate is refused until its step (#2042) applies
-    // it; a 1-1 `JOIN`'s validator checks its own.
-    refuse_unsupported_filter(def)?;
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);
     }
@@ -3086,11 +3082,96 @@ pub fn validate_join(
         // is typed by its own side, since the two tables may share names.
         join_field_value_type(def, field, left, joined)?;
     }
+    if let Some(predicate) = def.predicate.filter() {
+        check_join_predicate(def, join, predicate, left, joined, &resolve)?;
+    }
     check_join_collation_reads(def, join, left, joined)?;
     // The target and each hidden table carry columns per field (two per
     // distinct aggregate argument in the partials).
     for (table, columns) in super::join::table_widths(def, left, joined[0]) {
         check_table_width(|| table, columns)?;
+    }
+    Ok(())
+}
+
+/// The checks of a join aggregate's `WHERE` (ADR-0019, "`WHERE`"): those of
+/// any predicate, as Postgres reads it over the join (no aggregate call,
+/// every column qualified and resolved through one of the two tables, type
+/// `boolean`, total), then the per-side rule: each top-level `AND` conjunct
+/// reads exactly one table, and under `LEFT` not the joined one.
+fn check_join_predicate<'a>(
+    def: &TransformDef,
+    join: &JoinSpec,
+    predicate: &Expr,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[&HashMap<String, JoinColumnInfo>],
+    resolve: &ResolveJoinColumn<'a>,
+) -> Result<(), ValidationError> {
+    let mut aggregate = None;
+    let mut unresolved = Ok(());
+    predicate.walk(&mut |e| match e {
+        Expr::FunctionCall { name, .. }
+            if aggregate.is_none() && super::registry::is_aggregate_name(name) =>
+        {
+            aggregate = Some(name.clone());
+        }
+        Expr::Column(column) if unresolved.is_ok() => {
+            unresolved = Err(ValidationError::JoinUnqualifiedColumn {
+                field: "WHERE".to_string(),
+                column: column.clone(),
+            });
+        }
+        Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } if unresolved.is_ok() => {
+            unresolved = resolve(&QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: column.clone(),
+            })
+            .map(|_| ());
+        }
+        _ => {}
+    });
+    if let Some(function) = aggregate {
+        return Err(ValidationError::AggregateInPredicate { function });
+    }
+    unresolved?;
+    let columns = ColumnTypes::Join { def, root, joined };
+    if !matches!(predicate, Expr::Null) {
+        let found = infer_expr_type_in("WHERE", predicate, &columns)?;
+        if found != ValueType::Boolean {
+            return Err(ValidationError::PredicateNotBoolean { found });
+        }
+    }
+    super::totality::check(predicate, &columns).map_err(|refused| {
+        ValidationError::PredicateNotTotal {
+            construct: refused.construct,
+            reason: refused.reason,
+        }
+    })?;
+    let left = super::join::first_joined(join).kind == super::ast::JoinKind::Left;
+    for conjunct in super::join::conjuncts(predicate) {
+        let text = || super::ast::render_field_expr(conjunct);
+        let sides = super::join::conjunct_sides(def, conjunct);
+        let mut sides = sides.into_iter();
+        match (sides.next(), sides.next()) {
+            (None, _) => {
+                return Err(ValidationError::JoinPredicateReadsNoColumn { conjunct: text() });
+            }
+            (Some(_), Some(_)) => {
+                return Err(ValidationError::JoinPredicateReadsBothSides { conjunct: text() });
+            }
+            (Some(side @ Side::Joined(_)), None) if left => {
+                return Err(ValidationError::JoinPredicateJoinedSideUnderLeft {
+                    conjunct: text(),
+                    table: super::join::side_table(def, join, side).to_string(),
+                });
+            }
+            (Some(_), None) => {}
+        }
     }
     Ok(())
 }
@@ -5577,7 +5658,7 @@ fn visit<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defs::ast::Operator;
+    use crate::defs::ast::{Operator, Predicate};
     use crate::defs::pg_type::PgType;
     use crate::error_code::Message as _;
     use crate::float::FloatWidth;
@@ -7621,6 +7702,125 @@ mod tests {
     fn check_text(text: &str) -> Result<(), ValidationError> {
         let (left, right) = tables();
         validate_join(&parse_text(text).unwrap(), &left, &[&right])
+    }
+
+    fn check_where(kind: &str, predicate: &str) -> Result<(), ValidationError> {
+        check_text(&format!(
+            "TRANSFORM t FROM orders {kind} items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT orders.region AS region, COUNT(*) AS n \
+             WHERE {predicate}"
+        ))
+    }
+
+    /// A join aggregate's `WHERE` is a conjunction of one-side filters
+    /// (ADR-0019): any conjunct over `orders`, under either kind; over
+    /// `items` under `INNER`; nested and parenthesised `AND`s split alike.
+    #[test]
+    fn a_join_aggregate_admits_one_side_conjuncts() {
+        for kind in ["JOIN", "INNER JOIN", "LEFT JOIN"] {
+            for predicate in [
+                "orders.total > 5",
+                "orders.region = 'eu' OR orders.total IS NULL",
+                "orders.total > 5 AND NOT orders.region = 'us'",
+            ] {
+                assert_eq!(check_where(kind, predicate), Ok(()), "{kind} {predicate}");
+            }
+        }
+        for predicate in [
+            "items.qty > 0",
+            "orders.total > 5 AND items.qty > 0",
+            "(orders.total > 5 AND items.qty > 0) AND (items.note IS NULL OR items.qty < 9)",
+            "items.order_id IS NOT NULL",
+        ] {
+            assert_eq!(check_where("JOIN", predicate), Ok(()), "{predicate}");
+        }
+    }
+
+    /// The three per-side refusals, by name, each naming its conjunct.
+    #[test]
+    fn a_join_aggregate_refuses_conjuncts_no_one_side_applies() {
+        for (kind, predicate, conjunct) in [
+            (
+                "JOIN",
+                "orders.total > 5 AND items.qty > orders.id",
+                "(items.qty > orders.id)",
+            ),
+            (
+                "JOIN",
+                "orders.total > 5 OR items.qty > 0",
+                "((orders.total > 5) OR (items.qty > 0))",
+            ),
+            (
+                "LEFT JOIN",
+                "NOT (orders.total > 5 AND items.qty > 0)",
+                "(NOT ((orders.total > 5) AND (items.qty > 0)))",
+            ),
+        ] {
+            assert_eq!(
+                check_where(kind, predicate),
+                Err(ValidationError::JoinPredicateReadsBothSides {
+                    conjunct: conjunct.to_string()
+                }),
+                "{predicate}"
+            );
+        }
+        for predicate in [
+            "items.qty > 0",
+            "orders.total > 5 AND items.order_id IS NULL",
+        ] {
+            let refused = check_where("LEFT JOIN", predicate);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(ValidationError::JoinPredicateJoinedSideUnderLeft { table, .. })
+                        if table == "items"
+                ),
+                "{predicate}: {refused:?}"
+            );
+            let text = refused.unwrap_err().to_string();
+            assert!(text.starts_with("T0244: WHERE: "), "{text}");
+            assert!(text.contains("INNER JOIN"), "{text}");
+        }
+        for predicate in [
+            "FALSE",
+            "(TRUE)",
+            "NULL",
+            "orders.total > 5 AND FALSE",
+            "1 = 1",
+        ] {
+            assert!(
+                matches!(
+                    check_where("JOIN", predicate),
+                    Err(ValidationError::JoinPredicateReadsNoColumn { .. })
+                ),
+                "{predicate}: {:?}",
+                check_where("JOIN", predicate)
+            );
+        }
+    }
+
+    /// The predicate's own checks run first, as for any `WHERE`: qualified
+    /// and resolved columns, `boolean`, no aggregate, total.
+    #[test]
+    fn a_join_aggregate_predicate_is_checked_like_any_where() {
+        assert!(matches!(
+            check_where("JOIN", "total > 5"),
+            Err(ValidationError::JoinUnqualifiedColumn { field, .. }) if field == "WHERE"
+        ));
+        assert!(matches!(
+            check_where("JOIN", "items.nope > 5"),
+            Err(ValidationError::JoinUnresolvedColumn { .. })
+        ));
+        assert!(matches!(
+            check_where("JOIN", "orders.total + 1"),
+            Err(ValidationError::PredicateNotBoolean { .. })
+        ));
+        assert!(matches!(
+            check_where("JOIN", "items.qty * 2 > 5"),
+            Err(ValidationError::PredicateNotTotal { .. })
+        ));
+        let text = check_where("JOIN", "total > 5").unwrap_err().to_string();
+        assert!(text.contains("the WHERE predicate"), "{text}");
     }
 
     #[test]

@@ -244,11 +244,14 @@ const ASSIGNED: &[&str] = &[
     "T0235 ValidationError::AggregateInPredicate",
     "T0236 ValidationError::PredicateColumnNotFound",
     "T0237 ValidationError::PredicateNotTotal",
-    "T0238 ValidationError::FilterNotYetSupported",
+    "T0238 retired: no key space refuses a WHERE any more",
     "T0239 ValidationError::FilteredExtreme",
     "T0240 ParseError::UnsupportedAggregateModifier",
     "T0241 ValidationError::EnumLiteralNotALabel",
     "T0242 CatalogError::OutsideDependentsBlock",
+    "T0243 ValidationError::JoinPredicateReadsBothSides",
+    "T0244 ValidationError::JoinPredicateJoinedSideUnderLeft",
+    "T0245 ValidationError::JoinPredicateReadsNoColumn",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

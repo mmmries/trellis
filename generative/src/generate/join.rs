@@ -52,7 +52,9 @@
 //! In a quarter of the cases the aggregate arguments `ja.x` and `jb.y` are
 //! `numeric(14,2)` instead of `integer` ([`with_numeric_args`]) and a value is
 //! the numeric `NaN` now and then ([`JOIN_NAN`]), so `SUM`/`AVG` over a
-//! column that admits `NaN` runs through the join's partials too.
+//! column that admits `NaN` runs through the join's partials too. In three
+//! of ten others they are `real`, `double precision` or `interval`
+//! ([`with_exact_args`], [`super::exact_sums`]).
 //!
 //! The tables are unpartitioned and no definition reads another's target;
 //! partitioned sides are a separate draw dimension, and the chained-reader
@@ -118,6 +120,46 @@ pub fn with_numeric_args(mut program: Program) -> Program {
             .filter(|c| c.name == column)
         {
             col.value_type = ValueType::Numeric;
+        }
+    }
+    program
+}
+
+/// `program` with the two aggregate arguments, `ja.x` and `jb.y`, of
+/// `sum_type` (#1119) instead of `integer`, each drawn value written as
+/// [`super::exact_sums::join_value`] maps it (with `specials`, `NaN` and
+/// the infinities among them).
+pub fn with_exact_args(
+    mut program: Program,
+    sum_type: super::exact_sums::SumType,
+    specials: bool,
+) -> Program {
+    for (table, column) in [(FROM_TABLE, "x"), (JOINED_TABLE, "y")] {
+        for col in program
+            .tables
+            .iter_mut()
+            .filter(|t| t.name == table)
+            .flat_map(|t| t.columns.iter_mut())
+            .filter(|c| c.name == column)
+        {
+            col.value_type = sum_type.value_type();
+        }
+    }
+    let map = |cells: &mut Vec<(String, Option<String>)>| {
+        for (column, value) in cells.iter_mut() {
+            if column == "x" || column == "y" {
+                *value = value.as_deref().map(|v| {
+                    let v: i8 = v.parse().expect("a drawn integer value");
+                    super::exact_sums::join_value(sum_type, v, specials)
+                });
+            }
+        }
+    };
+    for op in &mut program.ops {
+        match op {
+            Op::Insert { row, .. } => map(row),
+            Op::Update { changes, .. } => map(changes),
+            _ => {}
         }
     }
     program
@@ -1063,6 +1105,29 @@ pub(crate) mod strategy {
                                 spec.fields.retain(|f| *f != JoinField::SumXPlusOne);
                             }
                         }
+                        // A float or `interval` argument (#1119) where the
+                        // arguments aren't `numeric`. The oracle sums a
+                        // top-level `SUM`/`AVG` exactly, so the composed and
+                        // expression fields are dropped.
+                        // Derived from a draw rather than drawn, so every
+                        // case draws what it drew before the arm existed.
+                        let sums = super::super::exact_sums::join_sums_of(draws[0].pick)
+                            .filter(|_| !numeric_args);
+                        if sums.is_some() {
+                            for spec in &mut specs {
+                                spec.fields.retain(|f| {
+                                    !matches!(
+                                        f,
+                                        JoinField::SumXPlusOne
+                                            | JoinField::CoalesceSumY
+                                            | JoinField::SumXPlusSumY
+                                    )
+                                });
+                                if spec.fields.is_empty() {
+                                    spec.fields.push(JoinField::SumX);
+                                }
+                            }
+                        }
                         let mut case = join_case(
                             &specs,
                             shape,
@@ -1075,6 +1140,9 @@ pub(crate) mod strategy {
                         );
                         if numeric_args {
                             case.program = with_numeric_args(case.program);
+                        }
+                        if let Some((sum_type, specials)) = sums {
+                            case.program = with_exact_args(case.program, sum_type, specials);
                         }
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);

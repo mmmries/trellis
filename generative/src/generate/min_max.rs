@@ -58,6 +58,9 @@
 //! table, and one definition may install part way through (a build over
 //! rows). The housekeeping (the zero-group GC) runs on a short cadence.
 //!
+//! Half the cases also sum `real`, `double precision` and `interval`
+//! columns ([`super::exact_sums::with_plain_sums`]).
+//!
 //! The oracle is each definition's own `GROUP BY` query
 //! (`crate::oracle`), and every burst is audited by a `Strict` `self_check`.
 
@@ -717,6 +720,15 @@ pub fn min_max_table() -> Table {
 ///
 /// If `draws.defs` is empty, or a definition has no `MIN`/`MAX` field.
 pub fn build_min_max_program(draws: &MinMaxDraws) -> Program {
+    build_min_max_program_with(draws, None)
+}
+
+/// [`build_min_max_program`], with the exact-sum arm `sums` (#1119,
+/// [`super::exact_sums::with_plain_sums`]) when drawn.
+pub fn build_min_max_program_with(
+    draws: &MinMaxDraws,
+    sums: Option<&super::exact_sums::PlainSumsDraw>,
+) -> Program {
     assert!(
         !draws.defs.is_empty() && draws.defs.iter().all(|d| !d.extremes.is_empty()),
         "every min_max definition has a MIN or MAX field — a generator bug"
@@ -809,6 +821,9 @@ pub fn build_min_max_program(draws: &MinMaxDraws) -> Program {
         restart_after_ops: Vec::new(),
         scale_out_after_ops: Vec::new(),
     };
+    if let Some(sums) = sums {
+        program = super::exact_sums::with_plain_sums(program, TABLE, sums);
+    }
     if let Some((def, at)) = draws.deferred
         && program.defs.len() > 1
         && program.ops.len() > 2
@@ -825,7 +840,15 @@ pub fn build_min_max_program(draws: &MinMaxDraws) -> Program {
 /// program, issued in bursts of `draws.burst_size` over `draws.lanes`
 /// lanes, with the drawn mid-burst actions and stalls.
 pub fn build_min_max_case(draws: &MinMaxDraws) -> ConcurrentCase {
-    let program = build_min_max_program(draws);
+    build_min_max_case_with(draws, None)
+}
+
+/// [`build_min_max_case`] over [`build_min_max_program_with`]'s program.
+pub fn build_min_max_case_with(
+    draws: &MinMaxDraws,
+    sums: Option<&super::exact_sums::PlainSumsDraw>,
+) -> ConcurrentCase {
+    let program = build_min_max_program_with(draws, sums);
     let mut plan = concurrent_plan(&program, draws.burst_size, draws.lanes);
     plan.steady_load = Some(SteadyLoad {
         pace: std::time::Duration::from_micros(draws.pace_micros),
@@ -857,6 +880,7 @@ mod strategy {
     use proptest::prelude::*;
 
     use super::super::ActionKind;
+    use super::super::exact_sums::plain_sums_of;
     use super::*;
 
     /// One definition of the shape (see the module doc).
@@ -947,23 +971,29 @@ mod strategy {
                         commit_stall,
                     ),
                 )| {
-                    build_min_max_case(&MinMaxDraws {
-                        seed,
-                        defs,
-                        deferred,
-                        seed_rows,
-                        ops,
-                        truncates: truncates.unwrap_or(0),
-                        burst_size,
-                        lanes,
-                        workers,
-                        seal_interval_ms: seal,
-                        housekeeping_interval_ms: housekeeping,
-                        pace_micros: pace,
-                        actions,
-                        entry_stall_seals: entry_stall.map(|s| s as u32),
-                        commit_stall_ms: commit_stall,
-                    })
+                    // Derived from the seed rather than drawn, so every
+                    // case draws what it drew before the arm existed.
+                    let sums = plain_sums_of(seed);
+                    build_min_max_case_with(
+                        &MinMaxDraws {
+                            seed,
+                            defs,
+                            deferred,
+                            seed_rows,
+                            ops,
+                            truncates: truncates.unwrap_or(0),
+                            burst_size,
+                            lanes,
+                            workers,
+                            seal_interval_ms: seal,
+                            housekeeping_interval_ms: housekeeping,
+                            pace_micros: pace,
+                            actions,
+                            entry_stall_seals: entry_stall.map(|s| s as u32),
+                            commit_stall_ms: commit_stall,
+                        },
+                        sums.as_ref(),
+                    )
                 },
             )
     }

@@ -126,6 +126,7 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
+pub mod exact_sums;
 pub mod held_keys;
 pub mod join;
 pub mod join_chained;

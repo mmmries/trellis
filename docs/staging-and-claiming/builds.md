@@ -33,12 +33,13 @@ an aggregate's sides commute and need no such rule.
    doesn't reorder the ranges.
 2. **Chunk.** One short transaction per range
    (`staging::build::one_to_one`): it reads the range's keys, leaving out the
-   ones quarantined for the definition and any with a `NULL` part; locks
+   ones quarantined for the definition, any with a `NULL` part and any whose
+   row fails the `WHERE`; locks
    their entries in key order as a page does (an entry for each key with
    none, then the others `for update`); then one statement takes
    `pg_current_snapshot()` and the active segment, reads the source rows and
    rewrites the entries (basis := that snapshot, `__applied_lsn` left alone,
-   a key with no row a tombstone) and the target rows. A change the snapshot
+   a key with no member row a tombstone) and the target rows. A change the snapshot
    saw is refused when it drains; one it didn't applies over the entry the
    chunk wrote. A key a page inserted after the chunk read its keys isn't
    locked, and its own change applies it.

@@ -18,6 +18,7 @@ use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use generative::run::{ConcurrentShape, Coverage};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
+use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, ValueType};
 
 /// `ValueType` has no `Hash` impl (it's an engine type, not owned by this
@@ -330,11 +331,11 @@ fn awkward_values_draw_numeric_nan_on_insert_and_update_only_when_on() {
     );
 }
 
-/// The `JOIN` tier's cases draw the numeric `NaN` only into the aggregate
-/// arguments of a case whose `ja.x`/`jb.y` are `numeric` (an `integer`
-/// column refuses it), such a case carries no `SUM(ja.x + 1)` (define
-/// refuses a sum over an unconstrained `numeric`), and both kinds of case
-/// are drawn.
+/// The `JOIN` tier's cases draw `NaN` only into the aggregate arguments of
+/// a case whose `ja.x`/`jb.y` are `numeric` or a float (#1119; an `integer`
+/// column refuses it), a `numeric` case carries no `SUM(ja.x + 1)` (define
+/// refuses a sum over an unconstrained `numeric`), and both `numeric` and
+/// `integer` cases are drawn.
 #[test]
 fn join_cases_draw_nan_only_into_numeric_arguments() {
     let mut runner = TestRunner::default();
@@ -365,7 +366,7 @@ fn join_cases_draw_nan_only_into_numeric_arguments() {
                     .all(|def| def.fields.iter().all(|f| f.name != "sx1")),
                 "a numeric case keeps SUM(ja.x + 1)"
             );
-        } else {
+        } else if column_type("ja", "x") == Some(ValueType::Integer(IntWidth::Int4)) {
             integer_cases += 1;
         }
         for op in &program.ops {
@@ -377,9 +378,11 @@ fn join_cases_draw_nan_only_into_numeric_arguments() {
             for (column, value) in cells {
                 if value.as_deref() == Some("NaN") {
                     nans += 1;
-                    assert_eq!(
-                        column_type(table, column),
-                        Some(ValueType::Numeric),
+                    assert!(
+                        matches!(
+                            column_type(table, column),
+                            Some(ValueType::Numeric | ValueType::Float(_))
+                        ),
                         "NaN written to {table}.{column}"
                     );
                 }

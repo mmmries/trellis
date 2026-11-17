@@ -325,9 +325,7 @@ fn verdict(predicate: &str, columns: &HashMap<String, ValueType>) -> Verdict {
         return Verdict::Other;
     };
     match validate(&def, columns) {
-        // The predicate's checks run first; this refusal follows them until
-        // the 1-1 key space applies a filter.
-        Ok(()) | Err(ValidationError::FilterNotYetSupported { .. }) => Verdict::Admitted,
+        Ok(()) => Verdict::Admitted,
         Err(ValidationError::PredicateNotTotal { .. }) => Verdict::NotTotal,
         Err(_) => Verdict::Other,
     }
