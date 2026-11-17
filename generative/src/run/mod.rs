@@ -600,7 +600,7 @@ pub async fn run_convergence_bursty<B: Backend>(
 
 /// `program`'s ops in bursts of up to `burst_size` consecutive ops, split
 /// early so no burst both brings a leaf into a tree that may hold a `DEFAULT`
-/// (a new leaf, or an attach) and removes it again (a detach or drop): the
+/// (a new leaf or middle, or an attach) and removes it again (a detach or drop): the
 /// second op starts a new burst. [`run_convergence_bursty`] settles between
 /// bursts, which waits for the reconcile pass that records the leaf, so a
 /// leaf beside a `DEFAULT` is never created and removed between two passes
@@ -639,7 +639,10 @@ fn bursts(program: &Program, burst_size: usize) -> Vec<&[Op]> {
         }
         if let Op::Partition {
             table,
-            action: PartitionAction::Attach { leaf, .. } | PartitionAction::Create { leaf, .. },
+            action:
+                PartitionAction::Attach { leaf, .. }
+                | PartitionAction::Create { leaf, .. }
+                | PartitionAction::CreateMiddle { middle: leaf, .. },
             ..
         } = op
         {
@@ -839,6 +842,23 @@ mod tests {
         };
         assert_eq!(sizes(without, 20), vec![10]);
         assert_eq!(sizes(without, 4), vec![4, 4, 2]);
+        // A new middle joins the tree like a new leaf.
+        let middle = vec![
+            ddl(PartitionAction::CreateMiddle {
+                middle: "t0_m1".into(),
+                bound: "for values in (1)".into(),
+                leaves: vec![("t0_m1_d".into(), "default".into())],
+                rows: Vec::new(),
+                standalone: false,
+            }),
+            ddl(PartitionAction::Detach {
+                leaf: "t0_m1".into(),
+                concurrently: false,
+            }),
+        ];
+        let program = partitioned(with_default, middle);
+        let sizes: Vec<usize> = bursts(&program, 20).iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![1, 1]);
     }
 
     /// Design doc §6: only `Ran` passes. Fast, no database —
