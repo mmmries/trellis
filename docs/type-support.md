@@ -193,7 +193,9 @@ per value. So:
   through `COALESCE`, a `CASE` result or another field: such a collation's `=`
   calls two different texts equal. `IS [NOT] NULL` accepts any column.
 - **`char(n)`** is treated as `text` but is not on the key allowlist: its
-  blank-padding is a hazard, not a volatility one.
+  blank-padding is a hazard, not a volatility one. A string literal compared
+  with one, or beside one in `COALESCE`, `NULLIF` or a `CASE`, is a `char(n)`,
+  as Postgres types it: `ch = 'ab  '` ignores trailing blanks.
 
 What happens when a collation changes after define is in
 [capture drift](staging-and-claiming/capture-drift.md#a-re-typed-key-column-or-an-outgrown-copy),

@@ -618,7 +618,7 @@ pub(crate) struct CollationRefusingRead {
 }
 
 /// A column an expression reads, with the qualifier it was written with.
-type ReadColumn = (Option<QualifiedColumn>, String);
+pub(crate) type ReadColumn = (Option<QualifiedColumn>, String);
 
 /// Every column an argument of a `STRPOS`/`REGEXP_COUNT` call in `def`'s
 /// fields reads, for the catalog to check each
@@ -730,7 +730,7 @@ fn collect_text_comparison(
 /// calculated field it reads, and the arguments of `COALESCE` and `NULLIF`
 /// and the results (not the conditions) of a `CASE`. Anything else (a call,
 /// an operator) returns a value of another type or a computed one.
-fn collect_value_columns<'a>(
+pub(crate) fn collect_value_columns<'a>(
     expr: &Expr,
     field: &str,
     fields_by_name: &HashMap<&str, &'a FieldDef>,
