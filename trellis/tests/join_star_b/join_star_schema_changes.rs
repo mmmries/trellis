@@ -634,33 +634,105 @@ async fn a_column_retyped_to_a_type_evaluated_differently_pauses_and_resume_rebu
 
 /// A column only the `WHERE` reads (`a.y`; the fields read `x` and `w`)
 /// retyped to a type the predicate evaluates differently (`text` to `integer`;
-/// `y IS NOT NULL` still types) pauses the transform naming the column,
-/// since membership would change; `RESUME` re-types the copy and rebuilds.
+/// `y IS NOT NULL` still types) pauses the transform naming the column, since
+/// membership would change. The rewrite also turns one `y` to `NULL`, which no
+/// row change carries, so the target matches the live join after `RESUME`
+/// only by its rebuild.
 #[tokio::test]
 async fn a_column_only_the_where_reads_retyped_to_another_evaluation_pauses_and_resume_rebuilds() {
     for star in stars(Shape::TWO) {
         let star = star.filtered("a.y IS NOT NULL");
-        let mut d = built_with(
-            star,
-            &star.definition_with("a.x + COALESCE(b1.w, 0) AS total"),
-        )
-        .await;
+        let definition = star.definition_with("a.x + COALESCE(b1.w, 0) AS total");
+        let mut d = built_with(star, &definition).await;
         let target = star.target();
         pass(&mut d).await;
         assert_unpaused(&d, &target, "the first pass").await;
         write(
             &d,
-            "alter table public.a alter column y type integer using y::integer",
+            "alter table public.a alter column y type integer using nullif(y::integer, 2)",
         )
         .await;
         pass(&mut d).await;
         let error = paused_for(&d, &target, "public.a", &["y"]).await;
         assert!(error.contains("changed type"), "{}: {error}", star.name());
         resume(&d, &star.name()).await;
-        pass(&mut d).await;
-        d.settle().await;
-        assert_unpaused(&d, &target, "the resume").await;
+        assert_live_join(&mut d, star, &definition, "the resume").await;
+        star::step(&mut d, "update public.a set y = null where id = 3").await;
+        assert_live_join(&mut d, star, &definition, "a change after the resume").await;
     }
+}
+
+/// A column of the joined table only the `WHERE` reads (`{b}.tag`; the fields
+/// read `x` and `w`) retyped to a type the predicate evaluates differently
+/// (`text` to `integer`; `tag IS NOT NULL` still types) pauses the transform
+/// naming the column, as for `a`. The rewrite turns `b`'s key-20 row's `tag`
+/// to `NULL`, which no row change carries, so the target matches the live join
+/// after `RESUME` only by its rebuild.
+#[tokio::test]
+async fn a_joined_column_only_the_where_reads_retyped_to_another_evaluation_pauses_and_resume_rebuilds()
+ {
+    for shape in SHAPES {
+        for star in stars(shape) {
+            let star = star.filtered("{b}.tag IS NOT NULL");
+            let b = shape.b();
+            let at = format!("b{}", shape.at);
+            let definition = star.definition_with(&format!("a.x + COALESCE({at}.w, 0) AS total"));
+            let mut d = built_with(star, &definition).await;
+            let target = star.target();
+            pass(&mut d).await;
+            assert_unpaused(&d, &target, "the first pass").await;
+            write(
+                &d,
+                &format!(
+                    "alter table {b} alter column tag type integer \
+                     using nullif(right(tag, 1)::integer, 2)"
+                ),
+            )
+            .await;
+            pass(&mut d).await;
+            let error = paused_for(&d, &target, &b, &["tag"]).await;
+            assert!(error.contains("changed type"), "{}: {error}", star.name());
+            resume(&d, &star.name()).await;
+            assert_live_join(&mut d, star, &definition, "the resume").await;
+            star::step(&mut d, &format!("update {b} set tag = null where id = 3")).await;
+            assert_live_join(&mut d, star, &definition, "a change after the resume").await;
+        }
+    }
+}
+
+/// Runs a staging-worker pass and the pending builds, then asserts `star`'s
+/// transform is live and its target's `(id, total)` equal what `definition`'s
+/// join gives now. For a definition whose only field is `total`, which the
+/// star oracle (it reads [`Star::definition`]'s fields) doesn't cover.
+async fn assert_live_join(d: &mut Driver, star: Star, definition: &str, step: &str) {
+    pass(d).await;
+    trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+    d.settle().await;
+    assert_unpaused(d, &star.target(), step).await;
+    let rest = &definition[definition.find(" FROM ").expect("FROM")..];
+    let (from, rest) = rest.split_at(rest.find(" SELECT ").expect("SELECT"));
+    let (fields, filter) = rest[" SELECT ".len()..]
+        .split_at(rest.find(" WHERE ").unwrap_or(rest.len()) - " SELECT ".len());
+    let total = fields.strip_suffix(" AS total").expect("one field, total");
+    let ctl = &d.ctl;
+    let rows = |sql: String| async move {
+        ctl.query(&sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)))
+            .collect::<Vec<_>>()
+    };
+    let target = rows(format!(
+        "select id::int8, total::int8 from {} order by 1",
+        star.target()
+    ))
+    .await;
+    let live = rows(format!(
+        "select a.id::int8, ({total})::int8{from}{filter} order by 1"
+    ))
+    .await;
+    assert_eq!(target, live, "{} after {step}", star.name());
 }
 
 // ----------------------------------------------------------------- the tables
