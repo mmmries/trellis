@@ -10,6 +10,7 @@ mod group_basis_alias_columns;
 mod group_basis_build;
 mod group_basis_chained;
 mod group_basis_collation;
+mod group_basis_float_interval;
 mod group_basis_interleavings;
 mod group_basis_min_max;
 mod group_basis_min_max_index;

@@ -177,3 +177,7 @@ conservative for a consumer that subtracts or reports unapplied rows, so
 them from a comparison (ADR-0013, "Quiescence"). That read is never wired into
 `converged_through` or any other fenced read: the strict predicate above and a loose
 view stay separate.
+
+A 1-1 page expects a key as the old image of its earliest unapplied change. It can't
+vouch for a key with no ledger entry whose earliest unapplied change has one: a build
+read the source past that change.

@@ -153,8 +153,6 @@ async fn a_plain_aggregate_outside_the_admitted_set_is_refused_at_define_by_fami
     for (field, family) in [
         ("BOOL_AND(ok)", "bool_and/bool_or/bit_and/bit_or"),
         ("ARRAY_AGG(val)", "array_agg/string_agg/jsonb_agg"),
-        ("SUM(f)", "float and interval SUM/AVG"),
-        ("AVG(f)", "float and interval SUM/AVG"),
     ] {
         let err = install_definition(
             &db.pool,

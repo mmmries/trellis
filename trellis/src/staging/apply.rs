@@ -37,7 +37,7 @@ use crate::defs::ast::KeySpace;
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::validate::ValidationError;
-use crate::error_code::{self, ErrorCode, ErrorId};
+use crate::error_code::{self, ErrorCode, ErrorId, SharedCondition};
 use crate::pool::{Pool, jsonb_build_object_sql, quote_ident, quote_literal};
 
 use super::append;
@@ -371,7 +371,7 @@ impl ApplyError {
             ApplyError::DefinitionNotLive { .. } => ErrorId(174),
             ApplyError::ColumnAwaitingCapture { .. } => ErrorId(175),
             ApplyError::Intake(err) => err.error_id(),
-            ApplyError::TransformNotFound { .. } => ErrorId(176),
+            ApplyError::TransformNotFound { .. } => SharedCondition::TransformNotFound.error_id(),
             ApplyError::TransformNotPaused { .. } => ErrorId(177),
             ApplyError::KeyNotHeld { .. } => ErrorId(178),
             ApplyError::ReleaseLockTimeout { .. } => ErrorId(179),
@@ -2985,6 +2985,9 @@ pub(super) async fn compute_page(
                                         def.id,
                                     ),
                                 )
+                                .await?;
+                            shape
+                                .read_key_types(&**client, def.id, &def.source_table)
                                 .await?;
                             ddl::identity_key_columns(&**client, &def.target_table).await?
                         };

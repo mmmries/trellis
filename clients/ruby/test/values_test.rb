@@ -44,7 +44,7 @@ class ValuesTest < Minitest::Test
       drain_failure: nil,
       source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
-      below_catalog_floor: nil, join: nil,
+      below_catalog_floor: nil, maintenance_refusals: [], join: nil,
       floor: "0.2.0", filter: nil
     ), status
   end
@@ -78,7 +78,7 @@ class ValuesTest < Minitest::Test
       drain_failure: nil,
       source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
-      below_catalog_floor: nil, join: nil,
+      below_catalog_floor: nil, maintenance_refusals: [], join: nil,
       floor: "0.2.0", filter: nil
     ), status
   end
@@ -226,6 +226,22 @@ class ValuesTest < Minitest::Test
     )
     assert_equal Trellis::BelowCatalogFloor.new(floor: "0.3.0", this_version: "0.2.0"),
                  status.below_catalog_floor
+  end
+
+  def test_a_refused_maintenance_step_becomes_a_value_naming_what_to_grant
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil,
+      version_handover: nil, below_catalog_floor: nil,
+      maintenance_refusals: [{ step: "retire_drained_segments", role: "worker", object: "seg_0",
+                               missing: ["TRUNCATE"], error: "permission denied for table seg_0" }],
+      join: nil, floor: "0.2.0"
+    )
+    assert_equal [Trellis::RefusedStep.new(step: "retire_drained_segments", role: "worker",
+                                           object: "seg_0", missing: ["TRUNCATE"],
+                                           error: "permission denied for table seg_0")],
+                 status.maintenance_refusals
   end
 
   def test_a_join_status_keeps_its_tables_warnings_and_build_step

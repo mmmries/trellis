@@ -13,14 +13,9 @@ defmodule Trellis.Metrics do
   handle and 0 after its last one shuts down; the other gauges of a stopped
   instance disappear after 60 seconds. See `docs/observability.md`.
 
-  The binding opens no port. Serve the text from a route the host already
-  has, for example with Plug:
-
-      get "/metrics" do
-        conn
-        |> put_resp_content_type("text/plain; version=0.0.4")
-        |> send_resp(200, Trellis.Metrics.render_prometheus())
-      end
+  The binding opens no port. With `:plug` in the host's deps,
+  `Trellis.Metrics.Plug` serves the text and `Trellis.Metrics.Appender` adds
+  it to an exporter's route.
   """
 
   alias Trellis.Native

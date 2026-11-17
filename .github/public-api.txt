@@ -193,6 +193,7 @@ struct PendingCall
 struct PoisonEntry
 struct PoisonSample
 struct QuarantineEntry
+struct RefusedStep
 struct SchemaDump
 struct SelfCheckJob
 struct SelfCheckReport

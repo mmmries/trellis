@@ -27,6 +27,8 @@
 //! - `s…`: the sweep's bound (#2027): an `R` entry written after the build's
 //!   start and before its `M` pass, whose `a` row is gone at its chunk, by a
 //!   page and by an earlier build's chunk, and in a fresh build.
+//! - A row the build read past its undrained change (#2032): `self_check`
+//!   can't vouch for its key until the change drains.
 
 use crate::support::drain_driver;
 
@@ -1717,5 +1719,170 @@ async fn a_sweep_killed_in_its_orphan_pass_resumes_from_its_cursor() {
             .await
             .expect("free the dead worker's claim");
         assert_oracle(&mut d, &[kind], "a killed sweep").await;
+    }
+}
+
+/// One comparison of `kind`'s target, every part and page, with no wait and
+/// no re-check: the divergences and whether each falls on a key the pass
+/// couldn't vouch for (what makes `Standard` re-check it).
+async fn compare_all(
+    d: &Driver,
+    kind: Kind,
+) -> (
+    Vec<trellis::staging::self_check::Divergence>,
+    Vec<String>,
+    bool,
+) {
+    use trellis::staging::self_check::{SelfCheckScope, compare_page};
+    let (mut found, mut uncertain, mut all) = (Vec::new(), Vec::new(), false);
+    let mut after = None;
+    loop {
+        let page = compare_page(
+            d.pool(),
+            &kind.target(),
+            SelfCheckScope { after, limit: 100 },
+        )
+        .await
+        .expect("a comparison");
+        found.extend(page.divergences);
+        uncertain.extend(page.uncertain_keys);
+        all |= page.uncertain_all;
+        after = page.next_after;
+        if after.is_none() {
+            uncertain.sort();
+            uncertain.dedup();
+            return (found, uncertain, all);
+        }
+    }
+}
+
+fn divergence_key(d: &trellis::staging::self_check::Divergence) -> Option<&str> {
+    use trellis::staging::self_check::Divergence;
+    match d {
+        Divergence::Cell { key, .. }
+        | Divergence::MissingRow { key }
+        | Divergence::ExtraRow { key } => Some(key),
+        _ => None,
+    }
+}
+
+/// A build reads `a` and `b` as they are now (#2032, #2028). After `RESUME`
+/// empties `R` and `M`, a row inserted and drained while the definition
+/// waits for its build, then updated and deleted with those changes still in
+/// the ring, gets no entry from the build: the "as applied" view rebuilds it
+/// from the update's old image. Until those changes drain, the comparison
+/// can't vouch for the key (ADR-0013), on `R` and on `M`, so `Standard`
+/// re-checks it rather than reporting it from one pass. Once they drain, the
+/// key has its tombstone and every part is exact again. A genuinely lost
+/// entry with nothing pending is still reported from one pass.
+#[tokio::test]
+async fn a_key_the_build_read_past_its_undrained_change_is_uncertain_until_it_drains() {
+    use trellis::dev::staging::one_to_one_join_snapshot::hidden_snapshot;
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        let t = trellis(&d).await;
+        t.apply(&format!("PAUSE TRANSFORM {}", kind.name()))
+            .await
+            .expect("pause");
+        t.apply(&format!("RESUME TRANSFORM {}", kind.name()))
+            .await
+            .expect("resume");
+        step(
+            &mut d,
+            "insert into public.a values ('a99', 99, 1, 's99'); \
+             insert into public.b values (9, 90, 900, 'k9')",
+        )
+        .await;
+        write(
+            &d,
+            "update public.a set r = 2 where id = 'a99'; update public.b set img = 901 where bid = 9",
+        )
+        .await;
+        write(
+            &d,
+            "delete from public.a where id = 'a99'; delete from public.b where bid = 9",
+        )
+        .await;
+        let pending = d.seal().await;
+        trellis::intake::harness::start_registered_builds(d.pool())
+            .await
+            .expect("start the resumed build");
+        run_until_live(&d, kind).await;
+
+        let s = hidden_snapshot(d.pool(), &kind.target())
+            .await
+            .expect("a snapshot")
+            .expect("not skipped");
+        assert!(s.status == "live" && !s.building, "{kind:?}: {}", s.status);
+        assert!(
+            !s.from_entries.iter().any(|e| e.key == "a99"),
+            "{kind:?}: the build wrote no R entry for a99"
+        );
+        assert!(
+            !s.joined_entries.iter().any(|e| e.key == "9"),
+            "{kind:?}: the build wrote no M entry for 9"
+        );
+        assert!(
+            s.from_applied.rows.iter().any(|(k, _)| k == "a99"),
+            "{kind:?}: a as applied rebuilds a99 from the update's old image"
+        );
+        assert!(
+            s.from_applied.uncertain.contains("a99"),
+            "{kind:?}: a99 is uncertain on R at the flip: {:?}",
+            s.from_applied.uncertain
+        );
+        assert!(
+            s.joined_applied.uncertain.contains("9"),
+            "{kind:?}: 9 is uncertain on M at the flip: {:?}",
+            s.joined_applied.uncertain
+        );
+        let (found, uncertain, all) = compare_all(&d, kind).await;
+        assert!(
+            !found.is_empty(),
+            "{kind:?}: a99's R part differs at the flip"
+        );
+        for divergence in &found {
+            let covered =
+                all || divergence_key(divergence).is_some_and(|k| uncertain.iter().any(|u| u == k));
+            assert!(
+                covered,
+                "{kind:?}: {divergence:?} at the flip is on a key the pass vouched for \
+                 (uncertain {uncertain:?}, all {all})"
+            );
+        }
+
+        d.drain(pending, "page").await;
+        let s = hidden_snapshot(d.pool(), &kind.target())
+            .await
+            .expect("a snapshot")
+            .expect("not skipped");
+        assert!(
+            s.from_entries.iter().any(|e| e.key == "a99" && e.tombstone),
+            "{kind:?}: the drained delete tombstones a99"
+        );
+        assert!(
+            s.from_applied.uncertain.is_empty() && s.joined_applied.uncertain.is_empty(),
+            "{kind:?}: nothing is uncertain once drained"
+        );
+        assert_eq!(
+            compare_all(&d, kind).await,
+            (vec![], vec![], false),
+            "{kind:?} after the drain"
+        );
+        assert_oracle(&mut d, &[kind], "the drained build").await;
+
+        // A lost `R` entry with nothing pending is reported, exactly.
+        let id = definition_id(&d, kind).await;
+        write(
+            &d,
+            &format!("delete from {DEFAULT_SCHEMA}.join1_{id}_r where __from_key = 'a01'"),
+        )
+        .await;
+        let (found, uncertain, all) = compare_all(&d, kind).await;
+        assert!(
+            found.iter().any(|f| divergence_key(f) == Some("a01")),
+            "{kind:?}: the lost entry is reported: {found:?}"
+        );
+        assert_eq!((uncertain, all), (vec![], false), "{kind:?}");
     }
 }

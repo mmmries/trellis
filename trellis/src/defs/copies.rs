@@ -8,7 +8,8 @@
 //!   typed as the source column they copy;
 //! - an aggregate target's `GROUP BY` columns, typed as the key's value
 //!   family ([`super::ddl::pg_type_name`]: `integer`, `bigint`, `text`,
-//!   `numeric`);
+//!   `numeric`), a field reading a `char(n)` or `name` key as its source
+//!   type (`staging::group_basis::GroupShape::key_reads`);
 //! - a `JOIN` target's `GROUP BY` columns, and the same columns of its
 //!   hidden `T` table, typed as the column of the side each comes from, and
 //!   each side's hidden partials table's `GROUP BY` and join-key columns and

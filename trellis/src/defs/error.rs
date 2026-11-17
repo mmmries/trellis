@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::error_code::{ErrorCode, ErrorId};
+use crate::error_code::{ErrorCode, ErrorId, SharedCondition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -187,7 +187,9 @@ impl ParseError {
             ParseError::UnsupportedIsForm { .. } => ErrorId(25),
             ParseError::NotChainTooLong { .. } => ErrorId(26),
             ParseError::SimpleCaseUnsupported => ErrorId(27),
-            ParseError::UnsupportedLiteralType { .. } => ErrorId(28),
+            ParseError::UnsupportedLiteralType { .. } => {
+                SharedCondition::UnsupportedLiteralType.error_id()
+            }
             ParseError::UnsupportedCastOperator => ErrorId(29),
             ParseError::ExpressionTooDeep { .. } => ErrorId(30),
             ParseError::MalformedDefinitionAddress { .. } => ErrorId(31),

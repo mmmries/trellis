@@ -75,11 +75,11 @@ use trellis_embed::{
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainExtremeIndexGap,
     PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
     PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
-    PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    index_role_names, quarantine_state_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    PlainRefusedStep, PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport,
+    PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
+    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// An error as it crosses: `{code, error_id, message}`, `error_id` `nil` for
@@ -241,6 +241,7 @@ struct StatusTerm {
     build_wait_xid: Option<i64>,
     version_handover: Option<VersionHandoverTerm>,
     below_catalog_floor: Option<BelowCatalogFloorTerm>,
+    maintenance_refusals: Vec<RefusedStepTerm>,
     join: Option<JoinStatusTerm>,
     floor: String,
     filter: Option<String>,
@@ -400,6 +401,29 @@ impl From<PlainBelowCatalogFloor> for BelowCatalogFloorTerm {
         BelowCatalogFloorTerm {
             floor: seen.floor,
             this_version: seen.this_version,
+        }
+    }
+}
+
+/// A maintenance step the staging worker's role is refused, as `status/2`
+/// reports it.
+#[derive(NifMap)]
+struct RefusedStepTerm {
+    step: String,
+    role: Option<String>,
+    object: Option<String>,
+    missing: Vec<String>,
+    error: String,
+}
+
+impl From<PlainRefusedStep> for RefusedStepTerm {
+    fn from(seen: PlainRefusedStep) -> Self {
+        RefusedStepTerm {
+            step: seen.step,
+            role: seen.role,
+            object: seen.object,
+            missing: seen.missing,
+            error: seen.error,
         }
     }
 }
@@ -1233,6 +1257,11 @@ fn status<'a>(
                 build_wait_xid: status.build_wait_xid,
                 version_handover: status.version_handover.map(VersionHandoverTerm::from),
                 below_catalog_floor: status.below_catalog_floor.map(BelowCatalogFloorTerm::from),
+                maintenance_refusals: status
+                    .maintenance_refusals
+                    .into_iter()
+                    .map(RefusedStepTerm::from)
+                    .collect(),
                 join: status
                     .join
                     .map(|join| JoinStatusTerm::new(env, join))

@@ -344,8 +344,9 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
 - **Must:** a plain aggregate, or a JOIN transform
   ([ADR-0019](0019-join-transforms.md)), admits exactly these aggregates:
   - `COUNT(*)` and `COUNT(col)`;
-  - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8` or
-    `numeric`, with or without a declared scale (next section);
+  - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8`,
+    `numeric` (with or without a declared scale), `real`, `double precision`
+    or `interval` (next section);
   - on a plain aggregate only, `MIN(col)` and `MAX(col)`, kept by recompute
     on retract under rules Rx1 to Rx8
     ([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
@@ -360,17 +361,21 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
   the group's row is written. Neither expression arguments nor composed
   fields change lock order or apply order.
 - **Must:** result types match Postgres: `count` is `bigint`,
-  `sum(int2|int4)` is `bigint`, `sum(int8|numeric)` is `numeric`, and `avg`
-  is `numeric`.
+  `sum(int2|int4)` is `bigint`, `sum(int8|numeric)` is `numeric`,
+  `sum(real)` is `real`, `sum(double precision)` and `avg(real|double
+  precision)` are `double precision`, `sum(interval)` and `avg(interval)`
+  are `interval`, and any other `avg` is `numeric`.
 - **Must:** every admitted aggregate but `MIN` and `MAX` is a function of
   per-group partials: the row count, each argument's non-null count, and
   each `SUM` or `AVG` argument's sum, kept as `numeric` whatever the
   argument type so a sum (or, on a JOIN, a product of a sum and a count)
-  never overflows where Postgres's own `sum()` wouldn't; a `numeric`
-  argument adds counts of its scales and special values (next section).
+  never overflows where Postgres's own `sum()` wouldn't; a `numeric`, float
+  or `interval` argument adds counts of its scales and special values (next
+  section).
 - **Must:** every other aggregate is refused at define, named by family:
   `MIN`/`MAX` on a JOIN; `bool_and`/`bool_or` and `bit_and`/`bit_or`;
-  `SUM`/`AVG` over a float, `interval` or any other type; and `array_agg`, `string_agg` and `jsonb_agg`. The
+  and `array_agg`, `string_agg` and `jsonb_agg`. `SUM`/`AVG` over any other
+  type is refused by its argument's type. The
   [Supported sources and targets](../transforms.md#supported-sources-and-targets)
   table is the reference. Each can be added later, through hidden counters,
   a value-count table or a recompute, without changing what is admitted
@@ -491,6 +496,37 @@ reason.
   stored maps keep their reference scale, so nothing pauses or rebuilds:
   values at other scales are counted from then on. A change between two
   declared scales re-renders values, so its readers rebuild.
+
+### Float and `interval` sums are exact
+
+Postgres's float `sum()` adds in scan order, and float addition isn't
+associative: `{1e20, 1, -1e20}` sums to 0 or 1 by order, and `sum(real)`
+adds in `real`, so a million `0.1::real` sum to 100958.34. No delta can
+follow an order. `interval` addition is exact per field, but Postgres's
+`sum(interval)` raises `interval out of range` by order too:
+`{2147483647 days, 1 day, -1 day}` raises in one order and not the other.
+Exact sums commute like the integer and `numeric` ones, so no new
+interleaving argument is needed (I2); only the read-time rounding is new.
+
+- **Must:** a float (`real`, `double precision`) `SUM` or `AVG` is the
+  exact sum of the values, rounded once to the result type: each value
+  converts exactly to `numeric` (a `real` widens to `double precision`
+  first), an `AVG` divides that exact sum by the count, and `NaN`,
+  `Infinity` and `-Infinity` are counted, not summed, resolving as Postgres
+  resolves them (`NaN` while it counts a `NaN` or both infinities, else the
+  infinity). This is a stated departure from Postgres's order-dependent
+  `sum()`.
+- **Must:** an `interval` `SUM` is the exact fieldwise sum (months, days,
+  microseconds), with `infinity` and `-infinity` counted (Postgres 17 and
+  later). It raises only when its final value is out of range, as an
+  evaluation error of its group, whatever order its values came in.
+- **Must:** an `interval` `AVG` divides the exact fieldwise sums as
+  Postgres's `interval_div` does (month fractions carry into days, then into
+  microseconds), so a group whose sum is in range has Postgres's own
+  `avg()`.
+- **Must:** these partials are the `numeric` ones above, each value its
+  exact `numeric`; the layout has a compatibility floor of its own
+  ([ADR-0024](0024-compatibility-floors-and-rollback.md)).
 
 ### Apply sums sides per group and transaction
 

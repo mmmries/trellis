@@ -116,6 +116,16 @@ scale with a non-zero count; `AVG` divides it by the non-null count, as
 build's shortcut for that case falls back under a savepoint on an off-scale
 value, so it never changes a result.
 
+A float or `interval` argument keeps the same partials, each value converted
+exactly to one `numeric` (`staging::group_basis::exact_sums`). A float is its
+exact decimal value at scale 1074, decoded from `float8send`; an `interval`'s
+fields pack into one integer, `months × 10^120 + days × 10^60 + microseconds`,
+which sums stay decodable from. Its reference scale is its kind's (1074, or 0),
+so the map counts only the special values. The visible `SUM` casts the exact
+sum to the float type or rebuilds the `interval` from its fields, raising when
+out of range; the `AVG` divides the exact sum, truncated far past any rounding
+boundary, or divides the fields as `interval_div` does.
+
 ## Zero groups (R4, Rx7)
 
 An all-zero group has no visible row, but its hidden row stays until the

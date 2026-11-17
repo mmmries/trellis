@@ -91,7 +91,10 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   gone. While this binary is below the catalog floor, `status/2` reports
   that this process stands by (`below_catalog_floor`, a
   `Trellis.BelowCatalogFloor` with `floor` and `this_version`), and
-  state-changing calls refuse with a `version_floor` error. For a `JOIN` transform `status/2` reports its hidden tables
+  state-changing calls refuse with a `version_floor` error. A process that
+  leads the staging worker lists the maintenance steps its role is refused
+  (`maintenance_refusals`, each a `Trellis.RefusedStep` with `step`, `role`,
+  `object`, `missing` and `error`). For a `JOIN` transform `status/2` reports its hidden tables
   (`join`, a `Trellis.JoinStatus`): `hidden_tables`, each a
   `Trellis.HiddenTable` with `table`, `name`, `estimated_rows` and `bytes`,
   the `P`-size warning (`partials_warning`, a `Trellis.PartialsWarning`),
@@ -131,7 +134,12 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   as Prometheus text, for a `/metrics` route the host already serves (the
   binding opens no port). It needs no handle. Every series carries the
   `trellis_instance` label (`<database>/<catalog schema>`, as in the log
-  lines), so handles in one VM stay apart.
+  lines), so handles in one VM stay apart. With `:plug` in your deps,
+  `Trellis.Metrics.Plug` serves it (`forward "/metrics/trellis", Trellis.Metrics.Plug`),
+  and `Trellis.Metrics.Appender` (`plug Trellis.Metrics.Appender, path: "/metrics"`,
+  ahead of `PromEx.Plug` or another exporter plug) appends it to that
+  exporter's response. The status gauges come with it; see the "Alerting"
+  table in `docs/observability.md`.
 - `Trellis.LogBridge`: started with the `:trellis_pg` application, it forwards
   the engine's log lines to `Logger` (`domain: [:trellis]`, the Rust module
   as `:target` metadata). Every line names its instance in the text, as
@@ -293,6 +301,23 @@ make it so: Ecto's `schema_migrations` runs each migration once. See
 
 Add `import_deps: [:trellis_pg]` to the app's `.formatter.exs` to keep
 `define` and `apply` free of parentheses, like Ecto's own commands.
+
+## Turning Trellis off in tests
+
+Set Trellis off where nothing should capture or maintain a target, usually
+the test environment:
+
+```elixir
+# config/test.exs
+config :trellis_pg, enabled: false
+```
+
+Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
+skip, and `mix trellis.load` / `mix trellis.dump` are `ecto.load` /
+`ecto.dump`, so target tables are plain tables a test writes directly.
+Build the test database with `mix ecto.load` (aliased to `trellis.load`),
+not `mix ecto.migrate`: a skipped define creates no target table.
+`Trellis.enabled?/0` reports the setting.
 
 ## Fixtures and bulk loads in tests
 

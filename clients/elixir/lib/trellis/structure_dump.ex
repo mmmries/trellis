@@ -71,6 +71,10 @@ defmodule Trellis.StructureDump do
 
   alias Trellis.StructureDump.Database
 
+  # `ecto_sql` is an optional dependency: these are called only by a host that
+  # has it (the mix tasks that reach this module are compiled only then).
+  @compile {:no_warn_undefined, [Ecto.Adapters.Postgres, Ecto.Adapters.SQL, Ecto.Migrator]}
+
   # The engine's appendix starts with this line; a second append replaces
   # the first's appendix rather than loading the definitions twice.
   @marker "-- Trellis definitions ("
