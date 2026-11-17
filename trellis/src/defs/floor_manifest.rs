@@ -296,7 +296,7 @@ fn type_rules() -> Vec<TypeRule> {
             ComparisonRule::Uuid => 13,
             ComparisonRule::TextEquality => 14,
             ComparisonRule::Temporal => 15,
-            ComparisonRule::EnumBesideStringLiteral => 60,
+            ComparisonRule::EnumBesideStringLiteral => 63,
         },
         T::Negate => 16,
         T::Cast(r) => match r {
