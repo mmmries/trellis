@@ -14,6 +14,9 @@
 //! Postgres, so a rendered `SELECT` can never be outgrown by the language). A
 //! divergence is a pipeline / apply / fold / ordering bug, or a rendering bug
 //! in the engine's compiler, which the independent printer here catches.
+//! The exception is a `SUM`/`AVG` over a float or `interval`, whose
+//! Postgres `sum()` depends on scan order: [`exact_sums`] computes the exact
+//! sum the engine keeps (#1119) from the group's values.
 //!
 //! # DB access
 //!
@@ -35,6 +38,8 @@ use trellis::dev::defs::{FloatWidth, IntWidth, PgType};
 use trellis::dev::pool::Pool;
 
 use crate::model::{Column, PRIMARY_KEY_VALUE_TYPE, Program, Table, group_key};
+
+mod exact_sums;
 
 /// Why an oracle read failed: a Postgres query error, or no pooled connection.
 #[derive(Debug)]
@@ -67,24 +72,16 @@ enum Comparison {
     Exact,
     /// Decimal by value, ignoring scale (`2.50 ≡ 2.5`).
     DecimalByValue,
-    /// Combined absolute+relative tolerance for `real`/`double precision`
-    /// (this arm exists because of [`ValueType::Float`]).
-    ///
-    /// Tolerance rather than [`Comparison::Exact`] even though
-    /// `trellis::float::render` reproduces `float4out`/`float8out`
-    /// byte-for-byte, because the *values* being compared can legitimately
-    /// differ in their last bits: float addition isn't associative, so an
-    /// engine-side fold and a server-side `sum()` over the same rows in a
-    /// different order really do produce different doubles
-    /// (`1e16::float8+1+1+1+1` is `1e+16`, `1+1+1+1+1e16` is
-    /// `1.0000000000000004e+16`). That is not a bug to report — it is why
-    /// a float `SUM`/`AVG` is refused at define.
-    ///
-    /// `NaN`/`±Infinity` are compared by Postgres's own float equality
-    /// ([`postgres_float_equal`]: `NaN = NaN` is true), not IEEE's, so a
-    /// converged `NaN` column doesn't report as a perpetual divergence.
-    #[allow(dead_code)]
-    FloatTolerance,
+    /// A `real` (parsed as one) or `double precision` by value, by
+    /// Postgres's float equality ([`postgres_float_equal`]: `NaN = NaN`,
+    /// `-0 = 0`). Exact: a float expression is Postgres's own on both sides,
+    /// a `MIN`/`MAX` a stored value, and a `SUM`/`AVG` the exact sum rounded
+    /// once ([`exact_sums`]), so the bits agree.
+    FloatByValue(FloatWidth),
+    /// An `interval` field by field (months, days, microseconds), or the
+    /// same infinity: an exact-sum field ([`exact_sums`]), whose fields the
+    /// engine and the oracle both compute exactly.
+    IntervalFields,
     /// `interval` by value, as Postgres's `=` compares it: a month is 30
     /// days and a day 24 hours, so `1 day 02:00:00`, `26:00:00` and
     /// `1 day 120 minutes` are one value ([`interval_micros`]). Only an
@@ -106,8 +103,7 @@ impl Comparison {
             // difference that a by-value decimal compare would forgive, and
             // for this type any such difference is a real bug.
             ValueType::Integer(_) => Comparison::Exact,
-            // See `Comparison::FloatTolerance`.
-            ValueType::Float(_) => Comparison::FloatTolerance,
+            ValueType::Float(width) => Comparison::FloatByValue(width),
             // `Other` is passthrough-only (no arithmetic, no
             // scale-insensitive semantics defined for it yet), same footing
             // as `Text`/`Boolean`/`Uuid` — byte-exact text equality is the
@@ -149,16 +145,33 @@ impl Comparison {
                 (Some(a), Some(b)) => decimal_text(a) == decimal_text(b),
                 _ => false,
             },
-            Comparison::FloatTolerance => match (expected, got) {
+            Comparison::FloatByValue(width) => match (expected, got) {
                 (None, None) => true,
-                (Some(a), Some(b)) => match (a.parse::<f64>(), b.parse::<f64>()) {
-                    (Ok(a), Ok(b)) => floats_close(a, b),
-                    // Text that isn't a float at all (`NaN`, `Infinity`,
-                    // `-Infinity` all *do* parse in Rust, so this is a
-                    // genuinely unparseable rendering) can only be compared
-                    // exactly, same fallback `DecimalByValue` takes.
-                    _ => a == b,
-                },
+                (Some(a), Some(b)) => {
+                    let parse = |text: &str| match width {
+                        FloatWidth::Float4 => text.parse::<f32>().ok().map(f64::from),
+                        FloatWidth::Float8 => text.parse::<f64>().ok(),
+                    };
+                    match (parse(a), parse(b)) {
+                        (Some(a), Some(b)) => postgres_float_equal(a, b),
+                        // Text that isn't a float (an oracle raise) compares
+                        // exactly, so a difference still surfaces.
+                        _ => a == b,
+                    }
+                }
+                _ => false,
+            },
+            Comparison::IntervalFields => match (expected, got) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    match (
+                        exact_sums::Interval::parse(a),
+                        exact_sums::Interval::parse(b),
+                    ) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => a == b,
+                    }
+                }
                 _ => false,
             },
         }
@@ -259,32 +272,6 @@ fn decimal_text(text: &str) -> String {
         if frac.is_empty() { "" } else { "." },
         frac
     )
-}
-
-/// Whether two floats agree within the combined absolute+relative tolerance
-/// [`Comparison::FloatTolerance`] applies.
-///
-/// Equality is checked first, through [`postgres_float_equal`] rather than
-/// `==`, so that `NaN`/`NaN` and `-0`/`0` pairs agree exactly as Postgres
-/// says they do. Only then does the tolerance apply, and it is deliberately
-/// tight: `1e-9` relative is roughly 10^7 times the `f64` epsilon, enough to
-/// absorb reassociation of a realistic fold but far too small to hide a
-/// genuinely wrong computation. The absolute floor handles values near zero,
-/// where a relative bound degenerates.
-fn floats_close(a: f64, b: f64) -> bool {
-    const RELATIVE: f64 = 1e-9;
-    const ABSOLUTE: f64 = 1e-12;
-    if postgres_float_equal(a, b) {
-        return true;
-    }
-    // A special value that isn't equal to the other side (e.g. `NaN` vs `1`,
-    // or `Infinity` vs `-Infinity`) is a real divergence, not a rounding
-    // difference — no tolerance can bridge it.
-    if !a.is_finite() || !b.is_finite() {
-        return false;
-    }
-    let diff = (a - b).abs();
-    diff <= ABSOLUTE || diff <= RELATIVE * a.abs().max(b.abs())
 }
 
 /// One differing cell, row, or column found while comparing a candidate
@@ -526,7 +513,7 @@ fn render_expr(expr: &Expr) -> String {
 /// On any shape beyond the numeric-`+`/aggregate slice this oracle models
 /// (a non-trivial predicate is a later slice), naming the follow-up that
 /// widens it.
-fn render_select(def: &TransformDef, pk_column: &str) -> String {
+fn render_select(def: &TransformDef, pk_column: &str, exact: &ExactFields) -> String {
     match def.predicate {
         Predicate::True => {}
     }
@@ -557,7 +544,7 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
                 .map(|field| {
                     format!(
                         "({})::text as {}",
-                        render_expr(&field.expr),
+                        field_sql(field, exact, &render_expr),
                         quote_ident(&field.name)
                     )
                 })
@@ -571,6 +558,139 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
                 group_cols.join(", ")
             )
         }
+    }
+}
+
+/// The fields of a definition the oracle sums exactly ([`exact_sums`]):
+/// each `SUM`/`AVG` whose argument is `real`, `double precision` or
+/// `interval`, by name.
+type ExactFields = HashMap<String, (exact_sums::Kind, exact_sums::Func)>;
+
+/// The argument of a top-level `SUM`/`AVG` call, and which it is.
+fn sum_or_avg_argument(expr: &Expr) -> Option<(&Expr, exact_sums::Func)> {
+    match expr {
+        Expr::FunctionCall { name, args } if args.len() == 1 => match name.as_str() {
+            "SUM" => Some((&args[0], exact_sums::Func::Sum)),
+            "AVG" => Some((&args[0], exact_sums::Func::Avg)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `def`'s exact-sum fields, the type of each `SUM`/`AVG` argument read off
+/// Postgres's description of `select (<argument>) from <from>`. A call
+/// nested in a larger expression isn't modelled: one over a float or
+/// `interval` panics, naming the missing work, rather than letting
+/// Postgres's own `sum()` stand in for the exact sum.
+async fn exact_fields(
+    client: &tokio_postgres::Client,
+    def: &TransformDef,
+    render: &dyn Fn(&Expr) -> String,
+    from: &str,
+) -> Result<ExactFields, OracleError> {
+    use tokio_postgres::types::Type;
+    let kind_of = async |arg: &Expr| -> Result<Option<exact_sums::Kind>, OracleError> {
+        let probe = format!("select ({}) from {from}", render(arg));
+        let statement = client.prepare(&probe).await?;
+        let pg_type = statement.columns()[0].type_();
+        Ok(if *pg_type == Type::FLOAT4 {
+            Some(exact_sums::Kind::Real)
+        } else if *pg_type == Type::FLOAT8 {
+            Some(exact_sums::Kind::Double)
+        } else if *pg_type == Type::INTERVAL {
+            Some(exact_sums::Kind::Interval)
+        } else {
+            None
+        })
+    };
+    let mut exact = ExactFields::new();
+    for field in &def.fields {
+        if let Some((arg, func)) = sum_or_avg_argument(&field.expr) {
+            if let Some(kind) = kind_of(arg).await? {
+                exact.insert(field.name.clone(), (kind, func));
+            }
+            continue;
+        }
+        let mut nested = Vec::new();
+        collect_sum_or_avg(&field.expr, &mut nested);
+        for arg in nested {
+            assert!(
+                kind_of(arg).await?.is_none(),
+                "oracle: {:?}'s field {:?} nests a SUM/AVG over a float or interval in an \
+                 expression; the exact-sum oracle models only a top-level call",
+                def.target,
+                field.name
+            );
+        }
+    }
+    Ok(exact)
+}
+
+/// Every `SUM`/`AVG` argument within `expr`.
+fn collect_sum_or_avg<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Some((arg, _)) = sum_or_avg_argument(expr) {
+        out.push(arg);
+    }
+    for child in expr.children() {
+        collect_sum_or_avg(child, out);
+    }
+}
+
+/// A field's select-list expression: the group's argument values as text,
+/// comma-separated, for an exact-sum field ([`evaluate_exact`] sums them),
+/// else the field rendered by `render`.
+fn field_sql(
+    field: &trellis::dev::defs::ast::FieldDef,
+    exact: &ExactFields,
+    render: &dyn Fn(&Expr) -> String,
+) -> String {
+    match sum_or_avg_argument(&field.expr) {
+        Some((arg, _)) if exact.contains_key(&field.name) => {
+            format!("array_to_string(array_agg(({})::text), ',')", render(arg))
+        }
+        _ => render(&field.expr),
+    }
+}
+
+/// Replaces each exact-sum cell of `rows` (its group's values, as
+/// [`field_sql`] gathers them) with the field's value ([`exact_sums::evaluate`]).
+async fn evaluate_exact(
+    client: &tokio_postgres::Client,
+    rows: &mut Rows,
+    exact: &ExactFields,
+) -> Result<(), OracleError> {
+    if exact.is_empty() {
+        return Ok(());
+    }
+    let pg17: bool = client
+        .query_one(
+            "select current_setting('server_version_num')::int >= 170000",
+            &[],
+        )
+        .await?
+        .get(0);
+    for by_column in rows.values_mut() {
+        for (name, (kind, func)) in exact {
+            let Some(cell) = by_column.get_mut(name) else {
+                continue;
+            };
+            let gathered = cell.take().unwrap_or_default();
+            let values: Vec<&str> = gathered.split(',').filter(|v| !v.is_empty()).collect();
+            *cell = exact_sums::evaluate(*kind, *func, &values, pg17);
+        }
+    }
+    Ok(())
+}
+
+/// How an exact-sum field's cell compares.
+fn exact_comparison(kind: exact_sums::Kind, func: exact_sums::Func) -> Comparison {
+    match (kind, func) {
+        (exact_sums::Kind::Interval, _) => Comparison::IntervalFields,
+        (exact_sums::Kind::Real, exact_sums::Func::Sum) => {
+            Comparison::FloatByValue(FloatWidth::Float4)
+        }
+        _ => Comparison::FloatByValue(FloatWidth::Float8),
     }
 }
 
@@ -635,9 +755,25 @@ pub async fn sql_oracle(
     def: &TransformDef,
     pk_column: &str,
 ) -> Result<Rows, OracleError> {
+    Ok(sql_oracle_exact(pool, def, pk_column).await?.0)
+}
+
+/// [`sql_oracle`], and the definition's exact-sum fields ([`exact_fields`]).
+async fn sql_oracle_exact(
+    pool: &Pool,
+    def: &TransformDef,
+    pk_column: &str,
+) -> Result<(Rows, ExactFields), OracleError> {
     let client = pool.get().await?;
     let def = &as_persisted(&client, def).await?;
-    let sql = render_select(def, pk_column);
+    let exact = match def.key_space {
+        KeySpace::Aggregate { .. } => {
+            let from = table_sql(&def.source, def.explicit_source_schema.as_deref());
+            exact_fields(&client, def, &render_expr, &from).await?
+        }
+        _ => ExactFields::new(),
+    };
+    let sql = render_select(def, pk_column, &exact);
     let db_rows = client.query(sql.as_str(), &[]).await?;
 
     match &def.key_space {
@@ -655,7 +791,7 @@ pub async fn sql_oracle(
                 }
                 rows.insert(pk, by_column);
             }
-            Ok(rows)
+            Ok((rows, exact))
         }
         KeySpace::Aggregate { group_by } => {
             let mut rows: Rows = BTreeMap::new();
@@ -692,7 +828,8 @@ pub async fn sql_oracle(
                 }
                 rows.insert(key, by_column);
             }
-            Ok(rows)
+            evaluate_exact(&client, &mut rows, &exact).await?;
+            Ok((rows, exact))
         }
     }
 }
@@ -795,15 +932,25 @@ pub fn compare(
     target: &Rows,
     sql: &Rows,
 ) -> OracleReport {
-    let field_types: HashMap<&str, ValueType> = def
+    let comparisons: HashMap<&str, Comparison> = def
         .fields
         .iter()
-        .map(|f| (f.name.as_str(), field_value_type(&f.expr, source_columns)))
+        .map(|f| {
+            let value_type = field_value_type(&f.expr, source_columns);
+            let comparison = if value_type == ValueType::Other(PgType::Interval)
+                && sum_or_avg_argument(&f.expr).is_some()
+            {
+                Comparison::IntervalFields
+            } else {
+                Comparison::for_field(value_type, &def.key_space)
+            };
+            (f.name.as_str(), comparison)
+        })
         .collect();
     let comparison_for = |column: &str| {
-        field_types
+        comparisons
             .get(column)
-            .map(|vt| Comparison::for_field(*vt, &def.key_space))
+            .copied()
             .unwrap_or(Comparison::Exact)
     };
 
@@ -1017,7 +1164,7 @@ pub fn field_types(
 ///
 /// If `def` isn't a `JOIN`.
 pub fn render_join_select(def: &TransformDef) -> String {
-    render_join_select_over(def, &table_sql)
+    render_join_select_over(def, &table_sql, &ExactFields::new())
 }
 
 /// [`render_join_select`] with each side read from `relation(table)`: the
@@ -1025,6 +1172,7 @@ pub fn render_join_select(def: &TransformDef) -> String {
 fn render_join_select_over(
     def: &TransformDef,
     relation: &dyn Fn(&str, Option<&str>) -> String,
+    exact: &ExactFields,
 ) -> String {
     let KeySpace::Join(join) = &def.key_space else {
         panic!("render_join_select: {:?} is not a JOIN", def.target);
@@ -1042,10 +1190,31 @@ fn render_join_select_over(
         }
         select.push(format!(
             "({})::text as {}",
-            render_join_expr(&field.expr),
+            field_sql(field, exact, &render_join_expr),
             quote_ident(&field.name)
         ));
     }
+    let group_by: Vec<String> = join
+        .group_by
+        .iter()
+        .map(|key| column(&key.table, &key.column))
+        .collect();
+    format!(
+        "select {} from {} group by {}",
+        select.join(", "),
+        join_from(def, relation),
+        group_by.join(", ")
+    )
+}
+
+/// The `FROM` clause of a `JOIN` definition: `a [left] join b on …`, each
+/// side read from `relation(table)`.
+fn join_from(def: &TransformDef, relation: &dyn Fn(&str, Option<&str>) -> String) -> String {
+    let KeySpace::Join(join) = &def.key_space else {
+        panic!("join_from: {:?} is not a JOIN", def.target);
+    };
+    let column =
+        |table: &str, column: &str| format!("{}.{}", quote_ident(table), quote_ident(column));
     let on: Vec<String> = join.joins[0]
         .on
         .iter()
@@ -1057,14 +1226,8 @@ fn render_join_select_over(
             )
         })
         .collect();
-    let group_by: Vec<String> = join
-        .group_by
-        .iter()
-        .map(|key| column(&key.table, &key.column))
-        .collect();
     format!(
-        "select {} from {} {} {} on {} group by {}",
-        select.join(", "),
+        "{} {} {} on {}",
         relation(&def.source, def.explicit_source_schema.as_deref()),
         match join.joins[0].kind {
             trellis::dev::defs::ast::JoinKind::Inner => "join",
@@ -1075,7 +1238,6 @@ fn render_join_select_over(
             join.joins[0].explicit_right_schema.as_deref()
         ),
         on.join(" and "),
-        group_by.join(", ")
     )
 }
 
@@ -1227,14 +1389,15 @@ async fn join_sql_oracle(
     pool: &Pool,
     def: &TransformDef,
     relation: &dyn Fn(&str, Option<&str>) -> String,
-) -> Result<Rows, OracleError> {
+) -> Result<(Rows, ExactFields), OracleError> {
     let KeySpace::Join(join) = &def.key_space else {
         unreachable!("join_sql_oracle is only called on a JOIN");
     };
     let client = pool.get().await?;
     let def = &as_persisted(&client, def).await?;
+    let exact = exact_fields(&client, def, &render_join_expr, &join_from(def, relation)).await?;
     let db_rows = client
-        .query(render_join_select_over(def, relation).as_str(), &[])
+        .query(render_join_select_over(def, relation, &exact).as_str(), &[])
         .await?;
     let fields: Vec<&str> = def
         .fields
@@ -1253,7 +1416,8 @@ async fn join_sql_oracle(
             .collect();
         rows.insert(group_key(&values), by_column);
     }
-    Ok(rows)
+    evaluate_exact(&client, &mut rows, &exact).await?;
+    Ok((rows, exact))
 }
 
 /// Runs [`render_join_one_to_one_select`] and keys its rows the way
@@ -1425,9 +1589,15 @@ pub async fn check_over(
     // A `JOIN`'s oracle is its own `JOIN … GROUP BY` query over the
     // two tables, compared byte for byte.
     if matches!(def.key_space, KeySpace::Join(_)) {
-        let sql = join_sql_oracle(pool, def, &relation).await?;
+        let (sql, exact) = join_sql_oracle(pool, def, &relation).await?;
+        let comparison_for = |column: &str| {
+            exact
+                .get(column)
+                .map(|(kind, func)| exact_comparison(*kind, *func))
+                .unwrap_or(Comparison::Exact)
+        };
         return Ok(OracleReport {
-            target_vs_sql: diff(&def.target, &sql, target, &|_| Comparison::Exact),
+            target_vs_sql: diff(&def.target, &sql, target, &comparison_for),
             definition_states: Vec::new(),
             program: format!("{program:#?}"),
         });
@@ -1443,7 +1613,7 @@ pub async fn check_over(
             program: format!("{program:#?}"),
         });
     }
-    let sql = sql_oracle(pool, def, pk_column).await?;
+    let (sql, _) = sql_oracle_exact(pool, def, pk_column).await?;
     let target = target_fields(target, pk_column);
     Ok(compare(program, def, source_columns, &target, &sql))
 }
@@ -1600,33 +1770,38 @@ mod tests {
         }
     }
 
-    /// Floats compare by Postgres's equality first (`NaN = NaN`, `-0 = 0`),
-    /// then within the tolerance, which never bridges a special value.
+    /// Floats compare by value with Postgres's equality (`NaN = NaN`,
+    /// `-0 = 0`), a `real` read as one; an interval exact sum field by
+    /// field.
     #[test]
-    fn floats_compare_by_postgres_equality_then_tolerance() {
+    fn floats_compare_by_value_and_interval_sums_by_field() {
         assert!(postgres_float_equal(f64::NAN, f64::NAN));
         assert!(postgres_float_equal(-0.0, 0.0));
         assert!(postgres_float_equal(f64::INFINITY, f64::INFINITY));
         assert!(!postgres_float_equal(f64::INFINITY, f64::NEG_INFINITY));
         assert!(!postgres_float_equal(f64::NAN, 1.0));
 
-        assert!(floats_close(f64::NAN, f64::NAN));
-        assert!(floats_close(-0.0, 0.0));
-        assert!(floats_close(0.1 + 0.2, 0.3));
-        assert!(floats_close(1e300, 1e300 * (1.0 + 1e-12)));
-        assert!(!floats_close(1.0, 1.0 + 1e-6));
-        assert!(!floats_close(f64::NAN, 1.0));
-        assert!(!floats_close(f64::INFINITY, f64::MAX));
-        assert!(!floats_close(f64::INFINITY, f64::NEG_INFINITY));
+        let equal =
+            |c: Comparison, a: &str, b: &str| c.equal(&Some(a.to_string()), &Some(b.to_string()));
+        let double = Comparison::FloatByValue(FloatWidth::Float8);
+        let real = Comparison::FloatByValue(FloatWidth::Float4);
+        assert!(equal(double, "NaN", "NaN"));
+        assert!(equal(double, "-0", "0"));
+        assert!(equal(double, "Infinity", "Infinity"));
+        assert!(equal(double, "1e+20", "1e20"));
+        assert!(!equal(double, "Infinity", "-Infinity"));
+        assert!(!equal(double, "0.30000000000000004", "0.3"));
+        assert!(equal(real, "0.1", "1e-1"));
+        assert!(!equal(real, "0.1", "0.10000001"));
+        assert!(!equal(double, "ERROR: value out of range: overflow", "1"));
 
-        let tolerant = |a: &str, b: &str| {
-            Comparison::FloatTolerance.equal(&Some(a.to_string()), &Some(b.to_string()))
-        };
-        assert!(tolerant("NaN", "NaN"));
-        assert!(tolerant("-0", "0"));
-        assert!(tolerant("Infinity", "Infinity"));
-        assert!(!tolerant("Infinity", "-Infinity"));
-        assert!(!tolerant("1", "2"));
+        let fields = Comparison::IntervalFields;
+        assert!(equal(fields, "1 mon", "1 mon"));
+        assert!(equal(fields, "1 year", "12 mons"));
+        assert!(!equal(fields, "1 mon", "30 days"));
+        assert!(!equal(fields, "1 day", "24:00:00"));
+        assert!(equal(fields, "infinity", "infinity"));
+        assert!(!equal(fields, "ERROR: interval out of range", "1 day"));
     }
 
     #[test]
@@ -1779,7 +1954,7 @@ mod tests {
             explicit_target_schema: None,
         };
         assert_eq!(
-            render_select(&def, "c0"),
+            render_select(&def, "c0", &ExactFields::new()),
             "select \"c0\"::text, ((\"c1\" + \"c2\"))::text as \"total\" from \"t0\""
         );
     }
@@ -1822,7 +1997,7 @@ mod tests {
             explicit_target_schema: None,
         };
         assert_eq!(
-            render_select(&def, "c0"),
+            render_select(&def, "c0", &ExactFields::new()),
             "select (\"grain\")::text as \"grain\", (sum(\"c1\"))::text as \"total\", \
              (count(*))::text as \"cnt\" from \"t0\" group by \"grain\""
         );

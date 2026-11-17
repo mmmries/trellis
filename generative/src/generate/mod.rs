@@ -126,6 +126,7 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
+pub mod exact_sums;
 pub mod join;
 pub mod join_chained;
 pub mod join_one_to_one;
