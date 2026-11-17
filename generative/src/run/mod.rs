@@ -19,6 +19,7 @@
 mod concurrent;
 mod coverage;
 mod db_admin;
+mod held_keys;
 mod noise;
 mod pause;
 mod restore;
@@ -29,6 +30,9 @@ pub use concurrent::{
 };
 pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES};
 pub use db_admin::run_convergence_with_db_admin;
+pub use held_keys::{
+    DefModel, HeldExpectation, HeldKeySummary, TRANSFORM_FUSE, run_convergence_with_held_keys,
+};
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
 pub use two_instance::{
@@ -205,6 +209,16 @@ pub enum RunError {
         op_index: usize,
         message: String,
         paused: Vec<DefinitionState>,
+    },
+    /// After op `op_index` of a held-key run
+    /// ([`run_convergence_with_held_keys`]), definition `target` reported
+    /// other held keys, or another status, than the held-key model expects.
+    HeldKeys {
+        op_index: usize,
+        target: String,
+        expected: String,
+        reported: String,
+        program: String,
     },
     /// A scheduled [`Backend::restart`] failed.
     Restart(String),

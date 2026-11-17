@@ -1782,7 +1782,8 @@ impl Trellis {
                         .await?
                         .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?
                         .get(0);
-                    match &after {
+                    #[allow(unused_mut)]
+                    let mut rows = match &after {
                         Some((after_src, after_key)) => {
                             client
                                 .query(
@@ -1803,7 +1804,17 @@ impl Trellis {
                                 )
                                 .await?
                         }
+                    };
+                    // Planted bug: the sample leaves out the first key the
+                    // definition holds. See `crate::plant`.
+                    #[cfg(any(test, feature = "test-util"))]
+                    if crate::plant::fires(
+                        crate::plant::Plant::HeldKeyUnlisted,
+                        after.is_none() && !rows.is_empty(),
+                    ) {
+                        rows.remove(0);
                     }
+                    rows
                 }
             };
             Ok(rows

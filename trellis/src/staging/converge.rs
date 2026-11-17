@@ -116,19 +116,66 @@ pub async fn converged_through(
     token: PgLsn,
 ) -> Result<bool, StagingError> {
     let row = client
-        .query_one(&converged_sql("$1", None), &[&token])
+        .query_one(&converged_sql("$1", HeldScope::All), &[&token])
         .await?;
     Ok(row.get(0))
+}
+
+/// [`converged_through`] without condition 4: a key any definition holds in
+/// quarantine, with its parked changes, doesn't gate the token. The ring's
+/// pending rows (conditions 2 and 3) and every 1-1 `JOIN`'s pending fan-out
+/// (condition 5) still do, so a key whose change is still failing, and not
+/// yet held, keeps the token open until the key fuse holds it.
+///
+/// Test-only, for a harness that models held keys and so must settle
+/// "converged except the held keys" rather than wait for a release that never
+/// comes (the generative suite's held-key tier). Not an engine wait: the
+/// engine never reports convergence across a parked key.
+#[cfg(any(test, feature = "test-util", feature = "internals"))]
+pub async fn converged_through_except_held(
+    client: &impl GenericClient,
+    token: PgLsn,
+) -> Result<bool, StagingError> {
+    let row = client
+        .query_one(&converged_sql("$1", HeldScope::Ignored), &[&token])
+        .await?;
+    Ok(row.get(0))
+}
+
+/// [`await_converged`] without condition 4, as [`converged_through_except_held`]
+/// checks. Test-only, like it.
+#[cfg(any(test, feature = "test-util", feature = "internals"))]
+pub async fn await_converged_except_held(
+    client: &Client,
+    token: PgLsn,
+    timeout: Duration,
+) -> Result<(), StagingError> {
+    poll_converged(client, token, timeout, HeldScope::Ignored).await
+}
+
+/// Which held keys gate a convergence check's condition 4 (and which pending
+/// fan-outs gate condition 5).
+#[derive(Debug, Clone, Copy)]
+enum HeldScope {
+    /// Every definition's held keys and fan-outs.
+    All,
+    /// One definition's held keys and fan-outs ([`await_converged_for`]).
+    Of(i64),
+    /// No held key; every definition's fan-outs. Test-only
+    /// ([`converged_through_except_held`]).
+    #[cfg_attr(
+        not(any(test, feature = "test-util", feature = "internals")),
+        allow(dead_code)
+    )]
+    Ignored,
 }
 
 /// [`converged_through`]'s query, one boolean column, with the token spelled
 /// as the SQL expression `token`: `$1` for the typed query above, or an
 /// inlined `pg_lsn` literal for [`await_converged`]'s simple-protocol poll.
 ///
-/// `held_by` scopes conditions 4 and 5 to one definition's held keys and
-/// pending fan-outs ([`await_converged_for`]); `None` counts every
-/// definition's.
-fn converged_sql(token: &str, held_by: Option<i64>) -> String {
+/// `held` scopes conditions 4 and 5 ([`HeldScope`]).
+fn converged_sql(token: &str, held: HeldScope) -> String {
     // `origin_lsn` is nullable — a row of unknown origin (a build's `NULL`-key
     // `Recompute`, say) reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
     // "unknown" to "conservatively old" — a NULL must gate exactly like the
@@ -163,14 +210,17 @@ fn converged_sql(token: &str, held_by: Option<i64>) -> String {
         )
     });
 
-    let held_by = match held_by {
-        Some(transform_id) => format!("transform_id = {transform_id} and "),
-        None => String::new(),
+    let held_by = match held {
+        HeldScope::Of(transform_id) => format!("transform_id = {transform_id} and "),
+        HeldScope::All | HeldScope::Ignored => String::new(),
     };
-    let condition4 = format!(
-        "select 1 from poison_held \
-         where {held_by}(origin_lsn is null or origin_lsn <= {token})"
-    );
+    let condition4 = match held {
+        HeldScope::Ignored => "select 1 where false".to_string(),
+        HeldScope::All | HeldScope::Of(_) => format!(
+            "select 1 from poison_held \
+             where {held_by}(origin_lsn is null or origin_lsn <= {token})"
+        ),
+    };
     // Condition 5: a 1-1 `JOIN`'s pending fan-out, whose marker carries the
     // earliest origin of the `b` changes its remaining rows don't reflect
     // yet (`super::join_one_to_one::fan_out`), gates like a parked row.
@@ -424,7 +474,7 @@ pub async fn await_converged(
     token: PgLsn,
     timeout: Duration,
 ) -> Result<(), StagingError> {
-    poll_converged(client, token, timeout, None).await
+    poll_converged(client, token, timeout, HeldScope::All).await
 }
 
 /// [`await_converged`], with condition 4 counting only the keys the
@@ -441,16 +491,16 @@ pub async fn await_converged_for(
     timeout: Duration,
     transform_id: i64,
 ) -> Result<(), StagingError> {
-    poll_converged(client, token, timeout, Some(transform_id)).await
+    poll_converged(client, token, timeout, HeldScope::Of(transform_id)).await
 }
 
-/// [`await_converged`]'s poll loop, with condition 4 scoped by `held_by`
+/// [`await_converged`]'s poll loop, with conditions 4 and 5 scoped by `held`
 /// ([`converged_sql`]).
 async fn poll_converged(
     client: &Client,
     token: PgLsn,
     timeout: Duration,
-    held_by: Option<i64>,
+    held: HeldScope,
 ) -> Result<(), StagingError> {
     const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
     const MAX_BACKOFF: Duration = Duration::from_millis(250);
@@ -463,7 +513,7 @@ async fn poll_converged(
     };
     // `PgLsn`'s `Display` is Postgres's own `X/Y` hex form: nothing to escape.
     let token_literal = format!("'{token}'::pg_lsn");
-    let converged = converged_sql(&token_literal, held_by);
+    let converged = converged_sql(&token_literal, held);
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let rows = poll_within_deadline(client, &wait, &converged).await?;

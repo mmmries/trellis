@@ -697,6 +697,76 @@ pub async fn sql_oracle(
     }
 }
 
+/// A plain 1-1 `def`'s rows computed one source row at a time, as the engine
+/// computes them: the rows whose fields Postgres computes, and the keys of
+/// the rows a field raises a data exception for (SQLSTATE class `22`:
+/// `division by zero`, an overflow), which the engine holds in quarantine
+/// rather than apply. One `SELECT` over the source aborts on the first such
+/// row, so this runs that `SELECT` first and reads row by row only when it
+/// raises. The held-key run's oracle
+/// ([`crate::run::run_convergence_with_held_keys`]).
+pub async fn sql_oracle_per_row(
+    pool: &Pool,
+    def: &TransformDef,
+    pk_column: &str,
+) -> Result<(Rows, std::collections::BTreeSet<String>), OracleError> {
+    assert!(
+        matches!(def.key_space, KeySpace::OneToOne),
+        "the per-row oracle models a plain 1-1 definition only"
+    );
+    let mut raised = std::collections::BTreeSet::new();
+    match sql_oracle(pool, def, pk_column).await {
+        Ok(rows) => return Ok((rows, raised)),
+        Err(err) if !is_data_exception(&err) => return Err(err),
+        Err(_) => {}
+    }
+    let client = pool.get().await?;
+    let def = &as_persisted(&client, def).await?;
+    let source = table_sql(&def.source, def.explicit_source_schema.as_deref());
+    let pk = quote_ident(pk_column);
+    let keys = client
+        .query(
+            format!("select {pk}::text from {source} order by {pk}").as_str(),
+            &[],
+        )
+        .await?;
+    let one_row = format!("{} where {pk}::text = $1", render_select(def, pk_column));
+    let mut rows: Rows = BTreeMap::new();
+    for key in keys {
+        let key: String = key.get(0);
+        match client.query_opt(one_row.as_str(), &[&key]).await {
+            Ok(Some(db_row)) => {
+                let mut by_column = BTreeMap::new();
+                for (i, field) in def.fields.iter().enumerate() {
+                    by_column.insert(field.name.clone(), db_row.get::<_, Option<String>>(i + 1));
+                }
+                rows.insert(key, by_column);
+            }
+            // Deleted since the key list was read: the harness writes nothing
+            // while it checks, so this is a bug in the oracle's own reads.
+            Ok(None) => panic!("oracle: {key:?} vanished from {source} mid-check"),
+            Err(err) if is_pg_data_exception(&err) => {
+                raised.insert(key);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok((rows, raised))
+}
+
+/// Whether `err` is a Postgres data exception (SQLSTATE class `22`), the
+/// class a field's computation raises for a row.
+fn is_data_exception(err: &OracleError) -> bool {
+    err.0
+        .downcast_ref::<tokio_postgres::Error>()
+        .is_some_and(is_pg_data_exception)
+}
+
+/// [`is_data_exception`] for a query's own error.
+fn is_pg_data_exception(err: &tokio_postgres::Error) -> bool {
+    err.code().is_some_and(|code| code.code().starts_with("22"))
+}
+
 /// Strips the primary-key column from a target's rows as read back by
 /// [`crate::backend::Backend::snapshot`], yielding the field-only [`Rows`] the
 /// comparison expects. The pk stays as each row's key.
