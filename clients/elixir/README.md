@@ -318,6 +318,36 @@ Build the test database with `mix ecto.load` (aliased to `trellis.load`),
 not `mix ecto.migrate`: a skipped define creates no target table.
 `Trellis.enabled?/0` reports the setting.
 
+## Target schemas are read-only
+
+Only Trellis writes a target. Mark an Ecto schema over one, and add the guard to the repo:
+
+```elixir
+defmodule MyApp.EventCount do
+  use Ecto.Schema
+  use Trellis.Target
+  # schema "event_counts" do ... end
+end
+
+defmodule MyApp.Repo do
+  use Ecto.Repo, otp_app: :my_app, adapter: Ecto.Adapters.Postgres
+  use Trellis.Repo # after `use Ecto.Repo`
+end
+```
+
+`insert`, `update`, `delete`, `insert_or_update` (and bang forms), `insert_all`, `update_all`
+and `delete_all` on a marked schema raise `Trellis.ReadOnlyTarget` before any SQL is sent;
+`Ecto.Multi` goes through them. Raw SQL and schemaless `insert_all("table", ...)` go around
+the guard: a `SELECT`-only grant is the strong answer (`docs/recommendations.md`).
+
+`config :trellis_pg, allow_target_writes: true` lifts it (default `false`, read at each
+write, independent of `enabled`). A test setup sets both:
+
+```elixir
+# config/test.exs
+config :trellis_pg, enabled: false, allow_target_writes: true
+```
+
 ## Fixtures and bulk loads in tests
 
 A loader that disables triggers for the load (`ALTER TABLE ... DISABLE
