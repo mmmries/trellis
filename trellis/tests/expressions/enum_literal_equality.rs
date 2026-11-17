@@ -226,6 +226,32 @@ async fn a_relabelled_value_fails_the_definition_at_resume() {
         .expect("define again with the new label");
 }
 
+/// An aggregate that reads the enum only in its `WHERE` is an enum reader
+/// too: a relabel pauses it, and its `RESUME` fails with define's refusal.
+#[tokio::test]
+async fn a_relabelled_value_in_a_where_fails_the_definition_at_resume() {
+    let mut h = H::new(
+        "create table public.s (id int primary key, g int, tone public.tone); \
+         insert into public.s values (1, 1, 'brisk'), (2, 1, 'calm');",
+        &["TRANSFORM t FROM public.s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(*) AS n WHERE tone = 'brisk'"],
+    )
+    .await;
+    h.write(RELABEL).await;
+    h.capture_pass().await;
+    assert_eq!(h.status("t").await, TransformStatus::Paused);
+    let refusal = h
+        .trellis
+        .apply("RESUME TRANSFORM t")
+        .await
+        .expect_err("the literal is no longer a label")
+        .to_string();
+    assert!(
+        refusal.contains("T0241") && refusal.contains("WHERE") && refusal.contains("'brisk'"),
+        "{refusal}"
+    );
+    assert_eq!(h.status("t").await, TransformStatus::Paused);
+}
+
 /// The rule the validator mirrors (ADR-0022), checked against Postgres: a
 /// bare literal beside an enum is a value of the enum, in either order; the
 /// same literal cast to `text` has no `=` operator; and a literal that is no

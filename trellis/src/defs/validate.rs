@@ -2672,7 +2672,11 @@ pub(crate) fn check_enum_literals(
 ) -> Result<(), ValidationError> {
     let live = ColumnTypes::Live(columns);
     infer_fields(&def.fields, &live)?;
-    if let Some(predicate) = def.predicate.filter() {
+    // A lone `NULL` has no type of its own; `validate` admits it as a
+    // `boolean` by position, and it holds no literal to check.
+    if let Some(predicate) = def.predicate.filter()
+        && !matches!(predicate, Expr::Null)
+    {
         infer_expr_type_in("WHERE", predicate, &live)?;
     }
     Ok(())
@@ -8926,6 +8930,39 @@ mod tests {
         ]);
         let def = parse_text("TRANSFORM t FROM s SELECT id AS id, status = 'nope' AS x").unwrap();
         assert_eq!(validate(&def, &types), Ok(()));
+    }
+
+    /// The `WHERE` is checked wherever its comparison sits: either order,
+    /// under `NOT`, nested `AND`/`OR`, a `CASE` condition. A lone `NULL`
+    /// holds no literal and stays admitted.
+    #[test]
+    fn a_where_checks_its_enum_literals_in_every_position() {
+        let aggregate = "TRANSFORM t FROM s GROUP BY other SELECT other AS other, COUNT(*) AS n";
+        for predicate in [
+            "NULL",
+            "(NULL)",
+            "status = 'open'",
+            "'closed' = status AND id > 1",
+        ] {
+            let text = format!("{aggregate} WHERE {predicate}");
+            assert_eq!(live(&text), Ok(()), "{text}");
+        }
+        for predicate in [
+            "'nope' = status",
+            "NOT (status = 'nope')",
+            "id > 1 OR (id < 0 AND status = 'nope')",
+            "CASE WHEN status = 'nope' THEN TRUE ELSE FALSE END",
+        ] {
+            let text = format!("{aggregate} WHERE {predicate}");
+            assert!(
+                matches!(
+                    live(&text),
+                    Err(ValidationError::EnumLiteralNotALabel { ref field, .. }) if field == "WHERE"
+                ),
+                "{text}: {:?}",
+                live(&text)
+            );
+        }
     }
 
     /// A `JOIN` reads the enum through its qualified side's labels.
