@@ -108,12 +108,15 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
             &[],
         )
         .await?;
-    for row in &definitions {
-        let (id, table): (i64, String) = (row.get(0), row.get(1));
-        let reason = crate::staging::pause_message::PauseReason::Restore { table };
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %reason.table(), "definition paused: {reason}");
-        }
+    let pauses = definitions.iter().map(|row| {
+        let table = row.get(1);
+        (
+            row.get(0),
+            crate::staging::pause_message::PauseReason::Restore { table },
+        )
+    });
+    for (id, reason) in crate::defs::lifecycle::pause_many(&txn, pauses).await? {
+        crate::instance_log::warn!(transform_id = id, table = %reason.table(), "definition paused: {reason}");
     }
     // The registry holds the original cluster's fences and transaction ids,
     // and the seal gate compares them with this cluster's (`staging::seal`),

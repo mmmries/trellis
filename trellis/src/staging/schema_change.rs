@@ -124,9 +124,21 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
     }
 
     let catalog = load_catalog_for(&**client, pool.floors()).await?;
-    let txn = client.transaction().await?;
-    for (table, missing) in &by_table {
-        let readers = readers_of(&catalog, table, &missing.columns, missing.whole_table());
+    pause_marked_readers(&mut client, &catalog, &by_table).await?;
+    Ok(())
+}
+
+/// [`pause_readers`]'s pauses: every reader of each table in `by_table` of
+/// a column it names missing, in one transaction
+/// ([`crate::defs::lifecycle::pause_many`]).
+async fn pause_marked_readers(
+    client: &mut Client,
+    catalog: &CaptureCatalog,
+    by_table: &BTreeMap<String, Missing>,
+) -> Result<(), CatalogError> {
+    let mut pauses: Vec<(i64, PauseReason)> = Vec::new();
+    for (table, missing) in by_table {
+        let readers = readers_of(catalog, table, &missing.columns, missing.whole_table());
         if readers.is_empty() {
             crate::instance_log::info!(
                 table = %table,
@@ -135,8 +147,15 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
             );
             continue;
         }
-        pause(&txn, &catalog, table, missing, &readers).await?;
+        pauses.extend(missing_pauses(catalog, table, missing, &readers));
     }
+    if pauses.is_empty() {
+        return Ok(());
+    }
+    // One transaction over every table, so its rows are locked in id order
+    // across them, not table by table.
+    let txn = client.transaction().await?;
+    log_paused(crate::defs::lifecycle::pause_many(&txn, pauses).await?);
     txn.commit().await?;
     Ok(())
 }
@@ -239,16 +258,16 @@ pub(crate) async fn pause_readers_of_redefined_keys(
     Ok(())
 }
 
-/// Pauses each of `readers` of `table` for `missing`, recording why
+/// The pause of each of `readers` of `table` for `missing`, with why
 /// ([`crate::defs::lifecycle::pause`]): a reason the
 /// capture pass checks again while the definition stays paused.
-async fn pause(
-    txn: &tokio_postgres::Transaction<'_>,
+fn missing_pauses(
     catalog: &CaptureCatalog,
     table: &str,
     missing: &Missing,
     readers: &[i64],
-) -> Result<(), CatalogError> {
+) -> Vec<(i64, PauseReason)> {
+    let mut pauses = Vec::with_capacity(readers.len());
     for &id in readers {
         let reason = match &missing.key_changed {
             Some((old, new)) => PauseReason::KeyChanged {
@@ -277,28 +296,29 @@ async fn pause(
                 }
             }
         };
-        if crate::defs::lifecycle::pause(txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
-        }
+        pauses.push((id, reason));
     }
-    Ok(())
+    pauses
 }
 
-/// A detector's pauses of `table`'s readers, each definition for its reason
-/// ([`crate::defs::lifecycle::pause`]), in one transaction. Returns `true`,
-/// the detector's answer once it pauses any: the caller leaves the table
-/// for the next pass.
+/// Logs each pause [`crate::defs::lifecycle::pause_many`] says moved its
+/// definition to `paused`.
+fn log_paused(paused: Vec<(i64, PauseReason)>) {
+    for (id, reason) in paused {
+        crate::instance_log::warn!(transform_id = id, table = %reason.table(), "definition paused: {reason}");
+    }
+}
+
+/// A detector's pauses of `table`'s definitions, each for its reason, in one
+/// transaction that locks their rows in id order
+/// ([`crate::defs::lifecycle::pause_many`]). Returns `true`, the detector's
+/// answer once it pauses any: the caller leaves the table for the next pass.
 async fn pause_all(
     client: &mut Client,
-    table: &str,
     pauses: impl IntoIterator<Item = (i64, PauseReason)>,
 ) -> Result<bool, CaptureError> {
     let txn = client.transaction().await?;
-    for (id, reason) in pauses {
-        if crate::defs::lifecycle::pause(&txn, id, &reason).await? {
-            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
-        }
-    }
+    log_paused(crate::defs::lifecycle::pause_many(&txn, pauses).await?);
     txn.commit().await?;
     Ok(true)
 }
@@ -397,10 +417,7 @@ pub(crate) async fn pause_readers_of_missing(
     if readers.is_empty() {
         return Ok(false);
     }
-    let txn = client.transaction().await?;
-    pause(&txn, catalog, table, &missing, &readers).await?;
-    txn.commit().await?;
-    Ok(true)
+    pause_all(client, missing_pauses(catalog, table, &missing, &readers)).await
 }
 
 /// The staging worker's capture pass's check for a column a definition
@@ -469,7 +486,7 @@ pub(crate) async fn pause_readers_of_uncapturable(
             PauseReason::capture_of(table, pause.columns, pause.error),
         )
     });
-    pause_all(client, table, pauses).await
+    pause_all(client, pauses).await
 }
 
 /// One definition [`pause_readers_of_uncapturable`] pauses: the columns of
@@ -615,7 +632,7 @@ pub(crate) async fn pause_joins_without_unique_key(
         let text = unique_key_gone_error(table, &on);
         (id, PauseReason::capture_of(table, on, text))
     });
-    pause_all(client, table, pauses).await
+    pause_all(client, pauses).await
 }
 
 /// The `capture_failure` sentence for a 1-1 `JOIN` paused because `table`,
@@ -708,12 +725,7 @@ pub(crate) async fn pause_readers_of_unbacked_key(
         partitioned,
         nullable,
     };
-    pause_all(
-        client,
-        table,
-        readers.into_iter().map(|id| (id, reason.clone())),
-    )
-    .await
+    pause_all(client, readers.into_iter().map(|id| (id, reason.clone()))).await
 }
 
 /// What the message of an unbacked `KEY` needs to know of `table`: whether
@@ -848,7 +860,7 @@ pub(crate) async fn pause_readers_of_missing_probe_index(
     let pauses = passed
         .into_iter()
         .map(|(id, index)| (id, PauseReason::MissingProbeIndex { index, partitioned }));
-    pause_all(client, table, pauses).await
+    pause_all(client, pauses).await
 }
 
 /// The staging worker's capture pass's check for a table Trellis can't read
@@ -933,7 +945,7 @@ pub(crate) async fn pause_readers_of_unsupported(
     let pauses = pauses
         .into_iter()
         .map(|(id, error)| (id, PauseReason::capture(table, error)));
-    pause_all(client, table, pauses).await
+    pause_all(client, pauses).await
 }
 
 /// The staging worker's capture pass's check for a captured table in a
@@ -969,12 +981,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
         return Ok(true);
     }
     let reason = PauseReason::capture(table, hierarchy_error(&found));
-    pause_all(
-        client,
-        table,
-        readers.into_iter().map(|id| (id, reason.clone())),
-    )
-    .await
+    pause_all(client, readers.into_iter().map(|id| (id, reason.clone()))).await
 }
 
 /// The staging worker's capture pass's check of the types and collations
@@ -1375,6 +1382,10 @@ pub(crate) async fn pause_readers_of_retyped(
         HashMap::new()
     };
     let txn = client.transaction().await?;
+    // Every row this transaction pauses, locked first in one sorted
+    // statement (ADR-0028 I5): `pauses` is in id order.
+    let ids: Vec<i64> = pauses.iter().map(|p| p.id).collect();
+    crate::defs::lifecycle::lock_for_pause(&txn, &ids).await?;
     for pause in pauses {
         let mut error = pause.error.clone();
         let mut caused_by = None;
@@ -1382,14 +1393,10 @@ pub(crate) async fn pause_readers_of_retyped(
             // A definition already frozen (paused by the operator,
             // quarantined) was paused for another reason first: it gets
             // the record, as before, but not the cause. Read under the lock
-            // the pause's update takes on an unfrozen row, so the status
-            // can't change before the update. A frozen row the update skips
-            // is locked here too: this transaction bumps no version fence
-            // and locks rows in id order, and a resume holding the row has
-            // finished its fence wait (ADR-0002).
+            // above, so the status can't change before the pause's update.
             let frozen = txn
                 .query_opt(
-                    "select status from transform_definitions where id = $1 for no key update",
+                    "select status from transform_definitions where id = $1",
                     &[&pause.id],
                 )
                 .await?
@@ -2558,5 +2565,151 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// The drain's pauses for a page's `schema_changed` markers take every
+    /// reader's row in one sorted statement, first (ADR-0028 I5, #2026), not
+    /// table by table: a page whose markers name two tables, the first by
+    /// name read by the higher id, would otherwise lock that id and then wait
+    /// on the lower one. Frozen with the lower id's row held by another
+    /// transaction, which then takes the higher id's, as a sorted taker of
+    /// both would: had the pauses gone table by table, the two would
+    /// deadlock.
+    #[tokio::test]
+    async fn a_pages_marker_pauses_lock_their_readers_in_id_order_across_tables() {
+        use std::collections::HashMap;
+
+        use crate::defs::ast::ValueType;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = crate::pool::Pool::new(&config).expect("pool");
+        let connect = || async {
+            let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .batch_execute(&format!(
+                    "set search_path to {}, public",
+                    crate::config::DEFAULT_SCHEMA
+                ))
+                .await
+                .expect("search path");
+            client
+        };
+        let mut pauser = connect().await;
+        pauser
+            .batch_execute(
+                "create table public.z (id bigint primary key, x numeric); \
+                 create table public.a (id bigint primary key, x numeric)",
+            )
+            .await
+            .expect("sources");
+        let columns: HashMap<String, ValueType> = ["id", "x"]
+            .iter()
+            .map(|name| (name.to_string(), ValueType::Numeric))
+            .collect();
+        let mut ids = Vec::new();
+        for text in [
+            "TRANSFORM low FROM public.z SELECT x AS v",
+            "TRANSFORM high FROM public.a SELECT x AS v",
+        ] {
+            let def = crate::defs::catalog::create_definition(&pool, text, &columns)
+                .await
+                .expect(text);
+            ids.push(def.id);
+        }
+        let (low, high) = (ids[0], ids[1]);
+        assert!(low < high);
+        pauser
+            .execute(
+                "update transform_definitions set status = 'live' where id = any($1)",
+                &[&ids],
+            )
+            .await
+            .expect("live");
+        let catalog = crate::capture::columns::load_catalog(&pauser)
+            .await
+            .expect("catalog");
+        let missing = || Missing {
+            columns: BTreeSet::from(["x".to_string()]),
+            ..Missing::default()
+        };
+        let by_table: BTreeMap<String, Missing> = [
+            ("public.a".to_string(), missing()),
+            ("public.z".to_string(), missing()),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut taker = connect().await;
+        let other = taker.transaction().await.expect("txn");
+        other
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&low],
+            )
+            .await
+            .expect("lock low");
+        let other_pid: i32 = other
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let pauser_pid: i32 = pauser
+            .query_one("select pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0);
+        let pausing = tokio::spawn(async move {
+            let paused = pause_marked_readers(&mut pauser, &catalog, &by_table).await;
+            (pauser, paused)
+        });
+        // Wait for the pauses to queue behind `low`'s row: a lock state,
+        // which they reach once, not a convergence.
+        let watcher = connect().await;
+        loop {
+            let blocked: bool = watcher
+                .query_one(
+                    "select $2 = any(pg_blocking_pids($1))",
+                    &[&pauser_pid, &other_pid],
+                )
+                .await
+                .expect("blocking pids")
+                .get(0);
+            if blocked {
+                break;
+            }
+            assert!(
+                !pausing.is_finished(),
+                "the pauses finished without queuing behind the low reader's row"
+            );
+            tokio::task::yield_now().await;
+        }
+        other
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&high],
+            )
+            .await
+            .expect("the pauses hold no row past the one they wait on");
+        other.commit().await.expect("commit");
+        let (pauser, paused) = pausing.await.expect("pause task");
+        paused.expect("pauses");
+        let statuses: Vec<String> = pauser
+            .query(
+                "select status from transform_definitions where id = any($1) order by id",
+                &[&ids],
+            )
+            .await
+            .expect("statuses")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(statuses, ["paused", "paused"], "both paused");
     }
 }
