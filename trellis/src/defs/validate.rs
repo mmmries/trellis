@@ -1261,16 +1261,19 @@ impl ValidationError {
 
 crate::error_code::coded_display!(ValidationError);
 
-/// The site the field-level refusals name for a check of the `WHERE`
+/// The sites the field-level refusals name for a check of the `WHERE`
 /// predicate, which they carry as the field `WHERE`.
-const PREDICATE_SITE: &str = "calculated field 'WHERE'";
+const PREDICATE_SITES: [&str; 2] = ["calculated field 'WHERE'", "field 'WHERE'"];
 
 impl crate::error_code::Message for ValidationError {
     /// A field-level refusal raised over the `WHERE` predicate names the
     /// predicate, not a "calculated field 'WHERE'".
     fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = FieldMessage(self).to_string();
-        match text.strip_prefix(PREDICATE_SITE) {
+        match PREDICATE_SITES
+            .iter()
+            .find_map(|site| text.strip_prefix(site))
+        {
             Some(rest) => write!(f, "the WHERE predicate{rest}"),
             None => f.write_str(&text),
         }
@@ -2188,7 +2191,8 @@ pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), Valida
         KeySpace::OneToOne => "1-1",
         KeySpace::Aggregate { .. } => return Ok(()),
         KeySpace::Join(_) => "JOIN aggregate",
-        KeySpace::JoinOneToOne(_) => "1-1 JOIN",
+        // Filtered at recompute (#2041): its validator checks the predicate.
+        KeySpace::JoinOneToOne(_) => return Ok(()),
     };
     Err(ValidationError::FilterNotYetSupported { key_space })
 }
@@ -2979,8 +2983,8 @@ pub fn validate_join(
     left: &HashMap<String, JoinColumnInfo>,
     joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
-    // A `JOIN`'s predicate reads qualified columns of either table, which
-    // the steps that apply it check (#1991); until then it is refused here.
+    // A join aggregate's predicate is refused until its step (#2042) applies
+    // it; a 1-1 `JOIN`'s validator checks its own.
     refuse_unsupported_filter(def)?;
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);

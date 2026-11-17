@@ -213,6 +213,13 @@ pub(crate) struct JoinShape {
     /// The columns of `s`: the SQL over `r` and `b`, and the name `fields`
     /// read it by.
     s_columns: Vec<(String, String)>,
+    /// The definition's `WHERE` over the lateral row `s`, as
+    /// `((<predicate>) is true)`; `None` without one. Its columns are among
+    /// `s_columns` whatever fields are paused. Every statement that decides
+    /// whether a row has a target row evaluates it on the row joined to the
+    /// newest live `M` entry at every position, above the presence test
+    /// ([`Self::member_rows_sql`]).
+    predicate: Option<String>,
 }
 
 /// One joined table of a [`JoinShape`]: its `M`, and its group of `J`.
@@ -463,6 +470,17 @@ impl JoinShape {
             let expr = qualify(def, &target, &field.expr, &mut reads)?;
             fields.push((field.name.clone(), render_qualified_expr_sql(&expr, "s")));
         }
+        // The predicate decides membership, so a pause never leaves it out.
+        let predicate = match def.predicate.filter() {
+            Some(predicate) => {
+                let expr = qualify(def, &target, predicate, &mut reads)?;
+                Some(format!(
+                    "(({}) is true)",
+                    render_qualified_expr_sql(&expr, "s")
+                ))
+            }
+            None => None,
+        };
         let s_columns = reads
             .iter()
             .map(|(side, column)| {
@@ -493,6 +511,7 @@ impl JoinShape {
             r_columns,
             fields,
             s_columns,
+            predicate,
             target,
         })
     }
@@ -689,6 +708,32 @@ impl JoinShape {
             ));
         }
         terms.join(" and ")
+    }
+
+    /// The `R` entries `probe` picks (a condition on `r`) that pass the
+    /// presence test ([`Self::has_target_row_sql`]), behind an `offset 0`
+    /// fence, as a relation `r`: what [`Self::member_rows_sql`] joins.
+    fn present_r_sql(&self, probe: &str) -> String {
+        format!(
+            "(select r.* from {r} r where {probe} and {has} offset 0) r",
+            r = self.r.ident,
+            has = self.has_target_row_sql(),
+        )
+    }
+
+    /// The rows that have a target row, from `from` (a relation supplying
+    /// `r` from [`Self::present_r_sql`]): joined to the newest live `M`
+    /// entry at every position ([`Self::joined_sql`]) and kept when the
+    /// predicate is `TRUE` on that row. The delete and the upsert of
+    /// [`write_target`] both read membership here, so they agree on every
+    /// row (ADR-0021). The predicate sits above the fence: Postgres
+    /// evaluates a `WHERE` only on a row the join produced, and so does
+    /// this, never on an entry that fails the presence test.
+    fn member_rows_sql(&self, from: &str) -> String {
+        match &self.predicate {
+            Some(predicate) => format!("{} where {predicate}", self.joined_sql(from)),
+            None => self.joined_sql(from),
+        }
     }
 
     /// An empty key set, one empty set per position.
@@ -2838,11 +2883,25 @@ enum Entries {
 impl Entries {
     /// Whether some of these entries may have no target row, for
     /// [`write_target`] to look for one to delete. A fan-out's entries are
-    /// live, so under a `LEFT` join each has its target row; under an `INNER`
-    /// join an entry has one only while a live `M` entry is on its key, and a
-    /// fan-out of a `b` delete is what removes them.
+    /// live, so under a `LEFT` join with no `WHERE` each has its target row.
+    /// Under an `INNER` join an entry has one only while a live `M` entry is
+    /// on its key, and a fan-out of a `b` delete is what removes them; with a
+    /// `WHERE`, a `b` change can make any row stop qualifying, at any kind
+    /// (#1991 rule 18).
     fn may_delete(self, shape: &JoinShape) -> bool {
-        self == Entries::Changed || shape.any_inner()
+        // Planted bug: a `LEFT`-only fan-out with a `WHERE` skips its
+        // delete, as one without does. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if self == Entries::FanOut
+            && !shape.any_inner()
+            && crate::plant::fires(
+                crate::plant::Plant::Join1WhereFanOutNoDelete,
+                shape.predicate.is_some(),
+            )
+        {
+            return false;
+        }
+        self == Entries::Changed || shape.any_inner() || shape.predicate.is_some()
     }
 }
 
@@ -2961,12 +3020,32 @@ async fn write_target(
     // Rows that have no target row: delete them. The key text compares only
     // for rows the index finds by primary key.
     if entries.may_delete(shape) {
-        let unbacked = format!(
-            "not exists (select 1 from {r} r where r.{key} = ({key_expr}) collate \"C\" and {has})",
-            r = shape.r.ident,
+        let probe = format!(
+            "r.{key} = ({key_expr}) collate \"C\"",
             key = quote_ident(schema::KEY_COLUMN),
-            has = shape.has_target_row_sql(),
         );
+        // Planted bug: the delete reads presence alone, not the membership
+        // the upsert reads, so a row that stops qualifying stays. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let presence_only = crate::plant::fires(
+            crate::plant::Plant::Join1WhereDeletePresenceOnly,
+            shape.predicate.is_some(),
+        );
+        #[cfg(not(any(test, feature = "test-util")))]
+        let presence_only = false;
+        let unbacked = if shape.predicate.is_none() || presence_only {
+            format!(
+                "not exists (select 1 from {r} r where {probe} and {has})",
+                r = shape.r.ident,
+                has = shape.has_target_row_sql(),
+            )
+        } else {
+            format!(
+                "not exists (select 1 from {})",
+                shape.member_rows_sql(&shape.present_r_sql(&probe))
+            )
+        };
         for (pattern, arm) in &matched.arms {
             let params: Vec<_> = arm.params().collect();
             let sql = format!(
@@ -3050,20 +3129,20 @@ fn upsert_sql(shape: &JoinShape) -> String {
     let ordinals: Vec<String> = (1..=arity).map(|i| i.to_string()).collect();
     let col_list: Vec<String> = pk_cols.iter().chain(field_cols.iter()).cloned().collect();
     let from = format!(
-        "unnest({}) as v({}) cross join lateral \
-         (select r.* from {r} r where r.{key} = v.__key and {has} offset 0) r",
+        "unnest({}) as v({}) cross join lateral {}",
         unnest_args.join(", "),
         unnest_cols.join(", "),
-        r = shape.r.ident,
-        key = quote_ident(schema::KEY_COLUMN),
-        has = shape.has_target_row_sql(),
+        shape.present_r_sql(&format!("r.{} = v.__key", quote_ident(schema::KEY_COLUMN))),
     );
+    // The fields are in the select list of the level whose `WHERE` is the
+    // predicate, so a field is never evaluated on a row that doesn't
+    // qualify (#1991 rule 9).
     format!(
-        "insert into {target} ({cols}) select {select} from {joined} \
+        "insert into {target} ({cols}) select {select} from {members} \
          order by {ordinals} {on_conflict}",
         cols = col_list.join(", "),
         select = select_cols.join(", "),
-        joined = shape.joined_sql(&from),
+        members = shape.member_rows_sql(&from),
         ordinals = ordinals.join(", "),
     )
 }
@@ -3152,7 +3231,7 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
     let sql = format!(
         "with expected as ( \
              select {a_key} as k{comma}{fields} \
-             from {a} r {joins} cross join lateral {s} \
+             from {a} r {joins} cross join lateral {s}{filter} \
          ), actual as ( \
              select {t_key} as k{t_comma}{t_fields} from {target} t \
          ) \
@@ -3164,6 +3243,10 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
         fields = expected.join(", "),
         a = ddl::qualified_source_table(&shape.source_table),
         joins = joins.join(" "),
+        filter = shape
+            .predicate
+            .as_ref()
+            .map_or_else(String::new, |p| format!(" where {p}")),
         t_key = ddl::pk_key_sql_expr(&shape.pk, Some("t")),
         t_comma = if names.is_empty() { "" } else { ", " },
         t_fields = names

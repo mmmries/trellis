@@ -10,11 +10,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::ValueType;
 use super::ast::{Expr, KeySpace, QualifiedColumn, TransformDef};
 use super::join::Side;
 use super::validate::{
-    JoinColumnInfo, RESERVED_COLUMN_PREFIX, ValidationError, join_field_value_type, join_resolver,
-    validate_join_tables_and_on,
+    ColumnTypes, JoinColumnInfo, RESERVED_COLUMN_PREFIX, ValidationError, infer_expr_type_in,
+    join_field_value_type, join_resolver, validate_join_tables_and_on,
 };
 
 /// Validates a [`KeySpace::JoinOneToOne`] definition against the live columns
@@ -26,7 +27,7 @@ use super::validate::{
 /// each table, of one type and collation, on the join-key allowlist; no
 /// column a hidden table copies is named like one of its ledger columns; and
 /// each field is any expression over qualified columns of either table, with
-/// no aggregate call, that types.
+/// no aggregate call, that types. A `WHERE` is [`check_predicate`]'s.
 pub fn validate(
     def: &TransformDef,
     root: &HashMap<String, JoinColumnInfo>,
@@ -76,6 +77,9 @@ pub fn validate(
         // target column.
         join_field_value_type(def, field, root, joined)?;
     }
+    if let Some(predicate) = def.predicate.filter() {
+        check_predicate(def, predicate, root, joined, &resolve)?;
+    }
     super::validate::check_join_collation_reads(def, join, root, joined)?;
     // `R`'s join-key index ends with the entry key, which a fan-out chunk
     // walks a key's entries by: one column past the `ON` columns.
@@ -96,6 +100,46 @@ pub fn validate(
         super::validate::check_table_width(|| table, columns)?;
     }
     Ok(())
+}
+
+/// The checks of a 1-1 `JOIN`'s `WHERE`, as Postgres reads it after the
+/// joins (ADR-0021): no aggregate call, every column qualified and resolved
+/// through a table of the join, type `boolean` (a lone `NULL` is one by
+/// position) and total ([`super::totality`]). Any such predicate is admitted,
+/// over one table or several, the anti-join included.
+fn check_predicate<'a>(
+    def: &TransformDef,
+    predicate: &Expr,
+    root: &HashMap<String, JoinColumnInfo>,
+    joined: &[&HashMap<String, JoinColumnInfo>],
+    resolve: &impl Fn(&QualifiedColumn) -> Result<(Side, &'a JoinColumnInfo), ValidationError>,
+) -> Result<(), ValidationError> {
+    let mut aggregate = None;
+    predicate.walk(&mut |e| {
+        if let Expr::FunctionCall { name, .. } = e
+            && aggregate.is_none()
+            && super::registry::is_aggregate_name(name)
+        {
+            aggregate = Some(name.clone());
+        }
+    });
+    if let Some(function) = aggregate {
+        return Err(ValidationError::AggregateInPredicate { function });
+    }
+    check_field_expr(predicate, "WHERE", resolve)?;
+    let columns = ColumnTypes::Join { def, root, joined };
+    if !matches!(predicate, Expr::Null) {
+        let found = infer_expr_type_in("WHERE", predicate, &columns)?;
+        if found != ValueType::Boolean {
+            return Err(ValidationError::PredicateNotBoolean { found });
+        }
+    }
+    super::totality::check(predicate, &columns).map_err(|refused| {
+        ValidationError::PredicateNotTotal {
+            construct: refused.construct,
+            reason: refused.reason,
+        }
+    })
 }
 
 /// `J` names its key column for each `FROM` column a position's `ON` reads
@@ -531,5 +575,86 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(check(&long(""), &format!("{}j", "k".repeat(59))), Ok(()));
+    }
+
+    fn check_where(predicate: &str) -> Result<(), ValidationError> {
+        check(&format!("customers.name AS who WHERE {predicate}"))
+    }
+
+    /// Any total boolean predicate is admitted (#1991 rule 18, ADR-0021):
+    /// over one table, over both, the anti-join, and the degenerate ones.
+    #[test]
+    fn any_total_boolean_predicate_is_admitted() {
+        for predicate in [
+            "orders.total > 5",
+            "customers.id IS NULL",
+            "orders.total > customers.id",
+            "customers.id IS NULL OR orders.total > 3",
+            "customers.name = 'x'",
+            "FALSE",
+            "NULL",
+            "(TRUE)",
+        ] {
+            assert_eq!(check_where(predicate), Ok(()), "{predicate}");
+        }
+        // A star's predicate reads any position.
+        let star = parse(
+            "TRANSFORM v FROM orders JOIN customers ON orders.cust = customers.id \
+             LEFT JOIN regions ON orders.cust = regions.id \
+             SELECT customers.name AS who \
+             WHERE regions.id IS NULL OR customers.id > orders.total",
+        )
+        .unwrap();
+        let (from, joined) = sides();
+        assert_eq!(validate_join(&star, &from, &[&joined, &joined]), Ok(()));
+    }
+
+    /// The predicate's own checks, as the one-table `WHERE`'s: every column
+    /// qualified and known, boolean, total. (The parser refuses an aggregate
+    /// call outside an aggregate's fields first.)
+    #[test]
+    fn a_predicate_is_refused_by_its_own_checks() {
+        assert!(matches!(
+            check_where("total > 1"),
+            Err(ValidationError::JoinUnqualifiedColumn { field, .. }) if field == "WHERE"
+        ));
+        assert!(check_where("orders.nope > 1").is_err());
+        assert_eq!(
+            check_where("orders.total + 1"),
+            Err(ValidationError::PredicateNotBoolean {
+                found: ValueType::Integer(IntWidth::Int4)
+            })
+        );
+        let divided = check_where("orders.total * customers.id > 1");
+        assert!(
+            matches!(divided, Err(ValidationError::PredicateNotTotal { .. })),
+            "{divided:?}"
+        );
+        // Two text columns of different tables may carry conflicting
+        // collations (side condition C2): refused, as two of one table are.
+        assert!(matches!(
+            check_where("orders.note = customers.name"),
+            Err(ValidationError::PredicateNotTotal { .. })
+        ));
+        // Two columns of one name in two tables are two columns.
+        let def = parse(
+            "TRANSFORM v FROM orders LEFT JOIN customers ON orders.cust = customers.id \
+             SELECT customers.name AS who WHERE orders.name = customers.name",
+        )
+        .unwrap();
+        let (mut from, joined) = sides();
+        from.insert("name".to_string(), info("text", ValueType::Text));
+        assert!(matches!(
+            validate_join(&def, &from, &[&joined]),
+            Err(ValidationError::PredicateNotTotal { .. })
+        ));
+    }
+
+    /// A refusal over the predicate names it, not a field called `WHERE`.
+    #[test]
+    fn a_refusal_over_the_predicate_names_the_where() {
+        let text = check_where("total > 1").unwrap_err().to_string();
+        assert!(text.contains("the WHERE predicate"), "{text}");
+        assert!(!text.contains("'WHERE'"), "{text}");
     }
 }

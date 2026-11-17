@@ -629,7 +629,7 @@ a stored generated column or a [chained](transforms.md#chaining-and-cycle-detect
 ### T0238 FilterNotYetSupported
 
 A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every
-one but the plain aggregate ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
+one but the plain aggregate and the 1-1 `JOIN` ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 There is no workaround in the definition yet; filter when reading the target.
 
 ### T0239 FilteredExtreme
