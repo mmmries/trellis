@@ -63,7 +63,6 @@ const EXEMPT: &[&str] = &[
     "CatalogError::AboveRunningRelease",
     "CatalogError::CannotRun",
     "CatalogError::DependentsBlockDrop",
-    "CatalogError::OutsideDependentsBlock",
     "CatalogError::AlterFieldAlreadyExists",
     "CatalogError::UnsupportedAlter",
     "CatalogError::LedgerTableMissing",

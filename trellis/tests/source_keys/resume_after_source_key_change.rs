@@ -502,6 +502,7 @@ async fn a_one_to_one_resume_that_empties_the_target_refuses_a_foreign_key_into_
         text.contains("objects outside Trellis depend on") && text.contains("refs_amount_fkey"),
         "{text}"
     );
+    assert!(!text.contains("define would refuse"), "{text}");
     assert_eq!(
         key_of(&raw, "public.c_copy").await,
         [

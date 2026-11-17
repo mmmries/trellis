@@ -238,7 +238,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | `TargetNameHasReaders`, naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it (`DependentsBlockDrop`) | `DROP TRANSFORM` each reader named (paused first), or another name |
 | A target name ending in `__ledger`, or over 55 bytes: its ledger, `<target>__ledger`, must fit Postgres's 63 | `ReservedTargetSuffix`, `TargetNameTooLong` | [Text](#text) | Another name |
 | A target in this instance's catalog schema, or in a schema holding another instance's `trellis_instance` table, whose uninstall would drop it ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)) | `TargetInCatalogSchema` | [Resume only](#resume-only) | An ordinary schema; after define, `DROP TRANSFORM` and define it there |
-| Objects outside Trellis depend on a target when `DROP TRANSFORM` drops it or `ALTER TRANSFORM … DROP` drops a field: another table's foreign key into it, or a view over it or the column. Trellis never cascades; the statement rolls back whole and the definition is unchanged | `OutsideDependentsBlock`, naming the dependents Postgres reports | n/a | Drop or alter the dependents, then retry |
+| Objects outside Trellis depend on a target that `DROP TRANSFORM` drops, `ALTER TRANSFORM … DROP` drops a field of, or a 1-1 `RESUME` empties: another table's foreign key into it, or a view over it or the column. Trellis never cascades; the statement rolls back whole and the definition is unchanged | `OutsideDependentsBlock`, naming the dependents Postgres reports | n/a | Drop or alter the dependents, then retry |
 
 ### Details
 
@@ -768,9 +768,8 @@ refuses while another table's foreign key into it, or a view over it, exists
   value for a moment though the source never does.
 * Another table's foreign key referencing the target holds the key of a
   referenced row Trellis deletes, and a source `TRUNCATE`'s page while any row
-  is referenced. `DROP TRANSFORM`, and the `RESUME` that empties a 1-1 target
-  keyed by a relabelled enum, fail with the database's error while it exists:
-  drop it first.
+  is referenced. It also refuses a `RESUME` that empties a 1-1 target
+  ([refusal table](#refusals)).
 * An `INSERT` or `UPDATE` rule, or most `DELETE` rules (`DO INSTEAD NOTHING`
   among them), make Postgres refuse the `INSERT … ON CONFLICT` and
   `DELETE … RETURNING` Trellis writes with: a build pauses, and each key a

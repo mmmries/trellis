@@ -492,9 +492,9 @@ pub enum CatalogError {
         /// resolved this precisely.
         column_detail: Vec<String>,
     },
-    /// A statement's DDL on a target failed because objects outside Trellis
-    /// depend on it: another table's foreign key, or a view over the table
-    /// or a column. Trellis never cascades (ADR-0014; what a user adds to a
+    /// A statement's DDL on a target, or a `RESUME`'s emptying of it, failed
+    /// because objects outside Trellis depend on it: another table's foreign
+    /// key, or a view over the table or a column. Trellis never cascades (ADR-0014; what a user adds to a
     /// target is the user's), so the statement rolls back whole.
     OutsideDependentsBlock {
         /// What the statement acts on: the target, or `target.column`.
@@ -689,6 +689,8 @@ impl CatalogError {
     /// schema that holds the target, whose uninstall drops the target with
     /// it: its repair is also to drop the definition and define it again,
     /// in an ordinary schema, and its own message says so.
+    /// [`CatalogError::OutsideDependentsBlock`] is no define refusal either:
+    /// define never sees the user's objects on a target.
     pub(crate) fn is_define_refusal(&self) -> bool {
         !matches!(
             self,
@@ -701,6 +703,7 @@ impl CatalogError {
                 | CatalogError::LedgerTableMissing { .. }
                 | CatalogError::TargetTableMissing { .. }
                 | CatalogError::TargetInCatalogSchema { .. }
+                | CatalogError::OutsideDependentsBlock { .. }
         )
     }
 }
@@ -1149,12 +1152,26 @@ impl CatalogError {
     /// [`CatalogError::OutsideDependentsBlock`], naming the dependents from
     /// Postgres's DETAIL. Any other error stays a database error.
     pub(crate) fn from_dependency_failure(err: tokio_postgres::Error, subject: &str) -> Self {
+        Self::lift_dependency_failure(err, subject, false)
+    }
+
+    /// [`CatalogError::from_dependency_failure`] for a `TRUNCATE` of
+    /// `subject`, which a foreign key into it refuses with `0A000`, naming
+    /// the referencing table in its DETAIL. Only a `TRUNCATE` site lifts
+    /// `0A000`: elsewhere it means an unsupported statement, not dependents.
+    pub(crate) fn from_truncate_failure(err: tokio_postgres::Error, subject: &str) -> Self {
+        Self::lift_dependency_failure(err, subject, true)
+    }
+
+    fn lift_dependency_failure(err: tokio_postgres::Error, subject: &str, truncate: bool) -> Self {
         use tokio_postgres::error::SqlState;
         let lines: Option<Vec<String>> = err.as_db_error().and_then(|db| {
             // A dependency failure's DETAIL lists the dependents; a foreign
-            // key's refusal of a delete names the key in its message, and its
-            // DETAIL names the referenced row.
-            let head = if db.code() == &SqlState::FOREIGN_KEY_VIOLATION {
+            // key's refusal of a delete or a truncate names it in its
+            // message, and its DETAIL names the referenced row or table.
+            let head = if db.code() == &SqlState::FOREIGN_KEY_VIOLATION
+                || (truncate && db.code() == &SqlState::FEATURE_NOT_SUPPORTED)
+            {
                 Some(db.message())
             } else if db.code() == &SqlState::DEPENDENT_OBJECTS_STILL_EXIST {
                 None
