@@ -88,6 +88,12 @@ impl RefusedSteps {
         self.lock().remove(step).is_some()
     }
 
+    /// Clears every refusal: this process no longer leads, so it no longer
+    /// knows whether the steps are refused.
+    pub(crate) fn clear_all(&self) {
+        self.lock().clear();
+    }
+
     pub(crate) fn snapshot(&self) -> Vec<RefusedStep> {
         self.lock().values().cloned().collect()
     }
@@ -283,5 +289,11 @@ mod tests {
         assert!(shared.clear("seal"));
         assert!(!shared.clear("seal"));
         assert!(shared.snapshot().is_empty());
+        shared.set(RefusedStep::from_message(
+            "seal",
+            "permission denied for table a",
+        ));
+        shared.clear_all();
+        assert!(shared.snapshot().is_empty(), "a standby reports none");
     }
 }

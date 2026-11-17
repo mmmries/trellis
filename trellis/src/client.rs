@@ -1463,6 +1463,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 release_singleton(session.take(), &process).await;
             }
             report_leader(&mut reported_leader, false);
+            // A standby runs no step, so it reports no refusal of one.
+            process.refused_steps.clear_all();
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     stop(database, session).await;
@@ -1503,6 +1505,9 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // Another worker leads: not a failure of this one.
                 Err(StagingError::ProducerAlreadyRunning) => {
                     lock_schedule.refused(Instant::now());
+                    // Another worker runs the steps now: what this one was
+                    // refused says nothing about them.
+                    process.refused_steps.clear_all();
                 }
                 Err(err) => {
                     let _ = failures.check("connect", Err::<(), _>(err));
