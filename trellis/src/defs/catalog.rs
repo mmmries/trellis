@@ -666,7 +666,7 @@ impl CatalogError {
             CatalogError::AboveRunningRelease { .. } => ErrorId(151),
             CatalogError::CannotRun { .. } => ErrorId(152),
             CatalogError::DependentsBlockDrop { .. } => ErrorId(153),
-            CatalogError::OutsideDependentsBlock { .. } => ErrorId(233),
+            CatalogError::OutsideDependentsBlock { .. } => ErrorId(242),
             CatalogError::TransformNotLive { .. } => ErrorId(154),
             CatalogError::AlterFieldNotFound { .. } => ErrorId(155),
             CatalogError::AlterFieldAlreadyExists { .. } => ErrorId(156),
