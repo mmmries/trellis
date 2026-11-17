@@ -22,7 +22,7 @@ use super::ast::{
 use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
 use super::pg_type::PgType;
-use crate::error_code::{ErrorCode, ErrorId};
+use crate::error_code::{ErrorCode, ErrorId, SharedCondition};
 use crate::integer::IntWidth;
 
 /// Which key a [`ValidationError::NondeterministicKeyCollation`] column
@@ -383,6 +383,16 @@ pub enum ValidationError {
     /// known at define time so Postgres can judge it once (`CatalogError::InvalidRegexPattern`)
     /// — a column-sourced pattern is out of scope.
     NonLiteralRegexPattern { field: String },
+    /// A string literal compared with an enum column (`status = 'open'`) is
+    /// not a label of the column's enum. Postgres reads the literal as a
+    /// value of the enum and fails the statement on a label it lacks.
+    /// Define checks it against the live labels, and a `RESUME` checks it
+    /// again, so a relabelled value fails the definition.
+    EnumLiteralNotALabel {
+        field: String,
+        enum_type: String,
+        label: String,
+    },
     /// A typed literal's text isn't in its family's **canonical**
     /// Postgres output spelling — `DATE '2024-1-5'`, `DATE 'today'`,
     /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
@@ -514,6 +524,13 @@ pub enum ValidationError {
     /// exact text, so the engine and Postgres would disagree. Refused at
     /// define time, as for join and key columns.
     NondeterministicCollationTextFunction(Box<NondeterministicCollationTextFunction>),
+    /// A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` whose text operands
+    /// carry different collations, none the database default, with none to
+    /// choose between them. Postgres raises `42P22` ("could not determine
+    /// which collation to use") on every row where both operands are not
+    /// `NULL`, so the definition would define and then fail every write.
+    /// The grammar has no `COLLATE` clause to pick one.
+    ConflictingCollations(Box<ConflictingCollations>),
     /// An explicitly-qualified `FROM <schema>.<table>` source reference
     /// (ADR-0011) named a schema that does not
     /// actually contain a table by that name, as introspected live against
@@ -542,6 +559,27 @@ pub enum ValidationError {
     /// separator is fixed per definition so the ledger's contribution column
     /// is the value argument alone.
     StringAggSeparatorNotLiteral { field: String },
+    /// The `WHERE` predicate is not `boolean` (Postgres: "argument of WHERE
+    /// must be type boolean").
+    PredicateNotBoolean { found: ValueType },
+    /// An aggregate call in the `WHERE` predicate, which Postgres refuses
+    /// ("aggregate functions are not allowed in WHERE").
+    AggregateInPredicate { function: String },
+    /// A name in the `WHERE` predicate that is no source column. As in
+    /// Postgres, a predicate reads the source, never a calculated field.
+    PredicateColumnNotFound { column: String },
+    /// A construct of the `WHERE` predicate that can raise an error for
+    /// some value of its operand types (ADR-0004): only a total predicate
+    /// is admitted (`defs::totality`).
+    PredicateNotTotal { construct: String, reason: String },
+    /// A `WHERE` other than `TRUE` on a key space whose apply path doesn't
+    /// filter yet. Each key space's step of #1991 lifts it for that key
+    /// space.
+    FilterNotYetSupported { key_space: &'static str },
+    /// `MIN` or `MAX` in an aggregate with a `WHERE` other than `TRUE`: an
+    /// extreme is kept by probing a source index for the group's endpoint,
+    /// and a filtered extreme's endpoint is no index endpoint (#1991).
+    FilteredExtreme { field: String, function: String },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -571,6 +609,21 @@ pub struct NondeterministicCollationTextFunction {
     pub collation: String,
 }
 
+/// Payload of [`ValidationError::ConflictingCollations`], boxed out of the
+/// enum like [`NondeterministicKeyCollation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictingCollations {
+    /// The calculated field whose own expression makes the comparison.
+    pub field: String,
+    /// The comparison operator, `NULLIF`, `STRPOS` or `REGEXP_COUNT`.
+    pub construct: String,
+    /// The two columns whose collations conflict, as `table.column`.
+    pub first_column: String,
+    pub first_collation: String,
+    pub second_column: String,
+    pub second_collation: String,
+}
+
 /// The registry functions whose Postgres implementation refuses a
 /// nondeterministic collation with `0A000`, so the engine can't compute them
 /// the way Postgres would on such a column: `strpos` ("not supported for
@@ -596,7 +649,7 @@ pub(crate) struct CollationRefusingRead {
 }
 
 /// A column an expression reads, with the qualifier it was written with.
-type ReadColumn = (Option<QualifiedColumn>, String);
+pub(crate) type ReadColumn = (Option<QualifiedColumn>, String);
 
 /// Every column an argument of a `STRPOS`/`REGEXP_COUNT` call in `def`'s
 /// fields reads, for the catalog to check each
@@ -614,6 +667,10 @@ pub(crate) fn collation_refusing_function_reads(def: &TransformDef) -> Vec<Colla
     let mut reads = Vec::new();
     for field in &def.fields {
         collect_refusing_calls(&field.expr, &field.name, &fields_by_name, &mut reads);
+    }
+    // A predicate's names are source columns, never fields.
+    if let Some(predicate) = def.predicate.filter() {
+        collect_refusing_calls(predicate, "WHERE", &HashMap::new(), &mut reads);
     }
     let mut seen = HashSet::new();
     reads.retain(|read| seen.insert(read.clone()));
@@ -708,7 +765,7 @@ fn collect_text_comparison(
 /// calculated field it reads, and the arguments of `COALESCE` and `NULLIF`
 /// and the results (not the conditions) of a `CASE`. Anything else (a call,
 /// an operator) returns a value of another type or a computed one.
-fn collect_value_columns<'a>(
+pub(crate) fn collect_value_columns<'a>(
     expr: &Expr,
     field: &str,
     fields_by_name: &HashMap<&str, &'a FieldDef>,
@@ -835,7 +892,208 @@ pub(crate) fn check_collation_reads<'a>(
             ));
         }
     }
+    check_collation_conflicts(def, only_fields, &resolve)
+}
+
+/// The database default's `pg_collation` OID.
+const DEFAULT_COLLATION_OID: u32 = 100;
+
+/// The collation an expression's text carries, as Postgres derives it
+/// (`assign_collations`): a column's own, the database default for a
+/// constant or a computed value, and a conflict where two different
+/// collations meet. The database default yields to any other collation.
+enum Derived {
+    Collation {
+        oid: u32,
+        /// `table.column` of a column that carries it, and the collation's name.
+        column: String,
+        name: String,
+    },
+    Default,
+    Conflict(Box<ConflictingCollations>),
+}
+
+impl Derived {
+    fn merge(self, other: Derived) -> Derived {
+        match (self, other) {
+            (Derived::Default, other) | (other, Derived::Default) => other,
+            (conflict @ Derived::Conflict(_), _) | (_, conflict @ Derived::Conflict(_)) => conflict,
+            (Derived::Collation { oid, .. }, other @ Derived::Collation { oid: other_oid, .. })
+                if oid == other_oid =>
+            {
+                other
+            }
+            (
+                Derived::Collation {
+                    column: first_column,
+                    name: first_collation,
+                    ..
+                },
+                Derived::Collation {
+                    column: second_column,
+                    name: second_collation,
+                    ..
+                },
+            ) => Derived::Conflict(Box::new(ConflictingCollations {
+                field: String::new(),
+                construct: String::new(),
+                first_column,
+                first_collation,
+                second_column,
+                second_collation,
+            })),
+        }
+    }
+}
+
+/// Refuses a definition whose comparison (`=`, `<>`, `IS [NOT] DISTINCT
+/// FROM`), `NULLIF`, `STRPOS` or `REGEXP_COUNT` has text operands of
+/// conflicting collations ([`ConflictingCollations`]). An operand's
+/// collation comes from the columns under it, directly or through
+/// `COALESCE`, a `CASE` result or a calculated field, read
+/// from the live catalog through `resolve` as [`check_collation_reads`]
+/// reads its columns. A read `resolve` can't place passes.
+fn check_collation_conflicts<'a>(
+    def: &TransformDef,
+    only_fields: Option<&[FieldDef]>,
+    resolve: &impl Fn(&CollationRefusingRead) -> Option<(String, &'a JoinColumnInfo)>,
+) -> Result<(), ValidationError> {
+    let fields_by_name: HashMap<&str, &FieldDef> =
+        def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    for field in &def.fields {
+        if only_fields.is_some_and(|only| !only.iter().any(|f| f.name == field.name)) {
+            continue;
+        }
+        derive_collation(
+            &field.expr,
+            &field.name,
+            &fields_by_name,
+            &mut HashSet::new(),
+            resolve,
+        )?;
+    }
     Ok(())
+}
+
+fn derive_collation<'a, 'f>(
+    expr: &Expr,
+    field: &str,
+    fields_by_name: &HashMap<&'f str, &'f FieldDef>,
+    visiting: &mut HashSet<&'f str>,
+    resolve: &impl Fn(&CollationRefusingRead) -> Option<(String, &'a JoinColumnInfo)>,
+) -> Result<Derived, ValidationError> {
+    let aggregate_scope;
+    let mut fields_by_name = fields_by_name;
+    if let Expr::FunctionCall { name, .. } = expr
+        && super::registry::is_aggregate_name(name)
+    {
+        // An aggregate's argument reads source columns, not aggregate
+        // fields (see `aggregate_field_names`).
+        let aggregates = aggregate_field_names(fields_by_name.iter().map(|(n, f)| (*n, &f.expr)));
+        aggregate_scope = without_aggregate_fields(fields_by_name, &aggregates);
+        fields_by_name = &aggregate_scope;
+    }
+    let mut children = Vec::new();
+    for child in expr.children() {
+        children.push(derive_collation(
+            child,
+            field,
+            fields_by_name,
+            visiting,
+            resolve,
+        )?);
+    }
+    let column = |qualifier: Option<QualifiedColumn>, name: &str| {
+        let read = CollationRefusingRead {
+            field: field.to_string(),
+            function: String::new(),
+            column: name.to_string(),
+            qualifier,
+        };
+        match resolve(&read) {
+            Some((table, info)) if !matches!(info.collation_oid, 0 | DEFAULT_COLLATION_OID) => {
+                Derived::Collation {
+                    oid: info.collation_oid,
+                    column: format!("{table}.{name}"),
+                    name: info.collation.clone().unwrap_or_default(),
+                }
+            }
+            _ => Derived::Default,
+        }
+    };
+    // The operands of a collation-sensitive construct, which must agree.
+    let check = |construct: &str, operands: Vec<Derived>| match operands
+        .into_iter()
+        .fold(Derived::Default, Derived::merge)
+    {
+        Derived::Conflict(mut conflict) => {
+            conflict.field = field.to_string();
+            conflict.construct = construct.to_string();
+            Err(ValidationError::ConflictingCollations(conflict))
+        }
+        merged => Ok(merged),
+    };
+    let merge_all =
+        |results: Vec<Derived>| results.into_iter().fold(Derived::Default, Derived::merge);
+    Ok(match expr {
+        Expr::Column(name) => match fields_by_name.get(name.as_str()) {
+            Some(other) if name != field => {
+                if visiting.insert(other.name.as_str()) {
+                    let derived = derive_collation(
+                        &other.expr,
+                        &other.name,
+                        fields_by_name,
+                        visiting,
+                        resolve,
+                    );
+                    visiting.remove(other.name.as_str());
+                    derived?
+                } else {
+                    Derived::Default
+                }
+            }
+            _ => column(None, name),
+        },
+        Expr::SourceColumn {
+            schema,
+            table,
+            column: name,
+        } => column(
+            Some(QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: name.clone(),
+            }),
+            name,
+        ),
+        Expr::BinaryOp { op, .. } if op.is_comparison() => {
+            check(super::registry::operator_spec(*op).symbol, children)?;
+            Derived::Default
+        }
+        Expr::FunctionCall { name, .. } => match name.as_str() {
+            "NULLIF" => check("NULLIF", children)?,
+            "STRPOS" | "REGEXP_COUNT" => {
+                check(name, children)?;
+                Derived::Default
+            }
+            "COALESCE" => merge_all(children),
+            _ => Derived::Default,
+        },
+        Expr::Case { branches, .. } => {
+            // `children` is each branch's condition and result in order, then
+            // the `ELSE`; only the results carry a value out.
+            let count = branches.len() * 2;
+            merge_all(
+                children
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i >= count || i % 2 == 1)
+                    .map(|(_, derived)| derived)
+                    .collect(),
+            )
+        }
+        _ => Derived::Default,
+    })
 }
 
 /// [`check_collation_reads`] for a `JOIN`: each read resolves against the
@@ -944,7 +1202,10 @@ impl ValidationError {
             ValidationError::FunctionArgTypeMismatch { .. } => ErrorId(95),
             ValidationError::NonLiteralRegexPattern { .. } => ErrorId(96),
             ValidationError::InvalidTypedLiteral { .. } => ErrorId(97),
-            ValidationError::UnsupportedLiteralType { .. } => ErrorId(98),
+            ValidationError::UnsupportedLiteralType { .. } => {
+                SharedCondition::UnsupportedLiteralType.error_id()
+            }
+            ValidationError::EnumLiteralNotALabel { .. } => ErrorId(241),
             ValidationError::UnresolvedGroupByColumn { .. } => ErrorId(99),
             ValidationError::UnsupportedGroupByKeyType { .. } => ErrorId(100),
             ValidationError::GroupByKeysShareTargetColumn { .. } => ErrorId(101),
@@ -956,9 +1217,16 @@ impl ValidationError {
             ValidationError::CalculatedFieldShadowsSourceColumn { .. } => ErrorId(107),
             ValidationError::NondeterministicKeyCollation(..) => ErrorId(108),
             ValidationError::NondeterministicCollationTextFunction(..) => ErrorId(109),
+            ValidationError::ConflictingCollations(..) => ErrorId(233),
             ValidationError::QualifiedSourceTableNotFound { .. } => ErrorId(110),
             ValidationError::QualifiedTargetTableNotFound { .. } => ErrorId(111),
             ValidationError::StringAggSeparatorNotLiteral { .. } => ErrorId(112),
+            ValidationError::PredicateNotBoolean { .. } => ErrorId(234),
+            ValidationError::AggregateInPredicate { .. } => ErrorId(235),
+            ValidationError::PredicateColumnNotFound { .. } => ErrorId(236),
+            ValidationError::PredicateNotTotal { .. } => ErrorId(237),
+            ValidationError::FilterNotYetSupported { .. } => ErrorId(238),
+            ValidationError::FilteredExtreme { .. } => ErrorId(239),
         }
     }
 
@@ -993,9 +1261,28 @@ impl ValidationError {
 
 crate::error_code::coded_display!(ValidationError);
 
+/// The site the field-level refusals name for a check of the `WHERE`
+/// predicate, which they carry as the field `WHERE`.
+const PREDICATE_SITE: &str = "calculated field 'WHERE'";
+
 impl crate::error_code::Message for ValidationError {
+    /// A field-level refusal raised over the `WHERE` predicate names the
+    /// predicate, not a "calculated field 'WHERE'".
     fn fmt_message(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
+        let text = FieldMessage(self).to_string();
+        match text.strip_prefix(PREDICATE_SITE) {
+            Some(rest) => write!(f, "the WHERE predicate{rest}"),
+            None => f.write_str(&text),
+        }
+    }
+}
+
+/// [`ValidationError`]'s message as each variant words it.
+struct FieldMessage<'a>(&'a ValidationError);
+
+impl std::fmt::Display for FieldMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
             ValidationError::DuplicateFieldName { name } => {
                 write!(f, "duplicate calculated field name '{name}'")
             }
@@ -1191,7 +1478,7 @@ impl crate::error_code::Message for ValidationError {
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
                  the supported aggregates are COUNT(*), COUNT(col), SUM/AVG over \
-                 smallint, integer, bigint or numeric, and, in a GROUP BY without a \
+                 a number or an interval, and, in a GROUP BY without a \
                  JOIN, MIN/MAX of a number, date or time column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
             ),
@@ -1202,7 +1489,7 @@ impl crate::error_code::Message for ValidationError {
             } => write!(
                 f,
                 "{function}({column}) is over {pg_type}; SUM and AVG are supported over \
-                 smallint, integer, bigint and numeric only"
+                 numbers and intervals only"
             ),
             ValidationError::UnsupportedExtremeArgument {
                 function,
@@ -1423,6 +1710,16 @@ impl crate::error_code::Message for ValidationError {
                 "calculated field '{field}': {value_type} literal '{text}' is not in canonical \
                  form: {detail}"
             ),
+            ValidationError::EnumLiteralNotALabel {
+                field,
+                enum_type,
+                label,
+            } => write!(
+                f,
+                "calculated field '{field}': '{label}' is not a label of the enum type \
+                 {enum_type}; a string literal compared with an enum column must be one of its \
+                 labels"
+            ),
             ValidationError::UnsupportedLiteralType { field, value_type } => write!(
                 f,
                 "calculated field '{field}': '{value_type}' is not a type a literal can be \
@@ -1560,6 +1857,24 @@ impl crate::error_code::Message for ValidationError {
                      needs a deterministic collation"
                 )
             }
+            ValidationError::ConflictingCollations(refused) => {
+                let ConflictingCollations {
+                    field,
+                    construct,
+                    first_column,
+                    first_collation,
+                    second_column,
+                    second_collation,
+                } = refused.as_ref();
+                write!(
+                    f,
+                    "calculated field '{field}': {construct} compares {first_column}, whose \
+                     collation is \"{first_collation}\", with {second_column}, whose collation \
+                     is \"{second_collation}\"; Postgres can't tell which collation to use \
+                     (42P22) and fails every row where both are not NULL; give the two columns \
+                     one collation"
+                )
+            }
             ValidationError::QualifiedSourceTableNotFound { schema, table } => write!(
                 f,
                 "FROM names '{schema}.{table}' explicitly, but schema '{schema}' has no table \
@@ -1576,6 +1891,35 @@ impl crate::error_code::Message for ValidationError {
             ValidationError::StringAggSeparatorNotLiteral { field } => write!(
                 f,
                 "calculated field '{field}': STRING_AGG's separator must be a string literal"
+            ),
+            ValidationError::PredicateNotBoolean { found } => {
+                write!(
+                    f,
+                    "argument of WHERE must be type boolean, not type {found}"
+                )
+            }
+            ValidationError::AggregateInPredicate { function } => write!(
+                f,
+                "aggregate functions are not allowed in WHERE ({function})"
+            ),
+            ValidationError::PredicateColumnNotFound { column } => write!(
+                f,
+                "WHERE reads column '{column}', which is not a column of the source; a WHERE \
+                 reads source columns, never a calculated field"
+            ),
+            ValidationError::PredicateNotTotal { construct, reason } => write!(
+                f,
+                "WHERE: {construct} can raise an error for some rows: {reason}; a WHERE must \
+                 be total"
+            ),
+            ValidationError::FilterNotYetSupported { key_space } => write!(
+                f,
+                "a WHERE other than TRUE is not supported on a {key_space} transform yet"
+            ),
+            ValidationError::FilteredExtreme { field, function } => write!(
+                f,
+                "calculated field '{field}': {function} is not supported in an aggregate with a \
+                 WHERE; an extreme of the rows the WHERE keeps can't be read from a source index"
             ),
         }
     }
@@ -1681,8 +2025,8 @@ pub fn validate(
             }
         }
     }
-    match def.predicate {
-        Predicate::True => {}
+    if let Some(predicate) = def.predicate.filter() {
+        validate_predicate(predicate, source_columns)?;
     }
 
     let mut field_names = HashSet::with_capacity(def.fields.len());
@@ -1776,10 +2120,103 @@ pub fn validate(
     }
 
     if let KeySpace::Aggregate { .. } = &def.key_space {
+        refuse_filtered_extremes(def)?;
         reject_extremes_without_source_index(def, source_columns)?;
         check_aggregate_table_widths(def, source_columns)?;
     }
 
+    refuse_unsupported_filter(def)?;
+
+    Ok(())
+}
+
+/// The checks of a one-table definition's `WHERE` predicate, as Postgres
+/// reads it: no aggregate call, every name a source column (never a
+/// calculated field, so a field named like a column reads the column), type
+/// `boolean` (a lone `NULL` is one by position), and total ([`super::totality`]).
+/// A qualified name is checked with the fields' (`validate_qualified_columns`).
+fn validate_predicate(
+    predicate: &Expr,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), ValidationError> {
+    let mut aggregate = None;
+    predicate.walk(&mut |e| {
+        if let Expr::FunctionCall { name, .. } = e
+            && aggregate.is_none()
+            && super::registry::is_aggregate_name(name)
+        {
+            aggregate = Some(name.clone());
+        }
+    });
+    if let Some(function) = aggregate {
+        return Err(ValidationError::AggregateInPredicate { function });
+    }
+    if let Some(column) = predicate
+        .columns()
+        .into_iter()
+        .find(|name| !source_columns.contains_key(*name))
+    {
+        return Err(ValidationError::PredicateColumnNotFound {
+            column: column.to_string(),
+        });
+    }
+    let columns = ColumnTypes::Source(source_columns);
+    if !matches!(predicate, Expr::Null) {
+        let found = infer_expr_type_in("WHERE", predicate, &columns)?;
+        if found != ValueType::Boolean {
+            return Err(ValidationError::PredicateNotBoolean { found });
+        }
+    }
+    super::totality::check(predicate, &columns).map_err(|refused| {
+        ValidationError::PredicateNotTotal {
+            construct: refused.construct,
+            reason: refused.reason,
+        }
+    })
+}
+
+/// Refuses a `WHERE` other than `TRUE` on a key space whose apply path
+/// doesn't filter yet (#1991). Each key space's step removes its arm once
+/// its build, apply and `self_check` read the predicate; until then define
+/// refuses here, after every other check, so the predicate's own refusals
+/// are reported first.
+pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), ValidationError> {
+    if matches!(def.predicate, Predicate::True) {
+        return Ok(());
+    }
+    let key_space = match &def.key_space {
+        KeySpace::OneToOne => "1-1",
+        KeySpace::Aggregate { .. } => return Ok(()),
+        KeySpace::Join(_) => "JOIN aggregate",
+        KeySpace::JoinOneToOne(_) => "1-1 JOIN",
+    };
+    Err(ValidationError::FilterNotYetSupported { key_space })
+}
+
+/// Refuses `MIN`/`MAX` in an aggregate whose `WHERE` is other than `TRUE`
+/// ([`ValidationError::FilteredExtreme`]), naming the first field that calls
+/// one.
+fn refuse_filtered_extremes(def: &TransformDef) -> Result<(), ValidationError> {
+    if def.predicate.filter().is_none() {
+        return Ok(());
+    }
+    for field in &def.fields {
+        let mut found = None;
+        field.expr.walk(&mut |e| {
+            if let Expr::FunctionCall { name, .. } = e
+                && found.is_none()
+                && matches!(name.to_ascii_uppercase().as_str(), "MIN" | "MAX")
+            {
+                found = Some(name.to_ascii_uppercase());
+            }
+        });
+        if let Some(function) = found {
+            return Err(ValidationError::FilteredExtreme {
+                field: field.name.clone(),
+                function,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2014,6 +2451,9 @@ pub struct JoinColumnInfo {
     pub collation_deterministic: bool,
     /// The type is a live enum, which is a text-stable join key too.
     pub is_enum: bool,
+    /// The labels of the enum type, in sort order: `Some` for an enum column
+    /// read live, `None` for any other column.
+    pub enum_labels: Option<Vec<String>>,
     /// The type a copy of the column is declared and cast as: no modifier,
     /// qualified ([`super::copy_type::type_sql`]).
     pub copy_type: String,
@@ -2143,10 +2583,19 @@ pub(crate) fn check_aggregate_admitted(
                         AggregateAdmissionRule::SumAvgNumeric
                     })
                 }
+                // Exact sums in a `numeric` argument's partials, each value
+                // converted exactly (`staging::group_basis::exact_sums`).
                 ValueType::Float(_) | ValueType::Other(PgType::Interval) => {
-                    Err(ValidationError::DeferredAggregate {
-                        function,
-                        family: "float and interval SUM/AVG",
+                    for layout in [
+                        super::floor::Layout::NumericSums,
+                        super::floor::Layout::FloatIntervalSums,
+                    ] {
+                        super::floor::record(super::floor::Feature::Layout(layout));
+                    }
+                    admitted(if matches!(arg.value_type, ValueType::Float(_)) {
+                        AggregateAdmissionRule::SumAvgFloat
+                    } else {
+                        AggregateAdmissionRule::SumAvgInterval
                     })
                 }
                 _ => Err(ValidationError::UnsupportedAggregateArgument {
@@ -2208,7 +2657,25 @@ pub(crate) fn validate_live(
         .map(|(name, info)| (name.clone(), info.value_type))
         .collect();
     validate(def, &value_types)?;
+    check_enum_literals(def, columns)?;
     validate_aggregate_admitted(def, columns)
+}
+
+/// Refuses a string literal compared with an enum column that is not a label
+/// of the enum, in a field or the `WHERE`, over the live `columns` (which
+/// carry the labels). [`validate`] types the definition over types alone, so
+/// it can't; define and every `RESUME` make this check
+/// ([`super::catalog::validate_live_schema`]).
+pub(crate) fn check_enum_literals(
+    def: &TransformDef,
+    columns: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let live = ColumnTypes::Live(columns);
+    infer_fields(&def.fields, &live)?;
+    if let Some(predicate) = def.predicate.filter() {
+        infer_expr_type_in("WHERE", predicate, &live)?;
+    }
+    Ok(())
 }
 
 /// [`validate_aggregate_admitted`]'s walk of one field's expression.
@@ -2489,6 +2956,9 @@ pub fn validate_join(
     left: &HashMap<String, JoinColumnInfo>,
     joined: &[&HashMap<String, JoinColumnInfo>],
 ) -> Result<(), ValidationError> {
+    // A `JOIN`'s predicate reads qualified columns of either table, which
+    // the steps that apply it check (#1991); until then it is refused here.
+    refuse_unsupported_filter(def)?;
     if let KeySpace::JoinOneToOne(_) = &def.key_space {
         return super::validate_join_one_to_one::validate(def, left, joined);
     }
@@ -2774,9 +3244,15 @@ pub(crate) fn validate_qualified_columns(
                     });
                 }
                 if !source_columns.contains_key(column) {
-                    return Err(ValidationError::UnresolvedColumn {
-                        field: field.to_string(),
-                        column: render_field_expr(expr),
+                    return Err(if field == "WHERE" {
+                        ValidationError::PredicateColumnNotFound {
+                            column: render_field_expr(expr),
+                        }
+                    } else {
+                        ValidationError::UnresolvedColumn {
+                            field: field.to_string(),
+                            column: render_field_expr(expr),
+                        }
                     });
                 }
                 Ok(())
@@ -2801,7 +3277,11 @@ pub(crate) fn validate_qualified_columns(
     }
     def.fields
         .iter()
-        .try_for_each(|f| walk(&f.expr, &f.name, def, source_columns, source_schema))
+        .try_for_each(|f| walk(&f.expr, &f.name, def, source_columns, source_schema))?;
+    match def.predicate.filter() {
+        Some(predicate) => walk(predicate, "WHERE", def, source_columns, source_schema),
+        None => Ok(()),
+    }
 }
 
 /// Refuses a bare name that could mean either a source column or a field:
@@ -3443,13 +3923,32 @@ pub(crate) enum ColumnTypes<'a> {
     },
 }
 
-impl ColumnTypes<'_> {
+impl<'a> ColumnTypes<'a> {
     /// The type of the bare column `name`, if it is one.
     fn bare(&self, name: &str) -> Option<ValueType> {
         match self {
             ColumnTypes::Source(columns) => columns.get(name).copied(),
             ColumnTypes::Live(columns) => columns.get(name).map(|info| info.value_type),
             ColumnTypes::Join { .. } => None,
+        }
+    }
+
+    /// The labels of the enum type `ty`, as some column of that type carries
+    /// them live. `None` when no column of the type does (a `Source` read
+    /// has only types).
+    fn enum_labels(&self, ty: ValueType) -> Option<&[String]> {
+        let find = |columns: &'a HashMap<String, JoinColumnInfo>| {
+            columns
+                .values()
+                .find(|info| info.value_type == ty)
+                .and_then(|info| info.enum_labels.as_deref())
+        };
+        match self {
+            ColumnTypes::Source(_) => None,
+            ColumnTypes::Live(columns) => find(columns),
+            ColumnTypes::Join { root, joined, .. } => {
+                find(root).or_else(|| joined.iter().find_map(|columns| find(columns)))
+            }
         }
     }
 
@@ -3860,6 +4359,83 @@ fn comparison_type(
     })
 }
 
+/// The enum column and string literal of `lhs op rhs` when it is that
+/// comparison: `=` with an enum on one side and a string literal on the
+/// other. Postgres types the literal from the column (`unknown` resolves to
+/// the enum), so the pair is an enum comparison. `<>`, the ordering
+/// operators and `NULLIF` don't take it.
+fn enum_beside_string_literal<'e>(
+    op: super::ast::Operator,
+    lhs: &'e Expr,
+    rhs: &'e Expr,
+    lhs_t: ValueType,
+    rhs_t: ValueType,
+) -> Option<(ValueType, &'e str)> {
+    if op != super::ast::Operator::Equal {
+        return None;
+    }
+    match (lhs_t, lhs, rhs_t, rhs) {
+        (ty @ ValueType::Other(PgType::Enum(_)), _, _, Expr::StringLiteral(label))
+        | (_, Expr::StringLiteral(label), ty @ ValueType::Other(PgType::Enum(_)), _) => {
+            Some((ty, label))
+        }
+        _ => None,
+    }
+}
+
+/// [`enum_beside_string_literal`]'s comparison type: a `boolean`.
+fn enum_literal_comparison(
+    op: super::ast::Operator,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_t: ValueType,
+    rhs_t: ValueType,
+) -> Option<ValueType> {
+    enum_beside_string_literal(op, lhs, rhs, lhs_t, rhs_t)?;
+    Some(
+        super::registry::Admitted::new(
+            ValueType::Boolean,
+            super::registry::TypeRule::Comparison(
+                super::registry::ComparisonRule::EnumBesideStringLiteral,
+            ),
+        )
+        .into_type(),
+    )
+}
+
+/// Refuses an enum compared with a string literal that is not a label of
+/// the enum, over the labels the live columns carry. A read with no labels
+/// (`ColumnTypes::Source`) is not checked.
+fn check_enum_literal(
+    op: super::ast::Operator,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_t: Option<ValueType>,
+    rhs_t: Option<ValueType>,
+    columns: &ColumnTypes<'_>,
+    field_name: &str,
+) -> Result<(), ValidationError> {
+    let (Some(lhs_t), Some(rhs_t)) = (lhs_t, rhs_t) else {
+        return Ok(());
+    };
+    let Some((ty, label)) = enum_beside_string_literal(op, lhs, rhs, lhs_t, rhs_t) else {
+        return Ok(());
+    };
+    match columns.enum_labels(ty) {
+        Some(labels) if !labels.iter().any(|l| l == label) => {
+            Err(ValidationError::EnumLiteralNotALabel {
+                field: field_name.to_string(),
+                enum_type: match ty {
+                    ValueType::Other(pg) => pg.enum_qualified_name().unwrap_or("").to_string(),
+                    _ => String::new(),
+                },
+                label: label.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The type of `expr`, or the refusal naming why it has none this grammar
 /// admits. Inference never evaluates a constant: an expression Postgres
 /// fails while planning it (`2147483647 + 1`) types like any other, and its
@@ -4061,7 +4637,9 @@ fn infer_expr(
                 infer_operand(lhs, field_name, columns, fields_by_name, types, in_progress)?;
             let rhs_t =
                 infer_operand(rhs, field_name, columns, fields_by_name, types, in_progress)?;
-            infer_binary_op(expr, *op, lhs, rhs, lhs_t, rhs_t, field_name)
+            let result = infer_binary_op(expr, *op, lhs, rhs, lhs_t, rhs_t, field_name)?;
+            check_enum_literal(*op, lhs, rhs, lhs_t, rhs_t, columns, field_name)?;
+            Ok(result)
         }
         Expr::Negate(operand) => {
             // Postgres finds prefix `-` over `NULL` ambiguous.
@@ -4359,6 +4937,9 @@ fn infer_binary_op(
         return Ok(result);
     }
     if op.is_comparison() {
+        if let Some(result) = enum_literal_comparison(op, lhs, rhs, lhs_t, rhs_t) {
+            return Ok(result);
+        }
         return comparison_type(op, lhs, rhs, lhs_t, rhs_t, field_name);
     }
     // No operator takes the other operand's type on both sides (or
@@ -4845,13 +5426,22 @@ fn validate_regexp_pattern(field_name: &str, pattern_arg: &Expr) -> Result<(), V
 /// non-literal pattern is [`validate`]'s refusal.
 pub(crate) fn regexp_pattern_literals(def: &TransformDef) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for field in &def.fields {
-        field.expr.walk(&mut |expr| {
-            if let Expr::FunctionCall { name, args } = expr
-                && name == "REGEXP_COUNT"
+    let predicate = def.predicate.filter().map(|p| ("WHERE", p));
+    for (name, expr) in def
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), &f.expr))
+        .chain(predicate)
+    {
+        expr.walk(&mut |expr| {
+            if let Expr::FunctionCall {
+                name: function,
+                args,
+            } = expr
+                && function == "REGEXP_COUNT"
                 && let Some(Expr::StringLiteral(pattern)) = args.get(1)
             {
-                out.push((field.name.clone(), pattern.clone()));
+                out.push((name.to_string(), pattern.clone()));
             }
         });
     }
@@ -6895,6 +7485,7 @@ mod tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            enum_labels: None,
             copy_type: pg_type.split('(').next().unwrap_or(pg_type).to_string(),
             copy_collation: None,
             trellis_target: false,
@@ -7085,8 +7676,6 @@ mod tests {
             ("BOOL_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_AND(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
-            ("SUM(items.weight)", "float and interval SUM/AVG"),
-            ("AVG(items.weight)", "float and interval SUM/AVG"),
             ("ARRAY_AGG(items.sku)", "array_agg/string_agg/jsonb_agg"),
             (
                 "STRING_AGG(items.sku, ',')",
@@ -7358,8 +7947,6 @@ mod tests {
         for (call, family) in [
             ("BOOL_AND(qty > 1)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_OR(qty)", "bool_and/bool_or/bit_and/bit_or"),
-            ("SUM(weight)", "float and interval SUM/AVG"),
-            ("AVG(wait)", "float and interval SUM/AVG"),
             ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg"),
             ("STRING_AGG(note, ',')", "array_agg/string_agg/jsonb_agg"),
             // Inside a composed field too.
@@ -7416,9 +8003,9 @@ mod tests {
             }
         }
         // An argument that names a calculated field is typed as that field's
-        // expression: an integer one is admitted, a float one is refused by
-        // family. (This check doesn't look at `GROUP BY`; `validate` refuses
-        // a calculated field over an ungrouped column.)
+        // expression, an integer one and a float one alike. (This check
+        // doesn't look at `GROUP BY`; `validate` refuses a calculated field
+        // over an ungrouped column.)
         let grouped = |fields: &str| {
             let def = parse_text(&format!(
                 "TRANSFORM t FROM items GROUP BY sku, qty \
@@ -7427,23 +8014,45 @@ mod tests {
             .unwrap_or_else(|e| panic!("{fields}: {e}"));
             validate_aggregate_admitted(&def, &items)
         };
-        assert!(
-            matches!(
-                grouped("(weight + weight) AS w2, SUM(w2) AS s"),
-                Err(ValidationError::DeferredAggregate {
-                    family: "float and interval SUM/AVG",
-                    ..
-                })
-            ),
-            "a float calculated field's SUM"
-        );
         for fields in [
+            "(weight + weight) AS w2, SUM(w2) AS s",
             "(qty + 1) AS q, SUM(q) AS s",
             "(qty + qty) AS q, COUNT(*) AS n, AVG(q) AS a",
         ] {
             if let Err(err) = grouped(fields) {
                 panic!("{fields}: {err:?}");
             }
+        }
+    }
+
+    /// `SUM` and `AVG` over a float or an `interval` are admitted as exact
+    /// sums (#1119), on a `JOIN` and a plain aggregate, recording the
+    /// layout their partials need.
+    #[test]
+    fn sum_and_avg_over_a_float_or_an_interval_are_admitted() {
+        let (_, mut items) = tables();
+        items.insert(
+            "wait".into(),
+            jcol(ValueType::Other(PgType::Interval), "interval", 1186, -1),
+        );
+        for call in ["SUM(items.weight)", "AVG(items.weight)"] {
+            check(&format!("orders.region AS region, {call} AS v"))
+                .unwrap_or_else(|err| panic!("{call}: {err:?}"));
+        }
+        for call in ["SUM(weight)", "AVG(weight)", "SUM(wait)", "AVG(wait)"] {
+            let def = parse_text(&format!(
+                "TRANSFORM t FROM items GROUP BY sku SELECT sku AS sku, {call} AS v"
+            ))
+            .unwrap_or_else(|e| panic!("{call}: {e}"));
+            let (result, used) =
+                super::super::floor::collect(|| validate_aggregate_admitted(&def, &items));
+            result.unwrap_or_else(|err| panic!("{call}: {err:?}"));
+            assert!(
+                used.contains(&super::super::floor::Feature::Layout(
+                    super::super::floor::Layout::FloatIntervalSums
+                )),
+                "{call}: {used:?}"
+            );
         }
     }
 
@@ -8207,6 +8816,139 @@ mod tests {
             Err(ValidationError::JoinNeedsBothTables)
         );
     }
+
+    // ---- An enum column beside a string literal ----
+
+    const STATUS: ValueType = ValueType::Other(PgType::Enum("enum:public.status"));
+
+    fn status_column(labels: &[&str]) -> JoinColumnInfo {
+        let mut info = jcol(STATUS, "status", 90000, -1);
+        info.is_enum = true;
+        info.enum_labels = Some(labels.iter().map(|l| l.to_string()).collect());
+        info
+    }
+
+    fn status_table() -> HashMap<String, JoinColumnInfo> {
+        side(&[
+            ("id", int4()),
+            ("status", status_column(&["open", "closed"])),
+            ("other", jcol(ValueType::Text, "text", 25, -1)),
+        ])
+    }
+
+    fn live(text: &str) -> Result<(), ValidationError> {
+        validate_live(&parse_text(text).unwrap(), &status_table())
+    }
+
+    /// An enum column `=` a label of its enum is a `boolean`, in either
+    /// order and anywhere a boolean is read: a field, a `CASE` condition.
+    #[test]
+    fn an_enum_equals_one_of_its_labels_is_admitted() {
+        for text in [
+            "TRANSFORM t FROM s SELECT id AS id, status = 'open' AS is_open",
+            "TRANSFORM t FROM s SELECT id AS id, 'closed' = status AS is_closed",
+            "TRANSFORM t FROM s SELECT id AS id, \
+             CASE WHEN status = 'open' THEN 1 ELSE 0 END AS n",
+            "TRANSFORM t FROM s SELECT id AS id, status AS st, st = 'open' AS is_open",
+            "TRANSFORM t FROM s GROUP BY other SELECT other AS other, \
+             COUNT(CASE WHEN status = 'open' THEN 1 END) AS n",
+        ] {
+            assert_eq!(live(text), Ok(()), "{text}");
+        }
+    }
+
+    /// The comparison's type is `boolean`, so `NOT` and `AND` read it.
+    #[test]
+    fn an_enum_comparison_is_boolean() {
+        assert_eq!(
+            live("TRANSFORM t FROM s SELECT id AS id, NOT status = 'open' AND id > 1 AS x"),
+            Ok(())
+        );
+    }
+
+    /// Postgres fails a statement that reads a literal that is no label, so
+    /// define names it.
+    #[test]
+    fn a_literal_that_is_not_a_label_is_refused() {
+        for text in [
+            "TRANSFORM t FROM s SELECT id AS id, status = 'Open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, 'nope' = status AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = '' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = 'open ' AS x",
+        ] {
+            assert!(
+                matches!(
+                    live(text),
+                    Err(ValidationError::EnumLiteralNotALabel { .. })
+                ),
+                "{text}: {:?}",
+                live(text)
+            );
+        }
+        let Err(refusal) = live("TRANSFORM t FROM s SELECT id AS id, status = 'x' AS v") else {
+            panic!("refused");
+        };
+        assert_eq!(
+            refusal.to_string(),
+            "T0241: calculated field 'v': 'x' is not a label of the enum type public.status; a string \
+             literal compared with an enum column must be one of its labels"
+        );
+    }
+
+    /// Only `=` takes the literal: the other comparisons, `NULLIF` and an
+    /// enum against `text` stay refused.
+    #[test]
+    fn only_equals_takes_the_literal() {
+        for text in [
+            "TRANSFORM t FROM s SELECT id AS id, status <> 'open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status < 'open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status IS DISTINCT FROM 'open' AS x",
+            "TRANSFORM t FROM s SELECT id AS id, NULLIF(status, 'open') AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = other AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = status AS x",
+            "TRANSFORM t FROM s SELECT id AS id, status = 1 AS x",
+        ] {
+            let refusal = live(text).expect_err(text);
+            assert!(
+                !matches!(refusal, ValidationError::EnumLiteralNotALabel { .. }),
+                "{text}: {refusal:?}"
+            );
+        }
+    }
+
+    /// A type-only read (no live labels) admits the pair: the labels are
+    /// the live validators' to check.
+    #[test]
+    fn a_type_only_read_does_not_check_labels() {
+        let types = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("status".to_string(), STATUS),
+        ]);
+        let def = parse_text("TRANSFORM t FROM s SELECT id AS id, status = 'nope' AS x").unwrap();
+        assert_eq!(validate(&def, &types), Ok(()));
+    }
+
+    /// A `JOIN` reads the enum through its qualified side's labels.
+    #[test]
+    fn a_join_checks_the_label_against_the_side_that_has_the_enum() {
+        let (mut left, right) = tables();
+        left.insert("status".to_string(), status_column(&["open"]));
+        let ok = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             SELECT items.sku AS sku, orders.status = 'open' AS is_open",
+        )
+        .unwrap();
+        assert_eq!(validate_join(&ok, &left, &[&right]), Ok(()));
+        let bad = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             SELECT items.sku AS sku, orders.status = 'closed' AS is_open",
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_join(&bad, &left, &[&right]),
+            Err(ValidationError::EnumLiteralNotALabel { .. })
+        ));
+    }
 }
 
 /// The pure key-collation check, over hand-built
@@ -8226,6 +8968,7 @@ mod key_collation_tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            enum_labels: None,
             copy_type: "text".to_string(),
             copy_collation: None,
             trellis_target: false,
@@ -8302,6 +9045,108 @@ mod key_collation_tests {
         assert_eq!(check_collation_reads(&def, Some(&new), resolve), Ok(()));
         let old: Vec<FieldDef> = def.fields[..1].to_vec();
         assert!(check_collation_reads(&def, Some(&old), resolve).is_err());
+        assert!(check_collation_reads(&def, None, resolve).is_err());
+    }
+
+    fn with_collation(oid: u32, name: &str) -> JoinColumnInfo {
+        let mut info = collated(column(), name);
+        info.collation_oid = oid;
+        info
+    }
+
+    /// Checks `body` (the `SELECT` list) against columns `a` (`"C"`), `p`
+    /// (`"POSIX"`), `a2` (`"C"`), `d` (the database default) and `n`
+    /// (`integer`, not collatable).
+    fn conflict_check(body: &str) -> Result<(), ValidationError> {
+        let def = crate::defs::parser::parse(&format!("TRANSFORM t FROM s SELECT {body}"))
+            .expect("parse");
+        let columns: HashMap<&str, JoinColumnInfo> = [
+            ("a", with_collation(950, "pg_catalog.\"C\"")),
+            ("p", with_collation(951, "pg_catalog.\"POSIX\"")),
+            ("a2", with_collation(950, "pg_catalog.\"C\"")),
+            ("d", with_collation(100, "pg_catalog.\"default\"")),
+            ("n", column_with_no_collation()),
+        ]
+        .into_iter()
+        .collect();
+        check_collation_reads(&def, None, |read| {
+            Some(("public.s".to_string(), columns.get(read.column.as_str())?))
+        })
+    }
+
+    fn column_with_no_collation() -> JoinColumnInfo {
+        let mut info = column();
+        info.value_type = ValueType::Integer(IntWidth::Int4);
+        info
+    }
+
+    /// Postgres raises `42P22` for each of these on a row where both
+    /// collations are present (confirmed on PG 17).
+    #[test]
+    fn operands_with_conflicting_collations_are_refused() {
+        for body in [
+            "a = p AS f",
+            "a <> p AS f",
+            "a IS DISTINCT FROM p AS f",
+            "NULLIF(a, p) AS f",
+            "STRPOS(a, p) AS f",
+            "REGEXP_COUNT(a, p) AS f",
+            "COALESCE(a, p) = 'x' AS f",
+            "STRPOS(COALESCE(a, p), 'x') AS f",
+            "CASE WHEN n = 1 THEN a ELSE p END = 'x' AS f",
+            "CASE WHEN a = p THEN 1 END AS f",
+            "a = COALESCE(d, p) AS f",
+            "p AS q, a = q AS f",
+        ] {
+            let err = conflict_check(body).expect_err(body);
+            let ValidationError::ConflictingCollations(conflict) = &err else {
+                panic!("{body}: {err:?}");
+            };
+            assert_eq!(conflict.field, "f", "{body}");
+            let message = err.message().to_string();
+            assert!(
+                message.contains("public.s.a") && message.contains("public.s.p"),
+                "{body}: {message}"
+            );
+        }
+    }
+
+    /// Each of these Postgres accepts: one collation, the database default
+    /// (which yields to any other), a value with no collation, or a
+    /// conflicting pair no collation-sensitive construct reads.
+    #[test]
+    fn operands_with_one_collation_pass() {
+        for body in [
+            "a = a2 AS f",
+            "a = d AS f",
+            "a = 'x' AS f",
+            "COALESCE(a, a2) = p2 AS f",
+            "a = CAST(n AS bigint) AS f",
+            "COALESCE(a, p) AS f",
+            "CHAR_LENGTH(COALESCE(a, p)) AS f",
+            "CASE WHEN a = 'x' THEN p ELSE d END AS f",
+            "a = a2 AND d = p AS f",
+        ] {
+            // `p2` is not a column: an unresolved read passes.
+            assert_eq!(conflict_check(body), Ok(()), "{body}");
+        }
+    }
+
+    /// `ALTER TRANSFORM ... ADD` checks only the fields it adds.
+    #[test]
+    fn only_the_listed_fields_conflicts_are_checked() {
+        let def =
+            crate::defs::parser::parse("TRANSFORM t FROM s SELECT a = p AS old, a = a2 AS new")
+                .expect("parse");
+        let (a, p) = (with_collation(950, "C"), with_collation(951, "POSIX"));
+        let resolve = |read: &CollationRefusingRead| {
+            Some((
+                "public.s".to_string(),
+                if read.column == "p" { &p } else { &a },
+            ))
+        };
+        let new: Vec<FieldDef> = def.fields[1..].to_vec();
+        assert_eq!(check_collation_reads(&def, Some(&new), resolve), Ok(()));
         assert!(check_collation_reads(&def, None, resolve).is_err());
     }
 

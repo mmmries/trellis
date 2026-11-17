@@ -451,6 +451,10 @@ pub enum ComparisonRule {
     /// A float beside a bare number literal (`validate`'s
     /// `comparison_type`).
     FloatBesideNumberLiteral,
+    /// An enum column beside a string literal, under `=` only: Postgres
+    /// reads the literal as a value of the enum, and a label the enum lacks
+    /// fails the statement, so define checks it against the live labels.
+    EnumBesideStringLiteral,
     /// Two booleans.
     Boolean,
     /// Two uuids.
@@ -509,12 +513,14 @@ pub enum AggregateRule {
     SumWideExact,
     /// `SUM` of a float: its own type.
     SumFloat,
-    /// `SUM` of an `interval`, typed so the family check refuses it.
+    /// `SUM` of an `interval`: `interval`.
     SumInterval,
     /// `AVG` of a float: `double precision`.
     AvgFloat,
     /// `AVG` of an exact number: `numeric`.
     AvgExact,
+    /// `AVG` of an `interval`: `interval`.
+    AvgInterval,
     /// `MIN` or `MAX` of a type with a btree order and no collation
     /// ([`extreme_type_admitted`]): its own type.
     Extreme,
@@ -532,6 +538,10 @@ pub enum AggregateAdmissionRule {
     /// `SUM` or `AVG` of a `numeric` with no declared scale: an
     /// unconstrained column, a target's column, or an expression.
     SumAvgNumeric,
+    /// `SUM` or `AVG` of a `real` or `double precision`, as an exact sum.
+    SumAvgFloat,
+    /// `SUM` or `AVG` of an `interval`, as an exact fieldwise sum.
+    SumAvgInterval,
     /// `MIN` or `MAX` of a plain source column, in a plain aggregate (not a
     /// `JOIN`), over a type [`extreme_type_admitted`] admits.
     Extreme,
@@ -588,6 +598,7 @@ impl TypeRule {
                 | ComparisonRule::Uuid
                 | ComparisonRule::TextEquality
                 | ComparisonRule::Temporal => BASELINE,
+                ComparisonRule::EnumBesideStringLiteral => Release::new(0, 4, 0),
             },
             TypeRule::Cast(rule) => match rule {
                 CastRule::IntegerWidening
@@ -615,6 +626,7 @@ impl TypeRule {
                 | AggregateRule::AvgFloat
                 | AggregateRule::AvgExact
                 | AggregateRule::Extreme => BASELINE,
+                AggregateRule::AvgInterval => super::floor::DEVELOPING,
             },
             TypeRule::AggregateAdmission(rule) => match rule {
                 AggregateAdmissionRule::Count
@@ -622,6 +634,9 @@ impl TypeRule {
                 | AggregateAdmissionRule::SumAvgScaledNumeric
                 | AggregateAdmissionRule::SumAvgNumeric
                 | AggregateAdmissionRule::Extreme => BASELINE,
+                AggregateAdmissionRule::SumAvgFloat | AggregateAdmissionRule::SumAvgInterval => {
+                    super::floor::DEVELOPING
+                }
             },
             TypeRule::GroupByKey(rule) => match rule {
                 GroupByKeyRule::Integer
@@ -1385,14 +1400,12 @@ pub fn aggregate_rule(name: &str, arg: ValueType) -> Option<Admitted> {
             None
         };
     }
-    // A float or `interval` sum is typed so a definition reaches its family
-    // refusal (`validate::check_aggregate_admitted`, #1119) rather than a
-    // type error; the group basis keeps neither.
+    // `sum(interval)` and `avg(interval)` are `interval` in Postgres.
     if let ValueType::Other(PgType::Interval) = arg {
-        return if name == "SUM" {
-            admitted(arg, AggregateRule::SumInterval)
-        } else {
-            None
+        return match name {
+            "SUM" => admitted(arg, AggregateRule::SumInterval),
+            "AVG" => admitted(arg, AggregateRule::AvgInterval),
+            _ => None,
         };
     }
     if !arg.is_numeric_family() {

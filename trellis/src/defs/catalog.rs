@@ -83,7 +83,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use crate::error_code::{self, ErrorCode, ErrorId};
+use crate::error_code::{self, ErrorCode, ErrorId, SharedCondition};
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 use crate::pool::{Pool, quote_ident};
@@ -636,7 +636,9 @@ impl CatalogError {
             CatalogError::Pool(err) => err.error_id(),
             CatalogError::UnknownValueType { .. } => ErrorId(125),
             CatalogError::Backfill(err) => err.error_id(),
-            CatalogError::SourceTableNotFound(..) => ErrorId(126),
+            CatalogError::SourceTableNotFound(..) => {
+                SharedCondition::SourceTableNotFound.error_id()
+            }
             CatalogError::InvalidRegexPattern { .. } => ErrorId(127),
             CatalogError::TableNotAccessible { .. } => ErrorId(128),
             CatalogError::KeyRepairBlocked { .. } => ErrorId(129),
@@ -660,7 +662,7 @@ impl CatalogError {
             CatalogError::Subscribed(..) => ErrorId(147),
             CatalogError::Ddl(err) => err.error_id(),
             CatalogError::DirectBackfill(err) => err.error_id(),
-            CatalogError::TransformNotFound { .. } => ErrorId(148),
+            CatalogError::TransformNotFound { .. } => SharedCondition::TransformNotFound.error_id(),
             CatalogError::NameCaseMismatch { .. } => ErrorId(149),
             CatalogError::TransformNotPaused { .. } => ErrorId(150),
             CatalogError::AboveRunningRelease { .. } => ErrorId(151),
@@ -5121,6 +5123,7 @@ pub(crate) async fn validate_live_schema(
         let source_key: Vec<&str> = key.iter().map(|column| column.name.as_str()).collect();
         check_key_collations(def, table, &source_key, |name| live.info(name))?;
         if plain {
+            super::validate::check_enum_literals(def, &live.typed())?;
             check_collation_reads(def, None, |read| {
                 Some((table.to_string(), live.info(&read.column)?))
             })?;
@@ -7496,6 +7499,17 @@ async fn column_dependents_via(
             ) {
                 deps.push((target.clone(), field.name.clone()));
             }
+        }
+        // A downstream `WHERE` reads the column too, named `WHERE`: a drop
+        // of the column is refused, and `status` names the paused column as
+        // the reader's cause. Not for the 1-1 field-pause cascade, which
+        // pauses fields: pausing every field would still let the frozen
+        // column decide membership.
+        if !only_one_to_one
+            && qualified_source == qualified_upstream
+            && super::oracle::predicate_columns(&def).contains(upstream_column)
+        {
+            deps.push((target.clone(), "WHERE".to_string()));
         }
         // A `GROUP BY` key is not itself a `FieldDef` in `def.fields` — see
         // `ast::KeySpace::Aggregate`'s own doc comment — so the loop above

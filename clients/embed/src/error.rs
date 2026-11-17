@@ -164,8 +164,8 @@ mod tests {
         let plain = PlainError::from(err);
 
         assert_eq!(plain.code, "not_found");
-        assert_eq!(plain.error_id.as_deref(), Some("T0209"));
-        assert!(message.starts_with("T0209: "), "{message}");
+        assert_eq!(plain.error_id.as_deref(), Some("T0126"));
+        assert!(message.starts_with("T0126: "), "{message}");
         assert_eq!(plain.message, message);
         assert_eq!(plain.to_string(), message);
     }

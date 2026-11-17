@@ -74,20 +74,21 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, JoinKind, Predicate, TransformDef};
+use crate::defs::ast::{Expr, JoinKind, Predicate, TransformDef, ValueType};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side as JoinSide};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
 
+use super::group_basis::exact_sums::SumKind;
 use super::group_basis::{self, SumPart};
 use super::self_check::{
     AuditRender, ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_audit,
 };
 use super::self_check_groups::{
-    Side, Uncertain, bound, drop_equal_values, partial_names, partial_text, weighted_partials,
-    zero_text,
+    Side, Uncertain, avg_of, bound, drop_equal_values, partial_names, partial_text, sum_of,
+    summand, weighted_partials, zero_text,
 };
 use super::self_check_keyset::{BYTE_ORDER, Keyset, recollated_pairs};
 use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
@@ -255,7 +256,7 @@ pub(super) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
         .collect();
     for field in value_fields(&def.def) {
         render(&def.def, &field.expr, "a", "b")
-            .and_then(|_| render_signed(&def.def, &field.expr, &args, &[]))
+            .and_then(|_| render_signed(&def.def, &field.expr, &args, &[], &[]))
             .map_err(|detail| SelfCheckError::UnsupportedExpr {
                 target: def.def.target.clone(),
                 detail,
@@ -290,6 +291,20 @@ fn sum_parts(summed: &[bool], numeric: &HashMap<usize, Option<i32>>) -> Vec<&'st
         .iter()
         .enumerate()
         .map(|(i, summed)| group_basis::sum_parts(*summed, numeric.contains_key(&(i + 1))))
+        .collect()
+}
+
+/// Each of `args`' sum kind over a side whose columns are typed `types`
+/// (`exact_sums::SumKind`): a float or `interval` argument's own, `Exact`
+/// for any other.
+fn sum_kinds(args: &[Expr], types: &HashMap<String, ValueType>) -> Vec<SumKind> {
+    args.iter()
+        .map(|arg| {
+            crate::defs::validate::infer_expr_type(arg, types)
+                .ok()
+                .and_then(SumKind::of)
+                .map_or(SumKind::Exact, |(kind, _)| kind)
+        })
         .collect()
 }
 
@@ -446,6 +461,9 @@ struct Audit<'a> {
     /// Each argument's reference scale ([`numeric_arguments`]).
     from_scales: Vec<Option<i32>>,
     joined_scales: Vec<Option<i32>>,
+    /// Each argument's sum kind ([`sum_kinds`]).
+    from_kinds: Vec<SumKind>,
+    joined_kinds: Vec<SumKind>,
     /// For each of a side's cell columns, the collation an unapplied
     /// change's column is read under to find its cell in `P` or `M`
     /// ([`Basis::collations`]): the hidden copy's, where the source column
@@ -581,18 +599,20 @@ impl Audit<'_> {
         keyset: &Keyset,
         steer: bool,
     ) -> Result<(String, Vec<String>), SelfCheckError> {
-        let (part, args, parts, scales) = match side {
+        let (part, args, parts, scales, kinds) = match side {
             JoinSide::From => (
                 Part::From,
                 &self.from_args,
                 &self.from_parts,
                 &self.from_scales,
+                &self.from_kinds,
             ),
             JoinSide::Joined(_) => (
                 Part::Joined,
                 &self.joined_args,
                 &self.joined_parts,
                 &self.joined_scales,
+                &self.joined_kinds,
             ),
         };
         let key = keyset.columns();
@@ -611,7 +631,15 @@ impl Audit<'_> {
             .into_iter()
             .zip(parts.iter().copied())
             .zip(scales.iter().copied())
-            .map(|((arg, parts), scale)| (arg, parts, scale))
+            .zip(kinds)
+            .map(|(((arg, parts), scale), kind)| {
+                let arg = if parts.is_empty() {
+                    arg
+                } else {
+                    summand(*kind, &arg)
+                };
+                (arg, parts, scale)
+            })
             .collect();
         let (values, nonzero) = weighted_partials(&rendered);
         let ring = self.ring(side);
@@ -750,11 +778,22 @@ impl Audit<'_> {
             .chain(&self.joined_scales)
             .copied()
             .collect();
+        let kinds: Vec<SumKind> = self
+            .from_kinds
+            .iter()
+            .chain(&self.joined_kinds)
+            .copied()
+            .collect();
         let x_columns: Vec<(String, &[SumPart], Option<i32>)> = parts
             .iter()
             .zip(&scales)
+            .zip(&kinds)
             .enumerate()
-            .map(|(i, (p, scale))| (format!("__x{}", i + 1), *p, *scale))
+            .map(|(i, ((p, scale), kind))| {
+                let x = format!("__x{}", i + 1);
+                let x = if p.is_empty() { x } else { summand(*kind, &x) };
+                (x, *p, *scale)
+            })
             .collect();
         let (sv, nonzero) = weighted_partials(&x_columns);
         let mut oracle_fields = Vec::with_capacity(fields.len());
@@ -762,7 +801,7 @@ impl Audit<'_> {
             let pg_type = field_types.get(&field.name).map_or("text", String::as_str);
             oracle_fields.push(format!(
                 "(({})::{pg_type})::text",
-                render_signed(self.def, &field.expr, &all_args, &numeric)
+                render_signed(self.def, &field.expr, &all_args, &numeric, &kinds)
                     .map_err(|d| self.unsupported(d))?
             ));
         }
@@ -944,8 +983,18 @@ fn render_signed(
     expr: &Expr,
     args: &[Expr],
     numeric: &[bool],
+    kinds: &[SumKind],
 ) -> Result<String, String> {
-    render_audit(&mut Signed { def, args, numeric }, expr, 0)
+    render_audit(
+        &mut Signed {
+            def,
+            args,
+            numeric,
+            kinds,
+        },
+        expr,
+        0,
+    )
 }
 
 /// [`render_signed`]'s aggregates and columns.
@@ -953,6 +1002,9 @@ struct Signed<'d> {
     def: &'d TransformDef,
     args: &'d [Expr],
     numeric: &'d [bool],
+    /// Each argument's sum kind: a float or `interval` sum is summed
+    /// exactly ([`summand`]) and read as its type.
+    kinds: &'d [SumKind],
 }
 
 impl AuditRender<'_> for Signed<'_> {
@@ -974,6 +1026,8 @@ impl AuditRender<'_> for Signed<'_> {
                     .ok_or_else(|| format!("{aggregate} of an expression it doesn't read"))?;
                 let x = format!("__x{}", i + 1);
                 let count = format!("sum({w} * ({x} is not null)::int)");
+                let kind = self.kinds.get(i).copied().unwrap_or_default();
+                let x = summand(kind, &x);
                 let sum = if self.numeric.get(i).copied().unwrap_or(false) {
                     let net = |value: &str| {
                         format!("coalesce(sum({w}) filter (where {x} = '{value}'), 0)")
@@ -1005,12 +1059,27 @@ impl AuditRender<'_> for Signed<'_> {
                               - coalesce(sum({x}) filter (where {w} < 0), 0))"
                     )
                 };
-                match aggregate {
-                    "COUNT" => count,
-                    "SUM" => format!("(case when {count} = 0 then null else {sum} end)"),
-                    _ => format!(
+                let cast = match kind {
+                    SumKind::Float(crate::float::FloatWidth::Float4) => "real",
+                    SumKind::Float(_) => "double precision",
+                    SumKind::Interval | SumKind::Exact => "interval",
+                };
+                match (aggregate, kind) {
+                    ("COUNT", _) => count,
+                    ("SUM", SumKind::Exact) => {
+                        format!("(case when {count} = 0 then null else {sum} end)")
+                    }
+                    ("SUM", _) => format!(
+                        "(case when {count} = 0 then null else {} end)",
+                        sum_of(kind, &sum, cast)
+                    ),
+                    (_, SumKind::Exact) => format!(
                         "(case when {count} = 0 then null \
                               else ({sum})::numeric / ({count})::numeric end)"
+                    ),
+                    _ => format!(
+                        "(case when {count} = 0 then null else {} end)",
+                        avg_of(kind, &sum, &count)
                     ),
                 }
             }
@@ -1040,21 +1109,22 @@ impl AuditRender<'_> for Signed<'_> {
 async fn joined_table(
     client: &tokio_postgres::Client,
     def: &Definition,
-) -> Result<String, SelfCheckError> {
-    let (joined, _) = catalog::join_side_of(client, def.id)
+) -> Result<(String, HashMap<String, ValueType>), SelfCheckError> {
+    catalog::join_side_of(client, def.id)
         .await?
         .ok_or_else(|| SelfCheckError::UnsupportedExpr {
             target: def.def.target.clone(),
             detail: "a JOIN definition with no joined table recorded".to_string(),
-        })?;
-    Ok(joined)
+        })
 }
 
-/// `def`'s audit over its tables (`joined` from [`joined_table`]).
+/// `def`'s audit over its tables (`joined` and its column types
+/// `joined_types` from [`joined_table`]).
 async fn build_audit<'a>(
     pool: &Pool,
     def: &'a Definition,
     joined: &'a String,
+    joined_types: &HashMap<String, ValueType>,
 ) -> Result<Audit<'a>, SelfCheckError> {
     let from_args = spec::side_arguments(&def.def, JoinSide::From);
     let joined_args = spec::side_arguments(&def.def, spec::JOINED);
@@ -1075,6 +1145,8 @@ async fn build_audit<'a>(
         joined_parts: Vec::new(),
         from_scales: Vec::new(),
         joined_scales: Vec::new(),
+        from_kinds: sum_kinds(&from_args, &def.source_columns),
+        joined_kinds: sum_kinds(&joined_args, joined_types),
         from_args,
         joined_args,
         from_basis: Vec::new(),
@@ -1202,8 +1274,8 @@ pub(super) async fn explain(
     executed: bool,
 ) -> Result<String, SelfCheckError> {
     let mut client = pool.get().await?;
-    let joined = joined_table(&client, def).await?;
-    let audit = build_audit(pool, def, &joined).await?;
+    let (joined, joined_types) = joined_table(&client, def).await?;
+    let audit = build_audit(pool, def, &joined, &joined_types).await?;
     let (part, _) = parse_cursor(Some(part));
     let (sql, _, steer) = audit
         .page_statement(&client, def, identity, part, after)
@@ -1237,14 +1309,15 @@ pub(super) async fn compare(
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
-    // The query has no `WHERE` for the definition's predicate, sound only
-    // while `Predicate` has one variant (as the 1-1 comparison's).
-    match def.def.predicate {
+    // The query has no `WHERE` for the definition's predicate; define
+    // refuses a join aggregate's until its step (#2042) renders it here.
+    match &def.def.predicate {
         Predicate::True => {}
+        Predicate::Filter(_) => return Err(super::self_check::unaudited_filter(def)),
     }
     let mut client = pool.get().await?;
-    let joined = joined_table(&client, def).await?;
-    let audit = build_audit(pool, def, &joined).await?;
+    let (joined, joined_types) = joined_table(&client, def).await?;
+    let audit = build_audit(pool, def, &joined, &joined_types).await?;
     let (part, after) = parse_cursor(scope.after.as_deref());
     let fields = value_fields(&def.def);
     let (sql, columns, steer) = audit
@@ -1536,7 +1609,7 @@ mod tests {
             );
             golden.add(
                 &format!("render_signed {}", field.name),
-                &shown(render_signed(&def, &field.expr, &args, &numeric)),
+                &shown(render_signed(&def, &field.expr, &args, &numeric, &[])),
             );
         }
         let bare = Expr::Column("qty".to_string());

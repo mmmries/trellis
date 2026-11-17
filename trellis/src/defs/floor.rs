@@ -142,6 +142,8 @@ pub enum KeySpaceKind {
 pub enum PredicateKind {
     /// None, or `WHERE TRUE`.
     True,
+    /// Any other `WHERE`, `WHERE (TRUE)` included.
+    Filter,
 }
 
 /// A kind of expression node whose since has no further detail: the nodes
@@ -193,6 +195,13 @@ pub enum Layout {
     /// validator as it admits such an argument, since the key space alone
     /// doesn't tell.
     NumericSums,
+    /// [`Layout::NumericSums`]'s partials holding a `real`, `double
+    /// precision` or `interval` argument's exact sum, each value converted
+    /// exactly to one `numeric` (an `interval`'s fields packed into it), under
+    /// a reference scale of its own (`crate::staging::group_basis::exact_sums`):
+    /// a release without them refuses the definition. Recorded by the
+    /// validator as it admits such an argument.
+    FloatIntervalSums,
 }
 
 impl Layout {
@@ -238,6 +247,12 @@ pub enum Feature {
     /// A release before it would read such a definition over its first
     /// joined table alone.
     StarJoin,
+    /// A string literal Postgres types from a `char(n)` neighbour, or from a
+    /// `name` one when it is over 63 bytes, which this release renders bare
+    /// and a release before it cast to `text`
+    /// ([`super::neighbour_literals`]). Recorded over the live column types
+    /// with the validation's features ([`on_retype`]).
+    NeighbourTypedLiteral,
     /// An expression node of this kind.
     Expr(ExprNode),
     /// An operator.
@@ -301,8 +316,10 @@ impl Feature {
             Feature::TableKey => Some(BASELINE),
             // Arrives in 0.2.0, the release floors arrive in.
             Feature::StarJoin => Some(BASELINE),
+            Feature::NeighbourTypedLiteral => Some(Release::new(0, 4, 0)),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
+                PredicateKind::Filter => Release::new(0, 4, 0),
             }),
             Feature::Expr(node) => Some(match node {
                 ExprNode::Column
@@ -353,6 +370,7 @@ impl Feature {
                 | Layout::Join
                 | Layout::JoinOneToOne
                 | Layout::NumericSums => BASELINE,
+                Layout::FloatIntervalSums => DEVELOPING,
             }),
             Feature::TypeRule(rule) => Some(rule.since()),
             Feature::Value(value) => value.since(),
@@ -482,6 +500,7 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
     }
     used.add(Feature::Predicate(match predicate {
         Predicate::True => PredicateKind::True,
+        Predicate::Filter(_) => PredicateKind::Filter,
     }));
     if *without_source_index {
         used.add(Feature::WithoutSourceIndex);
@@ -493,6 +512,9 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         used.add(Feature::PartitionedSource);
     }
     for FieldDef { name: _, expr } in fields {
+        used.expr(expr);
+    }
+    if let Predicate::Filter(expr) = predicate {
         used.expr(expr);
     }
     let extremes = used
@@ -990,6 +1012,9 @@ pub(crate) fn on_retype(
     match validated_features(def, from, joined) {
         Ok(mut validated) => {
             validated.extend_from_slice(keys);
+            if super::neighbour_literals::affected(def, from, joined) {
+                validated.push(Feature::NeighbourTypedLiteral);
+            }
             OnRetype::Restamp(floors.of(def, partitioned, Some(&validated)))
         }
         Err(refusal) => OnRetype::Pause(refusal),
@@ -1685,6 +1710,7 @@ mod tests {
             collation: None,
             collation_deterministic: true,
             is_enum: false,
+            enum_labels: None,
             copy_type: pg_type.to_string(),
             copy_collation: None,
             trellis_target: false,

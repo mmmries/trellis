@@ -47,6 +47,16 @@ changed.
 
 Each changed visible row reaches the target-mutation seam with its prior image.
 
+## A `WHERE`
+
+A plain aggregate's `WHERE` filters every side the stage evaluates and every
+source read below: partials count member rows only. An image without a column
+the predicate reads fails the stage, which holds its key, rather than reading
+the column as `NULL`. Group naming stays unfiltered (the groups step 2 locks,
+a recompute's groups, a build's enumeration), since an image may hold only the
+group columns: a group whose rows all fail keeps a hidden row of zeros and no
+visible row.
+
 ## Absolute writes
 
 One sorted lock statement, then one statement that takes the snapshot and
@@ -105,6 +115,16 @@ scale with a non-zero count; `AVG` divides it by the non-null count, as
 `numeric(p,s)` argument's values are finite, no statement writes its map; a
 build's shortcut for that case falls back under a savepoint on an off-scale
 value, so it never changes a result.
+
+A float or `interval` argument keeps the same partials, each value converted
+exactly to one `numeric` (`staging::group_basis::exact_sums`). A float is its
+exact decimal value at scale 1074, decoded from `float8send`; an `interval`'s
+fields pack into one integer, `months × 10^120 + days × 10^60 + microseconds`,
+which sums stay decodable from. Its reference scale is its kind's (1074, or 0),
+so the map counts only the special values. The visible `SUM` casts the exact
+sum to the float type or rebuilds the `interval` from its fields, raising when
+out of range; the `AVG` divides the exact sum, truncated far past any rounding
+boundary, or divides the fields as `interval_div` does.
 
 ## Zero groups (R4, Rx7)
 

@@ -25,7 +25,7 @@ ordered floor to ceiling:
    Needs an immutable operator or function in the registry and, for a
    constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field has this type: `COUNT`,
-   `SUM` or `AVG` over an integer or `numeric` column or expression, and, on a plain
+   `SUM` or `AVG` over a number or `interval` column or expression, and, on a plain
    aggregate, `MIN` or `MAX` over a column of a number, date or time type
    ([`MIN` and `MAX`](#min-and-max)).
 
@@ -46,13 +46,13 @@ filter role.
 | `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` `MIN` `MAX` |
 | `oid` | yes | yes | yes | yes | typed literal only | `MIN` `MAX` (no arithmetic in Postgres) |
 | `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG`; `MIN` `MAX` |
-| `real` `double precision` | yes | no | no | no | yes | `MIN` `MAX` |
+| `real` `double precision` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` |
 | `boolean` | yes | no | yes | no | yes | no |
 | `uuid` | yes | yes | yes | yes | yes | no |
 | `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | no |
 | `bytea` | yes | yes | yes | yes | typed literal | no |
 | `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | `MIN` `MAX`, but not over `timetz` |
-| `interval` | yes | no | no | no | yes | `MIN` `MAX` |
+| `interval` | yes | no | no | no | yes | `SUM` `AVG` `MIN` `MAX` |
 | `jsonb` | yes | no | no | no | typed literal | no |
 | `inet` | yes | no | yes | no | typed literal | no |
 | `cidr` | yes | yes | yes | yes | typed literal | no |
@@ -64,15 +64,8 @@ filter role.
 | array, range, composite, domain, geometric, extension types (`citext`) | no | no | no | no | no | no |
 
 `COUNT(*)` and `COUNT(<expr>)` are type-agnostic and typed `bigint`, as in
-Postgres; they are omitted from the aggregate column. An aggregate or `JOIN`
-transform admits `COUNT`, and `SUM` and `AVG` over the types above, the
-aggregates Trellis keeps exact from each change alone. A plain aggregate (not
-a `JOIN`) also admits `MIN` and `MAX` over the types above, which re-read
-the source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
-Every other aggregate is refused at define, named by its family: `MIN`/`MAX`
-on a `JOIN`, `bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over a
-float, an `interval` or another type, and `array_agg`/`string_agg`/`jsonb_agg`
-([Aggregates that are not supported](#aggregates-that-are-not-supported)).
+Postgres; they are omitted from the aggregate column. Which aggregates are
+admitted is in [Aggregates that are not supported](#aggregates-that-are-not-supported).
 
 ### The types of the columns Trellis creates
 
@@ -95,7 +88,9 @@ modifiers. A 1-1 copy holds the source's exact rendering: a `numeric` rewritten 
 `1.25` to `1.2500`, an `interval` from `'1 day'` to `'24 hours'` and a float
 from `-0` to `0` reach the copy, though each pair is equal as a value
 ([ADR-0020](decisions/0020-type-identity.md)). A `GROUP BY` key's column (in the target and its hidden table) takes its value family's type: `integer` or `bigint` by width, `text` for any
-string, unconstrained `numeric`, a temporal type at full precision. A `JOIN`
+string, unconstrained `numeric`, a temporal type at full precision. A field
+reads a `char(n)` or `name` key as its source type, as Postgres's `GROUP BY`
+does, so `ch = 'ab  '` ignores trailing blanks. A `JOIN`
 holds its `GROUP BY` and `ON` columns in each column's type and collation, in
 its target and its hidden tables, with no modifier.
 
@@ -193,7 +188,9 @@ per value. So:
   through `COALESCE`, a `CASE` result or another field: such a collation's `=`
   calls two different texts equal. `IS [NOT] NULL` accepts any column.
 - **`char(n)`** is treated as `text` but is not on the key allowlist: its
-  blank-padding is a hazard, not a volatility one.
+  blank-padding is a hazard, not a volatility one. A string literal compared
+  with one, or beside one in `COALESCE`, `NULLIF` or a `CASE`, is a `char(n)`,
+  as Postgres types it: `ch = 'ab  '` ignores trailing blanks.
 
 What happens when a collation changes after define is in
 [capture drift](staging-and-claiming/capture-drift.md#a-re-typed-key-column-or-an-outgrown-copy),
@@ -262,10 +259,13 @@ is widened to `double precision`, so the comparison runs in `double precision`:
 with `r = 0.1::real`, `r > 0.1` is true (the widened `r` is 0.10000000149...),
 `r = 0.1` is false and `r > 0.1::real` is false. Floats are refused as every
 key role: `-0` and `0` are equal but render as `'-0'` and `'0'`, which would
-split one group into two target rows. `SUM` and `AVG` over a float are refused
-at define ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
-float addition is not associative, and `NaN`/`Infinity` are absorbing, so
-there is no exact inverse. `extra_float_digits >= 1` is pinned for the
+split one group into two target rows. `SUM` and `AVG` over a float are the
+exact sum of the values, rounded once to the result type, with `NaN` and the
+infinities counted. This departs from Postgres's `sum()`, which adds in scan
+order (`{1e20, 1, -1e20}` sums to 0 or 1; the exact sum is 1), adds `real`s
+in `real`, and keeps a `-0` sum that the exact sum reads as `0`
+([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
+`extra_float_digits >= 1` is pinned for the
 shortest-round-trip rendering `trellis::float::render` reproduces. Checked in
 `trellis/tests/defs/defs_floats.rs`.
 
@@ -408,10 +408,11 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
   disagrees with `::text` (a `T` separator), which is why no engine read uses
   it. `defs_temporal.rs` sweeps the whole key allowlist for render agreement.
 - **`interval`** is refused as a key: `'24 hours' = '1 day'` is true but they
-  render differently, and no renderer fix helps. `SUM`/`AVG(interval)` is
-  refused ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)):
-  `interval` addition is exact but partial (`infinity + -infinity` raises, and
-  overflow depends on scan order), which a delta cannot represent.
+  render differently, and no renderer fix helps. `SUM(interval)` is the
+  exact fieldwise sum and raises `interval out of range` only when the final
+  value is, where Postgres's `sum()` raises by scan order; `AVG(interval)`
+  is Postgres's `avg()` wherever the sum is in range
+  ([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
 - Typed literals exist for `DATE`, `TIMESTAMP`, `TIME` and `TIMETZ`, not
   `TIMESTAMPTZ` (no canonical-form checker) or `INTERVAL` (`interval_in` reads
   `IntervalStyle`). The text must be in Postgres's canonical output spelling.
@@ -485,7 +486,8 @@ never joinable.
   and primary keys; the join/primary-key check reads the type's `typtype` from the catalog
   rather than a static list.
 - There is no typed-literal syntax: a literal's keyword would be a per-schema
-  identifier.
+  identifier. A string literal beside an enum column under `=` is read as a
+  value of the enum, as in Postgres ([expressions](expressions.md#comparison-and-logic)).
 
 Postgres refuses a `DROP TYPE` of an enum while a column Trellis created
 uses it, and the retype or drop of the source column that has to come first
@@ -547,11 +549,15 @@ divergence
 
 ## Aggregates that are not supported
 
-An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`
-over `smallint`, `integer`, `bigint` and `numeric`; a plain aggregate also
-admits `MIN` and `MAX` ([above](#min-and-max)). Every other aggregate is
-refused at define, by name, with the issue that tracks it: see
-[transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
+An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or
+`AVG` over `smallint`, `integer`, `bigint` and `numeric`: the aggregates
+Trellis keeps exact from each change alone. A plain aggregate (not a `JOIN`)
+also admits `MIN` and `MAX` over the types the matrix marks, which re-read the
+source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
+Every other aggregate is refused at define, named by its family
+([refusals](transforms.md#refusals)): `MIN`/`MAX` on a `JOIN`,
+`bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over a float, an
+`interval` or another type, and `array_agg`/`string_agg`/`jsonb_agg`.
 
 ## Typed literals and casts
 

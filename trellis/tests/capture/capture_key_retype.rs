@@ -2337,9 +2337,9 @@ async fn a_definition_paused_before_the_upstream_resume_records_no_cause() {
 
 /// #828: a definition the upstream's re-type pauses that also fails its own
 /// re-validation keeps its own error, with no cause: here the re-type moves
-/// the column a `SUM` reads (`next`, `qty + 1` over a `qty` now
-/// `double precision`) to `double precision`, which define refuses under a
-/// `SUM`, so a resume refuses until the column is changed back.
+/// a `GROUP BY` key (`next`, `qty + 1` over a `qty` now `double precision`)
+/// to `double precision`, which define refuses as a key, so a resume
+/// refuses until the column is changed back.
 #[tokio::test]
 async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
     let cluster = TestCluster::start();
@@ -2348,8 +2348,8 @@ async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
     trellis
         .apply(
-            "TRANSFORM name_totals FROM public.item_names GROUP BY name \
-             WITHOUT SOURCE INDEX SELECT name AS name, SUM(next) AS total",
+            "TRANSFORM name_totals FROM public.item_names GROUP BY name, next \
+             WITHOUT SOURCE INDEX SELECT name AS name, next AS next, COUNT(*) AS n",
         )
         .await
         .expect("define name_totals");
@@ -2369,7 +2369,7 @@ async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
     let error = paused_for(&trellis, "name_totals", "public.item_names", &["next"]).await;
     assert!(
         !error.contains("the resume of")
-            && error.contains("SUM is not supported: float and interval SUM/AVG")
+            && error.contains("GROUP BY key 'next' is a double precision column")
             && error.contains("refuses until that is fixed"),
         "{error}"
     );
@@ -2460,8 +2460,8 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
     let trellis = items(db.dsn(), &mut raw, &db.pool).await;
     for text in [
         "TRANSFORM b_names FROM public.item_names SELECT name AS name",
-        "TRANSFORM id_totals FROM public.item_names GROUP BY id \
-         WITHOUT SOURCE INDEX SELECT id AS id, SUM(next) AS total",
+        "TRANSFORM id_totals FROM public.item_names GROUP BY id, next \
+         WITHOUT SOURCE INDEX SELECT id AS id, next AS next, COUNT(*) AS n",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -2481,7 +2481,7 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
     let error = paused_for(&trellis, "id_totals", "public.item_names", &["id", "next"]).await;
     assert!(
         !error.contains("the resume of")
-            && error.contains("SUM is not supported: float and interval SUM/AVG")
+            && error.contains("GROUP BY key 'next' is a double precision column")
             && error.contains("refuses until that is fixed"),
         "{error}"
     );

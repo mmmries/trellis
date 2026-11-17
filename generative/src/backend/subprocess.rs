@@ -49,9 +49,9 @@ use trellis::dev::defs::{CatalogError, DdlError, install_definition};
 use trellis::dev::pool::Pool;
 use trellis::dev::staging::StagingError;
 
-use super::Snapshot;
 use super::ring_wait::QuiesceBudget;
 use super::sql;
+use super::{DefinitionState, Snapshot};
 use crate::model::{Op, Program, Table};
 
 /// How long [`SubprocessBackend::quiesce`] waits for definitions to settle,
@@ -561,6 +561,13 @@ impl super::Backend for SubprocessBackend {
     async fn quiesce(&mut self) -> Result<(), SubprocessBackendError> {
         // The same composed wait `ManualBackend::quiesce` runs.
         Ok(sql::quiesce(&self.raw, &self.defs, QUIESCE_BUDGET).await?)
+    }
+
+    async fn definition_states(
+        &mut self,
+        defs: &[TransformDef],
+    ) -> Result<Vec<DefinitionState>, SubprocessBackendError> {
+        Ok(sql::definition_states(&self.raw, defs).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SubprocessBackendError> {

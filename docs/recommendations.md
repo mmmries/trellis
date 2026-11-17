@@ -171,6 +171,20 @@ each recompute scans the source. Define requires the index anyway, for
 ([Keep the indexes a definition relies on](#keep-the-indexes-a-definition-relies-on)).
 An index you create or drop changes speed only, never results.
 
+## Filter an aggregate with `WHERE` when every field counts the same rows
+
+`WHERE status = 'open'` and `SUM(CASE WHEN status = 'open' THEN amount END)`
+give the same totals. Prefer `WHERE` when every field counts the same rows:
+`COUNT(*)` counts only them, and a group with none has no target row. Use
+`CASE` inside each aggregate when fields count different rows.
+
+A `WHERE` doesn't shrink capture or the ring: every change to the source is
+still captured and staged, and the drain drops the rows that fail
+([#1992](https://github.com/salesforce-misc/trellis/issues/1992) researches
+filtering at capture). A filtered aggregate refuses `MIN` and `MAX`; take
+them over a stored generated column
+`CASE WHEN <predicate> THEN <column> END` in an unfiltered aggregate.
+
 ## Benchmark aggregates over many concurrently written groups
 
 A page locks every group it touches until it commits, so drain workers whose
