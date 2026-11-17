@@ -7,6 +7,7 @@
 mod support;
 
 mod arithmetic_key_spaces;
+mod bpchar_literal;
 mod build_key_collation;
 mod builtin_shadowing;
 mod cast_aliases;
