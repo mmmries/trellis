@@ -632,6 +632,37 @@ async fn a_column_retyped_to_a_type_evaluated_differently_pauses_and_resume_rebu
     }
 }
 
+/// A column only the `WHERE` reads (`a.y`; the fields read `x` and `w`)
+/// retyped to a type the predicate evaluates differently (`text` to `integer`;
+/// `y IS NOT NULL` still types) pauses the transform naming the column,
+/// since membership would change; `RESUME` re-types the copy and rebuilds.
+#[tokio::test]
+async fn a_column_only_the_where_reads_retyped_to_another_evaluation_pauses_and_resume_rebuilds() {
+    for star in stars(Shape::TWO) {
+        let star = star.filtered("a.y IS NOT NULL");
+        let mut d = built_with(
+            star,
+            &star.definition_with("a.x + COALESCE(b1.w, 0) AS total"),
+        )
+        .await;
+        let target = star.target();
+        pass(&mut d).await;
+        assert_unpaused(&d, &target, "the first pass").await;
+        write(
+            &d,
+            "alter table public.a alter column y type integer using y::integer",
+        )
+        .await;
+        pass(&mut d).await;
+        let error = paused_for(&d, &target, "public.a", &["y"]).await;
+        assert!(error.contains("changed type"), "{}: {error}", star.name());
+        resume(&d, &star.name()).await;
+        pass(&mut d).await;
+        d.settle().await;
+        assert_unpaused(&d, &target, "the resume").await;
+    }
+}
+
 // ----------------------------------------------------------------- the tables
 
 /// Either table renamed away, or dropped and created again, pauses the
