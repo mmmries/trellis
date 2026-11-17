@@ -2387,30 +2387,39 @@ mod tests {
         waiting_on_lock(define_pid).await;
         let (mut pager, page_pid) = connect().await;
         let (release, released) = tokio::sync::oneshot::channel::<()>();
-        let paging = tokio::spawn(async move {
-            let txn = pager.transaction().await.expect("begin");
-            let held = hold_version_fences(&txn, &held).await;
-            let _ = released.await;
-            txn.commit().await.expect("commit the page");
-            held
+        let took_fences = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paging = tokio::spawn({
+            let took_fences = Arc::clone(&took_fences);
+            async move {
+                let txn = pager.transaction().await.expect("begin");
+                let held = hold_version_fences(&txn, &held).await;
+                took_fences.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = released.await;
+                txn.commit().await.expect("commit the page");
+                held
+            }
         });
-        // The page holds its fences, or queues on one.
-        for _ in 0..500 {
-            let parked: bool = raw
+        // The page has taken its fences, or queues on one. (An idle
+        // transaction is not enough: the page is idle right after `begin`,
+        // before it has asked for any fence.)
+        let mut parked = false;
+        for _ in 0..1000 {
+            let queued: bool = raw
                 .query_one(
-                    "select coalesce((select state = 'idle in transaction' \
-                         or wait_event_type = 'Lock' \
+                    "select coalesce((select wait_event_type = 'Lock' \
                      from pg_stat_activity where pid = $1), false)",
                     &[&page_pid],
                 )
                 .await
                 .expect("read pg_stat_activity")
                 .get(0);
-            if parked {
+            if queued || took_fences.load(std::sync::atomic::Ordering::SeqCst) {
+                parked = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(parked, "the page never took or queued on its fences");
         blocking.commit().await.expect("let the define go");
         let _ = release.send(());
         defining
