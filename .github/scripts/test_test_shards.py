@@ -97,6 +97,14 @@ class Weights(unittest.TestCase):
         self.assertNotIn(0.5, got.values())
         self.assertNotIn(None, got)
 
+    def test_a_log_missing_a_result_line_attributes_nothing(self):
+        # Drop the first `finished in` line: pairing by position would shift
+        # every later binary's seconds onto the wrong unit.
+        lines = INTERLEAVED_LOG.splitlines(keepends=True)
+        first = next(i for i, l in enumerate(lines) if "finished in" in l)
+        got = shards.unit_times(lines[:first] + lines[first + 1:], self.UNITS)
+        self.assertEqual(got, {})
+
 
 class Check(unittest.TestCase):
     UNITS = ["doc", "lib", "test:a", "test:b"]

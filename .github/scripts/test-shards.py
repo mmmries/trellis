@@ -260,8 +260,11 @@ def unit_times(lines, all_units):
     Each stream keeps its own order. Doc-test results come after every
     `Running` line and are left unpaired."""
     by_norm = {u.split(":", 1)[-1].replace("-", "_"): u for u in all_units if u != "lib"}
-    running, finished = [], []
+    running, finished, doc_runs = [], [], 0
     for line in lines:
+        if "Doc-tests " in line:
+            doc_runs += 1
+            continue
         m = RUNNING.search(line)
         if m:
             src = m.group(2) or m.group(3)
@@ -276,6 +279,15 @@ def unit_times(lines, all_units):
         m = FINISHED.search(line)
         if m:
             finished.append(float(m.group(1)))
+    if len(finished) != len(running) + doc_runs:
+        # A missing result line (a crash, a cut-off log) would shift every
+        # later pairing: attribute nothing from this log.
+        print(
+            f"test-shards: {len(running)} Running and {doc_runs} Doc-tests lines but "
+            f"{len(finished)} results; skipping this log",
+            file=sys.stderr,
+        )
+        return {}
     secs = {}
     for unit, t in zip(running, finished):
         if unit:
