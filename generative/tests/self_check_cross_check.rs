@@ -999,6 +999,11 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
+            // The maintenance loop's housekeeping (zero-group GC) must not run
+            // between the settle and the tamper read: it could collect the
+            // zero group a `LostZeroRow` reads (#2072). An interval past any
+            // test run means no pass runs.
+            backend.set_housekeeping_interval(std::time::Duration::from_secs(3600));
             let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
             let pool = Pool::new(&config).expect("pool");
             backend.install(&program).await.expect("install program");
@@ -1066,9 +1071,21 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
                 &live
             };
             if candidates.is_empty() {
-                // The floor of live rows keeps a group; a serial program
-                // never empties the table.
-                return Err(format!("no live group in {} to tamper with", def.target));
+                // The generator's live-row floor is checked only before a
+                // random step; a pending delete, `delete_group`,
+                // `delete_extreme` and `delete_oldest` run past it (#2033), so
+                // a program can end with an empty table. There is no group to
+                // tamper with: the settled target already matched the
+                // oracle, and `self_check` must agree it is intact. Reported
+                // as `Alike`, the documented fallback.
+                let report = self_check_to_end(&trellis, &pool, &def.target).await;
+                return match report.outcome {
+                    SelfCheckOutcome::Converged => Ok(ExtremeTamper::Alike),
+                    other => Err(format!(
+                        "{} is empty and untampered, but self_check reported {other:?}",
+                        def.target
+                    )),
+                };
             }
             let group = candidates[case.group % candidates.len()].clone();
             // The group, by its columns' text: `$1`… bind each, `NULL` too.
