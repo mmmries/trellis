@@ -96,7 +96,19 @@ fn expr(rng: &mut Rng, kind: Kind, depth: u32) -> String {
     let sub = |rng: &mut Rng, kind| expr(rng, kind, depth.saturating_sub(1));
     match kind {
         Kind::Int if leaf => rng
-            .pick(&["i2", "i4", "i8", "0", "1", "-1", "7", "2147483647", "id"])
+            .pick(&[
+                "i2",
+                "i4",
+                "i8",
+                "0",
+                "1",
+                "-1",
+                "7",
+                "2147483647",
+                "-2147483648",
+                "-9223372036854775808",
+                "id",
+            ])
             .to_string(),
         Kind::Int => match rng.below(12) {
             0..=2 => {
