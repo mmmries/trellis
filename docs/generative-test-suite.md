@@ -524,6 +524,9 @@ beside them run on every `cargo test`.
   default twelve take hours), gates the plants it catches in about one
   case in five or more: `join1_no_placeholder`, `join1_old_key_unlocked`,
   `join1_no_orphan_pass`, `join1_truncate_keeps_r` and `join1_m_before_j`.
+  `join1_old_key_unlocked` is gated on liveness only: the held-key recheck
+  turns the missing lock into a `JoinKeyMoved` retry loop, so the sweep
+  catches it as a quiesce timeout; its deterministic pins gate the lock.
   The other `Join1*` plants are narrow interleavings, or leave a target that
   the rest of the build or the next writes repair before the burst settles:
   the tier runs fourteen of them as known misses, with their measured rates
@@ -915,7 +918,9 @@ judges a run:
   `extremes_tamper_planted_bugs_are_caught`) re-run generated cases with a deliberate bug
   planted (`trellis/src/plant.rs`) and check the tier catches it, against an
   unplanted baseline that must have zero failures outside the quarantine list
-  (§6). A plant in the tier's `known_misses` is run and reported but doesn't fail
+  (§6). A quiesce timeout counts as a catch once the plant fired; the report's
+  "timed out" column counts them, so a plant caught only by hanging shows.
+  A plant in the tier's `known_misses` is run and reported but doesn't fail
   the sweep when uncaught, and one in `not_gated` (with its reason) is left out
   of `GENERATIVE_PLANTS=all`. Each plant breaks one apply path (the group basis,
   a group-basis aggregate's `MIN`/`MAX` extremes or `self_check`'s comparison
