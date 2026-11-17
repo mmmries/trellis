@@ -151,10 +151,9 @@
 //! the plants whose shapes it runs, and says why it doesn't gate the others
 //! (`SweepTier::not_gated`): the group-basis plants that need an absolute
 //! write racing pages are the mid-burst, steady-load and cooling-backfill
-//! tiers'; the `JOIN` plants are the `JOIN` tier's; and the 1-1 plants
-//! `early_tombstone_gc` and `chunk_without_entry_lock` are no tier's, since
-//! with every aggregate on the group basis no schedule opens their windows:
-//! deterministic pins gate them (`ONE_TO_ONE_PINNED`).
+//! tiers'; the `JOIN` plants are the `JOIN` tier's; and the 1-1 plants in
+//! `ONE_TO_ONE_PINNED` are no tier's, since no schedule opens their window
+//! or their bug never reaches the target: deterministic pins gate them.
 //! `trellis/src/plant.rs`'s module doc says how to add a plant.
 //!
 //! # A disk-backed cluster
@@ -1591,24 +1590,53 @@ const COOLING_KEY_MISSES: &[&str] = &[];
 /// [`STEADY_LOAD_MISSES`]).
 const HOT_KEY_BASED_MISSES: &[&str] = &[STALE_ONE_TO_ONE_MISS];
 
-const COOLING_KEY_NOT_GATED: &[(&str, &str)] = &[];
-const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[];
+/// Why the cooling-key and hot-key tiers don't gate
+/// `o2o_where_build_unfiltered`: they install every definition before the
+/// first insert and rebuild nothing, so each build runs over an empty
+/// source and the unfiltered build writes no row. The plant counts as fired
+/// whenever a filtered build plans (23 of 48 cooling-key and 8 of 48
+/// hot-key cases, caught in none, logbook `20261117T111758-e-sweep`).
+const NO_BUILD_OVER_ROWS: (&str, &str) = (
+    "o2o_where_build_unfiltered",
+    "every build runs at install over an empty source, so it writes no row to leave \
+     unfiltered (fired in 23 of 48 cooling-key and 8 of 48 hot-key cases, caught in none); \
+     the mid-burst and steady-load tiers gate it",
+);
+const COOLING_KEY_NOT_GATED: &[(&str, &str)] = &[NO_BUILD_OVER_ROWS];
+const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[NO_BUILD_OVER_ROWS];
 const MID_BURST_NOT_GATED: &[(&str, &str)] = &[];
 
 /// The cooling-backfill tier's programs are the hot table and the cooling
 /// table, each read by a `GROUP BY` definition, and install or resume
 /// nothing mid-burst. It gates the plants a `request_backfill` under
 /// load reaches, and not the 1-1 or build plants.
-const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[(
-    "stale_one_to_one_write",
-    "it needs a 1-1 definition, and the tier's programs have none (0 of 48 \
-     cases fired it); the cooling-key tier gates it",
-)];
+const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "stale_one_to_one_write",
+        "it needs a 1-1 definition, and the tier's programs have none (0 of 48 \
+         cases fired it); the cooling-key tier gates it",
+    ),
+    (
+        "o2o_where_apply_unfiltered",
+        "it needs a 1-1 definition, and the tier's programs have none; the cooling-key, \
+         hot-key, mid-burst and steady-load tiers gate it",
+    ),
+    (
+        "o2o_where_null_as_true",
+        "it needs a 1-1 definition, and the tier's programs have none; the cooling-key, \
+         hot-key, mid-burst and steady-load tiers gate it",
+    ),
+    (
+        "o2o_where_build_unfiltered",
+        "it needs a 1-1 definition, and the tier's programs have none; the mid-burst and \
+         steady-load tiers gate it",
+    ),
+];
 const STEADY_LOAD_NOT_GATED: &[(&str, &str)] = &[];
 
-/// The 1-1 plants no tier gates: with every aggregate on the group basis,
-/// neither has a window a random schedule opens, and each is pinned by
-/// deterministic tests instead.
+/// The 1-1 plants no tier gates, each pinned by deterministic tests
+/// instead: no random schedule opens its window, or its bug never reaches
+/// what the tiers check.
 const ONE_TO_ONE_PINNED: &[(&str, &str)] = &[
     (
         "early_tombstone_gc",
@@ -1626,6 +1654,14 @@ const ONE_TO_ONE_PINNED: &[(&str, &str)] = &[
          21 of 48 steady-load cases and was caught in none on 42545471, 2026-10-23); \
          a_page_queues_behind_a_chunk_holding_its_key (one_to_one_build_interleavings) \
          pins the lock",
+    ),
+    (
+        "o2o_where_no_tombstone",
+        "the failing change still deletes the target row, so only the ledger's size shows \
+         it, and neither the oracle nor self_check reads that (#1991 rule 16): it fired in \
+         30, 9, 7 and 12 of 48 cooling-key, hot-key, mid-burst and steady-load cases and \
+         was caught in none (logbook 20261117T111758-e-sweep); one_to_one_where's \
+         a_failing_apply_with_no_entry_leaves_a_tombstone pins it",
     ),
     (
         "held_key_unlisted",

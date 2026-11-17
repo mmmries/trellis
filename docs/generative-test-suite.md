@@ -321,10 +321,14 @@ report prints the same tally as `where_crossings`. A join aggregate's
 crossing is a row of one side changing that side's conjuncts.
 
 The `WHERE` plants are gated where their key space is drawn: the aggregate
-ones in every concurrent tier but `min_max`, the 1-1 `JOIN` ones in the
-two-table tier (the star tier gates `join1_where_build_unfiltered`).
-`gb_where_filtered_naming` needs a held key's release or a
-partition correction, which no tier draws; its deterministic pins gate it.
+ones in every concurrent tier but `min_max`; the plain 1-1 ones in every tier
+with a 1-1 definition, `o2o_where_build_unfiltered` only in the two that build
+over rows (mid-burst, steady-load); `join_where_m_unfiltered` in the `JOIN`
+tier; the 1-1 `JOIN` ones in the two-table tier (the star tier gates
+`join1_where_build_unfiltered`). Deterministic pins alone gate the rest:
+`gb_where_filtered_naming` needs a held key's release or a partition
+correction, the `*_column_not_imaged` plants a capture widen, and
+`o2o_where_no_tombstone` only grows the ledger, which no check reads.
 
 ## 4. The properties
 
