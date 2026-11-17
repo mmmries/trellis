@@ -834,19 +834,31 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     out.push_str(&fields.join(", "));
 
     // An omitted `WHERE` and a lone `WHERE TRUE` parse to the same
-    // `Predicate::True`, so it renders nothing. A filter that is the lone
-    // literal keeps its parentheses: a bare `WHERE TRUE` would read back as
-    // `Predicate::True`, with the older floor.
+    // `Predicate::True`, so it renders nothing.
     if let Predicate::Filter(expr) = &def.predicate {
         out.push_str(" WHERE ");
-        if matches!(expr, Expr::BooleanLiteral(true)) {
-            out.push_str("(TRUE)");
-        } else {
-            out.push_str(&render_expr(expr, &aliases));
-        }
+        out.push_str(&render_filter(expr, &aliases));
     }
 
     out
+}
+
+/// A `WHERE` filter as [`render_definition_text`] renders it. A filter that
+/// is the lone literal keeps its parentheses: a bare `WHERE TRUE` would read
+/// back as `Predicate::True`, with the older floor.
+fn render_filter(expr: &Expr, aliases: &Aliases<'_>) -> String {
+    if matches!(expr, Expr::BooleanLiteral(true)) {
+        "(TRUE)".to_string()
+    } else {
+        render_expr(expr, aliases)
+    }
+}
+
+/// `def`'s `WHERE` as its definition text reads it
+/// ([`render_definition_text`]), or `None` for `TRUE`.
+pub(crate) fn render_filter_text(def: &TransformDef) -> Option<String> {
+    let expr = def.predicate.filter()?;
+    Some(render_filter(expr, &Aliases::of(def)))
 }
 
 /// `name` as definition text: bare when the grammar reads the bare word as

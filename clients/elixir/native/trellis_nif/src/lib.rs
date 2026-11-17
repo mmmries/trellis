@@ -244,6 +244,7 @@ struct StatusTerm {
     maintenance_refusals: Vec<RefusedStepTerm>,
     join: Option<JoinStatusTerm>,
     floor: String,
+    filter: Option<String>,
 }
 
 /// A `JOIN` transform's hidden tables, warnings and build step, as `status/2`
@@ -1266,6 +1267,7 @@ fn status<'a>(
                     .map(|join| JoinStatusTerm::new(env, join))
                     .transpose()?,
                 floor: status.floor,
+                filter: status.filter,
             }))
         },
     )

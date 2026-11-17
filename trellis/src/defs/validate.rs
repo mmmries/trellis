@@ -566,6 +566,10 @@ pub enum ValidationError {
     /// filter yet. Each key space's step of #1991 lifts it for that key
     /// space.
     FilterNotYetSupported { key_space: &'static str },
+    /// `MIN` or `MAX` in an aggregate with a `WHERE` other than `TRUE`: an
+    /// extreme is kept by probing a source index for the group's endpoint,
+    /// and a filtered extreme's endpoint is no index endpoint (#1991).
+    FilteredExtreme { field: String, function: String },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -1211,6 +1215,7 @@ impl ValidationError {
             ValidationError::PredicateColumnNotFound { .. } => ErrorId(236),
             ValidationError::PredicateNotTotal { .. } => ErrorId(237),
             ValidationError::FilterNotYetSupported { .. } => ErrorId(238),
+            ValidationError::FilteredExtreme { .. } => ErrorId(239),
         }
     }
 
@@ -1890,6 +1895,11 @@ impl std::fmt::Display for FieldMessage<'_> {
                 f,
                 "a WHERE other than TRUE is not supported on a {key_space} transform yet"
             ),
+            ValidationError::FilteredExtreme { field, function } => write!(
+                f,
+                "calculated field '{field}': {function} is not supported in an aggregate with a \
+                 WHERE; an extreme of the rows the WHERE keeps can't be read from a source index"
+            ),
         }
     }
 }
@@ -2089,6 +2099,7 @@ pub fn validate(
     }
 
     if let KeySpace::Aggregate { .. } = &def.key_space {
+        refuse_filtered_extremes(def)?;
         reject_extremes_without_source_index(def, source_columns)?;
         check_aggregate_table_widths(def, source_columns)?;
     }
@@ -2154,11 +2165,38 @@ pub(crate) fn refuse_unsupported_filter(def: &TransformDef) -> Result<(), Valida
     }
     let key_space = match &def.key_space {
         KeySpace::OneToOne => "1-1",
-        KeySpace::Aggregate { .. } => "GROUP BY",
+        KeySpace::Aggregate { .. } => return Ok(()),
         KeySpace::Join(_) => "JOIN aggregate",
         KeySpace::JoinOneToOne(_) => "1-1 JOIN",
     };
     Err(ValidationError::FilterNotYetSupported { key_space })
+}
+
+/// Refuses `MIN`/`MAX` in an aggregate whose `WHERE` is other than `TRUE`
+/// ([`ValidationError::FilteredExtreme`]), naming the first field that calls
+/// one.
+fn refuse_filtered_extremes(def: &TransformDef) -> Result<(), ValidationError> {
+    if def.predicate.filter().is_none() {
+        return Ok(());
+    }
+    for field in &def.fields {
+        let mut found = None;
+        field.expr.walk(&mut |e| {
+            if let Expr::FunctionCall { name, .. } = e
+                && found.is_none()
+                && matches!(name.to_ascii_uppercase().as_str(), "MIN" | "MAX")
+            {
+                found = Some(name.to_ascii_uppercase());
+            }
+        });
+        if let Some(function) = found {
+            return Err(ValidationError::FilteredExtreme {
+                field: field.name.clone(),
+                function,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// One resolved `GROUP BY` key, as [`check_group_by_keys`] checks it.

@@ -976,6 +976,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("maintenance_refusals", maintenance_refusals.as_value()),
             ("join", ruby.into_value(join)),
             ("floor", ruby.into_value(status.floor)),
+            ("filter", ruby.into_value(status.filter)),
         ],
     )
 }

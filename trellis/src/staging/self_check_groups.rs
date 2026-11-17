@@ -68,7 +68,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, Predicate};
+use crate::defs::ast::Expr;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::model::Definition;
 use crate::pool::{Pool, quote_ident};
@@ -403,8 +403,10 @@ pub(super) fn bound(keyset: &Keyset, refs: &[String], end: &[String], bounded: b
 /// Side 5 names each group an unapplied ring row may touch but can't be
 /// subtracted from, and a row of side 6 (with no key) says every group may
 /// ([`super::self_check_ring`]).
+#[allow(clippy::too_many_arguments)]
 fn page_sql(
     shape: &GroupShape,
+    predicate: Option<&Expr>,
     keyset: &Keyset,
     ring: &Ring<'_>,
     hidden: &str,
@@ -432,13 +434,28 @@ fn page_sql(
         .join(", ");
 
     // Side 1: the source's partials per group, as the target has applied
-    // them: over the weighted rows (`super::self_check_ring`).
+    // them: over the weighted rows (`super::self_check_ring`) the
+    // definition's `WHERE` keeps, rendered here as written (ADR-0013), on
+    // live rows and unapplied images alike. An argument is read only on a
+    // member row, as the write path reads it.
+    let member = predicate.map(|p| format!("(({}) is true)", render_leaf(p)));
     let mut args = Vec::with_capacity(shape.args.len());
     for arg in &shape.args {
-        let x = render_leaf(&arg.expr);
-        let x = if arg.summed { summand(arg.kind, &x) } else { x };
-        args.push((x, arg.parts(), arg.scale));
+        let sql = render_leaf(&arg.expr);
+        let sql = if arg.summed {
+            summand(arg.kind, &sql)
+        } else {
+            sql
+        };
+        let sql = match &member {
+            Some(member) => format!("(case when {member} then {sql} end)"),
+            None => sql,
+        };
+        args.push((sql, arg.parts(), arg.scale));
     }
+    let members = member
+        .map(|member| format!(" and {member}"))
+        .unwrap_or_default();
     let (src_parts, nonzero) = weighted_partials(&args);
     let lands = Lands {
         floor_key,
@@ -462,7 +479,7 @@ fn page_sql(
     let src = keyset.side(&refs, |cond| {
         format!(
             "select {key} as __k{carried}, array[{}]::text[] as __v from {weighted} as __s \
-             where {cond} and {within_hid} \
+             where {cond} and {within_hid}{members} \
              group by {group_cols} having {nonzero} order by {order} limit $1",
             src_parts.join(", "),
         )
@@ -789,6 +806,7 @@ async fn statement(
     keyset.set_cursor(after)?;
     let sql = page_sql(
         shape,
+        def.def.predicate.filter(),
         &keyset,
         &ring,
         &hidden,
@@ -853,12 +871,6 @@ pub(super) async fn compare(
     paused: &HashSet<String>,
     checked_through: PgLsn,
 ) -> Result<ComparePass, SelfCheckError> {
-    // The source's `GROUP BY` has no `WHERE` for the definition's predicate;
-    // define refuses an aggregate's until its step (#2039) renders it here.
-    match &def.def.predicate {
-        Predicate::True => {}
-        Predicate::Filter(_) => return Err(super::self_check::unaudited_filter(def)),
-    }
     let mut client = pool.get().await?;
     let steer = steers(&client, def, shape).await?;
     let sql = statement(

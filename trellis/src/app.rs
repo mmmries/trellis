@@ -1320,10 +1320,7 @@ impl Trellis {
                         row.get("source_table"),
                     )
                     .await?;
-                    filter = def
-                        .predicate
-                        .filter()
-                        .map(crate::defs::ast::render_field_expr);
+                    filter = crate::defs::ast::render_filter_text(&def);
                     join = crate::staging::join_status::for_definition(
                         &*txn,
                         self.config.schema(),

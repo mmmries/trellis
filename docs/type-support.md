@@ -64,15 +64,8 @@ filter role.
 | array, range, composite, domain, geometric, extension types (`citext`) | no | no | no | no | no | no |
 
 `COUNT(*)` and `COUNT(<expr>)` are type-agnostic and typed `bigint`, as in
-Postgres; they are omitted from the aggregate column. An aggregate or `JOIN`
-transform admits `COUNT`, and `SUM` and `AVG` over the types above, the
-aggregates Trellis keeps exact from each change alone. A plain aggregate (not
-a `JOIN`) also admits `MIN` and `MAX` over the types above, which re-read
-the source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
-Every other aggregate is refused at define, named by its family: `MIN`/`MAX`
-on a `JOIN`, `bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over a
-float, an `interval` or another type, and `array_agg`/`string_agg`/`jsonb_agg`
-([Aggregates that are not supported](#aggregates-that-are-not-supported)).
+Postgres; they are omitted from the aggregate column. Which aggregates are
+admitted is in [Aggregates that are not supported](#aggregates-that-are-not-supported).
 
 ### The types of the columns Trellis creates
 
@@ -555,11 +548,15 @@ divergence
 
 ## Aggregates that are not supported
 
-An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`
-over `smallint`, `integer`, `bigint` and `numeric`; a plain aggregate also
-admits `MIN` and `MAX` ([above](#min-and-max)). Every other aggregate is
-refused at define, by name, with the issue that tracks it: see
-[transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
+An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or
+`AVG` over a number or an `interval`: the aggregates Trellis keeps exact from
+each change alone. A plain aggregate (not a `JOIN`)
+also admits `MIN` and `MAX` over the types the matrix marks, which re-read the
+source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
+Every other aggregate is refused at define, named by its family
+([refusals](transforms.md#refusals)): `MIN`/`MAX` on a `JOIN`,
+`bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over another type, and
+`array_agg`/`string_agg`/`jsonb_agg`.
 
 ## Typed literals and casts
 
