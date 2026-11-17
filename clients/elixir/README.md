@@ -293,6 +293,23 @@ make it so: Ecto's `schema_migrations` runs each migration once. See
 Add `import_deps: [:trellis_pg]` to the app's `.formatter.exs` to keep
 `define` and `apply` free of parentheses, like Ecto's own commands.
 
+## Turning Trellis off in tests
+
+Set Trellis off where nothing should capture or maintain a target, usually
+the test environment:
+
+```elixir
+# config/test.exs
+config :trellis_pg, enabled: false
+```
+
+Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
+skip, and `mix trellis.load` / `mix trellis.dump` are `ecto.load` /
+`ecto.dump`, so target tables are plain tables a test writes directly.
+Build the test database with `mix ecto.load` (aliased to `trellis.load`),
+not `mix ecto.migrate`: a skipped define creates no target table.
+`Trellis.enabled?/0` reports the setting.
+
 ## Fixtures and bulk loads in tests
 
 A loader that disables triggers for the load (`ALTER TABLE ... DISABLE
