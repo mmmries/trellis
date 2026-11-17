@@ -113,8 +113,7 @@ so does `orders.order AS order`. `AT TIME ZONE`
 binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
-definition time. `<predicate>` accepts only the
-literal `TRUE`; any other `WHERE` is refused at definition time.
+definition time. `<predicate>` follows the partial-data predicate rule above.
 
 ### Typed literals spell constants in canonical Postgres form
 
@@ -197,7 +196,7 @@ shape:
 * `GROUP BY <col1>[, <col2>...]` (at most 32 columns, Postgres's cap on an
   index key) produces a `KeySpace::Aggregate` whose
   calculated fields may reference a grouping column directly or wrap any other
-  column in `SUM` or `AVG` (over an integer or `numeric`), or in `MIN` or
+  column in `SUM` or `AVG` (over a number or an `interval`), or in `MIN` or
   `MAX` (over a number, date or time column; see `docs/type-support.md`),
   resolved against a separate aggregate-function registry. The grammar also
   parses `bool_*`, `bit_*`, `array_agg`, `string_agg` and `jsonb_agg`, and

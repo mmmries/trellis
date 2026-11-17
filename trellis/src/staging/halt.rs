@@ -167,11 +167,23 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
 pub(crate) async fn halt_failed_start(
     pool: &Pool,
     target: &str,
-    err: &str,
+    failure: &ApplyError,
 ) -> Result<Vec<String>, ApplyError> {
     let halted = format!("the re-derive build of {target} couldn't start");
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    // A refused start names the role that was refused, as a refused drain
+    // does: Postgres's message names the table and not the role.
+    let err = if quarantine::is_insufficient_privilege(failure) {
+        let role: String = txn
+            .query_one("select current_user::text", &[])
+            .await?
+            .get(0);
+        format!("{failure} (role {role} lacks a privilege on that table; grant it)")
+    } else {
+        failure.to_string()
+    };
+    let err = err.as_str();
     let paused = pause_closure(
         &txn,
         pool.schema(),

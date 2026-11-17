@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::error_code::{ErrorCode, ErrorId};
+use crate::error_code::{ErrorCode, ErrorId, SharedCondition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -43,7 +43,8 @@ pub enum ParseError {
     },
     /// An identifier known to be non-immutable (`NOW()`, `RANDOM()`, ...).
     NonImmutableConstruct { name: String },
-    /// A partial-data predicate other than a literal `TRUE`.
+    /// A partial-data predicate other than a literal `TRUE` in grammar-1
+    /// text, which had no other (stored text never holds one).
     UnsupportedPredicate { detail: String },
     /// `COALESCE` called with zero arguments.
     AtLeastOneArgumentRequired { name: String },
@@ -192,7 +193,9 @@ impl ParseError {
             ParseError::UnsupportedIsForm { .. } => ErrorId(25),
             ParseError::NotChainTooLong { .. } => ErrorId(26),
             ParseError::SimpleCaseUnsupported => ErrorId(27),
-            ParseError::UnsupportedLiteralType { .. } => ErrorId(28),
+            ParseError::UnsupportedLiteralType { .. } => {
+                SharedCondition::UnsupportedLiteralType.error_id()
+            }
             ParseError::UnsupportedCastOperator => ErrorId(29),
             ParseError::ExpressionTooDeep { .. } => ErrorId(30),
             ParseError::MalformedDefinitionAddress { .. } => ErrorId(31),

@@ -199,16 +199,31 @@ module Trellis
       # warning, so it doesn't hide the block's error; after a block that
       # returned, the shutdown's error is raised. Raises ValidationError if
       # the instance isn't connected and its options aren't configured.
+      #
+      # In a migration of another environment's database (`db:prepare` in
+      # development migrates the test databases too), it never uses this
+      # process's handle: it connects one of its own to that environment's
+      # counterpart of the database the instance's url points at
+      # (SchemaDump.migration_url), with the instance's other options.
       def with_handle(name = nil)
+        other = other_environment_migration
         instance = name ? @instances[name.to_sym] : (Trellis.default_instance if Trellis.connected?)
-        if instance&.connected?
+        if instance&.connected? && !other
           instance.migrate
           return yield(instance)
         end
 
         options = name ? named_options(name) : required_connect_options
         options = options.merge(staging: false, drain_threads: 0)
-        instance = name ? Trellis::Instance.connect(**options) : connect_default(options)
+        if other
+          require "trellis/schema_dump"
+          what = name ? "config.trellis.instances[#{name.inspect}]" : "config.trellis.connect"
+          options = options.merge(url: SchemaDump.migration_url(other, options[:url], what))
+        end
+        # The default instance's own handle is Trellis's default, unless
+        # that may already be this process's handle.
+        default = !name && !other
+        instance = default ? connect_default(options) : Trellis::Instance.connect(**options)
         primary = nil
         begin
           instance.migrate
@@ -217,7 +232,7 @@ module Trellis
           primary = e
           raise
         ensure
-          shutdown_after(name, instance, primary)
+          shutdown_after(default, instance, primary)
         end
       end
 
@@ -303,6 +318,17 @@ module Trellis
 
       private
 
+      # The db_config of the database a Trellis::Migration is running on
+      # (Trellis::Migration#exec_migration records it for the length of the
+      # migration) when it belongs to another environment than the one
+      # running the task, or nil.
+      def other_environment_migration
+        db_config = Thread.current[:trellis_migrating_database] or return nil
+        return nil if db_config.env_name.to_s == ::ActiveRecord::Tasks::DatabaseTasks.env.to_s
+
+        db_config
+      end
+
       # The environments config.trellis.off_in names, as strings; empty when
       # it isn't set (or there's no Rails app).
       def off_in
@@ -378,8 +404,8 @@ module Trellis
       # Shuts with_handle's own instance down. With a primary error on its
       # way out, a failed shutdown is only a warning: raising would replace
       # it.
-      def shutdown_after(name, instance, primary)
-        name ? instance.shutdown : Trellis.shutdown
+      def shutdown_after(default, instance, primary)
+        default ? Trellis.shutdown : instance.shutdown
       rescue StandardError => e
         raise unless primary
 

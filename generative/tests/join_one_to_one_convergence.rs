@@ -761,6 +761,11 @@ const ONE_TO_ONE_KNOWN_MISSES: &[&str] = &[
 /// `join1_truncate_keeps_r` 10, `join1_m_before_j` 9), runs and reports
 /// [`ONE_TO_ONE_KNOWN_MISSES`], and leaves out [`ONE_TO_ONE_NOT_GATED`],
 /// [`TWO_TABLE_NOT_GATED`] and every plant of another path.
+///
+/// The tier's reach of `join1_old_key_unlocked` is liveness only: the
+/// held-key recheck turns the missing lock into a `JoinKeyMoved` retry loop,
+/// so its catches are quiesce timeouts (the report's "timed out" column), not
+/// wrong rows. Its deterministic pins gate the lock itself.
 fn one_to_one_sweep_tier() -> SweepTier {
     sweep_tier(
         generative::baseline_quarantine::JOIN_ONE_TO_ONE_TIER,

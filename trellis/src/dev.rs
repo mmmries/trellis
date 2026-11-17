@@ -236,8 +236,8 @@ pub mod fixtures {
         CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, ExtremeIndexGap,
         FanOutWarning, HeldKeys, HiddenTableSize, IndexRole, JoinStatus, OtherProcess,
         OtherVersionLive, PartialsWarning, PoisonEntry, PoisonSample, QuarantineEntry,
-        QuarantineState, QuarantineTarget, SelfCheckJob, SelfCheckJobState, SelfCheckMode,
-        SelfCheckOutcome, SelfCheckReport, SourceIndexGap, TransformStatus,
+        QuarantineState, QuarantineTarget, RefusedStep, SelfCheckJob, SelfCheckJobState,
+        SelfCheckMode, SelfCheckOutcome, SelfCheckReport, SourceIndexGap, TransformStatus,
     };
 
     #[allow(non_snake_case)]
@@ -302,7 +302,9 @@ pub mod fixtures {
             version_handover: None,
             migrations_pending: None,
             below_catalog_floor: None,
+            maintenance_refusals: Vec::new(),
             floor: "0.2.0".to_string(),
+            filter: None,
         }
     }
 
@@ -311,6 +313,17 @@ pub mod fixtures {
         BelowCatalogFloor {
             floor: String::new(),
             this_version: String::new(),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn RefusedStep() -> RefusedStep {
+        RefusedStep {
+            step: String::new(),
+            role: None,
+            object: None,
+            missing: Vec::new(),
+            error: String::new(),
         }
     }
 

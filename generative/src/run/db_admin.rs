@@ -21,6 +21,7 @@ use crate::backend::{
 };
 use crate::model::{DbAdminAction, DbAdminPlan, Program};
 
+use super::pause::RunKind;
 use super::{Outcome, RunError, apply_and_check_outcome, quiesce_snapshot_and_check};
 
 /// [`super::run_convergence`] with `plan`'s database-administration actions
@@ -81,7 +82,16 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
             }
         }
 
-        quiesce_snapshot_and_check(backend, pool, program, op_index, &program.defs, false).await?;
+        quiesce_snapshot_and_check(
+            backend,
+            pool,
+            program,
+            op_index,
+            &program.defs,
+            false,
+            RunKind::DbAdmin,
+        )
+        .await?;
     }
 
     Ok(Outcome::Ran)
