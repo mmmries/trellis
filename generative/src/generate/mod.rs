@@ -132,6 +132,7 @@ pub mod join_chained;
 pub mod join_one_to_one;
 pub mod min_max;
 pub mod partition;
+pub mod where_clause;
 
 use std::collections::HashMap;
 
@@ -2905,10 +2906,12 @@ mod strategy {
                     defs.push((idx, shape));
                     derived.push(derived_shape);
                 }
-                interleave_tables(
+                // A `WHERE` on the definitions that take one (#2043), derived
+                // from the program, so the draws are what they were.
+                where_clause::with_predicates(interleave_tables(
                     build_program_multi_with_shapes_and_derived(&tables, &defs, &derived),
                     &schedule,
-                )
+                ))
             })
     }
 
@@ -2992,11 +2995,11 @@ mod strategy {
                         build_program_multi_with_shapes_and_derived(&tables, &defs, &derived),
                         &schedule,
                     );
-                    partition::add_partition_maintenance(
+                    where_clause::with_predicates(partition::add_partition_maintenance(
                         partition_table(program, 0, strategy),
                         0,
                         &partition_draws,
-                    )
+                    ))
                 },
             )
     }
@@ -3977,6 +3980,9 @@ mod strategy {
                         let after_op = 1 + usize::from(at) * (ops - 2) / 1000;
                         program = defer_def_install(program, def, after_op);
                     }
+                    // A `WHERE` on the aggregates (#2043), derived from the
+                    // program, so the draws are what they were.
+                    let program = where_clause::with_predicates(program);
                     let seal = cooling.as_ref().map_or(seal, |c| c.seal_interval_ms);
                     let load = extras.load.or(backfill.as_ref().map(|b| b.load));
                     let mut plan = concurrent_plan(&program, burst_size, lanes);

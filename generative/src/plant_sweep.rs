@@ -126,7 +126,11 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::GbBuildNoRingBranch
         | Plant::GbBuildNullKeyByEquality
         | Plant::GbBuildStragglerUnlocked
-        | Plant::GbBuildLeafUnrouted => PlantPath::GroupBasis,
+        | Plant::GbBuildLeafUnrouted
+        | Plant::GbWhereOldImage
+        | Plant::GbWhereNullAsTrue
+        | Plant::GbWhereBuildUnfiltered
+        | Plant::GbWhereFilteredNaming => PlantPath::GroupBasis,
         Plant::GbLsnNotVisibility | Plant::GbFoldSidesPerKey | Plant::GbEarlyZeroGc => {
             PlantPath::GroupBasisWriter
         }
@@ -160,6 +164,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1ReleaseNoRederive
         | Plant::Join1WhereFanOutNoDelete
         | Plant::Join1WhereDeletePresenceOnly
+        | Plant::Join1WhereNullAsTrue
+        | Plant::Join1WhereBuildUnfiltered
         | Plant::StarJUnsorted
         | Plant::StarRootSkipJLast
         | Plant::StarRootSkipJFirst

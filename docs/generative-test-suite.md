@@ -117,6 +117,8 @@ the same expression in Postgres. So the oracle *is Postgres*: render a
 definition's formulas (and predicate, and grain) back to a `SELECT` against the
 source, run it in the same cluster, and assert the persisted target equals it.
 
+A definition's `WHERE` goes into its `SELECT` as written.
+
 - **1-1:** `SELECT pk, (price + tax) AS total FROM orders` → compare row-by-row.
 - **Aggregate:** `SELECT grain, sum(measure) FROM src GROUP BY grain` → compare.
 - **Join aggregate:** the definition's own `SELECT keys, aggregates FROM a [LEFT]
@@ -289,6 +291,39 @@ while planning.
 4. Teach the end-to-end oracle (`oracle::render_expr`, `field_value_type`) the
    operator's rendering and typing, and add a literal pool for any new
    typed-literal keyword.
+
+### Generated predicates
+
+`generate::where_clause` gives about half the definitions whose key space
+applies a `WHERE` one (`where_clause::filters`: the plain aggregate without
+`MIN`/`MAX`, and the 1-1 `JOIN` and star). Each predicate is total, reads the
+columns the op streams update, and is derived from a digest of the drawn
+program rather than drawn, so every strategy draws what it drew before: a case
+without a predicate is the same program. An aggregate's read `c1`, `c2`, the
+flag and the grain; a 1-1 `JOIN`'s read `ja` and one or two joined tables,
+cross-table comparisons and the anti-join included. A few are `FALSE`, `NULL`
+or `(TRUE)`.
+
+The meta-test `every_where_crossing_bucket_is_drawn_for_each_filtering_key_space`
+(`tests/coverage.rs`) replays the serial, hot-key, 1-1 `JOIN` and star draws
+with no database (`run::coverage::where_crossings`, over the evaluator
+`where_clause::eval`) and fails when a key space has a crossing bucket
+(`in_in`, `in_out`, `out_in`, `out_out`) no change lands in. The coverage
+report prints the same tally as `where_crossings`.
+
+The `WHERE` plants are gated where their key space is drawn. Every
+concurrent tier but `min_max` (which draws no filtered definition) catches
+`gb_where_old_image`, `gb_where_null_as_true` and `gb_where_build_unfiltered`
+in 20 to 33 cases of 48. `gb_where_filtered_naming` fires in none: only a
+held key's release or a partition correction names groups from group-only
+images, which its deterministic pins cover. The 1-1 `JOIN` tier gates
+`join1_where_fan_out_no_delete`, `join1_where_delete_presence_only`,
+`join1_where_null_as_true` and `join1_where_build_unfiltered` (6 to 11 of
+24); the star tier gates the last and runs the others as known misses.
+
+The plain 1-1 (#2038) and the join aggregate (#2042) join `filters`, with
+templates of their own in `with_predicates`, once define applies their
+`WHERE`.
 
 ## 4. The properties
 
@@ -490,7 +525,8 @@ beside them run on every `cargo test`.
   inside the read. It checks that `R` and `M` are their tables as applied
   (the live rows minus the ring's unapplied changes, as `self_check`
   subtracts them), that each target row is its `R` entry's fields over the
-  newest live `M` entry on its key (with `INNER` dropping a row with none),
+  newest live `M` entry on its key (with `INNER` dropping a row with none, and a
+  `WHERE` that isn't `TRUE` on the row dropping it at either kind),
   and that every join key a live entry holds has its `J` row. The rows of a
   key with a pending fan-out marker that come after its cursor are left out
   of the target check, and a definition that isn't `live` or has a build

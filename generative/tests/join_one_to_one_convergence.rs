@@ -514,16 +514,6 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
          draws no held row; `join_one_to_one_quarantine` pins it",
     ),
     (
-        "join1_where_fan_out_no_delete",
-        "it needs a definition with a WHERE, and the tier draws none until #2043 adds \
-         predicate generation; `join_star_where` pins it",
-    ),
-    (
-        "join1_where_delete_presence_only",
-        "it needs a definition with a WHERE, and the tier draws none until #2043 adds \
-         predicate generation; `join_star_where` pins it",
-    ),
-    (
         "join1_m_pass_b_only",
         "it needs a b row deleted past capture before a rebuild in place (an uncaptured \
          write), and every write the runner issues is captured: it fired in 24 of 24 \
@@ -851,7 +841,17 @@ fn star_sweep_tier() -> SweepTier {
 ///   `join1_orphan_delete` (20), `join1_rd_no_key` (47),
 ///   `join1_snapshot_after_read` (48), `join1_truncate_def_after_lock` (36),
 ///   `join1_truncate_keeps_m` (35) and `join1_truncate_share_lock` (35).
+/// - The `WHERE` plants the two-table tier gates (#2043, 4 seeds x 6 cases,
+///   logbook `20261117T083652-e-sweep`): `join1_where_fan_out_no_delete`
+///   caught 0, fired 1 (it needs a `LEFT`-only definition's fan-out, and a
+///   star rarely has every position `LEFT`);
+///   `join1_where_delete_presence_only` caught 0, fired 12;
+///   `join1_where_null_as_true` caught 2, fired 12. The star tier gates
+///   `join1_where_build_unfiltered` (8 of 24).
 const STAR_KNOWN_MISSES: &[&str] = &[
+    "join1_where_fan_out_no_delete",
+    "join1_where_delete_presence_only",
+    "join1_where_null_as_true",
     "join1_truncate_no_rebuild",
     "star_own_j_only",
     "star_r_after_m",

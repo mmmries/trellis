@@ -519,6 +519,24 @@ pub enum Plant {
     /// `an_a_change_of_no_key_races_a_b_change_of_its_row` and
     /// `a_left_only_fan_out_deletes_the_rows_that_stop_qualifying`.
     Join1WhereDeletePresenceOnly,
+    /// #1991 rule 3 (`join1_where_null_as_true`): a 1-1 `JOIN`'s membership
+    /// reads `(<p>) is not false` (`staging::join_one_to_one`'s shape), so a
+    /// row whose `WHERE` is `NULL` gets a target row. Fires only on a
+    /// definition with a `WHERE`.
+    ///
+    /// Pinned by `join_star_where`'s
+    /// `a_guarded_field_and_predicate_only_columns` and
+    /// `a_truncate_of_b_rebuilds_membership`.
+    Join1WhereNullAsTrue,
+    /// #1991 rule 12 (`join1_where_build_unfiltered`): a 1-1 `JOIN`'s build
+    /// chunk writes its target rows with no `WHERE`
+    /// (`staging::join_one_to_one::build`'s chunk), so a build leaves every
+    /// row of the join until its next change. Fires only on a definition
+    /// with a `WHERE`.
+    ///
+    /// Pinned by `join_star_where`'s `a_truncate_of_b_rebuilds_membership`
+    /// and `a_resume_rebuilds_the_rows_whose_membership_changed_while_paused`.
+    Join1WhereBuildUnfiltered,
     /// #1464 U1 (`star_j_unsorted`): a 1-1 `JOIN` page's `J` statements,
     /// the insert of its keys and their lock
     /// (`staging::join_one_to_one::j_statements`), run unsorted, so two
@@ -847,6 +865,43 @@ pub enum Plant {
     /// and pinned by its
     /// `erroring_inserts_and_updates_follow_the_held_key_model`.
     HeldKeyDeleteApplies,
+    /// ADR-0002, #1991 (`gb_where_old_image`): a plain aggregate's page
+    /// stages an update's old image whatever its `WHERE` gives
+    /// (`staging::group_basis`'s stage statement), so a row that was no
+    /// member retracts a contribution it never made. Fires only on a
+    /// definition with a `WHERE`.
+    ///
+    /// Pinned by `group_basis_where`'s
+    /// `membership_flips_in_two_pages_in_both_orders` and
+    /// `every_transition_matches_the_filtered_query`.
+    GbWhereOldImage,
+    /// #1991 rule 3 (`gb_where_null_as_true`): a plain aggregate's membership
+    /// reads `(<p>) is not false` (`staging::group_basis::route`), so a row
+    /// whose `WHERE` is `NULL` counts. Fires only on a definition with a
+    /// `WHERE`.
+    ///
+    /// Pinned by `group_basis_where`'s
+    /// `every_transition_matches_the_filtered_query`.
+    GbWhereNullAsTrue,
+    /// #1991 rule 12 (`gb_where_build_unfiltered`): a plain aggregate's
+    /// build reads the source with no `WHERE` (`staging::group_basis`'s
+    /// write-once statement), so every row counts until it next changes.
+    /// Fires only on a definition with a `WHERE`.
+    ///
+    /// Pinned by `group_basis_where`'s `build_and_apply_agree` and
+    /// `every_transition_matches_the_filtered_query`.
+    GbWhereBuildUnfiltered,
+    /// #1991 rule 17 (`gb_where_filtered_naming`): a plain aggregate names
+    /// the groups it recomputes only from images its `WHERE` passes
+    /// (`staging::group_basis`'s naming statement), so an image holding only
+    /// the group columns (a parked change's, a partition correction's) names
+    /// nothing and its group keeps a stale contribution. Fires only on a
+    /// definition with a `WHERE`.
+    ///
+    /// Pinned by `group_basis_where`'s
+    /// `a_release_names_groups_from_group_only_images` and
+    /// `a_crossing_update_around_a_group_recompute`.
+    GbWhereFilteredNaming,
 }
 
 impl Plant {
@@ -897,6 +952,8 @@ impl Plant {
         Plant::Join1ReleaseNoRederive,
         Plant::Join1WhereFanOutNoDelete,
         Plant::Join1WhereDeletePresenceOnly,
+        Plant::Join1WhereNullAsTrue,
+        Plant::Join1WhereBuildUnfiltered,
         Plant::StarJUnsorted,
         Plant::StarRootSkipJLast,
         Plant::StarRootSkipJFirst,
@@ -931,6 +988,10 @@ impl Plant {
         Plant::StarReadsFirstOnly,
         Plant::HeldKeyUnlisted,
         Plant::HeldKeyDeleteApplies,
+        Plant::GbWhereOldImage,
+        Plant::GbWhereNullAsTrue,
+        Plant::GbWhereBuildUnfiltered,
+        Plant::GbWhereFilteredNaming,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -981,6 +1042,8 @@ impl Plant {
             Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
             Plant::Join1WhereFanOutNoDelete => "join1_where_fan_out_no_delete",
             Plant::Join1WhereDeletePresenceOnly => "join1_where_delete_presence_only",
+            Plant::Join1WhereNullAsTrue => "join1_where_null_as_true",
+            Plant::Join1WhereBuildUnfiltered => "join1_where_build_unfiltered",
             Plant::StarJUnsorted => "star_j_unsorted",
             Plant::StarRootSkipJLast => "star_root_skip_j_last",
             Plant::StarRootSkipJFirst => "star_root_skip_j_first",
@@ -1015,6 +1078,10 @@ impl Plant {
             Plant::StarReadsFirstOnly => "star_reads_first_only",
             Plant::HeldKeyUnlisted => "held_key_unlisted",
             Plant::HeldKeyDeleteApplies => "held_key_delete_applies",
+            Plant::GbWhereOldImage => "gb_where_old_image",
+            Plant::GbWhereNullAsTrue => "gb_where_null_as_true",
+            Plant::GbWhereBuildUnfiltered => "gb_where_build_unfiltered",
+            Plant::GbWhereFilteredNaming => "gb_where_filtered_naming",
         }
     }
 

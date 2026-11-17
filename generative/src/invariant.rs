@@ -27,7 +27,9 @@
 //!   the entry and the newest live `M` entry on its join key (the latest
 //!   applied position, then the highest key), evaluated by Postgres in the
 //!   snapshot. `INNER` has a row only when such an entry exists, `LEFT`
-//!   always. A target row with no live `R` entry is extra.
+//!   always, and either only when the definition's `WHERE` is `TRUE` on the
+//!   row (the snapshot's `passes`, by `self_check`'s renderer). A target row
+//!   with no live `R` entry is extra.
 //! - [`Clause::JoinPick`]: the `M` entry the snapshot read a row with is the
 //!   newest live one on the `R` entry's join key, by this module's own
 //!   reading of `M` (a disagreement is a bug in the read or the check, not in
@@ -299,6 +301,9 @@ pub struct StarJoinedRow {
     pub key: String,
     /// The `M_p` entry read at each position (`joined[p - 1]`), or `None`.
     pub joined: Vec<Option<String>>,
+    /// Whether the definition's `WHERE` is `TRUE` on the row (always, with
+    /// none). A row that fails has no target row, at any kind.
+    pub passes: bool,
     pub values: Vec<Option<String>>,
 }
 
@@ -354,6 +359,7 @@ impl From<&HiddenSnapshot> for StarSnapshot {
                 .map(|j| StarJoinedRow {
                     key: j.key.clone(),
                     joined: vec![j.joined.clone()],
+                    passes: j.passes,
                     values: j.values.clone(),
                 })
                 .collect(),
@@ -400,6 +406,7 @@ impl From<engine::StarSnapshot> for StarSnapshot {
                 .map(|j| StarJoinedRow {
                     key: j.key,
                     joined: j.joined,
+                    passes: j.passes,
                     values: j.values,
                 })
                 .collect(),
@@ -628,7 +635,9 @@ fn target_clause(s: &StarSnapshot, out: &mut Vec<Violation>) -> usize {
                 !position.left && joined.joined.get(*p).cloned().flatten().is_none()
             })
             .map(|(p, _)| p);
-        let expected = unmatched.is_none().then_some(&joined.values);
+        // A row exists when every `INNER` position matched and the `WHERE`
+        // is `TRUE` on it (ADR-0021).
+        let expected = (unmatched.is_none() && joined.passes).then_some(&joined.values);
         let picks = show_picks(&joined.joined);
         match (expected, rows.get(entry.key.as_str())) {
             (Some(want), Some(got)) if want != *got => out.push(Violation {
@@ -649,6 +658,16 @@ fn target_clause(s: &StarSnapshot, out: &mut Vec<Violation>) -> usize {
                 detail: format!(
                     "no target row where R and M give {} (M entry {})",
                     show(want),
+                    picks
+                ),
+                position: None,
+            }),
+            (None, Some(got)) if unmatched.is_none() => out.push(Violation {
+                clause: Clause::Target,
+                key: entry.key.clone(),
+                detail: format!(
+                    "a target row {} where the WHERE isn't TRUE on R and M (M entry {})",
+                    show(got),
                     picks
                 ),
                 position: None,
@@ -749,6 +768,7 @@ mod tests {
         JoinedRow {
             key: key.to_string(),
             joined: m.map(str::to_string),
+            passes: true,
             values: some(values),
         }
     }
@@ -870,6 +890,30 @@ mod tests {
         assert_eq!(clauses(&s), [Clause::Target]);
         // A held row is left out.
         s.held.insert("9".to_string());
+        assert_eq!(clauses(&s), []);
+    }
+
+    /// A row whose `WHERE` isn't `TRUE` has no target row, under `LEFT`
+    /// too (#2043): one left behind, or one missing where it passes, is
+    /// caught.
+    #[test]
+    fn a_row_that_fails_the_where_has_no_target_row() {
+        let mut s = good();
+        s.joined_rows[0].passes = false;
+        s.joined_rows[0].values = vec![None];
+        let v = check(&s);
+        assert_eq!(clauses(&s), [Clause::Target], "{v:?}");
+        assert!(
+            v.violations()[0].detail.contains("WHERE"),
+            "{:?}",
+            v.violations()
+        );
+        let key = s.joined_rows[0].key.clone();
+        s.rows.retain(|r| r.key != key);
+        assert_eq!(clauses(&s), []);
+        // Under `INNER` too, with the row's key matched.
+        s.left = false;
+        s.rows.retain(|r| r.key != "3");
         assert_eq!(clauses(&s), []);
     }
 
@@ -1057,6 +1101,7 @@ mod tests {
         let joined = |key: &str, picks: [Option<&str>; 2], values: &[&str]| StarJoinedRow {
             key: key.to_string(),
             joined: picks.iter().map(|p| p.map(str::to_string)).collect(),
+            passes: true,
             values: some(values),
         };
         StarSnapshot {
