@@ -492,6 +492,17 @@ pub enum CatalogError {
         /// resolved this precisely.
         column_detail: Vec<String>,
     },
+    /// A statement's DDL on a target failed because objects outside Trellis
+    /// depend on it: another table's foreign key, or a view over the table
+    /// or a column. Trellis never cascades (ADR-0014; what a user adds to a
+    /// target is the user's), so the statement rolls back whole.
+    OutsideDependentsBlock {
+        /// What the statement acts on: the target, or `target.column`.
+        subject: String,
+        /// Postgres's own list of the dependents, one per line, from the
+        /// dependency failure's DETAIL.
+        dependents: Vec<String>,
+    },
     /// `alter_transform` was asked to edit a target that doesn't apply
     /// (`staging::build::takes_field_build`): one still
     /// `waiting_to_backfill`, `backfilling` behind an old-path build, or
@@ -597,6 +608,7 @@ impl CatalogError {
             // precondition.
             CatalogError::TransformNotPaused { .. } => ErrorCode::Conflict,
             CatalogError::DependentsBlockDrop { .. } => ErrorCode::Conflict,
+            CatalogError::OutsideDependentsBlock { .. } => ErrorCode::Conflict,
             // Only another version gets past it, like a catalog floor.
             CatalogError::AboveRunningRelease { .. } => ErrorCode::VersionFloor,
             CatalogError::CannotRun { .. } => ErrorCode::VersionFloor,
@@ -654,6 +666,7 @@ impl CatalogError {
             CatalogError::AboveRunningRelease { .. } => ErrorId(151),
             CatalogError::CannotRun { .. } => ErrorId(152),
             CatalogError::DependentsBlockDrop { .. } => ErrorId(153),
+            CatalogError::OutsideDependentsBlock { .. } => ErrorId(233),
             CatalogError::TransformNotLive { .. } => ErrorId(154),
             CatalogError::AlterFieldNotFound { .. } => ErrorId(155),
             CatalogError::AlterFieldAlreadyExists { .. } => ErrorId(156),
@@ -1017,6 +1030,15 @@ impl crate::error_code::Message for CatalogError {
                 }
                 Ok(())
             }
+            CatalogError::OutsideDependentsBlock {
+                subject,
+                dependents,
+            } => write!(
+                f,
+                "objects outside Trellis depend on '{subject}': {} (Trellis refuses rather \
+                 than cascading)",
+                dependents.join("; ")
+            ),
             CatalogError::TransformNotLive { transform, status } => write!(
                 f,
                 "'{transform}' is {}, not live; only a fully-built, live definition can be \
@@ -1088,6 +1110,7 @@ impl std::error::Error for CatalogError {
             CatalogError::AboveRunningRelease { .. } => None,
             CatalogError::CannotRun { .. } => None,
             CatalogError::DependentsBlockDrop { .. } => None,
+            CatalogError::OutsideDependentsBlock { .. } => None,
             CatalogError::TransformNotLive { .. } => None,
             CatalogError::AlterFieldNotFound { .. } => None,
             CatalogError::AlterFieldAlreadyExists { .. } => None,
@@ -1116,6 +1139,43 @@ impl From<crate::locks::ColumnPauseLockError> for CatalogError {
                 CatalogError::ColumnPauseLockTimeout(err)
             }
             crate::locks::ColumnPauseLockError::Db(err) => CatalogError::Db(err),
+        }
+    }
+}
+
+impl CatalogError {
+    /// Lifts a dependency failure (`2BP01`, or `23503` on a delete a foreign
+    /// key refuses) of Trellis's own DDL on `subject` into
+    /// [`CatalogError::OutsideDependentsBlock`], naming the dependents from
+    /// Postgres's DETAIL. Any other error stays a database error.
+    pub(crate) fn from_dependency_failure(err: tokio_postgres::Error, subject: &str) -> Self {
+        use tokio_postgres::error::SqlState;
+        let lines: Option<Vec<String>> = err.as_db_error().and_then(|db| {
+            // A dependency failure's DETAIL lists the dependents; a foreign
+            // key's refusal of a delete names the key in its message, and its
+            // DETAIL names the referenced row.
+            let head = if db.code() == &SqlState::FOREIGN_KEY_VIOLATION {
+                Some(db.message())
+            } else if db.code() == &SqlState::DEPENDENT_OBJECTS_STILL_EXIST {
+                None
+            } else {
+                return None;
+            };
+            Some(
+                head.into_iter()
+                    .chain(db.detail().unwrap_or_default().lines())
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
+        });
+        match lines.filter(|lines| !lines.is_empty()) {
+            Some(dependents) => CatalogError::OutsideDependentsBlock {
+                subject: subject.to_string(),
+                dependents,
+            },
+            None => CatalogError::Db(err),
         }
     }
 }
@@ -2416,7 +2476,10 @@ pub async fn alter_transform(
             "alter table {target_ident} drop column if exists {}",
             quote_ident(field)
         ))
-        .await?;
+        .await
+        .map_err(|err| {
+            CatalogError::from_dependency_failure(err, &format!("{}.{field}", alter.target))
+        })?;
     }
     // An added bare passthrough takes its source column's type, as at
     // `DEFINE`: the same rule, not a second copy of it.

@@ -238,6 +238,7 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | `TargetNameHasReaders`, naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it (`DependentsBlockDrop`) | `DROP TRANSFORM` each reader named (paused first), or another name |
 | A target name ending in `__ledger`, or over 55 bytes: its ledger, `<target>__ledger`, must fit Postgres's 63 | `ReservedTargetSuffix`, `TargetNameTooLong` | [Text](#text) | Another name |
 | A target in this instance's catalog schema, or in a schema holding another instance's `trellis_instance` table, whose uninstall would drop it ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)) | `TargetInCatalogSchema` | [Resume only](#resume-only) | An ordinary schema; after define, `DROP TRANSFORM` and define it there |
+| Objects outside Trellis depend on a target when `DROP TRANSFORM` drops it or `ALTER TRANSFORM … DROP` drops a field: another table's foreign key into it, or a view over it or the column. Trellis never cascades; the statement rolls back whole and the definition is unchanged | `OutsideDependentsBlock`, naming the dependents Postgres reports | n/a | Drop or alter the dependents, then retry |
 
 ### Details
 
@@ -753,8 +754,10 @@ While a transform is `backfilling`, its target is partial
 ([status reference](status-reference.md#backfilling)).
 
 Indexes, grants, constraints, triggers, rules and foreign keys are yours to
-add, to a target define created or adopted; `DROP TRANSFORM` takes them with
-the table. What they do to Trellis's writes:
+add, to a target define created or adopted. `DROP TRANSFORM` drops the
+target's own indexes, grants, constraints and triggers with the table, and
+refuses while another table's foreign key into it, or a view over it, exists
+([refusal table](#refusals)). What they do to Trellis's writes:
 
 * A unique index, constraint or trigger that refuses a row Trellis writes
   fails that row's key like any value the target refuses: the key is held
