@@ -2356,6 +2356,63 @@ mod tests {
         );
     }
 
+    /// An update named on a middle's leaf may not move its row to another
+    /// leaf of the middle, attached or detached, as Postgres 17 refuses it
+    /// against a scratch database.
+    #[test]
+    fn an_update_named_on_a_middles_leaf_keeps_its_row_there() {
+        let program = program(
+            PartitionStrategy::List {
+                values: 3,
+                default: false,
+            },
+            &[],
+            vec![],
+        );
+        let t = &program.tables[0];
+        let ops = vec![
+            drop_leaf(t, "t0_p1"),
+            drop_leaf(t, "t0_p2"),
+            ddl(
+                t,
+                PartitionAction::CreateMiddle {
+                    middle: "t0_m1".into(),
+                    bound: "for values in (1, 2)".into(),
+                    leaves: vec![
+                        ("t0_m1_1".into(), "for values in (1)".into()),
+                        ("t0_m1_d".into(), "default".into()),
+                    ],
+                    rows: vec![row(t, 1, 1), row(t, 2, 2)],
+                    standalone: false,
+                },
+            ),
+            named("t0_m1_1", move_row(t, 1, 2)),
+            named("t0_m1_d", move_row(t, 2, 1)),
+            ddl(
+                t,
+                PartitionAction::Detach {
+                    leaf: "t0_m1".into(),
+                    concurrently: false,
+                },
+            ),
+            named("t0_m1_1", move_row(t, 1, 2)),
+            named("t0_m1", move_row(t, 1, 2)),
+        ];
+        assert_eq!(
+            outcomes(t, &ops),
+            vec![
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+                OpOutcome::Fails,
+                OpOutcome::Succeeds,
+            ]
+        );
+    }
+
     /// A partitioned `DEFAULT` holding a bound's rows in one of its own
     /// leaves refuses a new leaf for that bound, as a plain one does.
     #[test]

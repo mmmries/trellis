@@ -842,6 +842,23 @@ mod tests {
         };
         assert_eq!(sizes(without, 20), vec![10]);
         assert_eq!(sizes(without, 4), vec![4, 4, 2]);
+        // A new middle joins the tree like a new leaf.
+        let middle = vec![
+            ddl(PartitionAction::CreateMiddle {
+                middle: "t0_m1".into(),
+                bound: "for values in (1)".into(),
+                leaves: vec![("t0_m1_d".into(), "default".into())],
+                rows: Vec::new(),
+                standalone: false,
+            }),
+            ddl(PartitionAction::Detach {
+                leaf: "t0_m1".into(),
+                concurrently: false,
+            }),
+        ];
+        let program = partitioned(with_default, middle);
+        let sizes: Vec<usize> = bursts(&program, 20).iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![1, 1]);
     }
 
     /// Design doc §6: only `Ran` passes. Fast, no database —
