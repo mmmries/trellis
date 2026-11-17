@@ -366,15 +366,14 @@ each table to the `FROM` table.
 ### T0070 DeferredAggregate
 
 An aggregate Trellis doesn't keep exact yet: `MIN`/`MAX` in a `JOIN`,
-`bool_*`, `bit_*`, float or `interval` `SUM`/`AVG`, `array_agg`, `string_agg`,
-`jsonb_agg` ([not supported](type-support.md#aggregates-that-are-not-supported)).
-Take `MIN`/`MAX` in a plain aggregate over one table, and `SUM`/`AVG` over an
-integer or `numeric` column.
+`bool_*`, `bit_*`, `array_agg`, `string_agg`, `jsonb_agg`
+([not supported](type-support.md#aggregates-that-are-not-supported)).
+Take `MIN`/`MAX` in a plain aggregate over one table.
 
 ### T0071 UnsupportedAggregateArgument
 
-`SUM` or `AVG` over a type other than an integer or `numeric`. Aggregate an
-integer or `numeric` column.
+`SUM` or `AVG` over a type other than a number or an `interval`. Aggregate a
+number or `interval` column.
 
 ### T0072 UnsupportedExtremeArgument
 
