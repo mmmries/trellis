@@ -92,3 +92,19 @@ fn text_without_a_modifier_keeps_its_existing_reading() {
     let err = parse("TRANSFORM t FROM s SELECT ABS(DISTINCT x) AS y").unwrap_err();
     assert!(matches!(err, ParseError::ReservedWord { .. }), "{err:?}");
 }
+
+/// `FILTER` is not a reserved word: as a column or a field name it stays an
+/// identifier, as in Postgres. Only `FILTER (` right after a call's `)` is
+/// the clause.
+#[test]
+fn filter_as_a_name_is_an_identifier() {
+    for statement in [
+        "TRANSFORM t FROM s SELECT filter AS f",
+        "TRANSFORM t FROM s GROUP BY g SELECT g AS g, count(x) AS filter",
+        "TRANSFORM t FROM s GROUP BY g SELECT g AS g, count(filter) AS n",
+    ] {
+        if let Err(err) = parse(statement) {
+            panic!("{statement}: {err}");
+        }
+    }
+}
