@@ -11,16 +11,17 @@ defmodule Trellis.ReadOnlyTarget do
 
   @impl true
   def exception(opts) do
-    schema = Keyword.fetch!(opts, :schema)
+    schema = Keyword.get(opts, :schema)
     write = Keyword.fetch!(opts, :write)
 
     %__MODULE__{
       schema: schema,
       write: write,
       message:
-        "#{inspect(schema)} is a schema over a Trellis target, which only Trellis writes: " <>
-          "Repo.#{write} refused. Tests write it with " <>
-          "`config :trellis_pg, allow_target_writes: true` (config/test.exs)."
+        opts[:message] ||
+          "#{inspect(schema)} is a schema over a Trellis target, which only Trellis writes: " <>
+            "Repo.#{write} refused. Tests write it with " <>
+            "`config :trellis_pg, allow_target_writes: true` (config/test.exs)."
     }
   end
 end
