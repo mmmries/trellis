@@ -461,12 +461,76 @@ async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// After define: a `SUM`/`AVG` argument re-typed from `integer` to
+/// `double precision` (#1119) pauses its plain and `JOIN` aggregates, and
+/// the resume rebuilds them as exact float sums: the target columns become
+/// `double precision`, and the totals are Postgres's over the re-typed
+/// values, through later changes too.
+#[tokio::test]
+async fn a_source_retype_to_a_float_pauses_and_the_resume_rebuilds_exact_sums() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.src (id int primary key, g int, q int); \
+         create table public.o (id int primary key, g int); \
+         insert into public.src values (1, 1, 3), (2, 1, 4), (3, 2, -5); \
+         insert into public.o values (1, 1), (2, 2), (3, 2)",
+    )
+    .await
+    .expect("tables");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT g AS g, SUM(q) AS total, AVG(q) AS mean",
+        "TRANSFORM j FROM public.src JOIN public.o ON src.g = o.g GROUP BY src.g \
+         WITHOUT SOURCE INDEX SELECT src.g AS g, SUM(src.q) AS total, AVG(src.q) AS mean",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live(&mut raw, &db.pool, &["agg", "j"]).await;
+
+    raw.batch_execute("alter table public.src alter column q type double precision")
+        .await
+        .expect("retype q");
+    reconcile_pass(&mut raw, &db.pool).await;
+    for reader in ["agg", "j"] {
+        let reported = trellis.status(reader).await.expect("status").expect(reader);
+        assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
+        trellis
+            .apply(&format!("RESUME TRANSFORM {reader}"))
+            .await
+            .unwrap_or_else(|err| panic!("resume {reader}: {err}"));
+    }
+    raw.batch_execute("insert into public.src values (4, 1, 0.25), (5, 2, 1024.125), (6, 2, 0.5)")
+        .await
+        .expect("float values");
+    bring_live(&mut raw, &db.pool, &["agg", "j"]).await;
+    let joined = "(select src.g, src.q from public.src join public.o on src.g = o.g) as x";
+    for (reader, table) in [("agg", "public.src"), ("j", joined)] {
+        assert_eq!(
+            status(&raw, reader).await,
+            TransformStatus::Live,
+            "{reader}"
+        );
+        for column in ["total", "mean"] {
+            assert_eq!(
+                column_type(&raw, &format!("public.{reader}"), column).await,
+                "double precision",
+                "{reader}.{column}"
+            );
+        }
+        assert_sums_exact(&raw, reader, table, "q").await;
+    }
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// After define: a `SUM` argument re-typed from `integer`
-/// to `double precision` pauses its aggregate on the capture pass, and the
-/// resume refuses with define's family refusal until the column is
+/// to `text` pauses its aggregate on the capture pass, and the
+/// resume refuses with define's refusal until the column is
 /// an admitted type again.
 #[tokio::test]
-async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses() {
+async fn a_source_retype_to_text_pauses_its_sum_reader_and_the_resume_refuses() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -480,7 +544,7 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
         .expect("define agg");
     bring_live(&mut raw, &db.pool, &["agg"]).await;
 
-    raw.batch_execute("alter table public.src alter column q type double precision")
+    raw.batch_execute("alter table public.src alter column q type text")
         .await
         .expect("retype q");
     reconcile_pass(&mut raw, &db.pool).await;
@@ -489,7 +553,8 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
 
     match trellis.apply("RESUME TRANSFORM agg").await {
         Err(err) => assert!(
-            err.to_string().contains("float and interval SUM/AVG"),
+            err.to_string()
+                .contains("'SUM' expects a numeric value, found text"),
             "{err}"
         ),
         Ok(applied) => panic!("the resume should be refused: {applied:?}"),

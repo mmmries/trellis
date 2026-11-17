@@ -1417,7 +1417,7 @@ impl crate::error_code::Message for ValidationError {
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
                  the supported aggregates are COUNT(*), COUNT(col), SUM/AVG over \
-                 smallint, integer, bigint or numeric, and, in a GROUP BY without a \
+                 a number or an interval, and, in a GROUP BY without a \
                  JOIN, MIN/MAX of a number, date or time column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
             ),
@@ -1428,7 +1428,7 @@ impl crate::error_code::Message for ValidationError {
             } => write!(
                 f,
                 "{function}({column}) is over {pg_type}; SUM and AVG are supported over \
-                 smallint, integer, bigint and numeric only"
+                 numbers and intervals only"
             ),
             ValidationError::UnsupportedExtremeArgument {
                 function,
@@ -2387,10 +2387,19 @@ pub(crate) fn check_aggregate_admitted(
                         AggregateAdmissionRule::SumAvgNumeric
                     })
                 }
+                // Exact sums in a `numeric` argument's partials, each value
+                // converted exactly (`staging::group_basis::exact_sums`).
                 ValueType::Float(_) | ValueType::Other(PgType::Interval) => {
-                    Err(ValidationError::DeferredAggregate {
-                        function,
-                        family: "float and interval SUM/AVG",
+                    for layout in [
+                        super::floor::Layout::NumericSums,
+                        super::floor::Layout::FloatIntervalSums,
+                    ] {
+                        super::floor::record(super::floor::Feature::Layout(layout));
+                    }
+                    admitted(if matches!(arg.value_type, ValueType::Float(_)) {
+                        AggregateAdmissionRule::SumAvgFloat
+                    } else {
+                        AggregateAdmissionRule::SumAvgInterval
                     })
                 }
                 _ => Err(ValidationError::UnsupportedAggregateArgument {
@@ -7329,8 +7338,6 @@ mod tests {
             ("BOOL_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_AND(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_OR(items.qty)", "bool_and/bool_or/bit_and/bit_or"),
-            ("SUM(items.weight)", "float and interval SUM/AVG"),
-            ("AVG(items.weight)", "float and interval SUM/AVG"),
             ("ARRAY_AGG(items.sku)", "array_agg/string_agg/jsonb_agg"),
             (
                 "STRING_AGG(items.sku, ',')",
@@ -7602,8 +7609,6 @@ mod tests {
         for (call, family) in [
             ("BOOL_AND(qty > 1)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_OR(qty)", "bool_and/bool_or/bit_and/bit_or"),
-            ("SUM(weight)", "float and interval SUM/AVG"),
-            ("AVG(wait)", "float and interval SUM/AVG"),
             ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg"),
             ("STRING_AGG(note, ',')", "array_agg/string_agg/jsonb_agg"),
             // Inside a composed field too.
@@ -7660,9 +7665,9 @@ mod tests {
             }
         }
         // An argument that names a calculated field is typed as that field's
-        // expression: an integer one is admitted, a float one is refused by
-        // family. (This check doesn't look at `GROUP BY`; `validate` refuses
-        // a calculated field over an ungrouped column.)
+        // expression, an integer one and a float one alike. (This check
+        // doesn't look at `GROUP BY`; `validate` refuses a calculated field
+        // over an ungrouped column.)
         let grouped = |fields: &str| {
             let def = parse_text(&format!(
                 "TRANSFORM t FROM items GROUP BY sku, qty \
@@ -7671,23 +7676,45 @@ mod tests {
             .unwrap_or_else(|e| panic!("{fields}: {e}"));
             validate_aggregate_admitted(&def, &items)
         };
-        assert!(
-            matches!(
-                grouped("(weight + weight) AS w2, SUM(w2) AS s"),
-                Err(ValidationError::DeferredAggregate {
-                    family: "float and interval SUM/AVG",
-                    ..
-                })
-            ),
-            "a float calculated field's SUM"
-        );
         for fields in [
+            "(weight + weight) AS w2, SUM(w2) AS s",
             "(qty + 1) AS q, SUM(q) AS s",
             "(qty + qty) AS q, COUNT(*) AS n, AVG(q) AS a",
         ] {
             if let Err(err) = grouped(fields) {
                 panic!("{fields}: {err:?}");
             }
+        }
+    }
+
+    /// `SUM` and `AVG` over a float or an `interval` are admitted as exact
+    /// sums (#1119), on a `JOIN` and a plain aggregate, recording the
+    /// layout their partials need.
+    #[test]
+    fn sum_and_avg_over_a_float_or_an_interval_are_admitted() {
+        let (_, mut items) = tables();
+        items.insert(
+            "wait".into(),
+            jcol(ValueType::Other(PgType::Interval), "interval", 1186, -1),
+        );
+        for call in ["SUM(items.weight)", "AVG(items.weight)"] {
+            check(&format!("orders.region AS region, {call} AS v"))
+                .unwrap_or_else(|err| panic!("{call}: {err:?}"));
+        }
+        for call in ["SUM(weight)", "AVG(weight)", "SUM(wait)", "AVG(wait)"] {
+            let def = parse_text(&format!(
+                "TRANSFORM t FROM items GROUP BY sku SELECT sku AS sku, {call} AS v"
+            ))
+            .unwrap_or_else(|e| panic!("{call}: {e}"));
+            let (result, used) =
+                super::super::floor::collect(|| validate_aggregate_admitted(&def, &items));
+            result.unwrap_or_else(|err| panic!("{call}: {err:?}"));
+            assert!(
+                used.contains(&super::super::floor::Feature::Layout(
+                    super::super::floor::Layout::FloatIntervalSums
+                )),
+                "{call}: {used:?}"
+            );
         }
     }
 

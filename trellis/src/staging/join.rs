@@ -482,6 +482,7 @@ impl JoinTargetPlan {
                 summed: false,
                 numeric: false,
                 scale: None,
+                kind: group_basis::exact_sums::SumKind::Exact,
                 scale_read: false,
             })
             .collect();

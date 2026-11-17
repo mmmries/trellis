@@ -193,6 +193,13 @@ pub enum Layout {
     /// validator as it admits such an argument, since the key space alone
     /// doesn't tell.
     NumericSums,
+    /// [`Layout::NumericSums`]'s partials holding a `real`, `double
+    /// precision` or `interval` argument's exact sum, each value converted
+    /// exactly to one `numeric` (an `interval`'s fields packed into it), under
+    /// a reference scale of its own (`crate::staging::group_basis::exact_sums`):
+    /// a release without them refuses the definition. Recorded by the
+    /// validator as it admits such an argument.
+    FloatIntervalSums,
 }
 
 impl Layout {
@@ -360,6 +367,7 @@ impl Feature {
                 | Layout::Join
                 | Layout::JoinOneToOne
                 | Layout::NumericSums => BASELINE,
+                Layout::FloatIntervalSums => DEVELOPING,
             }),
             Feature::TypeRule(rule) => Some(rule.since()),
             Feature::Value(value) => value.since(),
