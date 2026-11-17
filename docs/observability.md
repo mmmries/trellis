@@ -175,8 +175,9 @@ below, and the histograms above, also carries the `trellis_instance` label
     drains. A table whose rows have all drained reads 0 for one read, then its
     series expires. The split shows which tables hold the backlog.
 
-* `definitions{status}`, `paused_definitions{cause}`, `held_keys`,
-  `quarantined_columns`, `drain_failures` and `capture_holdups{kind}` — what a
+* `definitions{status}`, `paused_definitions{cause}`,
+  `definitions_reading_paused_columns`, `held_keys`, `quarantined_columns`,
+  `drain_failures` and `capture_holdups{kind}` — what a
   definition's [status](status-reference.md) reports, in a form Prometheus can
   alert on. The staging worker reads them in the same 5 s housekeeping pass,
   from the catalog in one snapshot: the statuses `definitions()` reports, why

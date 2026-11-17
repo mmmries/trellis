@@ -7,9 +7,10 @@
 //! The pass reads the catalog and nothing else:
 //!
 //! - **Statuses** are [`crate::defs::catalog::reported_statuses_with_causes`],
-//!   the read `Trellis::definitions` makes, so a gauge and the API agree on a
-//!   `catching_up` definition and on which name a paused upstream column. One query over the definitions, plus a
-//!   definitions scan per paused column of a 1-1 target while there is one.
+//!   the read `Trellis::definitions` makes, so a gauge and the API agree on
+//!   which definitions report `catching_up` and which name a paused upstream
+//!   column. One query over the definitions, plus a definitions scan per
+//!   paused column of a 1-1 target while there is one.
 //! - **Why paused** is one query over the paused definitions: the `kind` of
 //!   the definition's `capture_failures` record, else a failing build chunk
 //!   (`backfill_failure`), else the operator, who leaves no record.
