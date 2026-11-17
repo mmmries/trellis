@@ -974,6 +974,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("below_catalog_floor", ruby.into_value(below_catalog_floor)),
             ("join", ruby.into_value(join)),
             ("floor", ruby.into_value(status.floor)),
+            ("filter", ruby.into_value(status.filter)),
         ],
     )
 }

@@ -55,8 +55,9 @@ DROP   TRANSFORM <transform>
 - `<expression>` is the [expression grammar](expressions.md); `<field>` names
   a target column.
 - `WHERE` takes a `boolean` [expression](expressions.md#where) over source
-  columns that can't raise an error. No key space applies one yet, so define
-  refuses any `WHERE` but `TRUE`
+  columns that can't raise an error. A plain aggregate applies one: its groups
+  count only the rows it is `TRUE` for. Every other key space refuses any
+  `WHERE` but `TRUE` for now
   ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)).
 - `ALTER TRANSFORM` edits the fields of a 1-1 transform of one table, and
   `<name>.<field>` pauses or resumes one field
@@ -232,7 +233,8 @@ quarantined once its held keys reach the fuse threshold. Nothing pauses.
 | `SUM` or `AVG` over anything but `smallint`, `integer`, `bigint` and `numeric`: a running float sum drifts from Postgres's | `DeferredAggregate` (`float and interval SUM/AVG`), `UnsupportedAggregateArgument` for another type | [Retype](#retype) | An integer or `numeric` column ([#1119](https://github.com/salesforce-misc/trellis/issues/1119)) |
 | `array_agg`, `string_agg` or `jsonb_agg` | `DeferredAggregate` | [Text](#text) | Not supported yet: [#1040](https://github.com/salesforce-misc/trellis/issues/1040) |
 | **Filters and chaining** | | | |
-| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every key space today ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | `FilterNotYetSupported` | [Text](#text) | None yet |
+| <a id="a-where-other-than-true"></a>A `WHERE` other than `TRUE` on a key space that doesn't apply one yet: every one but the plain aggregate ([#1991](https://github.com/salesforce-misc/trellis/issues/1991)). The predicate's own refusals are in [expressions](expressions.md#refusals) | `FilterNotYetSupported` | [Text](#text) | None yet |
+| `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an extreme is read from a source index, which holds the rows the `WHERE` drops too | `FilteredExtreme` | [Text](#text) | `MIN`/`MAX` over a stored generated column `CASE WHEN <predicate> THEN <column> END`, unfiltered |
 | A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | `TargetEqualsSource`, `TableCycle` | [Text](#text) | Another target |
 | Chaining off a transform that is not `live` | `TransformNotLive` | n/a | Wait for the upstream to go `live` |
 | **Target names** | | | |

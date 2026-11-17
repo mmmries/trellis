@@ -104,6 +104,10 @@ defmodule Trellis.Status do
   the application back to an earlier Trellis release, drop each transform
   whose floor is above that release, under the newer one.
 
+  `filter` is the transform's `WHERE`, as definition text, when it is other
+  than `TRUE`: the target holds only the source rows it is `TRUE` for. `nil`
+  for an unfiltered transform.
+
   Every process sees them, whichever one runs the staging worker.
   """
 
@@ -126,7 +130,8 @@ defmodule Trellis.Status do
           version_handover: Trellis.VersionHandover.t() | nil,
           below_catalog_floor: Trellis.BelowCatalogFloor.t() | nil,
           join: Trellis.JoinStatus.t() | nil,
-          floor: String.t()
+          floor: String.t(),
+          filter: String.t() | nil
         }
 
   @enforce_keys [
@@ -144,7 +149,8 @@ defmodule Trellis.Status do
     :version_handover,
     :below_catalog_floor,
     :join,
-    :floor
+    :floor,
+    :filter
   ]
   defstruct @enforce_keys
 
@@ -164,7 +170,8 @@ defmodule Trellis.Status do
         version_handover: version_handover,
         below_catalog_floor: below_catalog_floor,
         join: join,
-        floor: floor
+        floor: floor,
+        filter: filter
       }) do
     %__MODULE__{
       status: status,
@@ -182,7 +189,8 @@ defmodule Trellis.Status do
       below_catalog_floor:
         below_catalog_floor && Trellis.BelowCatalogFloor.from_native(below_catalog_floor),
       join: join && Trellis.JoinStatus.from_native(join),
-      floor: floor
+      floor: floor,
+      filter: filter
     }
   end
 end

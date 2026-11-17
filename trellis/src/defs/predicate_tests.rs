@@ -213,25 +213,18 @@ fn a_predicate_that_can_raise_is_refused_by_name() {
 }
 
 /// Until each key space's step lands (#1991), define refuses its filter by
-/// name, after the predicate's own checks.
+/// name, after the predicate's own checks. A plain aggregate applies one.
 #[test]
 fn every_key_space_refuses_a_filter_until_its_step_lands() {
-    for (text, key_space) in [
-        ("TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0", "1-1"),
-        (
-            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n WHERE qty > 0",
-            "GROUP BY",
-        ),
-    ] {
-        assert_eq!(
-            validated(text),
-            Err(ValidationError::FilterNotYetSupported { key_space }),
-            "{text}"
-        );
-    }
+    assert_eq!(
+        validated("TRANSFORM t FROM s SELECT qty AS q WHERE qty > 0"),
+        Err(ValidationError::FilterNotYetSupported { key_space: "1-1" }),
+    );
     for text in [
         "TRANSFORM t FROM s SELECT qty AS q",
         "TRANSFORM t FROM s SELECT qty AS q WHERE TRUE",
+        "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n, SUM(qty) AS total, \
+         AVG(amount) AS av WHERE qty > 0",
     ] {
         assert_eq!(validated(text), Ok(()), "{text}");
     }
@@ -256,6 +249,41 @@ fn every_key_space_refuses_a_filter_until_its_step_lands() {
             Err(ValidationError::FilterNotYetSupported { key_space }),
             "{text}"
         );
+    }
+}
+
+/// A plain aggregate's `MIN`/`MAX` is refused under any `WHERE` other than
+/// `TRUE`, `WHERE (TRUE)` included, naming the field; unfiltered, it stays
+/// admitted.
+#[test]
+fn a_filtered_aggregate_refuses_min_and_max() {
+    for (text, field, function) in [
+        (
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, MIN(qty) AS lo WHERE qty > 0",
+            "lo",
+            "MIN",
+        ),
+        (
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n, \
+             max(amount) + 1 AS hi WHERE (TRUE)",
+            "hi",
+            "MAX",
+        ),
+    ] {
+        assert_eq!(
+            validated(text),
+            Err(ValidationError::FilteredExtreme {
+                field: field.to_string(),
+                function: function.to_string(),
+            }),
+            "{text}"
+        );
+    }
+    for text in [
+        "TRANSFORM t FROM s GROUP BY g SELECT g AS g, MIN(qty) AS lo",
+        "TRANSFORM t FROM s GROUP BY g SELECT g AS g, MIN(qty) AS lo WHERE TRUE",
+    ] {
+        assert_eq!(validated(text), Ok(()), "{text}");
     }
 }
 

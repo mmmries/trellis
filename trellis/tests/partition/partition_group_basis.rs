@@ -93,6 +93,8 @@ fn int8() -> ValueType {
 
 struct Fx {
     d: Driver,
+    /// The oracle's `WHERE` (` where …`, or empty): the definition's.
+    filter: &'static str,
 }
 
 impl Fx {
@@ -103,6 +105,17 @@ impl Fx {
     }
 
     async fn start_with(schema: &str, seed: &str, definitions: &[&str]) -> Fx {
+        Self::start_filtered(schema, seed, definitions, "").await
+    }
+
+    /// [`Self::start_with`] for definitions whose `WHERE` is `filter`, as
+    /// the oracle's ` where …`.
+    async fn start_filtered(
+        schema: &str,
+        seed: &str,
+        definitions: &[&str],
+        filter: &'static str,
+    ) -> Fx {
         let d = Driver::start(
             schema,
             &[("id", int4()), ("g", int4()), ("v", int4())],
@@ -110,7 +123,7 @@ impl Fx {
             &[SOURCE],
         )
         .await;
-        let mut fx = Fx { d };
+        let mut fx = Fx { d, filter };
         let hidden: i64 = fx
             .d
             .ctl
@@ -163,9 +176,9 @@ impl Fx {
     /// as `group: have vs want`.
     async fn wrong_groups(&self) -> Vec<String> {
         self.d
-            .rows(
+            .rows(&format!(
                 "with want as (select g, sum(v) as total, count(*) as n \
-                               from public.items group by g), \
+                               from public.items{} group by g), \
                       have as (select g, total, n from public.agg) \
                  select coalesce(w.g, h.g)::text || ': ' || coalesce(h.total::text, '-') \
                         || '/' || coalesce(h.n::text, '-') || ' vs ' \
@@ -173,7 +186,8 @@ impl Fx {
                  from want w full join have h on h.g = w.g \
                  where w.total is distinct from h.total or w.n is distinct from h.n \
                  order by coalesce(w.g, h.g)",
-            )
+                self.filter
+            ))
             .await
     }
 
@@ -350,6 +364,49 @@ async fn a_dropped_or_detached_leaf_with_undrained_changes_is_recomputed() {
                 fx.d.settle().await;
                 fx.assert_right(&what).await;
             }
+        }
+    }
+}
+
+/// A filtered aggregate (#1991): the correction of a dropped, detached or
+/// truncated leaf recomputes its groups from member rows only, with
+/// undrained changes crossing the predicate both ways in the leaf, which
+/// the predicate's column (`v`) decides and the group column doesn't.
+#[tokio::test]
+async fn a_filtered_aggregates_leaf_correction_counts_member_rows_only() {
+    const FILTERED: &str = "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT SUM(v) AS total, COUNT(*) AS n WHERE v % 3 <> 0";
+    for op in [
+        "drop table public.items_p1",
+        "alter table public.items detach partition public.items_p1",
+        "truncate public.items_p1",
+        // A leaf attached with rows, half of them failing: only the
+        // correction reads them.
+        "create table public.items_new (id integer not null, g integer not null, \
+             v integer not null, primary key (g, id)); \
+         insert into public.items_new select 1000 + i, 16 + i % 2, i from generate_series(1, 12) i; \
+         alter table public.items attach partition public.items_new for values in (16, 17)",
+    ] {
+        let mut fx =
+            Fx::start_filtered(&tree("list"), SEED, &[FILTERED], " where v % 3 <> 0").await;
+        // Undrained: rows crossing in and out in the leaf and beside it.
+        fx.exec(
+            "update public.items set v = v + 1 where g in (4, 5, 9) and id % 4 = 0; \
+             insert into public.items values (500, 5, 7), (501, 5, 9), (502, 10, 3); \
+             delete from public.items_p1 where id % 7 = 0;",
+        )
+        .await;
+        fx.exec(op).await;
+        fx.correct().await;
+        fx.assert_right(op).await;
+        assert!(fx.queue().await.is_empty(), "{op}");
+        if op.contains("attach") {
+            assert_eq!(
+                fx.d.rows("select g, n from public.agg where g >= 16 order by g")
+                    .await,
+                ["(16,4)", "(17,4)"],
+                "the attached leaf's member rows"
+            );
         }
     }
 }
@@ -2504,7 +2561,7 @@ async fn groups_with_a_null_part_read_through_the_root_are_exact() {
         &[SOURCE],
     )
     .await;
-    let mut fx = Fx { d };
+    let mut fx = Fx { d, filter: "" };
     fx.pass().await;
     fx.exec(
         "insert into public.items select i, i % 16, nullif(i % 3, 0), i \
@@ -2802,7 +2859,7 @@ async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {
         &[SOURCE],
     )
     .await;
-    let mut fx = Fx { d };
+    let mut fx = Fx { d, filter: "" };
     fx.pass().await;
     fx.exec(
         "insert into public.items select i, i % 16, 'L' || (i % 16), i \

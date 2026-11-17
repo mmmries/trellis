@@ -504,6 +504,7 @@ impl JoinTargetPlan {
             args: all_args,
             aggs: Vec::new(),
             fields: Vec::new(),
+            predicate: None,
         };
         let type_of = |arg: &Expr| {
             let side = side_of(arg)?;
@@ -572,6 +573,7 @@ impl JoinTargetPlan {
                             args,
                             aggs: Vec::new(),
                             fields: Vec::new(),
+                            predicate: None,
                         },
                         Writer::JoinPartials {
                             deltas: deltas.clone(),
