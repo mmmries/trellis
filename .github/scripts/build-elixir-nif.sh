@@ -10,8 +10,8 @@
 #
 # Linux targets build with cargo-zigbuild, which links against the glibc
 # version named below rather than the build machine's, so the library loads
-# on older distributions than the runner's; the workflow cross-builds all
-# three Linux targets from one x86_64 runner this way. It needs
+# on older distributions than the runner's; the workflow cross-builds every
+# Linux target from one x86_64 runner this way. It needs
 # `cargo-zigbuild` and `zig` on PATH (or zig through `python3 -m ziglang`).
 # Apple targets build with plain Cargo on macOS, which links either
 # architecture.
