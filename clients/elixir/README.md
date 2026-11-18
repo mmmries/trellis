@@ -49,6 +49,8 @@ path pulls in an OpenTelemetry or gRPC stack. The engine's log lines reach
 
 The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a bang variant.
 
+Connect directly or through a session-mode pooler, never a transaction-mode one ([recommendations](../../docs/recommendations.md#connect-directly-or-through-a-session-mode-pooler)).
+
 - `connect/1`, `migrate/1`, `config/1`, `shutdown/1`: the handle's lifecycle.
 - `apply/2`: any statement of Trellis's grammar (`TRANSFORM`,
   `PAUSE TRANSFORM`, `RESUME TRANSFORM`, `DROP TRANSFORM`,
