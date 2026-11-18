@@ -714,3 +714,63 @@ async fn a_transient_failure_at_commit_is_retried() {
     assert_eq!(charged(&it.admin).await, 0);
     it.trellis.shutdown().await.expect("shutdown");
 }
+
+/// A full disk under a target (`53100`, `disk_full`) is the server's
+/// condition, not a record's (#2131): no key is charged, no fuse trips, and
+/// the page commits once the space is back. A deferred constraint trigger on
+/// `c_copy` raises `53100` while a gate row says the disk is full, so every
+/// attempt of the drain fails until the gate opens.
+#[tokio::test]
+async fn a_full_disk_charges_no_key_and_the_page_commits_once_it_clears() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &READERS[2..]).await;
+    it.admin
+        .batch_execute(
+            "create table public.disk_gate (full_ boolean); \
+             insert into public.disk_gate values (true); \
+             grant select on public.disk_gate to holdup_trellis; \
+             create function public.fail_while_full() returns trigger \
+               language plpgsql as $$ \
+               begin \
+                 if (select full_ from public.disk_gate) then \
+                   raise exception 'could not extend file: No space left on device' \
+                     using errcode = '53100'; \
+                 end if; \
+                 return null; \
+               end $$; \
+             create constraint trigger c_copy_fail_while_full \
+               after insert or update or delete on public.c_copy \
+               deferrable initially deferred \
+               for each row execute function public.fail_while_full(); \
+             update public.c set amount = 100 where id = 1",
+        )
+        .await
+        .expect("a trigger standing in for a full disk");
+    let seg = seal(&mut it.raw).await;
+
+    for _ in 0..2 {
+        let err = drain(&it.pool, seg)
+            .await
+            .expect_err("every attempt hits the full disk");
+        assert!(err.contains("No space left on device"), "{err}");
+        assert_eq!(charged(&it.admin).await, 0, "no key is charged or held");
+        assert_eq!(
+            status(&it, "c_copy").await.status,
+            TransformStatus::Live,
+            "the fuse did not trip"
+        );
+    }
+
+    it.admin
+        .batch_execute("update public.disk_gate set full_ = false")
+        .await
+        .expect("free the space");
+    drain(&it.pool, seg)
+        .await
+        .expect("the page commits once the disk has room");
+    assert_eq!(copied_amount(&it.admin, 1).await, 100);
+    assert!(holdups(&it.admin).await.is_empty());
+    assert_eq!(charged(&it.admin).await, 0);
+    assert_eq!(status(&it, "c_copy").await.status, TransformStatus::Live);
+    it.trellis.shutdown().await.expect("shutdown");
+}

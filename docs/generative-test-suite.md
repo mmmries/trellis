@@ -778,9 +778,9 @@ concurrency.
   exact sum rounded once, so the bits agree.
 - **An aggregate's `interval` by value**, as Postgres's `=` compares it (a month
   is 30 days, a day 24 hours): `26:00:00 ≡ 1 day 02:00:00`. An aggregate holds an
-  equal value (ADR-0020), and `MIN`/`MAX` keep one of a tie's spellings. A 1-1
-  field's `interval` stays exact text, and a `SUM`/`AVG` compares field by
-  field (`1 mon` is not `30 days`).
+  equal value (ADR-0020): `MIN`/`MAX` keep one of a tie's spellings, and a
+  `SUM`/`AVG` moving to an equal value (`30 days` to `1 mon`) keeps its old
+  one. A 1-1 field's `interval` stays exact text.
 - **A column present on one side and absent on the other is a divergence,** not a
   missing-key skip — this is how an unwritten derived cell surfaces.
 
