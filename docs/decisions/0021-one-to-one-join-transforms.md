@@ -121,16 +121,16 @@ below holds for them as it does for a captured side.
 ### Each table keeps a Trellis-owned copy, ordered by ADR-0002's 1-1 ledger
 
 - **`R`**, one entry per `a` row: the 1-1 ledger's ordering state, plus the
-  row's join key at every position and the `a` columns the fields read. It is
-  filled from captured images and has one index per position, on that
+  row's join key at every position and the `a` columns the fields and the
+  `WHERE` read. It is filled from captured images and has one index per position, on that
   position's join key and then the entry key, which is how a `b` change finds
   its rows and its chunks walk them. It is about the size of `a`, plus one
   key index per position. With a `WHERE`, `R` still holds every `a` row:
   membership is decided when a row is recomputed, not by which entries exist.
 - **`M`**, one per position, one entry per `b` row, keyed by `b`'s primary key
   and indexed on the join key: the ledger's ordering state plus the `b`
-  columns the fields read. It is about the size of `b`. Keyed by `b`'s
-  primary key rather than by join key, it applies a key's hand-off from one
+  columns the fields and the `WHERE` read. It is about the size of `b`. Keyed
+  by `b`'s primary key rather than by join key, it applies a key's hand-off from one
   `b` row to another in either order. For the moment the two are applied out
   of order, a key can hold two live entries, and a read takes the newest.
 - **`J`**, one shared lock table with one row per `(position, key)`, and the
@@ -558,7 +558,7 @@ transform with a `capture_failure` naming the table and the column when:
 - a key column of any table (`a`'s primary key, an `ON` column) is
   retyped so the keys Trellis stored render differently, or one column of an
   `ON` pair is retyped so the pair no longer has one type;
-- a column is retyped to a type the fields evaluate as another type
+- a column is retyped to a type the fields or the `WHERE` evaluate as another type
   (`text` to `integer`);
 - a column Trellis keeps a typed copy of widens past the copy
   ([ADR-0020](0020-type-identity.md)). The copies are the target's key (`a`'s

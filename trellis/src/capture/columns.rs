@@ -11,16 +11,16 @@
 //! 2. **Columns `T`'s own definitions read.** For every definition whose
 //!    source is `T`, in any status (a `JOIN` reads both of its tables, and
 //!    from each its join key, its `GROUP BY` columns and every column its
-//!    fields read there):
+//!    fields and its `WHERE` read there):
 //!    - every source column its fields reference
 //!      ([`crate::defs::oracle::referenced_source_columns`]: a self-named
 //!      passthrough reads its own column, a reference to another calculated
 //!      field doesn't);
-//!    - its plain `GROUP BY` columns.
+//!    - its plain `GROUP BY` columns;
+//!    - every column its `WHERE` reads, which decides membership.
 //!
 //!    Aggregate apply evaluates every field over both images, and a missing
 //!    `GROUP BY` value would silently put the row in the `NULL` group.
-//!    `WHERE` accepts only `TRUE` today, so no filter reads a column.
 //!
 //! A chained definition's source is another definition's target. That table
 //! isn't captured by triggers in C (the target-mutation seam feeds it), so
