@@ -89,15 +89,15 @@ under [Details](#details) where it needs more room.
 
 A condition define refuses can still arise later, through DDL on a table the
 definition reads. Each refusal's [errors](errors.md) entry names what Trellis
-does then, one of the classes below, or that the condition matters only at
-define (a name taken, an upstream not yet `live`). A paused definition
+does then, one of the classes below, or that the condition matters only when the
+statement runs (a name taken, an upstream not yet `live`). A paused definition
 keeps its last values, with the reason in
 [`capture_failure`](status-reference.md#capture_failure); every `RESUME` first
 runs define's validation and refuses with define's error while it would
 ([ADR-0027](decisions/0027-operating-principles.md), rule 4). Each reason's
-repair is in [operations — Paused definitions](operations.md#paused-definitions),
-and other ways a source can drift are in
-[known correctness gaps](known-correctness-gaps.md).
+repair is in [operations — Paused
+definitions](operations.md#paused-definitions), and other ways a source can
+drift are in [known correctness gaps](known-correctness-gaps.md).
 
 #### Text
 

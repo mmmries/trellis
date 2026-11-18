@@ -185,8 +185,9 @@ After define: [Text](transforms.md#text).
 
 ### T0030 ExpressionTooDeep
 
-An expression nested more than 100 levels deep. Split it into calculated fields.
-After define: [Text](transforms.md#text).
+An expression nested more than 100 levels deep: operands chained by operators,
+or nested parentheses or calls (a flat list of many terms is not deep). Split
+it into calculated fields. After define: [Text](transforms.md#text).
 
 ### T0031 MalformedDefinitionAddress
 
@@ -218,12 +219,11 @@ unquoted. After define: [Text](transforms.md#text).
 
 ### T0036 NameTooLong
 
-A name over Postgres's 63 bytes, which Postgres would truncate. Shorten it. A
-stored definition with such a name keeps running, but its `ALTER TRANSFORM`
-refuses: drop it and define it again with a shorter name. After define:
-[Text](transforms.md#text). A definition 0.1.x stored with a longer `AS` label
-keeps running, its `ALTER TRANSFORM` refuses, and the upgrade that writes a `KEY
-(…)` into it pauses it.
+A name over Postgres's 63 bytes after folding and unescaping, which Postgres
+would truncate. Shorten it. After define: [Text](transforms.md#text). A
+definition 0.1.x stored with a longer `AS` label keeps running, but its `ALTER
+TRANSFORM` refuses and the upgrade that writes a `KEY (…)` into it pauses it:
+drop it and define it again with a shorter name.
 
 ### T0037 ReservedTableName
 
@@ -279,9 +279,10 @@ column, or join a 1-1 target that renames it. After define:
 
 ### T0043 FieldNamedAfterPrimaryKey
 
-A 1-1 field named after a source key column (`id AS id`): the target carries
-every key column already. Drop the field, or give it another name (`id AS
-order_id`). After define: [Text](transforms.md#text).
+A 1-1 field named after a source key column, or a 1-1 `JOIN`'s after an `a` key
+column (`id AS id`): the target carries every key column already. Drop the
+field, or give it another name (`id AS order_id`). After define:
+[Text](transforms.md#text).
 
 ### T0044 UnresolvedColumn
 
@@ -355,8 +356,7 @@ An `ON` term repeating an earlier one. Remove it. After define:
 ### T0058 JoinOnRepeatedColumn
 
 A column in two `ON` terms, paired with different columns. Name each column
-once. After define: [Key](transforms.md#key), [Retype](transforms.md#retype) or
-[Shape](transforms.md#shape), by what changed.
+once. After define: [Text](transforms.md#text).
 
 ### T0059 IndexKeyTooWide
 
@@ -381,16 +381,14 @@ collations pauses nothing, but `RESUME` refuses until they match.
 
 An `ON` column of a type off the [join-key list](type-support.md#matrix). Join
 on a listed type; after define, retype the column, then `RESUME`. After define:
-[Retype](transforms.md#retype); a change between deterministic collations pauses
-nothing, but `RESUME` refuses until they match.
+[Retype](transforms.md#retype).
 
 ### T0063 JoinNondeterministicCollation
 
 An `ON` column with a nondeterministic collation, whose `=` Trellis can't
 reproduce. Use a deterministic collation
 ([collation](type-support.md#collation)). After define:
-[Retype](transforms.md#retype). A change between deterministic collations pauses
-nothing, but `RESUME` refuses until they match.
+[Retype](transforms.md#retype).
 
 ### T0064 JoinFieldShape
 
@@ -401,8 +399,7 @@ admitted shape. After define: [Text](transforms.md#text).
 ### T0065 OneToOneJoinAggregate
 
 An aggregate in a 1-1 `JOIN`. Add a `GROUP BY`, or aggregate in a separate
-transform. After define: [Key](transforms.md#key),
-[Retype](transforms.md#retype) or [Shape](transforms.md#shape), by what changed.
+transform. After define: [Text](transforms.md#text).
 
 ### T0066 OneToOneJoinKeyNotUnique
 
@@ -421,16 +418,12 @@ A construct a 1-1 `JOIN` doesn't take; the message names the fix. After define:
 
 A 1-1 `JOIN` of more than 5 tables
 ([star](transforms.md#1-1-join-of-more-than-two-tables-star)). Join at most 5,
-or chain transforms. After define: as for a 1-1 `JOIN` at each position:
-[Key](transforms.md#key), [Retype](transforms.md#retype) or
-[Shape](transforms.md#shape).
+or chain transforms. After define: [Text](transforms.md#text).
 
 ### T0069 JoinOnReadsAnotherJoinedTable
 
 An `ON` reading another joined table: each joins to the `FROM` table. Join each
-table to the `FROM` table. After define: as for a 1-1 `JOIN` at each position:
-[Key](transforms.md#key), [Retype](transforms.md#retype) or
-[Shape](transforms.md#shape).
+table to the `FROM` table. After define: [Text](transforms.md#text).
 
 ### T0070 DeferredAggregate
 
@@ -605,8 +598,7 @@ message names, with `CAST` if needed. After define:
 ### T0096 NonLiteralRegexPattern
 
 A `REGEXP_COUNT` pattern that isn't a string literal. Write the pattern as a
-literal. After define: [Text](transforms.md#text); a Postgres upgrade that
-changes the verdict is [Per row](transforms.md#per-row).
+literal. After define: [Text](transforms.md#text).
 
 ### T0097 InvalidTypedLiteral
 
@@ -623,9 +615,7 @@ A `GROUP BY` column the source doesn't have. Fix the name.
 
 A `GROUP BY` key of a type that can't be a key
 ([matrix](type-support.md#matrix)). Group by a column of a key type; after
-define, retype it, then `RESUME`. After define: [Retype](transforms.md#retype);
-a change between deterministic collations pauses nothing, but `RESUME` refuses
-until they match.
+define, retype it, then `RESUME`. After define: [Retype](transforms.md#retype).
 
 ### T0101 GroupByKeysShareTargetColumn
 
@@ -665,28 +655,26 @@ SUM(id) AS id`). Rename the field. After define: [Text](transforms.md#text).
 ### T0107 CalculatedFieldShadowsSourceColumn
 
 A 1-1 field named after a source column it doesn't pass through. Rename the
-field. After define, a source column added under a field's name refuses
-`RESUME` until one of them is renamed.
-
-After define: [Resume only](transforms.md#resume-only): a source column added
-under a field's name.
+field. After define: [Resume only](transforms.md#resume-only): a source column
+added under a field's name, until one of them is renamed.
 
 ### T0108 NondeterministicKeyCollation
 
 A key column with a nondeterministic collation, whose `=` treats distinct
 strings as equal. Use a deterministic collation
-([collation](type-support.md#collation)). After define: on a key,
-[Retype](transforms.md#retype); on a column only compared, nothing detects it
-([known correctness
-gaps](known-correctness-gaps.md#a-read-column-given-a-nondeterministic-collation)).
+([collation](type-support.md#collation)). After define:
+[Retype](transforms.md#retype).
 
 ### T0109 NondeterministicCollationTextFunction
 
 A column with a nondeterministic collation passed to `STRPOS` or
-`REGEXP_COUNT`, which Postgres refuses for every row. Use a deterministic
-collation, or a column with one.
-After define: on a column only a text function reads, [Per
-row](transforms.md#per-row).
+`REGEXP_COUNT`, which Postgres refuses for every row, or compared as text (`=`,
+`<>`, `!=`, `IS [NOT] DISTINCT FROM`, `NULLIF`), where its `=` would treat
+distinct strings as equal; directly or through `COALESCE`, a `CASE` result or a
+field. Use a deterministic collation, or a column with one. After define: under
+`STRPOS` or `REGEXP_COUNT`, [Per row](transforms.md#per-row); on a column only
+compared, nothing detects it ([known correctness
+gaps](known-correctness-gaps.md#a-read-column-given-a-nondeterministic-collation)).
 
 ### T0110 QualifiedSourceTableNotFound
 
@@ -862,12 +850,12 @@ the name, qualify it, or create the table.
 
 ### T0127 InvalidRegexPattern
 
-A `REGEXP_COUNT` pattern Postgres rejects; the message carries the server's
-reason. Write a pattern Postgres's `regexp_count` accepts. After an upgrade of
-Postgres that changes the verdict, each row fails and is
-[held](operations.md#releasing-held-keys). After define:
-[Text](transforms.md#text); a Postgres upgrade that changes the verdict is [Per
-row](transforms.md#per-row).
+A `REGEXP_COUNT` pattern Postgres rejects (`(?P<n>a)`, `a++`, `\pL`); define,
+`ALTER TRANSFORM` and `RESUME` probe it with `regexp_count('', pattern)`, and
+the message carries the server's reason. Back-references, lookahead and
+`\m`/`\M` are admitted. Write a pattern Postgres's `regexp_count` accepts.
+After define: [Text](transforms.md#text); a Postgres upgrade that changes the
+verdict is [Per row](transforms.md#per-row).
 
 ### T0128 TableNotAccessible
 
@@ -952,7 +940,7 @@ After define: [Resume only](transforms.md#resume-only).
 ### T0140 TargetTableSuffixCollision
 
 Two of an instance's targets with one bare name in two schemas. Choose another
-name. After define: nothing, as the condition matters only at define.
+name. After define: matters only when the statement runs.
 
 ### T0141 TargetTableExists
 
@@ -960,16 +948,17 @@ A relation already holds the target's name, or its ledger's
 ([details](transforms.md#a-target-whose-name-is-taken)). Choose another name,
 give the instance its own target schema ([instance
 identity](instance-identity.md)), drop or rename the relation, or build into it
-with `ADOPT EXISTING TABLE`. After define: nothing, as the condition matters
-only at define.
+with `ADOPT EXISTING TABLE`. After define: matters only when the statement
+runs.
 
 ### T0142 TargetNameHasReaders
 
-Other definitions read a table of the target's name as a source, or did before
-it was dropped or renamed: they would read the new target. `DROP TRANSFORM` each
-reader named (paused first), or choose another name. After define: Nothing, as
-the condition matters only at define. Later, a new reader of the name is a
-chain, and the target can't be dropped while one reads it ([T0153
+Other definitions read a table of the target's name as a source (including the
+table `ADOPT EXISTING TABLE` would adopt), or did before it was dropped or
+renamed: they would read the new target. `DROP TRANSFORM` each reader named
+(paused first), or choose another name. After define: matters only when the
+statement runs; later, a new reader of the name is a chain, and the target can't
+be dropped while one reads it ([T0153
 DependentsBlockDrop](errors.md#t0153-dependentsblockdrop)).
 
 ### T0143 TargetNotAdoptable
@@ -1006,7 +995,7 @@ time):
 | `owned_sequence` | has a sequence owned by one of its columns | `ALTER SEQUENCE … OWNED BY NONE`, or drop it |
 | `unrecognized` | has a constraint or dependent object the check doesn't know, so a new Postgres feature refuses until Trellis learns it | Drop the object the message names |
 
-After define: nothing, as the condition matters only at define.
+After define: matters only when the statement runs.
 
 ### T0144 SourceNotChangeKeyed
 
@@ -1019,13 +1008,18 @@ child created `INHERITS` it, or a drop and recreate as one).
 
 ### T0145 PartitionedSource
 
-A partitioned source the definition can't read as written
-([partitioned sources](transforms.md#partitioned-sources)); the message names
-the column or limit. Add the partition-key column to the `GROUP BY` or join on
-it; partition by a plain listed column; merge partitions to 1,000 or fewer
-leaves, or upgrade to PostgreSQL 15 or later; for a 1-1 transform, aggregate
-over it or use a plain table. After a change, detach the sub-level, then
-`RESUME`.
+A partitioned source the definition can't read as written ([partitioned
+sources](transforms.md#partitioned-sources)): a group key that omits a
+partition-key column at some level; a key level that is an expression, or whose
+column has a type other than `smallint`, `integer`, `bigint`, `numeric`, `text`,
+`varchar`, `uuid`, `date`, `timestamp`, `timestamptz` or `boolean`, a
+non-default operator class or a nondeterministic collation; more than 1,000
+leaves, or PostgreSQL before 15; or the `FROM` of a 1-1 transform. The message
+names the column or limit. Add the partition-key column to the `GROUP BY` or
+join on it; partition by a plain listed column; merge partitions to 1,000 or
+fewer leaves, or upgrade to PostgreSQL 15 or later; for a 1-1 transform,
+aggregate over it or use a plain table. After a change, detach the sub-level,
+then `RESUME`.
 
 After define: [Shape](transforms.md#shape) for a sub-level added later or a
 table attached into the tree; the source dropped and created again partitioned
@@ -1040,9 +1034,11 @@ then `RESUME`. After define: [Shape](transforms.md#shape).
 
 ### T0147 Subscribed
 
-A logical-replication subscription replicates into a source, and capture never
-sees its changes. Remove the table from the publication and `ALTER SUBSCRIPTION
-… REFRESH PUBLICATION`, or drop the subscription; then `RESUME`. After define:
+A logical-replication subscription in the same database replicates into a
+source, in any sync state or disabled: its apply worker fires only row-level
+triggers, so capture never sees its changes. Publishing a table is fine. Remove
+the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`,
+or drop the subscription; then `RESUME`. After define:
 [Shape](transforms.md#shape).
 
 ## Statements on a transform
@@ -1085,7 +1081,7 @@ names first.
 
 An `ALTER TRANSFORM` of a transform that isn't `live`, or a define chaining off
 one whose build hasn't finished. Retry once it is `live`; `RESUME` a paused one
-first. After define: nothing, as the condition matters only at define.
+first. After define: matters only when the statement runs.
 
 ### T0155 AlterFieldNotFound
 
@@ -1172,8 +1168,7 @@ into it, or a view over it or over the field's column. `DROP TRANSFORM`,
 while they exist: Trellis never drops what it doesn't own, and never cascades.
 The message names the dependents. Drop or alter them (`DROP VIEW …`,
 `ALTER TABLE … DROP CONSTRAINT …`), then retry; the failed statement changed
-nothing.
-After define: nothing, as the condition matters only at define.
+nothing. After define: matters only when the statement runs.
 
 ## Builds and drains
 

@@ -86,6 +86,13 @@ fn every_code_has_one_errors_md_heading() {
             None => {}
         }
     }
+    for line in ERRORS.lines() {
+        if line.starts_with("### ") && !line.starts_with("### T") {
+            failures.push(format!(
+                "docs/errors.md has `{line}`: every `###` heading is `### Tnnnn Name`"
+            ));
+        }
+    }
     for (code, _) in &headings {
         if !codes.iter().any(|c| c.code == *code) {
             failures.push(format!(
