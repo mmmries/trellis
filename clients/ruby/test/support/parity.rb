@@ -89,6 +89,7 @@ module Parity
     "Trellis::Railtie.off_in?" => "whether config.trellis.off_in names an environment",
     "Trellis::Railtie.off_message" => "the sentence a refusal or warning gives for an off environment",
     "Trellis::Railtie.release_check" => "Trellis::ReleaseCheck over the app's lockfile and migrations: git and files, no engine call",
+    "Trellis::Railtie.working_on" => "records the database a Rails task is migrating, loading or dumping, for with_handle",
     "Trellis::Railtie.with_handle" => "a handle of its own from config.trellis.connect (or a named instance), around a block",
     "Trellis::Migration.with_handle" => "Trellis::Railtie.with_handle, raising a migration's error"
   }.freeze

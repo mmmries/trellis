@@ -143,8 +143,8 @@ class TestSupportTest < Minitest::Test
     with_instance { assert_equal [], klass.new.run_it }
   end
 
-  # Where Trellis is off, a schema load leaves the definitions in the
-  # restore queue and the targets as plain tables. The helper fills a target
+  # A schema load not followed by a restore (`psql -f structure.sql`) leaves
+  # the definitions in the restore queue. The helper fills a target
   # from the test's own uncommitted rows, and a chained one refreshes its
   # upstream first; the test's rollback takes it all back.
   def test_refresh_trellis_target_fills_a_target_from_uncommitted_rows_and_rolls_back
@@ -181,7 +181,7 @@ class TestSupportTest < Minitest::Test
       Trellis.stub(:enabled?, false) do
         error = assert_raises(Trellis::NotFoundError) { Trellis::TestSupport.refresh_trellis_target(:rf_nowhere) }
         assert_includes error.message, "rf_nowhere"
-        assert_includes error.message, "#{schema}.restore_queue"
+        assert_includes error.message, "in the schemas #{schema}"
 
         # The target has a column the definition computes nothing for.
         error = assert_raises(Trellis::ValidationError) do

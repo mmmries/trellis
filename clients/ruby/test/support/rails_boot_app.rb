@@ -256,7 +256,7 @@ when "off_in", "off_in_elsewhere", "default_off_in", "opt_in_off_in"
   end
   seen[:connected_after_connect] = Trellis.connected?
 when "off_in_rake"
-  # `rails trellis:migrate` in an off environment migrates nothing.
+  # `rails trellis:migrate` in an off environment migrates as in any other.
   BootApp.config.trellis.off_in = [Rails.env]
   require "rake"
   Rake.with_application do |rake|
@@ -269,6 +269,7 @@ when "off_in_rake"
       begin
         Rake::Task["trellis:migrate"].invoke
         seen[:warning] = $stderr.string
+        seen[:connected] = Trellis.connected?
       ensure
         $stderr = stderr
       end

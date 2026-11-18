@@ -47,12 +47,12 @@ module Trellis
   #   that database: the instances' options with the database's host, port,
   #   name, user and password from its config.
   #
-  # None of this applies to a database of an environment named in
-  # config.trellis.off_in (`%w[test]`): its load creates the target tables as
-  # plain tables and restores nothing, and its dump is Rails' own. A dump of
-  # such a database run from an environment Trellis is on in (`db:prepare` in
-  # development also dumps the test database) is skipped, since the file is
-  # that environment's.
+  # A database of an environment named in config.trellis.off_in (`%w[test]`)
+  # loads and dumps the same way, connecting to that database itself
+  # (Railtie.with_handle): its load restores every definition, unbuilt. A
+  # dump of such a database run from an environment Trellis is on in
+  # (`db:prepare` in development also dumps the test database) is skipped,
+  # since the file is that environment's.
   #
   # A load that doesn't go through Rails (`psql -f structure.sql`) is followed
   # by `rails trellis:migrate`.
@@ -95,17 +95,16 @@ module Trellis
       end
 
       # Whether Trellis's definitions belong in the dump of db_config: Trellis
-      # is configured and on in db_config's environment, and db_config is
-      # the database config.trellis.dump_database names.
+      # is configured, and db_config is the database
+      # config.trellis.dump_database names.
       def applies?(db_config)
-        configured_for?(db_config) && !Railtie.off_in?(db_config.env_name)
+        configured_for?(db_config)
       end
 
       # Whether a dump of db_config is left undone: db_config belongs to an
       # environment Trellis is off in, and the environment running the task is
-      # one it is on in. The dump file is the running environment's, and
-      # a dump of the off database would overwrite it with one that has no
-      # definitions.
+      # one it is on in. The dump file is the running environment's, which
+      # the off database, migrated alongside it, would only overwrite.
       def skip_dump?(db_config)
         configured_for?(db_config) && Railtie.off_in?(db_config.env_name) &&
           !Railtie.off_in?(::ActiveRecord::Tasks::DatabaseTasks.env)
@@ -139,6 +138,10 @@ module Trellis
       # development's: a db_config of another environment is compared as the
       # current environment's config of the same name.
       def verify_same_database!(db_config)
+        # Trellis connects to a database of an off environment itself
+        # (Railtie.with_handle), whatever the urls say.
+        return if Railtie.off_in?(db_config.env_name)
+
         require "pg"
         target = rails_database(current_environment_config(db_config).configuration_hash)
         configured = {}
@@ -172,7 +175,7 @@ module Trellis
       def schema_flags(db_config, configuration_hash, parts = nil)
         return [] unless applies?(db_config)
 
-        parts ||= Thread.current[PARTS_KEY] || self.parts
+        parts ||= Thread.current[PARTS_KEY] || Railtie.working_on(db_config) { self.parts }
         flags = []
         if restricts_schemas?(configuration_hash)
           flags.concat(configured_options.map { |options| "--schema=#{exact_pattern(options.fetch(:target_schema, "public"))}" })
@@ -223,7 +226,8 @@ module Trellis
       # on each configured instance, in the database db_config names.
       def restore(db_config)
         verify_same_database!(db_config)
-        if db_config.env_name.to_s == ::ActiveRecord::Tasks::DatabaseTasks.env.to_s
+        if db_config.env_name.to_s == ::ActiveRecord::Tasks::DatabaseTasks.env.to_s &&
+           !Railtie.off_in?(db_config.env_name)
           Railtie.migrate_all
           return
         end
@@ -407,35 +411,37 @@ module Trellis
         filename = schema_dump_path(db_config, format)
         return super unless filename
 
-        SchemaDump.verify_same_database!(db_config)
+        Railtie.working_on(db_config) do
+          SchemaDump.verify_same_database!(db_config)
 
-        previous = File.exist?(filename) ? File.binread(filename) : nil
-        finished = false
-        begin
-          SchemaDump::ATTEMPTS.times do
-            before = SchemaDump.parts
-            begin
-              Thread.current[SchemaDump::PARTS_KEY] = before
-              super(db_config, format)
-            ensure
-              Thread.current[SchemaDump::PARTS_KEY] = nil
+          previous = File.exist?(filename) ? File.binread(filename) : nil
+          finished = false
+          begin
+            SchemaDump::ATTEMPTS.times do
+              before = SchemaDump.parts
+              begin
+                Thread.current[SchemaDump::PARTS_KEY] = before
+                super(db_config, format)
+              ensure
+                Thread.current[SchemaDump::PARTS_KEY] = nil
+              end
+              if SchemaDump.parts == before
+                SchemaDump.finish(filename, before)
+                finished = true
+                return nil
+              end
             end
-            if SchemaDump.parts == before
-              SchemaDump.finish(filename, before)
-              finished = true
-              return nil
-            end
+            raise Trellis::ConflictError,
+                  "Trellis's definitions changed during each of #{SchemaDump::ATTEMPTS} dumps of " \
+                  "#{db_config.name}: run the dump when no define or drop is running"
+          ensure
+            # Whatever Rails wrote is raw `pg_dump` output with the capture
+            # triggers in and no definitions: left in place, a later
+            # `db:schema:load` would load it without a word. A file no
+            # `pg_dump` wrote to (a failure before the first, or a `pg_dump`
+            # that failed before opening it) is the previous dump: left alone.
+            SchemaDump.discard_unfinished(filename, previous) unless finished
           end
-          raise Trellis::ConflictError,
-                "Trellis's definitions changed during each of #{SchemaDump::ATTEMPTS} dumps of " \
-                "#{db_config.name}: run the dump when no define or drop is running"
-        ensure
-          # Whatever Rails wrote is raw `pg_dump` output with the capture
-          # triggers in and no definitions: left in place, a later
-          # `db:schema:load` would load it without a word. A file no
-          # `pg_dump` wrote to (a failure before the first, or a `pg_dump`
-          # that failed before opening it) is the previous dump: left alone.
-          SchemaDump.discard_unfinished(filename, previous) unless finished
         end
       end
 
