@@ -4595,9 +4595,10 @@ async fn blocked_behind(client: &Client, pid: i32) -> i32 {
 /// deletes, the resume holds `total`'s row; the define then takes `cost`'s
 /// and waits for `total`'s, and the resume's delete of `cost` closes the
 /// cycle (`deadlock detected`). The resume's column-pause lock makes the
-/// define wait for the whole resume instead, so both commit, and the define
-/// finds nothing paused. With the one column-pause lock the define
-/// waits for the resume at the lock, before it reads any row.
+/// define wait for the whole resume instead, at the lock, before it reads any
+/// row. The resume commits, and the define, reading `sib` after the lock,
+/// finds the resume's field build running and is refused (`TransformNotLive`),
+/// with no deadlock.
 #[tokio::test]
 async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_sorts_first() {
     const PAUSE_LOCK: i64 = 9170;
@@ -4646,11 +4647,13 @@ async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_s
             ("sib".to_string(), "cost".to_string()),
         ]
     );
-    define
-        .await
-        .expect("define task")
-        .expect("the define commits");
-    assert_eq!(column_status_row(&client, "sib_sum", "t1").await, None);
+    match define.await.expect("define task") {
+        Err(trellis::defs::CatalogError::TransformNotLive { transform, status }) => {
+            assert_eq!(transform, "sib");
+            assert_eq!(status.as_str(), "backfilling");
+        }
+        other => panic!("expected TransformNotLive after the resume's build start, got {other:?}"),
+    }
     assert_eq!(column_status_row(&client, "sib", "cost").await, None);
 }
 
