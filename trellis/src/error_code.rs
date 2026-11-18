@@ -300,6 +300,9 @@ fn classify_sqlstate(code: &tokio_postgres::error::SqlState) -> ErrorCode {
         || *code == SqlState::CRASH_SHUTDOWN
         || *code == SqlState::CANNOT_CONNECT_NOW
         || *code == SqlState::IDLE_SESSION_TIMEOUT
+        || *code == SqlState::IDLE_IN_TRANSACTION_SESSION_TIMEOUT
+        // `transaction_timeout` (PG 17+); older tokio-postgres has no constant.
+        || code.code() == "25P04"
     {
         ErrorCode::Connectivity
     } else if *code == SqlState::UNIQUE_VIOLATION || *code == SqlState::FOREIGN_KEY_VIOLATION {
@@ -435,6 +438,8 @@ mod tests {
             SqlState::CRASH_SHUTDOWN,
             SqlState::CANNOT_CONNECT_NOW,
             SqlState::IDLE_SESSION_TIMEOUT,
+            SqlState::IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+            SqlState::from_code("25P04"),
             SqlState::CONNECTION_EXCEPTION,
             SqlState::CONNECTION_FAILURE,
             SqlState::CONNECTION_DOES_NOT_EXIST,
