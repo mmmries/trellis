@@ -47,8 +47,10 @@ defmodule Trellis.MixProject do
       # a host using the precompiled NIF never fetches it; a host building
       # from source adds it to its own deps.
       {:rustler, "~> 0.38.0", optional: true, runtime: false},
-      # `Trellis.Migration` is compiled only when the host depends on
-      # `ecto_sql`; nothing else here uses it.
+      # `Trellis.Migration`, `Trellis.Repo`, `Trellis.StructureDump` and the
+      # `trellis.dump` / `trellis.load` tasks are compiled only when the host
+      # depends on `ecto_sql`; `Trellis.TestSupport.refresh_target` calls it at
+      # run time. The rest compiles without.
       {:ecto_sql, "~> 3.13", optional: true},
       # `Trellis.Metrics.Plug` and `Trellis.Metrics.Appender` are compiled
       # only when the host depends on `plug`.

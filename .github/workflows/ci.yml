@@ -277,13 +277,22 @@ jobs:
           [ "$LINT" = success ] && [ "$TEST" = success ]
 
   elixir:
-    # The Elixir binding. Its NIF crate is a
+    # The Elixir binding, on the floor and latest supported Elixir/OTP
+    # (clients/elixir/README.md, "Supported versions"). Its NIF crate is a
     # workspace member, so the `lint` job already formats, lints and builds it
     # (Rustler needs no Erlang install to compile); this job loads it into a
     # BEAM and runs the ExUnit suite against a `trellis-testkit` cluster.
+    name: elixir (Elixir ${{ matrix.elixir }}, OTP ${{ matrix.otp }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Floor and latest; Hex's builds, so patch versions are exact.
+          - { elixir: "1.19", otp: "26", elixir_build: "1.19.7-otp-26", otp_build: "26.2.5.21" }
+          - { elixir: "1.20", otp: "29", elixir_build: "1.20.5-otp-29", otp_build: "29.1.2" }
     steps:
       - uses: actions/checkout@v4
 
@@ -321,7 +330,11 @@ jobs:
           echo "$pg_bin" >> "$GITHUB_PATH"
 
       - name: Install Erlang/OTP and Elixir
-        # The versions clients/elixir/.tool-versions pins, from Hex's builds.
+        # The matrix cell's pair, from Hex's builds (the .tool-versions file
+        # is the developer's pin; the cells override it).
+        env:
+          SETUP_BEAM_OTP: ${{ matrix.otp_build }}
+          SETUP_BEAM_ELIXIR: ${{ matrix.elixir_build }}
         run: .github/scripts/setup-beam.sh clients/elixir/.tool-versions "$RUNNER_TEMP/beam"
 
       - name: Build trellis-testkit onto PATH

@@ -13,6 +13,9 @@
 # and prints them either way. The OS build flavor defaults to this machine's
 # (`ubuntu-24.04` on ubuntu-latest); SETUP_BEAM_OS overrides it for a local
 # dry run on another distro.
+#
+# SETUP_BEAM_OTP and SETUP_BEAM_ELIXIR (e.g. 26.2.5.21 and 1.19.7-otp-26)
+# override the file's versions, so a CI matrix cell can test another pair.
 set -euo pipefail
 
 tool_versions="${1:?usage: setup-beam.sh <.tool-versions> <install-dir>}"
@@ -20,6 +23,8 @@ install_dir="${2:?usage: setup-beam.sh <.tool-versions> <install-dir>}"
 
 otp="$(awk '$1 == "erlang" { print $2 }' "$tool_versions")"
 elixir="$(awk '$1 == "elixir" { print $2 }' "$tool_versions")"
+otp="${SETUP_BEAM_OTP:-$otp}"
+elixir="${SETUP_BEAM_ELIXIR:-$elixir}"
 if [ -z "$otp" ] || [ -z "$elixir" ]; then
   echo "setup-beam: $tool_versions must pin both erlang and elixir" >&2
   exit 1
