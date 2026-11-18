@@ -1010,14 +1010,10 @@ pub fn compare(
         .iter()
         .map(|f| {
             let value_type = field_value_type(&f.expr, source_columns);
-            let comparison = if value_type == ValueType::Other(PgType::Interval)
-                && sum_or_avg_argument(&f.expr).is_some()
-            {
-                Comparison::IntervalByValue
-            } else {
-                Comparison::for_field(value_type, &def.key_space)
-            };
-            (f.name.as_str(), comparison)
+            (
+                f.name.as_str(),
+                Comparison::for_field(value_type, &def.key_space),
+            )
         })
         .collect();
     let comparison_for = |column: &str| {
@@ -1847,10 +1843,10 @@ mod tests {
     }
 
     /// Floats compare by value with Postgres's equality (`NaN = NaN`,
-    /// `-0 = 0`), a `real` read as one; an interval exact sum field by
-    /// field.
+    /// `-0 = 0`), a `real` read as one; an interval exact sum by value,
+    /// still microsecond-exact.
     #[test]
-    fn floats_compare_by_value_and_interval_sums_by_field() {
+    fn floats_and_interval_sums_compare_by_value() {
         assert!(postgres_float_equal(f64::NAN, f64::NAN));
         assert!(postgres_float_equal(-0.0, 0.0));
         assert!(postgres_float_equal(f64::INFINITY, f64::INFINITY));
@@ -1903,6 +1899,13 @@ mod tests {
         };
         let by_value = Comparison::for_field(interval, &aggregate);
         assert_eq!(by_value, Comparison::IntervalByValue);
+        // A `JOIN`'s exact `SUM`/`AVG(interval)` too (#2141).
+        for func in [exact_sums::Func::Sum, exact_sums::Func::Avg] {
+            assert_eq!(
+                exact_comparison(exact_sums::Kind::Interval, func),
+                Comparison::IntervalByValue
+            );
+        }
         assert_eq!(
             Comparison::for_field(interval, &KeySpace::OneToOne),
             Comparison::Exact
