@@ -78,15 +78,12 @@ enum Comparison {
     /// a `MIN`/`MAX` a stored value, and a `SUM`/`AVG` the exact sum rounded
     /// once ([`exact_sums`]), so the bits agree.
     FloatByValue(FloatWidth),
-    /// An `interval` field by field (months, days, microseconds), or the
-    /// same infinity: an exact-sum field ([`exact_sums`]), whose fields the
-    /// engine and the oracle both compute exactly.
-    IntervalFields,
     /// `interval` by value, as Postgres's `=` compares it: a month is 30
     /// days and a day 24 hours, so `1 day 02:00:00`, `26:00:00` and
     /// `1 day 120 minutes` are one value ([`interval_micros`]). Only an
-    /// aggregate's field compares this way (ADR-0020: it holds an equal
-    /// value); a 1-1 field holds the source's exact text.
+    /// aggregate's field compares this way, a `SUM`/`AVG` included
+    /// (ADR-0020: it holds an equal value, so `1 mon` and `30 days` are no
+    /// divergence); a 1-1 field holds the source's exact text.
     IntervalByValue,
 }
 
@@ -156,19 +153,6 @@ impl Comparison {
                         (Some(a), Some(b)) => postgres_float_equal(a, b),
                         // Text that isn't a float (an oracle raise) compares
                         // exactly, so a difference still surfaces.
-                        _ => a == b,
-                    }
-                }
-                _ => false,
-            },
-            Comparison::IntervalFields => match (expected, got) {
-                (None, None) => true,
-                (Some(a), Some(b)) => {
-                    match (
-                        exact_sums::Interval::parse(a),
-                        exact_sums::Interval::parse(b),
-                    ) {
-                        (Some(a), Some(b)) => a == b,
                         _ => a == b,
                     }
                 }
@@ -694,7 +678,10 @@ async fn evaluate_exact(
 /// How an exact-sum field's cell compares.
 fn exact_comparison(kind: exact_sums::Kind, func: exact_sums::Func) -> Comparison {
     match (kind, func) {
-        (exact_sums::Kind::Interval, _) => Comparison::IntervalFields,
+        // An aggregate holds an equal value (ADR-0020), so a sum or average
+        // moving to an equal value in other fields (`30 days` to `1 mon`)
+        // is no divergence.
+        (exact_sums::Kind::Interval, _) => Comparison::IntervalByValue,
         (exact_sums::Kind::Real, exact_sums::Func::Sum) => {
             Comparison::FloatByValue(FloatWidth::Float4)
         }
@@ -1023,14 +1010,10 @@ pub fn compare(
         .iter()
         .map(|f| {
             let value_type = field_value_type(&f.expr, source_columns);
-            let comparison = if value_type == ValueType::Other(PgType::Interval)
-                && sum_or_avg_argument(&f.expr).is_some()
-            {
-                Comparison::IntervalFields
-            } else {
-                Comparison::for_field(value_type, &def.key_space)
-            };
-            (f.name.as_str(), comparison)
+            (
+                f.name.as_str(),
+                Comparison::for_field(value_type, &def.key_space),
+            )
         })
         .collect();
     let comparison_for = |column: &str| {
@@ -1860,10 +1843,10 @@ mod tests {
     }
 
     /// Floats compare by value with Postgres's equality (`NaN = NaN`,
-    /// `-0 = 0`), a `real` read as one; an interval exact sum field by
-    /// field.
+    /// `-0 = 0`), a `real` read as one; an interval exact sum by value,
+    /// still microsecond-exact.
     #[test]
-    fn floats_compare_by_value_and_interval_sums_by_field() {
+    fn floats_and_interval_sums_compare_by_value() {
         assert!(postgres_float_equal(f64::NAN, f64::NAN));
         assert!(postgres_float_equal(-0.0, 0.0));
         assert!(postgres_float_equal(f64::INFINITY, f64::INFINITY));
@@ -1884,13 +1867,17 @@ mod tests {
         assert!(!equal(real, "0.1", "0.10000001"));
         assert!(!equal(double, "ERROR: value out of range: overflow", "1"));
 
-        let fields = Comparison::IntervalFields;
-        assert!(equal(fields, "1 mon", "1 mon"));
-        assert!(equal(fields, "1 year", "12 mons"));
-        assert!(!equal(fields, "1 mon", "30 days"));
-        assert!(!equal(fields, "1 day", "24:00:00"));
-        assert!(equal(fields, "infinity", "infinity"));
-        assert!(!equal(fields, "ERROR: interval out of range", "1 day"));
+        let by_value = Comparison::IntervalByValue;
+        assert!(equal(by_value, "1 mon", "1 mon"));
+        assert!(equal(by_value, "1 year", "12 mons"));
+        // An aggregate holds an equal value (#2141).
+        assert!(equal(by_value, "1 mon", "30 days"));
+        assert!(equal(by_value, "1 day", "24:00:00"));
+        // A microsecond off is still a difference.
+        assert!(!equal(by_value, "1 mon", "30 days 00:00:00.000001"));
+        assert!(!equal(by_value, "1 mon 00:00:00.000001", "30 days"));
+        assert!(equal(by_value, "infinity", "infinity"));
+        assert!(!equal(by_value, "ERROR: interval out of range", "1 day"));
     }
 
     #[test]
@@ -1912,6 +1899,13 @@ mod tests {
         };
         let by_value = Comparison::for_field(interval, &aggregate);
         assert_eq!(by_value, Comparison::IntervalByValue);
+        // A `JOIN`'s exact `SUM`/`AVG(interval)` too (#2141).
+        for func in [exact_sums::Func::Sum, exact_sums::Func::Avg] {
+            assert_eq!(
+                exact_comparison(exact_sums::Kind::Interval, func),
+                Comparison::IntervalByValue
+            );
+        }
         assert_eq!(
             Comparison::for_field(interval, &KeySpace::OneToOne),
             Comparison::Exact
