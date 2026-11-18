@@ -416,7 +416,7 @@ jobs:
           path: assets
 
       - name: Check every asset is here
-        # 6 CLI targets, Trellis.Native's 5 NIF targets, and 6 platform gems
+        # 6 CLI targets, Trellis.Native's 6 NIF targets, and 6 platform gems
         # and the source gem: the build matrices above.
         run: |
           set -euo pipefail
@@ -427,7 +427,7 @@ jobs:
             [ "$n" -eq "$1" ] || { echo "expected $1 assets named $2, found $n" >&2; exit 1; }
           }
           expect 6 'trellis-v*.tar.gz'
-          expect 5 'libtrellis_nif-*.tar.gz'
+          expect 6 'libtrellis_nif-*.tar.gz'
           expect 7 'trellis-pg-*.gem'
           (cd assets && sha256sum -- * > SHA256SUMS)
           cat assets/SHA256SUMS

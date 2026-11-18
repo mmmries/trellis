@@ -350,8 +350,9 @@ end
 
 Or write the target rows by hand, in the sandbox, with `allow_target_writes`.
 
-- A `GROUP BY` or `JOIN` define is refused without a source index on its
-  columns (`status/2`'s `source_index_gaps`), so the migration creates one:
+- A `GROUP BY` or `JOIN` define needs a source index on its columns
+  ([T0134](../../docs/errors.md#t0134-sourceindexmissing)), so the migration
+  creates one first:
 
   ```elixir
   def up do
@@ -370,10 +371,10 @@ Or write the target rows by hand, in the sandbox, with `allow_target_writes`.
 ### Trellis on in tests
 
 To test the real pipeline, run the worker and wait for it, in its own
-database (another name or `MIX_TEST_PARTITION`), never the off suite's. The
-fixtures it needs are committed, and they stay committed, which breaks exact
-counts in the off suite's tests; and the targets it wrote keep their row
-locks for every `refresh_target` after it.
+database (another name or `MIX_TEST_PARTITION`), never the off suite's. Its
+fixtures and the target rows the worker writes stay committed: in the off
+suite's database they break exact counts, and every `refresh_target` of
+those targets locks the same rows, which serializes async tests.
 
 ```elixir
 setup_all do
@@ -540,7 +541,7 @@ mix test
 
 An app that takes `trellis_pg` as a `path:` dependency (to test a change here
 in a scratch app) compiles it in `:prod`, which downloads the NIF. Add
-`{:rustler, ">= 0.0.0", optional: true}` to the app's deps and compile with
+`{:rustler, "~> 0.38.0", runtime: false}` to the app's deps and compile with
 `TRELLIS_PG_BUILD=1` to build it from source.
 
 In this repository (`:dev` and `:test`) the NIF always builds from source,

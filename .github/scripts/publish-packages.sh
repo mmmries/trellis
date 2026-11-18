@@ -252,10 +252,10 @@ if wants hex; then
       mix compile --warnings-as-errors
       # Without --ignore-unavailable: a target the release doesn't serve
       # fails here instead of shipping a package that can't install there.
-      # 5 is the length of Trellis.Native's `targets`.
+      # 6 is the length of Trellis.Native's `targets`.
       mix rustler_precompiled.download Trellis.Native --all --print
       targets="$(grep -c '"sha256:' checksum-Elixir.Trellis.Native.exs)"
-      [ "$targets" -eq 5 ] || { echo "checksum-Elixir.Trellis.Native.exs lists $targets NIFs, not 5" >&2; exit 1; }
+      [ "$targets" -eq 6 ] || { echo "checksum-Elixir.Trellis.Native.exs lists $targets NIFs, not 6" >&2; exit 1; }
       if [ "$dry_run" -eq 1 ]; then
         mix hex.build
       elif [ "$yes" -eq 1 ]; then
