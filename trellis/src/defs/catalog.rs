@@ -2473,10 +2473,17 @@ pub async fn alter_transform(
     // columns earlier edits dropped. Before any DDL, like the rechecks above.
     check_alter_target_width(&*txn, &target_ident, &real_adds, &real_drops).await?;
 
-    // An added or altered field's `STRPOS`/
-    // `REGEXP_COUNT` can't read a nondeterministic-collation column, exactly
-    // as at install. Before any DDL, like the rechecks above.
-    let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
+    // An edited field's `STRPOS`/`REGEXP_COUNT` can't read a
+    // nondeterministic-collation column, exactly as at install. The edited
+    // fields are the ones the build rewrites: a field reading an altered one
+    // by alias reads its new column, as a define of the merged text would.
+    // Before any DDL, like the rechecks above.
+    let edited: Vec<FieldDef> = merged
+        .fields
+        .iter()
+        .filter(|f| build_fields.contains(&f.name))
+        .cloned()
+        .collect();
     let live = LiveTable::read(&*txn, &current.source_table).await?;
     check_collation_reads(&merged, Some(&edited), |read| {
         Some((current.source_table.clone(), live.info(&read.column)?))
