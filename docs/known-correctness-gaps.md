@@ -45,6 +45,7 @@ Postgres, hidden tables included, detects and never repairs
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
+| **Connections through a pooler** | | |
 | [A Trellis process behind a transaction-mode pooler](#a-trellis-process-behind-a-transaction-mode-pooler) | nothing | configuration |
 
 ## Preconditions
@@ -84,6 +85,9 @@ while every rule holds.
 * **Change a read column to a nondeterministic collation only while the
   transforms that read it are paused**
   ([below](#a-read-column-given-a-nondeterministic-collation)).
+* **Connect every Trellis process directly or through a session-mode
+  pooler**
+  ([below](#a-trellis-process-behind-a-transaction-mode-pooler)).
 * **Don't write a 1-1 `JOIN`'s joined table (`b`, or the table at any
   position of a star) under `session_replication_role = replica`** when its
   key on its `ON` columns is a deferrable constraint
@@ -525,17 +529,19 @@ TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
 
+## Connections through a pooler
+
 ### A Trellis process behind a transaction-mode pooler
 
 **When:** the worker, `migrate` or a calls-only handle connects through a
-transaction-mode pooler (PgBouncer's default, Supabase port 6543, Neon's
-`-pooler` host). Session-mode and direct connections are fine
+transaction-mode pooler (such as Supabase port 6543 or Neon's `-pooler`
+host). Session-mode and direct connections are fine
 ([recommendations](recommendations.md#connect-directly-or-through-a-session-mode-pooler)).
 
-**What goes wrong:** the worker's session-level leadership lock lands on a
-different backend, so two workers both lead and targets go stale while
-`status` says `live`. `migrate`'s locks strand on a pooled backend and break
-direct processes too. Statement-mode pooling fails loudly instead (T0208).
+**What goes wrong:** the worker's leadership lock is a session lock, so it
+can't tell two workers apart when their calls share a pooled backend. Both
+stand by, and targets go stale while `status` says `live`. `migrate`'s locks
+strand on a pooled backend and break direct processes too.
 
 **Detected by:** nothing.
 

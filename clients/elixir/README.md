@@ -246,7 +246,8 @@ down when the supervisor stops it:
 
 ```elixir
 # config/runtime.exs
-database_url = System.fetch_env!("DATABASE_URL")
+# A direct or session-mode URL, not the Repo's pooled DATABASE_URL.
+database_url = System.fetch_env!("TRELLIS_DATABASE_URL")
 
 config :my_app, MyApp.Trellis,
   name: MyApp.Trellis,

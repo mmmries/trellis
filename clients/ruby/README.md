@@ -413,8 +413,7 @@ The Rails integration reads `Trellis.connect`'s options from one place,
 ```ruby
 # config/application.rb (or config/environments/*.rb)
 config.trellis.connect = {
-  # A direct or session-mode URL, not the app's pooled DATABASE_URL
-  # (docs/recommendations.md, "Connect directly or through a session-mode pooler").
+  # A direct or session-mode URL, not the app's pooled DATABASE_URL.
   url: ENV.fetch("TRELLIS_DATABASE_URL"),
   # The one dedicated worker process sets TRELLIS_WORKER=1.
   staging: ENV["TRELLIS_WORKER"] == "1",
