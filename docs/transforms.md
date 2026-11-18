@@ -64,7 +64,7 @@ DROP   TRANSFORM <transform>
   `<name>.<field>` pauses or resumes one field
   ([Changing a definition](#changing-a-definition)).
 
-What a definition may read is the [refusal table](#refusals); why the
+What a definition may read and write is refused as [errors](errors.md#tables-and-keys) lists; why the
 statement has this shape is
 [0004-transform-definition-grammar](decisions/0004-transform-definition-grammar.md),
 with aliases from [0019](decisions/0019-join-transforms.md) and the 1-1 `JOIN`
@@ -79,25 +79,25 @@ refusals are the supported-subset contract, not bugs. Each rule is checked for
 a transform's source, for each table a `JOIN` reads, and (where noted) for its
 target. Trellis never adds a key, index or policy itself.
 
-Each refusal is one row of [the refusal table](#refusals): the condition, the
-error, and what happens when the condition appears after define. The error
-links to its remedy in [errors](errors.md). A row links to an entry under
-[Details](#details) where it needs more room.
-What an expression may contain is refused in [its own table](expressions.md#refusals).
+Each refusal has an entry in [errors](errors.md), in the groups
+[Definition checks](errors.md#definition-checks) and
+[Tables and keys](errors.md#tables-and-keys): what it means, the remedy, and what
+happens when the condition appears after define. An entry links to an entry
+under [Details](#details) where it needs more room.
 
 ### After define
 
 A condition define refuses can still arise later, through DDL on a table the
-definition reads. The table's "After define" column names what Trellis does
-then, one of the classes below, or reads n/a where the condition matters only
-at define (a name taken, an upstream not yet `live`). A paused definition
+definition reads. Each refusal's [errors](errors.md) entry names what Trellis
+does then, one of the classes below, or that the condition matters only when the
+statement runs (a name taken, an upstream not yet `live`). A paused definition
 keeps its last values, with the reason in
 [`capture_failure`](status-reference.md#capture_failure); every `RESUME` first
 runs define's validation and refuses with define's error while it would
 ([ADR-0027](decisions/0027-operating-principles.md), rule 4). Each reason's
-repair is in [operations — Paused definitions](operations.md#paused-definitions),
-and other ways a source can drift are in
-[known correctness gaps](known-correctness-gaps.md).
+repair is in [operations — Paused
+definitions](operations.md#paused-definitions), and other ways a source can
+drift are in [known correctness gaps](known-correctness-gaps.md).
 
 #### Text
 
@@ -116,9 +116,11 @@ when define would now refuse it, when it would evaluate the column as another
 type (`integer` to `double precision`), or when the new type outgrew a column
 Trellis copied ([the widening entry](#a-column-trellis-copies-widened)). A key
 column (a source key, `GROUP BY` key or `ON` column) whose new type or
-collation define refuses, or whose stored keys now render differently, pauses
-its readers too. A source key's collation changed to another deterministic
-one pauses nothing, though the rest of any build then scans the source, and
+collation define refuses, or whose stored keys now render differently
+(`timestamp` ↔ `timestamptz`, `date` → `timestamp`, `text` → `uuid` or
+`integer`, `varchar` → `character(n)`, or a narrower `numeric` scale, temporal
+precision or `varchar(n)`), pauses its readers too. A source key's collation
+changed to another deterministic one pauses nothing, though the rest of any build then scans the source, and
 `self_check` reads the source by scan rather than by index (it pages under the
 target key's collation). A read column renamed or dropped pauses its readers
 ([capture drift](staging-and-claiming/capture-drift.md#a-renamed-or-dropped-column)).
@@ -177,7 +179,8 @@ a new leader starts that clock again.
 #### Disruption
 
 The condition can't exist at define: the table was dropped, renamed, swapped
-or replaced, or its capture was changed outside Trellis. The next pass pauses
+or replaced, or its capture was changed outside Trellis
+([details](#a-source-dropped-renamed-swapped-or-its-capture-disrupted)). The next pass pauses
 every reader with a `capture_failure` of kind `disruption`. A logical restore
 of the database pauses every definition.
 
@@ -191,61 +194,6 @@ refuses with define's error until the change is undone.
 Postgres refuses the computation for each changed row, so the row's key is
 held ([`held_keys`](status-reference.md#held_keys)). The transform is
 quarantined once its held keys reach the fuse threshold. Nothing pauses.
-
-### Refusals
-
-| Condition | Error | After define |
-|---|---|---|
-| **Source tables and partitioning** | | |
-| A table the role Trellis runs as can't use: it lacks `USAGE` on the table's schema, or neither owns the table nor holds a privilege on it | [T0128 TableNotAccessible](errors.md#t0128-tablenotaccessible) | [Shape](#shape): a revoked table privilege or schema `USAGE` halts the readers on the next drain, and a revoked schema `USAGE` at the next staging pass too |
-| A partition (a leaf or a middle), a partitioned root that is itself a partition, or a table in an inheritance hierarchy: a statement trigger fires only for the table a statement names | [T0144 SourceNotChangeKeyed](errors.md#t0144-sourcenotchangekeyed) | [Shape](#shape) (`ATTACH PARTITION`, `INHERIT`, a child created `INHERITS` it, or a drop and recreate as one) |
-| [A source dropped, renamed, swapped, or its capture disrupted](#a-source-dropped-renamed-swapped-or-its-capture-disrupted) | n/a | [Disruption](#disruption) |
-| A partitioned root ([0017](decisions/0017-partitioned-sources.md)) whose partition key, at any level, the group key omits: an aggregate's `GROUP BY`, or a `JOIN` table's `GROUP BY` and `ON` columns from that table | [T0145 PartitionedSource](errors.md#t0145-partitionedsource), naming the column | [Shape](#shape): a sub-level added later |
-| A partitioned root whose key level is an expression, or whose partition-key column has a type other than `smallint`, `integer`, `bigint`, `numeric`, `text`, `varchar`, `uuid`, `date`, `timestamp`, `timestamptz` or `boolean`, a non-default operator class or a nondeterministic collation | [T0145 PartitionedSource](errors.md#t0145-partitionedsource) | [Shape](#shape): a sub-level added later |
-| A partitioned root with more than 1,000 leaves, or on PostgreSQL before 15: every build statement opens every leaf | [T0145 PartitionedSource](errors.md#t0145-partitionedsource) | [Shape](#shape) |
-| A partitioned root as a 1-1 transform's `FROM` (partitioned targets are not supported) | [T0145 PartitionedSource](errors.md#t0145-partitionedsource) | [Disruption](#disruption): the source dropped and created again partitioned; `RESUME` then refuses |
-| **Source keys** | | |
-| An aggregate target, or a 1-1 target over one, as another Trellis instance's source: its identity is a `UNIQUE NULLS NOT DISTINCT` constraint, not a primary key. Inside the owning instance it can be chained off | [T0113 NoPrimaryKey](errors.md#t0113-noprimarykey) | [Disruption](#disruption): only by the table being replaced by such a target; `RESUME` then refuses |
-| [The key a transform keys each table by](#the-key-a-transform-keys-each-table-by) | [T0113 NoPrimaryKey](errors.md#t0113-noprimarykey), [T0118 RecordedKeyMissing](errors.md#t0118-recordedkeymissing), [T0114 DeferrablePrimaryKey](errors.md#t0114-deferrableprimarykey), [T0116 KeyNotBacked](errors.md#t0116-keynotbacked), [T0115 KeyOnTrellisTarget](errors.md#t0115-keyontrellistarget), [T0117 KeyDiffersFromReaders](errors.md#t0117-keydiffersfromreaders), [T0121 UnsupportedPrimaryKeyType](errors.md#t0121-unsupportedprimarykeytype) | [Key](#key) |
-| **Row-level security and replication** | | |
-| [Row-level security on a role Trellis runs as](#row-level-security-on-a-role-trellis-runs-as) | [T0146 RowSecurityApplies](errors.md#t0146-rowsecurityapplies), [T0136 ExtremeSourceNotReadable](errors.md#t0136-extremesourcenotreadable) | [Shape](#shape) |
-| A table a logical-replication subscription in the same database replicates into, in any sync state or disabled: its apply worker fires only row-level triggers. Publishing a table is fine | [T0147 Subscribed](errors.md#t0147-subscribed) | [Shape](#shape) |
-| **Generated columns and collations** | | |
-| [A virtual generated column a definition reads](#a-virtual-generated-column-a-definition-reads) | [T0133 VirtualGeneratedColumn](errors.md#t0133-virtualgeneratedcolumn) | [Shape](#shape) |
-| A nondeterministic collation on a key column (a source key, `GROUP BY` key or `ON` column), on a column passed to `STRPOS` or `REGEXP_COUNT`, or on one compared as text (`=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM`, `NULLIF`), directly or through `COALESCE`, a `CASE` result or a field | [T0108 NondeterministicKeyCollation](errors.md#t0108-nondeterministickeycollation), [T0109 NondeterministicCollationTextFunction](errors.md#t0109-nondeterministiccollationtextfunction), [T0063 JoinNondeterministicCollation](errors.md#t0063-joinnondeterministiccollation) | On a key, [Retype](#retype); on a column only a text function reads, [Per row](#per-row); on a column only compared, nothing detects it ([known correctness gaps](known-correctness-gaps.md#a-read-column-given-a-nondeterministic-collation)) |
-| **Retyped and widened columns** | | |
-| A key column (a source key, `GROUP BY` key or `ON` column) retyped so stored values render differently: `timestamp` ↔ `timestamptz`, `date` → `timestamp`, `text` → `uuid` or `integer`, `varchar` → `character(n)`, or a narrower `numeric` scale, temporal precision or `varchar(n)` | n/a | [Retype](#retype) |
-| [A column Trellis copies, widened](#a-column-trellis-copies-widened) | n/a | [Retype](#retype) |
-| **Target columns and widths** | | |
-| Two `GROUP BY` keys that share a target column name (a key listed twice, or a `JOIN`'s `orders.region` and `customers.region`); keys can't be aliased | [T0101 GroupByKeysShareTargetColumn](errors.md#t0101-groupbykeyssharetargetcolumn) | [Text](#text) |
-| A key of more than 32 columns (`INDEX_MAX_KEYS`): a `GROUP BY`, or a `JOIN` side's `ON` and `GROUP BY` columns together; a 1-1 `JOIN`'s `ON` at most 31 | [T0059 IndexKeyTooWide](errors.md#t0059-indexkeytoowide) | [Text](#text) |
-| [A table of more than 1,600 columns](#a-table-of-more-than-1600-columns) | [T0060 TableTooWide](errors.md#t0060-tabletoowide) | [Text](#text) |
-| **Source indexes** | | |
-| [A source without the index its `self_check` walk pages by](#a-source-without-the-index-its-self_check-walk-pages-by) | [T0134 SourceIndexMissing](errors.md#t0134-sourceindexmissing) | [Index](#index) |
-| **`JOIN` transforms** | | |
-| [An unsupported `JOIN` shape](#an-unsupported-join-shape) | [T0005 UnsupportedKeySpace](errors.md#t0005-unsupportedkeyspace), [T0015 TableAlias](errors.md#t0015-tablealias), [T0016 AliasedTableName](errors.md#t0016-aliasedtablename), [T0050 JoinSelf](errors.md#t0050-joinself), [T0051 JoinTooManyTables](errors.md#t0051-jointoomanytables), [T0055 JoinOnSameSide](errors.md#t0055-joinonsameside), [T0057 JoinOnRepeatedPair](errors.md#t0057-joinonrepeatedpair), [T0053 JoinUnqualifiedColumn](errors.md#t0053-joinunqualifiedcolumn), [T0052 JoinUnknownTable](errors.md#t0052-joinunknowntable), [T0054 JoinUnresolvedColumn](errors.md#t0054-joinunresolvedcolumn), [T0056 JoinMixedSideArgument](errors.md#t0056-joinmixedsideargument), [T0064 JoinFieldShape](errors.md#t0064-joinfieldshape) | [Text](#text) |
-| [A 1-1 `JOIN`](#a-1-1-join) | [T0066 OneToOneJoinKeyNotUnique](errors.md#t0066-onetoonejoinkeynotunique), [T0065 OneToOneJoinAggregate](errors.md#t0065-onetoonejoinaggregate), [T0067 OneToOneJoinUnsupported](errors.md#t0067-onetoonejoinunsupported), [T0145 PartitionedSource](errors.md#t0145-partitionedsource), [T0058 JoinOnRepeatedColumn](errors.md#t0058-joinonrepeatedcolumn) | [Key](#key), [Retype](#retype), [Shape](#shape) |
-| [1-1 `JOIN` of more than two tables (star)](#1-1-join-of-more-than-two-tables-star) | [T0068 StarJoinTooManyTables](errors.md#t0068-starjointoomanytables), [T0069 JoinOnReadsAnotherJoinedTable](errors.md#t0069-joinonreadsanotherjoinedtable), the 1-1 `JOIN`'s at each position | As for a 1-1 `JOIN`, at each position |
-| A join aggregate's `WHERE` with a top-level `AND` condition that reads both tables, reads the joined table under `LEFT`, or reads no column ([join aggregate](#join-aggregate)) | [T0243 JoinPredicateReadsBothSides](errors.md#t0243-joinpredicatereadsbothsides), [T0244 JoinPredicateJoinedSideUnderLeft](errors.md#t0244-joinpredicatejoinedsideunderleft), [T0245 JoinPredicateReadsNoColumn](errors.md#t0245-joinpredicatereadsnocolumn) | [Text](#text) |
-| `ON` columns that differ in type or collation (a modifier never counts; `text` and `varchar` are one type), are off the join-key allowlist in [type-support](type-support.md) (a domain always is), or have a nondeterministic collation; a `GROUP BY` key of a type that can't be one | [T0061 JoinKeyTypeMismatch](errors.md#t0061-joinkeytypemismatch), [T0062 JoinUnsupportedKeyType](errors.md#t0062-joinunsupportedkeytype), [T0063 JoinNondeterministicCollation](errors.md#t0063-joinnondeterministiccollation), [T0100 UnsupportedGroupByKeyType](errors.md#t0100-unsupportedgroupbykeytype) | [Retype](#retype); a change between deterministic collations pauses nothing, but `RESUME` refuses until they match |
-| **Aggregate functions** | | |
-| [`MIN` or `MAX` in a plain aggregate](#min-or-max-in-a-plain-aggregate) | [T0073 ExtremeOfExpression](errors.md#t0073-extremeofexpression), [T0072 UnsupportedExtremeArgument](errors.md#t0072-unsupportedextremeargument), [T0074 ChainedExtreme](errors.md#t0074-chainedextreme), [T0075 ExtremesWithoutSourceIndex](errors.md#t0075-extremeswithoutsourceindex), [T0135 ExtremeIndexMissing](errors.md#t0135-extremeindexmissing) | [Index](#index), [Retype](#retype) |
-| A field reading a column that is neither a `GROUP BY` key nor inside an aggregate, or named after a key but not that key (`GROUP BY id SELECT SUM(id) AS id`) | [T0102 UngroupedColumnReference](errors.md#t0102-ungroupedcolumnreference), [T0106 GroupingColumnFieldMustBePassthrough](errors.md#t0106-groupingcolumnfieldmustbepassthrough) | [Text](#text) |
-| `DISTINCT` or `ALL` before an aggregate's arguments, `ORDER BY` after them, or a `FILTER (WHERE …)` clause: Postgres accepts each | [T0240 UnsupportedAggregateModifier](errors.md#t0240-unsupportedaggregatemodifier) | [Text](#text) |
-| `MIN` or `MAX` in a `JOIN` transform | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) (`MIN/MAX`) | [Text](#text) |
-| `bool_and`, `bool_or`, `bit_and` or `bit_or` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
-| `SUM` or `AVG` over anything but a number (`smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`) or an `interval` | [T0071 UnsupportedAggregateArgument](errors.md#t0071-unsupportedaggregateargument) | [Retype](#retype) |
-| `array_agg`, `string_agg` or `jsonb_agg` | [T0070 DeferredAggregate](errors.md#t0070-deferredaggregate) | [Text](#text) |
-| **Filters and chaining** | | |
-| `MIN` or `MAX` in a plain aggregate with a `WHERE` other than `TRUE`: an extreme is read from a source index, which holds the rows the `WHERE` drops too | [T0239 FilteredExtreme](errors.md#t0239-filteredextreme) | [Text](#text) |
-| A target that is its own source, directly or through a [chain](#chaining-and-cycle-detection) | [T0048 TargetEqualsSource](errors.md#t0048-targetequalssource), [T0047 TableCycle](errors.md#t0047-tablecycle) | [Text](#text) |
-| Chaining off a transform that is not `live` | [T0154 TransformNotLive](errors.md#t0154-transformnotlive) | n/a |
-| **Target names** | | |
-| [A target whose name is taken](#a-target-whose-name-is-taken) | [T0141 TargetTableExists](errors.md#t0141-targettableexists), [T0140 TargetTableSuffixCollision](errors.md#t0140-targettablesuffixcollision), [T0143 TargetNotAdoptable](errors.md#t0143-targetnotadoptable) | n/a |
-| A target that would take the name of a table another transform reads as its `FROM` or joined table, one dropped or renamed away since, or one `ADOPT EXISTING TABLE` would adopt: the reader would read the new target's change feed | [T0142 TargetNameHasReaders](errors.md#t0142-targetnamehasreaders), naming each reader | n/a: later, a new reader of the name is a chain, and the target can't be dropped while one reads it ([T0153 DependentsBlockDrop](errors.md#t0153-dependentsblockdrop)) |
-| A target name ending in `__ledger`, or over 55 bytes: its ledger, `<target>__ledger`, must fit Postgres's 63 | [T0076 ReservedTargetSuffix](errors.md#t0076-reservedtargetsuffix), [T0077 TargetNameTooLong](errors.md#t0077-targetnametoolong) | [Text](#text) |
-| A target in this instance's catalog schema, or in a schema holding another instance's `trellis_instance` table, whose uninstall would drop it ([instance-identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)) | [T0139 TargetInCatalogSchema](errors.md#t0139-targetincatalogschema) | [Resume only](#resume-only) |
-| Objects outside Trellis depend on a target that `DROP TRANSFORM` drops, `ALTER TRANSFORM … DROP` drops a field of, or a 1-1 `RESUME` empties: another table's foreign key into it, or a view over it or the column. Trellis never cascades; the statement rolls back whole and the definition is unchanged | [T0242 OutsideDependentsBlock](errors.md#t0242-outsidedependentsblock), naming the dependents Postgres reports | n/a |
 
 ### Details
 
@@ -556,7 +504,7 @@ key holds every partition-key column at every level: an aggregate's
 `GROUP BY`, or a `JOIN` table's `GROUP BY` and `ON` columns from that table.
 Each group then lives in one partition, so a fact table partitioned on the
 column it joins by needs nothing more, while one partitioned on its own id is
-refused ([the refusal table](#refusals),
+refused ([its refusals](errors.md#tables-and-keys),
 [ADR-0017](decisions/0017-partitioned-sources.md)). A target is always a plain
 table.
 
@@ -592,7 +540,7 @@ One target row per source row the `WHERE` admits, keyed by the source's key:
 its primary key or the `KEY (…)` the definition names, or, over an aggregate
 or `JOIN` target whose group key can be `NULL`, a `UNIQUE NULLS NOT DISTINCT`
 constraint over the same columns. The target carries the key columns, so a field can't reuse a
-key column's name ([expressions — Refusals](expressions.md#refusals)). It
+key column's name ([errors](errors.md#definition-checks)). It
 reads one table: one row per row of a table with columns of a second is a
 [1-1 `JOIN`](#1-1-join), and one row per group of a join a
 [join aggregate](#join-aggregate).
@@ -607,7 +555,7 @@ operators and functions (`COALESCE(SUM(amount), 0) + COUNT(*)`). The
 aggregates are `COUNT(*)`, `COUNT(<expr>)`, `SUM` and `AVG` over `smallint`,
 `integer`, `bigint` or `numeric`, each over a column or an expression of the
 row, and `MIN` and `MAX` of a plain column; every other is
-[refused](#refusals). Result types, `numeric` scales and the special values are
+[refused](errors.md#tables-and-keys). Result types, `numeric` scales and the special values are
 Postgres's ([type support](type-support.md#numeric-and-floating-point)).
 
 ```
@@ -771,7 +719,7 @@ Indexes, grants, constraints, triggers, rules and foreign keys are yours to
 add, to a target define created or adopted. `DROP TRANSFORM` drops the
 target's own indexes, grants, constraints and triggers with the table, and
 refuses while another table's foreign key into it, or a view over it, exists
-([refusal table](#refusals)). What they do to Trellis's writes:
+([refusals](errors.md#tables-and-keys)). What they do to Trellis's writes:
 
 * A unique index, constraint or trigger that refuses a row Trellis writes
   fails that row's key like any value the target refuses: the key is held
@@ -783,7 +731,7 @@ refuses while another table's foreign key into it, or a view over it, exists
 * Another table's foreign key referencing the target holds the key of a
   referenced row Trellis deletes, and a source `TRUNCATE`'s page while any row
   is referenced. It also refuses a `RESUME` that empties a 1-1 target
-  ([refusal table](#refusals)).
+  ([refusals](errors.md#tables-and-keys)).
 * An `INSERT` or `UPDATE` rule, or most `DELETE` rules (`DO INSTEAD NOTHING`
   among them), make Postgres refuse the `INSERT … ON CONFLICT` and
   `DELETE … RETURNING` Trellis writes with: a build pauses, and each key a
@@ -795,7 +743,7 @@ refuses while another table's foreign key into it, or a view over it, exists
 
 Another Trellis instance may read a 1-1 target keyed by a primary key as a
 source. An aggregate target, and a 1-1 target over one, needs a `KEY (…)`
-naming its group key ([the refusal table](#refusals)).
+naming its group key ([its refusals](errors.md#tables-and-keys)).
 
 ## Status
 

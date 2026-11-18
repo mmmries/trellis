@@ -126,7 +126,7 @@ which sums stay decodable from. Its reference scale is its kind's (1074, or 0),
 so the map counts only the special values. The visible `SUM` casts the exact
 sum to the float type or rebuilds the `interval` from its fields, raising when
 out of range; the `AVG` divides the exact sum, truncated far past any rounding
-boundary, or divides the fields as `interval_div` does.
+boundary, or for an `interval` has the server divide it (`interval / float8`).
 
 ## Zero groups (R4, Rx7)
 

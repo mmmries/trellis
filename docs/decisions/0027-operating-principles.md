@@ -54,8 +54,7 @@ instead.
 `RESUME` re-runs define's validation against the schema as it is then, and
 refuses with define's error while define would. A condition define refuses
 that appears while the definition runs pauses it, where that is practical.
-The refusal tables of [transforms](../transforms.md#refusals) and
-[expressions](../expressions.md#refusals) say what each refusal does after define.
+Each refusal's entry in [errors](../errors.md) says what it does after define.
 
 This rules out a resume that runs a definition define would turn away.
 

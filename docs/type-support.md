@@ -256,7 +256,7 @@ nonzero operands), `sum(real)` is `real`, `avg(real)` is
 unlike the operators, and is modelled separately. `+`, `-`, `*` and `/` admit
 a float mixed with an exact numeric. `>` admits a float against a bare number literal
 (`f > 0.5`, `f > 1`) and refuses a float against any other exact numeric
-([expressions — Refusals](expressions.md#refusals)).
+([errors](errors.md#definition-checks)).
 As in Postgres, the literal is cast to `double precision` and a `real` operand
 is widened to `double precision`, so the comparison runs in `double precision`:
 with `r = 0.1::real`, `r > 0.1` is true (the widened `r` is 0.10000000149...),
@@ -301,7 +301,7 @@ overflow raise `22003` or `22012` for the row, as an overflowing `+` does. Where
 Postgres would truncate, round differently by type or cast behind the user's
 back (`integer / integer`, an integer or float argument to `ROUND`, `%` on a
 float), define refuses the expression with a remedy
-([expressions](expressions.md#refusals)).
+([errors](errors.md#definition-checks)).
 Checked in `trellis/tests/expressions/arithmetic_key_spaces.rs` and
 `trellis/tests/one_to_one/one_to_one_render.rs`.
 
@@ -354,7 +354,7 @@ column; a field that reads it is computed from the literal, as Postgres
 would read the inlined text (`NULL AS z, COALESCE(z, 1) AS n` makes `n` an
 `integer`). Where Postgres finds a `NULL` ambiguous, or types it by its
 function-candidate rules (a function or aggregate argument), define refuses it
-([expressions](expressions.md#refusals)).
+([errors](errors.md#definition-checks)).
 Checked in `trellis/tests/expressions/logic_key_spaces.rs`, `trellis/tests/expressions/null_literal_key_spaces.rs`,
 `trellis/tests/one_to_one/one_to_one_render.rs` and the harness.
 
@@ -392,7 +392,7 @@ under `timezone_abbreviations`, which every Trellis session pins to
 `Default` (`pool::EXPRESSION_INPUT_GUCS`). Where Postgres would silently pick
 a `STABLE` overload that reads `TimeZone`, produce an `interval`, or read the
 time zone database, define refuses the expression with a remedy
-([expressions](expressions.md#refusals)).
+([errors](errors.md#definition-checks)).
 Checked in `trellis/tests/expressions/date_key_spaces.rs`,
 `trellis/tests/one_to_one/one_to_one_render.rs` and the harness.
 
@@ -414,7 +414,8 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
   render differently, and no renderer fix helps. `SUM(interval)` is the
   exact fieldwise sum and raises `interval out of range` only when the final
   value is, where Postgres's `sum()` raises by scan order; `AVG(interval)`
-  is Postgres's `avg()` wherever the sum is in range
+  is Postgres's own division of the exact sum, so it is Postgres's `avg()`
+  wherever the sum is in range
   ([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
 - Typed literals exist for `DATE`, `TIMESTAMP`, `TIME` and `TIMETZ`, not
   `TIMESTAMPTZ` (no canonical-form checker) or `INTERVAL` (`interval_in` reads
@@ -558,7 +559,7 @@ each change alone. A plain aggregate (not a `JOIN`)
 also admits `MIN` and `MAX` over the types the matrix marks, which re-read the
 source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
 Every other aggregate is refused at define, named by its family
-([refusals](transforms.md#refusals)): `MIN`/`MAX` on a `JOIN`,
+([errors](errors.md#definition-checks)): `MIN`/`MAX` on a `JOIN`,
 `bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over another type, and
 `array_agg`/`string_agg`/`jsonb_agg`.
 
