@@ -2,8 +2,10 @@
 //! sums in a `numeric` argument's partials, each value converted exactly.
 //!
 //! The values here sum exactly in any order (binary fractions, whole
-//! microseconds), so Postgres's own `sum()` and `avg()` are the oracle, by
-//! text; the values whose `sum()` depends on its scan order are pinned to
+//! microseconds), so Postgres's own `sum()` and `avg()` are the oracle. Float
+//! and `numeric` cells compare by text, an `interval` cell by value (its
+//! `=`, so `1 mon` is `30 days`: an aggregate holds an equal value,
+//! ADR-0020); the values whose `sum()` depends on its scan order are pinned to
 //! the exact result instead. Each step compares the target, then
 //! `self_check` must find nothing, on a plain aggregate, an inner and a
 //! `LEFT JOIN`.
@@ -99,12 +101,12 @@ const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g \
                           SUM(i) AS si, AVG(i) AS ai, SUM(f) * 2 AS twice, MIN(f) AS lo, \
                           COUNT(f) AS cf, COUNT(*) AS n";
 
-const AGG_ROWS: &str = "select g, sr::text, ar::text, sf::text, af::text, si::text, ai::text, \
+const AGG_ROWS: &str = "select g, sr::text, ar::text, sf::text, af::text, si, ai, \
                                twice::text, lo::text, cf, n, \
                                pg_typeof(sr)::text, pg_typeof(ar)::text, pg_typeof(si)::text \
                         from public.agg";
 const AGG_EXPECTED: &str = "select g, sum(r)::text, avg(r)::text, sum(f)::text, avg(f)::text, \
-                                   sum(i)::text, avg(i)::text, (sum(f) * 2)::text, \
+                                   sum(i), avg(i), (sum(f) * 2)::text, \
                                    min(f)::text, count(f), count(*), \
                                    'real', 'double precision', 'interval' \
                             from public.src group by g";
@@ -135,6 +137,43 @@ async fn plain_sums_follow_postgres_through_every_change() {
         &[("agg", AGG_ROWS, AGG_EXPECTED)],
     )
     .await;
+}
+
+/// A group's sum moving to an equal value in other fields (`30 days` to
+/// `1 mon`) is no change: the target keeps an equal value of Postgres's
+/// result and `self_check` reports nothing (ADR-0020, #2141). A sum a
+/// microsecond off is still different.
+#[tokio::test]
+async fn an_interval_sum_moving_to_an_equal_value_is_held_by_value() {
+    let mut d = Driver::start(SRC_DDL, &columns(), &[AGG], &["public.src"]).await;
+    run(
+        &mut d,
+        &[
+            "insert into public.src values (1, 1, 1.5, 0.25, '30 days')",
+            "update public.src set i = '1 mon' where id = 1",
+        ],
+        &[("agg", AGG_ROWS, AGG_EXPECTED)],
+    )
+    .await;
+    assert_eq!(
+        d.rows("select si = '1 mon'::interval, ai = '30 days'::interval from public.agg")
+            .await,
+        ["(t,t)".to_string()]
+    );
+    assert_eq!(self_check(&d, "agg").await, Vec::<String>::new());
+    // By value still tells a microsecond apart.
+    d.step("update public.src set i = '1 mon 1 microsecond' where id = 1")
+        .await;
+    assert_eq!(
+        d.rows("select si = '1 mon'::interval from public.agg")
+            .await,
+        ["(f)".to_string()]
+    );
+    assert_eq!(
+        difference(&d, AGG_ROWS, AGG_EXPECTED).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(self_check(&d, "agg").await, Vec::<String>::new());
 }
 
 /// Values whose `sum()` depends on its scan order read the exact sum,
@@ -233,10 +272,10 @@ async fn filtered_sums_read_member_rows_exactly() {
                        SELECT g AS g, SUM(r) AS sr, AVG(r) AS ar, SUM(f) AS sf, AVG(f) AS af, \
                               SUM(i) AS si, AVG(i) AS ai, COUNT(f) AS cf, COUNT(*) AS n \
                        WHERE w > 0";
-    const ROWS: &str = "select g, sr::text, ar::text, sf::text, af::text, si::text, ai::text, \
+    const ROWS: &str = "select g, sr::text, ar::text, sf::text, af::text, si, ai, \
                                cf, n from public.agg";
     const EXPECTED: &str = "select g, sum(r)::text, avg(r)::text, sum(f)::text, avg(f)::text, \
-                                   sum(i)::text, avg(i)::text, count(f), count(*) \
+                                   sum(i), avg(i), count(f), count(*) \
                             from public.src where w > 0 group by g";
     let mut columns = columns().to_vec();
     columns.push(("w", int4()));
@@ -289,7 +328,7 @@ fn join(name: &str, kind: &str) -> String {
 
 fn join_rows(name: &str) -> String {
     format!(
-        "select region, sf::text, af::text, si::text, ai::text, sr::text, ar::text, n, \
+        "select region, sf::text, af::text, si, ai, sr::text, ar::text, n, \
                 pg_typeof(sf)::text, pg_typeof(si)::text, pg_typeof(sr)::text \
          from public.{name}"
     )
@@ -297,7 +336,7 @@ fn join_rows(name: &str) -> String {
 
 fn join_expected(kind: &str) -> String {
     format!(
-        "select c.region, sum(o.f)::text, avg(o.f)::text, sum(o.i)::text, avg(o.i)::text, \
+        "select c.region, sum(o.f)::text, avg(o.f)::text, sum(o.i), avg(o.i), \
                 sum(c.r)::text, avg(c.r)::text, count(*), \
                 'double precision', 'interval', 'real' \
          from public.o {kind} public.c on o.k = c.k group by c.region"
