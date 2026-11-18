@@ -251,8 +251,9 @@ fn interval_sum(m: &str, d: &str, u: &str) -> String {
 /// the sum, built exactly from its fields' text, while the sum is an
 /// `interval` (each field in its range, and on Postgres 17+ not an
 /// infinity's fields, which that text reads as the infinity). Otherwise,
-/// where `avg()` itself raises, [`interval_avg`].
-fn interval_quotient(m: &str, d: &str, u: &str, count: &str) -> String {
+/// where `avg()` itself raises, [`interval_avg`]. `self_check` divides with
+/// it too, so the apply and the audit take the same division path.
+pub(crate) fn interval_quotient(m: &str, d: &str, u: &str, count: &str) -> String {
     format!(
         "(case when {m} between {i32min} and {i32max} and {d} between {i32min} and {i32max} \
                     and {u} between {i64min} and {i64max} \
@@ -275,7 +276,7 @@ fn interval_quotient(m: &str, d: &str, u: &str, count: &str) -> String {
 /// range, which no server division can take. It can be a microsecond off a
 /// server that fuses its multiply-adds. `TSROUND` is a round to
 /// microseconds.
-pub(crate) fn interval_avg(m: &str, d: &str, u: &str, count: &str) -> String {
+fn interval_avg(m: &str, d: &str, u: &str, count: &str) -> String {
     let tsround =
         |x: &str| format!("(round(({x}) * 1000000::double precision) / 1000000::double precision)");
     let mrd = tsround(&format!("({m}::double precision / __f - __mo) * 30"));
