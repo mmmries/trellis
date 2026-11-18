@@ -304,11 +304,19 @@ pub(crate) fn sqlstate_of(err: &(dyn std::error::Error + 'static)) -> Option<Str
 /// a SQLSTATE at all), which is exactly the "dropped connection" case doc 05
 /// lists alongside the coded ones.
 ///
-/// Plus `53300`: the server refused a new
-/// connection because `max_connections`, or a role's or database's
-/// connection limit, is full. It arrives on a pool checkout
-/// (`PoolError::Backend`) or an unpooled page session's connect, and says
-/// only that the server is busy, nothing about any record.
+/// Plus class `53` (insufficient resources: `53000`, `53100` `disk_full`,
+/// `53300` `too_many_connections`, `53400`) and `58030` (`io_error`): the
+/// server ran short of something, or could not extend or read a file.
+/// `53300` arrives on a pool checkout (`PoolError::Backend`) or an unpooled
+/// page session's connect. None of them says anything about a record: the
+/// same key applies cleanly once the condition clears, so charging keys
+/// would quarantine a healthy transform over a full disk. The callers retry
+/// with a backoff and no charge, and the condition may last minutes.
+///
+/// Except `53200` (`out_of_memory`), which one huge row can cause on its
+/// own. Retried as transient, that row would hold its page, and so the ring
+/// and every definition, forever. Isolation pins it on the row instead; a
+/// server-wide shortage that a smaller probe survives charges no one.
 fn is_transient_sqlstate(code: Option<&tokio_postgres::error::SqlState>) -> bool {
     use tokio_postgres::error::SqlState;
     match code {
@@ -317,7 +325,8 @@ fn is_transient_sqlstate(code: Option<&tokio_postgres::error::SqlState>) -> bool
                 || *code == SqlState::T_R_DEADLOCK_DETECTED
                 || *code == SqlState::LOCK_NOT_AVAILABLE
                 || *code == SqlState::QUERY_CANCELED
-                || *code == SqlState::TOO_MANY_CONNECTIONS
+                || (code.code().starts_with("53") && *code != SqlState::OUT_OF_MEMORY)
+                || *code == SqlState::IO_ERROR
         }
         None => true,
     }
@@ -7627,6 +7636,10 @@ mod unit_tests {
             SqlState::LOCK_NOT_AVAILABLE,
             SqlState::QUERY_CANCELED,
             SqlState::TOO_MANY_CONNECTIONS,
+            SqlState::INSUFFICIENT_RESOURCES,
+            SqlState::DISK_FULL,
+            SqlState::CONFIGURATION_LIMIT_EXCEEDED,
+            SqlState::IO_ERROR,
         ] {
             assert!(is_transient_sqlstate(Some(&code)), "{}", code.code());
         }
@@ -7638,6 +7651,8 @@ mod unit_tests {
             SqlState::UNIQUE_VIOLATION,
             SqlState::UNDEFINED_TABLE,
             SqlState::DIVISION_BY_ZERO,
+            // One huge row can run the server out of memory on its own.
+            SqlState::OUT_OF_MEMORY,
         ] {
             assert!(!is_transient_sqlstate(Some(&code)), "{}", code.code());
         }
