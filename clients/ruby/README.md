@@ -413,12 +413,15 @@ The Rails integration reads `Trellis.connect`'s options from one place,
 ```ruby
 # config/application.rb (or config/environments/*.rb)
 config.trellis.connect = {
-  url: ENV.fetch("DATABASE_URL"),
+  # A direct or session-mode URL, not the app's pooled DATABASE_URL.
+  url: ENV.fetch("TRELLIS_DATABASE_URL"),
   # The one dedicated worker process sets TRELLIS_WORKER=1.
   staging: ENV["TRELLIS_WORKER"] == "1",
   drain_threads: ENV["TRELLIS_WORKER"] == "1" ? 2 : 0
 }
 ```
+
+Connect directly or through a session-mode pooler, never a transaction-mode one ([recommendations](../../docs/recommendations.md#connect-directly-or-through-a-session-mode-pooler)).
 
 With it set, the app's default instance connects as the app boots (an
 `after_initialize` hook), and the `at_exit` hook shuts it down. Left `nil`,
@@ -837,7 +840,7 @@ them, so with `schema_format = :ruby` the dump (`db:migrate`'s and
 ```ruby
 # config/application.rb
 config.active_record.schema_format = :sql
-config.trellis.connect = { url: ENV.fetch("DATABASE_URL") }
+config.trellis.connect = { url: ENV.fetch("TRELLIS_DATABASE_URL") }
 ```
 
 Nothing else is set up. The file has the application's tables, the target
