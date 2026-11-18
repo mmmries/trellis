@@ -508,12 +508,9 @@ pub enum CatalogError {
     /// `waiting_to_backfill`, `backfilling` behind an old-path build, or
     /// frozen (`paused`/`quarantined`). Retry once it applies.
     ///
-    /// Also returned when a new definition's source is another
-    /// definition's target whose build hasn't finished (one that isn't
-    /// applying yet). A target's own initial build
-    /// writes it outside the target-mutation seam
-    /// (`staging::target_mutations`), so a reader attached mid-build would
-    /// never hear about the rows the rest of the build writes.
+    /// Also returned when a new definition reads another definition's
+    /// target whose build is running, or that is paused or quarantined
+    /// (`reject_upstream_mid_build`).
     TransformNotLive {
         transform: String,
         status: TransformStatus,
@@ -1046,8 +1043,9 @@ impl crate::error_code::Message for CatalogError {
             ),
             CatalogError::TransformNotLive { transform, status } => write!(
                 f,
-                "'{transform}' is {}, not live; only a fully-built, live definition can be \
-                 edited with ALTER TRANSFORM or read by another transform",
+                "'{transform}' is {}: ALTER TRANSFORM edits only a live definition, and \
+                 another transform can't read one whose build is running or that is paused \
+                 or quarantined",
                 status.as_str()
             ),
             CatalogError::AlterFieldNotFound {
@@ -1505,7 +1503,6 @@ pub(crate) async fn install_definition_restoring(
     restoring: Option<&Restoring<'_>>,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse_for_define(source_text, restoring)?;
-    let restore = restoring.is_some();
 
     // ADR-0011: an explicit schema on either
     // side is trusted outright rather than resolved — checked here, before
@@ -1580,8 +1577,8 @@ pub(crate) async fn install_definition_restoring(
     // waiting for `create_definition_inner`'s later, authoritative one.
     let qualified_source = resolve_source_to_define(pool, &def).await?;
     // Fail fast, before any DDL, on a source that is another
-    // definition's not-yet-live target (see `reject_non_live_upstream`).
-    reject_non_live_upstream(&**pool.get().await?, &qualified_source, restore).await?;
+    // definition's target mid-build (see `reject_upstream_mid_build`).
+    reject_upstream_mid_build(&**pool.get().await?, &[&qualified_source], false).await?;
 
     // `reject_unkeyed_source` fails fast in both arms, before the
     // target's DDL is rendered. `create_definition_inner` repeats it as the
@@ -1607,7 +1604,7 @@ pub(crate) async fn install_definition_restoring(
                 .as_ref()
                 .expect("resolved by validate_for_define");
             for joined in sides.joined_tables() {
-                reject_non_live_upstream(&**pool.get().await?, joined, restore).await?;
+                reject_upstream_mid_build(&**pool.get().await?, &[joined], false).await?;
             }
             for side in sides.tables() {
                 reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
@@ -1627,7 +1624,7 @@ pub(crate) async fn install_definition_restoring(
                 .as_ref()
                 .expect("resolved by validate_for_define");
             for joined in sides.joined_tables() {
-                reject_non_live_upstream(&**pool.get().await?, joined, restore).await?;
+                reject_upstream_mid_build(&**pool.get().await?, &[joined], false).await?;
             }
             for side in sides.tables() {
                 reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
@@ -2052,46 +2049,54 @@ fn derive_reported(
     (reported, causes)
 }
 
-/// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
-/// source, `qualified_source`, is the target of another definition whose
-/// build hasn't finished yet: one that isn't
-/// [`TransformStatus::is_applying`]. A target's initial build
-/// (`defs::backfill`, the chunk queue) writes it directly, outside the
-/// target-mutation seam that tells a chained reader about every other target
-/// write, so a reader attached mid-build would silently miss whatever the
-/// rest of the build writes. Wait for the upstream definition to go live
-/// (or at least reach `catching_up`), then define the chained one.
+/// Refuses (with [`CatalogError::TransformNotLive`]) a new definition that
+/// reads one of `tables` (its source, or a `JOIN`'s joined table) when that
+/// table is the target of another definition whose build is running
+/// (`backfilling`), or that is frozen (`paused`, `quarantined`).
 ///
-/// A restore (`restore`, [`Restoring`]) accepts an upstream that is waiting
-/// for its first build too: it defines every definition unbuilt, upstream
-/// first, the state a define-only handle leaves a chain in once it is built
-/// and its definitions loaded unbuilt.
-async fn reject_non_live_upstream(
+/// An upstream that is `live`, or still `waiting_to_backfill`, is accepted:
+/// one rule for every caller, a define where no worker runs (a test
+/// database, a fresh `ecto.setup`), a define beside a running worker and a
+/// restore. A reader registered before its upstream's build starts applies
+/// from its own build's start, so the upstream's build stages its writes for
+/// it through the target-mutation seam (`staging::target_mutations`), and a
+/// group-basis upstream that needs it rebuilds its readers at the end
+/// (`intake::catch_up::park_target_catchup_if_read`).
+///
+/// `lock` takes the upstreams' definition rows `FOR SHARE`, in id order, in
+/// one statement, before reading their status: a build's start, which moves
+/// an upstream out of `waiting_to_backfill` under its row `FOR UPDATE`, then
+/// waits for the define to commit, so the reader is registered before the
+/// build starts or sees it running and is refused. The authoritative check
+/// in [`create_definition_inner`] locks, after the column-pause lock
+/// (stage 05's lock order); [`install_definition`]'s fail-fast doesn't.
+async fn reject_upstream_mid_build(
     client: &impl GenericClient,
-    qualified_source: &str,
-    restore: bool,
+    tables: &[&str],
+    lock: bool,
 ) -> Result<(), CatalogError> {
-    let Some(row) = client
-        .query_opt(
-            "select split_part(target_table, '.', 2), status from transform_definitions \
-             where target_table = $1",
-            &[&qualified_source],
+    let rows = client
+        .query(
+            &format!(
+                "select split_part(target_table, '.', 2), status from transform_definitions \
+                 where target_table = any($1) order by id{}",
+                if lock { " for share" } else { "" }
+            ),
+            &[&tables],
         )
-        .await?
-    else {
-        return Ok(());
-    };
-    let status_text: String = row.get(1);
-    let status = StoredStatus::from_row(&status_text)?;
-    // A `catching_up` upstream's build has finished: every write to its
-    // target goes through the seam now.
-    if status.is_applying() || (restore && status == StoredStatus::WaitingToBackfill) {
-        return Ok(());
+        .await?;
+    for row in rows {
+        let status_text: String = row.get(1);
+        let status = StoredStatus::from_row(&status_text)?;
+        if status.is_applying() || status == StoredStatus::WaitingToBackfill {
+            continue;
+        }
+        return Err(CatalogError::TransformNotLive {
+            transform: row.get(0),
+            status: status.into(),
+        });
     }
-    Err(CatalogError::TransformNotLive {
-        transform: row.get(0),
-        status: status.into(),
-    })
+    Ok(())
 }
 
 /// Edits an already-registered 1-1 transform's calculated fields in place —
@@ -3597,9 +3602,6 @@ async fn create_definition_inner(
             result => result?,
         },
     };
-    // The authoritative check (`install_definition` repeats it
-    // earlier, before any DDL, as a fail-fast).
-    reject_non_live_upstream(&*txn, &qualified_source, restoring.is_some()).await?;
     // A JOIN's joined table resolves the way its `FROM` does, and is
     // held to the same checks. Its columns are read here, in this
     // transaction, for the catalog row and the hidden tables.
@@ -3624,7 +3626,6 @@ async fn create_definition_inner(
                         }
                     }
                 };
-                reject_non_live_upstream(&*txn, &qualified, restoring.is_some()).await?;
                 joined.push(qualified);
             }
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
@@ -3710,6 +3711,13 @@ async fn create_definition_inner(
         crate::locks::ColumnPauseOp::Define,
     )
     .await?;
+    // The authoritative upstream check (`install_definition` runs it
+    // earlier, unlocked, as a fail-fast), under the upstreams' definition
+    // rows `FOR SHARE`: after the column-pause lock, which a build's start
+    // takes before the row it locks `FOR UPDATE` (stage 05's lock order).
+    let mut read_by_define: Vec<&str> = vec![qualified_source.as_str()];
+    read_by_define.extend(join_sides.iter().flat_map(JoinSides::joined_tables));
+    reject_upstream_mid_build(&*txn, &read_by_define, true).await?;
 
     // ADR-0011: resolve `def.target` — likewise always bare
     // — to its fully-qualified identity exactly once, here, mirroring

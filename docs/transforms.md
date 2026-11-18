@@ -684,9 +684,11 @@ A field's formula, its names and its refusals are in [expressions](expressions.m
 ## Chaining and cycle detection
 
 A field may read another field of its transform, and a target may be another
-transform's source, aggregated or joined, once that transform is `live`
-(`TransformNotLive` otherwise). Each write to a target reaches its readers in
-the write's own transaction, never through capture triggers, which is why an
+transform's source, aggregated or joined, while that transform is `live` or
+still `waiting_to_backfill` (so a migration defines a chain where no worker
+runs), never while its build runs (`TransformNotLive`). Each write to a target
+reaches its readers in the write's own transaction, never through capture
+triggers, which is why an
 aggregate target can be chained off at all; the hand-off doesn't cross into
 another instance
 ([data flow](data-flow.md#writing-to-calculated-tables-and-chaining)).

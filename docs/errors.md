@@ -1080,8 +1080,9 @@ names first.
 ### T0154 TransformNotLive
 
 An `ALTER TRANSFORM` of a transform that isn't `live`, or a define chaining off
-one whose build hasn't finished. Retry once it is `live`; `RESUME` a paused one
-first. After define: matters only when the statement runs.
+one whose build is running (`backfilling`) or that is paused or quarantined.
+Retry once it is `live`; `RESUME` a paused one first. After define: matters
+only when the statement runs.
 
 ### T0155 AlterFieldNotFound
 
