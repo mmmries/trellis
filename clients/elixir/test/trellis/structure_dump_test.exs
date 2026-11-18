@@ -51,7 +51,7 @@ defmodule Trellis.StructureDumpTest do
     assert_loads(cluster, pg, path, "new")
   end
 
-  test "a structure file dumped where Trellis is on loads plain targets where it is off",
+  test "a structure file dumped where Trellis is on loads unbuilt definitions where it is off",
        %{cluster: cluster, pg: pg, tmp_dir: dir} do
     source = define_widgets(cluster, pg, "off")
     on_exit(fn -> Trellis.shutdown(source) end)
@@ -65,29 +65,25 @@ defmodule Trellis.StructureDumpTest do
     database = "dump_loaded_off"
     Postgrex.query!(pg, "create database #{database}", [])
     stop_supervised!(TestRepo)
-    # Off, nothing connects to the :trellis url, so one at a database that
-    # doesn't exist is neither refused nor reached.
-    url = String.replace(cluster["dsn"], cluster["dbname"], "elsewhere")
+    url = String.replace(cluster["dsn"], cluster["dbname"], database)
     put_repo_config(cluster, database: database, dump_path: path, trellis: [url: url])
     Mix.Tasks.Trellis.Load.run(~w(-r Trellis.TestRepo --quiet))
 
     loaded = TestCluster.postgrex!(Map.put(cluster, "dbname", database))
 
-    # The target is a plain table: no definition was restored, so there is
-    # no catalog, no ledger and no capture trigger, and both tables take
-    # writes directly.
-    assert %{rows: [[true, false, false, 0]]} =
+    # Off, the load restores the definition as it does when on, and no
+    # worker builds it: no capture trigger is installed.
+    assert %{rows: [["waiting_to_backfill", false, 0]]} =
              Postgrex.query!(
                loaded,
-               "select to_regclass('public.dump_widget_prices_off') is not null, " <>
-                 "to_regclass('public.dump_widget_prices_off__ledger') is not null, " <>
-                 "to_regclass('trellis.transform_definitions') is not null, " <>
-                 "(select count(*)::int from pg_trigger where not tgisinternal)",
+               "select (select status from trellis.transform_definitions " <>
+                 "where target_table = 'public.dump_widget_prices_off'), " <>
+                 "to_regclass('trellis.restore_queue') is not null, " <>
+                 "(select count(*)::int from pg_trigger where not tgisinternal and tgrelid in " <>
+                 "('public.dump_widgets_off'::regclass, 'public.dump_widget_prices_off'::regclass))",
                []
              )
 
-    Postgrex.query!(loaded, "insert into dump_widgets_off values (1, 5)", [])
-    Postgrex.query!(loaded, "insert into dump_widget_prices_off (id, price) values (1, 5)", [])
     GenServer.stop(loaded)
   end
 

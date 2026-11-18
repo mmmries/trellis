@@ -142,15 +142,15 @@ defmodule Trellis.RefreshTargetTest do
 
   test "an unknown or ambiguous name raises" do
     assert_raise ArgumentError,
-                 ~r/no Trellis definition is recorded for the target nope: .* rq_trellis.restore_queue/,
+                 ~r/no Trellis definition is recorded for the target nope in the schemas rq_trellis/,
                  fn -> refresh("nope") end
 
     assert_raise ArgumentError,
                  ~r/rq_counts names more than one target \(public.rq_counts, rq_other.rq_counts\)/,
                  fn -> refresh("rq_counts") end
 
-    # The default Trellis schema holds no queue here.
-    assert_raise ArgumentError, ~r/ trellis.restore_queue/, fn ->
+    # The default Trellis schema holds no definitions here.
+    assert_raise ArgumentError, ~r/in the schemas trellis$/, fn ->
       TestSupport.refresh_target(GuardedTestRepo, "rq_view")
     end
   end

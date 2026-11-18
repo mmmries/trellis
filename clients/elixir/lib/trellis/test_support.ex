@@ -136,9 +136,9 @@ defmodule Trellis.TestSupport do
   with Trellis off (`config :trellis_pg, enabled: false`), where nothing
   maintains a target.
 
-  Reads the definition from the restore queue a schema load
-  (`mix trellis.load`) leaves in the Trellis schema, or from the catalog of
-  a live instance. Returns `:ok`.
+  Reads the definition from Trellis's catalog (the definitions a migration
+  or `mix trellis.load` recorded), or from a restore queue a structure file
+  loaded without `Trellis.migrate/1` left. Returns `:ok`.
 
   Raises `Trellis.ReadOnlyTarget` unless
   `config :trellis_pg, allow_target_writes` is `true`, and `ArgumentError`
@@ -300,9 +300,8 @@ defmodule Trellis.TestSupport do
 
       [] ->
         raise ArgumentError,
-              "no Trellis definition is recorded for the target #{name}: refresh_target reads " <>
-                "the definitions a schema load left in " <>
-                Enum.map_join(schemas, ", ", &"#{&1}.restore_queue")
+              "no Trellis definition is recorded for the target #{name} in the schemas " <>
+                Enum.join(schemas, ", ")
 
       many ->
         raise ArgumentError,

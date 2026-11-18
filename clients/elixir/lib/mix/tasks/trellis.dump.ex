@@ -37,7 +37,8 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
     refuses: the definitions of one database don't belong in the structure
     file of another.
 
-    Where Trellis is off (`Trellis.enabled?/0`), it is `mix ecto.dump`.
+    It runs the same where Trellis is off (`Trellis.enabled?/0`): a database
+    migrated there has Trellis's schema and definitions too.
     """
 
     @aliases [d: :dump_path, q: :quiet, r: :repo]
@@ -54,19 +55,10 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
     def run(args) do
       {:ok, _} = Application.ensure_all_started(:trellis_pg)
 
-      if Trellis.enabled?() do
-        run_enabled(args)
-      else
-        Mix.shell().info(
-          "Trellis is off (config :trellis_pg, enabled: false): dumping the structure only, " <>
-            "as `mix ecto.dump` does"
-        )
-
-        Mix.Tasks.Ecto.Dump.run(args)
-      end
+      dump_repos(args)
     end
 
-    defp run_enabled(args) do
+    defp dump_repos(args) do
       {opts, _} = OptionParser.parse!(args, strict: @switches, aliases: @aliases)
 
       repos = Mix.Ecto.parse_repo(args)

@@ -312,11 +312,13 @@ the test environment:
 config :trellis_pg, enabled: false, allow_target_writes: true
 ```
 
-`allow_target_writes` lets a test write target schemas (see below). Off, `{Trellis, options}` starts nothing, the `Trellis.Migration` helpers
-skip, and `mix trellis.load` / `mix trellis.dump` are `ecto.load` /
-`ecto.dump`, so target tables are plain tables a test writes directly.
-Build the test database with `mix ecto.load` (aliased to `trellis.load`),
-not `mix ecto.migrate`: a skipped define creates no target table.
+`allow_target_writes` lets a test write target schemas (see below). Off,
+`{Trellis, options}` starts nothing and nothing runs in the background, but
+the `Trellis.Migration` helpers still run, so `mix ecto.migrate` (Phoenix's
+default `test` alias) builds every target, and a new define reaches the test
+database on the next `mix test`. The test repo needs its `:trellis` url too.
+With no worker, definitions stay `waiting_to_backfill` and sources get no
+capture triggers, so test writes capture nothing and targets stay empty.
 `Trellis.enabled?/0` reports the setting.
 
 With Trellis off, `Trellis.TestSupport.refresh_target(MyApp.Repo, "event_counts")` fills a target from its definition's own query (upstream targets first, one transaction). It needs `allow_target_writes: true`.

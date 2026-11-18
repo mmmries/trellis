@@ -1,7 +1,8 @@
 defmodule Trellis.EnabledTest do
-  # `config :trellis_pg, enabled: false`: Trellis is off, and the host runs as
-  # if it were not installed. Each off behaviour, against a cluster of its
-  # own for the ones that touch a database.
+  # `config :trellis_pg, enabled: false`: Trellis's runtime is off, and its
+  # migration helpers and schema tasks run as when it's on. Each off
+  # behaviour, against a cluster of its own for the ones that touch a
+  # database.
   use ExUnit.Case, async: false
 
   alias Trellis.{TestCluster, TestRepo}
@@ -20,11 +21,13 @@ defmodule Trellis.EnabledTest do
       end
 
       define "TRANSFORM off_widget_prices FROM off_widgets SELECT price AS price"
-      apply "PAUSE TRANSFORM off_widget_prices"
-      nil = status("off_widget_prices")
     end
 
-    def down, do: :ok
+    def down do
+      apply "PAUSE TRANSFORM off_widget_prices"
+      apply "DROP TRANSFORM off_widget_prices"
+      drop table(:off_widgets)
+    end
   end
 
   defp turn_off do
@@ -67,8 +70,6 @@ defmodule Trellis.EnabledTest do
       {:ok, _} = Application.ensure_all_started(:ecto_sql)
       {:ok, _} = Application.ensure_all_started(:postgrex)
 
-      # The :trellis url names a database that doesn't exist: nothing may
-      # connect to it, or be refused for it.
       Application.put_env(:trellis_pg, TestRepo,
         socket_dir: cluster["host"],
         port: cluster["port"],
@@ -77,7 +78,7 @@ defmodule Trellis.EnabledTest do
         pool_size: 2,
         log: false,
         dump_prefixes: ["public"],
-        trellis: [url: String.replace(cluster["dsn"], cluster["dbname"], "elsewhere")]
+        trellis: [url: cluster["dsn"]]
       )
 
       Application.put_env(:trellis_pg, :enabled, false)
@@ -91,63 +92,85 @@ defmodule Trellis.EnabledTest do
       %{cluster: cluster, pg: TestCluster.postgrex!(cluster), dir: dir}
     end
 
-    test "the migration helpers skip, and the migration still records as run", %{pg: pg} do
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert :ok = Ecto.Migrator.up(TestRepo, 1, DefineWidgets, log: false)
-        end)
+    test "the migration helpers run: a define creates its target and nothing captures",
+         %{pg: pg} do
+      assert :ok = Ecto.Migrator.up(TestRepo, 1, DefineWidgets, log: false)
 
-      assert log =~ ~s[status("off_widget_prices") returns nil]
-      assert log =~ "Trellis is off"
-      assert log =~ "skipped TRANSFORM off_widget_prices"
+      assert table?(pg, "off_widget_prices")
 
-      # The host's own commands ran; Trellis's did not, and it was never set up.
-      assert table?(pg, "off_widgets")
+      assert %{rows: [["waiting_to_backfill"]]} =
+               Postgrex.query!(
+                 pg,
+                 "select status from trellis.transform_definitions " <>
+                   "where target_table = 'public.off_widget_prices'",
+                 []
+               )
+
+      # Nothing installed a capture trigger, so a write stages nothing.
+      assert triggers(pg, "off_widgets") == []
+      Postgrex.query!(pg, "insert into off_widgets (price) values (3)", [])
+      assert %{rows: [[0]]} = Postgrex.query!(pg, "select count(*) from off_widget_prices", [])
+
+      assert :ok = Ecto.Migrator.down(TestRepo, 1, DefineWidgets, log: false)
       refute table?(pg, "off_widget_prices")
-      refute schema?(pg, "trellis")
-      assert %{rows: [[1]]} = Postgrex.query!(pg, "select count(*) from schema_migrations", [])
+
+      assert %{rows: [[0]]} =
+               Postgrex.query!(pg, "select count(*) from trellis.transform_definitions", [])
     end
 
-    test "dump and load are ecto.dump and ecto.load, and leave targets plain",
-         %{cluster: cluster, pg: pg, dir: dir} do
-      Postgrex.query!(pg, "create table off_prices (id integer primary key, price integer)", [])
+    test "dump and load run as when Trellis is on", %{cluster: cluster, pg: pg, dir: dir} do
+      assert :ok = Ecto.Migrator.up(TestRepo, 1, DefineWidgets, log: false)
       path = Path.join(dir, "structure.sql")
 
       Mix.Tasks.Trellis.Dump.run(~w(-r Trellis.TestRepo --dump-path #{path} --quiet))
 
       text = File.read!(path)
-      assert text =~ "CREATE TABLE public.off_prices"
-      refute text =~ "Trellis definitions"
-      refute text =~ "restore_queue"
+      assert text =~ "CREATE TABLE public.off_widgets"
+      assert text =~ "TRANSFORM off_widget_prices"
 
       database = "off_loaded"
       Postgrex.query!(pg, "create database #{database}", [])
       stop_supervised!(TestRepo)
 
       config = Application.fetch_env!(:trellis_pg, TestRepo)
+      loaded_cluster = Map.put(cluster, "dbname", database)
 
       Application.put_env(
         :trellis_pg,
         TestRepo,
-        Keyword.merge(config, database: database, dump_path: path)
+        Keyword.merge(config,
+          database: database,
+          dump_path: path,
+          trellis: [url: String.replace(cluster["dsn"], cluster["dbname"], database)]
+        )
       )
 
       Mix.Tasks.Trellis.Load.run(~w(-r Trellis.TestRepo --quiet))
 
-      loaded = TestCluster.postgrex!(Map.put(cluster, "dbname", database))
+      loaded = TestCluster.postgrex!(loaded_cluster)
 
-      assert table?(loaded, "public.off_prices")
-      refute schema?(loaded, "trellis")
+      assert %{rows: [["public.off_widget_prices"]]} =
+               Postgrex.query!(
+                 loaded,
+                 "select target_table from trellis.transform_definitions",
+                 []
+               )
+
+      assert triggers(loaded, "off_widgets") == []
 
       GenServer.stop(loaded)
     end
   end
 
-  defp schema?(pg, name) do
-    %{rows: [[found]]} =
-      Postgrex.query!(pg, "select exists (select from pg_namespace where nspname = $1)", [name])
+  defp triggers(pg, table) do
+    %{rows: rows} =
+      Postgrex.query!(
+        pg,
+        "select tgname from pg_trigger where tgrelid = $1::text::regclass and not tgisinternal",
+        [table]
+      )
 
-    found
+    rows
   end
 
   defp table?(pg, name) do

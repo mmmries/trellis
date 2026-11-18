@@ -290,16 +290,16 @@ defmodule Trellis do
       # config/test.exs
       config :trellis_pg, enabled: false
 
-  Off, the host runs as if Trellis were not installed:
+  Off, only the runtime is off:
 
   - `{Trellis, options}` in a supervision tree starts nothing (its child
     spec's `start_link/1` returns `:ignore`), and the log bridge isn't
     installed. Nothing connects and nothing runs in the background.
-  - The `Trellis.Migration` helpers skip with a log message, so a migration
-    still records as run.
-  - `mix trellis.load` is `mix ecto.load` and `mix trellis.dump` is
-    `mix ecto.dump`: target tables load as plain tables.
   - Nothing is refused at boot.
+  - The `Trellis.Migration` helpers, `mix trellis.load` and
+    `mix trellis.dump` run as they do when it's on, so migrating builds
+    every target. With no worker, definitions stay `waiting_to_backfill`
+    and no capture triggers are installed (see `Trellis.Migration`).
 
   Calls made through a handle that was connected explicitly with
   `connect/1` are not affected.
