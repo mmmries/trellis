@@ -49,6 +49,8 @@ path pulls in an OpenTelemetry or gRPC stack. The engine's log lines reach
 
 The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a bang variant.
 
+Connect directly or through a session-mode pooler, never a transaction-mode one ([recommendations](../../docs/recommendations.md#connect-directly-or-through-a-session-mode-pooler)).
+
 - `connect/1`, `migrate/1`, `config/1`, `shutdown/1`: the handle's lifecycle.
 - `apply/2`: any statement of Trellis's grammar (`TRANSFORM`,
   `PAUSE TRANSFORM`, `RESUME TRANSFORM`, `DROP TRANSFORM`,
@@ -244,7 +246,8 @@ down when the supervisor stops it:
 
 ```elixir
 # config/runtime.exs
-database_url = System.fetch_env!("DATABASE_URL")
+# A direct or session-mode URL, not the Repo's pooled DATABASE_URL.
+database_url = System.fetch_env!("TRELLIS_DATABASE_URL")
 
 config :my_app, MyApp.Trellis,
   name: MyApp.Trellis,
