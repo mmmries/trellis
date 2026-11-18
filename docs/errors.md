@@ -6,9 +6,8 @@ renumbered ([ADR-0008](decisions/0008-public-api-design.md#3-stable-ffi-safe-err
 the coarse category a host branches on is the error's `code()`
 ([embedding](embedding.md#the-rust-api)).
 
-The refusal tables in [transforms](transforms.md#refusals) and
-[expressions](expressions.md#refusals) list what a definition may not do and
-what happens when the condition appears after define. A refusal of a stored
+A refusal's entry gives its remedy and the [class](transforms.md#after-define)
+of what happens when the condition appears after define. A refusal of a stored
 definition, at `RESUME`, `ALTER TRANSFORM` or an upgrade, reports the same
 code as at define.
 
@@ -19,8 +18,9 @@ The text of a statement doesn't parse, or uses a form the grammar
 
 ### T0001 UnexpectedChar
 
-A character no token starts with, or an operator character no listed
-operator uses. Remove it, or use a [listed operator](expressions.md#calculated-fields).
+A character no token starts with, or an operator character no listed operator
+uses. Remove it, or use a [listed operator](expressions.md#calculated-fields).
+After define: [Text](transforms.md#text).
 
 ### T0002 UnterminatedString
 
@@ -39,29 +39,33 @@ expected. Complete the statement.
 ### T0005 UnsupportedKeySpace
 
 A construct the statement's shape doesn't take, such as a `JOIN` form outside
-the [admitted shapes](transforms.md#an-unsupported-join-shape). Rewrite it in
-an admitted shape; for `RIGHT JOIN`, swap the tables and use `LEFT JOIN`.
+the [admitted shapes](transforms.md#an-unsupported-join-shape). Rewrite it in an
+admitted shape; for `RIGHT JOIN`, swap the tables and use `LEFT JOIN`. After
+define: [Text](transforms.md#text).
 
 ### T0006 UnsupportedOperator
 
-An operator the [lists](expressions.md#calculated-fields) don't name
-(`a || b`, `a ^ b`). Use a listed operator.
+An operator the [lists](expressions.md#calculated-fields) don't name (`a || b`,
+`a ^ b`). Use a listed operator. After define: [Text](transforms.md#text).
 
 ### T0007 UnsupportedFunction
 
 A function the [lists](expressions.md#calculated-fields) don't name,
 `date_part` included. Use a listed function; `EXTRACT` for `date_part`.
 
+After define: [Text](transforms.md#text).
+
 ### T0008 FunctionArityMismatch
 
-A listed function called with the wrong number of arguments. Pass the number
-the message names.
+A listed function called with the wrong number of arguments. Pass the number the
+message names. After define: [Text](transforms.md#text).
 
 ### T0009 NonImmutableConstruct
 
 A function that isn't [immutable](expressions.md#immutability) (`now()`,
 `random()`): its value changes without a source row changing. Compute it in
 the application, or store it in a source column.
+After define: [Text](transforms.md#text).
 
 ### T0010 UnsupportedPredicate
 
@@ -73,45 +77,56 @@ and define it again, which writes the current grammar.
 
 `COALESCE()` with no arguments. Pass at least one.
 
+After define: [Text](transforms.md#text).
+
 ### T0012 TooManyQualifiedNameParts
 
-A table name of more than two parts (`a.b.c`). Write `<schema>.<table>`.
+A table name of more than two parts (`a.b.c`). Write `<schema>.<table>`. After
+define: [Text](transforms.md#text).
 
 ### T0013 TooManyColumnNameParts
 
 A column name of more than three parts. Write at most
 `<schema>.<table>.<column>`.
 
+After define: [Text](transforms.md#text).
+
 ### T0014 GroupByKeyNotFromSource
 
 A `GROUP BY` key qualified with a table other than the `FROM` table. Name the
 `FROM` table, or read the other table with a `JOIN`.
 
+After define: [Text](transforms.md#text).
+
 ### T0015 TableAlias
 
 A table alias the grammar refuses: a reserved word, the other `JOIN` table's
 name or alias, or any alias on a single-table definition. Drop the alias, or
-choose another.
+choose another. After define: [Text](transforms.md#text).
 
 ### T0016 AliasedTableName
 
 A column qualified with the name of a `JOIN` table that has an alias. As in
-Postgres, qualify it with the alias.
+Postgres, qualify it with the alias. After define: [Text](transforms.md#text).
 
 ### T0017 UnsupportedCastTarget
 
 A `CAST` to a type the grammar doesn't list, or to a type with a modifier
-(`numeric(10,2)`). Cast to a [listed type](expressions.md#a-cast-that-is-not-an-exact-conversion)
-without a modifier.
+(`numeric(10,2)`). Cast to a [listed
+type](expressions.md#a-cast-that-is-not-an-exact-conversion) without a modifier.
+After define: [Retype](transforms.md#retype).
 
 ### T0018 PrefixMinusChainTooLong
 
-More than 100 prefix `-` in a row. Shorten the run.
+More than 100 prefix `-` in a row. Shorten the run. After define:
+[Text](transforms.md#text).
 
 ### T0019 ReservedWord
 
-A word Postgres reserves (`order`, `user`, `end`) used as a bare name.
-Quote it (`"order"`), or qualify it (`orders.order`).
+A word Postgres reserves (`order`, `user`, `end`) used as a bare name
+([details](expressions.md#an-unquoted-reserved-word-as-a-name)). Quote it
+(`"order"`), or qualify it (`orders.order`). After define:
+[Retype](transforms.md#retype): renaming a read column is a rename.
 
 ### T0020 SplitOperator
 
@@ -122,6 +137,8 @@ Postgres too. Write it without the space.
 
 `--`, which starts a comment in SQL. Write `- -x`.
 
+After define: [Text](transforms.md#text).
+
 ### T0022 NumericTrailingJunk
 
 A number directly followed by a letter (`1AND`, `12abc`), which Postgres
@@ -129,13 +146,16 @@ refuses. Separate them with a space.
 
 ### T0023 UnsupportedNumericForm
 
-A number with an exponent (`1e3`), a `0x`/`0o`/`0b` prefix or `_`
-separators. Write plain digits, with an optional fraction.
+A number with an exponent (`1e3`), a `0x`/`0o`/`0b` prefix or `_` separators.
+Write plain digits, with an optional fraction. After define:
+[Text](transforms.md#text).
 
 ### T0024 NonAssociativeComparison
 
 Chained comparisons (`a < b < c`), a syntax error in Postgres. Join them with
 `AND`, or add parentheses.
+
+After define: [Text](transforms.md#text).
 
 ### T0025 UnsupportedIsForm
 
@@ -143,24 +163,31 @@ Chained comparisons (`a < b < c`), a syntax error in Postgres. Join them with
 `x IS NOT DISTINCT FROM TRUE` (`IS DISTINCT FROM` for the `NOT` forms), or
 `x IS NULL`.
 
+After define: [Text](transforms.md#text).
+
 ### T0026 NotChainTooLong
 
-More than 100 prefix `NOT` in a row. Shorten the run.
+More than 100 prefix `NOT` in a row. Shorten the run. After define:
+[Text](transforms.md#text).
 
 ### T0027 SimpleCaseUnsupported
 
 The simple `CASE <operand> WHEN <value> THEN …`. Write
 `CASE WHEN <operand> = <value> THEN …`.
 
+After define: [Text](transforms.md#text).
+
 ### T0029 UnsupportedCastOperator
 
 `<expr>::<type>`. Write `CAST(<expr> AS <type>)`, or a typed literal
 (`DATE '2024-01-05'`).
+After define: [Text](transforms.md#text).
 
 ### T0030 ExpressionTooDeep
 
-An expression nested more than 100 levels deep. Split it into calculated
-fields.
+An expression nested more than 100 levels deep: operands chained by operators,
+or nested parentheses or calls (a flat list of many terms is not deep). Split
+it into calculated fields. After define: [Text](transforms.md#text).
 
 ### T0031 MalformedDefinitionAddress
 
@@ -176,27 +203,33 @@ A `"` quoted name never closes. Close it; write `""` for a quote inside.
 
 `""`, a zero-length name, which Postgres refuses. Write a name.
 
+After define: [Text](transforms.md#text).
+
 ### T0034 UnicodeEscapeIdentifier
 
-A `U&"…"` name. Write the name in ASCII.
+A `U&"…"` name. Write the name in ASCII. After define:
+[Text](transforms.md#text).
 
 ### T0035 UnsupportedQuotedIdentifier
 
 A quoted name the grammar refuses though Postgres takes it
 ([details](expressions.md#an-unsupported-quoted-name)). Rename the table or
 column, or write the name in ASCII characters; leave function and type names
-unquoted.
+unquoted. After define: [Text](transforms.md#text).
 
 ### T0036 NameTooLong
 
-A name over Postgres's 63 bytes, which Postgres would truncate. Shorten it. A
-stored definition with such a name keeps running, but its `ALTER TRANSFORM`
-refuses: drop it and define it again with a shorter name.
+A name over Postgres's 63 bytes after folding and unescaping, which Postgres
+would truncate. Shorten it. After define: [Text](transforms.md#text). A
+definition 0.1.x stored with a longer `AS` label keeps running, but its `ALTER
+TRANSFORM` refuses and the upgrade that writes a `KEY (…)` into it pauses it:
+drop it and define it again with a shorter name.
 
 ### T0037 ReservedTableName
 
-An unquoted table name Postgres reserves (`FROM user`). Quote it as the
-catalog spells it (`FROM "user"`), or qualify it (`public.user`).
+An unquoted table name Postgres reserves (`FROM user`). Quote it as the catalog
+spells it (`FROM "user"`), or qualify it (`public.user`). After define:
+[Text](transforms.md#text).
 
 ### T0038 GrammarVersionTooOld
 
@@ -213,40 +246,43 @@ release ([upgrading](upgrading.md#rolling-back)).
 ### T0240 UnsupportedAggregateModifier
 
 An aggregate call with `DISTINCT`, `ALL`, `ORDER BY` or `FILTER (WHERE …)`.
-Postgres accepts each; Trellis supports none. For `COUNT(DISTINCT x)`,
-[count in two transforms](transforms.md#counting-distinct-values). Drop `ALL`:
-it is the default. For the others, move the condition or order out of the
-call.
+Postgres accepts each; Trellis supports none. For `COUNT(DISTINCT x)`, [count in
+two transforms](transforms.md#counting-distinct-values). Drop `ALL`: it is the
+default. For the others, move the condition or order out of the call. After
+define: [Text](transforms.md#text).
 
 ## Definition checks
 
 The text parses, but what it computes isn't one Trellis maintains exactly
-([refusal table](expressions.md#refusals)).
+(what an [expression](expressions.md) may contain).
 
 ### T0028 UnsupportedLiteralType
 
-A typed literal of a type with no admitted literal. Write a literal of a
-[listed type](type-support.md#typed-literals-and-casts), or `CAST` one.
+A typed literal of a type with no admitted literal. Write a literal of a [listed
+type](type-support.md#typed-literals-and-casts), or `CAST` one. After define:
+[Text](transforms.md#text).
 
 ### T0040 DuplicateFieldName
 
-Two fields with one name. Rename one.
+Two fields with one name. Rename one. After define: [Text](transforms.md#text).
 
 ### T0041 ReservedFieldName
 
 A field name starting with `__`, which Trellis keeps for the columns it adds.
-Rename the field.
+Rename the field. After define: [Text](transforms.md#text).
 
 ### T0042 ReservedGroupByColumnName
 
 A `GROUP BY` key whose target column name starts with `__`. Group by another
-column, or join a 1-1 target that renames it.
+column, or join a 1-1 target that renames it. After define:
+[Text](transforms.md#text).
 
 ### T0043 FieldNamedAfterPrimaryKey
 
-A 1-1 field named after a source key column (`id AS id`): the target carries
-every key column already. Drop the field, or give it another name
-(`id AS order_id`).
+A 1-1 field named after a source key column, or a 1-1 `JOIN`'s after an `a` key
+column (`id AS id`): the target carries every key column already. Drop the
+field, or give it another name (`id AS order_id`). After define:
+[Text](transforms.md#text).
 
 ### T0044 UnresolvedColumn
 
@@ -255,121 +291,139 @@ message lists what is there.
 
 ### T0045 Cycle
 
-Fields that read each other in a cycle. Break the cycle.
+Fields that read each other in a cycle. Break the cycle. After define:
+[Text](transforms.md#text).
 
 ### T0046 FieldExpansionTooLarge
 
-Fields that read each other so often or so deeply that inlining them passes
-100 levels or 100,000 nodes. Shorten the chain, or read source columns in the
-later fields.
+Fields that read each other so often or so deeply that inlining them passes 100
+levels or 100,000 nodes. Shorten the chain, or read source columns in the later
+fields. After define: [Text](transforms.md#text).
 
 ### T0047 TableCycle
 
 The target would feed its own source through a
 [chain](transforms.md#chaining-and-cycle-detection). Write to another target.
+After define: [Text](transforms.md#text).
 
 ### T0048 TargetEqualsSource
 
-The target is the source table. Write to another target.
+The target is the source table. Write to another target. After define:
+[Text](transforms.md#text).
 
 ### T0050 JoinSelf
 
 A table joined to itself, even under two aliases: one change would feed both
-sides. Not supported.
+sides. Not supported. After define: [Text](transforms.md#text).
 
 ### T0051 JoinTooManyTables
 
 An aggregate `JOIN` of more than two tables. Join two, or chain transforms.
+After define: [Text](transforms.md#text).
 
 ### T0052 JoinUnknownTable
 
 A column qualified with a table the `JOIN` doesn't read. Qualify it with the
 `FROM` or joined table.
 
+After define: [Text](transforms.md#text).
+
 ### T0053 JoinUnqualifiedColumn
 
-An unqualified column in a `JOIN`. Qualify it with its table.
+An unqualified column in a `JOIN`. Qualify it with its table. After define:
+[Text](transforms.md#text).
 
 ### T0054 JoinUnresolvedColumn
 
-A qualified column its table doesn't have. Fix the name.
+A qualified column its table doesn't have. Fix the name. After define:
+[Text](transforms.md#text).
 
 ### T0055 JoinOnSameSide
 
-An `ON` term comparing two columns of one table. Compare a column of each
-side.
+An `ON` term comparing two columns of one table. Compare a column of each side.
+After define: [Text](transforms.md#text).
 
 ### T0056 JoinMixedSideArgument
 
-An aggregate argument reading both tables (`SUM(a.x + b.y)`). Read one
-table per argument.
+An aggregate argument reading both tables (`SUM(a.x + b.y)`). Read one table per
+argument. After define: [Text](transforms.md#text).
 
 ### T0057 JoinOnRepeatedPair
 
-An `ON` term repeating an earlier one. Remove it.
+An `ON` term repeating an earlier one. Remove it. After define:
+[Text](transforms.md#text).
 
 ### T0058 JoinOnRepeatedColumn
 
 A column in two `ON` terms, paired with different columns. Name each column
-once.
+once. After define: [Text](transforms.md#text).
 
 ### T0059 IndexKeyTooWide
 
-A key over more than 32 columns (31 for a 1-1 `JOIN`'s `ON`), Postgres's
-index limit. Group by or join on fewer columns.
+A key over more than 32 columns (31 for a 1-1 `JOIN`'s `ON`), Postgres's index
+limit. Group by or join on fewer columns. After define:
+[Text](transforms.md#text).
 
 ### T0060 TableTooWide
 
 A table Trellis would create of more than 1,600 columns
-([details](transforms.md#a-table-of-more-than-1600-columns)). Use fewer
-fields or distinct aggregate arguments.
+([details](transforms.md#a-table-of-more-than-1600-columns)). Use fewer fields
+or distinct aggregate arguments. After define: [Text](transforms.md#text).
 
 ### T0061 JoinKeyTypeMismatch
 
 `ON` columns of different types or collations. Alter one column to match the
 other; after define, then `RESUME`.
+After define: [Retype](transforms.md#retype); a change between deterministic
+collations pauses nothing, but `RESUME` refuses until they match.
 
 ### T0062 JoinUnsupportedKeyType
 
-An `ON` column of a type off the [join-key list](type-support.md#matrix).
-Join on a listed type; after define, retype the column, then `RESUME`.
+An `ON` column of a type off the [join-key list](type-support.md#matrix). Join
+on a listed type; after define, retype the column, then `RESUME`. After define:
+[Retype](transforms.md#retype).
 
 ### T0063 JoinNondeterministicCollation
 
 An `ON` column with a nondeterministic collation, whose `=` Trellis can't
-reproduce. Use a deterministic collation ([collation](type-support.md#collation)).
+reproduce. Use a deterministic collation
+([collation](type-support.md#collation)). After define:
+[Retype](transforms.md#retype).
 
 ### T0064 JoinFieldShape
 
-A `JOIN` field that is neither a `GROUP BY` key nor an admitted aggregate of
-one column ([shapes](transforms.md#an-unsupported-join-shape)). Rewrite it in
-an admitted shape.
+A `JOIN` field that is neither a `GROUP BY` key nor an admitted aggregate of one
+column ([shapes](transforms.md#an-unsupported-join-shape)). Rewrite it in an
+admitted shape. After define: [Text](transforms.md#text).
 
 ### T0065 OneToOneJoinAggregate
 
 An aggregate in a 1-1 `JOIN`. Add a `GROUP BY`, or aggregate in a separate
-transform.
+transform. After define: [Text](transforms.md#text).
 
 ### T0066 OneToOneJoinKeyNotUnique
 
 The joined table's `ON` columns aren't unique, so a row could match several
 ([1-1 `JOIN`](transforms.md#a-1-1-join)). Join on a unique key, or create a
-unique index over the `ON` columns.
+unique index over the `ON` columns. After define: [Key](transforms.md#key),
+[Retype](transforms.md#retype) or [Shape](transforms.md#shape), by what changed.
 
 ### T0067 OneToOneJoinUnsupported
 
-A construct a 1-1 `JOIN` doesn't take; the message names the fix.
+A construct a 1-1 `JOIN` doesn't take; the message names the fix. After define:
+[Key](transforms.md#key), [Retype](transforms.md#retype) or
+[Shape](transforms.md#shape), by what changed.
 
 ### T0068 StarJoinTooManyTables
 
 A 1-1 `JOIN` of more than 5 tables
 ([star](transforms.md#1-1-join-of-more-than-two-tables-star)). Join at most 5,
-or chain transforms.
+or chain transforms. After define: [Text](transforms.md#text).
 
 ### T0069 JoinOnReadsAnotherJoinedTable
 
-An `ON` reading another joined table: each joins to the `FROM` table. Join
-each table to the `FROM` table.
+An `ON` reading another joined table: each joins to the `FROM` table. Join each
+table to the `FROM` table. After define: [Text](transforms.md#text).
 
 ### T0070 DeferredAggregate
 
@@ -377,82 +431,97 @@ An aggregate Trellis doesn't keep exact yet: `MIN`/`MAX` in a `JOIN`,
 `bool_*`, `bit_*`, `array_agg`, `string_agg`, `jsonb_agg`
 ([not supported](type-support.md#aggregates-that-are-not-supported)).
 Take `MIN`/`MAX` in a plain aggregate over one table.
+After define: [Text](transforms.md#text).
 
 ### T0071 UnsupportedAggregateArgument
 
 `SUM` or `AVG` over a type other than a number or an `interval`. Aggregate a
 number or `interval` column.
+After define: [Retype](transforms.md#retype).
 
 ### T0072 UnsupportedExtremeArgument
 
 `MIN` or `MAX` over a type with no order or with a collation
 ([`MIN` and `MAX`](type-support.md#min-and-max)). Aggregate a number, date or
 time column.
+After define: [Index](transforms.md#index), [Retype](transforms.md#retype).
 
 ### T0073 ExtremeOfExpression
 
 `MIN` or `MAX` of an expression. Aggregate a plain source column; compute
 the expression in a 1-1 transform first.
+After define: [Index](transforms.md#index), [Retype](transforms.md#retype).
 
 ### T0074 ChainedExtreme
 
 `MIN` or `MAX` of another transform's target, which has no index for its
 probe. Aggregate the source table instead.
+After define: [Index](transforms.md#index), [Retype](transforms.md#retype).
 
 ### T0075 ExtremesWithoutSourceIndex
 
 `WITHOUT SOURCE INDEX` on a definition with `MIN` or `MAX`, whose probe
 needs an index. Drop `WITHOUT SOURCE INDEX` and create the indexes the
 message names.
+After define: [Index](transforms.md#index), [Retype](transforms.md#retype).
 
 ### T0076 ReservedTargetSuffix
 
-A target name ending in `__ledger`, a name Trellis keeps for a target's
-ledger. Choose another name.
+A target name ending in `__ledger`, a name Trellis keeps for a target's ledger.
+Choose another name. After define: [Text](transforms.md#text).
 
 ### T0077 TargetNameTooLong
 
-A target name over 55 bytes: its ledger's name would pass 63. Choose a
-shorter name.
+A target name over 55 bytes: its ledger's name would pass 63. Choose a shorter
+name. After define: [Text](transforms.md#text).
 
 ### T0078 TypeMismatch
 
 An operand type an operator doesn't take (`text_col + 1`; `+` never
-concatenates). `CAST` it, or use an operand of the operator's type.
+concatenates). `CAST` it, or use an operand of the operator's type. After
+define: [Retype](transforms.md#retype).
 
 ### T0079 MixedFloatExactComparison
 
 A float compared with an exact numeric
-([details](expressions.md#a-float-compared-with-an-exact-numeric)). Compare
-two floats or two exact values.
+([details](expressions.md#a-float-compared-with-an-exact-numeric)). Compare two
+floats or two exact values. After define: [Retype](transforms.md#retype).
 
 ### T0080 MixedTemporalComparison
 
 Two different temporal types compared, a comparison that can read the session
-time zone. `CAST` one side so both are one type.
+time zone. `CAST` one side so both are one type. After define:
+[Retype](transforms.md#retype).
 
 ### T0081 TextOrderingComparison
 
 `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. Order
 by a non-text value, or by `CHAR_LENGTH`.
+After define: [Retype](transforms.md#retype).
 
 ### T0082 ComparisonTypeMismatch
 
-A comparison or `NULLIF` between types no family covers (`text` with a
-number). Compare values of one family; `IS NULL` takes any type.
+A comparison or `NULLIF` between types no family covers (`text` with a number).
+Compare values of one family; `IS NULL` takes any type. After define:
+[Retype](transforms.md#retype).
 
 ### T0083 NullIfFirstArgumentCast
 
 `NULLIF(a, b)` where Postgres casts `a` to compare it. Write
 `NULLIF(CAST(a AS numeric), b)`, or put the float first.
 
+After define: [Retype](transforms.md#retype).
+
 ### T0084 CaseConditionNotBoolean
 
-A `CASE` condition that isn't `boolean`. Compare it (`WHEN x = 1`).
+A `CASE` condition that isn't `boolean`. Compare it (`WHEN x = 1`). After
+define: [Retype](transforms.md#retype).
 
 ### T0085 CaseResultTypeMismatch
 
 `CASE` results that don't unify to one type. `CAST` them to one type.
+
+After define: [Retype](transforms.md#retype).
 
 ### T0086 UntypedNull
 
@@ -460,20 +529,27 @@ A `NULL` with no type from its context
 ([details](expressions.md#an-untyped-null-literal)). Write
 `CAST(NULL AS <type>)`.
 
+After define: [Text](transforms.md#text); beside a column (`date_col + NULL`),
+[Retype](transforms.md#retype).
+
 ### T0087 ConstantDivisorZero
 
 A literal zero divisor, which fails every row
-([details](expressions.md#a-literal-zero-divisor)). Divide by a nonzero
-value or a column; `x / NULLIF(col, 0)`.
+([details](expressions.md#a-literal-zero-divisor)). Divide by a nonzero value or
+a column; `x / NULLIF(col, 0)`. After define: [Text](transforms.md#text).
 
 ### T0088 IntegerDivision
 
 `/` between two integers, which Postgres truncates. Write
 `CAST(qty AS numeric) / 2`.
 
+After define: [Retype](transforms.md#retype).
+
 ### T0089 FloatModulo
 
 `%` with a float operand. Use integer or `numeric` operands.
+
+After define: [Retype](transforms.md#retype).
 
 ### T0090 TemporalOperand
 
@@ -483,47 +559,53 @@ fix. For example `DATE_TRUNC('month', CAST(d AS timestamp))` for a date,
 `tz AT TIME ZONE 'UTC'` before reading a `timestamptz` as a `timestamp`, and
 an `integer` day count or `EXTRACT(EPOCH FROM …)` differences for date
 arithmetic.
+After define: [Retype](transforms.md#retype).
 
 ### T0091 TemporalLiteral
 
-A `DATE_TRUNC` unit, `EXTRACT` field or `AT TIME ZONE` zone that isn't
-admitted ([details](expressions.md#a-date_trunc-unit-or-extract-field-that-is-not-admitted)).
+A `DATE_TRUNC` unit, `EXTRACT` field or `AT TIME ZONE` zone that isn't admitted
+([details](expressions.md#a-date_trunc-unit-or-extract-field-that-is-not-admitted)).
 Use a listed unit or field, and the zone `'UTC'`; convert other zones in the
-source.
+source. After define: [Text](transforms.md#text) for a unit or field;
+[Retype](transforms.md#retype) for an `AT TIME ZONE` zone.
 
 ### T0092 UnsupportedCast
 
 A `CAST` that isn't an exact conversion
-([details](expressions.md#a-cast-that-is-not-an-exact-conversion)). Widen
-the column, or compute in `numeric`. A `timestamptz` to `timestamp` is
-[T0090](#t0090-temporaloperand): write `tz AT TIME ZONE 'UTC'`.
+([details](expressions.md#a-cast-that-is-not-an-exact-conversion)). Widen the
+column, or compute in `numeric`. A `timestamptz` to `timestamp` is
+[T0090](#t0090-temporaloperand): write `tz AT TIME ZONE 'UTC'`. After define:
+[Retype](transforms.md#retype).
 
 ### T0093 NumericFunctionArgument
 
 An argument `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` doesn't take
 ([details](expressions.md#an-argument-abs-ceil-floor-round-or-trunc-does-not-admit)).
-Pass the integer itself, or a `numeric` value (`CAST(qty AS numeric)`).
+Pass the integer itself, or a `numeric` value (`CAST(qty AS numeric)`). After
+define: [Retype](transforms.md#retype).
 
 ### T0094 ScaleNotIntegerLiteral
 
-A `ROUND` or `TRUNC` scale that isn't an integer literal. Write the scale as
-a literal.
+A `ROUND` or `TRUNC` scale that isn't an integer literal. Write the scale as a
+literal. After define: [Retype](transforms.md#retype).
 
 ### T0095 FunctionArgTypeMismatch
 
 A function argument of the wrong type for its position. Pass the type the
-message names, with `CAST` if needed.
+message names, with `CAST` if needed. After define:
+[Retype](transforms.md#retype).
 
 ### T0096 NonLiteralRegexPattern
 
 A `REGEXP_COUNT` pattern that isn't a string literal. Write the pattern as a
-literal.
+literal. After define: [Text](transforms.md#text).
 
 ### T0097 InvalidTypedLiteral
 
 A typed literal not in its type's canonical spelling
 ([details](expressions.md#a-typed-literal-not-in-its-types-canonical-spelling)).
-Write the spelling Postgres prints: `DATE '2024-01-05'`.
+Write the spelling Postgres prints: `DATE '2024-01-05'`. After define:
+[Text](transforms.md#text).
 
 ### T0099 UnresolvedGroupByColumn
 
@@ -531,56 +613,68 @@ A `GROUP BY` column the source doesn't have. Fix the name.
 
 ### T0100 UnsupportedGroupByKeyType
 
-A `GROUP BY` key of a type that can't be a key ([matrix](type-support.md#matrix)).
-Group by a column of a key type; after define, retype it, then `RESUME`.
+A `GROUP BY` key of a type that can't be a key
+([matrix](type-support.md#matrix)). Group by a column of a key type; after
+define, retype it, then `RESUME`. After define: [Retype](transforms.md#retype).
 
 ### T0101 GroupByKeysShareTargetColumn
 
 Two `GROUP BY` keys with one target column name (`orders.region` and
 `customers.region`); keys can't be aliased. List a key once; for a `JOIN`,
 join a 1-1 target that renames one side's column.
+After define: [Text](transforms.md#text).
 
 ### T0102 UngroupedColumnReference
 
 A field reading a column that is neither a `GROUP BY` key nor inside an
-aggregate. Aggregate the column, or group by it.
+aggregate. Aggregate the column, or group by it. After define:
+[Text](transforms.md#text).
 
 ### T0103 AggregateOfAggregateField
 
 An aggregate of another aggregate field (`SUM(val) AS total, SUM(total)`).
-Aggregate the source column.
+Aggregate the source column. After define: [Text](transforms.md#text).
 
 ### T0104 AmbiguousColumnReference
 
-A bare name that is both a source column and a field computing something
-else. Write `src.val` for the column, or rename the field.
+A bare name that is both a source column and a field computing something else.
+Write `src.val` for the column, or rename the field. After define: [Resume
+only](transforms.md#resume-only): a source column added under a field's name.
 
 ### T0105 QualifiedColumnNotFromSource
 
-A column qualified with a table or schema other than the `FROM` table's.
-Name the `FROM` table, or read the other table with a `JOIN`.
+A column qualified with a table or schema other than the `FROM` table's. Name
+the `FROM` table, or read the other table with a `JOIN`. After define:
+[Text](transforms.md#text).
 
 ### T0106 GroupingColumnFieldMustBePassthrough
 
-A field named after a `GROUP BY` key that isn't that key
-(`GROUP BY id SELECT SUM(id) AS id`). Rename the field.
+A field named after a `GROUP BY` key that isn't that key (`GROUP BY id SELECT
+SUM(id) AS id`). Rename the field. After define: [Text](transforms.md#text).
 
 ### T0107 CalculatedFieldShadowsSourceColumn
 
 A 1-1 field named after a source column it doesn't pass through. Rename the
-field. After define, a source column added under a field's name refuses
-`RESUME` until one of them is renamed.
+field. After define: [Resume only](transforms.md#resume-only): a source column
+added under a field's name, until one of them is renamed.
 
 ### T0108 NondeterministicKeyCollation
 
 A key column with a nondeterministic collation, whose `=` treats distinct
-strings as equal. Use a deterministic collation ([collation](type-support.md#collation)).
+strings as equal. Use a deterministic collation
+([collation](type-support.md#collation)). After define:
+[Retype](transforms.md#retype).
 
 ### T0109 NondeterministicCollationTextFunction
 
 A column with a nondeterministic collation passed to `STRPOS` or
-`REGEXP_COUNT`, which Postgres refuses for every row. Use a deterministic
-collation, or a column with one.
+`REGEXP_COUNT`, which Postgres refuses for every row, or compared as text (`=`,
+`<>`, `!=`, `IS [NOT] DISTINCT FROM`, `NULLIF`), where its `=` would treat
+distinct strings as equal; directly or through `COALESCE`, a `CASE` result or a
+field. Use a deterministic collation, or a column with one. After define: under
+`STRPOS` or `REGEXP_COUNT`, [Per row](transforms.md#per-row); on a column only
+compared, nothing detects it ([known correctness
+gaps](known-correctness-gaps.md#a-read-column-given-a-nondeterministic-collation)).
 
 ### T0110 QualifiedSourceTableNotFound
 
@@ -603,16 +697,19 @@ different collations, neither the database default, directly or through
 `COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and
 fails every row where both are not `NULL`. Give the two columns one collation
 (`ALTER COLUMN … TYPE text COLLATE …`).
+After define: a column re-collated later holds each key written ([releasing
+held keys](operations.md#releasing-held-keys)), and `RESUME` refuses it.
 
 ### T0234 PredicateNotBoolean
 
 A [`WHERE`](expressions.md#where) whose type isn't `boolean`. Write a
-comparison: `qty > 0`.
+comparison: `qty > 0`. After define: [Retype](transforms.md#retype).
 
 ### T0235 AggregateInPredicate
 
 A [`WHERE`](expressions.md#where) that calls an aggregate: it filters source
-rows, not groups. Compare source columns: `qty > 0`.
+rows, not groups. Compare source columns: `qty > 0`. After define:
+[Text](transforms.md#text).
 
 ### T0236 PredicateColumnNotFound
 
@@ -622,9 +719,10 @@ have; the message names it. A `WHERE` reads source columns, never fields.
 ### T0237 PredicateNotTotal
 
 A [`WHERE` construct that can raise an error](expressions.md#where) for some
-value of its operands; the message names it. Compare without it, or filter on
-a stored generated column or a [chained](transforms.md#chaining-and-cycle-detection)
-1-1 transform.
+value of its operands; the message names it. Compare without it, or filter on a
+stored generated column or a
+[chained](transforms.md#chaining-and-cycle-detection) 1-1 transform. After
+define: [Retype](transforms.md#retype).
 
 ### T0239 FilteredExtreme
 
@@ -633,11 +731,14 @@ extreme is read from a source index, which holds the rows the `WHERE` drops
 too. Take the `MIN`/`MAX` of a stored generated column
 `CASE WHEN <predicate> THEN <column> END` in an unfiltered transform.
 
+After define: [Text](transforms.md#text).
+
 ### T0241 EnumLiteralNotALabel
 
 An enum column compared with a string literal that is not one of its labels:
 Postgres fails every statement that reads it. Use a label of the enum. After a
 label was renamed, rename it back, or drop the transform and define it again.
+After define: [Retype](transforms.md#retype).
 
 ### T0243 JoinPredicateReadsBothSides
 
@@ -647,6 +748,7 @@ names it. Each condition filters one table's rows, so no table can apply this
 one. Split it into conditions that each read one table, or compute the value
 in a [chained](transforms.md#chaining-and-cycle-detection) 1-1 `JOIN` and
 aggregate that.
+After define: [Text](transforms.md#text).
 
 ### T0244 JoinPredicateJoinedSideUnderLeft
 
@@ -654,6 +756,7 @@ A `LEFT` [join aggregate](transforms.md#join-aggregate)'s `WHERE` has a
 condition on the joined table; the message names it. In SQL it also drops the
 `FROM` rows with no match, which the `LEFT` keeps, so the query is an `INNER`
 one: write `INNER JOIN`.
+After define: [Text](transforms.md#text).
 
 ### T0245 JoinPredicateReadsNoColumn
 
@@ -661,6 +764,7 @@ A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'
 `WHERE` reads no column (`WHERE FALSE`, `1 = 1`); the message names it. Each
 condition filters one table's rows. Drop it, or, to keep nothing, drop the
 transform.
+After define: [Text](transforms.md#text).
 
 ### T0246 CharKeyPaddingFunction
 
@@ -670,53 +774,62 @@ as `char(n)`: directly, or through another field or a `COALESCE`, `NULLIF` or
 without its trailing blanks
 ([the key's type](type-support.md#the-types-of-the-columns-trellis-creates)),
 so the length would differ from Postgres's. Group by a `text` column.
+After define: [Retype](transforms.md#retype).
 
 ## Tables and keys
 
 What a definition reads or writes can't be maintained as it stands
-([refusal table](transforms.md#refusals)), at define or at `RESUME`. A
+(what [sources and targets](transforms.md#supported-sources-and-targets) may be), at define or at `RESUME`. A
 condition that appears after define pauses the definition
 ([paused definitions](operations.md#paused-definitions)); fix it, then
 `RESUME`.
 
 ### T0113 NoPrimaryKey
 
-A source table with no primary key, and no `KEY (…)` for it
-([the key](transforms.md#the-key-a-transform-keys-each-table-by)). Add a
-primary key, or name a unique key with `KEY (…)`. Another instance's
-aggregate target has none: chain within the instance
-([instance identity](instance-identity.md)), group over a 1-1 transform of
-it, or name its group key with `KEY (…)`.
+A source table with no primary key, and no `KEY (…)` for it ([the
+key](transforms.md#the-key-a-transform-keys-each-table-by)). Add a primary key,
+or name a unique key with `KEY (…)`. Another instance's aggregate target has
+none: chain within the instance ([instance identity](instance-identity.md)),
+group over a 1-1 transform of it, or name its group key with `KEY (…)`. After
+define: [Key](transforms.md#key) for a source with no primary key; an aggregate
+target replacing a source is [Disruption](transforms.md#disruption), and
+`RESUME` then refuses.
 
 ### T0114 DeferrablePrimaryKey
 
 A deferrable primary key, which can hold duplicates inside a transaction.
-Postgres can't make a key not deferrable in place: recreate it in one
-statement (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`), or name a
-non-deferrable unique key with `KEY (…)`.
+Postgres can't make a key not deferrable in place: recreate it in one statement
+(`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`), or name a
+non-deferrable unique key with `KEY (…)`. After define:
+[Key](transforms.md#key).
 
 ### T0115 KeyOnTrellisTarget
 
 A `KEY (…)` on another transform's target, which is keyed already. Drop the
 `KEY (…)`.
 
+After define: [Key](transforms.md#key).
+
 ### T0116 KeyNotBacked
 
-No unique index backs a `KEY (…)` exactly
-([the key](transforms.md#the-key-a-transform-keys-each-table-by)). Create a
-valid, non-partial unique index over exactly those columns, `NULLS NOT
-DISTINCT` if one can be `NULL`.
+No unique index backs a `KEY (…)` exactly ([the
+key](transforms.md#the-key-a-transform-keys-each-table-by)). Create a valid,
+non-partial unique index over exactly those columns, `NULLS NOT DISTINCT` if one
+can be `NULL`. After define: [Key](transforms.md#key).
 
 ### T0117 KeyDiffersFromReaders
 
-The definition keys a table differently from the transforms that already
-read it. Name the same key, the one the message gives.
+The definition keys a table differently from the transforms that already read
+it. Name the same key, the one the message gives. After define:
+[Key](transforms.md#key).
 
 ### T0118 RecordedKeyMissing
 
 The index over the key Trellis recorded for a table is gone. Create a unique
 index over exactly those columns again (`NULLS NOT DISTINCT` if one can be
 `NULL`), then `RESUME`.
+
+After define: [Key](transforms.md#key).
 
 ### T0119 NoPrimaryKeyToRecord
 
@@ -726,8 +839,9 @@ to take as the new one. Add a primary key, then `RESUME`
 
 ### T0121 UnsupportedPrimaryKeyType
 
-A source key column of a type off the [key list](type-support.md#matrix).
-Key the table by a listed type, or name another key with `KEY (…)`.
+A source key column of a type off the [key list](type-support.md#matrix). Key
+the table by a listed type, or name another key with `KEY (…)`. After define:
+[Key](transforms.md#key).
 
 ### T0126 SourceTableNotFound
 
@@ -736,16 +850,21 @@ the name, qualify it, or create the table.
 
 ### T0127 InvalidRegexPattern
 
-A `REGEXP_COUNT` pattern Postgres rejects; the message carries the server's
-reason. Write a pattern Postgres's `regexp_count` accepts. After an upgrade
-of Postgres that changes the verdict, each row fails and is
-[held](operations.md#releasing-held-keys).
+A `REGEXP_COUNT` pattern Postgres rejects (`(?P<n>a)`, `a++`, `\pL`); define,
+`ALTER TRANSFORM` and `RESUME` probe it with `regexp_count('', pattern)`, and
+the message carries the server's reason. Back-references, lookahead and
+`\m`/`\M` are admitted. Write a pattern Postgres's `regexp_count` accepts.
+After define: [Text](transforms.md#text); a Postgres upgrade that changes the
+verdict is [Per row](transforms.md#per-row).
 
 ### T0128 TableNotAccessible
 
 A table the role Trellis runs as can't use: no `USAGE` on its schema, or no
 privilege on the table. `GRANT USAGE ON SCHEMA`, or make the role a member of
 the owner ([roles](recommendations.md#one-trellis-role)).
+After define: [Shape](transforms.md#shape): a revoked table privilege or schema
+`USAGE` halts the readers on the next drain, and a revoked schema `USAGE` at
+the next staging pass too.
 
 ### T0129 KeyRepairBlocked
 
@@ -774,21 +893,24 @@ left to re-key in place. `DROP TRANSFORM` and define it again.
 ### T0133 VirtualGeneratedColumn
 
 A definition reads a virtual generated column, which capture can't read
-([details](transforms.md#a-virtual-generated-column-a-definition-reads)).
-Make it `STORED`, or write its expression in the definition where the
-grammar covers it (in a 1-1 transform, under a field name no source column
-has).
+([details](transforms.md#a-virtual-generated-column-a-definition-reads)). Make
+it `STORED`, or write its expression in the definition where the grammar covers
+it (in a 1-1 transform, under a field name no source column has). After define:
+[Shape](transforms.md#shape).
 
 ### T0134 SourceIndexMissing
 
 A source lacks the index its `self_check` walk pages by
 ([details](transforms.md#a-source-without-the-index-its-self_check-walk-pages-by)).
-Create the index the message names, or define `WITHOUT SOURCE INDEX`.
+Create the index the message names, or define `WITHOUT SOURCE INDEX`. After
+define: [Index](transforms.md#index).
 
 ### T0135 ExtremeIndexMissing
 
 A `MIN` or `MAX` source lacks the index its probe reads. Create the index the
-message names ([recommendations](recommendations.md#index-each-minmax-argument-and-vacuum-retention-sources)).
+message names
+([recommendations](recommendations.md#index-each-minmax-argument-and-vacuum-retention-sources)).
+After define: [Index](transforms.md#index), [Retype](transforms.md#retype).
 
 ### T0136 ExtremeSourceNotReadable
 
@@ -796,6 +918,8 @@ The role drains run as, the ring's owner, lacks `SELECT` on a `MIN` or `MAX`
 source, which its probe reads
 ([row-level security](transforms.md#row-level-security-on-a-role-trellis-runs-as)).
 `GRANT SELECT` on the source to that role, then `RESUME`.
+
+After define: [Shape](transforms.md#shape).
 
 ### T0137 LedgerTableMissing
 
@@ -808,28 +932,34 @@ A target table was dropped by hand. `DROP TRANSFORM` and define it again.
 
 ### T0139 TargetInCatalogSchema
 
-A target in this instance's catalog schema, or in another instance's
-([instance identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)).
+A target in this instance's catalog schema, or in another instance's ([instance
+identity](instance-identity.md#a-catalog-schema-that-belongs-to-another-instance)).
 Use an ordinary schema; after define, `DROP TRANSFORM` and define it there.
+After define: [Resume only](transforms.md#resume-only).
 
 ### T0140 TargetTableSuffixCollision
 
-Two of an instance's targets with one bare name in two schemas. Choose
-another name.
+Two of an instance's targets with one bare name in two schemas. Choose another
+name. After define: matters only when the statement runs.
 
 ### T0141 TargetTableExists
 
 A relation already holds the target's name, or its ledger's
-([details](transforms.md#a-target-whose-name-is-taken)). Choose another
-name, give the instance its own target schema
-([instance identity](instance-identity.md)), drop or rename the relation, or
-build into it with `ADOPT EXISTING TABLE`.
+([details](transforms.md#a-target-whose-name-is-taken)). Choose another name,
+give the instance its own target schema ([instance
+identity](instance-identity.md)), drop or rename the relation, or build into it
+with `ADOPT EXISTING TABLE`. After define: matters only when the statement
+runs.
 
 ### T0142 TargetNameHasReaders
 
-Other definitions read a table of the target's name as a source, or did
-before it was dropped or renamed: they would read the new target. `DROP
-TRANSFORM` each reader named (paused first), or choose another name.
+Other definitions read a table of the target's name as a source (including the
+table `ADOPT EXISTING TABLE` would adopt), or did before it was dropped or
+renamed: they would read the new target. `DROP TRANSFORM` each reader named
+(paused first), or choose another name. After define: matters only when the
+statement runs; later, a new reader of the name is a chain, and the target can't
+be dropped while one reads it ([T0153
+DependentsBlockDrop](errors.md#t0153-dependentsblockdrop)).
 
 ### T0143 TargetNotAdoptable
 
@@ -865,34 +995,51 @@ time):
 | `owned_sequence` | has a sequence owned by one of its columns | `ALTER SEQUENCE … OWNED BY NONE`, or drop it |
 | `unrecognized` | has a constraint or dependent object the check doesn't know, so a new Postgres feature refuses until Trellis learns it | Drop the object the message names |
 
+After define: matters only when the statement runs.
+
 ### T0144 SourceNotChangeKeyed
 
 A source capture can't key: a partition, a table in an inheritance
 hierarchy, or one with no primary key. Use a plain table; after a change,
 `DETACH PARTITION` or `NO INHERIT`, then `RESUME`.
 
+After define: [Shape](transforms.md#shape) (`ATTACH PARTITION`, `INHERIT`, a
+child created `INHERITS` it, or a drop and recreate as one).
+
 ### T0145 PartitionedSource
 
-A partitioned source the definition can't read as written
-([partitioned sources](transforms.md#partitioned-sources)); the message names
-the column or limit. Add the partition-key column to the `GROUP BY` or join on
-it; partition by a plain listed column; merge partitions to 1,000 or fewer
-leaves, or upgrade to PostgreSQL 15 or later; for a 1-1 transform, aggregate
-over it or use a plain table. After a change, detach the sub-level, then
-`RESUME`.
+A partitioned source the definition can't read as written ([partitioned
+sources](transforms.md#partitioned-sources)): a group key that omits a
+partition-key column at some level; a key level that is an expression, or whose
+column has a type other than `smallint`, `integer`, `bigint`, `numeric`, `text`,
+`varchar`, `uuid`, `date`, `timestamp`, `timestamptz` or `boolean`, a
+non-default operator class or a nondeterministic collation; more than 1,000
+leaves, or PostgreSQL before 15; or the `FROM` of a 1-1 transform. The message
+names the column or limit. Add the partition-key column to the `GROUP BY` or
+join on it; partition by a plain listed column; merge partitions to 1,000 or
+fewer leaves, or upgrade to PostgreSQL 15 or later; for a 1-1 transform,
+aggregate over it or use a plain table. After a change, detach the sub-level,
+then `RESUME`.
+
+After define: [Shape](transforms.md#shape) for a sub-level added later or a
+table attached into the tree; the source dropped and created again partitioned
+is [Disruption](transforms.md#disruption), and `RESUME` then refuses.
 
 ### T0146 RowSecurityApplies
 
-Row-level security applies to a role Trellis reads a source or writes its
-target as ([details](transforms.md#row-level-security-on-a-role-trellis-runs-as)).
-Give the role `BYPASSRLS`, or run as the owner without `FORCE ROW LEVEL
-SECURITY`; then `RESUME`.
+Row-level security applies to a role Trellis reads a source or writes its target
+as ([details](transforms.md#row-level-security-on-a-role-trellis-runs-as)). Give
+the role `BYPASSRLS`, or run as the owner without `FORCE ROW LEVEL SECURITY`;
+then `RESUME`. After define: [Shape](transforms.md#shape).
 
 ### T0147 Subscribed
 
-A logical-replication subscription replicates into a source, and capture
-never sees its changes. Remove the table from the publication and `ALTER
-SUBSCRIPTION … REFRESH PUBLICATION`, or drop the subscription; then `RESUME`.
+A logical-replication subscription in the same database replicates into a
+source, in any sync state or disabled: its apply worker fires only row-level
+triggers, so capture never sees its changes. Publishing a table is fine. Remove
+the table from the publication and `ALTER SUBSCRIPTION … REFRESH PUBLICATION`,
+or drop the subscription; then `RESUME`. After define:
+[Shape](transforms.md#shape).
 
 ## Statements on a transform
 
@@ -932,9 +1079,9 @@ names first.
 
 ### T0154 TransformNotLive
 
-An `ALTER TRANSFORM` of a transform that isn't `live`, or a define chaining
-off one whose build hasn't finished. Retry once it is `live`; `RESUME` a
-paused one first.
+An `ALTER TRANSFORM` of a transform that isn't `live`, or a define chaining off
+one whose build hasn't finished. Retry once it is `live`; `RESUME` a paused one
+first. After define: matters only when the statement runs.
 
 ### T0155 AlterFieldNotFound
 
@@ -1021,7 +1168,7 @@ into it, or a view over it or over the field's column. `DROP TRANSFORM`,
 while they exist: Trellis never drops what it doesn't own, and never cascades.
 The message names the dependents. Drop or alter them (`DROP VIEW …`,
 `ALTER TABLE … DROP CONSTRAINT …`), then retry; the failed statement changed
-nothing.
+nothing. After define: matters only when the statement runs.
 
 ## Builds and drains
 

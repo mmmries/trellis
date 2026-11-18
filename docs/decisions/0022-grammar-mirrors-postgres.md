@@ -171,9 +171,8 @@ an `interval`-producing `-`, a `STABLE` overload Postgres picks silently,
 `integer / integer`'s truncation, text ordering under a collation, a relative
 typed literal. It also refuses a `/` or `%` whose divisor is written as a
 literal zero, since every row with a dividend would fail. Each refusal is named
-in the error, carries a remedy, and is listed in
-[expressions — Refusals](../expressions.md#refusals), the only reference for
-them. The narrowing runs one way: a
+in the error, carries a remedy, and is documented in
+[errors](../errors.md), the only reference for them. The narrowing runs one way: a
 refusal can later become an acceptance of Postgres's meaning, but Trellis never
 accepts text Postgres refuses, or gives a meaning Postgres doesn't, to work
 around one.
@@ -228,7 +227,7 @@ Postgres.
 ## Consequences
 
 - The grammar is stricter than Postgres in places a SQL user will notice: the
-  refusals in the transforms table, names over 63 bytes, and the quoted forms
+  refusals in [errors](../errors.md), names over 63 bytes, and the quoted forms
   above.
 - A name with upper-case letters is written quoted, as in psql: `"createdAt"`
   for a column an ORM created that way, `"OrderTotals"` to address a target

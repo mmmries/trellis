@@ -140,6 +140,8 @@ mod arithmetic_tests;
 #[cfg(test)]
 mod date_tests;
 #[cfg(test)]
+mod error_docs;
+#[cfg(test)]
 mod floor_manifest;
 #[cfg(test)]
 mod identifier_tests;
@@ -149,8 +151,6 @@ mod literal_tests;
 mod logic_tests;
 #[cfg(test)]
 mod predicate_tests;
-#[cfg(test)]
-mod refusal_tables;
 #[cfg(test)]
 mod table_alias_tests;
 #[cfg(test)]

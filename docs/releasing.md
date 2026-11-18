@@ -273,8 +273,7 @@ does not build, is a finding. `bundle install` may add a `bundler` line to
 **Refusals the script does not build (the `grammar` step).** The script constructs the
 refusals it can build with the old CLI. Check the rest by reading the
 candidate's list of refusals against what the old build accepted (the
-refusal tables of [transforms](transforms.md#refusals) and
-[expressions](expressions.md#refusals), the
+refusals in [errors](errors.md), the
 changes since the predecessor's tag), and for each one the old build accepts,
 define it under the old CLI, upgrade, and confirm the outcome: text the
 candidate can't parse pauses with a reason that names the remedy, and the remedy

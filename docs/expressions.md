@@ -21,7 +21,7 @@ TRANSFORM org_users FROM "User" GROUP BY "orgId" SELECT COUNT(*) AS members
 
 A quoted name is never a keyword: `"order"` is a column, and `FROM "user"` a
 table. The names Trellis refuses (over 63 bytes, an unquoted reserved word, a
-few quoted forms) are in [Refusals](#refusals). A name that finds nothing while
+few quoted forms) are in [errors](errors.md#definition-text). A name that finds nothing while
 one differing from it only in case exists is refused naming the quoted
 spelling: `DROP TRANSFORM OrderTotals` beside a target created as
 `"OrderTotals"` refuses with `did you mean "OrderTotals"?`, and drops nothing.
@@ -39,7 +39,7 @@ A calculated field's formula may reference:
 
 A bare name means a field when no source column has that name, and the source
 column when no field does. A name that is both a source column and a field
-whose expression is something else is refused ([Refusals](#refusals)). Two
+whose expression is something else is refused ([errors](errors.md#t0104-ambiguouscolumnreference)). Two
 reads of such a name are not ambiguous:
 
 * A field reading its own name reads the source column (`SUM(val) AS val`), and
@@ -185,60 +185,11 @@ compute the value in a stored generated column or a [chained](transforms.md#chai
 
 ## Refusals
 
-The columns are those of [transforms' table](transforms.md#refusals); "After
-define" names one of [its classes](transforms.md#after-define). A row links to
-an entry under [Details](#details) where it needs more room.
-
-| Condition | Error | After define |
-|---|---|---|
-| **Constants** | | |
-| [A literal zero divisor](#a-literal-zero-divisor) | [T0087 ConstantDivisorZero](errors.md#t0087-constantdivisorzero) | [Text](transforms.md#text) |
-| [A typed literal not in its type's canonical spelling](#a-typed-literal-not-in-its-types-canonical-spelling), or of a type with no admitted literal | [T0097 InvalidTypedLiteral](errors.md#t0097-invalidtypedliteral), [T0028 UnsupportedLiteralType](errors.md#t0028-unsupportedliteraltype) | [Text](transforms.md#text) |
-| A number with an exponent (`1e3`), a `0x`/`0o`/`0b` prefix or `_` separators | [T0023 UnsupportedNumericForm](errors.md#t0023-unsupportednumericform) | [Text](transforms.md#text) |
-| **Comparisons** | | |
-| [A float compared with an exact numeric](#a-float-compared-with-an-exact-numeric) | [T0079 MixedFloatExactComparison](errors.md#t0079-mixedfloatexactcomparison) | [Retype](transforms.md#retype) |
-| A comparison between two different temporal types (`date` and `timestamp`, `timestamp` and `timestamptz`, `time` and `timetz`): a conversion to or from `timestamptz` reads the session time zone | [T0080 MixedTemporalComparison](errors.md#t0080-mixedtemporalcomparison) | [Retype](transforms.md#retype) |
-| `<`, `<=`, `>`, `>=` over `text`, whose order depends on the collation. `=`, `<>`, `!=` and `IS [NOT] DISTINCT FROM` are admitted | [T0081 TextOrderingComparison](errors.md#t0081-textorderingcomparison) | [Retype](transforms.md#retype) |
-| A comparison, `NULLIF`, `STRPOS` or `REGEXP_COUNT` over text columns of two different collations, neither the database default, directly or through `COALESCE`, a `CASE` result or a field. Postgres can't pick one (`42P22`) and fails every row where both are not `NULL` | [T0233 ConflictingCollations](errors.md#t0233-conflictingcollations) | A column re-collated later holds each key written ([releasing held keys](operations.md#releasing-held-keys)), and `RESUME` refuses it |
-| `OCTET_LENGTH` of a `char(n)` `GROUP BY` key in a plain aggregate, as `char(n)`: directly, or through a field or a `COALESCE`, `NULLIF` or `CASE` that Postgres types `char(n)`. The aggregate keeps the key as `text`, without its blanks | [T0246 CharKeyPaddingFunction](errors.md#t0246-charkeypaddingfunction) | [Retype](transforms.md#retype) |
-| An enum column compared with a string literal that is not one of its labels | [T0241 EnumLiteralNotALabel](errors.md#t0241-enumliteralnotalabel) | [Retype](transforms.md#retype) |
-| A comparison or `NULLIF` between types no family covers: `text` with a number, `boolean` with a number, `uuid` with `text`, and every type outside the families (`bytea`, `jsonb`, `interval`, an enum with anything but a string literal under `=`, `inet`, …) | [T0082 ComparisonTypeMismatch](errors.md#t0082-comparisontypemismatch) | [Retype](transforms.md#retype) |
-| Chained comparisons (`a < b < c`, `a = b = c`, `IS DISTINCT FROM` followed by another `IS` form), which Postgres reads as a syntax error | [T0024 NonAssociativeComparison](errors.md#t0024-nonassociativecomparison) | [Text](transforms.md#text) |
-| **Grammar forms and typing** | | |
-| `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, the simple `CASE <operand> WHEN <value> THEN …`, `<expr>::<type>`, and `--` (a comment) | [T0025 UnsupportedIsForm](errors.md#t0025-unsupportedisform), [T0027 SimpleCaseUnsupported](errors.md#t0027-simplecaseunsupported), [T0029 UnsupportedCastOperator](errors.md#t0029-unsupportedcastoperator), [T0021 DoubleMinus](errors.md#t0021-doubleminus) | [Text](transforms.md#text) |
-| [An untyped `NULL` literal](#an-untyped-null-literal) | [T0086 UntypedNull](errors.md#t0086-untypednull) | [Text](transforms.md#text); beside a column (`date_col + NULL`), [Retype](transforms.md#retype) |
-| A `CASE` condition that isn't `boolean`, or `CASE` results that don't unify as `COALESCE`'s do (`THEN 1 ELSE 'x'`). Results unify to a common type: two integers to the wider, an exact numeric with a float to the float, otherwise `numeric` | [T0084 CaseConditionNotBoolean](errors.md#t0084-caseconditionnotboolean), [T0085 CaseResultTypeMismatch](errors.md#t0085-caseresulttypemismatch) | [Retype](transforms.md#retype) |
-| `NULLIF(a, b)` where Postgres casts `a` to compare it: an integer `a` with a `numeric` `b`, or an exact `a` with a float `b` | [T0083 NullIfFirstArgumentCast](errors.md#t0083-nulliffirstargumentcast) | [Retype](transforms.md#retype) |
-| **Expression size** | | |
-| An expression nested more than 100 levels deep (operands chained by operators, or nested parentheses or calls); a flat list of many terms is not deep. Also more than 100 prefix `NOT`s or `-`s in a row | [T0030 ExpressionTooDeep](errors.md#t0030-expressiontoodeep), [T0026 NotChainTooLong](errors.md#t0026-notchaintoolong), [T0018 PrefixMinusChainTooLong](errors.md#t0018-prefixminuschaintoolong) | [Text](transforms.md#text) |
-| Calculated fields that read each other so often or so deeply that inlining them passes 100 levels or more than a build can render | [T0046 FieldExpansionTooLarge](errors.md#t0046-fieldexpansiontoolarge) | [Text](transforms.md#text) |
-| An expression whose fields inline to more than 100,000 nodes (each `WHEN x = 1 THEN 1` branch is four) | [T0046 FieldExpansionTooLarge](errors.md#t0046-fieldexpansiontoolarge) | [Text](transforms.md#text) |
-| **Arithmetic, functions and casts** | | |
-| A function or operator the [lists above](#calculated-fields) don't name (`a \|\| b`, `a ^ b`), one that isn't [immutable](#immutability) (`now()`, `random()`), or a call with the wrong number of arguments | [T0007 UnsupportedFunction](errors.md#t0007-unsupportedfunction), [T0006 UnsupportedOperator](errors.md#t0006-unsupportedoperator), [T0001 UnexpectedChar](errors.md#t0001-unexpectedchar) (an operator character no listed operator uses), [T0009 NonImmutableConstruct](errors.md#t0009-nonimmutableconstruct), [T0008 FunctionArityMismatch](errors.md#t0008-functionaritymismatch), [T0011 AtLeastOneArgumentRequired](errors.md#t0011-atleastoneargumentrequired) | [Text](transforms.md#text) |
-| An operator given an operand type it doesn't take (`text_col + 1`, `NOT num_col`; `+` never concatenates) | [T0078 TypeMismatch](errors.md#t0078-typemismatch) | [Retype](transforms.md#retype) |
-| `/` between two integers (`qty / 2`): Postgres truncates the quotient. `numeric` and float quotients are admitted | [T0088 IntegerDivision](errors.md#t0088-integerdivision) | [Retype](transforms.md#retype) |
-| `%` with a float operand: Postgres has no float modulo. `%` takes integers and `numeric` | [T0089 FloatModulo](errors.md#t0089-floatmodulo) | [Retype](transforms.md#retype) |
-| [An argument `ABS`, `CEIL`, `FLOOR`, `ROUND` or `TRUNC` does not admit](#an-argument-abs-ceil-floor-round-or-trunc-does-not-admit) | [T0093 NumericFunctionArgument](errors.md#t0093-numericfunctionargument), [T0094 ScaleNotIntegerLiteral](errors.md#t0094-scalenotintegerliteral), [T0095 FunctionArgTypeMismatch](errors.md#t0095-functionargtypemismatch) | [Retype](transforms.md#retype) |
-| [A `CAST` that is not an exact conversion](#a-cast-that-is-not-an-exact-conversion) | [T0092 UnsupportedCast](errors.md#t0092-unsupportedcast), [T0090 TemporalOperand](errors.md#t0090-temporaloperand), [T0017 UnsupportedCastTarget](errors.md#t0017-unsupportedcasttarget) | [Retype](transforms.md#retype) |
-| A `REGEXP_COUNT` pattern that isn't a string literal, or that Postgres rejects (`(?P<n>a)`, `a++`, `\pL`); define, `ALTER TRANSFORM` and `RESUME` probe it with `regexp_count('', pattern)`. Back-references, lookahead and `\m`/`\M` are admitted | [T0096 NonLiteralRegexPattern](errors.md#t0096-nonliteralregexpattern), [T0127 InvalidRegexPattern](errors.md#t0127-invalidregexpattern) (with the server's message) | [Text](transforms.md#text); a Postgres upgrade that changes the verdict is [Per row](transforms.md#per-row) |
-| **Dates and times** | | |
-| [Date and time arithmetic](#date-and-time-arithmetic) | [T0090 TemporalOperand](errors.md#t0090-temporaloperand) | [Retype](transforms.md#retype) |
-| `DATE_TRUNC` of a `date` or `timestamptz`, `EXTRACT` of any type but `date` and `timestamp`, and `date_part` (an unsupported function) | [T0090 TemporalOperand](errors.md#t0090-temporaloperand) | [Retype](transforms.md#retype) |
-| [A `DATE_TRUNC` unit or `EXTRACT` field that is not admitted](#a-date_trunc-unit-or-extract-field-that-is-not-admitted) | [T0091 TemporalLiteral](errors.md#t0091-temporalliteral) | [Text](transforms.md#text) |
-| `AT TIME ZONE` with a zone other than the literal `'UTC'`, or over anything but a `timestamptz`: zone offsets change with time zone database releases | [T0091 TemporalLiteral](errors.md#t0091-temporalliteral) (the zone), [T0090 TemporalOperand](errors.md#t0090-temporaloperand) (the operand) | [Retype](transforms.md#retype) |
-| **`WHERE`** | | |
-| A `WHERE` that isn't `boolean`, or that calls an aggregate | [T0234 PredicateNotBoolean](errors.md#t0234-predicatenotboolean), [T0235 AggregateInPredicate](errors.md#t0235-aggregateinpredicate) | [Retype](transforms.md#retype); an aggregate, [Text](transforms.md#text) |
-| A [`WHERE` construct that can raise an error](#where) | [T0237 PredicateNotTotal](errors.md#t0237-predicatenottotal) | [Retype](transforms.md#retype) |
-| **Field, column and table names** | | |
-| Two fields with one name, or fields that read each other in a cycle | [T0040 DuplicateFieldName](errors.md#t0040-duplicatefieldname), [T0045 Cycle](errors.md#t0045-cycle) | [Text](transforms.md#text) |
-| A field named after a 1-1 source key column or a 1-1 `JOIN`'s `a` key column (`id AS id`; `id AS order_id` is fine), or a field or `GROUP BY` column whose name starts with `__` | [T0043 FieldNamedAfterPrimaryKey](errors.md#t0043-fieldnamedafterprimarykey), [T0041 ReservedFieldName](errors.md#t0041-reservedfieldname), [T0042 ReservedGroupByColumnName](errors.md#t0042-reservedgroupbycolumnname) | [Text](transforms.md#text) |
-| An aggregate whose argument names another aggregate field no source column is named after (`SUM(val) AS total, SUM(total)`) | [T0103 AggregateOfAggregateField](errors.md#t0103-aggregateofaggregatefield) | [Text](transforms.md#text) |
-| A bare name that is both a source column and a field whose expression isn't just that column, read by another field (`(grp + 1) AS val, SUM(val) AS total`; see [Calculated Fields](#calculated-fields)). A 1-1 transform refuses such a field whether or not anything reads it | [T0104 AmbiguousColumnReference](errors.md#t0104-ambiguouscolumnreference); in a 1-1 transform, [T0107 CalculatedFieldShadowsSourceColumn](errors.md#t0107-calculatedfieldshadowssourcecolumn) | [Resume only](transforms.md#resume-only): a source column added under a field's name |
-| [An unquoted reserved word as a name](#an-unquoted-reserved-word-as-a-name) | [T0019 ReservedWord](errors.md#t0019-reservedword) | [Retype](transforms.md#retype): renaming a read column is a rename |
-| An unquoted target, `FROM` or `JOIN` table name that Postgres reserves (`FROM user`, `FROM order`); `public.order` is fine | [T0037 ReservedTableName](errors.md#t0037-reservedtablename) | [Text](transforms.md#text) |
-| A name over 63 bytes after folding and unescaping, in any position: Postgres would truncate it | [T0036 NameTooLong](errors.md#t0036-nametoolong) | [Text](transforms.md#text); a definition 0.1.x stored with a longer `AS` label keeps running, its `ALTER TRANSFORM` refuses, and the upgrade that writes a `KEY (…)` into it pauses it |
-| [An unsupported quoted name](#an-unsupported-quoted-name) | [T0033 ZeroLengthQuotedIdentifier](errors.md#t0033-zerolengthquotedidentifier), [T0034 UnicodeEscapeIdentifier](errors.md#t0034-unicodeescapeidentifier), [T0035 UnsupportedQuotedIdentifier](errors.md#t0035-unsupportedquotedidentifier) | [Text](transforms.md#text) |
-| A qualified name whose table isn't the `FROM` table (`product.cost`), or whose schema isn't its schema; a `JOIN`'s are in [transforms](transforms.md#an-unsupported-join-shape). A table name of more than two parts, a column of more than three | [T0105 QualifiedColumnNotFromSource](errors.md#t0105-qualifiedcolumnnotfromsource), [T0014 GroupByKeyNotFromSource](errors.md#t0014-groupbykeynotfromsource), [T0012 TooManyQualifiedNameParts](errors.md#t0012-toomanyqualifiednameparts), [T0013 TooManyColumnNameParts](errors.md#t0013-toomanycolumnnameparts) | [Text](transforms.md#text) |
+Each refusal has an entry in [errors](errors.md), in the groups
+[Definition text](errors.md#definition-text) and
+[Definition checks](errors.md#definition-checks): what it means, the remedy,
+and what happens when the condition appears after define. An entry links to an
+entry under [Details](#details) where it needs more room.
 
 ### Details
 
