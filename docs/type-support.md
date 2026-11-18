@@ -414,7 +414,8 @@ role, `GROUP BY` and primary key included (`temporal::is_text_stable`).
   render differently, and no renderer fix helps. `SUM(interval)` is the
   exact fieldwise sum and raises `interval out of range` only when the final
   value is, where Postgres's `sum()` raises by scan order; `AVG(interval)`
-  is Postgres's `avg()` wherever the sum is in range
+  is Postgres's own division of the exact sum, so it is Postgres's `avg()`
+  wherever the sum is in range
   ([ADR-0002](decisions/0002-async-data-flow.md#float-and-interval-sums-are-exact)).
 - Typed literals exist for `DATE`, `TIMESTAMP`, `TIME` and `TIMETZ`, not
   `TIMESTAMPTZ` (no canonical-form checker) or `INTERVAL` (`interval_in` reads

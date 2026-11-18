@@ -520,10 +520,9 @@ interleaving argument is needed (I2); only the read-time rounding is new.
   microseconds), with `infinity` and `-infinity` counted (Postgres 17 and
   later). It raises only when its final value is out of range, as an
   evaluation error of its group, whatever order its values came in.
-- **Must:** an `interval` `AVG` divides the exact fieldwise sums as
-  Postgres's `interval_div` does (month fractions carry into days, then into
-  microseconds), so a group whose sum is in range has Postgres's own
-  `avg()`.
+- **Must:** an `interval` `AVG` is Postgres's own division
+  (`interval_div`, evaluated by the server) of the exact fieldwise sum, so a
+  group whose sum is in range has Postgres's own `avg()`.
 - **Must:** these partials are the `numeric` ones above, each value its
   exact `numeric`; the layout has a compatibility floor of its own
   ([ADR-0024](0024-compatibility-floors-and-rollback.md)).

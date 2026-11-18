@@ -24,8 +24,9 @@
 //!   `JOIN` cell's sum of products of counts under `2^63` stays: so read
 //!   back, the fields are exact ([`decoded`]). An infinite value (Postgres
 //!   17+) is the `numeric` infinity of its sign. The `SUM` raises only when
-//!   its final value is out of range; the `AVG` divides the exact sums by
-//!   Postgres's own `interval_div` cascade, in `double precision` as it does.
+//!   its final value is out of range; the `AVG` is the server's own
+//!   `interval / float8` over the exact sum, or, where the sum is out of an
+//!   `interval`'s range, a mirror of its cascade over the exact fields.
 
 use crate::defs::ast::ValueType;
 use crate::defs::pg_type::PgType;
@@ -122,7 +123,9 @@ impl SumKind {
                            else {quotient}::double precision end)"
                 )
             }
-            SumKind::Interval => interval_value(value, &|m, d, u| interval_avg(m, d, u, count)),
+            SumKind::Interval => {
+                interval_value(value, &|m, d, u| interval_quotient(m, d, u, count))
+            }
         }
     }
 }
@@ -243,10 +246,35 @@ fn interval_sum(m: &str, d: &str, u: &str) -> String {
     )
 }
 
+/// The `AVG` of the exact fields `m`, `d` and `u` over `count` values, as
+/// Postgres's `avg()` takes it: the server's own `interval / float8` over
+/// the sum, built exactly from its fields' text, while the sum is an
+/// `interval` (each field in its range, and on Postgres 17+ not an
+/// infinity's fields, which that text reads as the infinity). Otherwise,
+/// where `avg()` itself raises, [`interval_avg`].
+fn interval_quotient(m: &str, d: &str, u: &str, count: &str) -> String {
+    format!(
+        "(case when {m} between {i32min} and {i32max} and {d} between {i32min} and {i32max} \
+                    and {u} between {i64min} and {i64max} \
+                    and ({m}, {d}, {u}) not in \
+                        (({i32max}, {i32max}, {i64max}), ({i32min}, {i32min}, {i64min})) \
+               then format('%s mons %s days %s microseconds', {m}, {d}, {u})::interval \
+                    / ({count})::double precision \
+               else {mirror} end)",
+        i32min = i32::MIN,
+        i32max = i32::MAX,
+        i64min = i64::MIN,
+        i64max = i64::MAX,
+        mirror = interval_avg(m, d, u, count),
+    )
+}
+
 /// The `AVG` of the exact fields `m`, `d` and `u` over `count` values:
 /// Postgres's `interval_div(sum, count)` (`timestamp.c`), its steps in
-/// `double precision` as it takes them, so a group whose sum is in range
-/// has Postgres's own `avg()`. `TSROUND` is a round to microseconds.
+/// `double precision` as it takes them, for a sum out of an `interval`'s
+/// range, which no server division can take. It can be a microsecond off a
+/// server that fuses its multiply-adds. `TSROUND` is a round to
+/// microseconds.
 pub(crate) fn interval_avg(m: &str, d: &str, u: &str, count: &str) -> String {
     let tsround =
         |x: &str| format!("(round(({x}) * 1000000::double precision) / 1000000::double precision)");
