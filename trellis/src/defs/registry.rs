@@ -990,6 +990,22 @@ pub struct FunctionSpec {
     pub since: Release,
 }
 
+/// The text functions whose result depends on a `char(n)` argument's
+/// trailing blanks, which Postgres keeps in a `char(n)` value. An aggregate
+/// keeps a `char(n)` `GROUP BY` key as `text`, which drops them, so a field
+/// passing the key to one of these is refused
+/// ([`super::validate::check_char_key_padding_reads`]).
+///
+/// A scratch Postgres 17 probe (2026-11-16) found `CHAR_LENGTH`, `STRPOS`
+/// and `REGEXP_COUNT` blind to the padding. A text function admitted later
+/// must be listed here or in [`PADDING_BLIND_FUNCTIONS`]; a test fails
+/// until it is.
+pub(crate) const PADDING_SENSITIVE_FUNCTIONS: &[&str] = &["OCTET_LENGTH"];
+
+/// The text functions probed as blind to a `char(n)`'s padding.
+#[cfg(test)]
+pub(crate) const PADDING_BLIND_FUNCTIONS: &[&str] = &["CHAR_LENGTH", "STRPOS", "REGEXP_COUNT"];
+
 /// Function names the grammar accepts as calculated-field functions,
 /// each rendered as the Postgres function of the same name (per ADR-0004:
 /// the grammar and renderer function sets are one list).
@@ -1600,6 +1616,24 @@ pub fn lookup_operator(symbol: &str) -> Option<Operator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every function taking a text argument has been classified by whether
+    /// it reads a `char(n)`'s padding, so a new one can't dodge the refusal.
+    #[test]
+    fn every_text_function_is_classified_for_char_padding() {
+        for spec in FUNCTIONS {
+            if !spec.arg_types.contains(&ValueType::Text) || spec.name == "DATE_TRUNC" {
+                continue;
+            }
+            assert!(
+                PADDING_SENSITIVE_FUNCTIONS.contains(&spec.name)
+                    || PADDING_BLIND_FUNCTIONS.contains(&spec.name),
+                "{} takes text: probe whether it reads a char(n)'s padding and list it in \
+                 PADDING_SENSITIVE_FUNCTIONS or PADDING_BLIND_FUNCTIONS",
+                spec.name
+            );
+        }
+    }
 
     /// The reserved words PostgreSQL 15 lacks, so the drift test can compare
     /// the list with a 15 server.

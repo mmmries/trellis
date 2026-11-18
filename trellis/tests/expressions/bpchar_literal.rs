@@ -362,3 +362,80 @@ async fn a_bpchar_group_key_beside_a_literal_matches_postgres() {
     );
     trellis.shutdown().await.expect("shutdown");
 }
+
+/// `OCTET_LENGTH` of an expression Postgres types `text` with a `char(n)`
+/// `GROUP BY` key's value in it is admitted, and matches Postgres: the
+/// conversion to `text` drops the blanks the key's copy lacks (#2069). The
+/// same key reaching it as `char(n)` is refused (T0246).
+#[tokio::test]
+async fn octet_length_of_a_char_key_converted_to_text_matches_postgres() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table s (id bigint primary key, ch character(4), t text); \
+         create index on s (ch, t); \
+         insert into s values (1, 'ab', null), (2, 'ab', 'x'), (3, 'abcd', 'ab')",
+    )
+    .await
+    .expect("source");
+    let trellis = Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("dsn"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+    let err = trellis
+        .apply("TRANSFORM r FROM s GROUP BY ch, t SELECT OCTET_LENGTH(COALESCE(ch, t)) AS o")
+        .await
+        .expect_err("COALESCE(ch, t) is char(n)");
+    assert!(err.to_string().contains("T0246"), "{err}");
+    const FIELDS: &str = "OCTET_LENGTH(COALESCE(t, ch)) AS a, \
+         OCTET_LENGTH(CASE WHEN t = 'x' THEN ch ELSE t END) AS b, \
+         OCTET_LENGTH(NULLIF(ch, t)) AS c, COUNT(*) AS n";
+    trellis
+        .apply(&format!(
+            "TRANSFORM g FROM s GROUP BY ch, t SELECT ch AS ch, t AS t, {FIELDS}"
+        ))
+        .await
+        .expect("define");
+    wait_for_live(&trellis, "g").await;
+    raw.batch_execute("insert into s values (4, 'a', null), (5, 'a', 'x'), (6, null, 'yy')")
+        .await
+        .expect("insert");
+    let token = trellis.watermark_token().await.expect("token");
+    trellis
+        .await_converged(token, Duration::from_secs(60))
+        .await
+        .expect("converges");
+
+    let rows = async |sql: &str| -> Vec<String> {
+        raw.query(sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    let expected = rows(&format!(
+        "select concat_ws('|', ch::text, t, a, b, c, n) from \
+         (select ch, t, {FIELDS} from s group by ch, t) q order by 1"
+    ))
+    .await;
+    let actual = rows("select concat_ws('|', ch, t, a, b, c, n) from g order by 1").await;
+    assert_eq!(actual, expected);
+    // `ch` `'ab'` with a `NULL` `t`: `a` and `c` read the key, as `text`.
+    assert!(actual.contains(&"ab|2|2|1".to_string()), "{actual:?}");
+
+    use trellis::staging::self_check::CheckPageExt;
+    let report = trellis
+        .self_check_to_end("g", trellis::SelfCheckMode::Strict, Duration::from_secs(30))
+        .await
+        .expect("self_check");
+    assert_eq!(report.outcome, trellis::SelfCheckOutcome::Converged);
+    trellis.shutdown().await.expect("shutdown");
+}

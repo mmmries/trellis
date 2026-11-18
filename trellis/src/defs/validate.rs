@@ -587,6 +587,16 @@ pub enum ValidationError {
     /// A top-level `AND` conjunct of a join aggregate's `WHERE` that reads
     /// no column (`WHERE FALSE`): it filters neither side (ADR-0019).
     JoinPredicateReadsNoColumn { conjunct: String },
+    /// A field of a plain aggregate passes a `char(n)` `GROUP BY` key, or an
+    /// expression that keeps its `char(n)` type, to a function that reads
+    /// the key's trailing blanks (`OCTET_LENGTH`). The aggregate keeps the
+    /// key as `text`, which drops them, so the field would hold `2` for a
+    /// `char(4)` `'ab'` where Postgres gives `4` (#2069).
+    CharKeyPaddingFunction {
+        field: String,
+        function: String,
+        column: String,
+    },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -1236,6 +1246,7 @@ impl ValidationError {
             ValidationError::JoinPredicateReadsBothSides { .. } => ErrorId(243),
             ValidationError::JoinPredicateJoinedSideUnderLeft { .. } => ErrorId(244),
             ValidationError::JoinPredicateReadsNoColumn { .. } => ErrorId(245),
+            ValidationError::CharKeyPaddingFunction { .. } => ErrorId(246),
         }
     }
 
@@ -1944,6 +1955,16 @@ impl std::fmt::Display for FieldMessage<'_> {
                 "WHERE: {conjunct} reads no column; in a JOIN with GROUP BY each AND-ed \
                  condition of a WHERE must read one table"
             ),
+            ValidationError::CharKeyPaddingFunction {
+                field,
+                function,
+                column,
+            } => write!(
+                f,
+                "calculated field '{field}': {function} reads {column}, a char(n) GROUP BY key; \
+                 the aggregate keeps the key as text without its trailing blanks, so the value \
+                 would differ from Postgres's"
+            ),
         }
     }
 }
@@ -2341,6 +2362,248 @@ pub(crate) fn check_key_collations<'c>(
     Ok(())
 }
 
+/// One read [`padding_function_key_reads`] found.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PaddingFunctionRead {
+    /// The field whose own expression makes the call.
+    pub field: String,
+    pub function: String,
+    /// A `char(n)` column whose value reaches the call as `char(n)`: directly,
+    /// or through a `COALESCE`, `NULLIF` (its first argument), a `CASE`
+    /// result or another calculated field that Postgres resolves to
+    /// `char(n)` too.
+    pub column: String,
+}
+
+/// The string type Postgres resolves an expression to, as far as a
+/// `char(n)`'s trailing blanks go: they survive only while the value stays
+/// `bpchar`, and a conversion to `text`, `varchar` or `name` drops them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringType {
+    /// A string literal or `NULL`, typed by its context.
+    Unknown,
+    Bpchar,
+    Text,
+    Varchar,
+    Name,
+    /// Anything else, including what this check doesn't model.
+    Other,
+}
+
+impl StringType {
+    fn of_oid(type_oid: u32) -> Self {
+        use super::pg_type::oid;
+        match type_oid {
+            oid::BPCHAR => StringType::Bpchar,
+            oid::TEXT => StringType::Text,
+            oid::VARCHAR => StringType::Varchar,
+            oid::NAME => StringType::Name,
+            _ => StringType::Other,
+        }
+    }
+
+    /// The common type of `COALESCE`'s arguments, or of a `CASE`'s results
+    /// with its `ELSE` (or the `NULL` standing in for it) first, as
+    /// Postgres's `select_common_type` picks it: the first typed input,
+    /// unless a later one is implicitly reachable from it but not back.
+    /// Among the string types only `name` is, from `bpchar` or `varchar`;
+    /// `text` is preferred and stays. An [`StringType::Other`] input is
+    /// skipped, so an unmodelled mix leans to refusing.
+    fn common(inputs: impl IntoIterator<Item = StringType>) -> Self {
+        let mut common = None;
+        let mut other = false;
+        for input in inputs {
+            match (common, input) {
+                (_, StringType::Unknown) => {}
+                (_, StringType::Other) => other = true,
+                (None, input) => common = Some(input),
+                (Some(StringType::Bpchar | StringType::Varchar), StringType::Name) => {
+                    common = Some(StringType::Name)
+                }
+                (Some(_), _) => {}
+            }
+        }
+        common.unwrap_or(if other {
+            StringType::Other
+        } else {
+            StringType::Text
+        })
+    }
+
+    /// The type of `NULLIF(a, b)`: `a` as the `=` Postgres resolves takes
+    /// it, which turns a `bpchar` into `text` against a `text` or `name`.
+    fn nullif(a: StringType, b: StringType) -> Self {
+        match (a, b) {
+            (StringType::Bpchar, StringType::Text | StringType::Name) => StringType::Text,
+            (StringType::Varchar | StringType::Unknown, StringType::Bpchar) => StringType::Bpchar,
+            (StringType::Unknown, StringType::Name) => StringType::Name,
+            (StringType::Varchar | StringType::Unknown, _) => StringType::Text,
+            (a, _) => a,
+        }
+    }
+}
+
+/// Resolves the types of a field's expressions for
+/// [`padding_function_key_reads`].
+struct StringTypes<'d, 'c> {
+    fields_by_name: HashMap<&'d str, &'d FieldDef>,
+    column: &'d dyn Fn(&str) -> Option<&'c JoinColumnInfo>,
+}
+
+impl<'d> StringTypes<'d, '_> {
+    /// The field a bare name inside `field` reads, if not a column.
+    fn field_read(&self, name: &str, field: &str) -> Option<&'d FieldDef> {
+        self.fields_by_name
+            .get(name)
+            .copied()
+            .filter(|_| name != field)
+    }
+
+    fn column_type(&self, name: &str) -> StringType {
+        (self.column)(name).map_or(StringType::Other, |info| StringType::of_oid(info.type_oid))
+    }
+
+    /// `expr`'s type inside `field`; `depth` bounds a field cycle, which
+    /// [`validate`] has already refused.
+    fn of(&self, expr: &Expr, field: &str, depth: usize) -> StringType {
+        if depth > self.fields_by_name.len() + MAX_EXPRESSION_DEPTH {
+            return StringType::Other;
+        }
+        let of = |e: &Expr| self.of(e, field, depth + 1);
+        match expr {
+            Expr::Column(name) => match self.field_read(name, field) {
+                Some(other) => self.of(&other.expr, &other.name, depth + 1),
+                None => self.column_type(name),
+            },
+            Expr::SourceColumn { column, .. } => self.column_type(column),
+            Expr::StringLiteral(_) | Expr::Null => StringType::Unknown,
+            Expr::Cast { target, .. } if *target == ValueType::Text => StringType::Text,
+            Expr::FunctionCall { name, args } => match name.as_str() {
+                "COALESCE" => StringType::common(args.iter().map(of)),
+                "NULLIF" => match args.as_slice() {
+                    [a, b] => StringType::nullif(of(a), of(b)),
+                    _ => StringType::Other,
+                },
+                "MIN" | "MAX" => args.first().map_or(StringType::Other, of),
+                "STRING_AGG" => StringType::Text,
+                _ => StringType::Other,
+            },
+            Expr::Case {
+                branches,
+                otherwise,
+            } => StringType::common(
+                std::iter::once(otherwise.as_deref().map_or(StringType::Unknown, of))
+                    .chain(branches.iter().map(|(_, result)| of(result))),
+            ),
+            _ => StringType::Other,
+        }
+    }
+
+    /// The `char(n)` columns whose value reaches `expr`'s as `bpchar`: each
+    /// step from the column to `expr` resolves to `bpchar`.
+    fn padded_columns(&self, expr: &Expr, field: &str, depth: usize, out: &mut Vec<String>) {
+        if self.of(expr, field, depth) != StringType::Bpchar {
+            return;
+        }
+        let mut walk = |e: &Expr| self.padded_columns(e, field, depth + 1, out);
+        match expr {
+            Expr::Column(name) => match self.field_read(name, field) {
+                Some(other) => self.padded_columns(&other.expr, &other.name, depth + 1, out),
+                None => out.push(name.clone()),
+            },
+            Expr::SourceColumn { column, .. } => out.push(column.clone()),
+            Expr::FunctionCall { name, args } if name == "COALESCE" => args.iter().for_each(walk),
+            Expr::FunctionCall { name, args } if name == "NULLIF" => {
+                args.first().into_iter().for_each(walk)
+            }
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                branches.iter().for_each(|(_, result)| walk(result));
+                otherwise.iter().for_each(|e| walk(e));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every `char(n)` column a field of `def` passes as `char(n)` to a function
+/// that reads its trailing blanks
+/// ([`super::registry::PADDING_SENSITIVE_FUNCTIONS`]), outside an
+/// aggregate's argument, which reads source rows and so the padded value.
+/// `column` gives a column's live type. Each read is reported once, in field
+/// order.
+pub(crate) fn padding_function_key_reads<'c>(
+    def: &TransformDef,
+    column: &dyn Fn(&str) -> Option<&'c JoinColumnInfo>,
+) -> Vec<PaddingFunctionRead> {
+    fn walk(
+        expr: &Expr,
+        field: &str,
+        types: &StringTypes<'_, '_>,
+        out: &mut Vec<PaddingFunctionRead>,
+    ) {
+        if let Expr::FunctionCall { name, args } = expr {
+            if super::registry::is_aggregate_name(name) {
+                return;
+            }
+            if super::registry::PADDING_SENSITIVE_FUNCTIONS.contains(&name.as_str()) {
+                let mut columns = Vec::new();
+                for arg in args {
+                    types.padded_columns(arg, field, 0, &mut columns);
+                }
+                out.extend(columns.into_iter().map(|column| PaddingFunctionRead {
+                    field: field.to_string(),
+                    function: name.clone(),
+                    column,
+                }));
+            }
+        }
+        for child in expr.children() {
+            walk(child, field, types, out);
+        }
+    }
+    let types = StringTypes {
+        fields_by_name: def.fields.iter().map(|f| (f.name.as_str(), f)).collect(),
+        column,
+    };
+    let mut reads = Vec::new();
+    for field in &def.fields {
+        walk(&field.expr, &field.name, &types, &mut reads);
+    }
+    let mut seen = HashSet::new();
+    reads.retain(|read| seen.insert(read.clone()));
+    reads
+}
+
+/// Refuses a plain aggregate whose field passes a `char(n)` `GROUP BY` key,
+/// as `char(n)`, to a function that reads its padding
+/// ([`padding_function_key_reads`],
+/// [`ValidationError::CharKeyPaddingFunction`]): the aggregate keeps the key
+/// as `text`, without its trailing blanks. `column` gives a column's live
+/// type. Define, `RESUME` and the capture pass's re-validation of a retyped
+/// key ([`validate_live`]) all check it.
+pub(crate) fn check_char_key_padding_reads<'c>(
+    def: &TransformDef,
+    column: impl Fn(&str) -> Option<&'c JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let KeySpace::Aggregate { group_by } = &def.key_space else {
+        return Ok(());
+    };
+    match padding_function_key_reads(def, &column)
+        .into_iter()
+        .find(|read| group_by.contains(&read.column))
+    {
+        Some(read) => Err(ValidationError::CharKeyPaddingFunction {
+            field: read.field,
+            function: read.function,
+            column: read.column,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Refuses a `MIN`/`MAX` definition declared `WITHOUT SOURCE INDEX`
 /// ([`ValidationError::ExtremesWithoutSourceIndex`]): a probe without its
 /// index scans the group, and with no `GROUP BY` index either it scans the
@@ -2680,6 +2943,7 @@ pub(crate) fn validate_live(
         err => err,
     })?;
     check_enum_literals(def, columns)?;
+    check_char_key_padding_reads(def, |name| columns.get(name))?;
     validate_aggregate_admitted(def, columns)
 }
 
@@ -9466,5 +9730,134 @@ mod key_collation_tests {
             Err((KeyColumnRole::GroupBy, "g".to_string()))
         );
         assert_eq!(key_of(&[]), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod char_key_padding_tests {
+    use super::*;
+    use crate::defs::pg_type::oid;
+
+    fn info(type_oid: u32) -> JoinColumnInfo {
+        JoinColumnInfo {
+            value_type: ValueType::Text,
+            pg_type: String::new(),
+            type_oid,
+            typmod: -1,
+            collation_oid: 0,
+            collation: None,
+            collation_deterministic: true,
+            is_enum: false,
+            enum_labels: None,
+            copy_type: String::new(),
+            copy_collation: None,
+            trellis_target: false,
+        }
+    }
+
+    /// `ch` and `other` are `char(4)`, `t` is `text`, `vc` is `varchar(6)`
+    /// and `nm` is `name`.
+    fn check(text: &str) -> Result<(), ValidationError> {
+        let def = crate::defs::parser::parse(text).expect("parse");
+        let types = [
+            ("ch", info(oid::BPCHAR)),
+            ("other", info(oid::BPCHAR)),
+            ("t", info(oid::TEXT)),
+            ("vc", info(oid::VARCHAR)),
+            ("nm", info(oid::NAME)),
+        ];
+        check_char_key_padding_reads(&def, |name| {
+            types
+                .iter()
+                .find(|(column, _)| *column == name)
+                .map(|(_, info)| info)
+        })
+    }
+
+    fn refusal() -> Result<(), ValidationError> {
+        Err(ValidationError::CharKeyPaddingFunction {
+            field: "o".to_string(),
+            function: "OCTET_LENGTH".to_string(),
+            column: "ch".to_string(),
+        })
+    }
+
+    /// Each argument Postgres 17 types `character` (`pg_typeof`) with `ch`'s
+    /// value in it, so `octet_length` counts the blanks.
+    #[test]
+    fn a_char_key_reaching_octet_length_as_char_is_refused() {
+        for argument in [
+            "ch",
+            "k",
+            "COALESCE(ch, 'x')",
+            "COALESCE(NULL, ch)",
+            "COALESCE(ch, other)",
+            "COALESCE(ch, t)",
+            "COALESCE(ch, vc)",
+            "CASE WHEN t = 'a' THEN ch END",
+            "CASE WHEN t = 'a' THEN 'x' ELSE ch END",
+            "CASE WHEN t = 'a' THEN t ELSE ch END",
+            "CASE WHEN t = 'a' THEN NULL WHEN t = 'b' THEN ch ELSE NULL END",
+            "NULLIF(ch, 'x')",
+            "NULLIF(ch, other)",
+            "NULLIF(ch, vc)",
+        ] {
+            let def = format!(
+                "TRANSFORM g FROM s GROUP BY ch, t SELECT ch AS k, OCTET_LENGTH({argument}) + 1 AS o"
+            );
+            assert_eq!(check(&def), refusal(), "{argument}");
+        }
+    }
+
+    /// Each argument Postgres 17 types `text`, `varchar` or `name`
+    /// (`pg_typeof`): `ch`'s blanks are dropped there as in the key's copy.
+    #[test]
+    fn a_char_key_converted_from_char_is_admitted() {
+        for argument in [
+            "COALESCE(t, ch)",
+            "COALESCE(vc, ch)",
+            "COALESCE(ch, nm)",
+            "COALESCE(CAST(NULL AS text), ch)",
+            "CASE WHEN t = 'a' THEN ch ELSE t END",
+            "CASE WHEN t = 'a' THEN t WHEN t = 'b' THEN ch END",
+            "CASE WHEN t = 'a' THEN ch WHEN t = 'b' THEN 'x' ELSE CAST(NULL AS text) END",
+            "NULLIF(ch, t)",
+            "NULLIF(ch, nm)",
+            "COALESCE(NULLIF(ch, t), other)",
+            // `character` overall, but `ch` reaches it through `text`.
+            "CASE WHEN t = 'a' THEN COALESCE(t, ch) ELSE other END",
+        ] {
+            let def = format!(
+                "TRANSFORM g FROM s GROUP BY ch, t, vc, nm SELECT OCTET_LENGTH({argument}) AS o"
+            );
+            assert_eq!(check(&def), Ok(()), "{argument}");
+        }
+    }
+
+    #[test]
+    fn what_reads_no_char_key_copy_is_admitted() {
+        for field in [
+            "CHAR_LENGTH(ch)",
+            "STRPOS(ch, 'a')",
+            "SUM(OCTET_LENGTH(other))",
+            "MAX(OCTET_LENGTH(ch))",
+        ] {
+            let def = format!("TRANSFORM g FROM s GROUP BY ch SELECT {field} AS o, ch AS ch");
+            assert_eq!(check(&def), Ok(()), "{field}");
+        }
+        // A `text` key, and a `char(n)` column that is not a key.
+        assert_eq!(
+            check("TRANSFORM g FROM s GROUP BY t SELECT OCTET_LENGTH(t) AS o"),
+            Ok(())
+        );
+        assert_eq!(
+            check("TRANSFORM g FROM s GROUP BY t SELECT OCTET_LENGTH(COALESCE(t, other)) AS o"),
+            Ok(())
+        );
+        // A 1-1 transform keeps the column's own type.
+        assert_eq!(
+            check("TRANSFORM g FROM s SELECT OCTET_LENGTH(ch) AS o"),
+            Ok(())
+        );
     }
 }

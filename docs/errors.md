@@ -662,6 +662,15 @@ A top-level `AND` condition of a [join aggregate](transforms.md#join-aggregate)'
 condition filters one table's rows. Drop it, or, to keep nothing, drop the
 transform.
 
+### T0246 CharKeyPaddingFunction
+
+A field of an aggregate passes a `char(n)` `GROUP BY` key to `OCTET_LENGTH`
+as `char(n)`: directly, or through another field or a `COALESCE`, `NULLIF` or
+`CASE` that Postgres types `char(n)`. The aggregate keeps the key as `text`
+without its trailing blanks
+([the key's type](type-support.md#the-types-of-the-columns-trellis-creates)),
+so the length would differ from Postgres's. Group by a `text` column.
+
 ## Tables and keys
 
 What a definition reads or writes can't be maintained as it stands

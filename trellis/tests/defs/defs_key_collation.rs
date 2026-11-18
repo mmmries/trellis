@@ -671,3 +671,66 @@ async fn aggregate_join_text_reads_are_refused_in_every_aggregate_position() {
         assert_no_target(&db.pool, &name).await;
     }
 }
+
+/// `OCTET_LENGTH` over a `char(n)` `GROUP BY` key is refused at define
+/// (the aggregate keeps the key as `text`, without its blanks), and a
+/// definition whose key is retyped to `char(n)` while paused is refused at
+/// `RESUME` by the same rule (#2069).
+#[tokio::test]
+async fn octet_length_over_a_char_group_key_is_refused_at_define_and_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    batch(
+        &db.pool,
+        "create table padded (id bigint primary key, ch character(4));
+         create index on padded (ch);
+         create table loose (id bigint primary key, ch text);
+         create index on loose (ch);",
+    )
+    .await;
+    let trellis = definer(db.dsn()).await;
+    let err = trellis
+        .apply(
+            "TRANSFORM by_pad FROM padded GROUP BY ch \
+             SELECT OCTET_LENGTH(COALESCE(ch, 'x')) AS o, COUNT(*) AS n",
+        )
+        .await
+        .expect_err("a char(n) key under OCTET_LENGTH");
+    assert!(
+        err.to_string().contains("T0246") && err.to_string().contains("OCTET_LENGTH reads ch"),
+        "{err}"
+    );
+    trellis
+        .apply(
+            "TRANSFORM by_loose FROM loose GROUP BY ch \
+             SELECT OCTET_LENGTH(ch) AS o, COUNT(*) AS n",
+        )
+        .await
+        .expect("a text key is admitted");
+    trellis
+        .apply("PAUSE TRANSFORM by_loose")
+        .await
+        .expect("pause");
+    batch(
+        &db.pool,
+        "alter table loose alter column ch type character(4)",
+    )
+    .await;
+    let err = trellis
+        .apply("RESUME TRANSFORM by_loose")
+        .await
+        .expect_err("the key is now char(n)");
+    let message = err.to_string();
+    assert!(
+        message.contains("can't resume") && message.contains("OCTET_LENGTH reads ch"),
+        "{message}"
+    );
+    assert_eq!(
+        trellis
+            .status("by_loose")
+            .await
+            .expect("status")
+            .map(|status| status.status),
+        Some(TransformStatus::Paused)
+    );
+}
