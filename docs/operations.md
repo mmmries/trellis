@@ -564,6 +564,13 @@ it:
   * Trellis's schema or the targets restored without the rest need the
     affected transforms paused, dropped and defined again, or the whole
     database restored from one backup.
+* **A logical dump (`pg_dump`) that includes Trellis's schema** holds `ACCESS
+  SHARE` on the ring slots for its whole run, so no slot can be recycled.
+  Once the other slots drain, draining stops (`seal_refused_total` climbs,
+  with a [T0185](errors.md#t0185-ringfull) `WARN`), and every target lags by
+  up to the dump's duration. It catches up by itself once the dump ends, with
+  no wrong data. Schedule logical dumps for when that lag is acceptable, or
+  take a physical backup, which takes no table locks.
 * **Moving an instance's definitions to another database** (a staging copy, a
   fresh test database, another cluster), without its data:
   1. `trellis dump --out dump.sql` against the database. It runs `pg_dump
