@@ -694,12 +694,6 @@ Trellis's runtime is off in. Only the runtime is off there:
 - With no worker, each definition stays `waiting_to_backfill` and sources
   get no capture triggers, so test writes capture nothing and targets stay
   empty until a test fills them.
-- **Rails 8.1's fixture foreign-key check** resolves every foreign key
-  without Trellis's schema and fails with `PG::UndefinedTable` on Trellis's
-  own tables. Set `config.active_record.verify_foreign_keys_for_fixtures =
-  false` in `config/environments/test.rb`. Don't put Trellis's schema on the
-  test database's `schema_search_path` instead: `parallelize` then truncates
-  Trellis's tables between runs. Rails 8.0 needs neither.
 
 Stub a target's rows by hand, as the transform would write them; a model
 over the target ("Targets as models") writes here:
