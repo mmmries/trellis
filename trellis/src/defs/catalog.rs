@@ -1836,7 +1836,8 @@ pub(crate) async fn reported_statuses(
 /// A column of a 1-1 target is paused when it has a `column_status` row
 /// (its fuse tripped, or `PAUSE TRANSFORM t.col`). Its 1-1 readers' fields
 /// are paused with it by the cascade, but any other reader (an aggregate, a
-/// `JOIN`) keeps applying over the column's frozen values and stays `live`,
+/// `JOIN`, a `WHERE` of any kind of transform) keeps applying over the
+/// column's frozen values and stays `live`,
 /// exact against the upstream target and stale against the source. A `live`
 /// definition reading such a column therefore reports `catching_up` too,
 /// until the column's resume writes through to it. Nothing is paused or
@@ -7626,6 +7627,96 @@ mod column_dependents_tests {
                 .collect();
             assert_eq!(deps, expected, "t.{column}");
         }
+    }
+
+    /// A `WHERE` is not a field (ADR-0003): a paused upstream column a
+    /// definition reads only in its `WHERE` is its cause of `catching_up`
+    /// in every key space (plain 1-1, aggregate, 1-1 `JOIN` at a later star
+    /// position, `JOIN` aggregate), and the column-pause cascade, which
+    /// pauses fields, lists none of them.
+    #[tokio::test]
+    async fn a_where_read_of_a_paused_column_is_a_cause_in_every_key_space() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.t', 1), ('public.orders', 1), \
+                        ('public.items', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status, \
+                  join_table, join_columns) \
+                 values \
+                 ('public.t', 'public.s', 1, \
+                  'TRANSFORM t FROM s SELECT a AS a, c AS c, k AS k', 'live', null, null), \
+                 ('public.plain', 'public.t', 1, \
+                  'TRANSFORM plain FROM t SELECT a AS a WHERE c > 0', 'live', null, null), \
+                 ('public.agg', 'public.t', 1, \
+                  'TRANSFORM agg FROM t GROUP BY a SELECT a AS a, COUNT(*) AS n WHERE c > 0', \
+                  'live', null, null), \
+                 ('public.star', 'public.orders', 1, \
+                  'TRANSFORM star FROM orders LEFT JOIN items ON orders.id = items.oid \
+                   LEFT JOIN t ON orders.id = t.k SELECT items.sku AS sku WHERE t.c > 0', \
+                  'live', 'public.items', '{}'), \
+                 ('public.jagg', 'public.orders', 1, \
+                  'TRANSFORM jagg FROM orders JOIN t ON orders.id = t.k \
+                   GROUP BY orders.region SELECT orders.region AS region, COUNT(*) AS n \
+                   WHERE t.c > 0', \
+                  'live', 'public.t', '{}'); \
+                 insert into definition_join_tables (transform_id, position, table_name, columns) \
+                 select id, 2, 'public.t', '{}' from transform_definitions \
+                 where target_table = 'public.star'; \
+                 insert into column_status (transform_table, column_name, paused_at, local_fuse) \
+                 values ('t', 'c', now(), true)",
+            )
+            .await
+            .expect("seed definitions");
+        // A `WHERE` needs a grammar and a floor that read it.
+        client
+            .execute(
+                "update transform_definitions set grammar_version = $1, floor_version = $2",
+                &[
+                    &super::grammar::CURRENT_GRAMMAR_VERSION,
+                    &env!("CARGO_PKG_VERSION"),
+                ],
+            )
+            .await
+            .expect("stamp the grammar and floor");
+
+        let (statuses, causes) =
+            reported_statuses_with_causes(&**client, &Floors::of_this_binary())
+                .await
+                .expect("reported statuses");
+        let ids: HashMap<String, i64> = client
+            .query(
+                "select split_part(target_table, '.', 2), id from transform_definitions",
+                &[],
+            )
+            .await
+            .expect("ids")
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        for reader in ["plain", "agg", "star", "jagg"] {
+            let id = ids[reader];
+            assert_eq!(statuses[&id], TransformStatus::CatchingUp, "{reader}");
+            assert_eq!(causes.get(&id), Some(&vec!["t.c".to_string()]), "{reader}");
+        }
+        assert_eq!(statuses[&ids["t"]], TransformStatus::Live);
+        assert!(
+            column_dependents_via(
+                &**client,
+                &Floors::of_this_binary(),
+                "t",
+                "c",
+                Lineage::OneToOne
+            )
+            .await
+            .expect("cascade dependents")
+            .is_empty(),
+            "the cascade pauses no field of a predicate reader"
+        );
     }
 
     /// The cascade's per-pair re-check, [`reads_column`], says

@@ -251,7 +251,9 @@ Settled parameters:
   definition reading a paused column of an upstream 1-1 target reports
   `catching_up`, transitively, and `DefinitionStatus::paused_upstream_columns`
   names the column. Nothing is paused or rebuilt: the column's resume writes
-  through to the reader, which reads `live` again. Each reader's pause
+  through to the reader, which reads `live` again. A `WHERE` is not a field: a
+  downstream predicate that reads a paused column keeps applying over its frozen
+  values and reports `catching_up`, in every kind of transform. Each reader's pause
   commits in a transaction of its own, fenced against its writers in flight, so
   a cascade can fail part-way. The walk is idempotent: it walks on through a
   reader that is paused already, so running it again reaches the readers the

@@ -5915,3 +5915,112 @@ async fn a_resume_does_not_wait_for_an_upstream_reading_a_paused_column() {
     );
     assert_ne!(status_named(&client, "sib_chain").await, "paused");
 }
+
+/// A `WHERE` is not a field (ADR-0003): a plain 1-1 and a plain aggregate
+/// whose predicate reads a paused upstream column keep applying over its
+/// frozen values, report `catching_up` naming the column, and get no
+/// `column_status` row. The column's resume corrects membership and both
+/// read `live` again.
+#[tokio::test]
+async fn a_where_reading_a_paused_column_reports_catching_up_until_the_columns_resume() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform_of(
+        &db,
+        &client,
+        "price + tax AS total, price + 0 AS cost",
+        "bigint",
+        ValueType::Integer(trellis::integer::IntWidth::Int8),
+    )
+    .await;
+    // Row 1's total is 35: a member of both readers.
+    change_item(&mut client, &db.pool, 1, None, (30, 5, 0)).await;
+    let trellis = trellis_on(&db).await;
+    for define in [
+        "TRANSFORM sib_where FROM sib SELECT cost AS c WHERE total > 20",
+        "TRANSFORM sib_where_agg FROM sib GROUP BY id WITHOUT SOURCE INDEX \
+         SELECT id AS id, SUM(cost) AS c WHERE total > 20",
+    ] {
+        trellis.apply(define).await.expect("define a WHERE reader");
+        trellis::intake::harness::settle_builds(&db.pool).await;
+        trellis::staging::build::settle_builds(&db.pool).await;
+        drain_staged(&mut client, &db.pool).await;
+    }
+    let readers = ["sib_where", "sib_where_agg"];
+    assert_eq!(where_costs(&client).await, [vec!["30"], vec!["30"]]);
+    for reader in readers {
+        assert_eq!(
+            reported(&trellis, reader).await,
+            ("live", vec![]),
+            "{reader}"
+        );
+    }
+
+    trellis
+        .apply("PAUSE TRANSFORM sib.total")
+        .await
+        .expect("pause total");
+    for reader in readers {
+        assert_eq!(
+            reported(&trellis, reader).await,
+            ("catching_up", vec!["sib.total".to_string()]),
+            "{reader}"
+        );
+        assert_eq!(status_named(&client, reader).await, "live", "{reader}");
+        let rows: i64 = client
+            .query_one(
+                "select count(*) from column_status where transform_table = $1",
+                &[&reader],
+            )
+            .await
+            .expect("count column_status")
+            .get(0);
+        assert_eq!(
+            rows, 0,
+            "{reader}: a predicate reader gets no column_status row"
+        );
+    }
+
+    // Rows keep flowing; membership follows the frozen total (35), so row 1
+    // stays although its total is now 15.
+    change_item(&mut client, &db.pool, 1, Some((30, 5, 0)), (10, 5, 0)).await;
+    assert_eq!(where_costs(&client).await, [vec!["10"], vec!["10"]]);
+
+    trellis
+        .apply("RESUME TRANSFORM sib.total")
+        .await
+        .expect("resume total");
+    for _ in 0..2 {
+        trellis::staging::build::settle_builds(&db.pool).await;
+        drain_staged(&mut client, &db.pool).await;
+    }
+    assert_eq!(
+        where_costs(&client).await,
+        [Vec::<String>::new(), Vec::new()],
+        "the resume corrects membership"
+    );
+    for reader in readers {
+        assert_eq!(
+            reported(&trellis, reader).await,
+            ("live", vec![]),
+            "{reader}"
+        );
+    }
+}
+
+/// `sib_where`'s and `sib_where_agg`'s `c` column, each by `id`.
+async fn where_costs(client: &Client) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for reader in ["sib_where", "sib_where_agg"] {
+        let rows = client
+            .query(
+                &format!("select c::text from public.{reader} order by id"),
+                &[],
+            )
+            .await
+            .expect("read the reader");
+        out.push(rows.iter().map(|r| r.get::<_, String>(0)).collect());
+    }
+    out
+}

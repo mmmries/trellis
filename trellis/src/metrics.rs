@@ -152,6 +152,10 @@ const DEFINITIONS_METRIC: &str = "trellis_definitions";
 /// ([`StatusGauges::paused_by`]).
 const PAUSED_DEFINITIONS_METRIC: &str = "trellis_paused_definitions";
 
+/// Definitions that report a paused upstream column
+/// ([`StatusGauges::reading_paused_columns`]).
+const READING_PAUSED_COLUMNS_METRIC: &str = "trellis_definitions_reading_paused_columns";
+
 /// Source keys held in quarantine, all definitions together.
 const HELD_KEYS_METRIC: &str = "trellis_held_keys";
 
@@ -549,6 +553,12 @@ fn describe_metrics() {
          backfill_failure (its build kept failing) or unknown."
     );
     metrics::describe_gauge!(
+        READING_PAUSED_COLUMNS_METRIC,
+        "Count of definitions whose status names a paused upstream column \
+         (paused_upstream_columns). They keep applying over its frozen values until the column \
+         is resumed."
+    );
+    metrics::describe_gauge!(
         HELD_KEYS_METRIC,
         "Count of source keys held in quarantine, all definitions together."
     );
@@ -711,6 +721,8 @@ pub(crate) struct StatusGauges {
     pub(crate) definitions: BTreeMap<&'static str, u64>,
     /// The paused ones, by cause.
     pub(crate) paused_by: BTreeMap<&'static str, u64>,
+    /// Definitions whose `paused_upstream_columns` isn't empty.
+    pub(crate) reading_paused_columns: u64,
     /// Source keys held in quarantine.
     pub(crate) held_keys: u64,
     /// Columns of 1-1 targets whose own fuse tripped.
@@ -745,6 +757,8 @@ fn publish_status_gauges(label: &str, status: &StatusGauges) {
         metrics::gauge!(PAUSED_DEFINITIONS_METRIC, INSTANCE_LABEL => label.to_string(), "cause" => *cause)
             .set(*count as f64);
     }
+    metrics::gauge!(READING_PAUSED_COLUMNS_METRIC, INSTANCE_LABEL => label.to_string())
+        .set(status.reading_paused_columns as f64);
     metrics::gauge!(HELD_KEYS_METRIC, INSTANCE_LABEL => label.to_string())
         .set(status.held_keys as f64);
     metrics::gauge!(QUARANTINED_COLUMNS_METRIC, INSTANCE_LABEL => label.to_string())
@@ -1207,6 +1221,7 @@ mod tests {
         StatusGauges {
             definitions: BTreeMap::from([("live", 4), ("paused", 3), ("quarantined", 1)]),
             paused_by: BTreeMap::from([("operator", 1), ("disruption", 2)]),
+            reading_paused_columns: 10,
             held_keys: 5,
             quarantined_columns: 6,
             drain_failures: 7,
@@ -1321,6 +1336,7 @@ mod tests {
                 );
             }
             for (metric, count) in [
+                (READING_PAUSED_COLUMNS_METRIC, 10.0),
                 (HELD_KEYS_METRIC, 5.0),
                 (QUARANTINED_COLUMNS_METRIC, 6.0),
                 (DRAIN_FAILURES_METRIC, 7.0),
@@ -1364,6 +1380,7 @@ mod tests {
                 assert_eq!(get(&rendered, metric, &[extra]), Some(count), "{rendered}");
             }
             for metric in [
+                READING_PAUSED_COLUMNS_METRIC,
                 HELD_KEYS_METRIC,
                 QUARANTINED_COLUMNS_METRIC,
                 DRAIN_FAILURES_METRIC,
@@ -1559,6 +1576,7 @@ mod tests {
                 RING_UNDRAINED_BYTES_METRIC,
                 DEFINITIONS_METRIC,
                 PAUSED_DEFINITIONS_METRIC,
+                READING_PAUSED_COLUMNS_METRIC,
                 HELD_KEYS_METRIC,
                 QUARANTINED_COLUMNS_METRIC,
                 DRAIN_FAILURES_METRIC,
