@@ -10,6 +10,9 @@
 //! - a define racing the upstream's build start waits for the start's commit
 //!   and is refused
 //!   (`a_define_racing_the_upstream_build_start_waits_for_it_and_is_refused`)
+//! - a define racing a pause of the upstream that holds its row waits for it
+//!   and is refused
+//!   (`a_define_waits_for_a_pause_holding_its_upstream_row_and_is_refused`)
 
 use crate::support::pipeline;
 use crate::support::wait_live::wait_for_live;
@@ -236,5 +239,61 @@ async fn a_define_racing_the_upstream_build_start_waits_for_it_and_is_refused() 
         .expect("probe down")
         .get(0);
     assert!(!down_exists, "the refusal comes before any DDL");
+    d.shutdown().await.expect("shut the definer down");
+}
+
+/// The define's `FOR SHARE` on its upstream's definition row, which the
+/// column-pause lock doesn't cover: a pause that takes no column-pause lock
+/// (`lifecycle::pause_many`, as a restore's response does) holds the row
+/// `FOR UPDATE` while it moves the upstream out of `waiting_to_backfill`. A
+/// define reading the upstream waits for that commit and is refused, rather
+/// than reading the old status and chaining off a paused upstream.
+#[tokio::test]
+async fn a_define_waits_for_a_pause_holding_its_upstream_row_and_is_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute("create table public.src (id bigint primary key, v bigint)")
+        .await
+        .expect("source");
+    let d = definer(db.dsn()).await;
+    d.apply("TRANSFORM up FROM src SELECT v AS v")
+        .await
+        .expect("up");
+
+    // The pause, by hand: the row `FOR UPDATE`, then the status.
+    let mut pauser = connect(db.dsn()).await;
+    let pause = pauser.transaction().await.expect("begin the pause");
+    pause
+        .batch_execute(
+            "select 1 from transform_definitions where target_table = 'public.up' for update",
+        )
+        .await
+        .expect("lock up's row");
+
+    let definer_dsn = db.dsn().to_string();
+    let define = tokio::spawn(async move {
+        let d2 = definer(&definer_dsn).await;
+        let result = d2.apply("TRANSFORM down FROM up SELECT v + 1 AS w").await;
+        d2.shutdown().await.expect("shut the second definer down");
+        result
+    });
+    wait_for_lock_wait(&raw, "transactionid", "the define to wait on up's row").await;
+    pause
+        .batch_execute(
+            "update transform_definitions set status = 'paused' \
+             where target_table = 'public.up'",
+        )
+        .await
+        .expect("pause up");
+    pause.commit().await.expect("commit the pause");
+
+    match define.await.expect("the define").expect_err("up is paused") {
+        TrellisError::Catalog(CatalogError::TransformNotLive { transform, status }) => {
+            assert_eq!(transform, "up");
+            assert_eq!(status, TransformStatus::Paused);
+        }
+        other => panic!("expected TransformNotLive, got {other:?}"),
+    }
     d.shutdown().await.expect("shut the definer down");
 }

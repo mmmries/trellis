@@ -2064,12 +2064,15 @@ fn derive_reported(
 /// (`intake::catch_up::park_target_catchup_if_read`).
 ///
 /// `lock` takes the upstreams' definition rows `FOR SHARE`, in id order, in
-/// one statement, before reading their status: a build's start, which moves
-/// an upstream out of `waiting_to_backfill` under its row `FOR UPDATE`, then
-/// waits for the define to commit, so the reader is registered before the
-/// build starts or sees it running and is refused. The authoritative check
-/// in [`create_definition_inner`] locks, after the column-pause lock
-/// (stage 05's lock order); [`install_definition`]'s fail-fast doesn't.
+/// one statement, before reading their status: anything that moves an
+/// upstream out of `waiting_to_backfill` under its row `FOR UPDATE` (a
+/// build's start, a pause) then waits for the define to commit, so the
+/// reader is registered first, or sees the new status and is refused. The
+/// authoritative check in [`create_definition_inner`] locks, after the
+/// column-pause lock (stage 05's lock order), which already orders a build's
+/// start; the row lock covers a pause that takes no column-pause lock
+/// (`lifecycle::pause_many`). [`install_definition`]'s fail-fast doesn't
+/// lock.
 async fn reject_upstream_mid_build(
     client: &impl GenericClient,
     tables: &[&str],
