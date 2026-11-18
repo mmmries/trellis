@@ -541,6 +541,9 @@ pub struct ManualBackend {
     /// ([`ClientOptions::reclaim_ttl`]), when a caller sets one with
     /// [`ManualBackend::set_reclaim_ttl`]; the engine's default otherwise.
     reclaim_ttl: Option<Duration>,
+    /// Whether [`Backend::quiesce`](super::Backend::quiesce) retires drained
+    /// segments while it waits ([`ManualBackend::set_retire_during_quiesce`]).
+    retire_during_quiesce: bool,
     /// The schema this backend's transform *target* tables are created
     /// under (`trellis::Config::target_schema`,
     /// `docs/instance-identity.md`): two instances sharing one
@@ -701,6 +704,7 @@ impl ManualBackend {
             housekeeping_interval: None,
             drain_batch_cap: None,
             reclaim_ttl: None,
+            retire_during_quiesce: false,
             strict_audit: false,
             strict_audits_converged: 0,
             target_schema,
@@ -823,6 +827,22 @@ impl ManualBackend {
     /// [`ManualBackend::connect_to_restore`] carries it over.
     pub fn set_reclaim_ttl(&mut self, ttl: Duration) {
         self.reclaim_ttl = Some(ttl);
+    }
+
+    /// Makes [`Backend::quiesce`] retire drained segments
+    /// (`retire_drained_segments`, the housekeeping pass's segment step)
+    /// while it waits, on a session of its own.
+    ///
+    /// For a backend whose housekeeping is held off
+    /// ([`ManualBackend::set_housekeeping_interval`] raised so the zero-group
+    /// GC can't race a pin). Convergence counts a straggler row in a drained
+    /// segment's slot as pending until the slot is retired, and with
+    /// housekeeping off only a seal that hits `RingFull` retires; an idle
+    /// seal reaches back one segment, so a straggler two or more behind an
+    /// empty active segment would never clear (#2135). Only segments retire:
+    /// tombstones and zero groups are left alone.
+    pub fn set_retire_during_quiesce(&mut self, retire: bool) {
+        self.retire_during_quiesce = retire;
     }
 
     /// Chooses where [`Backend::install`] puts the source tables.
@@ -1440,8 +1460,23 @@ impl super::Backend for ManualBackend {
 
         // Partition maintenance, definition status and the ring,
         // in that order — see `sql::quiesce` for why the order matters.
-        let result =
-            sql::quiesce_within(&self.raw, &self.defs, &mut deadline, self.held_keys).await;
+        let result = if self.retire_during_quiesce {
+            let mut retirer = connect_raw(&self.config).await?;
+            let retiring = async {
+                loop {
+                    if let Err(err) = retire_drained_segments(&mut retirer).await {
+                        break err;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            tokio::select! {
+                result = sql::quiesce_within(&self.raw, &self.defs, &mut deadline, self.held_keys) => result,
+                err = retiring => return Err(err.into()),
+            }
+        } else {
+            sql::quiesce_within(&self.raw, &self.defs, &mut deadline, self.held_keys).await
+        };
 
         if timing_enabled {
             eprintln!(
