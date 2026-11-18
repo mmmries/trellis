@@ -119,6 +119,32 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
   ring grows and `ring_oldest_undrained_age_seconds` climbs while it is open,
   and both fall once it ends.
 
+## Connect directly or through a session-mode pooler
+
+Every Trellis connection (the worker, `migrate`, and calls-only handles) goes
+direct to Postgres or through a pooler in **session mode**. Transaction-mode
+and statement-mode pooling are unsupported. Under transaction mode, observed
+with PgBouncer:
+
+* The worker's leadership lock is a session lock, so it can't tell two
+  workers apart when their calls share a pooled backend. Both workers stand
+  by, targets go stale, and `status` still says `live`. Nothing reports it.
+* `migrate`'s locks strand on a pooled backend after the process exits. They
+  then fail direct processes: `trellis run` refuses (T0219), a running worker's
+  registry row ages out, and calls are refused with T0220.
+* Trellis's session settings leak into the application's own pooled
+  connections.
+* `LISTEN` notifications are dropped.
+
+Statement mode fails loudly (T0208). Session mode is safe.
+
+Safe endpoints: Supabase port 5432 (not 6543), Neon's host without
+`-pooler`, and a PgBouncer or Supavisor session-mode port. RDS Proxy pins a
+connection on Trellis's `SET`s and so behaves like session mode, but is
+untested. A Rails or Phoenix app gives Trellis its own direct or
+session-mode URL, not the app's pooled `DATABASE_URL`. The silent case is a known gap:
+[a Trellis process behind a transaction-mode pooler](known-correctness-gaps.md#a-trellis-process-behind-a-transaction-mode-pooler).
+
 ## `statement_timeout`
 
 Trellis never lifts the `statement_timeout` on its role or database: it

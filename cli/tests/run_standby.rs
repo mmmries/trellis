@@ -82,6 +82,30 @@ fn wait_for_log(
     }
 }
 
+/// Kills and reaps the child on drop, so a failing assertion (a panic) never
+/// leaves an orphaned `trellis run` holding a database connection.
+struct KillOnDrop(Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn stderr_lines(child: &mut Child) -> Receiver<String> {
     lines_of(child.stderr.take().expect("piped stderr"))
 }
@@ -123,6 +147,7 @@ async fn run_stands_by_while_its_role_cannot_migrate_then_takes_over() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
+        .map(KillOnDrop)
         .expect("spawn trellis run");
     let log = stderr_lines(&mut run);
 
@@ -176,12 +201,12 @@ async fn run_migrates_a_fresh_database_before_it_stages() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+        .map(KillOnDrop)
         .expect("spawn trellis run");
     let stdout = lines_of(run.stdout.take().expect("piped stdout"));
     let log = stderr_lines(&mut run);
 
     if let Err(e) = wait_for_log(&stdout, "trellis running", Duration::from_secs(60)) {
-        let _ = run.kill();
         let stderr: Vec<String> = log.try_iter().collect();
         panic!("{e}\nstderr:\n{}", stderr.join("\n"));
     }

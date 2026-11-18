@@ -205,3 +205,118 @@ async fn forced_seals_lap_the_ring_without_a_maintenance_tick() {
         previous = sealed;
     }
 }
+
+/// A straggler row in a drained segment's slot gates convergence until the
+/// segment is retired (`converged_through`'s condition 3), and with the
+/// engine's housekeeping off nothing retires it while the ring isn't full: an
+/// idle seal reaches back one segment only. With the straggler's segment two
+/// behind an empty active segment, a plain quiesce never converges (#2135);
+/// one that retires drained segments does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_straggler_in_a_long_drained_segment_needs_retirement_to_converge() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let mut pool = NamePool::new();
+    let source = Table::new(&mut pool, &[ValueType::Numeric]);
+    let a = source.columns[1].name.clone();
+    let def = TransformDef {
+        target: pool.next_table_name(),
+        source: source.name.clone(),
+        key_space: KeySpace::OneToOne,
+        fields: vec![FieldDef {
+            name: "copy".to_string(),
+            expr: Expr::Column(a),
+        }],
+        predicate: Predicate::True,
+        without_source_index: false,
+        adopt_target: false,
+        source_key: None,
+        explicit_source_schema: None,
+        explicit_target_schema: None,
+    };
+    let program = Program {
+        tables: vec![source],
+        defs: vec![def],
+        def_install_after_op: vec![0],
+        ops: Vec::new(),
+        restart_after_ops: Vec::new(),
+        scale_out_after_ops: Vec::new(),
+    };
+
+    let mut backend =
+        ManualBackend::connect_with_options(db.dsn(), 1, Some(SEAL_ON_DEMAND_INTERVAL))
+            .await
+            .expect("connect manual backend");
+    backend.install(&program).await.expect("install program");
+    backend
+        .quiesce_forcing_seals()
+        .await
+        .expect("settle the install");
+
+    // Three empty seals leave the active segment empty, three past the first.
+    let first = backend.force_seal_active_segment().await.expect("seal");
+    backend.force_seal_active_segment().await.expect("seal");
+    backend.force_seal_active_segment().await.expect("seal");
+
+    let (side, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("side connection");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    side.batch_execute("set search_path = trellis")
+        .await
+        .expect("search path");
+    let drained = async {
+        for _ in 0..200 {
+            let undrained: i64 = side
+                .query_one(
+                    "select count(*) from segments where seg_seq <= $1::bigint + 2 and state <> 'drained'",
+                    &[&first],
+                )
+                .await
+                .expect("count undrained")
+                .get(0);
+            if undrained == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the empty segments never drained");
+    };
+    drained.await;
+
+    // A row lands in the first segment's slot after its fence: invisible to
+    // it, so nothing applies it.
+    let slot: i16 = side
+        .query_one(
+            "select ring_slot from segments where seg_seq = $1",
+            &[&first],
+        )
+        .await
+        .expect("slot of the first segment")
+        .get(0);
+    side.execute(
+        &format!(
+            "insert into seg_{slot} (src_table, key, op, hop_gen) \
+             values ('stray', 'k', 'recompute', 0)"
+        ),
+        &[],
+    )
+    .await
+    .expect("insert the straggler");
+
+    // The old quiesce can't converge: nothing retires the slot.
+    let plain = tokio::time::timeout(std::time::Duration::from_secs(3), backend.quiesce()).await;
+    assert!(
+        plain.is_err(),
+        "a plain quiesce must hang on the straggler: {plain:?}"
+    );
+
+    backend.set_retire_during_quiesce(true);
+    tokio::time::timeout(std::time::Duration::from_secs(20), backend.quiesce())
+        .await
+        .expect("the retiring quiesce must converge, not time out")
+        .expect("quiesce");
+}

@@ -21,8 +21,15 @@ the machine from the release's GitHub page and checks it against the SHA-256
 the package ships. Builds exist for
 
 - Linux, glibc 2.17 or newer: `x86_64` and `aarch64`
-- Linux, musl (Alpine): `x86_64`
+- Linux, musl (Alpine): `x86_64` and `aarch64`
 - macOS: Apple silicon and Intel
+
+### Supported versions
+
+Elixir 1.19 and later, on the OTP releases Elixir supports for it (26 to 29
+today); `ecto_sql` 3.13+ and `plug` 1.16+ where used; PostgreSQL 15 to 18,
+as for Trellis itself. CI runs the suite on Elixir 1.19 / OTP 26 and
+Elixir 1.20 / OTP 29.
 
 On any other target, or to build it yourself, build the NIF from source. It
 needs a Rust toolchain (the version in the repository's `rust-toolchain.toml`)
@@ -48,6 +55,8 @@ path pulls in an OpenTelemetry or gRPC stack. The engine's log lines reach
 ## Usage
 
 The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a bang variant.
+
+Connect directly or through a session-mode pooler, never a transaction-mode one ([recommendations](../../docs/recommendations.md#connect-directly-or-through-a-session-mode-pooler)).
 
 - `connect/1`, `migrate/1`, `config/1`, `shutdown/1`: the handle's lifecycle.
 - `apply/2`: any statement of Trellis's grammar (`TRANSFORM`,
@@ -244,7 +253,8 @@ down when the supervisor stops it:
 
 ```elixir
 # config/runtime.exs
-database_url = System.fetch_env!("DATABASE_URL")
+# A direct or session-mode URL, not the Repo's pooled DATABASE_URL.
+database_url = System.fetch_env!("TRELLIS_DATABASE_URL")
 
 config :my_app, MyApp.Trellis,
   name: MyApp.Trellis,
@@ -302,54 +312,87 @@ make it so: Ecto's `schema_migrations` runs each migration once. See
 Add `import_deps: [:trellis_pg]` to the app's `.formatter.exs` to keep
 `define` and `apply` free of parentheses, like Ecto's own commands.
 
-## Turning Trellis off in tests
+## Testing
 
-Set Trellis off where nothing should capture or maintain a target, usually
-the test environment:
+The recipe: Trellis off in the test environment, targets filled by hand.
 
 ```elixir
 # config/test.exs
+config :my_app, MyApp.Repo,
+  # ...the generated settings...
+  # The migration helpers connect here, so the test repo needs its own url,
+  # partition suffix included.
+  trellis: [url: "postgres://localhost/my_app_test#{System.get_env("MIX_TEST_PARTITION")}"]
+
 config :trellis_pg, enabled: false, allow_target_writes: true
 ```
 
-`allow_target_writes` lets a test write target schemas (see below). Off,
-`{Trellis, options}` starts nothing and nothing runs in the background, but
-the `Trellis.Migration` helpers still run, so `mix ecto.migrate` (Phoenix's
-default `test` alias) builds every target, and a new define reaches the test
-database on the next `mix test`. The test repo needs its `:trellis` url too.
-With no worker, definitions stay `waiting_to_backfill` and sources get no
-capture triggers, so test writes capture nothing and targets stay empty.
-`Trellis.enabled?/0` reports the setting.
+Off, `{Trellis, options}` starts nothing and nothing runs in the background,
+but the `Trellis.Migration` helpers still run. Phoenix's default `test` alias
+(`ecto.create`, `ecto.migrate`) builds every target, and a new define reaches
+the test database on the next `mix test`. With no worker, definitions stay
+`waiting_to_backfill` and sources get no capture triggers, so test writes
+capture nothing and targets stay empty. `Trellis.enabled?/0` reports the
+setting. `allow_target_writes` lets a test write target schemas (see below).
 
-With Trellis off, `Trellis.TestSupport.refresh_target(MyApp.Repo, "event_counts")` fills a target from its definition's own query (upstream targets first, one transaction). It needs `allow_target_writes: true`.
-
-## Target schemas are read-only
-
-Only Trellis writes a target. Mark an Ecto schema over one, and add the guard to the repo:
+`Trellis.TestSupport.refresh_target/2` fills a target from its definition's
+own query (upstream targets first, one transaction). It needs
+`allow_target_writes: true`. Inside the SQL sandbox:
 
 ```elixir
-defmodule MyApp.EventCount do
-  use Ecto.Schema
-  use Trellis.Target
-  # schema "event_counts" do ... end
-end
-
-defmodule MyApp.Repo do
-  use Ecto.Repo, otp_app: :my_app, adapter: Ecto.Adapters.Postgres
-  use Trellis.Repo # after `use Ecto.Repo`
+test "revenue by region" do
+  Repo.insert!(%Order{region: "west", total: 40})
+  Repo.insert!(%Order{region: "west", total: 60})
+  Trellis.TestSupport.refresh_target(MyApp.Repo, "sales_by_region")
+  assert %{total: 100} = Repo.get_by!(SalesByRegion, region: "west")
 end
 ```
 
-`insert`, `update`, `delete`, `insert_or_update` (and bang forms), `insert_all`, `update_all`
-and `delete_all` on a marked schema raise `Trellis.ReadOnlyTarget` before any SQL is sent;
-`Ecto.Multi` goes through them. Raw SQL and writes that name no schema
-(`insert_all("table", ...)`, `from("table")`) go around the guard: a `SELECT`-only grant
-is the strong answer (`docs/recommendations.md`).
+Or write the target rows by hand, in the sandbox, with `allow_target_writes`.
 
-`config :trellis_pg, allow_target_writes: true` lifts it (default `false`, read at each
-write, independent of `enabled`).
+- A `GROUP BY` or `JOIN` define needs a source index on its columns
+  ([T0134](../../docs/errors.md#t0134-sourceindexmissing)), so the migration
+  creates one first:
 
-## Fixtures and bulk loads in tests
+  ```elixir
+  def up do
+    create index(:orders, [:region])
+    define "TRANSFORM sales_by_region FROM orders SELECT region AS region, SUM(total) AS total GROUP BY region"
+  end
+  ```
+
+- Give `async: true` tests distinct group keys. Two tests refreshing the same
+  group each insert it into the target's unique index, and the second waits
+  for the first's sandbox transaction to end, which serializes them.
+- Drop a test database a worker has run on (`MIX_ENV=test mix ecto.drop`).
+  It keeps its capture triggers and live definitions after Trellis is turned
+  off, so every test write pays the capture cost.
+
+### Trellis on in tests
+
+To test the real pipeline, run the worker and wait for it, in its own
+database (another name or `MIX_TEST_PARTITION`), never the off suite's. Its
+fixtures and the target rows the worker writes stay committed: in the off
+suite's database they break exact counts, and every `refresh_target` of
+those targets locks the same rows, which serializes async tests.
+
+```elixir
+setup_all do
+  trellis = Trellis.connect!(url: url, staging: true, drain_threads: 2)
+  # Fixtures outside the sandbox, so they commit.
+  Ecto.Adapters.SQL.Sandbox.unboxed_run(MyApp.Repo, fn -> load_fixtures() end)
+  token = Trellis.watermark_token!(trellis)
+  :ok = Trellis.await_converged!(trellis, token, 30_000)
+  on_exit(fn -> Trellis.shutdown(trellis) end)
+  %{trellis: trellis}
+end
+```
+
+Trellis sees a write when it commits, so the fixtures that targets must
+reflect load outside the sandbox transaction (in `setup_all`, or with the
+sandbox in `:auto` mode), and one `await_converged!` waits for them.
+
+### Bulk loads with triggers disabled
 
 A loader that disables triggers for the load (`ALTER TABLE ... DISABLE
 TRIGGER ALL`, `pg_restore --disable-triggers`) disables Trellis's capture
@@ -384,9 +427,31 @@ raises `Trellis.TestSupport.ResumeRefused` (or `Trellis.Error`). The
 staging worker and a drain worker (`staging: true, drain_threads: 1`),
 because the resume rebuilds through them.
 
-Trellis sees a write when it commits, so with Ecto's SQL sandbox, load the
-fixtures that targets must reflect outside the sandbox transaction (in
-`setup_all`, or with the sandbox in `:auto` mode) and call the helper once.
+## Target schemas are read-only
+
+Only Trellis writes a target. Mark an Ecto schema over one, and add the guard to the repo:
+
+```elixir
+defmodule MyApp.EventCount do
+  use Ecto.Schema
+  use Trellis.Target
+  # schema "event_counts" do ... end
+end
+
+defmodule MyApp.Repo do
+  use Ecto.Repo, otp_app: :my_app, adapter: Ecto.Adapters.Postgres
+  use Trellis.Repo # after `use Ecto.Repo`
+end
+```
+
+`insert`, `update`, `delete`, `insert_or_update` (and bang forms), `insert_all`, `update_all`
+and `delete_all` on a marked schema raise `Trellis.ReadOnlyTarget` before any SQL is sent;
+`Ecto.Multi` goes through them. Raw SQL and writes that name no schema
+(`insert_all("table", ...)`, `from("table")`) go around the guard: a `SELECT`-only grant
+is the strong answer (`docs/recommendations.md`).
+
+`config :trellis_pg, allow_target_writes: true` lifts it (default `false`, read at each
+write, independent of `enabled`).
 
 ## Schema dumps
 
@@ -473,6 +538,11 @@ cargo build -p testkit --bin trellis-testkit   # the suite's throwaway Postgres
 mix deps.get
 mix test
 ```
+
+An app that takes `trellis_pg` as a `path:` dependency (to test a change here
+in a scratch app) compiles it in `:prod`, which downloads the NIF. Add
+`{:rustler, "~> 0.38.0", runtime: false}` to the app's deps and compile with
+`TRELLIS_PG_BUILD=1` to build it from source.
 
 In this repository (`:dev` and `:test`) the NIF always builds from source,
 never downloads. `mix test` compiles it through Cargo into the workspace's
