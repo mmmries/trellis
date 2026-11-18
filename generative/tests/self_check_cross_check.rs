@@ -1007,6 +1007,11 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
             // both are raised.
             backend.set_reclaim_ttl(Duration::from_secs(6 * 3600));
             backend.set_housekeeping_interval(Duration::from_secs(3600));
+            // Housekeeping is the only thing that retires a drained segment
+            // while the ring isn't full, and a straggler row in one gates
+            // convergence until it does (#2135): retire during the quiesce,
+            // leaving the zero-group GC off.
+            backend.set_retire_during_quiesce(true);
             let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
             let pool = Pool::new(&config).expect("pool");
             backend.install(&program).await.expect("install program");
