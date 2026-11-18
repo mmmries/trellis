@@ -117,7 +117,12 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::EarlyTombstoneGc
         | Plant::ChunkWithoutEntryLock
         | Plant::HeldKeyUnlisted
-        | Plant::HeldKeyDeleteApplies => PlantPath::OneToOne,
+        | Plant::HeldKeyDeleteApplies
+        | Plant::O2oWhereApplyUnfiltered
+        | Plant::O2oWhereNullAsTrue
+        | Plant::O2oWhereBuildUnfiltered
+        | Plant::O2oWhereNoTombstone
+        | Plant::O2oWhereColumnNotImaged => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild
@@ -130,14 +135,16 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::GbWhereOldImage
         | Plant::GbWhereNullAsTrue
         | Plant::GbWhereBuildUnfiltered
-        | Plant::GbWhereFilteredNaming => PlantPath::GroupBasis,
+        | Plant::GbWhereFilteredNaming
+        | Plant::GbWhereColumnNotImaged => PlantPath::GroupBasis,
         Plant::GbLsnNotVisibility | Plant::GbFoldSidesPerKey | Plant::GbEarlyZeroGc => {
             PlantPath::GroupBasisWriter
         }
         Plant::JoinNoJLock
         | Plant::JoinOtherSideBeforeJ
         | Plant::JoinDropFlip
-        | Plant::JoinTSkipLock => PlantPath::Join,
+        | Plant::JoinTSkipLock
+        | Plant::JoinWhereMUnfiltered => PlantPath::Join,
         Plant::Join1NoJLock
         | Plant::Join1NoRecheck
         | Plant::Join1LsnOnly

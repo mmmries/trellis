@@ -1159,6 +1159,9 @@ pub(crate) mod strategy {
                                 group_lock_stall: false,
                             });
                         }
+                        // A `WHERE` (#2043), derived from the program, so
+                        // the draws are what they were.
+                        case.program = crate::generate::where_clause::with_predicates(case.program);
                         case
                     },
                 )

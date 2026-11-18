@@ -330,3 +330,52 @@ async fn the_exact_sum_oracle_reads_postgres_where_postgres_is_order_free() {
     )
     .await;
 }
+
+/// The per-row oracle of a filtered plain 1-1 (#2043): it appends its key
+/// condition to the `WHERE` rather than writing a second one, and a key whose
+/// row fails the `WHERE` has no row rather than "vanishing".
+#[tokio::test]
+async fn the_per_row_oracle_reads_a_filtered_one_to_one() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let (mut program, mut def, source, _) = numeric_add_program();
+    let (a, b) = (
+        source.columns[1].name.clone(),
+        source.columns[2].name.clone(),
+    );
+    // `a / b` raises for `b = 0`, so the oracle falls back to reading row
+    // by row; `a > 5` filters.
+    def.fields[0].expr = Expr::BinaryOp {
+        op: Operator::Divide,
+        lhs: Box::new(Expr::Column(a.clone())),
+        rhs: Box::new(Expr::Column(b.clone())),
+    };
+    def.predicate = Predicate::Filter(Expr::BinaryOp {
+        op: Operator::GreaterThan,
+        lhs: Box::new(Expr::Column(a.clone())),
+        rhs: Box::new(Expr::NumberLiteral("5".to_string())),
+    });
+    program.defs = vec![def.clone()];
+    program.ops.clear();
+    let mut backend = ManualBackend::connect(db.dsn())
+        .await
+        .expect("connect manual backend");
+    backend.install(&program).await.expect("install program");
+
+    let raw = db.connect_raw().await;
+    // 1 passes, 2 fails the WHERE (and would raise), 3 passes and raises.
+    raw.batch_execute(&format!(
+        "insert into {} ({}, {a}, {b}) values (1, 10, 2), (2, 1, 0), (3, 10, 0)",
+        source.name, source.pk_col
+    ))
+    .await
+    .expect("insert");
+
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let (rows, raised) = oracle::sql_oracle_per_row(&pool, &def, &source.pk_col)
+        .await
+        .expect("per-row oracle");
+    assert_eq!(rows.keys().collect::<Vec<_>>(), ["1"]);
+    assert_eq!(raised.into_iter().collect::<Vec<_>>(), ["3".to_string()]);
+}

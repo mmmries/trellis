@@ -3753,6 +3753,25 @@ async fn settle_one_to_one_target(
             }
         })
     };
+    // Planted bug: a failing Apply records a live entry, not a tombstone.
+    // See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let no_tombstone = crate::plant::fires(
+        crate::plant::Plant::O2oWhereNoTombstone,
+        !failing.is_empty(),
+    );
+    #[cfg(not(any(test, feature = "test-util")))]
+    let no_tombstone = false;
+    // Whether an Apply's entry is live: its image is a member row.
+    let present_of = |r: &OneToOneRecord| -> Option<bool> {
+        r.apply.as_ref().map(|(_, _, image)| {
+            if no_tombstone {
+                image.is_some()
+            } else {
+                apply_image(r).flatten().is_some()
+            }
+        })
+    };
     // A Re-derive's `present` is unknown before its read; the lock ignores
     // it.
     let to_lock: Vec<one_to_one_ledger::EntryChange<'_>> = by_key
@@ -3760,7 +3779,7 @@ async fn settle_one_to_one_target(
         .map(|r| one_to_one_ledger::EntryChange {
             key: &r.pk_text,
             apply: r.apply.as_ref().map(|(lsn, txid, _)| (*lsn, txid.as_str())),
-            present: apply_image(r).is_none_or(|image| image.is_some()),
+            present: present_of(r).unwrap_or(true),
         })
         .collect();
     let inserted =
@@ -3818,8 +3837,8 @@ async fn settle_one_to_one_target(
         if record.apply.is_some() && inserted.keys.contains(&record.pk_text) {
             continue;
         }
-        let present = match apply_image(record) {
-            Some(values) => values.is_some(),
+        let present = match present_of(record) {
+            Some(present) => present,
             None => match rederived.get(record.pk_text.as_str()) {
                 Some(values) => values.is_some(),
                 None => continue,
@@ -3891,6 +3910,11 @@ async fn failing_apply_keys<'a>(
     by_key: &BTreeMap<&'a str, &'a OneToOneRecord>,
 ) -> Result<HashSet<&'a str>, ApplyError> {
     if !plan.render.filtered() {
+        return Ok(HashSet::new());
+    }
+    // Planted bug: every Apply image is a member. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(crate::plant::Plant::O2oWhereApplyUnfiltered, true) {
         return Ok(HashSet::new());
     }
     let applied: Vec<(&str, &str)> = by_key

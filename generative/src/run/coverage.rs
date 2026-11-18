@@ -147,11 +147,12 @@ pub struct Coverage {
     /// How many changes cross each filtered definition's `WHERE`, keyed
     /// `(key space, bucket)` ([`where_clause::bucket`]: `in_in`, `in_out`,
     /// `out_in`, `out_out`), replayed from the program alone
-    /// ([`where_crossings`]). A plain aggregate's are its source's updates
-    /// of a live row; a 1-1 `JOIN`'s are its target rows whose inputs (the
-    /// `a` row or a matched row) a write changes, `a`'s updates and every
-    /// joined table's writes alike. An empty bucket is coverage that dropped
-    /// out.
+    /// ([`where_crossings`]). A plain aggregate's and a plain 1-1's are
+    /// their source's updates of a live row; a join aggregate's are each
+    /// side's updates, against that side's conjuncts; a 1-1 `JOIN`'s are
+    /// its target rows whose inputs (the `a` row or a matched row) a write
+    /// changes, `a`'s updates and every joined table's writes alike. An
+    /// empty bucket is coverage that dropped out.
     pub where_crossings: HashMap<(&'static str, &'static str), usize>,
 }
 
@@ -529,7 +530,34 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                     view = next;
                 }
             }
-            KeySpace::Join(_) => {}
+            // ADR-0019: each side's conjuncts filter that side's rows before
+            // the join, so a crossing is a row of one side changing its
+            // side's filter.
+            KeySpace::Join(_) => {
+                for (table, side) in where_clause::join_side_conjuncts(predicate) {
+                    let Some(source) = program.tables.iter().find(|t| t.name == table) else {
+                        continue;
+                    };
+                    let member = |row: &SimRow| {
+                        where_clause::eval(&side, &|_, c| row.get(c).cloned().flatten())
+                            == Some(true)
+                    };
+                    let mut rows: HashMap<String, SimRow> = HashMap::new();
+                    for op in program.ops.iter().filter(|op| op.table() == table) {
+                        if let Op::Update { pk, .. } = op
+                            && let Some(row) = rows.get(pk)
+                        {
+                            let before = member(row);
+                            apply_to_rows(op, &source.pk_col, &mut rows);
+                            if let Some(row) = rows.get(pk) {
+                                add(before, member(row));
+                            }
+                            continue;
+                        }
+                        apply_to_rows(op, &source.pk_col, &mut rows);
+                    }
+                }
+            }
         }
     }
     out
