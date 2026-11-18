@@ -13,6 +13,7 @@ mod app_converge;
 mod blocking_trellis;
 mod call_deadline;
 mod call_fence;
+mod chained_define_before_build;
 mod claims;
 mod client_e2e;
 mod connectivity;

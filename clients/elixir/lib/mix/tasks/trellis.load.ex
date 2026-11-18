@@ -29,8 +29,9 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Load) do
 
     The handle it migrates with starts no background work.
 
-    Where Trellis is off (`Trellis.enabled?/0`), it is `mix ecto.load` and
-    nothing more: the target tables load as plain tables.
+    It runs the same where Trellis is off (`Trellis.enabled?/0`), so the
+    definitions are restored there too, unbuilt, as `Trellis.Migration`'s
+    helpers leave them.
     """
 
     alias __MODULE__.RecordingShell
@@ -42,20 +43,10 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Load) do
     def run(args) do
       {:ok, _} = Application.ensure_all_started(:trellis_pg)
 
-      if Trellis.enabled?() do
-        run_enabled(args)
-      else
-        Mix.shell().info(
-          "Trellis is off (config :trellis_pg, enabled: false): loading the structure only, " <>
-            "so target tables are plain tables"
-        )
-
-        load(args)
-        :ok
-      end
+      load_and_restore(args)
     end
 
-    defp run_enabled(args) do
+    defp load_and_restore(args) do
       {opts, _, _} = OptionParser.parse(args, strict: @switches, aliases: @aliases)
 
       trellis_repos =

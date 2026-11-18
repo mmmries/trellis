@@ -1254,3 +1254,97 @@ async fn a_build_over_a_re_collated_group_column_inserts_in_the_index_order() {
             .await
     );
 }
+
+/// A reader defined before its upstream was built (`waiting_to_backfill`)
+/// starts its build in the same pass as the upstream's, and can read the
+/// upstream's target before the upstream's build commits: here the reader's
+/// build read the empty upstream and is frozen before its commit while the
+/// upstream's build runs to its end. The reader applies from its start, so
+/// the upstream's build stages its writes for it through the seam, and the
+/// reader ends exact.
+#[tokio::test]
+async fn a_reader_building_while_its_upstream_builds_is_rebuilt_after_it() {
+    const DOWN: &str = "TRANSFORM down FROM public.agg GROUP BY n WITHOUT SOURCE INDEX \
+                        SELECT n AS n, SUM(total) AS total";
+    let mut d = seeded("(1, 1, 10), (2, 2, 5), (3, 2, 7)").await;
+    let definer = Trellis::connect(
+        Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("a define-only handle");
+    definer.apply(AGG).await.expect("define agg");
+    definer
+        .apply(DOWN)
+        .await
+        .expect("define down over unbuilt agg");
+    definer.shutdown().await.expect("shut the definer down");
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start both builds");
+    // agg's plan job waits; down's runs first, reads agg empty and freezes
+    // before its commit.
+    d.ctl
+        .execute(
+            "update backfill_chunks set next_attempt_at = now() + interval '1 hour' \
+             where definition_id = (select id from transform_definitions \
+                                    where target_table = 'public.agg')",
+            &[],
+        )
+        .await
+        .expect("hold agg's plan job back");
+    let dsn = d.db.dsn().to_string();
+    let mut down = d
+        .run_frozen(
+            &[(PausePoint::BeforeRebuildCommit, "public.down")],
+            |_shared| async move {
+                let pool = trellis::pool::Pool::new(&Config::from_dsn(dsn).expect("valid dsn"))
+                    .expect("the build's own pool");
+                let claimed = chunk_queue::claim_chunks_of(
+                    &**pool.get().await.expect("pool"),
+                    "down-build",
+                    1,
+                    &[chunk_queue::KIND_PLAN],
+                )
+                .await
+                .expect("claim down's plan job");
+                assert_eq!(claimed.len(), 1, "down's plan job");
+                build::run_claimed(&pool, &claimed[0], "down-build", &OPTIONS).await;
+                Ok(())
+            },
+        )
+        .await;
+    let frozen = down.reached(PausePoint::BeforeRebuildCommit).await;
+
+    // agg's build runs meanwhile. It may queue behind down's build (a lock
+    // down holds) or finish first; either way down is released after.
+    d.ctl
+        .execute(
+            "update backfill_chunks set next_attempt_at = null \
+             where definition_id = (select id from transform_definitions \
+                                    where target_table = 'public.agg')",
+            &[],
+        )
+        .await
+        .expect("release agg's plan job");
+    let agg = build_frozen(&d, &[]).await;
+    testkit::wait_blocked_behind(&d.ctl, frozen.backend_pid, Duration::from_secs(60), || {
+        agg.is_finished()
+    })
+    .await;
+    d.release(&mut down, PausePoint::BeforeRebuildCommit).await;
+    down.finish().await;
+    agg.finish().await;
+    trellis::staging::build::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_eq!(
+        d.rows("select n, total from public.down order by n").await,
+        d.rows(
+            "select n, sum(total) from (select count(*) n, sum(v) total from public.src \
+             group by g) x group by n order by n"
+        )
+        .await,
+        "down (left) differs from the oracle (right)"
+    );
+    assert_oracle(&mut d).await;
+}

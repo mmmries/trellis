@@ -684,11 +684,13 @@ A field's formula, its names and its refusals are in [expressions](expressions.m
 ## Chaining and cycle detection
 
 A field may read another field of its transform, and a target may be another
-transform's source, aggregated or joined, once that transform is `live`
-(`TransformNotLive` otherwise). Each write to a target reaches its readers in
-the write's own transaction, never through capture triggers, which is why an
-aggregate target can be chained off at all; the hand-off doesn't cross into
-another instance
+transform's source, aggregated or joined, while that transform is `live` or
+still `waiting_to_backfill` (so a migration defines a chain where no worker
+runs), never while its build runs or it is paused or quarantined
+([T0154 TransformNotLive](errors.md#t0154-transformnotlive)). Each write to a
+target reaches its readers in the write's own transaction, never through
+capture triggers, which is why an aggregate target can be chained off at all;
+the hand-off doesn't cross into another instance
 ([data flow](data-flow.md#writing-to-calculated-tables-and-chaining)).
 Trellis computes in dependency order over one graph of fields and tables, and
 refuses at define any definition that would close a cycle in it, directly or
