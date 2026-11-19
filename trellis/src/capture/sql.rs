@@ -768,14 +768,22 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// subtransaction id: an ORM's transaction of single-row statements that
 /// each re-read would overflow the backend's cache of 64 past its 64th
 /// statement, and every snapshot in the cluster would then consult
-/// `pg_subtrans`. So the block runs only when the catalog says the re-read
+/// `pg_subtrans`. So the block runs only when a check says the re-read
 /// could be refused (`exposed`, [`exposed_check`]), and otherwise the
 /// re-read runs bare, as a statement that images its transition tables
 /// does. An ownership change, row-level security being enabled or forced,
 /// and a policy created all take `ACCESS EXCLUSIVE` on the table, which
-/// can't land while the writer holds it, so the check can't go stale
-/// before the re-read for those. A `REVOKE` takes no table lock: one that
-/// commits between the check and the re-read, microseconds apart, still
+/// can't land while the writer holds it. A `REVOKE` (of the table, of its
+/// schema's `USAGE`, or of the role that owns it) and `ALTER ROLE … NOINHERIT`
+/// take no table lock. Both the check and the re-read's own privilege check
+/// read the backend's catalog caches, which take in other sessions' catalog
+/// changes only when the backend newly takes a lock, so the check could be
+/// stale by a whole transaction. So [`exposed_check`] first takes every lock
+/// the re-read takes before Postgres checks its privileges: the re-read is
+/// then checked against the catalog the check read. What stays open is a
+/// re-read that must re-plan (an `ANALYZE` invalidated its plan, say):
+/// planning newly locks the table's indexes, so a lock-free revoke that
+/// commits in the microseconds between the check and that planning still
 /// fails that one statement.
 fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
     let span = text_expr(&span_setting(schema, &spec.table));
@@ -867,7 +875,7 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
         ));
     }
     if rows.is_some() {
-        body.push_str(&exposed_check(spec));
+        body.push_str(&exposed_check(schema, spec));
     }
     body.push_str("    case slot\n");
     for slot in 0..RING_SIZE {
@@ -916,20 +924,54 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
 /// counts as exposed. The table is named by the trigger's `tg_relid`, and
 /// the schema by its name as text: a `regclass` lookup of the name would
 /// itself be refused without `USAGE`.
-fn exposed_check(spec: &CaptureSpec) -> String {
+///
+/// It first takes every lock the re-read takes before Postgres checks its
+/// privileges, so that the re-read takes in no catalog change the check
+/// missed: `ROW EXCLUSIVE` on the slot's ring segment, `ACCESS SHARE` on a
+/// partitioned source's partitions (`pg_partition_tree` keeps them), and
+/// `ACCESS SHARE` on the table by a probe that reads no row. Postgres checks
+/// the probe's privileges as the re-read's, so the probe runs in a block that
+/// traps a refusal: it writes nothing, so its subtransaction takes no id and
+/// costs the backend's cache nothing. A refused probe marks the re-read
+/// exposed.
+fn exposed_check(ring_schema: &str, spec: &CaptureSpec) -> String {
     let rel = if spec.partitioned {
         "pg_catalog.pg_partition_root(tg_relid)"
     } else {
         "tg_relid"
     };
-    let (schema, _) = split_table(&spec.table).expect("CaptureSpec::new checked the table name");
+    let (schema, name) = split_table(&spec.table).expect("CaptureSpec::new checked the table name");
+    let tree = if spec.partitioned {
+        format!("        perform 1 from pg_catalog.pg_partition_tree({rel}) limit 1;\n")
+    } else {
+        String::new()
+    };
+    let segments: String = (0..RING_SIZE)
+        .map(|slot| {
+            format!(
+                "        when {slot} then\n            lock table {}.{} in row exclusive mode;\n",
+                quote_ident(ring_schema),
+                quote_ident(&format!("seg_{slot}"))
+            )
+        })
+        .collect();
     format!(
-        "    -- Whether the re-read could be refused, so it traps the refusal.\n    \
+        "    -- Whether the re-read could be refused, so it traps the refusal,\n    \
+         -- after the locks the re-read takes before its privilege check.\n    \
          if reread then\n        \
-         exposed := not (pg_catalog.has_table_privilege({rel}, 'SELECT')\n            \
+         case slot\n{segments}        else\n            null;\n        end case;\n\
+         {tree}        \
+         begin\n            \
+         perform 1 from {}.{} t where false;\n        \
+         exception when insufficient_privilege then\n            \
+         exposed := true;\n        \
+         end;\n        \
+         exposed := exposed or not (pg_catalog.has_table_privilege({rel}, 'SELECT')\n            \
          and pg_catalog.has_schema_privilege(cast({} as text), 'USAGE')\n            \
          and not pg_catalog.row_security_active({rel}));\n    \
          end if;\n",
+        quote_ident(schema),
+        quote_ident(name),
         text_expr(schema)
     )
 }
@@ -2227,7 +2269,7 @@ mod tests {
             ));
             assert!(read < counted && counted < saved && saved < at("if present < 0 then"));
             for slot in 0..RING_SIZE {
-                let arm = &sql[at(&format!("    when {slot} then\n"))..];
+                let arm = &sql[at(&format!("\n    when {slot} then\n"))..];
                 let reread = arm.find("        elsif reread then\n").expect("the gate");
                 let otherwise = arm.find("        else\n").expect("the transition insert");
                 let end = arm.find("        end if;\n").expect("end if");
@@ -2298,26 +2340,42 @@ mod tests {
                 sql.find(needle)
                     .unwrap_or_else(|| panic!("no {needle:?} in\n{sql}"))
             };
+            // The slots' re-reads, the schema-changed branch's and the
+            // check's probe.
             assert_eq!(
                 sql.matches(handler).count(),
-                RING_SIZE as usize + 1,
+                RING_SIZE as usize + 2,
                 "{sql}"
             );
             assert!(!sql.contains("when others"), "{sql}");
-            // Only an exposed re-read runs in the block.
-            let check = at("    if reread then\n        exposed := not (");
+            // Only an exposed re-read runs in the block. The check first
+            // takes the locks the re-read takes before its privilege check:
+            // the slot's segment, and the table by a probe that traps its
+            // own refusal and writes nothing.
+            let segments: String = (0..RING_SIZE)
+                .map(|slot| {
+                    format!(
+                        "        when {slot} then\n            \
+                         lock table \"trellis\".\"seg_{slot}\" in row exclusive mode;\n"
+                    )
+                })
+                .collect();
+            let check = at("    if reread then\n        case slot\n");
             assert!(
-                sql[check..].starts_with(
-                    "    if reread then\n        \
-                     exposed := not (pg_catalog.has_table_privilege(tg_relid, 'SELECT')\n            \
+                sql[check..].starts_with(&format!(
+                    "    if reread then\n        case slot\n{segments}        else\n            \
+                     null;\n        end case;\n        begin\n            \
+                     perform 1 from \"public\".\"orders\" t where false;\n        \
+                     {handler}            exposed := true;\n        end;\n        \
+                     exposed := exposed or not (pg_catalog.has_table_privilege(tg_relid, 'SELECT')\n            \
                      and pg_catalog.has_schema_privilege(cast('public' as text), 'USAGE')\n            \
                      and not pg_catalog.row_security_active(tg_relid));\n    end if;\n"
-                ),
+                )),
                 "{sql}"
             );
-            assert!(check < at("    case slot\n"), "{sql}");
+            assert!(check < at("\n    case slot\n"), "{sql}");
             for slot in 0..RING_SIZE {
-                let arm = &sql[at(&format!("    when {slot} then\n"))..];
+                let arm = &sql[at(&format!("\n    when {slot} then\n"))..];
                 let exposed = arm.find("        if exposed then\n").expect("the check");
                 let block = arm.find("        begin\n").expect("the block");
                 let lateral = arm.find("left join lateral").expect("the re-read");
@@ -2349,7 +2407,7 @@ mod tests {
             let images = at("execute pg_catalog.format('insert into %1$s (");
             let trap = at(handler);
             assert!(sql[..images].ends_with("        begin\n        "), "{sql}");
-            assert!(images < trap && trap < at("    case slot\n"), "{sql}");
+            assert!(images < trap && trap < check, "{sql}");
             assert!(
                 sql[trap..].starts_with(&format!(
                     "{handler}        execute pg_catalog.format('insert into %s ("
@@ -2361,11 +2419,16 @@ mod tests {
         for event in [CaptureEvent::Truncate, CaptureEvent::Begin] {
             assert!(!ddl(&spec(), event).contains(handler), "{event:?}");
         }
-        // A partitioned source's re-read reads its root.
+        // A partitioned source's re-read reads its root, and locks its
+        // partitions.
         let root = ddl(&spec().with_partitioned(true), CaptureEvent::Insert);
         assert!(
             root.contains(
-                "exposed := not (pg_catalog.has_table_privilege(\
+                "        end case;\n        \
+                 perform 1 from pg_catalog.pg_partition_tree(\
+                 pg_catalog.pg_partition_root(tg_relid)) limit 1;\n        begin\n"
+            ) && root.contains(
+                "exposed := exposed or not (pg_catalog.has_table_privilege(\
                  pg_catalog.pg_partition_root(tg_relid), 'SELECT')"
             ) && root
                 .contains("pg_catalog.row_security_active(pg_catalog.pg_partition_root(tg_relid))"),

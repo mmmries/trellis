@@ -689,10 +689,16 @@ async fn seal_and_drain(raw: &mut Client, pool: &trellis::pool::Pool) -> Result<
     seal::seal_phase2(raw, sealed.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
+    drain(pool, sealed.sealed_seg_seq).await
+}
+
+/// Drains the sealed segment `seg_seq` through `pool`, as in
+/// [`seal_and_drain`].
+async fn drain(pool: &trellis::pool::Pool, seg_seq: i64) -> Result<(), String> {
     for _ in 0..16 {
         match apply::drain_once(
             pool,
-            sealed.sealed_seg_seq,
+            seg_seq,
             "row_security_test",
             1,
             "trellis_row_security_test",
@@ -2071,6 +2077,88 @@ async fn an_ownership_change_never_fails_a_write_and_halts_the_readers() {
         .batch_execute("alter table public.c owner to app_owner")
         .await
         .expect("give ownership back");
+    refused_capture_halts_then_resume_is_exact(&mut it, "permission denied for table c").await;
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// A `REVOKE` takes no lock on the table, so it lands in the middle of the
+/// writer's transaction, and the writer's backend takes it in only when it
+/// next newly takes a lock. Here a statement's nested update has staged its
+/// rows, after an earlier statement took every other lock capture takes,
+/// when the ring moves to its next segment and the Trellis role loses the
+/// owner's membership; the statement's own capture then re-reads into that
+/// segment, its first lock on it. The capture's check must take
+/// that lock before it reads the catalog, or it reads the role as
+/// privileged and the re-read is refused outside the trap, failing the
+/// write. The write succeeds, and the readers halt and resume exact.
+#[tokio::test]
+async fn a_revoke_that_lands_mid_statement_never_fails_a_write() {
+    let cluster = TestCluster::start();
+    let mut it = readers_of_c_with_a_rewriting_trigger(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create function public.app_wait() returns trigger language plpgsql as $$ \
+             begin if pg_catalog.current_setting('app.wait', true) = 'on' then \
+               perform pg_catalog.pg_advisory_xact_lock(2154); end if; \
+             return null; end $$; \
+             create trigger app_wait after insert on public.c \
+               for each row execute function public.app_wait(); \
+             select pg_catalog.pg_advisory_lock(2154);",
+        )
+        .await
+        .expect("a trigger that waits, after app_fix's update, until the test lets it go");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("fence the ring before the writer's transaction");
+    // The transaction's first insert takes every lock but the next
+    // segment's, and compiles the functions; the second waits.
+    let writer = connect_with(it._db.dsn(), "").await;
+    let write = tokio::spawn(async move {
+        writer
+            .batch_execute(
+                "begin; insert into public.c values (100, 1, 7); \
+                 set local app.wait = 'on'; insert into public.c values (101, 2, 8); commit;",
+            )
+            .await
+    });
+    for _ in 0..600 {
+        let waiting: bool = it
+            .admin
+            .query_one(
+                "select exists (select 1 from pg_catalog.pg_locks \
+                 where locktype = 'advisory' and not granted)",
+                &[],
+            )
+            .await
+            .expect("read pg_locks")
+            .get(0);
+        if waiting {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let first = seal::seal_phase1_waiting(&mut it.raw).await;
+    seal::seal_phase2(&it.raw, first.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    it.admin
+        .batch_execute(
+            "revoke app_owner from rls_trellis; \
+             select pg_catalog.pg_advisory_unlock(2154);",
+        )
+        .await
+        .expect("revoke the owner's membership, then let the writer go");
+    write
+        .await
+        .expect("the writer's task")
+        .expect("the application's write succeeds");
+    it.admin
+        .batch_execute("grant app_owner to rls_trellis")
+        .await
+        .expect("give the membership back");
+    drain(&it.pool, first.sealed_seg_seq)
+        .await
+        .expect("drain the segment the first insert and the nested update staged into");
     refused_capture_halts_then_resume_is_exact(&mut it, "permission denied for table c").await;
     it.trellis.shutdown().await.expect("shutdown");
 }

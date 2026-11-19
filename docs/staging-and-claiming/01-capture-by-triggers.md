@@ -335,8 +335,10 @@ runs in a block that traps that condition alone and stages a
 rows. The drain halts every reader of the table on the marker, whether or
 not access is back by then, and `RESUME` rebuilds them. The block is a
 subtransaction, which past 64 per transaction would overflow the backend's
-cache, so a re-read enters it only when the catalog says the role could be
-refused (`capture::sql`'s `function_body` has the argument).
+cache, so a re-read enters it only when a check says the role could be
+refused. The check first takes the locks the re-read takes, so only a
+re-read that re-plans can see a privilege change the check missed
+(`capture::sql`'s `function_body` has the argument).
 
 One write isn't a statement of its own: the update a foreign key's action
 makes (`ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT`, or `ON DELETE SET
