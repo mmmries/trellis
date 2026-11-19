@@ -20,6 +20,11 @@ use crate::support::pipeline;
 
 use pipeline::connect;
 
+/// The remedy a retype pause names: never `ALTER TRANSFORM`, which refuses a
+/// paused definition (T0154).
+const REMEDY: &str =
+    "Change the column back, then RESUME it, or DROP TRANSFORM it and define it again";
+
 /// A handle running as 0.3.0, in which the identity integer cast arrived.
 async fn later_release(dsn: &str) -> Trellis {
     Trellis::connect(
@@ -180,10 +185,11 @@ async fn an_invalid_retype_pauses_with_the_refusal_until_fixed() {
             &format!("column \"c\" of public.{}", &target[2..]),
             &format!("changed type from {from} to bigint"),
             refusal,
-            "Change the column back, then RESUME it, or DROP TRANSFORM it and define it again",
+            REMEDY,
         ] {
             assert!(failure.contains(part), "{target}: {part:?} in {failure}");
         }
+        assert!(!failure.contains("ALTER TRANSFORM"), "{target}: {failure}");
         let resumed = trellis.apply(&format!("RESUME TRANSFORM {target}")).await;
         assert!(resumed.is_err(), "{target}: resume refused while invalid");
     }
@@ -232,10 +238,12 @@ async fn a_key_retype_the_validator_refuses_names_the_refusal() {
     for part in [
         "column \"id\" of public.p5 changed type from smallint to bigint",
         "date arithmetic takes a smallint or integer",
+        REMEDY,
         "refuses until that is fixed",
     ] {
         assert!(failure.contains(part), "{part:?} in {failure}");
     }
+    assert!(!failure.contains("ALTER TRANSFORM"), "{failure}");
     assert!(
         !failure.contains("the resume brings Trellis's copies to the new types"),
         "{failure}"

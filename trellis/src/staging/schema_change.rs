@@ -1060,8 +1060,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
 /// fourth check finds outgrown, re-validates the definition over the live
 /// types as define would ([`crate::defs::floor::on_live_retype`],
 /// ADR-0024). A refusal pauses it naming the refusal and the remedies
-/// (`ALTER TRANSFORM` to a definition that validates, or change the column
-/// back, then `RESUME`), so the pause never promises a rebuild a resume would
+/// ([`RETYPE_REMEDY`]), so the pause never promises a rebuild a resume would
 /// refuse. A definition left unpaused has its floor stamped again over the
 /// new types, in the transaction that re-records its key types.
 ///
@@ -2240,20 +2239,13 @@ pub(crate) fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64
 }
 
 /// The remedy a retype pause names. `ALTER TRANSFORM` is not among them: it
-/// refuses a paused definition (T0154) and `RESUME` refuses while define would
-/// refuse the definition (T0078), so neither works in any key space.
+/// refuses a paused definition (T0154), and `RESUME` refuses while define
+/// would, so editing first is never possible in any key space.
 pub(crate) const RETYPE_REMEDY: &str =
     "Change the column back, then RESUME it, or DROP TRANSFORM it and define it again";
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn retype_remedy_names_only_what_works() {
-        assert!(!super::RETYPE_REMEDY.contains("ALTER"));
-        assert!(super::RETYPE_REMEDY.contains("Change the column back, then RESUME"));
-        assert!(super::RETYPE_REMEDY.contains("DROP TRANSFORM"));
-    }
-
     use super::*;
     use crate::defs::copies::{CopyKind, CopyState, CopyType, TypedCopy};
     use crate::defs::key_types::ColumnType;

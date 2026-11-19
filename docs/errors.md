@@ -479,9 +479,7 @@ name. After define: [Text](transforms.md#text).
 
 An operand type an operator doesn't take (`text_col + 1`; `+` never
 concatenates). `CAST` it, or use an operand of the operator's type. After
-define: [Retype](transforms.md#retype). A definition paused because a retyped
-column now hits this can't be altered or resumed: change the column back, then
-`RESUME`, or `DROP TRANSFORM` and define it again.
+define: [Retype](transforms.md#retype).
 
 ### T0079 MixedFloatExactComparison
 
@@ -1083,8 +1081,9 @@ names first.
 
 An `ALTER TRANSFORM` of a transform that isn't `live`, or a define chaining off
 one whose build is running (`backfilling`) or that is paused or quarantined.
-Retry once it is `live`; `RESUME` a paused one first (a definition paused by a retype its define would now refuse can't resume: change the column back, or `DROP TRANSFORM` it). After define: matters
-only when the statement runs.
+Retry once it is `live`; [repair](operations.md#paused-definitions) and
+`RESUME` a paused one first. After define: matters only when the statement
+runs.
 
 ### T0155 AlterFieldNotFound
 
