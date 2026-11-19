@@ -126,8 +126,8 @@ needs pausing, as the per-column tier does.
     apply it together. With two, both are charged. With three or more, each
     is left out in turn, and every one whose absence lets the record apply is
     charged: it is in every failing combination. When no one is (two separate
-    failing pairs, say), the record is charged to nobody, as a failure only two
-    records reproduce together is, and the page is a drain holdup
+    failing pairs, say), the record is charged to nobody, and the page is a
+    drain holdup
     ([operations — A page that fails only for several definitions together](../operations.md#a-page-that-fails-only-for-several-definitions-together)).
   * Each probe counts toward the isolation's probe limit. At the limit, a
     record is charged to the transforms its probes had pinned; a probe that
@@ -448,8 +448,9 @@ it, is not charged to any key: it pauses the definitions it reaches
 ([ADR-0014](0014-pause-and-drop-a-transform.md)).
 A failure that is charged to no key and pauses nothing is a *drain holdup*: a refused
 read or write the catalog can't pin on a table (so the halt pauses nothing), isolation
-that charges nobody (records that fail only together, or a record that fails only in two
-separate combinations of transforms) or stops at its probe limit without pinning a key,
+that charges nobody when no one definition's share fails alone (records that fail only
+together across several definitions, or a record that fails only in two separate
+combinations of transforms) or stops at its probe limit without pinning a key,
 or a reproducing failure whose page runs out of retries. The drain surfaces it and
 records the page in `drain_holdups`, one row per segment, in a short transaction of its
 own after the page's transaction rolls back: the latest error and SQLSTATE, the source
