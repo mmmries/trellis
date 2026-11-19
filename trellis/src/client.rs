@@ -1693,11 +1693,13 @@ impl Leader {
         // thing that can keep retirement from freeing a slot, so skipping
         // it here would keep the ring full for good.
         let ring_full = matches!(sealed, Some(Err(StagingError::RingFull { .. })));
-        if let Some(sealed) = sealed {
-            self.settle(c, "seal", sealed, &mut failed).await;
-        }
         if ring_full {
-            failed = false;
+            // Normal backpressure, logged at `debug`: not a failure to warn
+            // about and then "recover" from every tick.
+            crate::instance_log::debug!("seal refused: the ring is full; drains are behind");
+            self.failures.succeeded("seal");
+        } else if let Some(sealed) = sealed {
+            self.settle(c, "seal", sealed, &mut failed).await;
         }
         // Issue #273: everything but the seal runs on the housekeeping
         // cadence, not every tick. See [`HousekeepingSchedule`] for what each
@@ -2588,6 +2590,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     let mut wake = wake;
 
     let mut drain_failures = DrainFailures::default();
+    let mut build_failures = StepFailures::default();
     let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
 
     if !wait_out_restore(&pool, poll_interval, &mut shutdown_rx).await {
@@ -2624,7 +2627,8 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                 // failed): build work comes next. Only actually
                 // wait if it made no progress — otherwise loop straight
                 // back around without an idle wait.
-                let step = build_step(&pool, &claimed_by, &build_options).await;
+                let step =
+                    build_step(&pool, &claimed_by, &build_options, &mut build_failures).await;
                 // Only here is the worker idle: no segment to look at (a
                 // lookup that failed found nothing out, so it isn't "none")
                 // and, when the probe is answered, no build work either.
@@ -2705,7 +2709,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // there takes build work instead.
         let build_progress = !drained
             && matches!(
-                build_step(&pool, &claimed_by, &build_options).await,
+                build_step(&pool, &claimed_by, &build_options, &mut build_failures).await,
                 BuildStep::Progress
             );
         backoff.reset();
@@ -2739,6 +2743,7 @@ async fn build_step(
     pool: &Pool,
     claimed_by: &str,
     build_options: &staging::build::WorkerOptions,
+    failures: &mut StepFailures,
 ) -> BuildStep {
     // One probe when there is nothing to do (#273): the step below would look
     // on every idle wake. An error is not "nothing": run the step, which
@@ -2753,10 +2758,10 @@ async fn build_step(
     // A 1-1 `JOIN`'s pending fan-out first: it is a `b` change on its way to
     // the target, which a reader waits on, where a build is a whole
     // target's.
-    if fan_out_step(pool, claimed_by).await {
+    if fan_out_step(pool, failures).await {
         return BuildStep::Progress;
     }
-    if rederive_build_step(pool, claimed_by, build_options).await {
+    if rederive_build_step(pool, claimed_by, build_options, failures).await {
         BuildStep::Progress
     } else {
         BuildStep::Waiting
@@ -2766,18 +2771,13 @@ async fn build_step(
 /// One chunk of a 1-1 `JOIN`'s pending fan-out
 /// (`staging::join_one_to_one::fan_out`), when there is one to run. Returns
 /// whether it ran one.
-async fn fan_out_step(pool: &Pool, claimed_by: &str) -> bool {
-    match staging::join_one_to_one::fan_out::step(pool).await {
-        Ok(step) => step.progressed(),
-        Err(error) => {
-            crate::instance_log::warn!(
-                worker = %claimed_by,
-                error = %error,
-                "1-1 JOIN fan-out chunk failed; retrying on the next pass"
-            );
-            false
-        }
-    }
+async fn fan_out_step(pool: &Pool, failures: &mut StepFailures) -> bool {
+    failures
+        .check(
+            "join_fan_out",
+            staging::join_one_to_one::fan_out::step(pool).await,
+        )
+        .is_ok_and(|step| step.progressed())
 }
 
 /// How an idle drain worker's wait grows (#273): from the poll floor, doubling
@@ -2790,6 +2790,10 @@ struct IdleBackoff {
     cap: Duration,
     /// Idle waits since the last reset.
     streak: u32,
+    /// Passes in a row whose segment lookup failed (the database is
+    /// unreachable): the wait doubles per failure so an outage isn't spun on
+    /// at the poll floor.
+    failing: u32,
 }
 
 impl IdleBackoff {
@@ -2798,11 +2802,13 @@ impl IdleBackoff {
             floor,
             cap: cap.max(floor),
             streak: 0,
+            failing: 0,
         }
     }
 
     fn reset(&mut self) {
         self.streak = 0;
+        self.failing = 0;
     }
 
     /// The wait after a pass that found no segment to drain and took `step`
@@ -2820,10 +2826,23 @@ impl IdleBackoff {
                 self.reset();
                 None
             }
-            BuildStep::Idle { next_due } if listed => Some(self.idle_wait(listener_up, *next_due)),
+            BuildStep::Idle { next_due } if listed => {
+                self.failing = 0;
+                Some(self.idle_wait(listener_up, *next_due))
+            }
             BuildStep::Idle { .. } | BuildStep::Waiting => {
-                self.reset();
-                Some(self.floor)
+                self.streak = 0;
+                if listed {
+                    self.failing = 0;
+                    Some(self.floor)
+                } else {
+                    let wait = self
+                        .floor
+                        .saturating_mul(1u32 << self.failing.min(30))
+                        .min(self.cap);
+                    self.failing = self.failing.saturating_add(1);
+                    Some(wait)
+                }
             }
         }
     }
@@ -2959,18 +2978,14 @@ async fn rederive_build_step(
     pool: &Pool,
     claimed_by: &str,
     options: &staging::build::WorkerOptions,
+    failures: &mut StepFailures,
 ) -> bool {
-    match staging::build::work_once(pool, claimed_by, options).await {
-        Ok(step) => step.progressed(),
-        Err(error) => {
-            crate::instance_log::warn!(
-                worker = %claimed_by,
-                error = %error,
-                "re-derive build step failed; retrying on the next pass"
-            );
-            false
-        }
-    }
+    failures
+        .check(
+            "rederive_build",
+            staging::build::work_once(pool, claimed_by, options).await,
+        )
+        .is_ok_and(|step| step.progressed())
 }
 
 /// The drainer ids (`claimed_by`) of one `Client`'s app-worker loops that are
@@ -4637,6 +4652,47 @@ mod maintenance_failure_tests {
         assert_eq!(events[3].fields["failures"], "3", "{events:?}");
         assert_eq!(events[4].fields["failures"], "3", "{events:?}");
         assert_eq!(events[5].fields["failures"], "1", "{events:?}");
+    }
+
+    /// A drain worker whose segment lookup keeps failing (the database is
+    /// down) waits longer each pass, up to the cap, and starts over at the
+    /// floor on the first answered lookup.
+    #[test]
+    fn idle_backoff_grows_while_the_lookup_keeps_failing() {
+        let ms = Duration::from_millis;
+        let mut backoff = IdleBackoff::new(ms(200), ms(1500));
+        let waiting = BuildStep::Waiting;
+        let waits: Vec<_> = (0..5)
+            .map(|_| backoff.after_build_step(&waiting, false, false).unwrap())
+            .collect();
+        assert_eq!(waits, [ms(200), ms(400), ms(800), ms(1500), ms(1500)]);
+        assert_eq!(
+            backoff.after_build_step(&waiting, true, false),
+            Some(ms(200))
+        );
+        assert_eq!(
+            backoff.after_build_step(&waiting, false, false),
+            Some(ms(200))
+        );
+    }
+
+    /// A build step that fails on every pass of an outage (what the fan-out
+    /// and re-derive steps do) warns once, and its recovery logs once.
+    #[test]
+    fn repeated_build_step_failures_warn_once() {
+        let (_guard, captured) = install_capture();
+        let mut failures = StepFailures::default();
+        for _ in 0..100 {
+            let _ = failures.check("join_fan_out", Err::<(), _>("pool down"));
+            let _ = failures.check("rederive_build", Err::<(), _>("pool down"));
+        }
+        let _ = failures.check("join_fan_out", Ok::<(), &str>(()));
+        let events = captured.0.lock().unwrap().clone();
+        let loud = events
+            .iter()
+            .filter(|e| e.level <= tracing::Level::INFO)
+            .count();
+        assert_eq!(loud, 3, "{events:?}");
     }
 
     /// The reconcile runs only every `reconcile_interval`,
