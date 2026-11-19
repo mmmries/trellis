@@ -315,17 +315,30 @@ statement nothing else touched takes no predicate lock on the table. The
 inexact cases all err towards re-reading: a disabled or missing begin
 trigger makes every capture re-read (and the capture audit reports it).
 
-The re-read runs under the writing session's `row_security`, so a policy
-that comes to apply to the ring's owner hides rows from it, and a hidden row
-reads as gone: the capture stages a delete for a row that still exists.
-Setting `row_security` in the capture functions would turn the policy into a
-failed application write instead. A target that reads the table directly
+The re-read runs under the writing session's `row_security`. Under the
+default `on`, a policy that comes to apply to the ring's owner hides rows
+from it, and a hidden row reads as gone: the capture stages a delete for a
+row that still exists. A target that reads the table directly
 doesn't show the wrong delete: a 1-1 apply re-reads a delete's row
 live as the drain's role, which is either exempt from the policy and reads
 the row, or refused, which halts the definition, and the group basis sums
 the statement's own transition rows.
 The next reconcile pass pauses the table's readers
 ([transforms — Supported sources and targets](../transforms.md#supported-sources-and-targets)).
+
+Postgres refuses the re-read (`42501`) when the ring's owner has lost
+`SELECT` on the table or `USAGE` on its schema (the table handed to an owner
+it doesn't inherit, say), or a policy applies to it under a writer's
+`row_security = off`. That never fails the writer (ADR-0002 I6): the re-read
+runs in a block that traps that condition alone and stages a
+`schema_changed` marker recording the refusal in place of the statement's
+rows. The drain halts every reader of the table on the marker, whether or
+not access is back by then, and `RESUME` rebuilds them. The block is a
+subtransaction, which past 64 per transaction would overflow the backend's
+cache, so a re-read enters it only when a check says the role could be
+refused. The check first takes the locks the re-read takes, so only a
+re-read that re-plans can see a privilege change the check missed
+(`capture::sql`'s `function_body` has the argument).
 
 One write isn't a statement of its own: the update a foreign key's action
 makes (`ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT`, or `ON DELETE SET

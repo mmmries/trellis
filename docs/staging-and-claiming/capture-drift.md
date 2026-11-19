@@ -507,8 +507,10 @@ them:
   - a read column changed so define would refuse a definition reading it, so
     it would evaluate the column as another type, or so a `numeric` column
     Trellis created must be re-typed;
-  - row-level security applying to Trellis's roles, a subscription into a
-    source, or a source joining a partition or inheritance hierarchy.
+  - Trellis losing access to a source (row-level security applying to its
+    roles, or the table handed to an owner its role doesn't inherit), a
+    subscription into a source, or a source joining a partition or
+    inheritance hierarchy.
 - **Missed, and documented** in
   [known correctness gaps](../known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type):
   a `USING` rewrite with a metadata change to the same column in the same
