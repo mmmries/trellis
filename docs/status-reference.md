@@ -341,8 +341,9 @@ charged to no key and pauses nothing: a refused read or write the catalog
 can't pin on a table (a column grant, a function's `EXECUTE`, one of
 Trellis's own tables;
 [observability — A halting failure](observability.md#a-halting-failure)),
-records that fail only together, a record that fails only in two separate
-combinations of definitions
+records that fail only together and in no one definition's share alone
+([T0247](errors.md#t0247-definitionfailsalone) pauses one that does), a record
+that fails only in two separate combinations of definitions
 ([operations](operations.md#a-page-that-fails-only-for-several-definitions-together)),
 isolation stopping at its probe limit, or a failure that kept reproducing
 until the page's retries ran out. The drain records such a page as a *drain

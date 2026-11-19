@@ -333,9 +333,12 @@ the key. When the change fails in combinations no one definition is in every
 one of (two separate pairs, `a` with `b` and `c` with `d`, or any two of
 three), leaving any one out still leaves a failing combination, so it's
 charged to nobody. The page is a drain holdup: the drain fails on it every
-pass, every target reading the page's tables stops short of it, along with
-every watermark token taken since, and `drain_failure` and `self_check`
-report it ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
+pass, and every target reading the page's tables stops short of it. Once the
+ring's other slots drain, the ring fills, so every target in the instance
+stops, along with every watermark token taken since. `drain_failure` and
+`self_check` report it ([ADR-0003](decisions/0003-quarantine-storage-and-api.md#retry-policy)).
+A page that fails for one definition's share alone pauses that definition
+instead ([T0247](errors.md#t0247-definitionfailsalone)).
 
 Fix the trigger or constraint, and the next pass commits the page. Or pause
 one definition from each failing combination: once some definition is in

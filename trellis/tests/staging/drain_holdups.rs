@@ -4,7 +4,9 @@
 //! `self_check` for the instance, and cleared by the transaction that
 //! commits the page. A page that fails at COMMIT, on a deferred constraint an
 //! application put on a target, is classified like any other: retried,
-//! charged to its key, or held up.
+//! charged to its key, or held up. A page whose failure no key reproduces
+//! alone, but one definition's share does, pauses that definition (T0247)
+//! instead of holding the page up.
 //!
 //! Trellis runs as a non-superuser login role, `holdup_trellis`, owning the
 //! application's tables, and the drain as a second one, `holdup_worker`,
@@ -37,8 +39,9 @@ struct Instance {
 }
 
 /// `public.p` (3 rows), `public.c` (6 rows, `pid` naming a `p`, indexed so a
-/// `JOIN` on it defines) and
-/// `public.q` (6 rows), owned by `holdup_trellis`, which runs Trellis; and
+/// `JOIN` on it defines),
+/// `public.q` (6 rows) and an empty `public.m` (grouped by `g`), owned by
+/// `holdup_trellis`, which runs Trellis; and
 /// `ddl`'s definitions, live, with nothing left to drain.
 async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
     let db = cluster.create_empty_database().await;
@@ -55,9 +58,13 @@ async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
              create index c_pid_idx on public.c (pid); \
              create table public.q (id int primary key, v int); \
              insert into public.q select i, i from generate_series(1, 6) i; \
+             create table public.m (id int primary key, g int not null, f float8, \
+               iv interval); \
+             create index m_g_idx on public.m (g); \
              alter table public.p owner to holdup_trellis; \
              alter table public.c owner to holdup_trellis; \
-             alter table public.q owner to holdup_trellis;",
+             alter table public.q owner to holdup_trellis; \
+             alter table public.m owner to holdup_trellis;",
             db.name()
         ))
         .await
@@ -490,35 +497,214 @@ async fn status_reports_a_holdup_on_a_page_holding_only_a_joined_table() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// Records that fail only together: two keys of `c` set to one amount, which
-/// a unique index on `c_copy`'s target refuses. Each key applies alone, so
-/// isolation reproduces nothing and charges no key, and the drain records a
-/// holdup that `c_copy` reports.
+/// Two keys of `c` that collide on a unique index on `c_copy.amount`: each
+/// applies alone, so isolation charges no key, but `c_copy`'s share of the
+/// page fails alone with the page's `23505`, and the page applies without
+/// it. The drain pauses `c_copy` with the reason (T0247) and commits the
+/// page, recording no holdup.
 #[tokio::test]
-async fn records_failing_only_together_are_a_holdup() {
+async fn records_failing_only_together_in_one_definition_pause_it() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster, &READERS[2..]).await;
     it.admin
         .batch_execute(
             "create unique index c_copy_amount on public.c_copy (amount); \
-             update public.c set amount = 100 where id in (1, 2)",
+             update public.c set amount = 100 where id in (1, 2); \
+             update public.q set v = 60 where id = 6",
         )
         .await
-        .expect("a unique amount, and two keys that collide on it");
+        .expect("a unique amount, two keys that collide on it, and a q change");
+    let seg = seal(&mut it.raw).await;
+    drain(&it.pool, seg)
+        .await
+        .expect("the page commits without c_copy's share");
+
+    assert_paused_failing_alone(
+        &it,
+        "c_copy",
+        "23505",
+        &["public.c key=1", "public.c key=2"],
+    )
+    .await;
+    assert!(holdups(&it.admin).await.is_empty());
+    assert_eq!(charged(&it.admin).await, 0, "isolation charged nothing");
+    assert_eq!(status(&it, "q_copy").await.status, TransformStatus::Live);
+    assert_eq!(q_copied(&it.admin, 6).await, 60, "q_copy applied its share");
+    assert_eq!(segment_state(&it.admin, seg).await, "drained");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// `definition`'s status: paused by the drain, with a T0247 reason naming
+/// `sqlstate`, `keys` and what to do.
+async fn assert_paused_failing_alone(
+    it: &Instance,
+    definition: &str,
+    sqlstate: &str,
+    keys: &[&str],
+) {
+    let reported = status(it, definition).await;
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let failure = reported.capture_failure.expect("a pause reason");
+    assert_eq!(failure.kind, trellis::CaptureFailureKind::Halt);
+    let reason = &failure.error;
+    assert!(reason.contains("T0247"), "{reason}");
+    assert!(reason.contains(&format!("'{definition}'")), "{reason}");
+    assert!(reason.contains(sqlstate), "{reason}");
+    for key in keys {
+        assert!(reason.contains(key), "{key}: {reason}");
+    }
+    assert!(reason.contains("resume the definition"), "{reason}");
+}
+
+/// `q_copy`'s `v` for `q` row `id`.
+async fn q_copied(admin: &Client, id: i32) -> i32 {
+    admin
+        .query_one("select v from public.q_copy where id = $1", &[&id])
+        .await
+        .expect("read q_copy")
+        .get(0)
+}
+
+/// The `segments` row's state for `seg_seq`.
+async fn segment_state(admin: &Client, seg_seq: i64) -> String {
+    admin
+        .query_one(
+            &format!("select state from {SCHEMA}.segments where seg_seq = $1"),
+            &[&seg_seq],
+        )
+        .await
+        .expect("read the segment")
+        .get(0)
+}
+
+/// The issue's repro: two `1e308` rows of one group of `m`, in one
+/// statement and so one page with a `q` change. Each key applies alone, so
+/// isolation charges none, but `ms`'s share overflows its `SUM` alone
+/// (`22003`). The drain pauses `ms`, `q_copy` applies, and the segment
+/// drains.
+#[tokio::test]
+async fn a_sum_overflowing_only_for_two_rows_of_a_page_pauses_its_definition() {
+    let cluster = TestCluster::start();
+    let mut it = instance(
+        &cluster,
+        &[
+            "TRANSFORM ms FROM public.m GROUP BY g SELECT g AS g, SUM(f) AS sf",
+            READERS[3],
+        ],
+    )
+    .await;
+    it.admin
+        .batch_execute(
+            "insert into public.m (id, g, f) values (3, 2, 1e308), (4, 2, 1e308); \
+             update public.q set v = 60 where id = 6",
+        )
+        .await
+        .expect("two rows whose sum overflows, and a q change");
+    let seg = seal(&mut it.raw).await;
+    drain(&it.pool, seg)
+        .await
+        .expect("the page commits without ms's share");
+
+    assert_paused_failing_alone(&it, "ms", "22003", &["public.m key=3", "public.m key=4"]).await;
+    assert!(holdups(&it.admin).await.is_empty());
+    assert_eq!(charged(&it.admin).await, 0);
+    assert_eq!(status(&it, "q_copy").await.status, TransformStatus::Live);
+    assert_eq!(q_copied(&it.admin, 6).await, 60);
+    assert_eq!(segment_state(&it.admin, seg).await, "drained");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The `interval` variant on PostgreSQL 17+, where `'infinity'` and
+/// `'-infinity'` sum to an out-of-range interval (`22008`).
+#[tokio::test]
+async fn an_interval_sum_out_of_range_only_together_pauses_its_definition() {
+    let cluster = TestCluster::start();
+    let mut it = instance(
+        &cluster,
+        &["TRANSFORM mi FROM public.m GROUP BY g SELECT g AS g, SUM(iv) AS siv"],
+    )
+    .await;
+    if server_version(&it.admin).await < 170_000 {
+        eprintln!("skipped: an infinite interval needs PostgreSQL 17");
+        it.trellis.shutdown().await.expect("shutdown");
+        return;
+    }
+    it.admin
+        .batch_execute(
+            "insert into public.m (id, g, iv) values (5, 3, 'infinity'), (6, 3, '-infinity')",
+        )
+        .await
+        .expect("two intervals whose sum is out of range");
+    let seg = seal(&mut it.raw).await;
+    drain(&it.pool, seg)
+        .await
+        .expect("the page commits without mi's share");
+
+    assert_paused_failing_alone(&it, "mi", "22008", &["public.m key=5", "public.m key=6"]).await;
+    assert!(holdups(&it.admin).await.is_empty());
+    assert_eq!(segment_state(&it.admin, seg).await, "drained");
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+async fn server_version(admin: &Client) -> i32 {
+    admin
+        .query_one("select current_setting('server_version_num')::int", &[])
+        .await
+        .expect("read the server version")
+        .get(0)
+}
+
+/// Rule 5 of #2130: a failure only several definitions together reproduce
+/// stays a holdup. A deferred check refuses the page once `c_copy` and
+/// `c_pid` both wrote rows of different keys: each key applies alone (its
+/// two rows share an id), and each definition's share applies alone, so
+/// nothing is charged or paused.
+#[tokio::test]
+async fn a_failure_only_several_definitions_reproduce_together_is_a_holdup() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &[READERS[0], READERS[2]]).await;
+    it.admin
+        .batch_execute(
+            "create table public.touched (tbl text, id int); \
+             grant all on public.touched to public; \
+             create function public.log_touch() returns trigger language plpgsql as $$ \
+               begin insert into public.touched values (tg_table_name, new.id); \
+               return null; end $$; \
+             create trigger c_copy_touch after insert or update on public.c_copy \
+               for each row execute function public.log_touch(); \
+             create trigger c_pid_touch after insert or update on public.c_pid \
+               for each row execute function public.log_touch(); \
+             create function public.check_touch() returns trigger language plpgsql as $$ \
+               begin \
+                 if exists (select from public.touched a join public.touched b \
+                            on a.tbl = 'c_copy' and b.tbl = 'c_pid' and a.id <> b.id) then \
+                   raise exception 'c_copy and c_pid wrote different keys' \
+                     using errcode = '23514'; \
+                 end if; \
+                 return null; \
+               end $$; \
+             create constraint trigger touched_check after insert on public.touched \
+               deferrable initially deferred \
+               for each row execute function public.check_touch(); \
+             update public.c set amount = amount + 100, pid = pid % 3 + 1 where id in (1, 2)",
+        )
+        .await
+        .expect("a check across two definitions' targets, and two keys that trip it");
     let seg = seal(&mut it.raw).await;
     let err = drain(&it.pool, seg)
         .await
-        .expect_err("the page fails while both keys are in it");
-    assert!(err.contains("c_copy_amount"), "{err}");
+        .expect_err("the page fails while both definitions write both keys");
+    assert!(err.contains("wrote different keys"), "{err}");
 
     let rows = holdups(&it.admin).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].sqlstate.as_deref(), Some("23505"));
-    assert_eq!(rows[0].tables, vec!["public.c".to_string()]);
+    assert_eq!(rows[0].sqlstate.as_deref(), Some("23514"));
     assert_eq!(charged(&it.admin).await, 0, "isolation charged nothing");
-    let reported = status(&it, "c_copy").await;
-    assert_eq!(reported.status, TransformStatus::Live);
-    assert_eq!(reported.drain_failure.map(|f| f.seg_seq), Some(seg));
+    for target in ["c_pid", "c_copy"] {
+        let reported = status(&it, target).await;
+        assert_eq!(reported.status, TransformStatus::Live, "{target}");
+        assert_eq!(reported.drain_failure.map(|f| f.seg_seq), Some(seg));
+    }
     it.trellis.shutdown().await.expect("shutdown");
 }
 
@@ -631,12 +817,12 @@ async fn a_deferred_constraint_failing_at_commit_is_charged_to_its_key() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// Records failing only together at COMMIT: two keys of `c` set to one
-/// amount, which a deferrable unique constraint on `c_copy` refuses when the
-/// page commits. Each key passes alone, deferred check included, so
-/// isolation charges nothing and the drain records a holdup.
+/// A deferred unique constraint on `c_copy.amount`, and two keys of `c`
+/// that collide on it only at COMMIT. Each key passes alone, deferred check
+/// included, so isolation charges nothing; `c_copy`'s share fails alone,
+/// and the drain pauses it and commits the page.
 #[tokio::test]
-async fn records_failing_only_together_at_commit_are_a_holdup() {
+async fn records_failing_only_together_at_commit_pause_their_definition() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster, &READERS[2..]).await;
     it.admin
@@ -648,21 +834,20 @@ async fn records_failing_only_together_at_commit_are_a_holdup() {
         .await
         .expect("a deferred unique amount, and two keys that collide on it");
     let seg = seal(&mut it.raw).await;
-    let err = drain(&it.pool, seg)
+    drain(&it.pool, seg)
         .await
-        .expect_err("the page fails at COMMIT while both keys are in it");
-    assert!(err.contains("c_copy_amount"), "{err}");
+        .expect("the page commits without c_copy's share");
 
-    let rows = holdups(&it.admin).await;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].seg_seq, seg);
-    assert_eq!(rows[0].sqlstate.as_deref(), Some("23505"));
-    assert_eq!(rows[0].tables, vec!["public.c".to_string()]);
+    assert_paused_failing_alone(
+        &it,
+        "c_copy",
+        "23505",
+        &["public.c key=1", "public.c key=2"],
+    )
+    .await;
+    assert!(holdups(&it.admin).await.is_empty());
     assert_eq!(charged(&it.admin).await, 0, "isolation charged nothing");
-    assert_eq!(
-        status(&it, "c_copy").await.drain_failure.map(|f| f.seg_seq),
-        Some(seg)
-    );
+    assert_eq!(segment_state(&it.admin, seg).await, "drained");
     it.trellis.shutdown().await.expect("shutdown");
 }
 
@@ -789,12 +974,7 @@ async fn a_full_disk_charges_no_key_and_the_page_commits_once_it_clears() {
 async fn a_transaction_timeout_charges_no_key_and_the_page_commits_once_it_clears() {
     let cluster = TestCluster::start();
     let mut it = instance(&cluster, &READERS[2..]).await;
-    let version: i32 = it
-        .admin
-        .query_one("select current_setting('server_version_num')::int", &[])
-        .await
-        .expect("read the server version")
-        .get(0);
+    let version = server_version(&it.admin).await;
     if version < 170_000 {
         eprintln!("skipped: transaction_timeout needs PostgreSQL 17, the server is {version}");
         it.trellis.shutdown().await.expect("shutdown");

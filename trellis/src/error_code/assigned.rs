@@ -253,6 +253,7 @@ const ASSIGNED: &[&str] = &[
     "T0244 ValidationError::JoinPredicateJoinedSideUnderLeft",
     "T0245 ValidationError::JoinPredicateReadsNoColumn",
     "T0246 ValidationError::CharKeyPaddingFunction",
+    "T0247 ApplyError::DefinitionFailsAlone",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

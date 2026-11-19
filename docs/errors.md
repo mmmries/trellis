@@ -1205,6 +1205,20 @@ it again.
 A change names a source table Postgres no longer has. Its staged changes are
 purged; put the table back, then `RESUME`.
 
+### T0247 DefinitionFailsAlone
+
+A drain page fails, no key of it fails alone, but one definition's share of
+it does: several of its rows fail only together. Two `float8` or `interval`
+values whose `SUM` overflows, or a trigger or constraint on the target that
+refuses two rows, say. The definition pauses with this reason, naming its
+tables, the page's keys and Postgres's error, and the page commits for every
+other definition. Only a data exception (class `22`), an integrity violation
+(class `23`), a `RAISE` (`P0001`) or an error code of your own pauses; any
+other failure leaves the page a
+[drain holdup](operations.md#a-page-that-fails-only-for-several-definitions-together).
+Fix the data, or the trigger or constraint, then `RESUME` to rebuild it; a
+rebuild that still fails pauses as any build does.
+
 ## Self-check
 
 A [`self_check`](operations.md#self_check) that can't run, or stopped.
