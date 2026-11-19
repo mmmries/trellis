@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the `trellis` CLI (cli/) in release mode for one target and packs it
 # as `trellis-v<version>-<target>.tar.gz`, holding a `trellis-v<version>-<target>/`
-# directory with the binary, LICENSE.txt and README.md. Used by
+# directory with the binary, LICENSE.txt and README.md (its docs links rewritten to the release tag). Used by
 # .github/workflows/release.yml, once per target; runs the same way locally.
 #
 # usage: build-cli.sh <target> <out-dir>
@@ -60,6 +60,10 @@ out_dir="$(cd "$out_dir" && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/$name"
-cp "$built" "$repo_root/LICENSE.txt" "$repo_root/README.md" "$work/$name/"
+cp "$built" "$repo_root/LICENSE.txt" "$work/$name/"
+# The tarball ships no docs/ or clients/, so point the README's relative links
+# at the docs as tagged for this release.
+sed -E "s#\]\((docs|clients)/#](https://github.com/salesforce-misc/trellis/blob/v$version/\1/#g" \
+  "$repo_root/README.md" >"$work/$name/README.md"
 tar -C "$work" -czf "$out_dir/$name.tar.gz" "$name"
 echo "$out_dir/$name.tar.gz"

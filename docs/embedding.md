@@ -16,7 +16,7 @@ same database:
   migrations. These connect at `drain_threads: 0`: no staging worker, no
   drain workers. Cheap to run in every web dyno/pod without each one
   competing to drain the same work.
-* **A dedicated worker process** (one is enough; a second stands by) — runs the live pipeline: capture
+* **A dedicated worker process** (one is enough; a second stands by; in Rails or Phoenix, one more copy of the app started with `TRELLIS_WORKER=1`, see each client's README) — runs the live pipeline: capture
   install + ring maintenance (`staging: true`) and one or more drain workers
   (`drain_threads: N`) that actually apply staged changes into target
   tables.
@@ -363,14 +363,21 @@ and its own tables through its own connections, with the credentials it already
 has, and schema-qualifies target names (`select ... from analytics.order_totals`)
 or sets its own `search_path`.
 
+## Supported PostgreSQL versions
+
+PostgreSQL 15 to 18. The whole suite runs against each every night
+([testing strategy](testing-strategy.md)); other versions are untested. Poolers
+are covered in [recommendations](recommendations.md#connect-directly-or-through-a-session-mode-pooler).
+
 ## Configuration from the environment
 
 `Config::resolve` (what the CLI calls) reads the connection from an explicit
 connection string, then from the environment, with no config file.
 `Config::from_dsn` takes the connection string and reads the other variables
 below. `Config::with_schema`, which the Ruby and Elixir clients call with their
-own options, reads no environment variable. A value is read once, when the
-`Config` is built.
+own options, reads no connection or schema variable. A value is read once, when the
+`Config` is built, except `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING`, which
+every binding reads from the process environment on first use.
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -379,6 +386,7 @@ own options, reads no environment variable. A value is read once, when the
 | `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` | TLS options for the connection string assembled from the `PG*` variables only; a connection string given explicitly is used as written ([TLS to Postgres](#tls-to-postgres)). | unset |
 | `TRELLIS_SCHEMA` | The schema holding the instance's catalog, ring and bookkeeping tables ([instance identity](instance-identity.md)). | `trellis` |
 | `TRELLIS_TARGET_SCHEMA` | The schema transform target tables are created in. It is independent of `TRELLIS_SCHEMA`, so a target never collides with a catalog object. | `public` |
+| `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` | Rows of one join key past which `status()` warns of a 1-1 `JOIN` fan-out ([status reference](status-reference.md#join)). | `250000` |
 
 The call pool is not configured by environment variable. It is a handle option,
 next to `staging` and `drain_threads`:

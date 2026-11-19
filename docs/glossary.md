@@ -5,6 +5,21 @@ that owns the code. Where one thing has several names, the term is the one to
 use and the [aliases](#aliases) point to it. A decision's terms are owned by its
 ADR; the [module map](architecture.md) says where each module sits.
 
+## Using Trellis
+
+| Term | Means | Owner |
+|---|---|---|
+| **source** | A table (or each table of a `JOIN`) a transform reads, owned by you. | [transforms](transforms.md#supported-sources-and-targets) |
+| **target** | The table a transform writes, owned by Trellis; read it, never write it. | [transforms](transforms.md#target-tables-are-trellis-owned) |
+| **transform** | One `TRANSFORM ... FROM ... SELECT` statement and the target it keeps current. | [transforms](transforms.md#statements) |
+| **definition** | A transform's stored statement and state, as `trellis status` lists it. | [transforms](transforms.md#changing-a-definition) |
+| **instance** | One Trellis catalog schema (default `trellis`) with its ring, definitions and workers. | [instance identity](instance-identity.md) |
+| **staging worker** | The one process (`staging: true`) that installs capture and maintains the ring. | [embedding](embedding.md) |
+| **drain worker** | A thread (`drain_threads: N`) that applies staged changes to targets. | [embedding](embedding.md) |
+| **ring** | The fixed set of segments that staged changes are appended to until drained. | [02](staging-and-claiming/02-the-staging-ring.md#the-objects) |
+| **floor** | The oldest Trellis release that can run a definition (`floor=` in `trellis status`); also the catalog floor, for the whole instance. | [status](status-reference.md#floor), [upgrading](upgrading.md#the-catalog-floor) |
+| **`P~`, `M~`, `J~`, `T~`** | `trellis status`'s `join tables` line: a `JOIN`'s hidden tables with estimated rows and bytes (see [`P`, `M`, `J`, `T`](#hidden-tables)). | [status](status-reference.md#join) |
+
 ## Fences
 
 Each fence is an ordering device. A doc that says just "the fence" means the

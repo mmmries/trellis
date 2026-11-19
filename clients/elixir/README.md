@@ -65,58 +65,17 @@ Connect directly or through a session-mode pooler, never a transaction-mode one 
   value (`{:transform_defined, target_table}`, `:paused`,
   `{:resumed, addresses}`, ...). `define/2` is an `apply/2` that refuses
   anything but a `TRANSFORM`.
-- `status/2`, `definitions/1`: the catalog reads (each status word and
-  field: the [status reference](../../docs/status-reference.md)).
+- `status/2`, `definitions/1`: the catalog reads. `status/2` returns a
+  `Trellis.Status` (with nested `Trellis.DrainFailure`,
+  `Trellis.SourceIndexGap`, `Trellis.ExtremeIndexGap`,
+  `Trellis.CorrectingNode`, `Trellis.VersionHandover`,
+  `Trellis.BelowCatalogFloor`, `Trellis.RefusedStep`, `Trellis.JoinStatus`
+  and the like) whose fields are named and defined in the
+  [status reference](../../docs/status-reference.md).
 - `quarantined/1`, `quarantine_status/2`, `sample_quarantined/3`,
   `poisoned_since/2`: the quarantine reads. Resuming is a statement.
   `release_key/4` releases one key a transform holds, once its cause is
-  fixed; `status/2` reports how many it holds (`held_keys`). `status/2`
-  also reports a page the drain keeps failing on with nothing charged or
-  paused (`drain_failure`, a `Trellis.DrainFailure`), and a finished `self_check/3`
-  job's report lists every one open (`drain_failures`). `status/2` names the paused upstream columns
-  (`paused_upstream_columns`, each `"target.column"`) that make a `:live`
-  transform report `:catching_up`. `status/2` lists the source indexes a
-  `GROUP BY` or `JOIN` target
-  needs and lacks (`source_index_gaps`, each a `Trellis.SourceIndexGap` with
-  `table`, `columns`, `role` (`:group_by`, `:join_from` or `:join_joined`: the part
-  of the definition that needs it), `opted_out` and a `create index` statement as `fix`);
-  `self_check/3` refuses such a target unless it was defined `WITHOUT SOURCE
-  INDEX`. `status/2` lists the source indexes a `MIN`/`MAX` aggregate's
-  probes read and the source lacks (`extreme_index_gaps`, each a
-  `Trellis.ExtremeIndexGap` with `table`, `columns`, `argument`, `opted_out`
-  and `fix`); nothing pauses, and a deleted extreme is re-read by scanning
-  its group. `status/2` lists the partitions of a partitioned source a transform
-  is being corrected for while it reads `:backfilling` for them
-  (`correcting`, each a `Trellis.CorrectingNode` with `node`, `since` and
-  `keys_remaining`). `status/2` names what a Re-derive build waits on
-  instead of its own work (`build_wait_xid`, the transaction id of the
-  fence it waits out, `nil` when it waits on nothing). While a process of
-  another Trellis version is live, `status/2` reports that this process
-  stands by (`version_handover`, a `Trellis.VersionHandover` with
-  `this_version`, `processes`, each a `Trellis.OtherProcess` with
-  `worker_id` and `version` (`nil` for a release before 0.2.0),
-  `unregistered_staging_worker` and `migrations_pending`), and
-  state-changing calls refuse with a `version_handover` error until it is
-  gone. While this binary is below the catalog floor, `status/2` reports
-  that this process stands by (`below_catalog_floor`, a
-  `Trellis.BelowCatalogFloor` with `floor` and `this_version`), and
-  state-changing calls refuse with a `version_floor` error. A process that
-  leads the staging worker lists the maintenance steps its role is refused
-  (`maintenance_refusals`, each a `Trellis.RefusedStep` with `step`, `role`,
-  `object`, `missing` and `error`). For a `JOIN` transform `status/2` reports its hidden tables
-  (`join`, a `Trellis.JoinStatus`): `hidden_tables`, each a
-  `Trellis.HiddenTable` with `table`, `name`, `estimated_rows` and `bytes`,
-  the `P`-size warning (`partials_warning`, a `Trellis.PartialsWarning`),
-  a 1-1 `JOIN`'s fan-out warnings (`fan_out_warnings`, one
-  `Trellis.FanOutWarning` per joined position past the threshold, naming its
-  `position`) and the step its build runs (`building`, a
-  `Trellis.JoinBuildStep` with `step` and the `side`, `part`, `leaf`,
-  `remaining` or `position` its kind of step carries). `join` is `nil` for any other
-  transform. `status/2` reports the oldest Trellis release that can run a
-  transform (`floor`, `"major.minor.patch"`), which an application reads
-  before rolling back to an earlier Trellis release
-  ([upgrading](../../docs/upgrading.md#rolling-back)), and its `WHERE`
-  (`filter`, definition text, `nil` when unfiltered).
+  fixed.
 - `request_backfill/2`, `detect_capture_disruptions/1` (pauses now the readers
   of every table whose Trellis capture was changed outside Trellis, and
   returns the tables), `has_live_drain_workers/1`,
@@ -262,6 +221,8 @@ config :my_app, MyApp.Trellis,
   # Only the fleet's one worker node runs the background work.
   staging: System.get_env("TRELLIS_WORKER") == "true",
   drain_threads: if(System.get_env("TRELLIS_WORKER") == "true", do: 2, else: 0)
+# The worker is one more copy of the app, e.g. a Procfile line:
+#   worker: TRELLIS_WORKER=true mix run --no-halt
 
 # lib/my_app/application.ex
 children = [

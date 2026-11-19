@@ -1,6 +1,6 @@
 # Trellis
 
-> **Version 0.3:** the API may change between 0.x minor releases, before 1.0. An upgrade never re-interprets a stored definition: it keeps its meaning, or is paused with the reason; see [grammar versions](docs/transforms.md#grammar-versions).
+> **Version 0.3:** these docs on `main` track the next release and may describe features 0.3 lacks; for 0.3 read the docs at the [`v0.3.0` tag](https://github.com/salesforce-misc/trellis/tree/v0.3.0/docs). The API may change between 0.x minor releases, before 1.0. An upgrade never re-interprets a stored definition: it keeps its meaning, or is paused with the reason; see [grammar versions](docs/transforms.md#grammar-versions).
 
 A declarative API for creating data transformations in PostgreSQL.
 Correctness and performance are the key design goals.
@@ -37,7 +37,7 @@ Pick the form that matches how you run it:
 * **Elixir**: the Hex package `trellis_pg`; see [clients/elixir](clients/elixir/README.md).
 * **Ruby**: the gem `trellis-pg`; see [clients/ruby](clients/ruby/README.md).
 
-[docs/embedding.md](docs/embedding.md) is the guide to running Trellis inside an application, [docs/upgrading.md](docs/upgrading.md) says how to upgrade Trellis and roll it back, and [docs/releasing.md](docs/releasing.md) lists what each release ships.
+Trellis supports PostgreSQL 15 to 18 ([details](docs/embedding.md#supported-postgresql-versions)). [docs/embedding.md](docs/embedding.md) is the guide to running Trellis inside an application, [docs/upgrading.md](docs/upgrading.md) says how to upgrade Trellis and roll it back, and [docs/releasing.md](docs/releasing.md) lists what each release ships.
 
 ## A first transform
 

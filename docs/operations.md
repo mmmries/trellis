@@ -126,7 +126,11 @@ holds every privilege here but can't alter Trellis's tables stands by when
 ## Repair tools
 
 `PAUSE`, `RESUME` and `DROP` are statements: run them through
-`Trellis::apply` or `trellis apply '<statement>'`.
+`Trellis::apply` or `trellis apply '<statement>'`. The other repairs here and in
+[known correctness gaps](known-correctness-gaps.md) (`request_backfill`,
+`self_check`, `detect_capture_disruptions`) are
+library calls with no `trellis` command: run them from the Rust, Ruby or Elixir
+binding.
 
 ### `request_backfill`
 

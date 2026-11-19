@@ -25,6 +25,11 @@ quoted shell argument. The statement forms:
   trellis apply 'RESUME TRANSFORM post_totals.n'
   trellis apply 'DROP TRANSFORM post_totals'
 
+  trellis apply 'ALTER TRANSFORM post_totals ADD upper(title) AS t, DROP n'
+
+ALTER edits the fields of a 1-1 transform: ADD <expression> AS <field>,
+ALTER <field> AS <expression>, DROP <field>, comma-separated.
+
 A transform is addressed by its target table, bare (post_totals) or
 schema-qualified (public.post_totals); PAUSE and RESUME also take
 <transform>.<column>, which names one calculated field and always takes the
@@ -38,6 +43,10 @@ definition before dropping it.
 
 Applies pending migrations first, so this works against a freshly created
 database with no separate migrate step.
+
+TRELLIS_SCHEMA names the schema holding Trellis's own tables (default
+trellis); TRELLIS_TARGET_SCHEMA the schema a bare target table is created in
+(default public). A schema-qualified target name overrides the latter.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
@@ -179,6 +188,8 @@ mod tests {
             "RESUME TRANSFORM post_totals'",
             "RESUME TRANSFORM post_totals.n",
             "DROP TRANSFORM post_totals",
+            "ALTER TRANSFORM post_totals ADD",
+            "TRELLIS_TARGET_SCHEMA",
         ] {
             assert!(USAGE.contains(form), "USAGE is missing {form:?}");
         }
