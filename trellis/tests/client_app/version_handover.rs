@@ -853,6 +853,55 @@ async fn processes_of_one_version_never_stand_by() {
     leader.shutdown().await.expect("shutdown");
 }
 
+/// #2155: an outage longer than the registry TTL leaves every row stale, and
+/// the first maintenance pass of the process that retakes the staging lock
+/// sweeps stale rows before its next heartbeat. The sweep keeps the lock
+/// holder's row, so the next pass matches the lock to a row of this version
+/// and takes over, rather than reading it as a release before 0.2.0.
+#[tokio::test]
+async fn the_staging_lock_holder_keeps_its_row_through_a_sweep_after_an_outage() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    let schema = trellis::config::DEFAULT_SCHEMA;
+    let trellis = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+
+    trellis::staging::register_worker(
+        &raw,
+        &trellis::staging::Registration::drain_worker("leader"),
+    )
+    .await
+    .expect("register the leader");
+    let leader = ProducerSession::connect(db.dsn(), schema)
+        .await
+        .expect("the leader retakes the staging lock");
+    trellis::staging::worker_registry::claim_staging(leader.client(), "leader")
+        .await
+        .expect("its row names the session");
+    raw.execute(
+        "update worker_registry set last_seen = now() - interval '1 minute'",
+        &[],
+    )
+    .await
+    .expect("no heartbeat during the outage");
+    trellis::staging::reclaim_stale_workers(&raw, schema, std::time::Duration::from_secs(30))
+        .await
+        .expect("the leader's first maintenance pass");
+
+    assert!(
+        handover_pass_as(&pool, &config(&db), "probe")
+            .await
+            .expect("pass")
+            .took_over,
+        "the lock is the leader's, of this version"
+    );
+    leader.release().await.expect("release");
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// `has_live_drain_workers` counts the live rows whose drain threads run and
 /// don't stand by, and a row with no version (a release before 0.2.0, where
 /// only drain workers registered), but not a staging-only process or one that
