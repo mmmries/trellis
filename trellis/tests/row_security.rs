@@ -2145,13 +2145,16 @@ async fn a_revoke_that_lands_mid_statement_never_fails_a_write() {
     seal::seal_phase2(&it.raw, first.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
+    // Two round trips: one simple query is one transaction, and the unlock
+    // must follow the revoke's commit.
     it.admin
-        .batch_execute(
-            "revoke app_owner from rls_trellis; \
-             select pg_catalog.pg_advisory_unlock(2154);",
-        )
+        .batch_execute("revoke app_owner from rls_trellis")
         .await
-        .expect("revoke the owner's membership, then let the writer go");
+        .expect("revoke the owner's membership");
+    it.admin
+        .batch_execute("select pg_catalog.pg_advisory_unlock(2154)")
+        .await
+        .expect("let the writer go");
     write
         .await
         .expect("the writer's task")
