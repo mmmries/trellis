@@ -277,11 +277,12 @@ pub(crate) use assert_all_is_every_variant;
 ///
 /// The exception to "a `DbError` reached the server, so it isn't
 /// connectivity" is the server telling us the connection itself is gone or
-/// unavailable: SQLSTATE class `08` (connection exception) and
+/// unavailable: SQLSTATE class `08` (connection exception),
 /// `57P01`/`57P02`/`57P03`/`57P05` (admin shutdown, which is what
 /// `pg_terminate_backend` sends; crash shutdown; cannot connect now; the
-/// server closing a session past `idle_session_timeout`) are
-/// [`ErrorCode::Connectivity`]. Otherwise the same fault reads differently
+/// server closing a session past `idle_session_timeout`) and `25P03`/`25P04`
+/// (the server closing a session past `idle_in_transaction_session_timeout`
+/// or `transaction_timeout`) are [`ErrorCode::Connectivity`]. Otherwise the same fault reads differently
 /// depending on whether the server's `FATAL` or the socket close reached the
 /// caller first.
 pub fn classify_pg_error(err: &tokio_postgres::Error) -> ErrorCode {

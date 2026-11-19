@@ -168,7 +168,11 @@ the two ways out:
   isn't subject to the re-type rewrite.
 
 A `statement_timeout` meant for application queries belongs on the
-application's roles.
+application's roles. So do `transaction_timeout` and
+`idle_in_transaction_session_timeout`: a drain page or build chunk that
+outlasts one is retried without end and charges no key, so a value shorter
+than Trellis's work stalls it, with the error in the log and, for a build, in
+`status`.
 
 ## Index an aggregate's group key when groups are large
 

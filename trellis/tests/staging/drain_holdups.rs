@@ -754,6 +754,10 @@ async fn a_full_disk_charges_no_key_and_the_page_commits_once_it_clears() {
             .expect_err("every attempt hits the full disk");
         assert!(err.contains("No space left on device"), "{err}");
         assert_eq!(charged(&it.admin).await, 0, "no key is charged or held");
+        assert!(
+            holdups(&it.admin).await.is_empty(),
+            "a transient failure records no holdup"
+        );
         assert_eq!(
             status(&it, "c_copy").await.status,
             TransformStatus::Live,
@@ -778,8 +782,9 @@ async fn a_full_disk_charges_no_key_and_the_page_commits_once_it_clears() {
 /// An operator's `transaction_timeout` (PG 17+, `25P04`) closes the drain's
 /// session; a key whose apply outlasts it is the timeout's doing, not its
 /// data's (#2145): no key is charged, no fuse trips, and the page commits
-/// once the timeout no longer bites. A slow deferred trigger on `c_copy`
-/// outlasts a 300ms role timeout until the role's timeout is reset.
+/// once the timeout no longer bites. A slow trigger on `c_copy` outlasts
+/// a 300ms role timeout until the role's timeout is reset. Before #2145 the
+/// key was charged a death on every drain.
 #[tokio::test]
 async fn a_transaction_timeout_charges_no_key_and_the_page_commits_once_it_clears() {
     let cluster = TestCluster::start();
@@ -797,19 +802,55 @@ async fn a_transaction_timeout_charges_no_key_and_the_page_commits_once_it_clear
     }
     it.admin
         .batch_execute(
-            "create function public.slow_commit() returns trigger \
+            "create function public.slow_apply() returns trigger \
                language plpgsql as $$ \
                begin perform pg_sleep(1); return null; end $$; \
-             create constraint trigger c_copy_slow \
+             create trigger c_copy_slow \
                after insert or update or delete on public.c_copy \
-               deferrable initially deferred \
-               for each row execute function public.slow_commit(); \
+               for each row execute function public.slow_apply(); \
              alter role holdup_trellis set transaction_timeout = '300ms'; \
              update public.c set amount = 100 where id = 1",
         )
         .await
         .expect("a slow trigger under an operator's transaction_timeout");
-    // The role's setting reaches new sessions only: end the pool's open ones.
+    end_pool_sessions(&it).await;
+    let seg = seal(&mut it.raw).await;
+
+    for _ in 0..2 {
+        let err = drain(&it.pool, seg)
+            .await
+            .expect_err("every attempt outlasts the timeout");
+        assert!(err.contains("transaction timeout"), "{err}");
+        assert_eq!(charged(&it.admin).await, 0, "no key is charged or held");
+        assert!(
+            holdups(&it.admin).await.is_empty(),
+            "a transient failure records no holdup"
+        );
+        assert_eq!(
+            status(&it, "c_copy").await.status,
+            TransformStatus::Live,
+            "the fuse did not trip"
+        );
+    }
+
+    it.admin
+        .batch_execute("alter role holdup_trellis reset transaction_timeout")
+        .await
+        .expect("lift the timeout");
+    end_pool_sessions(&it).await;
+    drain(&it.pool, seg)
+        .await
+        .expect("the page commits once the timeout no longer bites");
+    assert_eq!(copied_amount(&it.admin, 1).await, 100);
+    assert!(holdups(&it.admin).await.is_empty());
+    assert_eq!(charged(&it.admin).await, 0);
+    assert_eq!(status(&it, "c_copy").await.status, TransformStatus::Live);
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Ends every `holdup_trellis` session but `it.raw`'s, so the pool's next
+/// sessions pick up a changed role setting.
+async fn end_pool_sessions(it: &Instance) {
     let own: i32 = it
         .raw
         .query_one("select pg_backend_pid()", &[])
@@ -824,31 +865,4 @@ async fn a_transaction_timeout_charges_no_key_and_the_page_commits_once_it_clear
         )
         .await
         .expect("end the pool's sessions");
-    let seg = seal(&mut it.raw).await;
-
-    for _ in 0..2 {
-        let err = drain(&it.pool, seg)
-            .await
-            .expect_err("every attempt outlasts the timeout");
-        assert!(err.contains("transaction timeout"), "{err}");
-        assert_eq!(charged(&it.admin).await, 0, "no key is charged or held");
-        assert_eq!(
-            status(&it, "c_copy").await.status,
-            TransformStatus::Live,
-            "the fuse did not trip"
-        );
-    }
-
-    it.admin
-        .batch_execute("alter role holdup_trellis reset transaction_timeout")
-        .await
-        .expect("lift the timeout");
-    drain(&it.pool, seg)
-        .await
-        .expect("the page commits once the timeout no longer bites");
-    assert_eq!(copied_amount(&it.admin, 1).await, 100);
-    assert!(holdups(&it.admin).await.is_empty());
-    assert_eq!(charged(&it.admin).await, 0);
-    assert_eq!(status(&it, "c_copy").await.status, TransformStatus::Live);
-    it.trellis.shutdown().await.expect("shutdown");
 }

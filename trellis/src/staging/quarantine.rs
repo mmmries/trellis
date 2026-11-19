@@ -216,7 +216,8 @@ pub(super) fn is_claim_lost(err: &ApplyError) -> bool {
 /// ([`is_transient_sqlstate`]), or as a lost connection however it was
 /// reported. A dropped connection reaches the caller either with no SQLSTATE
 /// (the socket closed first) or as the server's own `FATAL` (`08xxx`,
-/// `57P01` from `pg_terminate_backend`, `57P02`, `57P03`, `57P05`), whichever
+/// `57P01` from `pg_terminate_backend`, `57P02`, `57P03`, `57P05`, `25P03`,
+/// `25P04`), whichever
 /// arrives first, and [`crate::error_code::classify_pg_error`] already maps
 /// both to [`crate::error_code::ErrorCode::Connectivity`]. A pool timeout
 /// (waiting for a free connection, creating one, or recycling one) is
