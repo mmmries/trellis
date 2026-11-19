@@ -708,6 +708,119 @@ async fn a_failure_only_several_definitions_reproduce_together_is_a_holdup() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
+/// Logs every row the drain writes to `targets` in `public.touched`, and
+/// checks the log at COMMIT with `check`, a PL/pgSQL statement list that
+/// raises to refuse the page.
+async fn check_touched_at_commit(admin: &Client, targets: &[&str], check: &str) {
+    let mut sql = String::from(
+        "create table public.touched (tbl text, id int); \
+         grant all on public.touched to public; \
+         create function public.log_touch() returns trigger language plpgsql as $$ \
+           begin insert into public.touched values (tg_table_name, new.id); \
+           return null; end $$; ",
+    );
+    for target in targets {
+        sql.push_str(&format!(
+            "create trigger {target}_touch after insert or update on public.{target} \
+               for each row execute function public.log_touch(); "
+        ));
+    }
+    sql.push_str(&format!(
+        "create function public.check_touch() returns trigger language plpgsql as $$ \
+           begin {check} return null; end $$; \
+         create constraint trigger touched_check after insert on public.touched \
+           deferrable initially deferred \
+           for each row execute function public.check_touch();"
+    ));
+    admin
+        .batch_execute(&sql)
+        .await
+        .expect("log and check the drain's writes");
+}
+
+/// Rule 7 of #2130: `c_copy`'s share fails alone with the page's `23514`,
+/// but the page still fails without it (`c_pid` and `q_copy` together trip
+/// the check too), so nothing is paused and the page is a holdup.
+#[tokio::test]
+async fn a_definition_failing_alone_stays_live_while_the_page_fails_without_it() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &[READERS[0], READERS[2], READERS[3]]).await;
+    check_touched_at_commit(
+        &it.admin,
+        &["c_pid", "c_copy", "q_copy"],
+        "if (select count(distinct id) from public.touched where tbl = 'c_copy') > 1 \
+            or (exists (select from public.touched where tbl = 'c_pid') \
+                and exists (select from public.touched where tbl = 'q_copy')) then \
+           raise exception 'the page wrote too much' using errcode = '23514'; \
+         end if;",
+    )
+    .await;
+    it.admin
+        .batch_execute(
+            "update public.c set amount = amount + 100, pid = pid % 3 + 1 where id in (1, 2); \
+             update public.q set v = 60 where id = 6",
+        )
+        .await
+        .expect("two c keys and a q key");
+    let seg = seal(&mut it.raw).await;
+    let err = drain(&it.pool, seg)
+        .await
+        .expect_err("the page fails with or without c_copy's share");
+    assert!(err.contains("the page wrote too much"), "{err}");
+
+    let rows = holdups(&it.admin).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].sqlstate.as_deref(), Some("23514"));
+    assert_eq!(charged(&it.admin).await, 0, "isolation charged nothing");
+    for target in ["c_pid", "c_copy", "q_copy"] {
+        let reported = status(&it, target).await;
+        assert_eq!(reported.status, TransformStatus::Live, "{target}");
+    }
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Rule 8 of #2130: the probe of `c` key 1 alone hits a serialization
+/// failure, so isolation didn't settle whether that key fails alone.
+/// `c_copy`'s share fails alone and the page applies without it, but
+/// nothing is paused and the page is a holdup, for a later drain to retry.
+#[tokio::test]
+async fn an_unjudged_lone_record_pauses_no_definition() {
+    let cluster = TestCluster::start();
+    let mut it = instance(&cluster, &READERS[2..]).await;
+    check_touched_at_commit(
+        &it.admin,
+        &["c_copy"],
+        "if (select count(distinct id) from public.touched where tbl = 'c_copy') > 1 then \
+           raise exception 'two c_copy rows' using errcode = '23514'; \
+         elsif exists (select from public.touched where tbl = 'c_copy' and id = 1) then \
+           raise exception 'c key 1 alone' using errcode = '40001'; \
+         end if;",
+    )
+    .await;
+    it.admin
+        .batch_execute(
+            "update public.c set amount = amount + 100 where id in (1, 2); \
+             update public.q set v = 60 where id = 6",
+        )
+        .await
+        .expect("two c keys and a q key");
+    let seg = seal(&mut it.raw).await;
+    let err = drain(&it.pool, seg)
+        .await
+        .expect_err("the page fails while c_copy writes both keys");
+    assert!(err.contains("two c_copy rows"), "{err}");
+
+    let rows = holdups(&it.admin).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].sqlstate.as_deref(), Some("23514"));
+    assert_eq!(charged(&it.admin).await, 0, "isolation charged nothing");
+    for target in ["c_copy", "q_copy"] {
+        let reported = status(&it, target).await;
+        assert_eq!(reported.status, TransformStatus::Live, "{target}");
+    }
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
 /// A transient failure records nothing: retrying it is the expected
 /// behaviour. Here every statement of the drain's sessions times out after
 /// 300 ms, and a lock held on `c_copy`'s target keeps its write waiting past

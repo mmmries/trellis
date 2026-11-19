@@ -1822,7 +1822,8 @@ fn describe_failing_share(message: &str, tables: &[String], keys: &[String]) -> 
 
 /// The SQLSTATE classes Postgres defines (its `errcodes.txt`). A code of
 /// any other class is one an application raised itself (`RAISE ... USING
-/// ERRCODE`), which [`pauses_on_sqlstate`] counts as a refusal.
+/// ERRCODE`), which [`pauses_on_sqlstate`] counts as a refusal, except
+/// Trellis's own ([`crate::locks::CALL_FENCE_REFUSED_SQLSTATE`]).
 const POSTGRES_SQLSTATE_CLASSES: &[&str] = &[
     "00", "01", "02", "03", "08", "09", "0A", "0B", "0F", "0L", "0P", "0Z", "20", "21", "22", "23",
     "24", "25", "26", "27", "28", "2B", "2D", "2F", "34", "38", "39", "3B", "3D", "3F", "40", "42",
@@ -1843,7 +1844,9 @@ fn pauses_on_sqlstate(sqlstate: &str) -> bool {
     class == "22"
         || class == "23"
         || sqlstate == "P0001"
-        || (sqlstate.len() == 5 && !POSTGRES_SQLSTATE_CLASSES.contains(&class))
+        || (sqlstate.len() == 5
+            && !POSTGRES_SQLSTATE_CLASSES.contains(&class)
+            && sqlstate != crate::locks::CALL_FENCE_REFUSED_SQLSTATE)
 }
 
 /// What a page-level probe of some definitions' shares showed.
@@ -7618,6 +7621,10 @@ mod unit_tests {
         ] {
             assert!(!pauses_on_sqlstate(sqlstate), "{sqlstate}");
         }
+        // Trellis's own code, though no Postgres class: a call fence's refusal.
+        assert!(!pauses_on_sqlstate(
+            crate::locks::CALL_FENCE_REFUSED_SQLSTATE
+        ));
     }
 
     /// A paused share's reason spells out its first keys and counts the
