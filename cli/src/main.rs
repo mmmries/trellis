@@ -48,6 +48,11 @@ Options:
   -h, --help                 Print this help and exit.
   -V, --version              Print the version and exit.
 
+Environment:
+  TRELLIS_SCHEMA         The schema holding Trellis's own tables (default trellis).
+  TRELLIS_TARGET_SCHEMA  The schema a bare target table is created in (default
+                         public).
+
 Run `trellis <COMMAND> --help` for command-specific help.
 ";
 

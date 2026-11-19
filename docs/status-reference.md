@@ -454,8 +454,8 @@ Set for a `JOIN` definition (aggregate or 1-1) and `None` for any other. Read
 live on each call, it reports three things, none of which changes the status:
 
 - `hidden_tables`: the estimated rows (`pg_class.reltuples`, 0 before the
-  first analyze) and total on-disk size in bytes of `P`, `M`, `J` and `T`, the
-  definition's hidden tables ([ADR-0019](decisions/0019-join-transforms.md)).
+  first analyze) and total on-disk size in bytes of the definition's
+  [hidden tables](glossary.md#hidden-tables).
   Estimates keep the call cheap on large tables; they are as fresh as the
   table's last `ANALYZE` or autovacuum.
 - `partials_warning`: set once `P`'s estimated rows reach half of the `FROM`

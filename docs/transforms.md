@@ -72,6 +72,8 @@ and star from [0021](decisions/0021-one-to-one-join-transforms.md).
 
 ## Supported sources and targets
 
+A bare source name resolves once, at define, against the Trellis schema, the target schema and `public`, in that order, and is stored qualified ([ADR-0011](decisions/0011-fully-qualified-names.md)). Qualify a name to be sure.
+
 Trellis reads tables it does not own ([0005](decisions/0005-source-schema-is-user-owned.md)),
 so it validates them when a definition is applied and refuses what it can't
 maintain correctly, with an error naming the table or column and the fix. These

@@ -159,7 +159,7 @@ cancellations. The transform stays `paused`, and its `capture_failure` names
 the two ways out:
 
 * raise `statement_timeout` for the Trellis role or database to a value
-  longer than the rewrite takes (`alter role trellis set statement_timeout =
+  longer than the rewrite takes (`alter role trellis_runner set statement_timeout =
   '1h'`, say; `0` removes the bound altogether), restart Trellis, and
   `RESUME` the transform again. The restart matters: a role or database
   setting reaches only new connections, and the staging worker keeps its
@@ -474,21 +474,27 @@ A setup, with `app_owner` owning the source tables, `app_writer` writing them
 and `app_reader` reading targets:
 
 ```sql
-create role trellis login;
-grant create on database mydb to trellis;
+create role trellis_runner login;
+grant create on database mydb to trellis_runner;
 -- only if CONNECT or TEMPORARY was revoked from PUBLIC:
-grant connect, temporary on database mydb to trellis;
-grant app_owner to trellis;                     -- owns the sources, inherited
-create schema trellis_targets authorization trellis;
+grant connect, temporary on database mydb to trellis_runner;
+grant app_owner to trellis_runner;                     -- owns the sources, inherited
+create schema trellis_targets authorization trellis_runner;
 
 grant usage on schema trellis_targets to app_reader;
-alter default privileges for role trellis in schema trellis_targets
+alter default privileges for role trellis_runner in schema trellis_targets
   grant select on tables to app_reader;
 ```
 
-Only Trellis creates tables in `trellis_targets`. Default privileges apply only
-to tables the named role creates, so declare them for each role that applies
-transforms.
+Don't name the role after the Trellis schema (`trellis` by default): the
+default `search_path` starts with `"$user"`, so that role's unqualified
+`CREATE TABLE` would land in Trellis's catalog schema.
+
+Only Trellis creates tables in `trellis_targets`. Set `TRELLIS_TARGET_SCHEMA=trellis_targets`
+(`target_schema:` in the Ruby and Elixir clients) or write targets qualified
+(`TRANSFORM trellis_targets.customer_totals`); otherwise a bare target goes to
+`public`. Default privileges apply only to tables the named role creates, so
+declare them for each role that applies transforms.
 
 `trellis/tests/least_privilege.rs` runs the whole lifecycle as a role holding
 only these privileges, in a database that revoked `PUBLIC`'s, with no

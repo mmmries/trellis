@@ -60,62 +60,19 @@ Nothing in the binding uses it.
   (`:transform_defined`, `:paused`, `:resumed`, ...).
   `Trellis.define(statement)` is an `apply` that refuses anything but a
   `TRANSFORM`, and returns its fully qualified target table.
-- `Trellis.status(target_table)`, `Trellis.definitions`: the catalog reads
-  (each status word and field: the
-  [status reference](../../docs/status-reference.md)).
+- `Trellis.status(target_table)`, `Trellis.definitions`: the catalog reads.
+  `status` returns a `Trellis::Status` (with nested `Trellis::DrainFailure`,
+  `Trellis::SourceIndexGap`, `Trellis::ExtremeIndexGap`,
+  `Trellis::CorrectingNode`, `Trellis::VersionHandover`,
+  `Trellis::BelowCatalogFloor`, `Trellis::RefusedStep`, `Trellis::JoinStatus`
+  and the like) whose fields are named and defined in the
+  [status reference](../../docs/status-reference.md).
 - `Trellis.quarantined`, `Trellis.quarantine_status(target)`,
   `Trellis.sample_quarantined(target, limit:, after:)`,
   `Trellis.poisoned_since(time)`: the quarantine reads. Resuming is a
   statement: `Trellis.apply("RESUME TRANSFORM order_totals.total")`.
   `Trellis.release_key(transform, source_table, key)` releases one key a
-  transform holds, once its cause is fixed; `status` reports how many it
-  holds (`held_keys`). `status` also reports a page the drain keeps failing
-  on with nothing charged or paused (`drain_failure`, a
-  `Trellis::DrainFailure`), and a finished `self_check` job's report lists
-  every one open (`drain_failures`). `status` names the paused upstream columns
-  (`paused_upstream_columns`, each `"target.column"`) that make a `live`
-  definition report `catching_up`. `status` lists the source indexes a
-  `GROUP BY` or `JOIN` target
-  needs and lacks (`source_index_gaps`, each a `Trellis::SourceIndexGap` with
-  `table`, `columns`, `role` (`:group_by`, `:join_from` or `:join_joined`: the part of
-  the definition that needs it), `opted_out` and a `create index` statement as `fix`);
-  `self_check` refuses such a target unless it was defined `WITHOUT SOURCE
-  INDEX`. `status` lists the source indexes a `MIN`/`MAX` aggregate's probes
-  read and the source lacks (`extreme_index_gaps`, each a
-  `Trellis::ExtremeIndexGap` with `table`, `columns`, `argument`, `opted_out`
-  and `fix`); nothing pauses, and a deleted extreme is re-read by scanning
-  its group. `status` lists the partitions of a partitioned source a definition
-  is being corrected for while it reads `:backfilling` for them
-  (`correcting`, each a `Trellis::CorrectingNode` with `node`, `since` and
-  `keys_remaining`). `status` names what a Re-derive build waits on instead
-  of its own work (`build_wait_xid`, the transaction id of the fence it
-  waits out, `nil` when it waits on nothing). While a process of another
-  Trellis version is live, `status` reports that this process stands by
-  (`version_handover`, a `Trellis::VersionHandover` with `this_version`,
-  `processes`, each a `Trellis::OtherProcess` with `worker_id` and
-  `version` (`nil` for a release before 0.2.0),
-  `unregistered_staging_worker` and `migrations_pending`), and
-  state-changing calls raise a `version_handover` error until it is gone.
-  While this binary is below the catalog floor, `status` reports that this
-  process stands by (`below_catalog_floor`, a `Trellis::BelowCatalogFloor`
-  with `floor` and `this_version`), and state-changing calls raise a
-  `version_floor` error. A process that leads the staging worker lists the
-  maintenance steps its role is refused (`maintenance_refusals`, each a
-  `Trellis::RefusedStep` with `step`, `role`, `object`, `missing` and
-  `error`).
-  For a `JOIN` definition `status` reports its hidden tables (`join`, a
-  `Trellis::JoinStatus`): `hidden_tables`, each a `Trellis::HiddenTable` with
-  `table`, `name`, `estimated_rows` and `bytes`, the `P`-size warning
-  (`partials_warning`, a `Trellis::PartialsWarning`), a 1-1 `JOIN`'s fan-out
-  warnings (`fan_out_warnings`, one `Trellis::FanOutWarning` per joined
-  position past the threshold, naming its `position`) and the step its build
-  runs (`building`, a `Trellis::JoinBuildStep` with `step` and the `side`,
-  `part`, `leaf`, `remaining` or `position` its kind of step carries). `join` is
-  `nil` for any other definition. `status` reports the oldest Trellis release
-  that can run a definition (`floor`, `"major.minor.patch"`), which an
-  application reads before rolling back to an earlier Trellis release
-  ([upgrading](../../docs/upgrading.md#rolling-back)), and its `WHERE`
-  (`filter`, definition text, `nil` when unfiltered).
+  transform holds, once its cause is fixed.
 - `Trellis.request_backfill(source_table)`,
   `Trellis.detect_capture_disruptions` (pauses now the readers of every table
   whose Trellis capture was changed outside Trellis, and returns the tables),
@@ -408,10 +365,13 @@ include with a clear error on a Rails without the internals it guards (7.1).
 ### Configuration and boot
 
 The Rails integration reads `Trellis.connect`'s options from one place,
-`config.trellis.connect`:
+`config.trellis.connect`. Trellis's definitions live in the database, so the
+schema dump must be SQL; Rails's default `:ruby` makes `db:migrate` fail
+([Schema dumps](#schema-dumps)):
 
 ```ruby
 # config/application.rb (or config/environments/*.rb)
+config.active_record.schema_format = :sql
 config.trellis.connect = {
   # A direct or session-mode URL, not the app's pooled DATABASE_URL.
   url: ENV.fetch("TRELLIS_DATABASE_URL"),
@@ -419,6 +379,13 @@ config.trellis.connect = {
   staging: ENV["TRELLIS_WORKER"] == "1",
   drain_threads: ENV["TRELLIS_WORKER"] == "1" ? 2 : 0
 }
+```
+
+The dedicated worker is one extra process running your app with that variable,
+for example this `Procfile` line:
+
+```
+worker: TRELLIS_WORKER=1 bin/rails runner 'sleep'
 ```
 
 Connect directly or through a session-mode pooler, never a transaction-mode one ([recommendations](../../docs/recommendations.md#connect-directly-or-through-a-session-mode-pooler)).
