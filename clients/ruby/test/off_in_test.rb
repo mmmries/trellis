@@ -154,6 +154,33 @@ class OffInTest < Minitest::Test
     assert_nil to_regclass(elsewhere, "trellis.transform_definitions")
   end
 
+  # `RAILS_ENV=test bin/rails db:migrate` (or `trellis:migrate`) in an app
+  # whose config.trellis.connect names development's primary database in
+  # every environment: Trellis goes to the test environment's primary
+  # database, even from a migration of another of its databases, and never
+  # to development's.
+  def test_an_off_environment_finds_the_counterpart_of_a_url_naming_another_environments_database
+    names = %w[primary reports].product(%w[development test]).to_h { |db, env| [[db, env], database("#{db[0]}#{env[0]}")] }
+    info = TestCluster.info
+    configs = %w[development test].to_h do |env|
+      [env, %w[primary reports].to_h do |db|
+        [db, { "adapter" => "postgresql", "host" => info.fetch("host"), "port" => info.fetch("port"),
+               "username" => info.fetch("user"), "database" => names.fetch([db, env]) }]
+      end]
+    end
+    ActiveRecord::Base.configurations = configs
+    TrellisTestApp.config.trellis.connect = { url: dsn(names.fetch(%w[primary development])) }
+    Tasks.env = "test"
+    reports = ActiveRecord::Base.configurations.configs_for(env_name: "test", name: "reports")
+    in_environment("test") do
+      Trellis::Railtie.working_on(reports) { Trellis::Railtie.with_handle { nil } }
+      Trellis::Railtie.migrate_all
+    end
+    installed = names.transform_values { |name| !to_regclass(name, "trellis.transform_definitions").nil? }
+    assert_equal({ %w[primary development] => false, %w[primary test] => true,
+                   %w[reports development] => false, %w[reports test] => false }, installed)
+  end
+
   # The load of an off environment's database restores every definition, as
   # a load where Trellis is on does, and no worker builds it: nothing
   # installs a capture trigger, and the restore queue is gone.

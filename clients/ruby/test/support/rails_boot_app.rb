@@ -256,14 +256,27 @@ when "off_in", "off_in_elsewhere", "default_off_in", "opt_in_off_in"
   end
   seen[:connected_after_connect] = Trellis.connected?
 when "off_in_rake"
-  # `rails trellis:migrate` in an off environment migrates as in any other.
+  # `rails trellis:migrate` in an off environment migrates as in any other,
+  # in that environment's primary database, though config.trellis.connect
+  # names another (here, one that doesn't exist).
   BootApp.config.trellis.off_in = [Rails.env]
   require "rake"
+  require "pg"
   Rake.with_application do |rake|
     rake.init("rails", ["probe"])
     BootApp.load_tasks
     Rake::Task["environment"].enhance { BootApp.initialize! }
     Rake::Task.define_task(probe: :environment) do
+      info = PG::Connection.conninfo_parse(ENV.fetch("TRELLIS_TEST_DSN")).to_h { |e| [e[:keyword], e[:val]] }
+      ActiveRecord::Base # loads, reading DATABASE_URL, which would override the config below
+      ENV.delete("DATABASE_URL")
+      ActiveRecord::Base.configurations = {
+        Rails.env => { "primary" => { "adapter" => "postgresql", "host" => info["host"], "port" => info["port"],
+                                      "username" => info["user"], "database" => info["dbname"] } }
+      }
+      BootApp.config.trellis.connect = BootApp.config.trellis.connect.merge(
+        "url" => ENV.fetch("TRELLIS_TEST_DSN").sub(/dbname=\S+/, "dbname=trellis_no_such_database")
+      )
       stderr = $stderr
       $stderr = StringIO.new
       begin

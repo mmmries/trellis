@@ -250,18 +250,22 @@ module Trellis
       # The url an instance configured with configured_url (`what` names it
       # in an error) connects to in a migration running on db_config, a
       # database of another environment than the one running the task
-      # (`db:prepare` in development migrates the test databases too): that
-      # environment's config of the same name as the running environment's
-      # config configured_url points at, compared as verify_same_database!
-      # compares, or db_config itself when it points at none of them. Either
-      # is read as environment_url reads it.
+      # (`db:prepare` in development migrates the test databases too), or of
+      # one Trellis is off in: db_config's environment's config of the same
+      # name as the config configured_url points at (the running
+      # environment's, else any environment's), compared as
+      # verify_same_database! compares, or db_config itself when it points
+      # at none of them. Either is read as environment_url reads it.
       def migration_url(db_config, configured_url, what)
         require "pg"
         configurations = ::ActiveRecord::Base.configurations
         found = trellis_database(configured_url, what)
-        running = configurations.configs_for(env_name: ::ActiveRecord::Tasks::DatabaseTasks.env.to_s)
-                                .find { |config| same_database?(found, rails_database(config.configuration_hash)) }
-        counterpart = running && configurations.configs_for(env_name: db_config.env_name, name: running.name)
+        named = lambda do |configs|
+          configs.find { |config| same_database?(found, rails_database(config.configuration_hash)) }
+        end
+        pointed = named.call(configurations.configs_for(env_name: ::ActiveRecord::Tasks::DatabaseTasks.env.to_s)) ||
+                  named.call(configurations.configs_for)
+        counterpart = pointed && configurations.configs_for(env_name: db_config.env_name, name: pointed.name)
         environment_url(counterpart || db_config, configured_url, what)
       end
 

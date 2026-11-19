@@ -243,8 +243,10 @@ module Trellis
       # Runs Trellis.migrate on the default instance (when
       # config.trellis.connect is set) and on each of
       # config.trellis.instances, each as with_handle does, whether or not
-      # Trellis is off in this environment. Raises ValidationError if neither
-      # is set.
+      # Trellis is off in this environment. Where it's off, and no Rails task
+      # is working on a database, that is this environment's
+      # config.trellis.dump_database. Raises ValidationError if neither is
+      # set.
       def migrate_all
         default = connect_options
         named = instance_options
@@ -253,8 +255,12 @@ module Trellis
                 "config.trellis.connect is not set: give it Trellis.connect's options"
         end
 
-        with_handle { nil } if default
-        named.each_key { |name| with_handle(name) { nil } }
+        run = lambda do
+          with_handle { nil } if default
+          named.each_key { |name| with_handle(name) { nil } }
+        end
+        database = off_environment_database
+        database ? working_on(database, &run) : run.call
         nil
       end
 
@@ -331,6 +337,15 @@ module Trellis
       end
 
       private
+
+      # This environment's config.trellis.dump_database config, when Trellis
+      # is off here and no Rails task is working on a database, or nil.
+      def off_environment_database
+        return nil if Thread.current[WORKING_ON] || enabled? || !defined?(::ActiveRecord::Base)
+
+        require "trellis/schema_dump"
+        ::ActiveRecord::Base.configurations.configs_for(env_name: ::Rails.env.to_s, name: SchemaDump.dump_database)
+      end
 
       # The db_config working_on recorded, when it belongs to another
       # environment than the one running the task, or to one Trellis is off

@@ -690,7 +690,9 @@ Trellis's runtime is off in. Only the runtime is off there:
   the test database has every target and definition, and a new define
   reaches it the next time `rails test` reloads the schema. They connect to
   the database Rails is loading or migrating (the per-worker databases of
-  `parallelize` included), with `config.trellis.connect`'s other options.
+  `parallelize` included), and `trellis:migrate` to that environment's
+  `config.trellis.dump_database`, with `config.trellis.connect`'s other
+  options.
 - With no worker, each definition stays `waiting_to_backfill` and sources
   get no capture triggers, so test writes capture nothing and targets stay
   empty until a test fills them.
@@ -720,9 +722,10 @@ end
 ```
 
 It computes the target from its sources as they stand, as a fresh build
-would, with the `SELECT` the engine renders from the recorded definition. It doesn't exercise capture, the drain
-or any pause. A chained target refreshes its upstream first. A source the
-definition names without a schema resolves on the test's `search_path`. It
+would, with the `SELECT` the engine renders from the recorded definition. It
+doesn't exercise capture, the drain or any pause. A chained target refreshes
+its upstream first. A source the definition names without a schema resolves
+on the test's `search_path`. It
 raises `Trellis::ValidationError` where Trellis is on, since the engine
 maintains the target there (`trellis_on: true` writes anyway).
 
