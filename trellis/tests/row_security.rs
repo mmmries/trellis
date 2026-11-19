@@ -2121,12 +2121,15 @@ async fn a_revoke_that_lands_mid_statement_never_fails_a_write() {
             )
             .await
     });
-    for _ in 0..600 {
-        let waiting: bool = it
+    let mut waiting = false;
+    for _ in 0..1200 {
+        waiting = it
             .admin
             .query_one(
                 "select exists (select 1 from pg_catalog.pg_locks \
-                 where locktype = 'advisory' and not granted)",
+                 where locktype = 'advisory' and not granted and objid = 2154 \
+                 and database = (select oid from pg_catalog.pg_database \
+                     where datname = pg_catalog.current_database()))",
                 &[],
             )
             .await
@@ -2137,6 +2140,7 @@ async fn a_revoke_that_lands_mid_statement_never_fails_a_write() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(waiting, "the writer never reached app_wait");
     let first = seal::seal_phase1_waiting(&mut it.raw).await;
     seal::seal_phase2(&it.raw, first.sealed_seg_seq, "wake")
         .await
