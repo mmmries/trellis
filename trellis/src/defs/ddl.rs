@@ -148,8 +148,9 @@ pub struct PrimaryKeyColumn {
     /// `UNIQUE` index [`source_primary_key`] also accepts. `true` only for
     /// a column of a `UNIQUE NULLS NOT DISTINCT` key: the grouping columns
     /// [`create_aggregate_target_table`] puts on an aggregate target, whose
-    /// `GROUP BY` columns are deliberately nullable, and the same columns of
-    /// a 1-1 target over such a source ([`target_table_ddl`]).
+    /// `GROUP BY` columns are deliberately nullable, a user table's `KEY
+    /// (...)` column on such an index (ADR-0026), and the same columns of a
+    /// 1-1 target over either ([`target_table_ddl`]).
     pub nullable: bool,
     /// The collation the key's index orders this column by, as a quoted,
     /// qualified name ready to interpolate after `collate`
@@ -1159,8 +1160,10 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// This encoding is applied to a key component **if and only if that
 /// component's key column is nullable** ([`PrimaryKeyColumn::nullable`]) —
 /// in practice, only an aggregate target's `UNIQUE NULLS NOT DISTINCT`
-/// `GROUP BY` columns ([`create_aggregate_target_table`]) and a 1-1
-/// target's over them ([`target_table_ddl`]). A
+/// `GROUP BY` columns ([`create_aggregate_target_table`]), a user table's
+/// `KEY (...)` column on such an index (ADR-0026, which capture encodes the
+/// same way, `capture::sql`), and a 1-1 target's over them
+/// ([`target_table_ddl`]). A
 /// `NOT NULL` key column — every real `PRIMARY KEY`, and the all-`NOT NULL`
 /// `UNIQUE` index [`source_primary_key`] also accepts — keeps its raw
 /// `col::text` instead, with no substitution and no escape.
