@@ -60,8 +60,8 @@ Nothing in the binding uses it.
   (`:transform_defined`, `:paused`, `:resumed`, ...).
   `Trellis.define(statement)` is an `apply` that refuses anything but a
   `TRANSFORM`, and returns its fully qualified target table.
-- `Trellis.status(target_table)`, `Trellis.definitions`: the catalog reads. Each
-  returns a `Trellis::Status` (with nested `Trellis::DrainFailure`,
+- `Trellis.status(target_table)`, `Trellis.definitions`: the catalog reads.
+  `status` returns a `Trellis::Status` (with nested `Trellis::DrainFailure`,
   `Trellis::SourceIndexGap`, `Trellis::ExtremeIndexGap`,
   `Trellis::CorrectingNode`, `Trellis::VersionHandover`,
   `Trellis::BelowCatalogFloor`, `Trellis::RefusedStep`, `Trellis::JoinStatus`

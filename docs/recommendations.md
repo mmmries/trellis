@@ -492,9 +492,9 @@ default `search_path` starts with `"$user"`, so that role's unqualified
 
 Only Trellis creates tables in `trellis_targets`. Set `TRELLIS_TARGET_SCHEMA=trellis_targets`
 (`target_schema:` in the Ruby and Elixir clients) or write targets qualified
-(`TRANSFORM trellis_targets.customer_totals`); otherwise a bare target goes to `public`. Default privileges apply only
-to tables the named role creates, so declare them for each role that applies
-transforms.
+(`TRANSFORM trellis_targets.customer_totals`); otherwise a bare target goes to
+`public`. Default privileges apply only to tables the named role creates, so
+declare them for each role that applies transforms.
 
 `trellis/tests/least_privilege.rs` runs the whole lifecycle as a role holding
 only these privileges, in a database that revoked `PUBLIC`'s, with no

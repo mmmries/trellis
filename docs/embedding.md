@@ -16,10 +16,11 @@ same database:
   migrations. These connect at `drain_threads: 0`: no staging worker, no
   drain workers. Cheap to run in every web dyno/pod without each one
   competing to drain the same work.
-* **A dedicated worker process** (one is enough; a second stands by; in Rails or Phoenix, one more copy of the app started with `TRELLIS_WORKER=1`, see each client's README) — runs the live pipeline: capture
-  install + ring maintenance (`staging: true`) and one or more drain workers
-  (`drain_threads: N`) that actually apply staged changes into target
-  tables.
+* **A dedicated worker process** (one is enough; a second stands by) — runs
+  the live pipeline: capture install + ring maintenance (`staging: true`) and
+  one or more drain workers (`drain_threads: N`) that actually apply staged
+  changes into target tables. In Rails or Phoenix it is one more copy of the
+  app, started as each client's README shows.
 
 ### Who runs what
 

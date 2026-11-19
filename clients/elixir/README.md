@@ -27,8 +27,8 @@ the package ships. Builds exist for
 ### Supported versions
 
 Elixir 1.19 and later, on the OTP releases Elixir supports for it (26 to 29
-today); `ecto_sql` 3.13+ and `plug` 1.16+ where used; PostgreSQL 15 to 18,
-as for Trellis itself. CI runs the suite on Elixir 1.19 / OTP 26 and
+today); `ecto_sql` 3.13+ and `plug` 1.16+ where used; the PostgreSQL
+versions [Trellis supports](../../docs/embedding.md#supported-postgresql-versions). CI runs the suite on Elixir 1.19 / OTP 26 and
 Elixir 1.20 / OTP 29.
 
 On any other target, or to build it yourself, build the NIF from source. It

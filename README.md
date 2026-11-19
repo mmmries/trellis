@@ -1,6 +1,6 @@
 # Trellis
 
-> **Version 0.3:** these docs on `main` track the next release and may describe features 0.3 lacks; for 0.3 read the docs at the [`v0.3.0` tag](https://github.com/salesforce-misc/trellis/tree/v0.3.0/docs). The API may change between 0.x minor releases, before 1.0. An upgrade never re-interprets a stored definition: it keeps its meaning, or is paused with the reason; see [grammar versions](docs/transforms.md#grammar-versions).
+> **Version 0.3:** the docs on `main` track the next release; for the release you run, read the docs at its [tag](https://github.com/salesforce-misc/trellis/tags). The API may change between 0.x minor releases, before 1.0. An upgrade never re-interprets a stored definition: it keeps its meaning, or is paused with the reason; see [grammar versions](docs/transforms.md#grammar-versions).
 
 A declarative API for creating data transformations in PostgreSQL.
 Correctness and performance are the key design goals.

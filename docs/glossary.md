@@ -18,7 +18,7 @@ ADR; the [module map](architecture.md) says where each module sits.
 | **drain worker** | A thread (`drain_threads: N`) that applies staged changes to targets. | [embedding](embedding.md) |
 | **ring** | The fixed set of segments that staged changes are appended to until drained. | [02](staging-and-claiming/02-the-staging-ring.md#the-objects) |
 | **floor** | The oldest Trellis release that can run a definition (`floor=` in `trellis status`); also the catalog floor, for the whole instance. | [status](status-reference.md#floor), [upgrading](upgrading.md#the-catalog-floor) |
-| **`P~`, `M~`, `J~`, `T~`** | `trellis status`'s `join tables` line: a `JOIN`'s hidden tables with estimated rows and bytes (see [`P`, `M`, `J`, `T`](#hidden-tables)). | [status](status-reference.md#join) |
+| **`join tables`** | `trellis status`'s line for a `JOIN`: each [hidden table](#hidden-tables) as `<name>~<rows>rows/<bytes>B`, rows estimated (`P~1200rows/8192B`). | [status](status-reference.md#join) |
 
 ## Fences
 
