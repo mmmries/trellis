@@ -103,7 +103,7 @@ proptest! {
 /// none silently drops out of the sweep.
 #[test]
 fn drawn_plans_stay_in_bounds_and_cover_every_action() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = program_with_db_admin_plan();
     let (mut checkpoint, mut fast, mut immediate) = (false, false, false);
     for _ in 0..300 {
