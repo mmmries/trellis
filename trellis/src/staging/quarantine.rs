@@ -34,7 +34,7 @@
 //! key-shaped.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::SystemTime;
 
@@ -848,7 +848,14 @@ pub enum IsolationOutcome {
     /// No single key reproduced an isolate-eligible failure on its own that
     /// could be attributed to a definition: the failure is not
     /// attributable to a key, so nothing was charged.
-    NothingReproduced,
+    NothingReproduced {
+        /// Whether the search settled that no key fails alone: no record
+        /// failed alone, and no probe of a lone record hit a transient error
+        /// or a version fence miss, which would leave its record
+        /// unjudged. Only a settled search may pause a definition
+        /// (`pause_definitions_failing_alone`).
+        settled: bool,
+    },
     /// Isolation ran [`MAX_ISOLATION_PROBES`] probes without pinning the
     /// failure on any key, and stopped with parts of the batch unprobed.
     /// Nothing was charged. Distinct from [`Self::NothingReproduced`],
@@ -1051,6 +1058,11 @@ struct Bisection<E> {
     /// Whether it stopped after [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] probes
     /// in a row hit a transient error, with runs still unprobed.
     transient_storm: bool,
+    /// Whether a probe of a lone record came back
+    /// [`ProbeVerdict::Transient`] or [`ProbeVerdict::Unknown`], so that
+    /// record wasn't judged: the search didn't settle whether it fails
+    /// alone.
+    unsettled_single: bool,
 }
 
 /// One entry on a [`Bisector`]'s stack of work still to do.
@@ -1144,6 +1156,7 @@ impl<E> Bisector<E> {
                 probes: 0,
                 exhausted: false,
                 transient_storm: false,
+                unsettled_single: false,
             },
         };
         match n {
@@ -1238,7 +1251,9 @@ impl<E> Bisector<E> {
             ProbeVerdict::Failed(err) if run.len() == 1 => {
                 self.found.failing.push((run.start, err))
             }
-            ProbeVerdict::Unknown | ProbeVerdict::Transient if run.len() == 1 => {}
+            ProbeVerdict::Unknown | ProbeVerdict::Transient if run.len() == 1 => {
+                self.found.unsettled_single = true;
+            }
             ProbeVerdict::Failed(_) => self.split(run, true),
             ProbeVerdict::Unknown | ProbeVerdict::Transient => self.split(run, false),
         }
@@ -1288,8 +1303,9 @@ async fn probe_records(
     at: ProbeSite<'_>,
     records: &[FoldedChange],
     focus: Option<&apply::ProbeFocus<'_>>,
+    definitions: Option<apply::DefinitionFocus<'_>>,
 ) -> Result<Option<ApplyError>, ApplyError> {
-    let plan = match apply::compute_page(pool, records, focus, at.skip_frozen).await {
+    let plan = match apply::compute_page(pool, records, focus, definitions, at.skip_frozen).await {
         Ok(plan) => plan,
         Err(err) => return Ok(Some(err)),
     };
@@ -1381,10 +1397,11 @@ async fn probe_records(
 ///
 /// Returns (see [`IsolationOutcome`]'s variants):
 /// - `Ok(FuseDisabled)` if `threshold == 0`, without probing anything.
-/// - `Ok(NothingReproduced)` if no single key reproduced an isolate-eligible
-///   failure (the error is surfaced, not blamed —
-///   [`super::apply::drain_once`] returns the *original* failure it already
-///   holds, unmodified).
+/// - `Ok(NothingReproduced { .. })` if no single key reproduced an
+///   isolate-eligible failure. Nothing is charged: the drain pauses a
+///   definition whose share of the page fails alone
+///   (`pause_definitions_failing_alone`), or else surfaces the *original*
+///   failure it already holds, unmodified.
 /// - `Ok(ProbeLimitReached { .. })` if the probe limit stopped isolation
 ///   before it pinned any key; handled as `NothingReproduced` is.
 /// - `Ok(TransientStorm { .. })` if [`MAX_CONSECUTIVE_TRANSIENT_PROBES`]
@@ -1476,7 +1493,7 @@ impl IsolationOutcome {
     fn label(&self) -> &'static str {
         match self {
             IsolationOutcome::FuseDisabled => "FuseDisabled",
-            IsolationOutcome::NothingReproduced => "NothingReproduced",
+            IsolationOutcome::NothingReproduced { .. } => "NothingReproduced",
             IsolationOutcome::ProbeLimitReached { .. } => "ProbeLimitReached",
             IsolationOutcome::TransientStorm { .. } => "TransientStorm",
             IsolationOutcome::ChargedBelowThreshold { .. } => "ChargedBelowThreshold",
@@ -1582,7 +1599,7 @@ async fn isolate_and_evict_probing(
     while let Some(run) = bisector.next_run() {
         stats.probes += 1;
         let records = &candidates[run.clone()];
-        let Some(err) = probe_records(pool, at, records, None).await? else {
+        let Some(err) = probe_records(pool, at, records, None, None).await? else {
             bisector.record(run, ProbeVerdict::Clean);
             continue;
         };
@@ -1626,6 +1643,7 @@ async fn isolate_and_evict_probing(
         bisector.record(run, verdict);
     }
     let bisection = bisector.finish();
+    let settled = !bisection.unsettled_single && bisection.failing.is_empty();
     stats.stopped = if bisection.transient_storm {
         Some(IsolationStop::TransientStorm)
     } else if bisection.exhausted {
@@ -1669,7 +1687,7 @@ async fn isolate_and_evict_probing(
             Some(IsolationStop::ProbeLimit) => IsolationOutcome::ProbeLimitReached {
                 probes: bisection.probes,
             },
-            None => IsolationOutcome::NothingReproduced,
+            None => IsolationOutcome::NothingReproduced { settled },
         });
     }
 
@@ -1768,6 +1786,284 @@ struct ProbeSite<'a> {
     claimed_by: &'a str,
     wake_channel: &'a str,
     skip_frozen: bool,
+}
+
+// ---------------------------------------------------------------------
+// A definition whose share of a page fails alone
+// ---------------------------------------------------------------------
+
+/// How many of a page's keys a [`ApplyError::DefinitionFailsAlone`]
+/// reason names before counting the rest.
+const DESCRIBED_FAILING_KEYS: usize = 5;
+
+/// [`ApplyError::DefinitionFailsAlone`]'s `detail`: Postgres's `message`,
+/// then `tables` and `keys`, the first [`DESCRIBED_FAILING_KEYS`] of them
+/// spelled out, e.g. `numeric field overflow (tables public.m; keys public.m
+/// key=3, public.m key=4)`.
+fn describe_failing_share(message: &str, tables: &[String], keys: &[String]) -> String {
+    let mut detail = format!(
+        "{message} (tables {}; keys {}",
+        tables.join(", "),
+        keys.iter()
+            .take(DESCRIBED_FAILING_KEYS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if keys.len() > DESCRIBED_FAILING_KEYS {
+        detail.push_str(&format!(
+            ", and {} more",
+            keys.len() - DESCRIBED_FAILING_KEYS
+        ));
+    }
+    detail.push(')');
+    detail
+}
+
+/// The SQLSTATE classes Postgres defines (its `errcodes.txt`). A code of
+/// any other class is one an application raised itself (`RAISE ... USING
+/// ERRCODE`), which [`pauses_on_sqlstate`] counts as a refusal, except
+/// Trellis's own ([`crate::locks::CALL_FENCE_REFUSED_SQLSTATE`]).
+const POSTGRES_SQLSTATE_CLASSES: &[&str] = &[
+    "00", "01", "02", "03", "08", "09", "0A", "0B", "0F", "0L", "0P", "0Z", "20", "21", "22", "23",
+    "24", "25", "26", "27", "28", "2B", "2D", "2F", "34", "38", "39", "3B", "3D", "3F", "40", "42",
+    "44", "53", "54", "55", "57", "58", "72", "F0", "HV", "P0", "XX",
+];
+
+/// Whether a page failing with `sqlstate` may pause a definition whose share
+/// fails alone: a data exception (class `22`), an integrity violation (class
+/// `23`), a plain `RAISE` (`P0001`) or a code the application defined.
+/// Those say something about the data or a target-side refusal, which
+/// "fix the data, or the trigger or constraint" remedies. Anything else (a
+/// resource limit such as `53200` or `54xxx`, an internal error `XX000`, a
+/// session ended by `transaction_timeout`) stays a drain holdup.
+fn pauses_on_sqlstate(sqlstate: &str) -> bool {
+    let Some(class) = sqlstate.get(..2) else {
+        return false;
+    };
+    class == "22"
+        || class == "23"
+        || sqlstate == "P0001"
+        || (sqlstate.len() == 5
+            && !POSTGRES_SQLSTATE_CLASSES.contains(&class)
+            && sqlstate != crate::locks::CALL_FENCE_REFUSED_SQLSTATE)
+}
+
+/// What a page-level probe of some definitions' shares showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShareProbe {
+    /// It applied (and was rolled back).
+    Clean,
+    /// It failed with a [`FailureClass::Isolate`] error of this SQLSTATE.
+    Failed { sqlstate: Option<String> },
+    /// It hit a transient error or a version fence miss: unjudged.
+    Unsettled,
+}
+
+/// Whether a page whose failure has `page_sqlstate`, and whose isolation
+/// charged no key, may have its definitions' shares probed: the failure is
+/// one [`pauses_on_sqlstate`] allows, and isolation settled that no key
+/// fails alone (`settled`, see [`IsolationOutcome::NothingReproduced`]).
+fn may_probe_shares(page_sqlstate: Option<&str>, settled: bool) -> bool {
+    settled && page_sqlstate.is_some_and(pauses_on_sqlstate)
+}
+
+/// The definitions whose share fails alone, from each one's probe in
+/// `solos`, if they may be paused once the page applies without them: every
+/// probe settled, at least one failed, and each that failed did with the
+/// page's own `page_sqlstate`. `None` leaves the page a holdup: no share
+/// fails alone (only a combination of definitions does), a probe went
+/// unjudged, or a share fails with another error than the page did.
+fn shares_failing_alone(page_sqlstate: &str, solos: &[(i64, ShareProbe)]) -> Option<BTreeSet<i64>> {
+    let mut failing = BTreeSet::new();
+    for (id, probe) in solos {
+        match probe {
+            ShareProbe::Clean => {}
+            ShareProbe::Unsettled => return None,
+            ShareProbe::Failed { sqlstate } if sqlstate.as_deref() == Some(page_sqlstate) => {
+                failing.insert(*id);
+            }
+            ShareProbe::Failed { .. } => return None,
+        }
+    }
+    (!failing.is_empty()).then_some(failing)
+}
+
+/// A definition reading some of a page's tables.
+struct PageReader {
+    id: i64,
+    target: String,
+    /// The page's canonical tables it reads, sorted.
+    tables: BTreeSet<String>,
+}
+
+/// After a page failed and isolation charged no key (`settled` as
+/// [`IsolationOutcome::NothingReproduced`] says), pauses every definition
+/// whose share of the page fails alone, with an
+/// [`ApplyError::DefinitionFailsAlone`] reason, so the page commits for
+/// everyone else on the drain's retry. Returns the bare targets it paused,
+/// in id order: empty when it paused nothing, and the page stays a holdup.
+///
+/// It pauses only when every one of these holds:
+///
+/// 1. The page's error `err` has a SQLSTATE [`pauses_on_sqlstate`] allows,
+///    and isolation settled ([`may_probe_shares`]).
+/// 2. Applying the page with one definition's share alone, for each
+///    definition reading its tables, settles for every one, and those that
+///    fail do with the page's SQLSTATE ([`shares_failing_alone`]).
+/// 3. Applying the page without those definitions is clean.
+///
+/// One rule whatever the cause: an aggregate whose sum overflows only for
+/// several of the page's rows of one group, a target trigger or constraint
+/// that refuses two rows of one definition. A failure only several
+/// definitions together reproduce pauses nothing. Every probe computes and
+/// applies the page in a transaction that always rolls back, as
+/// isolation's do; a halting error or a lost claim in one propagates, as in
+/// isolation.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn pause_definitions_failing_alone(
+    pool: &Pool,
+    seg_seq: i64,
+    claimed_by: &str,
+    wake_channel: &str,
+    folded: &[FoldedChange],
+    settled: bool,
+    skip_frozen: bool,
+    err: &ApplyError,
+) -> Result<Vec<String>, ApplyError> {
+    let page_sqlstate = sqlstate_of(err);
+    if !may_probe_shares(page_sqlstate.as_deref(), settled) {
+        return Ok(Vec::new());
+    }
+    let page_sqlstate = page_sqlstate.expect("may_probe_shares checked it");
+    let at = ProbeSite {
+        seg_seq,
+        claimed_by,
+        wake_channel,
+        skip_frozen,
+    };
+    let candidates: Vec<FoldedChange> = folded.iter().filter(|c| !c.is_truncate).cloned().collect();
+
+    // The definitions reading the page's tables, with the tables each reads.
+    let mut canonical_srcs = CanonicalSrcTables::default();
+    let mut readers: std::collections::BTreeMap<i64, PageReader> =
+        std::collections::BTreeMap::new();
+    let mut tables: BTreeSet<String> = BTreeSet::new();
+    for change in &candidates {
+        tables.insert(canonical_srcs.get(pool, &change.src_table).await?);
+    }
+    for table in &tables {
+        for def in catalog::transforms_for_source(pool, table).await? {
+            readers
+                .entry(def.id)
+                .or_insert_with(|| PageReader {
+                    id: def.id,
+                    target: def.def.target.clone(),
+                    tables: BTreeSet::new(),
+                })
+                .tables
+                .insert(table.clone());
+        }
+    }
+    if readers.is_empty() || readers.len() >= MAX_ISOLATION_PROBES {
+        return Ok(Vec::new());
+    }
+
+    let mut solos = Vec::with_capacity(readers.len());
+    for id in readers.keys() {
+        let probe = probe_shares(pool, at, &candidates, apply::DefinitionFocus::Only(*id)).await?;
+        let unsettled = probe == ShareProbe::Unsettled;
+        solos.push((*id, probe));
+        if unsettled {
+            break;
+        }
+    }
+    let Some(failing) = shares_failing_alone(&page_sqlstate, &solos) else {
+        return Ok(Vec::new());
+    };
+    let without = probe_shares(
+        pool,
+        at,
+        &candidates,
+        apply::DefinitionFocus::Without(&failing),
+    )
+    .await?;
+    if without != ShareProbe::Clean {
+        crate::instance_log::debug!(
+            seg_seq,
+            failing = ?failing,
+            without = ?without,
+            "definitions fail alone on a page, but it doesn't apply without them; pausing \
+             nothing"
+        );
+        return Ok(Vec::new());
+    }
+
+    let message = pg_message(err).unwrap_or_else(|| err.to_string());
+    let mut pauses = Vec::with_capacity(failing.len());
+    for id in &failing {
+        let reader = &readers[id];
+        let mut keys: Vec<String> = candidates
+            .iter()
+            .filter_map(|change| {
+                let table = canonical_srcs.canonical(&change.src_table)?;
+                reader
+                    .tables
+                    .contains(table)
+                    .then(|| format!("{table} key={}", change.key))
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let tables: Vec<String> = reader.tables.iter().cloned().collect();
+        let reason = ApplyError::DefinitionFailsAlone {
+            target: reader.target.clone(),
+            sqlstate: page_sqlstate.clone(),
+            detail: describe_failing_share(&message, &tables, &keys),
+        };
+        pauses.push((
+            reader.id,
+            super::pause_message::PauseReason::Halt {
+                table: tables.join(", "),
+                text: reason.to_string(),
+            },
+        ));
+    }
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let paused: Vec<String> = crate::defs::lifecycle::pause_many(&txn, pauses)
+        .await?
+        .into_iter()
+        .map(|(id, _)| readers[&id].target.clone())
+        .collect();
+    if !paused.is_empty() {
+        record_halting_stop(&txn, &err.to_string()).await?;
+    }
+    txn.commit().await?;
+    Ok(paused)
+}
+
+/// Applies `records` with only the shares `definitions` keeps, rolled back
+/// ([`probe_records`]). A halting error or a lost claim propagates.
+async fn probe_shares(
+    pool: &Pool,
+    at: ProbeSite<'_>,
+    records: &[FoldedChange],
+    definitions: apply::DefinitionFocus<'_>,
+) -> Result<ShareProbe, ApplyError> {
+    let Some(err) = probe_records(pool, at, records, None, Some(definitions)).await? else {
+        return Ok(ShareProbe::Clean);
+    };
+    if is_claim_lost(&err) {
+        return Err(err);
+    }
+    Ok(match classify(&err) {
+        FailureClass::Halting => return Err(err),
+        FailureClass::Isolate => ShareProbe::Failed {
+            sqlstate: sqlstate_of(&err),
+        },
+        FailureClass::Transient | FailureClass::VersionFenceMiss => ShareProbe::Unsettled,
+    })
 }
 
 /// The definitions a record that fails alone (`change`, of canonical source
@@ -1953,7 +2249,7 @@ impl Probe<'_> {
         }
         stats.probes += 1;
         let records = std::slice::from_ref(self.change);
-        let Some(err) = probe_records(pool, self.at, records, focus).await? else {
+        let Some(err) = probe_records(pool, self.at, records, focus, None).await? else {
             return Ok(Probed::Clean);
         };
         if is_claim_lost(&err) {
@@ -7268,6 +7564,138 @@ mod unit_tests {
         assert_eq!(
             event_field(&events[2], "error"),
             ApplyError::ClaimLost.to_string()
+        );
+    }
+
+    /// A probe of a lone record that hits a transient error or a version
+    /// fence miss leaves the search unsettled; one of a larger run doesn't,
+    /// since its halves are probed.
+    #[test]
+    fn bisect_records_a_lone_records_unjudged_probe() {
+        let found = bisect_with(8, MAX_ISOLATION_PROBES, fails_alone(&[]));
+        assert!(!found.unsettled_single);
+        for unjudged in [ProbeVerdict::Transient, ProbeVerdict::Unknown] {
+            let unjudged = std::cell::RefCell::new(Some(unjudged));
+            // Records 2 and 3 fail only together; record 2's own probe is
+            // the one that goes unjudged.
+            let found = bisect_with(8, MAX_ISOLATION_PROBES, |run| {
+                if *run == (2..3)
+                    && let Some(verdict) = unjudged.borrow_mut().take()
+                {
+                    return verdict;
+                }
+                if run.contains(&2) && run.contains(&3) {
+                    ProbeVerdict::Failed(())
+                } else {
+                    ProbeVerdict::Clean
+                }
+            });
+            assert!(found.failing.is_empty());
+            assert!(found.unsettled_single);
+            assert!(!found.transient_storm);
+        }
+        // A transient run of several records is split, not left unjudged.
+        let first = std::cell::Cell::new(true);
+        let found = bisect_with(8, MAX_ISOLATION_PROBES, |run| {
+            if run.len() > 1 && first.replace(false) {
+                ProbeVerdict::Transient
+            } else {
+                ProbeVerdict::Clean
+            }
+        });
+        assert!(!found.unsettled_single);
+    }
+
+    /// Rule 6 of #2130: only a data exception, an integrity violation, a
+    /// plain `RAISE` or an application's own code may pause a definition.
+    #[test]
+    fn only_data_and_refusal_sqlstates_pause_a_definition() {
+        for sqlstate in [
+            "22003", "22008", "22012", "23505", "23514", "P0001", "45000", "UX001",
+        ] {
+            assert!(pauses_on_sqlstate(sqlstate), "{sqlstate}");
+        }
+        for sqlstate in [
+            "53200", "54000", "54001", "XX000", "25P04", "40001", "55P03", "57014", "42501",
+            "P0004", "P0002", "08006", "",
+        ] {
+            assert!(!pauses_on_sqlstate(sqlstate), "{sqlstate}");
+        }
+        // Trellis's own code, though no Postgres class: a call fence's refusal.
+        assert!(!pauses_on_sqlstate(
+            crate::locks::CALL_FENCE_REFUSED_SQLSTATE
+        ));
+    }
+
+    /// A paused share's reason spells out its first keys and counts the
+    /// rest.
+    #[test]
+    fn a_failing_shares_reason_caps_its_keys() {
+        let tables = vec!["public.m".to_string()];
+        let keys: Vec<String> = (1..=7).map(|k| format!("public.m key={k}")).collect();
+        assert_eq!(
+            describe_failing_share("value out of range", &tables, &keys[..2]),
+            "value out of range (tables public.m; keys public.m key=1, public.m key=2)"
+        );
+        assert_eq!(
+            describe_failing_share("value out of range", &tables, &keys),
+            "value out of range (tables public.m; keys public.m key=1, public.m key=2, \
+             public.m key=3, public.m key=4, public.m key=5, and 2 more)"
+        );
+    }
+
+    /// Rules 6 and 8 of #2130: no share is probed for an error outside the
+    /// allow-list, one with no SQLSTATE (Trellis's own, such as
+    /// `GroupLockGap`), or an isolation that left a lone record unjudged.
+    #[test]
+    fn shares_are_probed_only_for_a_settled_data_failure() {
+        assert!(may_probe_shares(Some("22003"), true));
+        assert!(!may_probe_shares(Some("22003"), false));
+        assert!(!may_probe_shares(Some("53200"), true));
+        assert!(!may_probe_shares(Some("XX000"), true));
+        assert!(!may_probe_shares(None, true));
+    }
+
+    /// Rules 1, 5 and 7 of #2130, over each definition's solo probe.
+    #[test]
+    fn the_definitions_failing_alone_are_those_failing_with_the_pages_sqlstate() {
+        let failed = |sqlstate: &str| ShareProbe::Failed {
+            sqlstate: Some(sqlstate.to_string()),
+        };
+        // One definition fails alone, another applies: pause the first.
+        assert_eq!(
+            shares_failing_alone("22003", &[(1, failed("22003")), (2, ShareProbe::Clean)]),
+            Some(BTreeSet::from([1]))
+        );
+        // Every one that fails alone.
+        assert_eq!(
+            shares_failing_alone("23505", &[(1, failed("23505")), (2, failed("23505"))]),
+            Some(BTreeSet::from([1, 2]))
+        );
+        // None fails alone: only a combination does, so it stays a holdup.
+        assert_eq!(
+            shares_failing_alone("22003", &[(1, ShareProbe::Clean), (2, ShareProbe::Clean)]),
+            None
+        );
+        // A solo failure with another SQLSTATE than the page's.
+        assert_eq!(
+            shares_failing_alone("22003", &[(1, failed("22003")), (2, failed("23505"))]),
+            None
+        );
+        assert_eq!(
+            shares_failing_alone(
+                "22003",
+                &[
+                    (1, ShareProbe::Failed { sqlstate: None }),
+                    (2, ShareProbe::Clean)
+                ]
+            ),
+            None
+        );
+        // A solo probe that went unjudged.
+        assert_eq!(
+            shares_failing_alone("22003", &[(1, failed("22003")), (2, ShareProbe::Unsettled)]),
+            None
         );
     }
 

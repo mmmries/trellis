@@ -1212,7 +1212,7 @@ async fn release_of_a_key_held_across_batches_re_derives_it_to_the_oracle() {
 /// scenario this test means to cover. Keeping the group brand new makes the
 /// insert-shaped tuple the real, correct value for a single-key probe.
 #[tokio::test]
-async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
+async fn a_batch_failure_that_only_reproduces_combined_pauses_its_definition_unblamed() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -1274,17 +1274,28 @@ async fn a_batch_failure_that_only_reproduces_combined_surfaces_unblamed() {
     .await;
     let seg1 = pipeline::seal(&mut client).await;
 
-    let result = apply::drain_once(&db.pool, seg1, "worker", 1, "trellis_quarantine_test").await;
-    match &result {
-        Err(ApplyError::Db(db_err)) => {
-            assert_eq!(
-                db_err.code(),
-                Some(&SqlState::CHECK_VIOLATION),
-                "expected the combined-delta check violation, got {db_err:?}"
-            );
-        }
-        other => panic!("expected the combined batch's check violation to surface, got {other:?}"),
-    }
+    // The definition's share of the page fails alone (#2130): it is paused
+    // with the check violation as its reason, and the page commits without
+    // it.
+    apply::drain_once(&db.pool, seg1, "worker", 1, "trellis_quarantine_test")
+        .await
+        .expect("the page commits without the failing definition's share");
+    let (status, reason): (String, String) = {
+        let row = client
+            .query_one(
+                "select t.status, f.error from transform_definitions t \
+                 join capture_failures f on f.transform_id = t.id \
+                 where t.target_table like '%order_summary'",
+                &[],
+            )
+            .await
+            .expect("read the definition's pause");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(status, "paused");
+    assert!(reason.contains("T0247"), "{reason}");
+    assert!(reason.contains("23514"), "{reason}");
+    assert!(reason.contains("total_at_most_8"), "{reason}");
 
     assert_eq!(
         key_deaths_count(&client, &order_items, "1").await,

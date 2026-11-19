@@ -728,8 +728,8 @@ refuses while another table's foreign key into it, or a view over it, exists
 * A unique index, constraint or trigger that refuses a row Trellis writes
   fails that row's key like any value the target refuses: the key is held
   ([`held_keys`](status-reference.md#held_keys)), rows that fail only together
-  hold their page as a `drain_failure`, and an aggregate's or a `JOIN`'s build
-  pauses with a `backfill_failure`. A unique index off the key is the likely
+  pause the definition ([T0247](errors.md#t0247-definitionfailsalone)), and
+  an aggregate's or a `JOIN`'s build pauses with a `backfill_failure`. A unique index off the key is the likely
   case: changes to different keys apply in any order, so two rows can hold one
   value for a moment though the source never does.
 * Another table's foreign key referencing the target holds the key of a

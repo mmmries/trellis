@@ -92,7 +92,7 @@ fn charged(outcome: &IsolationOutcome) -> Vec<String> {
         IsolationOutcome::ChargedBelowThreshold { charged } => {
             charged.iter().map(|key| key.transform.clone()).collect()
         }
-        IsolationOutcome::NothingReproduced => Vec::new(),
+        IsolationOutcome::NothingReproduced { .. } => Vec::new(),
         other => panic!("expected a charge below the threshold, or none, got {other:?}"),
     };
     targets.sort();

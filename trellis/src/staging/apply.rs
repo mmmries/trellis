@@ -293,6 +293,22 @@ pub enum ApplyError {
     /// definitions reading `src_table` rather than clearing their targets
     /// without the floor.
     TruncateWithoutLsn { src_table: String },
+    /// A page failed, no key of it failed alone, and `target`'s share of the
+    /// page failed on its own with the page's SQLSTATE: a data exception, an
+    /// integrity violation or a `RAISE` that only several of its rows
+    /// together trip (two float sums that overflow together, a target
+    /// trigger or constraint across two rows). Never returned: the drain
+    /// pauses the definition with this as its reason
+    /// (`super::quarantine::pause_definitions_failing_alone`), and the page
+    /// commits for every other definition.
+    DefinitionFailsAlone {
+        target: String,
+        sqlstate: String,
+        /// Postgres's message, then the qualified tables of the page `target`
+        /// reads and some of the page's keys of those tables
+        /// (`super::quarantine::describe_failing_share`).
+        detail: String,
+    },
 }
 
 impl ApplyError {
@@ -324,6 +340,7 @@ impl ApplyError {
             | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::GroupLockGap { .. }
             | ApplyError::TruncateWithoutLsn { .. } => ErrorCode::Internal,
+            ApplyError::DefinitionFailsAlone { .. } => ErrorCode::Validation,
             ApplyError::SourceTableDropped { .. } => ErrorCode::NotFound,
             ApplyError::ColumnNotPaused { .. } => ErrorCode::NotFound,
             // The definition's persisted status conflicts with what
@@ -382,6 +399,7 @@ impl ApplyError {
             ApplyError::ColumnPauseLockTimeout(err) => err.error_id(),
             ApplyError::ResumeRefused { reason, .. } => reason.error_id(),
             ApplyError::TruncateWithoutLsn { .. } => ErrorId(182),
+            ApplyError::DefinitionFailsAlone { .. } => ErrorId(247),
         }
     }
 }
@@ -535,6 +553,17 @@ impl crate::error_code::Message for ApplyError {
                  raise its targets' truncate floor; the capture trigger always stamps one, so \
                  the ring row was written by something else"
             ),
+            ApplyError::DefinitionFailsAlone {
+                target,
+                sqlstate,
+                detail,
+            } => write!(
+                f,
+                "'{target}' fails on its own share of a drain page, though no single key of the \
+                 page does: {sqlstate} {detail}. Several of its rows fail only together. Fix the \
+                 data, or the trigger or constraint on the target, then resume the definition to \
+                 rebuild it"
+            ),
         }
     }
 }
@@ -569,7 +598,8 @@ impl std::error::Error for ApplyError {
             | ApplyError::TransformNotPaused { .. }
             | ApplyError::KeyNotHeld { .. }
             | ApplyError::ReleaseLockTimeout { .. }
-            | ApplyError::TruncateWithoutLsn { .. } => None,
+            | ApplyError::TruncateWithoutLsn { .. }
+            | ApplyError::DefinitionFailsAlone { .. } => None,
         }
     }
 }
@@ -2736,7 +2766,7 @@ fn definition_share<'c, 'f>(
 /// [`compute_page`]'s, which this calls and [`drain_batch`] calls directly.
 #[cfg(any(test, feature = "internals"))]
 pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, ApplyError> {
-    compute_page(pool, folded, None, false).await
+    compute_page(pool, folded, None, None, false).await
 }
 
 /// One key an isolation probe (`quarantine::attribute`) applies with
@@ -2779,6 +2809,27 @@ impl ProbeFocus<'_> {
     }
 }
 
+/// The definitions a page-level isolation probe
+/// (`quarantine::pause_definitions_failing_alone`) applies the page for: one
+/// definition's share alone, or every definition's but some.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DefinitionFocus<'a> {
+    /// That one alone.
+    Only(i64),
+    /// Every one but these.
+    Without(&'a BTreeSet<i64>),
+}
+
+impl DefinitionFocus<'_> {
+    /// Whether the probe applies definition `id`'s share.
+    fn keeps(&self, id: i64) -> bool {
+        match self {
+            DefinitionFocus::Only(only) => *only == id,
+            DefinitionFocus::Without(left_out) => !left_out.contains(&id),
+        }
+    }
+}
+
 /// Which readers a folded change's key is left out of: the readers
 /// of its table it's poisoned for, in id order, which it is parked for.
 #[derive(Default)]
@@ -2795,7 +2846,8 @@ impl KeyExclusion {
 }
 
 /// [`compute`], with `focus` overriding one key's direct readers for an
-/// isolation probe, and with `skip_frozen` also skipping every
+/// isolation probe, `definitions` keeping only some definitions' shares
+/// for a page-level one, and with `skip_frozen` also skipping every
 /// table no definition that isn't frozen reads, as [`source_key_for_apply`]
 /// skips one whose key can't be used ([`has_unfrozen_reader`], fenced the
 /// same way). [`drain_batch`] asks for it on the retry after Postgres
@@ -2805,7 +2857,7 @@ impl KeyExclusion {
 /// so a drain that was refused nothing reads nothing more.
 #[tracing::instrument(
     name = "staging.compute",
-    skip(pool, folded, focus),
+    skip(pool, folded, focus, definitions),
     fields(
         folded = folded.len(),
         poisoned = tracing::field::Empty,
@@ -2816,6 +2868,7 @@ pub(super) async fn compute_page(
     pool: &Pool,
     folded: &[FoldedChange],
     focus: Option<&ProbeFocus<'_>>,
+    definitions: Option<DefinitionFocus<'_>>,
     skip_frozen: bool,
 ) -> Result<ApplyPlan, ApplyError> {
     // Find the already-poisoned keys before anything else touches
@@ -2971,11 +3024,14 @@ pub(super) async fn compute_page(
         // downstream-propagation hop's (staged under the upstream target's
         // `target_table`); `qualified_schema_node_key` only resolves the bare
         // spelling a hand-staged fixture uses.
-        let defs = catalog::transforms_for_source(
+        let mut defs = catalog::transforms_for_source(
             pool,
             &qualified_schema_node_key(pool, qualified_source).await?,
         )
         .await?;
+        if let Some(definitions) = definitions {
+            defs.retain(|def| definitions.keeps(def.id));
+        }
 
         // Which readers each change is left out of (see
         // `KeyExclusion`). A change poisoned for a reader of this table is
@@ -5647,7 +5703,7 @@ async fn drain_batch(
     loop {
         attempt += 1;
         tracing::Span::current().record("attempt", attempt);
-        let plan = match compute_page(pool, &folded, None, halt_retry.skip_frozen).await {
+        let plan = match compute_page(pool, &folded, None, None, halt_retry.skip_frozen).await {
             Ok(plan) => plan,
             Err(ApplyError::SourceTableDropped { source_table }) => {
                 // The one sanctioned exception to immutability: the
@@ -5806,7 +5862,8 @@ async fn end_session(client: &impl GenericClient) -> ApplyError {
 ///
 /// `Ok(())` means "retry with `folded` unchanged": a version fence miss or a
 /// transient failure, within [`MAX_APPLY_ATTEMPTS`]; a halt, see [`halt`];
-/// or an isolation that poisoned at least one key for the definition it
+/// a definition paused because its share of the page fails alone
+/// ([`quarantine::pause_definitions_failing_alone`]); or an isolation that poisoned at least one key for the definition it
 /// fails in, which the retry's recompute leaves out of that definition's
 /// apply.
 /// `Err(_)` propagates `err` (or a probe's own halting error, once its halt
@@ -6010,7 +6067,8 @@ async fn retry_or_surface(
         // fail alone to attribute the failure to specific key(s),
         // evicting any past the death
         // threshold and retrying without them. If nothing reproduces alone,
-        // the error is surfaced, not blamed; if keys reproduce but none is
+        // a definition whose share of the page fails alone is paused, or
+        // else the error is surfaced, not blamed; if keys reproduce but none is
         // past the threshold yet, they are charged and the error is surfaced
         // too (the next drain cycle charges them again).
         quarantine::FailureClass::Isolate => {
@@ -6095,7 +6153,43 @@ async fn retry_or_surface(
                     );
                     Err(Surface::Plain(err))
                 }
-                quarantine::IsolationOutcome::NothingReproduced => {
+                // No key fails alone: a definition whose share of the
+                // page fails alone is paused, and the page retried without
+                // it. Free, as a halt's retry is: it runs without the
+                // failing share rather than repeating it.
+                quarantine::IsolationOutcome::NothingReproduced { settled } => {
+                    match quarantine::pause_definitions_failing_alone(
+                        pool,
+                        seg_seq,
+                        claimed_by,
+                        wake_channel,
+                        folded,
+                        settled,
+                        halt_retry.skip_frozen,
+                        &err,
+                    )
+                    .await
+                    {
+                        Ok(paused) if !paused.is_empty() => {
+                            crate::instance_log::error!(
+                                seg_seq,
+                                paused = ?paused,
+                                error = %err,
+                                "a definition's share of the page fails alone though no key \
+                                 does; paused it until resumed, and retrying the page without it"
+                            );
+                            *attempts -= 1;
+                            return Ok(());
+                        }
+                        Ok(_) => {}
+                        Err(probe_err)
+                            if quarantine::classify(&probe_err)
+                                == quarantine::FailureClass::Halting =>
+                        {
+                            return halt(pool, seg_seq, attempts, halt_retry, probe_err).await;
+                        }
+                        Err(probe_err) => return Err(Surface::Plain(probe_err)),
+                    }
                     crate::instance_log::debug!(
                         seg_seq,
                         error = %err,
