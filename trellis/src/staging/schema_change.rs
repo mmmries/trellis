@@ -768,12 +768,16 @@ async fn unbacked_shape(
 ) -> Result<UnbackedShape, tokio_postgres::Error> {
     let row = client
         .query_typed_one(
-            "select coalesce((select c.relkind = 'p' from pg_catalog.pg_class c \
+            concat!(
+                "select coalesce((select c.relkind = 'p' from pg_catalog.pg_class c \
                               where c.oid = pg_catalog.to_regclass($1)), false), \
                     exists (select 1 from pg_catalog.pg_attribute a \
                             where a.attrelid = pg_catalog.to_regclass($1) \
                               and a.attname::text = any($2) and a.attnum > 0 \
-                              and not a.attisdropped and not a.attnotnull)",
+                              and not a.attisdropped and not ",
+                crate::defs::ddl::not_null_sql!("a"),
+                ")"
+            ),
             &[
                 (&crate::defs::ddl::regclass_arg(table), Type::TEXT),
                 (&key, Type::TEXT_ARRAY),

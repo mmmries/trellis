@@ -418,7 +418,7 @@ pub enum SelfCheckError {
     /// The audited definition reads something the comparison can't render
     /// (a `JOIN` field outside the shapes it holds), or its recorded state
     /// is missing (a `JOIN` with no joined table, a keyset over a key that's
-    /// gone).
+    /// gone), or a page holds a `NULL` key in a column it read as `NOT NULL`.
     UnsupportedExpr {
         target: String,
         detail: String,
@@ -1238,7 +1238,16 @@ async fn compare_once(
     for row in &rows {
         let side = row.get::<_, i32>(0);
         page_end = row.get(1);
-        let key: String = row.get(2);
+        // A key column read as `NOT NULL` renders raw, so a `NULL` in it
+        // (one whose `NOT NULL` changed after the key was read) renders no
+        // key: refuse the page rather than panic.
+        let Some(key) = row.get::<_, Option<String>>(2) else {
+            return Err(SelfCheckError::UnsupportedExpr {
+                target: def.def.target.clone(),
+                detail: "a key column read as NOT NULL holds NULL; run self_check again"
+                    .to_string(),
+            });
+        };
         match side {
             3 => {
                 uncertain.keys.insert(key);

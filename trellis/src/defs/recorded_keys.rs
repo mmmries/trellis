@@ -281,7 +281,8 @@ pub(crate) async fn unique_indexes(
 ) -> Result<Vec<String>, tokio_postgres::Error> {
     Ok(client
         .query_typed(
-            "select pg_catalog.format('%I (%s)%s%s', c.relname, \
+            concat!(
+                "select pg_catalog.format('%I (%s)%s%s', c.relname, \
                     (select string_agg(case when k.attnum = 0 then 'an expression' \
                                             else pg_catalog.quote_ident(a.attname) end, \
                                        ', ' order by k.ord) \
@@ -325,12 +326,15 @@ pub(crate) async fn unique_indexes(
                                  from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
                                  join pg_catalog.pg_attribute a \
                                    on a.attrelid = i.indrelid and a.attnum = k.attnum \
-                                 where k.ord <= i.indnkeyatts and not a.attnotnull) \
+                                 where k.ord <= i.indnkeyatts and not ",
+                crate::defs::ddl::not_null_sql!("a"),
+                ") \
                              then ', over a nullable column and not NULLS NOT DISTINCT' end)) \
              from pg_catalog.pg_index i \
              join pg_catalog.pg_class c on c.oid = i.indexrelid \
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisunique \
-             order by i.indexrelid",
+             order by i.indexrelid"
+            ),
             &[(&ddl::regclass_arg(table), Type::TEXT)],
         )
         .await?
@@ -795,7 +799,8 @@ pub(crate) async fn check(
 /// non-partial unique index that is `NULLS NOT DISTINCT` or over `NOT NULL`
 /// columns only, `INCLUDE` columns counted), when that index's key columns
 /// are `key`. Empty otherwise: any other index with `INCLUDE` columns, a
-/// covering index beside the key among them, never keyed anything.
+/// covering index beside the key among them, never keyed anything. It reads
+/// bare `attnotnull`, as that release did, not `ddl::not_null_sql`.
 async fn included_columns(
     client: &impl GenericClient,
     table: &str,
