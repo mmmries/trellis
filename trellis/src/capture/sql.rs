@@ -67,7 +67,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::defs::ddl::composite_key_escape_sql;
+use crate::defs::ddl::{composite_key_escape_sql, null_key_escape_sql};
 use crate::pool::{DETERMINISTIC_TEXT_OUTPUT_GUCS, jsonb_build_object_calls, quote_ident};
 use crate::staging::append::{
     NODE_TRUNCATE_SENTINEL_KEY, RING_SIZE, SCHEMA_CHANGED_SENTINEL_KEY, TRUNCATE_SENTINEL_KEY,
@@ -134,6 +134,13 @@ pub struct CaptureSpec {
     /// key change (`staging::schema_change`). Recorded in the comment only
     /// when set, so a primary-key capture's comment is what it always was.
     declared: bool,
+    /// The key columns that can hold `NULL` (`not attnotnull`: a `KEY`
+    /// column on a `NULLS NOT DISTINCT` index, ADR-0026), in key order. Each
+    /// one's ring key part takes the build's `NULL` encoding
+    /// ([`crate::defs::ddl::null_key_escape_sql`]); see [`key_expr`].
+    /// Recorded in the comment only when non-empty, so a `NOT NULL` key's
+    /// comment is what it always was.
+    nullable: Vec<String>,
 }
 
 impl CaptureSpec {
@@ -157,6 +164,7 @@ impl CaptureSpec {
             columns: columns.into_iter().collect(),
             partitioned: false,
             declared: false,
+            nullable: Vec::new(),
         })
     }
 
@@ -172,6 +180,29 @@ impl CaptureSpec {
     #[cfg(any(test, feature = "internals"))]
     pub fn declared_key(&self) -> bool {
         self.declared
+    }
+
+    /// The same spec, its key columns named in `nullable` able to hold
+    /// `NULL`. A name that isn't a key column is ignored.
+    #[must_use]
+    pub fn with_nullable_key(mut self, nullable: impl IntoIterator<Item = String>) -> Self {
+        let nullable: BTreeSet<String> = nullable.into_iter().collect();
+        self.nullable = self
+            .key
+            .iter()
+            .filter(|c| nullable.contains(*c))
+            .cloned()
+            .collect();
+        self
+    }
+
+    /// The key columns that can hold `NULL`, in key order.
+    pub fn nullable_key(&self) -> &[String] {
+        &self.nullable
+    }
+
+    fn is_nullable(&self, column: &str) -> bool {
+        self.nullable.iter().any(|c| c == column)
     }
 
     /// The same spec, marked as the capture of a partitioned root.
@@ -491,7 +522,8 @@ pub fn comment_ddl(
 }
 
 /// What a capture function's comment records, as a JSON object: the table,
-/// the event, the key and image columns, and a hash of the
+/// the event, the key (whether it is declared, and its nullable columns)
+/// and image columns, and a hash of the
 /// function's source as generated ([`body_hash`]). `capture::install::installed`
 /// reads the spec back to decide whether the installed functions match the
 /// spec the catalog now asks for; the capture pass compares the hash with
@@ -506,7 +538,7 @@ pub fn comment_text(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> St
         format!("[{}]", items.join(","))
     };
     format!(
-        "{{\"trellis_capture\":1,\"table\":{},\"event\":{},\"key\":{},{}\"columns\":{},\"body\":\"{}\"}}",
+        "{{\"trellis_capture\":1,\"table\":{},\"event\":{},\"key\":{},{}{}\"columns\":{},\"body\":\"{}\"}}",
         crate::intake::json_string(&spec.table),
         crate::intake::json_string(event.as_str()),
         list(&spec.key),
@@ -514,6 +546,11 @@ pub fn comment_text(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> St
             "\"declared\":true,"
         } else {
             ""
+        },
+        if spec.nullable.is_empty() {
+            String::new()
+        } else {
+            format!("\"nullable\":{},", list(&spec.nullable))
         },
         list(&spec.columns),
         body_hash(&function_source(schema, spec, event)),
@@ -1237,9 +1274,7 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
     if !live {
         return transition_select(spec, event, render);
     }
-    let table = quoted_table(&spec.table).expect("CaptureSpec::new checked the table name");
-    let first_key = quote_ident(&spec.key[0]);
-    let live = format!("t.{first_key} is not null");
+    let live = live_present(spec);
     // `t`, read by the primary key's typed equality. The `limit 1` keeps the
     // lateral subquery from being flattened into a join, so the plan is a
     // probe per captured row whatever the table's size was when PL/pgSQL
@@ -1249,19 +1284,6 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
     // `key` is the row's own ring key, which the live version's must match
     // as text; `age(t.xmin) <= 0` keeps the probe on a version this
     // transaction wrote (see "The image is the live row" above).
-    let live_join = |of: &dyn Fn(&str) -> String, key: &str| {
-        let on: Vec<String> = spec
-            .key
-            .iter()
-            .map(|c| format!("t.{} = {}", quote_ident(c), of(&quote_ident(c))))
-            .collect();
-        format!(
-            "{indent}left join lateral (select * from {table} t where {}\n{indent}    \
-             and {} = {key} collate \"C\" and pg_catalog.age(t.xmin) <= 0 limit 1) t on true",
-            on.join(" and "),
-            key_expr(spec, "t"),
-        )
-    };
     match event {
         CaptureEvent::Insert => format!(
             "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
@@ -1273,7 +1295,7 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
             render.image(spec, "n"),
             render.image(spec, "t"),
             transition_images(spec, render, None, Some("true"), &live),
-            live_join(&|c| format!("n.{c}"), &key_expr(spec, "n")),
+            live_probe(spec, &|c| column_ref("n", c), &key_expr(spec, "n")),
         ),
         CaptureEvent::Delete => format!(
             "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
@@ -1285,7 +1307,7 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
             render.image(spec, "o"),
             render.image(spec, "t"),
             transition_images(spec, render, Some("true"), None, &live),
-            live_join(&|c| format!("o.{c}"), &key_expr(spec, "o")),
+            live_probe(spec, &|c| column_ref("o", c), &key_expr(spec, "o")),
         ),
         // A statement trigger sees the update's old and new rows as two sets
         // with no pairing, so they are paired on the key text, one to one
@@ -1298,14 +1320,15 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
         // the imaged columns beside its pair number, so the number's name
         // ([`pair_column`]) can't collide with a column the select reads.
         CaptureEvent::Update => {
-            let old = format!("o.{first_key} is not null");
-            let new = format!("n.{first_key} is not null");
+            let old = side_present(spec, "o");
+            let new = side_present(spec, "n");
             let changed = update_changed_filter(spec, render);
             let pair = pair_column(spec);
             let numbered = |rows: &str, alias: &str| {
                 format!(
-                    "(select {}, row_number() over (partition by {} collate \"C\") as {pair} \
+                    "(select {}{}, row_number() over (partition by {} collate \"C\") as {pair} \
                      from {rows} {alias}) {alias}",
+                    present_marker(spec),
                     render.projection(spec, alias),
                     key_expr(spec, alias)
                 )
@@ -1330,8 +1353,17 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
                 numbered(NEW_ROWS, "n"),
                 key_expr(spec, "o"),
                 key_expr(spec, "n"),
-                live_join(
-                    &|c| format!("coalesce(n.{c}, o.{c})"),
+                live_probe(
+                    spec,
+                    &|c| {
+                        let (n, o) = (column_ref("n", c), column_ref("o", c));
+                        // A NULL key part can't stand for "no new row".
+                        if spec.is_nullable(c) {
+                            format!("case when {new} then {n} else {o} end")
+                        } else {
+                            format!("coalesce({n}, {o})")
+                        }
+                    },
                     &format!(
                         "case when {new} then {} else {} end",
                         key_expr(spec, "n"),
@@ -1353,7 +1385,6 @@ fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) ->
     let src = text_expr(&spec.table);
     let (l, ts) = (render.lsn(), render.ts());
     let indent = "        ";
-    let first_key = quote_ident(&spec.key[0]);
     match event {
         CaptureEvent::Insert => format!(
             "{indent}select {src}, {}, 'insert', {l}, null, {}, {l}, {ts}, null\n{indent}from {NEW_ROWS} n",
@@ -1366,19 +1397,30 @@ fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) ->
             render.image(spec, "o"),
         ),
         CaptureEvent::Update => {
-            let old = format!("o.{first_key} is not null");
-            let new = format!("n.{first_key} is not null");
+            let old = side_present(spec, "o");
+            let new = side_present(spec, "n");
+            // A key with no NOT NULL column reads presence from a marker
+            // each side selects (see [`side_present`]).
+            let side = |rows: &str, alias: &str| match present_marker(spec).as_str() {
+                "" => format!("{rows} {alias}"),
+                marker => format!(
+                    "(select {marker}{} from {rows} {alias}) {alias}",
+                    render.projection(spec, alias)
+                ),
+            };
             format!(
                 "{indent}select {src}, case when {new} then {} else {} end,\n{indent}    \
                  case when not ({new}) then 'delete' when not ({old}) then 'insert' \
                  else 'update' end,\n{indent}    \
                  {l}, case when {old} then {} end, case when {new} then {} end, {l}, {ts}, null\n\
-                 {indent}from {OLD_ROWS} o\n\
-                 {indent}full join {NEW_ROWS} n on {} = {} collate \"C\"{}",
+                 {indent}from {}\n\
+                 {indent}full join {} on {} = {} collate \"C\"{}",
                 key_expr(spec, "n"),
                 key_expr(spec, "o"),
                 render.image(spec, "o"),
                 render.image(spec, "n"),
+                side(OLD_ROWS, "o"),
+                side(NEW_ROWS, "n"),
                 key_expr(spec, "o"),
                 key_expr(spec, "n"),
                 update_changed_filter(spec, render),
@@ -1407,11 +1449,12 @@ fn transition_select(spec: &CaptureSpec, event: CaptureEvent, render: Render) ->
 /// imaged columns' binary images differ. [`Render::Dynamic`] has none.
 fn update_changed_filter(spec: &CaptureSpec, render: Render) -> String {
     let indent = "        ";
-    let first_key = quote_ident(&spec.key[0]);
     match render {
         Render::Static => format!(
-            "\n{indent}where not (o.{first_key} is not null) or not (n.{first_key} is not null)\n{indent}    \
+            "\n{indent}where not ({}) or not ({})\n{indent}    \
              or {}",
+            side_present(spec, "o"),
+            side_present(spec, "n"),
             images_differ(spec, "o", "n")
         ),
         Render::Dynamic => String::new(),
@@ -1467,6 +1510,135 @@ fn transition_images(
     format!("case when {set} then {images} end")
 }
 
+/// How many of a key's nullable columns [`live_probe`] splits into branches.
+/// Beyond these, a nullable column is matched by one `OR`, which the index
+/// can't narrow by that column.
+const NULL_SAFE_BRANCH_COLUMNS: usize = 3;
+
+/// The live re-read of the row whose key columns `of` renders and whose
+/// ring key is `key`: a lateral probe of the table `t` by the key's typed
+/// equality, kept to a version this transaction wrote whose key renders as
+/// `key` (see "The image is the live row" on [`ring_select`]).
+///
+/// A `NOT NULL` key column matches with a plain `=`. A nullable one must
+/// match `NULL` to `NULL`, which `=` never does and `IS NOT DISTINCT FROM`
+/// does without the index. So each nullable column (up to
+/// [`NULL_SAFE_BRANCH_COLUMNS`] of them) doubles the probe into a `UNION ALL`
+/// of branches, one matching it by `=` and one by `t.c is null and <of c> is
+/// null`. The second test reads only the outer row, so the planner makes it
+/// the branch's one-time filter: per row, one branch probes the index with
+/// the whole key, and an `=` against a `NULL` reads nothing.
+///
+/// `ctid` rides along when no key column is `NOT NULL`, as the test of
+/// whether the probe found a row ([`live_present`]): no user column can have
+/// that name.
+fn live_probe(spec: &CaptureSpec, of: &dyn Fn(&str) -> String, key: &str) -> String {
+    let indent = "        ";
+    let table = quoted_table(&spec.table).expect("CaptureSpec::new checked the table name");
+    let filter = format!(
+        "{} = {key} collate \"C\" and pg_catalog.age(t.xmin) <= 0",
+        key_expr(spec, "t")
+    );
+    let split: Vec<&String> = spec
+        .nullable
+        .iter()
+        .take(NULL_SAFE_BRANCH_COLUMNS)
+        .collect();
+    if split.is_empty() {
+        let on: Vec<String> = spec
+            .key
+            .iter()
+            .map(|c| format!("{} = {}", column_ref("t", c), of(c)))
+            .collect();
+        return format!(
+            "{indent}left join lateral (select * from {table} t where {}\n{indent}    \
+             and {filter} limit 1) t on true",
+            on.join(" and "),
+        );
+    }
+    let select = if live_present_column(spec).is_some() {
+        "*"
+    } else {
+        "t.ctid, t.*"
+    };
+    let branches: Vec<String> = (0..1usize << split.len())
+        .map(|branch| {
+            let on: Vec<String> = spec
+                .key
+                .iter()
+                .map(|c| {
+                    let (t, of) = (column_ref("t", c), of(c));
+                    match split.iter().position(|s| *s == c) {
+                        Some(bit) if branch & (1 << bit) != 0 => {
+                            format!("{t} is null and {of} is null")
+                        }
+                        Some(_) => format!("{t} = {of}"),
+                        None if spec.is_nullable(c) => {
+                            format!("({t} = {of} or ({t} is null and {of} is null))")
+                        }
+                        None => format!("{t} = {of}"),
+                    }
+                })
+                .collect();
+            format!(
+                "select {select} from {table} t where {}\n{indent}        and {filter}",
+                on.join(" and ")
+            )
+        })
+        .collect();
+    format!(
+        "{indent}left join lateral (select * from (\n{indent}    {}) t limit 1) t on true",
+        branches.join(&format!("\n{indent}    union all "))
+    )
+}
+
+/// The first `NOT NULL` key column, if the key has one: never `NULL` in a
+/// row that is there, so the test of whether a row is.
+fn live_present_column(spec: &CaptureSpec) -> Option<&String> {
+    spec.key.iter().find(|c| !spec.is_nullable(c))
+}
+
+/// Whether the live re-read `t` found a row. A key column that can hold
+/// `NULL` can't tell: the `NULL`-keyed row is a row. So the test reads a
+/// `NOT NULL` key column, or else the `ctid` [`live_probe`] selects.
+fn live_present(spec: &CaptureSpec) -> String {
+    match live_present_column(spec) {
+        Some(c) => format!("{} is not null", column_ref("t", c)),
+        None => "t.ctid is not null".to_string(),
+    }
+}
+
+/// Whether the update's side `alias` (`o` or `n`) has a row. As for
+/// [`live_present`], a `NOT NULL` key column, or else the marker
+/// [`present_marker`] selects on each side.
+fn side_present(spec: &CaptureSpec, alias: &str) -> String {
+    match live_present_column(spec) {
+        Some(c) => format!("{} is not null", column_ref(alias, c)),
+        None => format!("{} is not null", column_ref(alias, &present_column(spec))),
+    }
+}
+
+/// The select-list prefix that gives an update's side the marker
+/// [`side_present`] tests (`true as <name>, `), or nothing for a key with a
+/// `NOT NULL` column.
+fn present_marker(spec: &CaptureSpec) -> String {
+    match live_present_column(spec) {
+        Some(_) => String::new(),
+        None => format!("true as {}, ", quote_ident(&present_column(spec))),
+    }
+}
+
+/// The name of [`present_marker`]'s column: `trellis_present`, with
+/// underscores added until no imaged column has it. A side's subquery
+/// selects only the imaged columns beside it, so it can't collide.
+fn present_column(spec: &CaptureSpec) -> String {
+    let mut name = "trellis_present".to_string();
+    while spec.columns.contains(&name) {
+        name.push('_');
+    }
+    name
+}
+
 /// `alias`'s primary-key columns, typed, for the update's repeated-key
 /// check ([`function_body`]). Grouping by the typed values rather than the
 /// rendered key ([`key_expr`]) costs no output function per row, and never
@@ -1484,15 +1656,26 @@ fn typed_key(spec: &CaptureSpec, alias: &str) -> String {
         .join(", ")
 }
 
-/// `alias`'s ring key. A single-column key is the column's text verbatim; a
-/// composite key joins its parts, each with a separator escape, on
-/// U+001F in declared order ([`crate::defs::ddl::join_pk_key`]). Primary-key
-/// columns are never `NULL`, so the null encoding never applies.
+/// `alias`'s ring key, byte for byte the key the build and the 1-1 ledger
+/// render for the same row ([`crate::defs::ddl::pk_key_sql_expr`]). Each
+/// part is the column's text; a nullable key column's part
+/// ([`CaptureSpec::nullable_key`]) also takes the build's `NULL` encoding
+/// ([`null_key_escape_sql`]: `NULL` is `chr(1)`, a real `chr(1)` doubled), so
+/// a `NULL` part is apart from `''`. A `NOT NULL` column's part is its raw
+/// text. A single-column key is its one part; a composite key joins its
+/// parts, each with a separator escape, on U+001F in declared order
+/// ([`crate::defs::ddl::join_pk_key`]).
 fn key_expr(spec: &CaptureSpec, alias: &str) -> String {
     let parts: Vec<String> = spec
         .key
         .iter()
-        .map(|c| format!("format('%s', {alias}.{})", quote_ident(c)))
+        .map(|c| {
+            if spec.is_nullable(c) {
+                null_key_escape_sql(&value_text(alias, c))
+            } else {
+                format!("format('%s', {alias}.{})", quote_ident(c))
+            }
+        })
         .collect();
     match parts.as_slice() {
         [single] => single.clone(),
@@ -2138,6 +2321,150 @@ mod tests {
             composite.contains("where t.\"post\" = n.\"post\" and t.\"tag\" = n.\"tag\"\n"),
             "{composite}"
         );
+    }
+
+    fn nullable() -> CaptureSpec {
+        CaptureSpec::new("public.nk", vec!["code".to_string()], ["v".to_string()])
+            .unwrap()
+            .with_nullable_key(["code".to_string()])
+    }
+
+    /// A nullable key column's part takes the build's `NULL` encoding over
+    /// the column's output text, so a `NULL` key is `chr(1)`, apart from
+    /// `''`; a `NOT NULL` column's part stays its raw text (#2126).
+    #[test]
+    fn a_nullable_key_columns_part_takes_the_builds_null_encoding() {
+        let sql = ddl(&nullable(), CaptureEvent::Delete);
+        let part = null_key_escape_sql(
+            "case when num_nulls(o.\"code\") = 1 then null else format('%s', o.\"code\") end",
+        );
+        assert!(
+            sql.contains(&format!("select 'public.nk', {part}, 'delete'")),
+            "{sql}"
+        );
+        let mixed = composite().with_nullable_key(["tag".to_string()]);
+        let sql = ddl(&mixed, CaptureEvent::Delete);
+        let expected = format!(
+            "array_to_string(array[{}, {}], chr(31))",
+            composite_key_escape_sql("format('%s', o.\"post\")"),
+            composite_key_escape_sql(&null_key_escape_sql(
+                "case when num_nulls(o.\"tag\") = 1 then null else format('%s', o.\"tag\") end"
+            )),
+        );
+        assert!(sql.contains(&expected), "{sql}");
+        assert_eq!(
+            mixed.nullable_key(),
+            ["tag".to_string()],
+            "only key columns, in key order"
+        );
+    }
+
+    /// A row's presence is never read from a nullable key column: the
+    /// `NULL`-keyed row is a row. A key with a `NOT NULL` column reads that
+    /// one; one without reads a marker each update side selects and the live
+    /// re-read's `ctid` (#2126).
+    #[test]
+    fn presence_is_never_read_from_a_nullable_key_column() {
+        for event in CaptureEvent::CAPTURED {
+            let sql = ddl(&nullable(), event);
+            assert!(!sql.contains("\"code\" is not null"), "{event:?}:\n{sql}");
+        }
+        let update = ddl(&nullable(), CaptureEvent::Update);
+        assert!(
+            update.contains(
+                "from (select true as \"trellis_present\", o.\"code\", o.\"v\" \
+                 from trellis_old o) o\n"
+            ),
+            "{update}"
+        );
+        assert!(
+            update.contains(
+                "case when not (t.ctid is not null) then 'delete' \
+                 when not (o.\"trellis_present\" is not null) then 'insert' else 'update' end"
+            ),
+            "{update}"
+        );
+        assert!(
+            update.contains(
+                "where not (o.\"trellis_present\" is not null) \
+                 or not (n.\"trellis_present\" is not null)"
+            ),
+            "{update}"
+        );
+        // A NOT NULL key column beside a nullable one is the test.
+        let mixed = ddl(
+            &composite().with_nullable_key(["post".to_string()]),
+            CaptureEvent::Update,
+        );
+        assert!(
+            mixed.contains("when not (o.\"tag\" is not null) then 'insert'"),
+            "{mixed}"
+        );
+        assert!(!mixed.contains("trellis_present"), "{mixed}");
+    }
+
+    /// The live re-read matches a nullable key column `NULL` to `NULL` and
+    /// keeps an index probe on the whole key: one `UNION ALL` branch per
+    /// `NULL` pattern, the outer row's `NULL` test a one-time filter (#2126).
+    #[test]
+    fn the_live_reread_matches_a_null_key_part_in_its_own_branch() {
+        let sql = ddl(&nullable(), CaptureEvent::Insert);
+        assert!(
+            sql.contains(
+                "left join lateral (select * from (\n            \
+                 select t.ctid, t.* from \"public\".\"nk\" t where t.\"code\" = n.\"code\"\n"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "union all select t.ctid, t.* from \"public\".\"nk\" t \
+                 where t.\"code\" is null and n.\"code\" is null\n"
+            ),
+            "{sql}"
+        );
+        assert!(!sql.contains(" is not distinct from "), "{sql}");
+        // An update's side with no new row reads the old row's key, NULL or
+        // not.
+        let update = ddl(&nullable(), CaptureEvent::Update);
+        assert!(
+            update.contains(
+                "t.\"code\" = case when n.\"trellis_present\" is not null \
+                 then n.\"code\" else o.\"code\" end"
+            ),
+            "{update}"
+        );
+        // Past three nullable columns, the rest match by one `OR`.
+        let wide = CaptureSpec::new(
+            "public.w",
+            ["a", "b", "c", "d"].map(String::from).to_vec(),
+            [],
+        )
+        .unwrap()
+        .with_nullable_key(["a", "b", "c", "d"].map(String::from));
+        let sql = ddl(&wide, CaptureEvent::Insert);
+        // 2^3 branches, so 7 `union all`s, in each static insert and the
+        // schema-changed branch's template.
+        assert_eq!(
+            sql.matches("union all select").count(),
+            (RING_SIZE as usize + 1) * 7
+        );
+        assert!(
+            sql.contains("(t.\"d\" = n.\"d\" or (t.\"d\" is null and n.\"d\" is null))"),
+            "{sql}"
+        );
+    }
+
+    /// The comment records a nullable key's columns, so an install that
+    /// encoded them otherwise reads back as another spec; a `NOT NULL`
+    /// key's comment is unchanged.
+    #[test]
+    fn the_comment_records_a_nullable_keys_columns() {
+        assert!(
+            comment_text("trellis", &nullable(), CaptureEvent::Insert)
+                .contains("\"key\":[\"code\"],\"nullable\":[\"code\"],\"columns\""),
+        );
+        assert!(!comment_text("trellis", &spec(), CaptureEvent::Insert).contains("nullable"));
     }
 
     /// An update row whose imaged columns are all unchanged,

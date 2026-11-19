@@ -33,6 +33,7 @@ Postgres, hidden tables included, detects and never repairs
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
 | [A read column given a nondeterministic collation](#a-read-column-given-a-nondeterministic-collation) | `self_check` | [#1643](https://github.com/salesforce-misc/trellis/issues/1643) (research) |
+| [A `KEY` column's `NOT NULL` set or dropped with changes in flight](#a-key-columns-not-null-set-or-dropped-with-changes-in-flight) | `self_check` | [#2147](https://github.com/salesforce-misc/trellis/issues/2147) |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
@@ -83,6 +84,9 @@ while every rule holds.
 * **Change a read column to a nondeterministic collation only while the
   transforms that read it are paused**
   ([below](#a-read-column-given-a-nondeterministic-collation)).
+* **Set or drop `NOT NULL` on a `KEY (…)` column only while the transforms
+  that read the table are paused**
+  ([below](#a-key-columns-not-null-set-or-dropped-with-changes-in-flight)).
 * **Don't write a 1-1 `JOIN`'s joined table (`b`, or the table at any
   position of a star) under `session_replication_role = replica`** when its
   key on its `ON` columns is a deferrable constraint
@@ -252,6 +256,26 @@ read the column before changing its collation.
 
 **Ends with:** [#1643](https://github.com/salesforce-misc/trellis/issues/1643),
 research on detecting a collation change the way a retype is detected.
+
+### A `KEY` column's `NOT NULL` set or dropped with changes in flight
+
+**When:** a table read through `KEY (…)` on a `UNIQUE NULLS NOT DISTINCT`
+index has `ALTER COLUMN … SET NOT NULL` or `DROP NOT NULL` run on a key
+column while changes to rows whose key holds `NULL` or `chr(1)` are captured
+but not yet applied.
+
+**What goes wrong:** a nullable key column's part is encoded (`NULL` is
+`chr(1)`, a real `chr(1)` doubled) and a `NOT NULL` one's is not. Capture
+encodes by the column's nullability when it stages a change, and the drain
+decodes by its nullability when it applies it, so a change staged before the
+`ALTER` and applied after names another key. A 1-1 target gains a row under
+that key and keeps the old values under the right one.
+
+**Detected by:** `self_check`.
+
+**Repair:** `request_backfill` the table.
+
+**Ends with:** [#2147](https://github.com/salesforce-misc/trellis/issues/2147).
 
 ## Writes past a unique key
 

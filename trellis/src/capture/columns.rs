@@ -223,8 +223,8 @@ pub(crate) async fn live_columns(
 
 /// The [`CaptureSpec`] for `table` (an unquoted `schema.table` identity):
 /// its key (the `KEY (...)` its readers declare, [`declared_key`], else its
-/// primary key) plus [`read_columns`], checked against the table's live
-/// columns.
+/// primary key) and which of its columns can hold `NULL`, plus
+/// [`read_columns`], checked against the table's live columns.
 ///
 /// Fails with [`CaptureError::NoPrimaryKey`] for a table without a primary
 /// key, and with [`CaptureError::MissingColumn`] when a definition that
@@ -308,9 +308,23 @@ pub async fn capture_spec(
         // left.
         read.columns.retain(|c| !missing.contains(c));
     }
+    // A key column that can hold `NULL` (a `KEY` on a `NULLS NOT DISTINCT`
+    // index, ADR-0026) takes the build's `NULL` encoding in the ring key.
+    let nullable: Vec<String> = client
+        .query_typed(
+            "select a.attname::text from pg_catalog.pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) and a.attnum > 0 \
+               and not a.attisdropped and not a.attnotnull and a.attname = any ($2::text[])",
+            &[(&regclass, Type::TEXT), (&key, Type::TEXT_ARRAY)],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
     Ok(CaptureSpec::new(table, key, read.columns)?
         .with_partitioned(partitioned)
-        .with_declared_key(declared.is_some()))
+        .with_declared_key(declared.is_some())
+        .with_nullable_key(nullable))
 }
 
 /// The `KEY (...)` `catalog`'s readers declare for `table` (ADR-0026), in
