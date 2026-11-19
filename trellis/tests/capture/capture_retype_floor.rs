@@ -180,7 +180,7 @@ async fn an_invalid_retype_pauses_with_the_refusal_until_fixed() {
             &format!("column \"c\" of public.{}", &target[2..]),
             &format!("changed type from {from} to bigint"),
             refusal,
-            "ALTER TRANSFORM it to a definition that validates, or change the column back",
+            "Change the column back, then RESUME it, or DROP TRANSFORM it and define it again",
         ] {
             assert!(failure.contains(part), "{target}: {part:?} in {failure}");
         }

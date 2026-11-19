@@ -1286,9 +1286,8 @@ pub(crate) async fn pause_readers_of_retyped(
                         changed.join(", ")
                     };
                     reasons.push(format!(
-                        "{changed}, and define would now refuse the definition: {refusal}. ALTER \
-                         TRANSFORM it to a definition that validates, or change the column back, \
-                         then resume it"
+                        "{changed}, and define would now refuse the definition: {refusal}. {}",
+                        RETYPE_REMEDY
                     ));
                     for (column, _, _) in &moved {
                         if !columns.contains(column) {
@@ -2240,8 +2239,21 @@ pub(crate) fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64
         .collect()
 }
 
+/// The remedy a retype pause names. `ALTER TRANSFORM` is not among them: it
+/// refuses a paused definition (T0154) and `RESUME` refuses while define would
+/// refuse the definition (T0078), so neither works in any key space.
+pub(crate) const RETYPE_REMEDY: &str =
+    "Change the column back, then RESUME it, or DROP TRANSFORM it and define it again";
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retype_remedy_names_only_what_works() {
+        assert!(!super::RETYPE_REMEDY.contains("ALTER"));
+        assert!(super::RETYPE_REMEDY.contains("Change the column back, then RESUME"));
+        assert!(super::RETYPE_REMEDY.contains("DROP TRANSFORM"));
+    }
+
     use super::*;
     use crate::defs::copies::{CopyKind, CopyState, CopyType, TypedCopy};
     use crate::defs::key_types::ColumnType;
