@@ -1748,6 +1748,7 @@ impl Leader {
                     failed,
                     staging::reclaim_stale_workers(
                         c,
+                        &self.config.schema,
                         reclaim_ttl.max(staging::DEFAULT_RECLAIM_TTL),
                     )
                     .await

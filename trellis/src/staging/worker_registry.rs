@@ -203,11 +203,12 @@ pub(crate) const LIVE_DRAIN_WORKER_SQL: &str = "\
       and (j->>'version' is null \
            or ((j->>'drain')::boolean and not (j->>'standby')::boolean))";
 
-/// A row whose `staging_pid` session still holds an advisory lock is kept
-/// however old its heartbeat: after a database outage the process that
-/// retook the staging-worker lock would otherwise lose its row to this sweep
-/// before its next heartbeat, and the handover check would read its own lock
-/// as a release before 0.2.0's.
+/// A row whose `staging_pid` session holds the instance's staging-worker lock
+/// (`$2`, matched in this database as `crate::handover::observe` matches it)
+/// is kept however old its heartbeat: after a database outage the process
+/// that retook the lock would otherwise lose its row to this sweep before its
+/// next heartbeat, and the handover check would read its own lock as a
+/// release before 0.2.0's.
 ///
 /// The `WITH ... DELETE` sweep behind [`reclaim_stale_workers`], mirroring
 /// `super::liveness`'s own `RECLAIM_STALE_SQL` shape — including the `for
@@ -220,6 +221,9 @@ const RECLAIM_STALE_WORKERS_SQL: &str = "\
           and not exists ( \
               select 1 from pg_locks l \
               where l.locktype = 'advisory' and l.granted and l.objsubid = 1 \
+                and l.database = (select oid from pg_database \
+                                  where datname = current_database()) \
+                and ((l.classid::int8 << 32) | l.objid::int8) = $2 \
                 and l.pid = (to_jsonb(w)->>'staging_pid')::int4) \
         for update of w skip locked \
     ) \
@@ -239,11 +243,16 @@ const RECLAIM_STALE_WORKERS_SQL: &str = "\
 /// wrong in precisely the fleet this feature exists to catch.
 pub async fn reclaim_stale_workers(
     client: &impl GenericClient,
+    schema: &str,
     ttl: Duration,
 ) -> Result<u64, StagingError> {
     let ttl_secs = ttl.as_secs_f64();
+    let lock_key = super::session::producer_singleton_lock_key(schema);
     let n = client
-        .execute_typed(RECLAIM_STALE_WORKERS_SQL, &[(&ttl_secs, Type::FLOAT8)])
+        .execute_typed(
+            RECLAIM_STALE_WORKERS_SQL,
+            &[(&ttl_secs, Type::FLOAT8), (&lock_key, Type::INT8)],
+        )
         .await?;
     Ok(n)
 }

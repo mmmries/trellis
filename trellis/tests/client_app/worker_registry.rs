@@ -340,9 +340,10 @@ async fn reclaim_stale_workers_deletes_only_the_stale_row() {
         .await
         .expect("backdate dead-worker");
 
-    let reclaimed = worker_registry::reclaim_stale_workers(&client, ttl)
-        .await
-        .expect("reclaim_stale_workers");
+    let reclaimed =
+        worker_registry::reclaim_stale_workers(&client, trellis::config::DEFAULT_SCHEMA, ttl)
+            .await
+            .expect("reclaim_stale_workers");
     assert_eq!(reclaimed, 1, "exactly the stale row must be reclaimed");
 
     let remaining: Vec<String> = client
@@ -363,48 +364,55 @@ async fn reclaim_stale_workers_deletes_only_the_stale_row() {
 /// TTL, and the first maintenance pass swept the row of the process that had
 /// just retaken the staging-worker lock. The handover check then read its own
 /// lock as a staging worker of a release before 0.2.0. A stale row whose
-/// `staging_pid` session still holds the lock must survive the sweep.
+/// `staging_pid` session holds the staging-worker lock survives the sweep; one
+/// whose session holds only some other advisory lock does not.
 #[tokio::test]
 async fn reclaim_stale_workers_keeps_the_row_of_the_staging_lock_holder() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = connect_raw(db.dsn()).await;
     let holder = connect_raw(db.dsn()).await;
+    let bystander = connect_raw(db.dsn()).await;
+    let schema = trellis::config::DEFAULT_SCHEMA;
 
-    worker_registry::register_worker(
-        &client,
-        &worker_registry::Registration::drain_worker("leader"),
-    )
-    .await
-    .expect("register leader");
-    worker_registry::register_worker(
-        &client,
-        &worker_registry::Registration::drain_worker("gone"),
-    )
-    .await
-    .expect("register gone");
+    for worker_id in ["leader", "other-lock", "gone"] {
+        worker_registry::register_worker(
+            &client,
+            &worker_registry::Registration::drain_worker(worker_id),
+        )
+        .await
+        .expect("register");
+    }
     worker_registry::claim_staging(&holder, "leader")
         .await
         .expect("claim_staging");
     holder
+        .execute(
+            "select pg_advisory_lock($1)",
+            &[&trellis::staging::producer_singleton_lock_key(schema)],
+        )
+        .await
+        .expect("take the staging-worker lock");
+    worker_registry::claim_staging(&bystander, "other-lock")
+        .await
+        .expect("claim_staging");
+    bystander
         .execute("select pg_advisory_lock(424242)", &[])
         .await
-        .expect("hold an advisory lock");
+        .expect("hold an unrelated advisory lock");
     client
         .execute(
             "update worker_registry set last_seen = now() - interval '2 hours'",
             &[],
         )
         .await
-        .expect("backdate both rows");
+        .expect("backdate every row");
 
-    let reclaimed = worker_registry::reclaim_stale_workers(&client, Duration::from_secs(30))
-        .await
-        .expect("reclaim_stale_workers");
-    assert_eq!(
-        reclaimed, 1,
-        "only the row with no lock-holding session goes"
-    );
+    let reclaimed =
+        worker_registry::reclaim_stale_workers(&client, schema, Duration::from_secs(30))
+            .await
+            .expect("reclaim_stale_workers");
+    assert_eq!(reclaimed, 2, "only the staging-lock holder's row stays");
     let remaining: Vec<String> = client
         .query("select worker_id from worker_registry", &[])
         .await
