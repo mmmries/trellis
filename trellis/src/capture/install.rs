@@ -326,10 +326,12 @@ pub fn plan(installed: &Installed, desired: &CaptureSpec) -> CaptureAction {
 }
 
 /// Whether `desired` images nothing `installed` doesn't: the same table and
-/// key, and a subset of its image columns.
+/// key, keyed the same way (its nullable columns), and a subset of its image
+/// columns.
 fn narrows(installed: &CaptureSpec, desired: &CaptureSpec) -> bool {
     installed.table() == desired.table()
         && installed.key() == desired.key()
+        && installed.nullable_key() == desired.nullable_key()
         && desired
             .columns()
             .iter()
@@ -368,6 +370,9 @@ pub async fn installed(
                     case when c.j is not null then array( \
                         select pg_catalog.jsonb_array_elements_text(c.j -> 'columns')) end, \
                     coalesce((c.j ->> 'declared')::boolean, false), \
+                    case when c.j is not null then array( \
+                        select pg_catalog.jsonb_array_elements_text( \
+                            coalesce(c.j -> 'nullable', '[]'))) end, \
                     t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid, \
                     case when e.ord = 1 and exists ( \
                         select 1 from pg_catalog.pg_class r \
@@ -400,7 +405,7 @@ pub async fn installed(
             ],
         )
         .await?;
-    let partitioned: bool = rows.first().is_some_and(|row| row.get(11));
+    let partitioned: bool = rows.first().is_some_and(|row| row.get(12));
     let mut present = false;
     let mut current = true;
     let mut faults = Vec::new();
@@ -412,7 +417,7 @@ pub async fn installed(
         .zip(&rows)
     {
         let has_function: bool = row.get(0);
-        let has_trigger: bool = row.get(7);
+        let has_trigger: bool = row.get(8);
         present |= has_function || has_trigger;
         let what = event.as_str();
         if !has_function {
@@ -425,6 +430,9 @@ pub async fn installed(
                     |spec| {
                         spec.with_partitioned(partitioned)
                             .with_declared_key(row.get(6))
+                            .with_nullable_key(
+                                row.get::<_, Option<Vec<String>>>(7).unwrap_or_default(),
+                            )
                     },
                 );
             match recorded {
@@ -443,14 +451,14 @@ pub async fn installed(
                 "the {what} trigger {trigger} on {table} is missing"
             ));
         } else {
-            let enabled: String = row.get(8);
+            let enabled: String = row.get(9);
             if enabled != "A" {
                 faults.push(format!(
                     "the {what} trigger {trigger} on {table} is not ENABLE ALWAYS \
                      (tgenabled = {enabled})"
                 ));
             }
-            if row.get::<_, Option<bool>>(9) != Some(true) {
+            if row.get::<_, Option<bool>>(10) != Some(true) {
                 faults.push(format!(
                     "the {what} trigger {trigger} on {table} doesn't call {schema}.{function}"
                 ));
@@ -464,7 +472,7 @@ pub async fn installed(
     // show the root whole and a node bare.
     let missing = rows
         .first()
-        .and_then(|row| row.get::<_, Option<Vec<String>>>(10))
+        .and_then(|row| row.get::<_, Option<Vec<String>>>(11))
         .unwrap_or_default();
     if !missing.is_empty() {
         faults.push(format!(

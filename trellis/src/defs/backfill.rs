@@ -516,7 +516,7 @@ pub(crate) async fn narrow_one_to_one_chunk(
                 .await?;
             let mid: Vec<String> = (0..pk.len()).map(|i| row.get(i)).collect();
             Ok(ChunkNarrowing::Split {
-                mid: ddl::join_pk_key(mid),
+                mid: encode_key(&pk, &mid),
             })
         }
     }
@@ -548,8 +548,22 @@ pub(crate) async fn next_pk_ranges(
     Ok(walk_pk_ranges(client, &source, pk, start, rows.max(1), max)
         .await?
         .into_iter()
-        .map(|(lo, hi)| (lo.map(ddl::join_pk_key), ddl::join_pk_key(hi)))
+        .map(|(lo, hi)| (lo.map(|lo| encode_key(pk, &lo)), encode_key(pk, &hi)))
         .collect())
+}
+
+/// A row's key column values (none `NULL`) as the encoded key the ring and
+/// the ledger hold ([`ddl::pk_key_sql_expr`]): a nullable column's value
+/// takes the `NULL` encoding's escape, so [`ddl::split_pk_key`] reads back
+/// exactly `values`.
+fn encode_key(pk: &[PrimaryKeyColumn], values: &[String]) -> String {
+    ddl::join_pk_key(values.iter().zip(pk).map(|(value, column)| {
+        if column.nullable {
+            ddl::encode_key_part(Some(value))
+        } else {
+            std::borrow::Cow::Borrowed(value.as_str())
+        }
+    }))
 }
 
 /// The walk from `start`, `rows` rows per range, at most

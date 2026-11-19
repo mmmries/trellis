@@ -24,6 +24,10 @@ segment with one `INSERT … SELECT`:
 - **Keys.** Every ring row is keyed by the table's key, in declared
   order, joined with `\x1f` for a composite key: its primary key, or the
   `KEY (…)` its definitions name ([ADR-0026](../decisions/0026-source-keys.md)).
+  A nullable `KEY` column (on a `NULLS NOT DISTINCT` index) is encoded as the
+  build encodes it: `NULL` is `\x01` and a real `\x01` is doubled, so the
+  `NULL`-keyed row is a row of its own, never the `''` row. Whether a row is
+  there is never read from such a column.
   A table with neither, a partitioned table without a primary key, or a table in a partition or inheritance
   hierarchy is refused (see
   [supported sources and targets](../transforms.md#supported-sources-and-targets)).
@@ -283,6 +287,10 @@ probe is a `LATERAL … LIMIT 1` per row, and the function runs with
 that was empty then, and a cached sequential scan would read the whole table
 for every captured row once it grows (`tests/capture/capture_reread.rs`, at every
 isolation level).
+A nullable key column can't match `NULL` with `=`, and `IS NOT DISTINCT FROM`
+can't use the index, so the probe is a `UNION ALL` of one branch per `NULL`
+pattern of up to three such columns, each gated by a one-time filter on the
+row's own `NULL`s: one branch probes the index with the whole key.
 
 Under `SERIALIZABLE` the re-read's index probe takes a predicate (SIREAD)
 lock on the key's btree leaf page, and concurrent serializable writers on
