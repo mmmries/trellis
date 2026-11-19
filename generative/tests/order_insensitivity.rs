@@ -138,7 +138,7 @@ fn trivial_program_sometimes_has_ops_with_genuinely_distinct_target_keys() {
     use proptest::strategy::{Strategy, ValueTree};
     use proptest::test_runner::TestRunner;
 
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let saw_genuine_reorder = (0..500).any(|_| {
         let program = strategy

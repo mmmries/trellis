@@ -247,7 +247,7 @@ fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
 /// is deliberately kept byte-for-byte the same for every flag-gated column.
 #[test]
 fn awkward_values_off_never_draws_null() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program_with(false);
     for _ in 0..200 {
         let program = strategy
@@ -265,7 +265,7 @@ fn awkward_values_off_never_draws_null() {
 /// appear — the other half of the same coverage meta-test (design doc §3).
 #[test]
 fn awkward_values_on_sometimes_draws_null() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program_with(true);
     let saw_null = (0..500).any(|_| {
         let program = strategy
@@ -287,7 +287,7 @@ fn awkward_values_on_sometimes_draws_null() {
 #[test]
 fn awkward_values_draw_numeric_nan_on_insert_and_update_only_when_on() {
     let count = |awkward_values: bool| {
-        let mut runner = TestRunner::default();
+        let mut runner = TestRunner::deterministic();
         let strategy = trivial_program_with(awkward_values);
         let (mut inserted, mut updated, mut values, mut infinite) =
             (0usize, 0usize, 0usize, 0usize);
@@ -338,7 +338,7 @@ fn awkward_values_draw_numeric_nan_on_insert_and_update_only_when_on() {
 /// `integer` cases are drawn.
 #[test]
 fn join_cases_draw_nan_only_into_numeric_arguments() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = generative::generate::join::join_case_strategy();
     let (mut numeric_cases, mut integer_cases, mut nans) = (0usize, 0usize, 0usize);
     for _ in 0..200 {
@@ -409,7 +409,7 @@ fn join_cases_draw_nan_only_into_numeric_arguments() {
 #[test]
 fn grain_value_sometimes_draws_null_regardless_of_awkward_values() {
     for awkward_values in [false, true] {
-        let mut runner = TestRunner::default();
+        let mut runner = TestRunner::deterministic();
         let strategy = trivial_program_with(awkward_values);
         let saw_null_grain = (0..500).any(|_| {
             let program = strategy
@@ -441,7 +441,7 @@ fn grain_value_sometimes_draws_null_regardless_of_awkward_values() {
 /// — sampled the same way as the NULL check above.
 #[test]
 fn trivial_program_sometimes_draws_a_duplicate_pk_insert() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let saw_duplicate = (0..500).any(|_| {
         let program = strategy
@@ -506,7 +506,7 @@ fn has_duplicate_pk_insert(program: &generative::model::Program) -> bool {
 /// just its types.
 #[test]
 fn pk_column_is_never_null_or_missing_across_many_generated_programs() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     for _ in 0..200 {
         let program = strategy
@@ -574,7 +574,7 @@ fn duplicate_insert_is_a_distinct_mutate_from_update_and_delete() {
 /// values.
 #[test]
 fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -670,7 +670,7 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
 /// that silently drops out").
 #[test]
 fn trivial_program_sometimes_draws_more_than_one_table() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let saw_multiple_tables = (0..500).any(|_| {
         let program = strategy
@@ -691,7 +691,7 @@ fn trivial_program_sometimes_draws_more_than_one_table() {
 /// asserts the count, not the fan-out shape).
 #[test]
 fn trivial_program_sometimes_draws_more_than_one_definition() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let saw_multiple_defs = (0..500).any(|_| {
         let program = strategy
@@ -715,7 +715,7 @@ fn trivial_program_sometimes_draws_more_than_one_definition() {
 #[test]
 fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_defs_on_different_sources()
  {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut saw_shared_source = false;
     let mut saw_different_sources = false;
@@ -756,7 +756,7 @@ fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_def
 /// (many samples, not every sample: which expression a def draws is random).
 #[test]
 fn trivial_program_sometimes_draws_greater_than() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -779,7 +779,7 @@ fn trivial_program_sometimes_draws_greater_than() {
 /// admits).
 #[test]
 fn trivial_program_draws_every_scalar_function_at_least_once() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
     // Many registry entries share the draw (every comparison family, `CASE`,
@@ -813,7 +813,7 @@ fn trivial_program_draws_every_scalar_function_at_least_once() {
 /// `expr_shapes`.
 #[test]
 fn trivial_program_sometimes_draws_a_nested_expression() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -847,7 +847,7 @@ const ADMITTED_AGGREGATE_CALLS: &[(&str, &str)] = &[
 /// expression, whose type would be unconstrained `numeric`.
 #[test]
 fn trivial_program_draws_exactly_the_admitted_aggregate_set() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..1000 {
@@ -907,7 +907,7 @@ fn trivial_program_draws_exactly_the_admitted_aggregate_set() {
 /// `trivial_program_sometimes_draws_more_than_one_table` above.
 #[test]
 fn trivial_program_sometimes_draws_an_aggregate_key_space() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let saw_aggregate = (0..500).any(|_| {
         let program = strategy
@@ -940,7 +940,7 @@ fn trivial_program_sometimes_draws_an_aggregate_key_space() {
 /// in this file already checks for its own shape.
 #[test]
 fn trivial_program_sometimes_draws_a_null_first_row_for_an_aggregate_sum_avg_argument() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let saw_it = (0..2000).any(|_| {
         let program = strategy
@@ -1004,7 +1004,7 @@ fn program_has_null_first_row_sum_avg_arg(program: &Program) -> bool {
 /// floor test here samples `trivial_program()`.
 #[test]
 fn noise_plan_for_sometimes_draws_at_least_one_event() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = noise_plan_for(4);
     let saw_nonempty = (0..500).any(|_| {
         let plan = strategy
@@ -1028,7 +1028,7 @@ fn noise_plan_for_sometimes_draws_at_least_one_event() {
 /// quietly regress to DML-only without any test noticing.
 #[test]
 fn noise_plan_for_draws_every_action_variant_across_enough_samples() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = noise_plan_for(4);
     let mut saw_insert = false;
     let mut saw_update = false;
@@ -1084,7 +1084,7 @@ fn noise_plan_for_draws_every_action_variant_across_enough_samples() {
 /// need real coverage, not just the middle.
 #[test]
 fn noise_plan_for_sometimes_fires_at_both_ends_of_the_op_stream() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let op_count = 4;
     let strategy = noise_plan_for(op_count);
     let mut saw_start = false;
@@ -1122,7 +1122,7 @@ fn noise_plan_for_sometimes_fires_at_both_ends_of_the_op_stream() {
 /// all).
 #[test]
 fn checkpoint_plan_for_sometimes_draws_at_least_one_checkpoint() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = checkpoint_plan_for(4);
     let mut saw_checkpoint = false;
     for _ in 0..500 {
@@ -1163,7 +1163,7 @@ fn checkpoint_plan_for_sometimes_draws_at_least_one_checkpoint() {
 /// a second time.
 #[test]
 fn mid_stream_def_installs_actually_get_drawn() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = program_with_mid_stream_def_install(true);
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -1185,7 +1185,7 @@ fn mid_stream_def_installs_actually_get_drawn() {
 /// enough samples.
 #[test]
 fn client_restarts_actually_get_drawn() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = program_with_client_restart(true);
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -1206,7 +1206,7 @@ fn client_restarts_actually_get_drawn() {
 /// `client_restarts_actually_get_drawn` above, over `program_with_scale_out`.
 #[test]
 fn client_scale_outs_actually_get_drawn() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = program_with_scale_out(true);
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -1229,7 +1229,7 @@ fn client_scale_outs_actually_get_drawn() {
 /// is) must sometimes draw a `Truncate` op across enough samples.
 #[test]
 fn trivial_program_sometimes_draws_a_truncate() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -1254,7 +1254,7 @@ fn trivial_program_sometimes_draws_a_truncate() {
 /// if the dimension is real.
 #[test]
 fn bulk_insert_row_count_gets_meaningfully_large() {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     let strategy = bulk_insert_program();
     let mut coverage = generative::run::Coverage::new();
     for _ in 0..500 {
@@ -1675,9 +1675,9 @@ async fn drawn_aggregate_definitions_land_on_the_group_basis() {
     assert!(group_basis_defs >= PROGRAMS);
 }
 
-/// Samples `count` values of `strategy` with the default runner.
+/// Samples `count` values of `strategy` with a deterministic runner.
 fn sample<T: std::fmt::Debug>(strategy: impl Strategy<Value = T>, count: usize) -> Vec<T> {
-    let mut runner = TestRunner::default();
+    let mut runner = TestRunner::deterministic();
     (0..count)
         .map(|_| {
             strategy
