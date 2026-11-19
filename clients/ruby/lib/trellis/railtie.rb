@@ -34,16 +34,15 @@ module Trellis
   # the definitions in `structure.sql` (Trellis::SchemaDump). The database
   # they dump into is config.trellis.dump_database, "primary" by default.
   #
-  # `config.trellis.off_in` names the environments Trellis is off in. The
-  # default is `%w[test]`: a test suite's transactions never commit, so it
-  # can't see a target change. `off_in = []` turns Trellis on in tests. It
-  # is read from any environment, so a `db:prepare` or `db:test:prepare` run
-  # from development leaves Trellis out of the test database too. There,
-  # nothing connects at boot, Railtie.connect and `trellis:migrate` do
-  # nothing, the schema load and dump hooks leave the target tables as plain
-  # ones, and the migration helpers refuse (or skip, migrating that database
-  # from an environment Trellis is on in).
-  # Trellis.enabled? is the predicate; "Testing" in the README has the rest.
+  # `config.trellis.off_in` names the environments Trellis's runtime is off
+  # in. The default is `%w[test]`: a test suite's transactions never commit,
+  # so it can't see a target change. `off_in = []` turns Trellis on in tests.
+  # There, nothing connects at boot and Railtie.connect does nothing. The
+  # migration helpers, `trellis:migrate` and the schema load and dump hooks
+  # run as they do where it's on, against the database Rails is migrating,
+  # loading or dumping (with_handle), so that database gets every
+  # definition, unbuilt. Trellis.enabled? is the predicate; "Testing" in the
+  # README has the rest.
   #
   # When either is set, the app's handles connect in an after_initialize hook,
   # except in these cases:
@@ -121,6 +120,9 @@ module Trellis
     end
 
     config.after_initialize { Trellis::Railtie.instance.send(:boot) }
+
+    # The thread-local Railtie.working_on records its db_config in.
+    WORKING_ON = :trellis_migrating_database
 
     # The instances Railtie.connect opened for config.trellis.instances,
     # by name.
@@ -200,13 +202,15 @@ module Trellis
       # returned, the shutdown's error is raised. Raises ValidationError if
       # the instance isn't connected and its options aren't configured.
       #
-      # In a migration of another environment's database (`db:prepare` in
-      # development migrates the test databases too), it never uses this
-      # process's handle: it connects one of its own to that environment's
-      # counterpart of the database the instance's url points at
+      # In a migration, schema load or dump of another environment's
+      # database (`db:prepare` in development migrates the test databases
+      # too), or of a database of an environment Trellis is off in, it never
+      # uses this process's handle: it connects one of its own to that
+      # environment's counterpart of the database the instance's url points
+      # at, or to that database itself when the url points at none
       # (SchemaDump.migration_url), with the instance's other options.
       def with_handle(name = nil)
-        other = other_environment_migration
+        other = elsewhere_database
         instance = name ? @instances[name.to_sym] : (Trellis.default_instance if Trellis.connected?)
         if instance&.connected? && !other
           instance.migrate
@@ -238,11 +242,12 @@ module Trellis
 
       # Runs Trellis.migrate on the default instance (when
       # config.trellis.connect is set) and on each of
-      # config.trellis.instances, each as with_handle does. Raises
-      # ValidationError if neither is set.
+      # config.trellis.instances, each as with_handle does, whether or not
+      # Trellis is off in this environment. Where it's off, and no Rails task
+      # is working on a database, that is this environment's
+      # config.trellis.dump_database. Raises ValidationError if neither is
+      # set.
       def migrate_all
-        return skipped("trellis:migrate migrates nothing") unless enabled?
-
         default = connect_options
         named = instance_options
         if default.nil? && named.empty?
@@ -250,8 +255,12 @@ module Trellis
                 "config.trellis.connect is not set: give it Trellis.connect's options"
         end
 
-        with_handle { nil } if default
-        named.each_key { |name| with_handle(name) { nil } }
+        run = lambda do
+          with_handle { nil } if default
+          named.each_key { |name| with_handle(name) { nil } }
+        end
+        database = off_environment_database
+        database ? working_on(database, &run) : run.call
         nil
       end
 
@@ -276,9 +285,9 @@ module Trellis
         off_in.include?(environment.to_s)
       end
 
-      # Whether Trellis is on in `environment` (this process's, by default):
-      # false when config.trellis.off_in names it. Trellis.enabled? is the
-      # shortcut for code that doesn't need the Railtie.
+      # Whether Trellis's runtime is on in `environment` (this process's, by
+      # default): false when config.trellis.off_in names it. Trellis.enabled?
+      # is the shortcut for code that doesn't need the Railtie.
       def enabled?(environment = ::Rails.env)
         !off_in?(environment)
       end
@@ -316,14 +325,35 @@ module Trellis
         end
       end
 
+      # Runs the block with db_config recorded as the database Rails is
+      # working on (a migration, schema load or dump of it), for with_handle,
+      # and returns the block's value.
+      def working_on(db_config)
+        previous = Thread.current[WORKING_ON]
+        Thread.current[WORKING_ON] = db_config
+        yield
+      ensure
+        Thread.current[WORKING_ON] = previous
+      end
+
       private
 
-      # The db_config of the database a Trellis::Migration is running on
-      # (Trellis::Migration#exec_migration records it for the length of the
-      # migration) when it belongs to another environment than the one
-      # running the task, or nil.
-      def other_environment_migration
-        db_config = Thread.current[:trellis_migrating_database] or return nil
+      # This environment's config.trellis.dump_database config, when Trellis
+      # is off here and no Rails task is working on a database, or nil.
+      def off_environment_database
+        return nil if Thread.current[WORKING_ON] || enabled? || !defined?(::ActiveRecord::Base)
+
+        require "trellis/schema_dump"
+        ::ActiveRecord::Base.configurations.configs_for(env_name: ::Rails.env.to_s, name: SchemaDump.dump_database)
+      end
+
+      # The db_config working_on recorded, when it belongs to another
+      # environment than the one running the task, or to one Trellis is off
+      # in: with_handle connects to it rather than to the configured url.
+      # nil otherwise.
+      def elsewhere_database
+        db_config = Thread.current[WORKING_ON] or return nil
+        return db_config if off_in?(db_config.env_name)
         return nil if db_config.env_name.to_s == ::ActiveRecord::Tasks::DatabaseTasks.env.to_s
 
         db_config

@@ -7,12 +7,13 @@ require "test_helper"
 require_relative "support/rails_app"
 require "trellis/schema_dump"
 
-# config.trellis.off_in: the environments Trellis is off in, so a test suite
-# runs without it. The predicate and the Railtie's entry points need no
-# database; the schema load, the dump and the migration helpers run Rails'
-# own tasks in-process over databases of the test cluster, the way
-# schema_dump_test.rb does. (`parallelize` is simulated by the call Rails
-# makes in each forked worker.)
+# config.trellis.off_in: the environments Trellis's runtime is off in, so a
+# test suite runs no worker. The predicate and the boot connect need no
+# database; the schema load, the dump and the migration helpers, which run
+# there as they do where it's on, run Rails' own tasks in-process over
+# databases of the test cluster, the way schema_dump_test.rb does.
+# (`parallelize` is simulated by the call Rails makes in each forked
+# worker.)
 class OffInTest < Minitest::Test
   include TrellisTestCase
 
@@ -80,8 +81,9 @@ class OffInTest < Minitest::Test
     in_environment("test") { refute Trellis.enabled? }
   end
 
-  def test_connect_and_migrate_all_connect_nothing_in_an_off_environment
-    TrellisTestApp.config.trellis.connect = { url: TestCluster.dsn }
+  def test_connect_connects_nothing_and_migrate_all_migrates_in_an_off_environment
+    database = database("mall")
+    TrellisTestApp.config.trellis.connect = { url: dsn(database) }
     in_environment("test") do
       _, warned = capture_io { assert_nil Trellis::Railtie.connect }
       assert_includes warned, "Trellis is off in the test environment (config.trellis.off_in)"
@@ -89,8 +91,9 @@ class OffInTest < Minitest::Test
       refute Trellis.connected?
 
       _, warned = capture_io { assert_nil Trellis::Railtie.migrate_all }
-      assert_includes warned, "migrates nothing"
+      assert_empty warned
       refute Trellis.connected?
+      refute_nil to_regclass(database, "trellis.transform_definitions")
     end
     # The same app and config, in an environment it is on in.
     in_environment("development") do
@@ -100,95 +103,133 @@ class OffInTest < Minitest::Test
   end
 
   # Run in the off environment itself (`RAILS_ENV=test bin/rails
-  # db:migrate`), the helpers refuse; run from an environment Trellis is on
-  # in (`db:prepare` in development migrates the test database too), they
-  # skip, and the migration completes. The database is the migrating
-  # connection's.
-  def test_the_migration_helpers_refuse_in_an_off_environment_and_skip_from_an_on_one
-    database = database("migr")
-    ActiveRecord::Base.establish_connection(db_config(database))
-    TrellisTestApp.config.trellis.connect = { url: dsn(database) }
+  # db:migrate`) or from an environment Trellis is on in (`db:prepare` in
+  # development migrates the test database too), the helpers run against the
+  # migrating database, whatever database config.trellis.connect names. No
+  # worker builds the definition, and nothing installs a capture trigger.
+  def test_the_migration_helpers_run_against_an_off_database
     klass = Class.new(ActiveRecord::Migration[ActiveRecord::Migration.current_version]) do
       include Trellis::Migration
 
       disable_ddl_transaction!
 
       def up
-        create_table :of_migrated, if_not_exists: true
-        define "TRANSFORM of_migrated_copy FROM of_migrated SELECT id AS id"
+        create_table(:of_migrated) { |t| t.integer :price }
+        define "TRANSFORM of_migrated_copy FROM of_migrated SELECT price AS price"
+        define "TRANSFORM of_migrated_twice FROM of_migrated_copy SELECT price * 2 AS twice"
+      end
+
+      def down
+        apply "PAUSE TRANSFORM of_migrated_twice"
+        apply "DROP TRANSFORM of_migrated_twice"
+        apply "PAUSE TRANSFORM of_migrated_copy"
+        apply "DROP TRANSFORM of_migrated_copy"
+        drop_table :of_migrated
       end
     end
     ActiveRecord::Migration.verbose = false
+    elsewhere = database("migr_elsewhere")
+    TrellisTestApp.config.trellis.connect = { url: dsn(elsewhere) }
 
-    Tasks.env = "test"
-    error = assert_raises(ActiveRecord::MigrationError) { klass.new.migrate(:up) }
-    assert_includes error.message, "Trellis is off in the test environment"
-    assert_includes error.message, "loading the schema"
-    assert_includes error.message, "of_migrated_copy"
-    assert_raises(ActiveRecord::MigrationError) { klass.new.status("of_migrated_copy") }
+    %w[test development].each do |running|
+      database = database("migr_#{running}")
+      ActiveRecord::Base.establish_connection(db_config(database))
+      Tasks.env = running
+      klass.new.exec_migration(ActiveRecord::Base.lease_connection, :up)
 
-    Tasks.env = "development"
-    klass.new.migrate(:up)
-    assert_nil klass.new.status("of_migrated_copy")
-    # The migration's own create_table ran; the database never got Trellis.
-    assert_nil to_regclass(database, "of_migrated_copy")
-    assert_nil to_regclass(database, "trellis.transform_definitions")
+      # The chained define (of_migrated_twice reads of_migrated_copy) too.
+      assert_equal "waiting_to_backfill,waiting_to_backfill",
+                   scalar(database, "select string_agg(status, ',') from trellis.transform_definitions")
+      assert_equal "0", capture_triggers(database)
+      status = Trellis::Railtie.working_on(db_config(database)) { klass.new.status("of_migrated_copy") }
+      refute_nil status
+
+      klass.new.exec_migration(ActiveRecord::Base.lease_connection, :down)
+      assert_nil to_regclass(database, "of_migrated_copy")
+      assert_equal "0", scalar(database, "select count(*) from trellis.transform_definitions")
+    ensure
+      use_app_database
+    end
+    # The database config.trellis.connect names never got Trellis.
+    assert_nil to_regclass(elsewhere, "trellis.transform_definitions")
   end
 
-  # The load of an off environment's database creates the targets as the
-  # plain tables structure.sql carries, restores nothing, and leaves Trellis's
-  # schema out: Rails' fixture check, which resolves every foreign key of
-  # every schema, then passes. With Trellis on, it fails on Trellis's tables.
-  def test_a_schema_load_into_an_off_database_leaves_plain_tables
+  # `RAILS_ENV=test bin/rails db:migrate` (or `trellis:migrate`) in an app
+  # whose config.trellis.connect names development's primary database in
+  # every environment: Trellis goes to the test environment's primary
+  # database, even from a migration of another of its databases, and never
+  # to development's.
+  def test_an_off_environment_finds_the_counterpart_of_a_url_naming_another_environments_database
+    names = %w[primary reports].product(%w[development test]).to_h { |db, env| [[db, env], database("#{db[0]}#{env[0]}")] }
+    info = TestCluster.info
+    configs = %w[development test].to_h do |env|
+      [env, %w[primary reports].to_h do |db|
+        [db, { "adapter" => "postgresql", "host" => info.fetch("host"), "port" => info.fetch("port"),
+               "username" => info.fetch("user"), "database" => names.fetch([db, env]) }]
+      end]
+    end
+    ActiveRecord::Base.configurations = configs
+    TrellisTestApp.config.trellis.connect = { url: dsn(names.fetch(%w[primary development])) }
+    Tasks.env = "test"
+    reports = ActiveRecord::Base.configurations.configs_for(env_name: "test", name: "reports")
+    in_environment("test") do
+      Trellis::Railtie.working_on(reports) { Trellis::Railtie.with_handle { nil } }
+      Trellis::Railtie.migrate_all
+    end
+    installed = names.transform_values { |name| !to_regclass(name, "trellis.transform_definitions").nil? }
+    assert_equal({ %w[primary development] => false, %w[primary test] => true,
+                   %w[reports development] => false, %w[reports test] => false }, installed)
+  end
+
+  # The load of an off environment's database restores every definition, as
+  # a load where Trellis is on does, and no worker builds it: nothing
+  # installs a capture trigger, and the restore queue is gone.
+  def test_a_schema_load_into_an_off_database_restores_the_definitions_unbuilt
     source = source_database
     structure = dump(source)
     assert_includes structure, "CREATE TABLE public.of_totals_#{@id}"
     assert_includes structure, "-- Trellis definitions"
 
-    on = database("on")
-    TrellisTestApp.config.trellis.connect = { url: dsn(on) }
-    TrellisTestApp.config.trellis.off_in = [] # Trellis on in the test environment
-    Tasks.load_schema(db_config(on), :sql, File.join(@dir, "structure.sql"))
-    assert_includes tables(on, "trellis"), "transform_definitions"
-    if ActiveRecord.version >= Gem::Version.new("8.1")
-      # 8.1's check casts `conrelid::regclass` unqualified; 8.0's doesn't.
-      error = assert_raises(ActiveRecord::StatementInvalid) { check_foreign_keys(on) }
-      assert_match(/does not exist/, error.message)
-    end
-    # The other way out, with Trellis on: Trellis's schema on the search path.
-    check_foreign_keys(on, schema_search_path: "public,trellis")
-
     off = database("off")
-    TrellisTestApp.config.trellis.connect = { url: dsn(off) }
-    TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN
+    # Not the loaded database: the restore connects to that one itself.
+    TrellisTestApp.config.trellis.connect = { url: dsn(database("off_elsewhere")) }
+    Tasks.env = "test"
     Tasks.load_schema(db_config(off), :sql, File.join(@dir, "structure.sql"))
     assert_includes tables(off, "public"), "of_totals_#{@id}"
-    assert_nil to_regclass(off, "trellis.transform_definitions")
-    assert_equal "0", scalar(off, "select count(*) from pg_trigger where tgname like 'trellis_capture_%'")
-    # What Rails' fixture load does, with the fixture check on.
-    check_foreign_keys(off)
-    # Nothing was restored: the definition is still queued, and Trellis was
-    # never migrated into the database.
-    assert_equal "1", scalar(off, "select count(*) from trellis.restore_queue")
+    assert_equal "waiting_to_backfill",
+                 scalar(off, "select status from trellis.transform_definitions " \
+                             "where target_table = 'public.of_totals_#{@id}'")
+    assert_equal "0", capture_triggers(off)
+    assert_nil to_regclass(off, "trellis.restore_queue")
+    # Rails 8.1's fixture check casts `conrelid::regclass` unqualified, and
+    # fails on Trellis's own foreign keys unless Trellis's schema is on the
+    # search path; 8.0's doesn't.
+    if ActiveRecord.version >= Gem::Version.new("8.1")
+      error = assert_raises(ActiveRecord::StatementInvalid) { check_foreign_keys(off) }
+      assert_match(/does not exist/, error.message)
+    end
+    check_foreign_keys(off, schema_search_path: "public,trellis")
   end
 
   # `db:prepare` in development loads the test database with development's
   # config.trellis.connect, and `db:test:prepare` loads it from development
-  # too: the test database's environment is what decides, not the running one.
-  def test_a_load_of_an_off_environments_database_from_another_environment_restores_nothing
+  # too: the restore connects to the test database.
+  def test_a_load_of_an_off_environments_database_from_another_environment_restores_into_it
     dump(source_database)
     test = database("envtest")
-    TrellisTestApp.config.trellis.connect = { url: dsn(database("envdev")) }
+    dev = database("envdev")
+    TrellisTestApp.config.trellis.connect = { url: dsn(dev) }
     Tasks.env = "development"
     Tasks.load_schema(db_config(test), :sql, File.join(@dir, "structure.sql"))
-    assert_nil to_regclass(test, "trellis.transform_definitions")
+    assert_equal "waiting_to_backfill", scalar(test, "select status from trellis.transform_definitions")
     assert_includes tables(test, "public"), "of_totals_#{@id}"
+    assert_nil to_regclass(dev, "trellis.transform_definitions")
   end
 
   # `parallelize(workers: n)` makes a database per worker (`<name>_<i>`, or
   # `<name>-<i>` before Rails 8.1) and loads the schema into it in each forked
   # worker. config.trellis.connect names the one database, so with Trellis on
-  # the load is refused.
+  # the load is refused; with it off, the restore connects to the worker's.
   def test_a_parallel_worker_database_loads_when_trellis_is_off
     dump(source_database)
     name = "of_app_#{@id}_#{Process.pid}"
@@ -207,15 +248,20 @@ class OffInTest < Minitest::Test
       ActiveRecord::TestDatabases.create_and_load_schema(0, env_name: "test")
     end
     assert_includes error.message, "config.trellis.dump_database"
+    # Rails recorded the load before the restore refused, and renamed the
+    # config: start over.
+    @admin.exec("drop database #{worker} with (force)")
+    ActiveRecord::Base.configurations = { "development" => { "primary" => base },
+                                          "test" => { "primary" => base } }
 
     TrellisTestApp.config.trellis.off_in = DEFAULT_OFF_IN
     ActiveRecord::TestDatabases.create_and_load_schema(0, env_name: "test")
     assert_includes tables(worker, "public"), "of_totals_#{@id}"
-    assert_nil to_regclass(worker, "trellis.transform_definitions")
+    assert_equal "waiting_to_backfill", scalar(worker, "select status from trellis.transform_definitions")
   end
 
   # The dump file is the environment Trellis is on in: a `db:prepare` there
-  # also dumps the test database, which has no definitions to put in it.
+  # also dumps the test database, which would only overwrite it.
   def test_a_dump_of_an_off_database_from_an_on_environment_is_skipped
     source = source_database
     TrellisTestApp.config.trellis.connect = { url: dsn(source) }
@@ -225,12 +271,16 @@ class OffInTest < Minitest::Test
     Tasks.dump_schema(db_config(source))
     assert_equal "-- the development dump\n", File.read(path)
 
-    # From the off environment itself, it is Rails' own dump.
+    # From the off environment itself, it dumps as where Trellis is on,
+    # reading the definitions from the dumped database.
+    TrellisTestApp.config.trellis.connect = { url: dsn(database("dump_elsewhere")) }
     Tasks.env = "test"
-    Tasks.dump_schema(db_config(source))
+    config = db_config(source)
+    Tasks.with_temporary_connection(config) { Tasks.dump_schema(config) }
     structure = File.read(path)
     assert_includes structure, "CREATE TABLE public.of_totals_#{@id}"
-    refute_includes structure, "Trellis definitions"
+    assert_includes structure, "-- Trellis definitions"
+    refute_includes structure, "CREATE TABLE trellis."
   end
 
   private
@@ -299,6 +349,13 @@ class OffInTest < Minitest::Test
     hash = { adapter: "postgresql", database:, host: info.fetch("host"), port: info.fetch("port"),
              username: info.fetch("user"), schema_search_path: "public", **options }
     ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary", hash)
+  end
+
+  # The triggers on tables outside Trellis's own schema, as a count: a
+  # capture trigger is the only kind Trellis installs there.
+  def capture_triggers(database)
+    scalar(database, "select count(*) from pg_trigger t join pg_class c on c.oid = t.tgrelid " \
+                     "join pg_namespace n on n.oid = c.relnamespace where not t.tgisinternal and n.nspname <> 'trellis'")
   end
 
   def scalar(database, sql)

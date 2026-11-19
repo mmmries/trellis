@@ -130,16 +130,16 @@ module Trellis
     # the definition names without a schema resolves on the connection's
     # search_path. Returns the number of rows written.
     #
-    # The definition is the one the schema load left in the restore queue
-    # (`trellis.restore_queue`, or the schema config.trellis.connect or
-    # config.trellis.instances names). A definition that reads another
-    # transform's target refreshes that target first.
+    # The definition is the one Trellis's catalog records (in `trellis`, or
+    # the schema config.trellis.connect or config.trellis.instances names),
+    # or one a schema load not followed by a restore left in the restore
+    # queue. A definition that reads another transform's target refreshes
+    # that target first.
     #
     # Raises Trellis::NotFoundError when the target has no definition, and
     # Trellis::ValidationError when Trellis is on in this environment
     # (Trellis.enabled?), where the engine maintains the target and would
-    # overwrite what this writes. `trellis_on: true` writes anyway, reading
-    # the definition from the instance's catalog when there is no queue.
+    # overwrite what this writes. `trellis_on: true` writes anyway.
     def refresh_trellis_target(target, connection: nil, trellis_on: false)
       if Trellis.enabled? && !trellis_on
         raise ValidationError,
@@ -244,8 +244,8 @@ module Trellis
         when 1 then matches.first
         when 0
           raise NotFoundError,
-                "no Trellis definition is recorded for the target #{name}: refresh_trellis_target reads " \
-                "the definitions the schema load left in #{trellis_schemas.map { |s| "#{s}.restore_queue" }.join(', ')}"
+                "no Trellis definition is recorded for the target #{name} in the schemas " \
+                "#{trellis_schemas.join(', ')}"
         else
           raise ValidationError,
                 "#{name} names more than one target (#{matches.map { |d| d.fetch(:target) }.join(', ')}): " \
