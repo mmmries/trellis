@@ -1578,6 +1578,7 @@ struct Leader {
     config: LeaderConfig,
     seal_config: SealConfig,
     failures: StepFailures,
+    ring_full: RingFullLog,
     housekeeping: HousekeepingSchedule,
     /// Whether the last tombstone collection may have stopped at its
     /// per-ledger cap ([`staging::retire::may_leave_backlog`]).
@@ -1598,6 +1599,7 @@ impl Leader {
             config,
             seal_config: SealConfig::default(),
             failures: StepFailures::default(),
+            ring_full: RingFullLog::default(),
             tombstone_backlog: false,
             next_reconcile: Instant::now(),
             backoff: Default::default(),
@@ -1691,13 +1693,20 @@ impl Leader {
         // rest of the tick still runs. The housekeeping pass is what
         // reclaims a dead claimant's hold on the oldest segment, the one
         // thing that can keep retirement from freeing a slot, so skipping
-        // it here would keep the ring full for good.
-        let ring_full = matches!(sealed, Some(Err(StagingError::RingFull { .. })));
-        if let Some(sealed) = sealed {
-            self.settle(c, "seal", sealed, &mut failed).await;
-        }
-        if ring_full {
-            failed = false;
+        // it here would keep the ring full for good. [`RingFullLog`] reports
+        // it, warning only once the ring has stayed full.
+        match sealed {
+            Some(Err(err @ StagingError::RingFull { .. })) => {
+                self.ring_full.refused(&err, Instant::now());
+                self.failures.succeeded("seal");
+            }
+            Some(sealed) => {
+                if sealed.is_ok() {
+                    self.ring_full.cleared(Instant::now());
+                }
+                self.settle(c, "seal", sealed, &mut failed).await;
+            }
+            None => {}
         }
         // Issue #273: everything but the seal runs on the housekeeping
         // cadence, not every tick. See [`HousekeepingSchedule`] for what each
@@ -2169,6 +2178,57 @@ impl StepFailures {
     }
 }
 
+/// How long the ring must stay full before [`RingFullLog`] warns. A ring
+/// full for a tick or two is backpressure; one full for this long is a stall
+/// (drains dead or wedged, or a dump pinning the slots).
+const RING_FULL_WARN_AFTER: Duration = STEP_FAILURE_WARN_INTERVAL;
+
+/// Reports the leader's refused seals (`T0185 RingFull`). Each refusal logs
+/// at `debug`: a ring that fills for a moment is normal backpressure. One
+/// that stays full for [`RING_FULL_WARN_AFTER`] warns, then at most once per
+/// [`STEP_FAILURE_WARN_INTERVAL`] while it stays full, and logs one `info`
+/// once a seal goes through again. Pure over an injected `now`.
+#[derive(Default)]
+struct RingFullLog {
+    /// When the current run of refusals began, if the ring is full.
+    since: Option<Instant>,
+    /// When the current run last warned, if it has.
+    last_warned: Option<Instant>,
+}
+
+impl RingFullLog {
+    fn refused(&mut self, error: &dyn fmt::Display, now: Instant) {
+        let since = *self.since.get_or_insert(now);
+        let full_for = now.duration_since(since);
+        let due = full_for >= RING_FULL_WARN_AFTER
+            && self
+                .last_warned
+                .is_none_or(|warned| now.duration_since(warned) >= STEP_FAILURE_WARN_INTERVAL);
+        if due {
+            self.last_warned = Some(now);
+            crate::instance_log::warn!(
+                error = %error,
+                full_for_secs = full_for.as_secs(),
+                "seal refused: the ring has stayed full; drains are not keeping up or are stalled"
+            );
+        } else {
+            crate::instance_log::debug!(error = %error, "seal refused: the ring is full");
+        }
+    }
+
+    /// A seal that wasn't refused for a full ring.
+    fn cleared(&mut self, now: Instant) {
+        if let Some(since) = self.since.take()
+            && self.last_warned.take().is_some()
+        {
+            crate::instance_log::info!(
+                full_for_secs = now.duration_since(since).as_secs(),
+                "the ring is no longer full; sealing again"
+            );
+        }
+    }
+}
+
 /// How often [`DrainFailures`] repeats the `warn` for a drain error that
 /// keeps recurring. The occurrences in between log at `debug`.
 const DRAIN_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
@@ -2589,6 +2649,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     let mut wake = wake;
 
     let mut drain_failures = DrainFailures::default();
+    let mut build_failures = StepFailures::default();
     let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
 
     if !wait_out_restore(&pool, poll_interval, &mut shutdown_rx).await {
@@ -2625,13 +2686,14 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                 // failed): build work comes next. Only actually
                 // wait if it made no progress — otherwise loop straight
                 // back around without an idle wait.
-                let step = build_step(&pool, &claimed_by, &build_options).await;
+                let step =
+                    build_step(&pool, &claimed_by, &build_options, &mut build_failures).await;
                 // Only here is the worker idle: no segment to look at (a
                 // lookup that failed found nothing out, so it isn't "none")
                 // and, when the probe is answered, no build work either.
                 // Anything else is a peer's work in flight, which finishes
-                // with its own `NOTIFY`, or a failure, and is waited on at
-                // the poll floor.
+                // with its own `NOTIFY`, and is waited on at the poll floor,
+                // or a failed lookup, which backs off.
                 let Some(wait) = backoff.after_build_step(&step, listed.is_ok(), wake.is_up())
                 else {
                     continue;
@@ -2706,7 +2768,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // there takes build work instead.
         let build_progress = !drained
             && matches!(
-                build_step(&pool, &claimed_by, &build_options).await,
+                build_step(&pool, &claimed_by, &build_options, &mut build_failures).await,
                 BuildStep::Progress
             );
         backoff.reset();
@@ -2740,6 +2802,7 @@ async fn build_step(
     pool: &Pool,
     claimed_by: &str,
     build_options: &staging::build::WorkerOptions,
+    failures: &mut StepFailures,
 ) -> BuildStep {
     // One probe when there is nothing to do (#273): the step below would look
     // on every idle wake. An error is not "nothing": run the step, which
@@ -2754,10 +2817,10 @@ async fn build_step(
     // A 1-1 `JOIN`'s pending fan-out first: it is a `b` change on its way to
     // the target, which a reader waits on, where a build is a whole
     // target's.
-    if fan_out_step(pool, claimed_by).await {
+    if fan_out_step(pool, failures).await {
         return BuildStep::Progress;
     }
-    if rederive_build_step(pool, claimed_by, build_options).await {
+    if rederive_build_step(pool, claimed_by, build_options, failures).await {
         BuildStep::Progress
     } else {
         BuildStep::Waiting
@@ -2767,18 +2830,13 @@ async fn build_step(
 /// One chunk of a 1-1 `JOIN`'s pending fan-out
 /// (`staging::join_one_to_one::fan_out`), when there is one to run. Returns
 /// whether it ran one.
-async fn fan_out_step(pool: &Pool, claimed_by: &str) -> bool {
-    match staging::join_one_to_one::fan_out::step(pool).await {
-        Ok(step) => step.progressed(),
-        Err(error) => {
-            crate::instance_log::warn!(
-                worker = %claimed_by,
-                error = %error,
-                "1-1 JOIN fan-out chunk failed; retrying on the next pass"
-            );
-            false
-        }
-    }
+async fn fan_out_step(pool: &Pool, failures: &mut StepFailures) -> bool {
+    failures
+        .check(
+            "join_fan_out",
+            staging::join_one_to_one::fan_out::step(pool).await,
+        )
+        .is_ok_and(|step| step.progressed())
 }
 
 /// How an idle drain worker's wait grows (#273): from the poll floor, doubling
@@ -2791,6 +2849,10 @@ struct IdleBackoff {
     cap: Duration,
     /// Idle waits since the last reset.
     streak: u32,
+    /// Passes in a row whose segment lookup failed (the database is
+    /// unreachable): the wait doubles per failure so an outage isn't spun on
+    /// at the poll floor.
+    failing: u32,
 }
 
 impl IdleBackoff {
@@ -2799,17 +2861,19 @@ impl IdleBackoff {
             floor,
             cap: cap.max(floor),
             streak: 0,
+            failing: 0,
         }
     }
 
     fn reset(&mut self) {
         self.streak = 0;
+        self.failing = 0;
     }
 
     /// The wait after a pass that found no segment to drain and took `step`
     /// of build work, or `None` to loop straight back. `listed` is whether
     /// the segment lookup answered: one that failed says nothing about the
-    /// ring, so the pass isn't idle and waits at the floor.
+    /// ring, so the pass isn't idle, and waits per [`Self::failed_wait`].
     fn after_build_step(
         &mut self,
         step: &BuildStep,
@@ -2822,17 +2886,31 @@ impl IdleBackoff {
                 None
             }
             BuildStep::Idle { next_due } if listed => Some(self.idle_wait(listener_up, *next_due)),
-            BuildStep::Idle { .. } | BuildStep::Waiting => {
+            BuildStep::Idle { .. } | BuildStep::Waiting if listed => {
                 self.reset();
                 Some(self.floor)
             }
+            BuildStep::Idle { .. } | BuildStep::Waiting => Some(self.failed_wait()),
         }
+    }
+
+    /// The wait after a pass whose lookup failed: from the floor, doubling
+    /// per failure in a row, up to the cap. Idle waits start over.
+    fn failed_wait(&mut self) -> Duration {
+        self.streak = 0;
+        let wait = self
+            .floor
+            .saturating_mul(1u32 << self.failing.min(30))
+            .min(self.cap);
+        self.failing = self.failing.saturating_add(1);
+        wait
     }
 
     /// The wait after an idle pass. `next_due` shortens it to the moment a
     /// backing-off chunk becomes claimable (a millisecond past, so the probe
     /// sees it due).
     fn idle_wait(&mut self, listener_up: bool, next_due: Option<Duration>) -> Duration {
+        self.failing = 0;
         let mut wait = if listener_up {
             let doubled = self.floor.saturating_mul(1u32 << self.streak.min(30));
             self.streak = self.streak.saturating_add(1);
@@ -2877,6 +2955,7 @@ async fn self_check_loop(
     mut backoff: IdleBackoff,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let mut failures = StepFailures::default();
     loop {
         if !wait_while_standing_by(&mut active, &mut shutdown_rx).await {
             break;
@@ -2884,15 +2963,27 @@ async fn self_check_loop(
         // Wakes already heard are answered by the claim below; one that
         // arrives after this drain is kept for the wait.
         wake.clear();
-        let ran = self_check_step(&pool, &claimed_by, reclaim_ttl, &mut shutdown_rx).await;
+        let ran = self_check_step(
+            &pool,
+            &claimed_by,
+            reclaim_ttl,
+            &mut failures,
+            &mut shutdown_rx,
+        )
+        .await;
         if *shutdown_rx.borrow() {
             break;
         }
-        if ran {
-            backoff.reset();
-            continue;
-        }
-        let wait = backoff.idle_wait(wake.is_up(), None);
+        let wait = match ran {
+            Some(true) => {
+                backoff.reset();
+                continue;
+            }
+            Some(false) => backoff.idle_wait(wake.is_up(), None),
+            // A failed step (the database unreachable) backs off as a drain
+            // worker's failed lookup does.
+            None => backoff.failed_wait(),
+        };
         match wait_for_wake(&mut wake, &mut shutdown_rx, wait).await {
             WakeEnd::Shutdown => break,
             // A wake that is not a job (build work shares the work channel)
@@ -2904,19 +2995,21 @@ async fn self_check_loop(
 }
 
 /// One page of a `self_check` job ([`staging::self_check_job::work_once`]),
-/// if there is one to run. Returns whether it ran one.
+/// if there is one to run. Returns whether it ran one, or `None` if the step
+/// failed.
 ///
 /// A page is bounded by its own budget (`staging::self_check_job::page_budget`),
 /// but a shutdown does not wait for it: the page is dropped where it is, the
 /// worker's jobs are marked cancelled, and the statement the page had on the
 /// server is stopped by that budget. A failure of the step itself (the claim
-/// or a save) is logged at warn and retried on the next pass.
+/// or a save) is reported through `failures` and retried on the next pass.
 async fn self_check_step(
     pool: &Pool,
     claimed_by: &str,
     reclaim_ttl: Duration,
+    failures: &mut StepFailures,
     shutdown_rx: &mut watch::Receiver<bool>,
-) -> bool {
+) -> Option<bool> {
     let options = staging::self_check_job::WorkerOptions::new(reclaim_ttl);
     let page = staging::self_check_job::work_once(pool, claimed_by, &options);
     tokio::select! {
@@ -2935,19 +3028,9 @@ async fn self_check_step(
                      another worker takes it over once it has gone stale"
                 );
             }
-            false
+            Some(false)
         }
-        result = page => match result {
-            Ok(ran) => ran,
-            Err(error) => {
-                crate::instance_log::warn!(
-                    worker = %claimed_by,
-                    error = %error,
-                    "self_check step failed; retrying on the next pass"
-                );
-                false
-            }
-        },
+        result = page => failures.check("self_check", result).ok(),
     }
 }
 
@@ -2960,18 +3043,14 @@ async fn rederive_build_step(
     pool: &Pool,
     claimed_by: &str,
     options: &staging::build::WorkerOptions,
+    failures: &mut StepFailures,
 ) -> bool {
-    match staging::build::work_once(pool, claimed_by, options).await {
-        Ok(step) => step.progressed(),
-        Err(error) => {
-            crate::instance_log::warn!(
-                worker = %claimed_by,
-                error = %error,
-                "re-derive build step failed; retrying on the next pass"
-            );
-            false
-        }
-    }
+    failures
+        .check(
+            "rederive_build",
+            staging::build::work_once(pool, claimed_by, options).await,
+        )
+        .is_ok_and(|step| step.progressed())
 }
 
 /// The drainer ids (`claimed_by`) of one `Client`'s app-worker loops that are
@@ -4638,6 +4717,157 @@ mod maintenance_failure_tests {
         assert_eq!(events[3].fields["failures"], "3", "{events:?}");
         assert_eq!(events[4].fields["failures"], "3", "{events:?}");
         assert_eq!(events[5].fields["failures"], "1", "{events:?}");
+    }
+
+    /// A drain worker whose segment lookup keeps failing (the database is
+    /// down) waits longer each pass, up to the cap, and starts over at the
+    /// floor on the first answered lookup.
+    #[test]
+    fn idle_backoff_grows_while_the_lookup_keeps_failing() {
+        let ms = Duration::from_millis;
+        let mut backoff = IdleBackoff::new(ms(200), ms(1500));
+        let waiting = BuildStep::Waiting;
+        let waits: Vec<_> = (0..5)
+            .map(|_| backoff.after_build_step(&waiting, false, false).unwrap())
+            .collect();
+        assert_eq!(waits, [ms(200), ms(400), ms(800), ms(1500), ms(1500)]);
+        assert_eq!(
+            backoff.after_build_step(&waiting, true, false),
+            Some(ms(200))
+        );
+        assert_eq!(
+            backoff.after_build_step(&waiting, false, false),
+            Some(ms(200))
+        );
+        // The self_check task's path: an idle wait after failures starts the
+        // failure doubling over too.
+        assert_eq!(backoff.failed_wait(), ms(400));
+        assert_eq!(backoff.idle_wait(false, None), ms(200));
+        assert_eq!(backoff.failed_wait(), ms(200));
+    }
+
+    /// A pool whose every checkout fails at once: the database is down.
+    fn unreachable_pool() -> Pool {
+        let config = crate::config::Config::from_dsn(
+            "postgres://trellis@127.0.0.1:1/trellis?connect_timeout=1".to_string(),
+        )
+        .expect("valid config");
+        Pool::new(&config).expect("build a pool")
+    }
+
+    fn loud(events: &[CapturedEvent]) -> Vec<(tracing::Level, String)> {
+        levels(events)
+            .into_iter()
+            .filter(|(level, _)| *level <= tracing::Level::INFO)
+            .collect()
+    }
+
+    /// Issue #2156: a drain worker's fan-out and re-derive build steps fail
+    /// on every pass while the database is down, and warn once each, not
+    /// once a pass.
+    #[tokio::test]
+    async fn repeated_build_step_failures_warn_once() {
+        let pool = unreachable_pool();
+        let options = staging::build::WorkerOptions {
+            chunk_rows: 1000,
+            drain_batch_cap: 1000,
+            heartbeat_interval: Duration::from_secs(1),
+            reclaim_ttl: Duration::from_secs(30),
+        };
+        let (_guard, captured) = install_capture();
+        let mut failures = StepFailures::default();
+        for _ in 0..3 {
+            assert!(!fan_out_step(&pool, &mut failures).await);
+            assert!(!rederive_build_step(&pool, "w", &options, &mut failures).await);
+        }
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            loud(&events),
+            vec![
+                (tracing::Level::WARN, "join_fan_out".to_string()),
+                (tracing::Level::WARN, "rederive_build".to_string()),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// Issue #2156: the `self_check` task's step fails on every pass while
+    /// the database is down, and warns once.
+    #[tokio::test]
+    async fn repeated_self_check_step_failures_warn_once() {
+        let pool = unreachable_pool();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_guard, captured) = install_capture();
+        let mut failures = StepFailures::default();
+        for _ in 0..3 {
+            let ran = self_check_step(
+                &pool,
+                "w",
+                Duration::from_secs(30),
+                &mut failures,
+                &mut shutdown_rx,
+            )
+            .await;
+            assert_eq!(ran, None);
+        }
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            loud(&events),
+            vec![(tracing::Level::WARN, "self_check".to_string())],
+            "{events:?}"
+        );
+    }
+
+    /// Issue #2156: a full ring logs at `debug` until it has stayed full for
+    /// [`RING_FULL_WARN_AFTER`], then warns once per interval, and its
+    /// clearing logs one `info`. A ring that fills and clears before then
+    /// says nothing above `debug`.
+    #[test]
+    fn a_ring_full_for_long_warns_and_reports_clearing() {
+        let (_guard, captured) = install_capture();
+        let mut log = RingFullLog::default();
+        let start = Instant::now();
+        let tick = Duration::from_millis(300);
+        let full = "T0185 ring full";
+
+        // A brief fill: refused, then sealed again.
+        log.refused(&full, start);
+        log.refused(&full, start + tick);
+        log.cleared(start + tick * 2);
+        // A long one, from `later`.
+        let later = start + tick * 3;
+        log.refused(&full, later);
+        log.refused(&full, later + RING_FULL_WARN_AFTER - tick);
+        log.refused(&full, later + RING_FULL_WARN_AFTER);
+        log.refused(&full, later + RING_FULL_WARN_AFTER + tick);
+        log.refused(&full, later + RING_FULL_WARN_AFTER * 2 - tick);
+        log.refused(&full, later + RING_FULL_WARN_AFTER * 2);
+        log.cleared(later + RING_FULL_WARN_AFTER * 2 + tick);
+        // A new fill starts its clock over.
+        let again = later + RING_FULL_WARN_AFTER * 3;
+        log.refused(&full, again);
+        log.cleared(again + tick);
+
+        let events = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().map(|e| e.level).collect::<Vec<_>>(),
+            vec![
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG,
+                tracing::Level::WARN,
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG,
+                tracing::Level::WARN,
+                tracing::Level::INFO,
+                tracing::Level::DEBUG,
+            ],
+            "{events:?}"
+        );
+        assert!(events[4].fields["error"].contains("T0185"), "{events:?}");
+        assert_eq!(events[4].fields["full_for_secs"], "60", "{events:?}");
+        assert_eq!(events[8].fields["full_for_secs"], "120", "{events:?}");
     }
 
     /// The reconcile runs only every `reconcile_interval`,
