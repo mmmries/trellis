@@ -203,15 +203,25 @@ pub(crate) const LIVE_DRAIN_WORKER_SQL: &str = "\
       and (j->>'version' is null \
            or ((j->>'drain')::boolean and not (j->>'standby')::boolean))";
 
+/// A row whose `staging_pid` session still holds an advisory lock is kept
+/// however old its heartbeat: after a database outage the process that
+/// retook the staging-worker lock would otherwise lose its row to this sweep
+/// before its next heartbeat, and the handover check would read its own lock
+/// as a release before 0.2.0's.
+///
 /// The `WITH ... DELETE` sweep behind [`reclaim_stale_workers`], mirroring
 /// `super::liveness`'s own `RECLAIM_STALE_SQL` shape — including the `for
 /// update skip locked`: a row a concurrent heartbeat is mid-upsert on is not
 /// a dead worker, and this sweep must never block behind one.
 const RECLAIM_STALE_WORKERS_SQL: &str = "\
     with dead as ( \
-        select worker_id from worker_registry \
-        where last_seen < now() - (interval '1 second' * $1) \
-        for update skip locked \
+        select w.worker_id from worker_registry w \
+        where w.last_seen < now() - (interval '1 second' * $1) \
+          and not exists ( \
+              select 1 from pg_locks l \
+              where l.locktype = 'advisory' and l.granted and l.objsubid = 1 \
+                and l.pid = (to_jsonb(w)->>'staging_pid')::int4) \
+        for update of w skip locked \
     ) \
     delete from worker_registry where worker_id in (select worker_id from dead)";
 

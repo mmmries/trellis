@@ -359,6 +359,62 @@ async fn reclaim_stale_workers_deletes_only_the_stale_row() {
     );
 }
 
+/// Regression for #2155: after an outage every heartbeat is older than the
+/// TTL, and the first maintenance pass swept the row of the process that had
+/// just retaken the staging-worker lock. The handover check then read its own
+/// lock as a staging worker of a release before 0.2.0. A stale row whose
+/// `staging_pid` session still holds the lock must survive the sweep.
+#[tokio::test]
+async fn reclaim_stale_workers_keeps_the_row_of_the_staging_lock_holder() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect_raw(db.dsn()).await;
+    let holder = connect_raw(db.dsn()).await;
+
+    worker_registry::register_worker(
+        &client,
+        &worker_registry::Registration::drain_worker("leader"),
+    )
+    .await
+    .expect("register leader");
+    worker_registry::register_worker(
+        &client,
+        &worker_registry::Registration::drain_worker("gone"),
+    )
+    .await
+    .expect("register gone");
+    worker_registry::claim_staging(&holder, "leader")
+        .await
+        .expect("claim_staging");
+    holder
+        .execute("select pg_advisory_lock(424242)", &[])
+        .await
+        .expect("hold an advisory lock");
+    client
+        .execute(
+            "update worker_registry set last_seen = now() - interval '2 hours'",
+            &[],
+        )
+        .await
+        .expect("backdate both rows");
+
+    let reclaimed = worker_registry::reclaim_stale_workers(&client, Duration::from_secs(30))
+        .await
+        .expect("reclaim_stale_workers");
+    assert_eq!(
+        reclaimed, 1,
+        "only the row with no lock-holding session goes"
+    );
+    let remaining: Vec<String> = client
+        .query("select worker_id from worker_registry", &[])
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(remaining, vec!["leader".to_string()]);
+}
+
 /// `Client::start`/`shutdown` (the lower-level API `Trellis` itself is built
 /// on) directly: registers exactly one row per `Client` — not one per
 /// `application_threads` task — and removes it once `shutdown` returns,
