@@ -23,6 +23,11 @@
 //! row holds its marker too, and each drain handles its own. Pausing is
 //! idempotent, so peers and retries repeat it harmlessly.
 //!
+//! The same marker records a capture re-read Postgres refused (`42501`;
+//! `capture::sql`, "A refused re-read"), which staged nothing for its
+//! statement. For those, [`pause_readers`] halts every reader of the table
+//! and everything downstream (`staging::halt`), before the column pauses.
+//!
 //! What pausing drops is only the paused definition's share of these
 //! segments. Resuming it is a rebuild from the source, as for any pause.
 //!
@@ -100,13 +105,18 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
     }
 
     let mut by_table: BTreeMap<String, Missing> = BTreeMap::new();
+    // The refusals a refused re-read's marker records, by table.
+    let mut refused: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for seg_seq in marked {
         let (window, params) =
             super::seal::fenced_window(&**client, seg_seq, "src_table, op, new_image").await?;
         let sql = format!(
             "select w.src_table, \
                     coalesce(array_agg(distinct m.c) filter (where m.c is not null), '{{}}'), \
-                    coalesce(bool_or((w.new_image ->> 'key_missing')::boolean), false) \
+                    coalesce(bool_or((w.new_image ->> 'key_missing')::boolean), false), \
+                    coalesce(array_agg(distinct 'role ' || (w.new_image ->> 'role') || ': ' \
+                        || (w.new_image ->> 'refused')) \
+                        filter (where w.new_image ? 'refused'), '{{}}') \
              from ({window}) w \
              left join lateral jsonb_array_elements_text(w.new_image -> 'missing') as m(c) \
                on true \
@@ -117,12 +127,27 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         for row in client.query(&sql, &param_refs).await? {
-            let missing = by_table.entry(row.get(0)).or_default();
-            missing.columns.extend(row.get::<_, Vec<String>>(1));
-            missing.key_missing |= row.get::<_, bool>(2);
+            let table: String = row.get(0);
+            let columns: Vec<String> = row.get(1);
+            let key_missing: bool = row.get(2);
+            let refusals: Vec<String> = row.get(3);
+            if !refusals.is_empty() {
+                refused.entry(table.clone()).or_default().extend(refusals);
+            }
+            if columns.is_empty() && !key_missing {
+                continue;
+            }
+            let missing = by_table.entry(table).or_default();
+            missing.columns.extend(columns);
+            missing.key_missing |= key_missing;
         }
     }
 
+    // A refused re-read staged nothing for its statement, so its readers
+    // halt first, whatever else the markers say.
+    for target in super::halt::halt_refused_captures(pool, &refused).await? {
+        crate::instance_log::warn!(target = %target, "definition halted: a capture re-read was refused");
+    }
     let catalog = load_catalog_for(&**client, pool.floors()).await?;
     pause_marked_readers(&mut client, &catalog, &by_table).await?;
     Ok(())

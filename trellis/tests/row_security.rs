@@ -1965,3 +1965,149 @@ async fn a_revoked_schema_usage_leaves_a_joins_usable_table_in_the_staging_pass(
     assert_eq!(totals, "x1:1006,x2:5,x3:7");
     it.trellis.shutdown().await.expect("shutdown");
 }
+
+/// `c` owned by `app_owner`, which the Trellis role inherits, as
+/// `docs/recommendations.md` asks, with a 1-1 copy and an aggregate of it
+/// live, and an application trigger that rewrites the row it fired for, so
+/// every insert and update of `c` takes capture's live re-read (ADR-0002 I6,
+/// #2154).
+async fn readers_of_c_with_a_rewriting_trigger(cluster: &TestCluster) -> Instance {
+    let mut it = instance(cluster).await;
+    it.admin
+        .batch_execute(
+            "create role app_owner nologin; create role dba2 nologin; \
+             grant app_owner to rls_trellis; \
+             alter table public.c owner to app_owner; \
+             create function public.app_fix() returns trigger language plpgsql as $$ \
+             begin if pg_catalog.pg_trigger_depth() < 2 then \
+               update public.c set amount = amount + 1000 where id = new.id; end if; \
+             return null; end $$; \
+             create trigger app_fix after insert or update on public.c \
+               for each row execute function public.app_fix();",
+        )
+        .await
+        .expect("an owner role the Trellis role inherits, and a rewriting trigger");
+    for ddl in [
+        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
+        "TRANSFORM c_totals FROM public.c GROUP BY pid \
+        WITHOUT SOURCE INDEX SELECT pid AS pid, SUM(amount) AS total, COUNT(*) AS n",
+    ] {
+        it.trellis.apply(ddl).await.expect(ddl);
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+    for target in ["c_copy", "c_totals"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    it
+}
+
+/// After a refused capture re-read: the drain halts both readers of `c`
+/// with the capture's refusal, `RESUME` rebuilds them, and both targets
+/// match the source.
+async fn refused_capture_halts_then_resume_is_exact(it: &mut Instance, refusal: &str) {
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the drain halts the readers and commits the page");
+    for target in ["c_copy", "c_totals"] {
+        let failure = halted(&it.trellis, target).await;
+        assert_eq!(failure.source_table, "public.c", "{target}");
+        assert!(
+            failure.error.contains(
+                "Trellis's capture of public.c was refused a re-read of it as role rls_trellis"
+            ) && failure.error.contains(refusal),
+            "{target}: {}",
+            failure.error
+        );
+    }
+    for target in ["c_copy", "c_totals"] {
+        it.trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .expect("resume");
+    }
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+    for target in ["c_copy", "c_totals"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    let [source, copy, totals, aggregate] = source_and_targets(&it.admin).await;
+    assert_eq!(copy, source, "the 1-1 target matches the source");
+    assert_eq!(aggregate, totals, "the aggregate matches the source");
+    assert_eq!(poison_rows(&it.admin).await, 0, "no key was charged");
+}
+
+/// A routine ownership change hands `c` to a role the Trellis role neither
+/// is nor inherits, so capture's re-read, which runs as the ring's owner, is
+/// refused `SELECT`. The application's insert and update still succeed
+/// (ADR-0002 I6), and the capture records the refusal in the ring. Ownership
+/// is given back before the drain runs, so only that record can tell the
+/// drain the writes went uncaptured: it halts both readers, and after
+/// `RESUME` both targets are exact.
+#[tokio::test]
+async fn an_ownership_change_never_fails_a_write_and_halts_the_readers() {
+    let cluster = TestCluster::start();
+    let mut it = readers_of_c_with_a_rewriting_trigger(&cluster).await;
+    it.admin
+        .batch_execute("alter table public.c owner to dba2")
+        .await
+        .expect("hand the table to another owner");
+    it.admin
+        .batch_execute(
+            "insert into public.c values (100, 1, 7); \
+             update public.c set amount = 22 where id = 2;",
+        )
+        .await
+        .expect("the application's writes succeed");
+    it.admin
+        .batch_execute("alter table public.c owner to app_owner")
+        .await
+        .expect("give ownership back");
+    refused_capture_halts_then_resume_is_exact(&mut it, "permission denied for table c").await;
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// Row-level security that applies to the ring's owner, under a writer
+/// whose session sets `row_security = off`: Postgres refuses capture's
+/// re-read with `42501` instead of filtering it. The writes still succeed,
+/// and the readers halt and resume as for a lost privilege. (Under the
+/// default `row_security = on` the re-read is filtered instead, which
+/// `deletes_staged_for_rows_the_policy_hides` covers.)
+#[tokio::test]
+async fn row_security_refusing_the_re_read_never_fails_a_write() {
+    let cluster = TestCluster::start();
+    let mut it = readers_of_c_with_a_rewriting_trigger(&cluster).await;
+    it.admin
+        .batch_execute(
+            "alter table public.c enable row level security, force row level security; \
+             create policy hide_all on public.c to public using (false);",
+        )
+        .await
+        .expect("policies that apply to the ring's owner");
+    it.admin
+        .batch_execute(
+            "set row_security = off; \
+             insert into public.c values (100, 1, 7); \
+             update public.c set amount = 22 where id = 2; \
+             reset row_security;",
+        )
+        .await
+        .expect("the application's writes succeed");
+    it.admin
+        .batch_execute(
+            "drop policy hide_all on public.c; \
+             alter table public.c no force row level security, disable row level security;",
+        )
+        .await
+        .expect("drop the policies");
+    refused_capture_halts_then_resume_is_exact(&mut it, "row-level security").await;
+    it.trellis.shutdown().await.expect("shutdown");
+}

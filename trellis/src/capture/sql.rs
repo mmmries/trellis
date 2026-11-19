@@ -79,6 +79,10 @@ use super::CaptureError;
 /// images has been renamed or dropped, keyed by
 /// [`SCHEMA_CHANGED_SENTINEL_KEY`]. Its `new_image` is `{"missing": [<column
 /// names, sorted>], "key_missing": <bool>}`, and it has no `old_image`.
+///
+/// The same marker, with `new_image` `{"refused": <Postgres's message>,
+/// "role": <the ring's owner>}`, records a live re-read Postgres refused
+/// (see "A refused re-read" on [`function_body`]).
 pub const SCHEMA_CHANGED_OP: &str = "schema_changed";
 
 /// The ring `op` of the marker a partitioned source's truncate function
@@ -744,6 +748,35 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 ///
 /// The schema-changed branch ([`schema_changed_branch`]) always re-reads:
 /// it is rare, and its `EXECUTE` builds one statement shape.
+///
+/// # A refused re-read
+///
+/// The function is `SECURITY DEFINER` as the ring's owner, so its re-read
+/// needs `SELECT` on the source (and `USAGE` on its schema) as that role,
+/// which holds it through ownership of the table. An ownership change to a
+/// role it doesn't inherit, a revoked grant, or row-level security that
+/// applies to it under a writer's `row_security = off` makes Postgres
+/// refuse the re-read with `insufficient_privilege` (`42501`), which would
+/// fail the application's statement (ADR-0002 I6). So each re-read runs in
+/// a block that traps that one condition and, instead of the statement's
+/// rows, stages a [`SCHEMA_CHANGED_OP`] marker recording the refusal
+/// ([`refused_marker`]). The drain then halts every reader of the table
+/// (`staging::schema_change`), whose `RESUME` rebuilds it. Every other error
+/// still raises.
+///
+/// The block is a subtransaction, and the ring insert inside it takes a
+/// subtransaction id: an ORM's transaction of single-row statements that
+/// each re-read would overflow the backend's cache of 64 past its 64th
+/// statement, and every snapshot in the cluster would then consult
+/// `pg_subtrans`. So the block runs only when the catalog says the re-read
+/// could be refused (`exposed`, [`exposed_check`]), and otherwise the
+/// re-read runs bare, as a statement that images its transition tables
+/// does. An ownership change, row-level security being enabled or forced,
+/// and a policy created all take `ACCESS EXCLUSIVE` on the table, which
+/// can't land while the writer holds it, so the check can't go stale
+/// before the re-read for those. A `REVOKE` takes no table lock: one that
+/// commits between the check and the re-read, microseconds apart, still
+/// fails that one statement.
 fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
     let span = text_expr(&span_setting(schema, &spec.table));
     let span_state = format!(
@@ -776,7 +809,8 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     );
     if rows.is_some() {
         body.push_str(
-            "    present bigint;\n    have text[];\n    st bigint[];\n    reread boolean;\n",
+            "    present bigint;\n    have text[];\n    st bigint[];\n    reread boolean;\n    \
+             exposed boolean := false;\n",
         );
     }
     let node_truncate = spec.partitioned && event == CaptureEvent::Truncate;
@@ -832,6 +866,9 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
             typed_key(spec, "n")
         ));
     }
+    if rows.is_some() {
+        body.push_str(&exposed_check(spec));
+    }
     body.push_str("    case slot\n");
     for slot in 0..RING_SIZE {
         let ring = format!(
@@ -847,10 +884,13 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
         };
         if rows.is_some() {
             body.push_str(&format!(
-                "    when {slot} then\n        if reread then\n        {};\n        \
+                "    when {slot} then\n        if exposed then\n        begin\n        {live};\n        \
+                 exception when insufficient_privilege then\n        {};\n        end;\n        \
+                 elsif reread then\n        {live};\n        \
                  else\n        {};\n        end if;\n",
-                insert(true),
-                insert(false)
+                refused_marker(spec, &ring),
+                insert(false),
+                live = insert(true),
             ));
         } else {
             body.push_str(&format!(
@@ -864,6 +904,52 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
          end case;\n    return null;\nend;\n",
     );
     body
+}
+
+/// The statement that sets `exposed` for a statement that re-reads: whether
+/// the ring's owner might be refused the re-read, so it runs in the
+/// trapping block (see "A refused re-read" on [`function_body`]). It reads
+/// what Postgres checks, from the catalog: `SELECT` on the table (on a
+/// partitioned source, its root, which the re-read reads), `USAGE` on its
+/// schema, and whether row-level security applies to the role under the
+/// session's `row_security`. A column grant alone, rather than the table's,
+/// counts as exposed. The table is named by the trigger's `tg_relid`, and
+/// the schema by its name as text: a `regclass` lookup of the name would
+/// itself be refused without `USAGE`.
+fn exposed_check(spec: &CaptureSpec) -> String {
+    let rel = if spec.partitioned {
+        "pg_catalog.pg_partition_root(tg_relid)"
+    } else {
+        "tg_relid"
+    };
+    let (schema, _) = split_table(&spec.table).expect("CaptureSpec::new checked the table name");
+    format!(
+        "    -- Whether the re-read could be refused, so it traps the refusal.\n    \
+         if reread then\n        \
+         exposed := not (pg_catalog.has_table_privilege({rel}, 'SELECT')\n            \
+         and pg_catalog.has_schema_privilege(cast({} as text), 'USAGE')\n            \
+         and not pg_catalog.row_security_active({rel}));\n    \
+         end if;\n",
+        text_expr(schema)
+    )
+}
+
+/// The `new_image` of the marker a refused re-read stages (see "A refused
+/// re-read" on [`function_body`]): Postgres's message, which names the table
+/// and the condition, and the role refused, which is the function's owner.
+/// Only valid in an `insufficient_privilege` handler, where `sqlerrm` is set.
+const REFUSED_IMAGE: &str =
+    "pg_catalog.jsonb_build_object('refused', sqlerrm, 'role', current_user::text)";
+
+/// The statement that stages the marker for a refused re-read into the ring
+/// segment `ring` (see "A refused re-read" on [`function_body`]).
+fn refused_marker(spec: &CaptureSpec, ring: &str) -> String {
+    format!(
+        "insert into {ring} ({RING_COLUMNS})\n        \
+         values ({}, {}, '{SCHEMA_CHANGED_OP}', l, null, {REFUSED_IMAGE}, l, ts, null)",
+        text_expr(&spec.table),
+        text_expr(SCHEMA_CHANGED_SENTINEL_KEY),
+    )
 }
 
 /// The first statement of a partitioned source's capture function: stage
@@ -1068,10 +1154,15 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
          execute pg_catalog.format({marker_sql}, {ring})\n            \
          using {src}, {marker_key}, l, {marker}, ts;\n        \
          if not ({key_present}) then\n            return null;\n        end if;\n        \
+         begin\n        \
          execute pg_catalog.format({template},\n                {ring},\n                \
          {img_o},\n                {img_n},\n                {img_t},\n                \
          {cols_o},\n                {cols_n})\n            \
          using l, ts;\n        \
+         exception when insufficient_privilege then\n        \
+         execute pg_catalog.format({marker_sql}, {ring})\n            \
+         using {src}, {marker_key}, l, {REFUSED_IMAGE}, ts;\n        \
+         end;\n        \
          return null;\n    end if;\n",
         count = spec.columns.len(),
         names = column_probe("a.attname::text", &spec.columns),
@@ -1985,18 +2076,20 @@ mod tests {
                     "slot {slot} unqualified in\n{sql}"
                 );
             }
-            // The schema-changed branch's two dynamic inserts name the ring
-            // as `%s`/`%1$s`, the quoted schema plus the slot's table.
+            // The schema-changed branch's three dynamic inserts (its marker,
+            // its images and their refusal's marker) name the ring as
+            // `%s`/`%1$s`, the quoted schema plus the slot's table.
             let dynamic = if event == CaptureEvent::Truncate {
                 0
             } else {
-                2
+                3
             };
-            // A re-read and a transition-only insert per slot.
+            // A trapped re-read, its refusal's marker, a bare re-read and a
+            // transition-only insert per slot.
             let per_slot = if event == CaptureEvent::Truncate {
                 1
             } else {
-                2
+                4
             };
             assert_eq!(
                 sql.matches("insert into ").count(),
@@ -2007,7 +2100,7 @@ mod tests {
                 assert_eq!(
                     sql.matches("'\"trellis\"' || '.' || pg_catalog.quote_ident('seg_' || slot)")
                         .count(),
-                    2,
+                    dynamic,
                     "{sql}"
                 );
             }
@@ -2056,7 +2149,9 @@ mod tests {
     /// The guard's query counts the imaged columns the table still
     /// has, and a miss takes the schema-changed branch before any static
     /// insert: the marker first, then (only with the key intact) the images
-    /// over the columns left, by `EXECUTE`, with no `EXCEPTION` block.
+    /// over the columns left, by `EXECUTE`. The only `EXCEPTION` blocks are
+    /// the re-reads' (see the test below), so the guard and a statement that
+    /// doesn't re-read run no subtransaction.
     #[test]
     fn a_missing_column_takes_the_marker_branch_before_the_static_inserts() {
         for (event, rows) in [
@@ -2093,8 +2188,11 @@ mod tests {
             assert!(at("pg_current_xact_id") < miss, "the xid comes first");
             assert_eq!(
                 sql.matches("exception").count(),
-                sql.matches("raise exception").count(),
-                "no EXCEPTION block, so no subtransaction:\n{sql}"
+                sql.matches("raise exception").count()
+                    + sql
+                        .matches("exception when insufficient_privilege then")
+                        .count(),
+                "no EXCEPTION block but the re-reads':\n{sql}"
             );
             // The dynamic template keeps the static select's `format('%s', …)`
             // as a literal `%%s` for `format()` to pass through.
@@ -2130,9 +2228,10 @@ mod tests {
             assert!(read < counted && counted < saved && saved < at("if present < 0 then"));
             for slot in 0..RING_SIZE {
                 let arm = &sql[at(&format!("    when {slot} then\n"))..];
-                let reread = arm.find("        if reread then\n").expect("the gate");
+                let reread = arm.find("        elsif reread then\n").expect("the gate");
                 let otherwise = arm.find("        else\n").expect("the transition insert");
                 let end = arm.find("        end if;\n").expect("end if");
+                assert!(reread < otherwise, "{sql}");
                 assert!(
                     arm[reread..otherwise].contains("left join lateral"),
                     "{sql}"
@@ -2180,6 +2279,98 @@ mod tests {
                 "{event:?}"
             );
         }
+    }
+
+    /// Every live re-read, each slot's and the schema-changed branch's,
+    /// runs in a block that traps `insufficient_privilege` alone and stages
+    /// a refusal marker into the same segment instead of failing the
+    /// writer (ADR-0002 I6). The transition-only insert is outside it.
+    #[test]
+    fn a_refused_reread_stages_a_marker_instead_of_failing_the_writer() {
+        let handler = "exception when insufficient_privilege then\n";
+        for event in [
+            CaptureEvent::Insert,
+            CaptureEvent::Update,
+            CaptureEvent::Delete,
+        ] {
+            let sql = ddl(&spec(), event);
+            let at = |needle: &str| {
+                sql.find(needle)
+                    .unwrap_or_else(|| panic!("no {needle:?} in\n{sql}"))
+            };
+            assert_eq!(
+                sql.matches(handler).count(),
+                RING_SIZE as usize + 1,
+                "{sql}"
+            );
+            assert!(!sql.contains("when others"), "{sql}");
+            // Only an exposed re-read runs in the block.
+            let check = at("    if reread then\n        exposed := not (");
+            assert!(
+                sql[check..].starts_with(
+                    "    if reread then\n        \
+                     exposed := not (pg_catalog.has_table_privilege(tg_relid, 'SELECT')\n            \
+                     and pg_catalog.has_schema_privilege(cast('public' as text), 'USAGE')\n            \
+                     and not pg_catalog.row_security_active(tg_relid));\n    end if;\n"
+                ),
+                "{sql}"
+            );
+            assert!(check < at("    case slot\n"), "{sql}");
+            for slot in 0..RING_SIZE {
+                let arm = &sql[at(&format!("    when {slot} then\n"))..];
+                let exposed = arm.find("        if exposed then\n").expect("the check");
+                let block = arm.find("        begin\n").expect("the block");
+                let lateral = arm.find("left join lateral").expect("the re-read");
+                let trap = arm.find(handler).expect("the handler");
+                let end = arm.find("        end;\n").expect("the block's end");
+                let bare = arm
+                    .find("        elsif reread then\n")
+                    .expect("the bare re-read");
+                assert!(
+                    exposed < block
+                        && block < lateral
+                        && lateral < trap
+                        && trap < end
+                        && end < bare,
+                    "{sql}"
+                );
+                assert!(!arm[bare..].starts_with(handler), "{sql}");
+                assert_eq!(
+                    arm[trap..end].trim_end(),
+                    format!(
+                        "{handler}        insert into \"trellis\".\"seg_{slot}\" ({RING_COLUMNS})\n        \
+                         values ('public.orders', (chr(31) || 'trellis-schema-changed'), \
+                         'schema_changed', l, null, {REFUSED_IMAGE}, l, ts, null);"
+                    ),
+                    "{sql}"
+                );
+            }
+            // The schema-changed branch's re-read, by `EXECUTE`.
+            let images = at("execute pg_catalog.format('insert into %1$s (");
+            let trap = at(handler);
+            assert!(sql[..images].ends_with("        begin\n        "), "{sql}");
+            assert!(images < trap && trap < at("    case slot\n"), "{sql}");
+            assert!(
+                sql[trap..].starts_with(&format!(
+                    "{handler}        execute pg_catalog.format('insert into %s ("
+                )),
+                "{sql}"
+            );
+            assert!(sql[trap..].contains(REFUSED_IMAGE), "{sql}");
+        }
+        for event in [CaptureEvent::Truncate, CaptureEvent::Begin] {
+            assert!(!ddl(&spec(), event).contains(handler), "{event:?}");
+        }
+        // A partitioned source's re-read reads its root.
+        let root = ddl(&spec().with_partitioned(true), CaptureEvent::Insert);
+        assert!(
+            root.contains(
+                "exposed := not (pg_catalog.has_table_privilege(\
+                 pg_catalog.pg_partition_root(tg_relid), 'SELECT')"
+            ) && root
+                .contains("pg_catalog.row_security_active(pg_catalog.pg_partition_root(tg_relid))"),
+            "{root}"
+        );
     }
 
     #[test]
@@ -2443,11 +2634,11 @@ mod tests {
         .unwrap()
         .with_nullable_key(["a", "b", "c", "d"].map(String::from));
         let sql = ddl(&wide, CaptureEvent::Insert);
-        // 2^3 branches, so 7 `union all`s, in each static insert and the
-        // schema-changed branch's template.
+        // 2^3 branches, so 7 `union all`s, in each static re-read (trapped
+        // and bare) and the schema-changed branch's template.
         assert_eq!(
             sql.matches("union all select").count(),
-            (RING_SIZE as usize + 1) * 7
+            (2 * RING_SIZE as usize + 1) * 7
         );
         assert!(
             sql.contains("(t.\"d\" = n.\"d\" or (t.\"d\" is null and n.\"d\" is null))"),

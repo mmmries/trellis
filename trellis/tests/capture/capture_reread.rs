@@ -862,3 +862,70 @@ async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {
     assert!(idx >= 4001, "one probe per captured row, got {idx}");
     assert_eq!(ring(&raw, "public.g").await.len(), 4001);
 }
+
+/// A re-read runs in a subtransaction only when the catalog says Postgres
+/// could refuse it (`capture::sql`, "A refused re-read"). An ORM's
+/// transaction of single-row inserts, each rewritten by an application
+/// trigger so its capture re-reads, takes no subtransaction while the ring's
+/// owner can read the table: past 64 it would overflow the backend's
+/// subtransaction cache, and every snapshot in the cluster would consult
+/// `pg_subtrans`. Postgres 16 reports the cache (`pg_stat_get_backend_subxact`).
+#[tokio::test]
+async fn a_readable_tables_reread_takes_no_subtransaction() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = held_table(db.dsn()).await;
+    let version: i32 = raw
+        .query_one("select current_setting('server_version_num')::int", &[])
+        .await
+        .expect("read the server version")
+        .get(0);
+    if version < 160000 {
+        eprintln!("skipped: pg_stat_get_backend_subxact needs Postgres 16");
+        return;
+    }
+    raw.batch_execute(
+        "create function public.rewrite() returns trigger language plpgsql as $$ \
+         begin if pg_catalog.pg_trigger_depth() < 2 then \
+             update public.t set a = new.a + 1000 where id = new.id; end if; \
+         return null; end $$; \
+         create trigger rewrite after insert on public.t \
+             for each row execute function public.rewrite()",
+    )
+    .await
+    .expect("an application trigger that rewrites the row it fired for");
+
+    let inserts: String = (100..200)
+        .map(|id| format!("insert into public.t values ({id}, {id}, 0); "))
+        .collect();
+    raw.batch_execute(&format!("begin; {inserts}"))
+        .await
+        .expect("100 single-row inserts in one transaction");
+    let id = txid(&raw).await;
+    let (count, overflowed): (i32, bool) = raw
+        .query_one(
+            "select s.subxact_count, s.subxact_overflowed \
+             from pg_catalog.pg_stat_get_backend_idset() b \
+             cross join lateral pg_catalog.pg_stat_get_backend_subxact(b) s \
+             where pg_catalog.pg_stat_get_backend_pid(b) = pg_catalog.pg_backend_pid()",
+            &[],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .expect("read this backend's subtransaction cache");
+    raw.batch_execute("commit").await.expect("commit");
+    assert_eq!((count, overflowed), (0, false));
+
+    // Each insert's capture re-read the rewritten row.
+    let staged = staged_by(&raw, "public.t", &id).await;
+    for id in 100..200 {
+        let key = id.to_string();
+        let image = format!(r#"{{"a": "{}", "id": "{id}"}}"#, id + 1000);
+        assert!(
+            staged
+                .iter()
+                .any(|r| r.0 == key && r.1 == "insert" && r.3.as_deref() == Some(&image)),
+            "{id}: {staged:?}"
+        );
+    }
+}

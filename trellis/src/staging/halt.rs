@@ -154,6 +154,54 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
     Ok(paused)
 }
 
+/// [`halt_closure`] for capture re-reads Postgres refused
+/// (`capture::sql`, "A refused re-read"): each of `refused`'s tables, with
+/// the refusals its markers recorded, halts its readers and everything
+/// downstream of them, kind `halt`. The statements whose re-read was refused
+/// staged nothing, so the readers halt whether or not the role can read the
+/// table by the time the drain sees the markers. Returns the bare targets it
+/// paused.
+pub(crate) async fn halt_refused_captures(
+    pool: &Pool,
+    refused: &std::collections::BTreeMap<String, BTreeSet<String>>,
+) -> Result<Vec<String>, ApplyError> {
+    if refused.is_empty() {
+        return Ok(Vec::new());
+    }
+    let halts: Vec<(Option<Seed>, String)> = refused
+        .iter()
+        .map(|(table, refusals)| {
+            let refusals: Vec<&str> = refusals.iter().map(String::as_str).collect();
+            (
+                Some(Seed::Tables(vec![table.clone()])),
+                format!(
+                    "Trellis's capture of {table} was refused a re-read of it as {}, so changes \
+                     written to it meanwhile are missing",
+                    refusals.join("; ")
+                ),
+            )
+        })
+        .collect();
+    let stop = halts
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let paused = pause_closure(
+        &txn,
+        pool.schema(),
+        pool.floors(),
+        halts,
+        "the drain halted",
+        &stop,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(paused)
+}
+
 /// [`halt_closure`] for a Re-derive build's start
 /// (`staging::build::start_ready_builds`): a start that failed in a way no
 /// retry gets past (its ledger table was dropped, say) pauses the
