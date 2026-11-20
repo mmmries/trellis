@@ -207,8 +207,12 @@ async fn every_wiring_keeps_each_ops_outcome_and_its_shadows() {
     }
     shapes.extend([None, None]);
     for (index, shape) in shapes.into_iter().enumerate() {
-        let db = cluster.create_empty_database().await;
-        let mut raw = connect(db.dsn()).await;
+        // The application's role, as the tiers run it: source DDL and writes.
+        let db = crate::backend::CaseDatabase::provision(&cluster).await;
+        let mut raw = connect(&db.roles().app).await;
+        raw.batch_execute("set search_path to public")
+            .await
+            .expect("search_path");
         let tables: HashMap<String, Table> = ["t0", "t1"]
             .into_iter()
             .map(|t| (t.to_string(), table(t)))
