@@ -199,8 +199,9 @@ pub(super) async fn await_ring(
 /// How many consecutive failed drains of one page, with no commit between,
 /// count as retrying without bound (#2185 6c): about the #2130 storm in 7 s.
 /// `drain_holdups.attempts` is the counter: the drain bumps it on each failure
-/// of a page charged to no key or definition and the page's commit clears
-/// it.
+/// of a page charged to no key or definition. It is kept per segment, so it
+/// sums the failures of every failing page (bucket) of the segment, and goes
+/// only when the last of them commits; a restart or a reclaim keeps it.
 pub(super) const MAX_DRAIN_ATTEMPTS: i32 = 20;
 
 /// Each holdup that has reached [`MAX_DRAIN_ATTEMPTS`], one `seg_seq: N

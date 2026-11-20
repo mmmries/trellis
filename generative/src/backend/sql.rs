@@ -32,6 +32,7 @@ use trellis::dev::staging::{
 use super::DefinitionState;
 use super::ring_wait::{
     Expiry, ProgressDeadline, QuiesceBudget, await_ring, dump_state, expiry_reason,
+    unbounded_holdups,
 };
 
 use crate::model::{
@@ -1406,6 +1407,11 @@ pub(super) async fn quiesce_within(
             .expired(Instant::now())
             .unwrap_or(Expiry::NoProgress);
         dump_state(raw, None, &expiry_reason(expiry, deadline)).await;
+        // A status wait stuck behind a page retried without bound (a build's
+        // drain, say) is that page's failure.
+        if let Some(holdups) = unbounded_holdups(raw).await {
+            return Err(QuiesceError::RetriesUnbounded { holdups });
+        }
     }
     result
 }
@@ -2371,12 +2377,13 @@ mod tests {
     }
 
     /// A ring row nothing drains, with its segment's holdup at `attempts`
-    /// failed drains: the quiesce's outcome under a short window.
-    async fn quiesce_with_holdup_at(attempts: i32) -> Result<(), QuiesceError> {
+    /// failed drains, under a definition in `status`: the quiesce's outcome
+    /// under a short window.
+    async fn quiesce_with_holdup_at(status: &str, attempts: i32) -> Result<(), QuiesceError> {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let raw = session(db.dsn()).await;
-        let def = catalog_definition(&raw, "live").await;
+        let def = catalog_definition(&raw, status).await;
         raw.batch_execute(STAGE_ENUMERATION).await.expect("stage");
         raw.execute(
             "insert into drain_holdups (seg_seq, buckets, tables, error, since, last_seen, attempts) \
@@ -2397,15 +2404,31 @@ mod tests {
     /// that is an ordinary stuck ring, the quiesce's own timeout.
     #[tokio::test]
     async fn twenty_failed_drains_of_one_page_are_retries_without_bound() {
-        match quiesce_with_holdup_at(MAX_DRAIN_ATTEMPTS).await {
+        match quiesce_with_holdup_at("live", MAX_DRAIN_ATTEMPTS).await {
             Err(QuiesceError::RetriesUnbounded { holdups }) => {
                 assert!(holdups.contains("20 failed drains: it fails"), "{holdups}");
             }
             other => panic!("expected RetriesUnbounded, got {other:?}"),
         }
-        match quiesce_with_holdup_at(MAX_DRAIN_ATTEMPTS - 1).await {
+        match quiesce_with_holdup_at("live", MAX_DRAIN_ATTEMPTS - 1).await {
             Err(QuiesceError::Staging(StagingError::ConvergenceTimeout { .. })) => {}
             other => panic!("expected the ring's own timeout, got {other:?}"),
+        }
+    }
+
+    /// A status wait that times out behind such a page, before the ring
+    /// wait starts, reports the page too.
+    #[tokio::test]
+    async fn a_status_wait_stuck_behind_unbounded_retries_names_them() {
+        match quiesce_with_holdup_at("backfilling", MAX_DRAIN_ATTEMPTS).await {
+            Err(QuiesceError::RetriesUnbounded { holdups }) => {
+                assert!(holdups.contains("20 failed drains: it fails"), "{holdups}");
+            }
+            other => panic!("expected RetriesUnbounded, got {other:?}"),
+        }
+        match quiesce_with_holdup_at("backfilling", MAX_DRAIN_ATTEMPTS - 1).await {
+            Err(QuiesceError::DefinitionsUnsettled { .. }) => {}
+            other => panic!("expected the status wait's own timeout, got {other:?}"),
         }
     }
 
