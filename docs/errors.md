@@ -815,7 +815,8 @@ After define: [Key](transforms.md#key).
 No unique index backs a `KEY (…)` exactly ([the
 key](transforms.md#the-key-a-transform-keys-each-table-by)). Create a valid,
 non-partial unique index over exactly those columns, `NULLS NOT DISTINCT` if one
-can be `NULL`. After define: [Key](transforms.md#key).
+can be `NULL`, as a `NOT NULL … NOT VALID` column can until `VALIDATE
+CONSTRAINT`. After define: [Key](transforms.md#key).
 
 ### T0117 KeyDiffersFromReaders
 
@@ -1235,7 +1236,8 @@ A `self_check` limit that isn't a positive row count. Pass a positive limit.
 ### T0194 UnsupportedExpr
 
 A `self_check` of a field it can't render, or of a definition whose recorded
-state is missing. Report it as a bug.
+state is missing. Report it as a bug. A `NULL` key in a column read as
+`NOT NULL` means the column's `NOT NULL` changed during the check: run it again.
 
 ### T0195 PageTimedOut
 

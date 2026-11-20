@@ -315,9 +315,13 @@ pub async fn capture_spec(
     // index, ADR-0026) takes the build's `NULL` encoding in the ring key.
     let nullable: Vec<String> = client
         .query_typed(
-            "select a.attname::text from pg_catalog.pg_attribute a \
+            concat!(
+                "select a.attname::text from pg_catalog.pg_attribute a \
              where a.attrelid = pg_catalog.to_regclass($1) and a.attnum > 0 \
-               and not a.attisdropped and not a.attnotnull and a.attname = any ($2::text[])",
+               and not a.attisdropped and not ",
+                crate::defs::ddl::not_null_sql!("a"),
+                " and a.attname = any ($2::text[])"
+            ),
             &[(&regclass, Type::TEXT), (&key, Type::TEXT_ARRAY)],
         )
         .await?
