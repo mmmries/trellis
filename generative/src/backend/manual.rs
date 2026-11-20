@@ -1313,6 +1313,64 @@ impl ManualBackend {
         self.app.as_ref().unwrap_or(&self.raw)
     }
 
+    /// `target`'s qualified, quoted name in this backend's target schema,
+    /// for DDL a run puts on a target (a unique index, a trigger).
+    pub fn qualified_target(&self, target: &str) -> String {
+        format!(
+            "{}.{}",
+            quote_ident(&self.target_schema),
+            quote_ident(target)
+        )
+    }
+
+    /// What, once the engine has settled, still keeps the ring from
+    /// retiring: a drain holdup, or a segment sealed or draining. `None`
+    /// when nothing does: every page committed, so each segment is drained
+    /// and housekeeping may retire it. A page stuck failing shows here
+    /// (#2130: a holdup fills the ring and stops every target).
+    ///
+    /// A quiesce settles on the ring's rows, not its segments' states, so a
+    /// segment can still read `sealed` or `draining` for a moment after it.
+    /// This waits up to `within` for that to clear, and answers what's
+    /// still left then.
+    pub async fn ring_unretired(
+        &self,
+        within: Duration,
+    ) -> Result<Option<String>, ManualBackendError> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let left = self.ring_unretired_now().await?;
+            if left.is_none() || std::time::Instant::now() >= deadline {
+                return Ok(left);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn ring_unretired_now(&self) -> Result<Option<String>, ManualBackendError> {
+        let row = self
+            .raw
+            .query_one(
+                "select (select string_agg(seg_seq || ' ' || state, ', ' order by seg_seq) \
+                           from segments where state in ('sealed', 'draining')), \
+                        (select string_agg(seg_seq || ': ' || left(error, 200), '; ' \
+                                           order by seg_seq) \
+                           from drain_holdups)",
+                &[],
+            )
+            .await?;
+        let segments: Option<String> = row.get(0);
+        let holdups: Option<String> = row.get(1);
+        Ok(match (segments, holdups) {
+            (None, None) => None,
+            (segments, holdups) => Some(format!(
+                "undrained segments: {}; holdups: {}",
+                segments.as_deref().unwrap_or("none"),
+                holdups.as_deref().unwrap_or("none")
+            )),
+        })
+    }
+
     /// Fires one [`NoiseEvent`]'s [`NoiseEventKind`]: renders it to SQL text
     /// ([`render_noise_action`] for a `Table` event, used as-is for an
     /// `Admin` one) and runs it via [`ManualBackend::execute_raw`]. Errors
@@ -1590,7 +1648,8 @@ impl super::Backend for ManualBackend {
         &mut self,
         defs: &[TransformDef],
     ) -> Result<Vec<DefinitionState>, ManualBackendError> {
-        Ok(sql::definition_states(&self.raw, defs).await?)
+        let reported = sql::reported_statuses(self.config.clone()).await?;
+        Ok(sql::definition_states(&self.raw, defs, &reported).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, ManualBackendError> {

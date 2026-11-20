@@ -34,6 +34,7 @@ pub use db_admin::run_convergence_with_db_admin;
 pub use epoch::run_epochs;
 pub use held_keys::{
     DefModel, HeldExpectation, HeldKeySummary, TRANSFORM_FUSE, run_convergence_with_held_keys,
+    run_convergence_with_isolation,
 };
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
@@ -138,6 +139,10 @@ pub struct Divergence {
     /// divergence was found, so a target that stopped following its source
     /// shows why. Empty only if the catalog read itself failed.
     pub states: Vec<DefinitionState>,
+    /// The diverging targets whose definition reports `live` with nothing
+    /// recorded against it: "status tells the truth" fails for them, since
+    /// `live` promises an exact target ([`status_lies`]).
+    pub status_lies: Vec<String>,
 }
 
 impl Divergence {
@@ -148,7 +153,22 @@ impl Divergence {
         checked: Vec<(String, OracleReport)>,
         states: Vec<DefinitionState>,
     ) -> Option<Self> {
-        let lines: Vec<String> = states.iter().map(ToString::to_string).collect();
+        let lies: Vec<String> = status_lies(&states, |target| {
+            checked.iter().any(|(diverged, _)| diverged == target)
+        })
+        .into_iter()
+        .map(|state| state.target.clone())
+        .collect();
+        let lines: Vec<String> = states
+            .iter()
+            .map(|state| {
+                if lies.contains(&state.target) {
+                    format!("{state} <- status lies: reports live, target isn't exact")
+                } else {
+                    state.to_string()
+                }
+            })
+            .collect();
         let mut checked = checked
             .into_iter()
             .map(|(target, report)| (target, report.with_definition_states(lines.clone())));
@@ -159,6 +179,7 @@ impl Divergence {
             report: Box::new(report),
             also_diverged: checked.collect(),
             states,
+            status_lies: lies,
         })
     }
 
@@ -176,6 +197,25 @@ impl Divergence {
     pub fn targets(&self) -> impl Iterator<Item = &str> {
         self.all().map(|(target, _)| target)
     }
+}
+
+/// "Status tells the truth" (#2185): the definitions of `states` that
+/// claim an exact target ([`DefinitionState::claims_exact`]: reported `live`,
+/// nothing held, no failure recorded) while `inexact` says their target
+/// isn't. Every settled check runs it: [`Divergence::from_checked`] names
+/// them in the report, and a run that excuses a target from the oracle
+/// (the isolation draw's failing definition) fails on one
+/// ([`RunError::StatusLies`]). A check follows a quiesce, so a window in
+/// which the harness itself took Postgres or the engine away is over by
+/// then; no other window is exempt.
+pub fn status_lies(
+    states: &[DefinitionState],
+    inexact: impl Fn(&str) -> bool,
+) -> Vec<&DefinitionState> {
+    states
+        .iter()
+        .filter(|state| state.claims_exact() && inexact(&state.target))
+        .collect()
 }
 
 /// Why a convergence run stopped. Backend and oracle errors are rendered to
@@ -220,6 +260,26 @@ pub enum RunError {
         target: String,
         expected: String,
         reported: String,
+        program: String,
+    },
+    /// After op `op_index`, a definition whose target the run excuses from
+    /// the oracle (it was made to fail) reported `live` with nothing
+    /// recorded against it ([`status_lies`]).
+    StatusLies {
+        op_index: usize,
+        state: DefinitionState,
+    },
+    /// After op `op_index` of an isolation run, the definition made to fail
+    /// in combination (`target`) didn't end as the engine's isolation
+    /// promises: paused with a T0247 reason naming the page's SQLSTATE and
+    /// the pair's keys, its target as it was before the pair. Or, in any
+    /// held-key run (`target` `<ring>`), the ring didn't retire once the run
+    /// settled. Another definition paused beside it is
+    /// [`RunError::UnexpectedPause`].
+    Isolation {
+        op_index: usize,
+        target: String,
+        problem: String,
         program: String,
     },
     /// A scheduled [`Backend::restart`] failed.
@@ -758,7 +818,7 @@ pub fn source_table(
 
 #[cfg(test)]
 mod tests {
-    use super::{DefinitionState, Divergence, OracleReport, Outcome, bursts};
+    use super::{DefinitionState, Divergence, OracleReport, Outcome, bursts, status_lies};
     use crate::model::{Op, OpOutcome, PartitionAction, PartitionStrategy, Program};
 
     /// A one-table program partitioned by `strategy`, its ops replaced by
@@ -906,11 +966,13 @@ mod tests {
             DefinitionState {
                 target: "t0".to_string(),
                 status: "live".to_string(),
+                reported: "live".to_string(),
                 reason: None,
             },
             DefinitionState {
                 target: "t1".to_string(),
                 status: "paused".to_string(),
+                reported: "paused".to_string(),
                 reason: Some("disruption: the capture trigger was dropped".to_string()),
             },
         ];
@@ -933,6 +995,60 @@ mod tests {
                 "{target}: {printed}"
             );
         }
+    }
+
+    fn state(target: &str, status: &str, reported: &str, reason: Option<&str>) -> DefinitionState {
+        DefinitionState {
+            target: target.to_string(),
+            status: status.to_string(),
+            reported: reported.to_string(),
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    /// Only a definition reporting `live` with nothing recorded claims an
+    /// exact target: `catching_up`, a held key's reason, a pause or a
+    /// quarantine each say why it may not be.
+    #[test]
+    fn status_lies_names_only_inexact_definitions_claiming_live() {
+        let states = vec![
+            state("a", "live", "live", None),
+            state("b", "live", "live", None),
+            state("c", "live", "catching_up", None),
+            state(
+                "d",
+                "live",
+                "live",
+                Some("poisoned 1 key(s), last error: x"),
+            ),
+            state("e", "paused", "paused", Some("T0247")),
+            state("f", "quarantined", "quarantined", None),
+        ];
+        let lies: Vec<&str> = status_lies(&states, |t| t != "a")
+            .into_iter()
+            .map(|s| s.target.as_str())
+            .collect();
+        assert_eq!(lies, ["b"]);
+
+        let divergence = Divergence::from_checked(
+            0,
+            vec![
+                ("b".to_string(), missing_row("b")),
+                ("c".to_string(), missing_row("c")),
+            ],
+            states,
+        )
+        .expect("a divergence");
+        assert_eq!(divergence.status_lies, ["b"]);
+        let printed = divergence.report.to_string();
+        assert!(
+            printed.contains("  b: live <- status lies: reports live, target isn't exact\n"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("  c: live (reported catching_up)\n"),
+            "{printed}"
+        );
     }
 
     #[test]

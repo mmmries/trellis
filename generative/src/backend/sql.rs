@@ -1158,6 +1158,7 @@ async fn unsettled_definitions(
 pub(super) async fn definition_states(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
+    reported: &HashMap<String, String>,
 ) -> Result<Vec<DefinitionState>, tokio_postgres::Error> {
     let targets: Vec<String> = defs.iter().map(|d| d.target.clone()).collect();
     let rows = raw
@@ -1190,11 +1191,39 @@ pub(super) async fn definition_states(
             let (status, reason) = found
                 .remove(&target)
                 .unwrap_or_else(|| ("<missing>".to_string(), None));
+            let reported = reported
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| "<missing>".to_string());
             DefinitionState {
                 target,
                 status,
+                reported,
                 reason,
             }
+        })
+        .collect())
+}
+
+/// Every definition's status as an operator reads it, by bare target name:
+/// `Trellis::definitions` through a facade connected for the call, so a
+/// stored `live` reads `catching_up` exactly when the engine says so.
+pub(super) async fn reported_statuses(
+    config: trellis::Config,
+) -> Result<HashMap<String, String>, trellis::TrellisError> {
+    let facade = trellis::Trellis::connect(config, trellis::TrellisOptions::default()).await?;
+    let listed = facade.definitions().await;
+    facade.shutdown().await?;
+    Ok(listed?
+        .into_iter()
+        .map(|d| {
+            let bare = d
+                .target_table
+                .rsplit('.')
+                .next()
+                .unwrap_or(&d.target_table)
+                .to_string();
+            (bare, d.status.as_str().to_string())
         })
         .collect())
 }

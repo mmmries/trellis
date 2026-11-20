@@ -407,6 +407,19 @@ beside them run on every `cargo test`.
 - **Held keys** (`tests/held_keys.rs`). Programs whose rows make a plain 1-1
   field raise, and the fuse that quarantines a definition (§10, "The oracle
   and erroring rows").
+- **Isolation** (`tests/held_keys.rs`,
+  `property_a_definition_failing_in_combination_stalls_no_other`). A
+  held-key program plus a table `iso` read by `iso_d` and a sibling `iso_s`
+  (`generate::isolation`). One two-row `INSERT` fails `iso_d`'s apply only
+  in combination: two `1e308` rows in one group of a `float8` `SUM`, the
+  `interval` infinities on Postgres 17+, or a unique index or trigger on its
+  target that refuses the second row. `iso_d` must pause with
+  [T0247](errors.md#t0247-definitionfailsalone), naming the SQLSTATE and
+  both keys, its target frozen at its value before the pair. Every other
+  definition, `iso_s` over the same rows included, keeps converging and
+  none pauses. Once the run settles no holdup or undrained segment is left,
+  so the ring retires. The held-key sweep gates
+  `isolation_pauses_every_reader` on these cases.
 - **Out-of-band tampering** (`tests/self_check_cross_check.rs`). Direct writes to
   derived tables are found by `self_check`, whose SQL renderer is independently
   authored from the oracle's; the suite asserts the two agree on every generated
@@ -883,6 +896,16 @@ with its reason.
 Every divergence report, in every backend, prints each definition's status and
 pause reason under `definitions:` beside the cell diffs.
 
+**Status tells the truth.** Every settled check reads each definition's status
+as `Trellis::definitions` reports it (`catching_up` included) beside the stored
+one. A definition reporting `live` with nothing held and no failure recorded
+claims an exact target, so one that diverges is marked `status lies` in the
+report (`run::status_lies`). Most tiers hold every target to the oracle anyway.
+The check bites where a run excuses a target, as the isolation draw does for
+its failing definition (`RunError::StatusLies`). It runs after a quiesce, so a
+window in which the harness itself took Postgres or the engine away is over by
+then. No other window is exempt.
+
 **Findings terminate as deterministic pins; generative runs are lead generation.**
 A seed reproduces the *program*, not reliably a *race*, and does not survive
 generator refactors. Three artifact kinds:
@@ -1175,5 +1198,7 @@ judges a run:
   fast with a held key as without, and shrinking pays no timeout per step.
   Its fuse family gives one definition two raising fields, four rows at most
   each, so the whole-transform fuse trips before either column fuse. Only
-  the plain 1-1 key space is modelled; every other tier keeps its draws
-  raise-free.
+  the plain 1-1 key space is modelled for a row that fails alone; every
+  other tier keeps its draws raise-free. Rows that fail only in combination
+  are the isolation family's, which needs no model of them: the definition
+  pauses (T0247) and its target holds still.

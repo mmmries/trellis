@@ -2042,6 +2042,10 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             plant_sweep::NO_EXTREMES,
         ))
         .chain(not_on_path(
+            &[PlantPath::Isolation],
+            plant_sweep::NO_ISOLATION,
+        ))
+        .chain(not_on_path(
             &[PlantPath::XidEpoch],
             plant_sweep::NO_XID_EPOCH,
         ))

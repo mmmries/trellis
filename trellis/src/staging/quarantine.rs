@@ -2013,6 +2013,17 @@ pub(super) async fn pause_definitions_failing_alone(
         return Ok(Vec::new());
     }
 
+    // Planted bug: pause every reader of the page, the innocent ones too.
+    // See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let failing: BTreeSet<i64> = if crate::plant::fires(
+        crate::plant::Plant::IsolationPausesEveryReader,
+        readers.len() > failing.len(),
+    ) {
+        readers.keys().copied().collect()
+    } else {
+        failing
+    };
     let message = pg_message(err).unwrap_or_else(|| err.to_string());
     let mut pauses = Vec::with_capacity(failing.len());
     for id in &failing {

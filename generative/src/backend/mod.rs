@@ -41,13 +41,17 @@ use crate::model::{BurstAction, Op, Program, RestartMode};
 pub type Snapshot = BTreeMap<String, BTreeMap<String, BTreeMap<String, Option<String>>>>;
 
 /// One definition's catalog state at a check: its `status` as stored
-/// (`live`, `paused`, ...) and, when something recorded why it stopped, the
-/// `reason` (its `capture_failures` row, or its poisoned keys' error). What a
-/// divergence report and the unexpected-pause check read.
+/// (`live`, `paused`, ...), its status as `Trellis::definitions` reports it
+/// (`reported`: a stored `live` reads `catching_up` while an upstream isn't
+/// `live`) and, when something recorded why it stopped, the `reason` (its
+/// `capture_failures` row, or its poisoned keys' error). What a divergence
+/// report, the unexpected-pause check and the "status tells the truth"
+/// check read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionState {
     pub target: String,
     pub status: String,
+    pub reported: String,
     pub reason: Option<String>,
 }
 
@@ -56,11 +60,20 @@ impl DefinitionState {
     pub fn is_paused(&self) -> bool {
         self.status == "paused"
     }
+
+    /// Whether the definition reports `live` with no failure recorded: the
+    /// claim that its target is exact (ADR-0002, "What `live` promises").
+    pub fn claims_exact(&self) -> bool {
+        self.reported == "live" && self.reason.is_none()
+    }
 }
 
 impl std::fmt::Display for DefinitionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.target, self.status)?;
+        if self.reported != self.status {
+            write!(f, " (reported {})", self.reported)?;
+        }
         if let Some(reason) = &self.reason {
             write!(f, " ({reason})")?;
         }

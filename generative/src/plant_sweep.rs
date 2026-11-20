@@ -110,6 +110,11 @@ pub enum PlantPath {
     /// the source (its side 7). Only a tier that audits a `MIN`/`MAX`
     /// definition by `self_check` reaches it.
     SelfCheckExtremes,
+    /// The drain's isolation of a failing page (`staging::quarantine`): a
+    /// page that no key fails alone, but one definition's share of it does.
+    /// Only the held-key tier's isolation draw makes such a page. A plant
+    /// here can stop any reader of the page, whatever its key space.
+    Isolation,
     /// The drain's transaction-id comparisons past the first 32-bit epoch.
     /// Only the `db_admin` property's xid-aging action
     /// (`crate::model::DbAdminAction::WrapXids`) crosses the boundary, and
@@ -222,6 +227,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarHeldOriginFirstOnly
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
+        Plant::IsolationPausesEveryReader => PlantPath::Isolation,
         Plant::FenceXid32 => PlantPath::XidEpoch,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
     }
@@ -242,9 +248,9 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
-        // A reader of a target can be of any kind, and so can a reader of a
-        // keyed source.
-        PlantPath::Chain | PlantPath::SourceKey => true,
+        // A reader of a target, or of a failing page, or of a keyed source,
+        // can be of any kind.
+        PlantPath::Chain | PlantPath::Isolation | PlantPath::SourceKey => true,
         // Every target drains through the fenced read.
         PlantPath::XidEpoch => true,
     }
@@ -848,6 +854,12 @@ pub fn reach_report(tier: &SweepTier, results: &[SweepCase]) -> String {
     out
 }
 
+/// Why a tier other than the held-key tier leaves out a
+/// [`PlantPath::Isolation`] plant.
+pub const NO_ISOLATION: &str = "it breaks the drain's isolation of a page that fails only \
+     in combination, which only the held-key tier's isolation draw makes (held_keys.rs, \
+     held_key_planted_bugs_are_caught)";
+
 /// Why a tier whose programs define no `MIN`/`MAX` doesn't run the
 /// extremes' plants ([`PlantPath::Extremes`], [`PlantPath::SelfCheckExtremes`]).
 pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggregate, which \
@@ -1010,7 +1022,10 @@ mod tests {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Chain | PlantPath::XidEpoch | PlantPath::SourceKey => {
+                PlantPath::Chain
+                | PlantPath::Isolation
+                | PlantPath::XidEpoch
+                | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");
                 }

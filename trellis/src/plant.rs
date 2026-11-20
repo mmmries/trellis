@@ -871,6 +871,18 @@ pub enum Plant {
     /// and pinned by its
     /// `erroring_inserts_and_updates_follow_the_held_key_model`.
     HeldKeyDeleteApplies,
+    /// #2130 (`isolation_pauses_every_reader`): when a page fails and one
+    /// definition's share of it fails alone
+    /// (`staging::quarantine::pause_definitions_failing_alone`), every
+    /// definition reading the page's tables is paused (T0247), not just the
+    /// one that fails: an innocent reader of the same table stops with it.
+    /// Fires only when such a page has a reader whose share applies.
+    ///
+    /// Gated by the held-key tier's isolation draw
+    /// (`held_key_planted_bugs_are_caught`), whose failing definition has a
+    /// sibling reader of its table, and pinned by its
+    /// `a_sum_overflowing_in_one_page_pauses_only_its_definition`.
+    IsolationPausesEveryReader,
     /// ADR-0002, #1991 (`gb_where_old_image`): a plain aggregate's page
     /// stages an update's old image whatever its `WHERE` gives
     /// (`staging::group_basis`'s stage statement), so a row that was no
@@ -1090,6 +1102,7 @@ impl Plant {
         Plant::StarReadsFirstOnly,
         Plant::HeldKeyUnlisted,
         Plant::HeldKeyDeleteApplies,
+        Plant::IsolationPausesEveryReader,
         Plant::GbWhereOldImage,
         Plant::GbWhereNullAsTrue,
         Plant::GbWhereBuildUnfiltered,
@@ -1190,6 +1203,7 @@ impl Plant {
             Plant::StarReadsFirstOnly => "star_reads_first_only",
             Plant::HeldKeyUnlisted => "held_key_unlisted",
             Plant::HeldKeyDeleteApplies => "held_key_delete_applies",
+            Plant::IsolationPausesEveryReader => "isolation_pauses_every_reader",
             Plant::GbWhereOldImage => "gb_where_old_image",
             Plant::GbWhereNullAsTrue => "gb_where_null_as_true",
             Plant::GbWhereBuildUnfiltered => "gb_where_build_unfiltered",
