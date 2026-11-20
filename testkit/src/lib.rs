@@ -14,6 +14,8 @@
 //!   was stuck behind another's lock, and for how long, and waits for one
 //!   to queue behind another.
 //! - [`raw`] opens plain `tokio_postgres` connections outside any pool.
+//! - [`xid`] ages a cluster's transaction ids: freezes it and moves its next
+//!   id forward with `pg_resetwal`, or burns ids with small transactions.
 //! - [`wait`] waits for a condition with a hard deadline and a failure
 //!   that names what was awaited.
 //!
@@ -38,6 +40,7 @@ pub mod lsn;
 pub mod plan;
 pub mod raw;
 pub mod wait;
+pub mod xid;
 
 pub use blocking::{BlockedWatch, Blocker, wait_blocked_behind, watch_blocked};
 pub use cluster::{ClusterBackup, StopMode, TestCluster, TestDatabase};
@@ -46,3 +49,4 @@ pub use lsn::wal_insert_lsn;
 pub use raw::connect_raw;
 pub use raw::connect_with;
 pub use wait::{wait_for, wait_until};
+pub use xid::{XID_PAGE, XidAging};

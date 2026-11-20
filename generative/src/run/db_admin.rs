@@ -14,6 +14,7 @@
 //! `def_install_after_op`, `restart_after_ops` and `scale_out_after_ops` are
 //! not honoured here, the same as in the noise runner.
 
+use testkit::XID_PAGE;
 use trellis::dev::pool::Pool;
 
 use crate::backend::{
@@ -71,13 +72,18 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
                 }
                 DbAdminAction::RestartPostgres(mode) => {
                     cluster.restart_postgres(*mode);
+                    reconnect(backend, pool, op_index, action).await?;
+                }
+                DbAdminAction::VacuumFreeze => {
                     backend
-                        .reconnect_after_server_restart()
+                        .execute_admin("VACUUM FREEZE")
                         .await
                         .map_err(|e| admin_error(op_index, action, e))?;
-                    await_pool_usable(pool)
-                        .await
-                        .map_err(|e| admin_error(op_index, action, e))?;
+                }
+                DbAdminAction::WrapXids { tail } => {
+                    cluster.age_xids_to_epoch_edge(XID_PAGE);
+                    reconnect(backend, pool, op_index, action).await?;
+                    cluster.burn_xids(XID_PAGE.saturating_sub(*tail));
                 }
             }
         }
@@ -95,6 +101,23 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
     }
 
     Ok(Outcome::Ran)
+}
+
+/// Reconnects the backend's raw session and waits until `pool` works again
+/// after the server restarted under them.
+async fn reconnect(
+    backend: &mut ManualBackend,
+    pool: &Pool,
+    op_index: usize,
+    action: &DbAdminAction,
+) -> Result<(), RunError> {
+    backend
+        .reconnect_after_server_restart()
+        .await
+        .map_err(|e| admin_error(op_index, action, e))?;
+    await_pool_usable(pool)
+        .await
+        .map_err(|e| admin_error(op_index, action, e))
 }
 
 fn admin_error(op_index: usize, action: &DbAdminAction, error: impl std::fmt::Debug) -> RunError {

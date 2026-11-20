@@ -689,6 +689,9 @@ async fn window_over_fence(
     columns: &str,
 ) -> Result<(String, Vec<String>), StagingError> {
     let table = ring_table_name(ring_slot)?;
+    // Planted bug: the fences compared as 32-bit ids. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let fence = planted_fence(fence);
 
     let mut sql = format!(
         "select {columns} from {table} \
@@ -714,6 +717,8 @@ async fn window_over_fence(
                  where pg_visible_in_snapshot(row_txid, $1::text::pg_snapshot) \
                    and not pg_visible_in_snapshot(row_txid, $2::text::pg_snapshot)"
             ));
+            #[cfg(any(test, feature = "test-util"))]
+            let predecessor_fence = planted_fence(predecessor_fence);
             params.push(predecessor_fence);
         }
         // A predecessor that exists but has no fence yet is itself mid-crash-
@@ -722,6 +727,18 @@ async fn window_over_fence(
     }
 
     Ok((sql, params))
+}
+
+/// `fence`, or its ids cut to 32 bits when the `fence_xid32` plant is armed
+/// and that changes it.
+#[cfg(any(test, feature = "test-util"))]
+fn planted_fence(fence: String) -> String {
+    use crate::plant::{Plant, fires, snapshot_as_32_bit, snapshot_past_first_epoch};
+    if fires(Plant::FenceXid32, snapshot_past_first_epoch(&fence)) {
+        snapshot_as_32_bit(&fence)
+    } else {
+        fence
+    }
 }
 
 /// The both-slots fence read: [`fenced_window`] projected down to a physical
