@@ -413,7 +413,7 @@ fn resolve(
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::{epoch_case, max_epochs};
+pub use strategy::{DEFAULT_MAX_EPOCHS, epoch_case, epoch_case_with, max_epochs};
 
 #[cfg(feature = "proptest")]
 mod strategy {
@@ -426,13 +426,17 @@ mod strategy {
     /// The environment variable that sets [`max_epochs`].
     pub const MAX_EPOCHS_ENV: &str = "GENERATIVE_MAX_EPOCHS";
 
+    /// [`max_epochs`] when `GENERATIVE_MAX_EPOCHS` isn't set.
+    pub const DEFAULT_MAX_EPOCHS: usize = 12;
+
     /// The most epochs a chain draws after its first: `GENERATIVE_MAX_EPOCHS`
-    /// when set (a deep run sets 50 or more), otherwise 12.
+    /// when set (a deep run sets 50 or more), otherwise
+    /// [`DEFAULT_MAX_EPOCHS`].
     pub fn max_epochs() -> usize {
         std::env::var(MAX_EPOCHS_ENV)
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(12)
+            .unwrap_or(DEFAULT_MAX_EPOCHS)
     }
 
     /// The most changes one epoch's start draws.
@@ -463,12 +467,17 @@ mod strategy {
             .prop_map(|(changes, mutates)| EpochDraw { changes, mutates })
     }
 
-    /// A chain: the first epoch as `trivial_program` draws it (awkward values
-    /// on), then one to [`max_epochs`] later epochs. The epochs come before
-    /// the definitions in the draw, so a shrink drops whole epochs first,
-    /// then shrinks within the ones left.
+    /// [`epoch_case_with`] up to [`max_epochs`] later epochs.
     pub fn epoch_case() -> impl Strategy<Value = EpochCase> {
-        let max = max_epochs().max(1);
+        epoch_case_with(max_epochs())
+    }
+
+    /// A chain: the first epoch as `trivial_program` draws it (awkward values
+    /// on), then one to `max` later epochs. The epochs come before the
+    /// definitions in the draw, so a shrink drops whole epochs first, then
+    /// shrinks within the ones left.
+    pub fn epoch_case_with(max: usize) -> impl Strategy<Value = EpochCase> {
+        let max = max.max(1);
         prop::collection::vec(table_spec(true), 1..=MAX_TABLES)
             .prop_flat_map(move |tables| {
                 let seed_counts: Vec<usize> = tables.iter().map(|t| t.seed_values.len()).collect();

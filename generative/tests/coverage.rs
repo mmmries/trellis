@@ -1953,7 +1953,9 @@ fn the_join_tiers_draw_every_redefinition() {
 /// defined holds, and both key spaces are defined again.
 #[test]
 fn the_epoch_tier_draws_every_step() {
-    use generative::generate::epoch::{EpochStep, apply_step, chain, chain_shapes, epoch_case};
+    use generative::generate::epoch::{
+        DEFAULT_MAX_EPOCHS, EpochStep, apply_step, chain, chain_shapes, epoch_case_with,
+    };
     use generative::model::BurstAction;
     use trellis::dev::defs::validate;
 
@@ -1961,7 +1963,9 @@ fn the_epoch_tier_draws_every_step() {
     let mut totals: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let mut long = 0;
     let mut redefined: HashSet<&'static str> = HashSet::new();
-    for case in sample(epoch_case(), SAMPLES) {
+    // The default length, not `GENERATIVE_MAX_EPOCHS`, so the floors hold
+    // whatever a deep run exports.
+    for case in sample(epoch_case_with(DEFAULT_MAX_EPOCHS), SAMPLES) {
         let chain = chain(&case);
         for (name, n) in chain_shapes(&chain) {
             *totals.entry(name).or_insert(0) += n;
