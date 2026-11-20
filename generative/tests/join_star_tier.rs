@@ -23,8 +23,8 @@ use generative::generate::join_chained::chained_case_strategy;
 use generative::generate::join_one_to_one::{
     MAX_TABLES, OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, STAR_COMMIT_STALL_MS,
     STAR_LOCK_STEP_STALL_MS, STAR_MAX_FAN_OUT_CHUNK_ROWS, STAR_MAX_PACE_MICROS,
-    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program,
-    one_to_one_case_strategy, own_key_column, star_case_strategy, star_definition_text, table_at,
+    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program, own_key_column,
+    star_case_strategy, star_definition_text, table_at,
 };
 use generative::model::{Op, Program, Table};
 use proptest::strategy::Strategy;

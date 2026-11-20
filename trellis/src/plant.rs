@@ -1211,6 +1211,7 @@ impl Plant {
                 | Plant::StarReadsFirstOnly
                 | Plant::Join1FanOutHeldRow
                 | Plant::SeamTokenEarly
+                | Plant::CaptureSlotFromSnapshot
         )
     }
 }
