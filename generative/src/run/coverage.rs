@@ -558,7 +558,14 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                     let Some((pk_col, rows)) = tables.get_mut(op.table()) else {
                         continue;
                     };
-                    apply_to_rows(op, pk_col, rows);
+                    // A joined table read through `KEY (...)` (#2171).
+                    let key = program
+                        .tables
+                        .iter()
+                        .find(|t| t.name == op.table())
+                        .and_then(|t| t.source_key.as_ref())
+                        .map_or(&[][..], |k| k.columns.as_slice());
+                    apply_to_keyed_rows(op, pk_col, key, rows);
                     if matches!(op, Op::Truncate { .. }) {
                         view = join_view(def, predicate, &tables);
                         continue;

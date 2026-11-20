@@ -233,15 +233,30 @@ pub fn resimulate(program: &mut Program, name: &str) {
                     OpOutcome::Succeeds
                 }
             }
-            Op::Update { pk, changes, .. } => match written_key(&key, changes) {
-                _ if !live.contains_key(pk.as_str()) => OpOutcome::AffectsNoRows,
-                Some(k) if taken(&live, &k, Some(pk)) => OpOutcome::Fails,
-                Some(k) => {
-                    live.insert(pk.clone(), k);
-                    OpOutcome::Succeeds
+            Op::Update { pk, changes, .. } => {
+                // An update may also move its row to another `pk_col` (the
+                // 1-1 JOIN tier's rekey).
+                let moved_to = changes
+                    .iter()
+                    .find(|(c, _)| *c == pk_col)
+                    .and_then(|(_, v)| v.clone())
+                    .filter(|to| to != pk);
+                match live.get(pk.as_str()).cloned() {
+                    None => OpOutcome::AffectsNoRows,
+                    Some(old) => {
+                        let k = written_key(&key, changes).unwrap_or(old);
+                        if moved_to.as_ref().is_some_and(|to| live.contains_key(to))
+                            || taken(&live, &k, Some(pk))
+                        {
+                            OpOutcome::Fails
+                        } else {
+                            live.remove(pk.as_str());
+                            live.insert(moved_to.unwrap_or_else(|| pk.clone()), k);
+                            OpOutcome::Succeeds
+                        }
+                    }
                 }
-                None => OpOutcome::Succeeds,
-            },
+            }
             Op::Delete { pk, .. } => {
                 if live.remove(pk.as_str()).is_some() {
                     OpOutcome::Succeeds
@@ -276,7 +291,7 @@ fn pk_of(row: &[(String, Option<String>)], pk_col: &str) -> String {
 /// What a keyed program draws, by name, for the coverage floors: its
 /// shape (`single`/`composite`, `not_null`/`nullable`,
 /// `primary_key`/`no_primary_key`), the key spaces over it (`one_to_one`,
-/// `aggregate`), each [`KeyValueClass`] a key it writes
+/// `aggregate`, and `joined` for a 1-1 `JOIN`'s joined table), each [`KeyValueClass`] a key it writes
 /// holds (`value_<class>`), `twins` when two keys it inserts differ only in
 /// one part being `NULL` in one and `''` in the other, and the key moves its
 /// updates make that run (`move`, `move_to_null`, `move_from_null`) and
@@ -314,14 +329,21 @@ pub fn drawn(program: &Program) -> BTreeSet<String> {
         }
         .into(),
     );
-    for def in program.defs.iter().filter(|d| d.source == table.name) {
-        out.insert(
-            match def.key_space {
-                KeySpace::Aggregate { .. } => "aggregate",
-                _ => "one_to_one",
-            }
-            .into(),
-        );
+    for def in &program.defs {
+        if def.source == table.name {
+            out.insert(
+                match def.key_space {
+                    KeySpace::Aggregate { .. } => "aggregate",
+                    _ => "one_to_one",
+                }
+                .into(),
+            );
+        }
+        if let KeySpace::JoinOneToOne(join) = &def.key_space
+            && join.joins.iter().any(|j| j.right == table.name)
+        {
+            out.insert("joined".into());
+        }
     }
     let mut inserted: Vec<Key> = Vec::new();
     let mut current: HashMap<String, Key> = HashMap::new();
@@ -366,11 +388,6 @@ pub fn drawn(program: &Program) -> BTreeSet<String> {
             }
         }
     }
-    let twins = |a: &Key, b: &Key| {
-        let differing: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
-        matches!(differing.as_slice(), [i]
-            if matches!((&a[*i], &b[*i]), (None, Some(e)) | (Some(e), None) if e.is_empty()))
-    };
     if inserted
         .iter()
         .enumerate()
@@ -379,6 +396,14 @@ pub fn drawn(program: &Program) -> BTreeSet<String> {
         out.insert("twins".into());
     }
     out
+}
+
+/// Whether keys `a` and `b` differ only in one part, `NULL` in one and `''`
+/// in the other: the two keys #2126's encoding ran together.
+pub fn twins(a: &Key, b: &Key) -> bool {
+    let differing: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+    matches!(differing.as_slice(), [i]
+        if matches!((&a[*i], &b[*i]), (None, Some(e)) | (Some(e), None) if e.is_empty()))
 }
 
 #[cfg(feature = "proptest")]
@@ -598,6 +623,59 @@ mod tests {
             assert!(drawn.contains(name), "{name}: {drawn:?}");
         }
         assert!(!drawn.contains("move_to_null"), "{drawn:?}");
+    }
+
+    /// An update that also moves its row to another `pk_col` (the 1-1 JOIN
+    /// tier's rekey) fails onto a live id, and otherwise moves the row and
+    /// its key: the old id is gone, and the key still collides.
+    #[test]
+    fn a_rekey_onto_a_live_id_fails_and_onto_a_free_one_moves_the_row() {
+        let draw = KeyDraw {
+            shape: KeyShape {
+                nullable: vec![true],
+                primary_key: true,
+            },
+            inserts: vec![k(None), k(Some(""))],
+            moves: vec![None],
+        };
+        let mut p = program(Vec::new(), &draw);
+        let (table, pk_col) = (p.tables[0].name.clone(), p.tables[0].pk_col.clone());
+        let pks: Vec<String> = p
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Insert { row, .. } => Some(pk_of(row, &pk_col)),
+                _ => None,
+            })
+            .collect();
+        let [a, b] = pks.as_slice() else {
+            panic!("{pks:?}")
+        };
+        let seeded = p.ops.len();
+        let update = |pk: &str, changes: Vec<(String, Option<String>)>| Op::Update {
+            table: table.clone(),
+            pk: pk.to_string(),
+            changes,
+            expect: OpOutcome::Succeeds,
+        };
+        let id = |to: &str| (pk_col.clone(), Some(to.to_string()));
+        p.ops.extend([
+            update(a, vec![id(b)]),
+            update(a, vec![id("999")]),
+            update(a, vec![("k0".to_string(), Some("x".to_string()))]),
+            update("999", vec![("k0".to_string(), Some(String::new()))]),
+            update(
+                "999",
+                vec![id("998"), ("k0".to_string(), Some("y".to_string()))],
+            ),
+        ]);
+        resimulate(&mut p, &table);
+        use OpOutcome::{AffectsNoRows, Fails, Succeeds};
+        let expects: Vec<&OpOutcome> = p.ops[seeded..].iter().map(Op::expect).collect();
+        assert_eq!(
+            expects,
+            [&Fails, &Succeeds, &AffectsNoRows, &Fails, &Succeeds]
+        );
     }
 
     #[test]

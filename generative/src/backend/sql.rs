@@ -103,12 +103,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         KeySpace::Join(join) => {
             let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
             format!(
-                " {} {} ON {} GROUP BY {}",
+                " {} {}{} ON {} GROUP BY {}",
                 match join.joins[0].kind {
                     JoinKind::Inner => "INNER JOIN",
                     JoinKind::Left => "LEFT JOIN",
                 },
                 join.joins[0].right,
+                render_key(join.joins[0].right_key.as_deref()),
                 join.joins[0]
                     .on
                     .iter()
@@ -130,12 +131,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                 .iter()
                 .map(|joined| {
                     format!(
-                        " {} {} ON {}",
+                        " {} {}{} ON {}",
                         match joined.kind {
                             JoinKind::Inner => "INNER JOIN",
                             JoinKind::Left => "LEFT JOIN",
                         },
                         joined.right,
+                        render_key(joined.right_key.as_deref()),
                         joined
                             .on
                             .iter()
@@ -167,16 +169,21 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         Predicate::True => String::new(),
         Predicate::Filter(expr) => format!(" WHERE ({})", render_expr(expr)),
     };
-    let key = match &def.source_key {
-        Some(columns) => format!(" KEY ({})", columns.join(", ")),
-        None => String::new(),
-    };
+    let key = render_key(def.source_key.as_deref());
     format!(
         "TRANSFORM {} FROM {}{key}{key_space_clause}{opt_out} SELECT {}{filter}",
         def.target,
         def.source,
         fields.join(", ")
     )
+}
+
+/// ` KEY (<columns>)` for a table read through an explicit key (ADR-0026),
+/// or nothing.
+fn render_key(columns: Option<&[String]>) -> String {
+    columns.map_or_else(String::new, |columns| {
+        format!(" KEY ({})", columns.join(", "))
+    })
 }
 
 /// The source indexes `def` needs, as `(table, leading columns)`: an
@@ -1534,6 +1541,26 @@ mod tests {
                     assert_eq!(reparsed, def, "{text}");
                 }
             }
+        }
+    }
+
+    /// A joined table's `KEY (...)` (#2171) renders back after the table's
+    /// name, beside the `FROM` side's: dropped, the definition would read
+    /// the joined table by its primary key, or fail define without one.
+    #[test]
+    fn render_definition_round_trips_a_joined_tables_key() {
+        for text in [
+            "TRANSFORM j FROM ja KEY (k0) LEFT JOIN jb KEY (k0, k1) \
+             ON ja.k0 = jb.k0 AND ja.k1 = jb.k1 SELECT jb.y AS y",
+            "TRANSFORM j FROM ja INNER JOIN jb KEY (k0) ON ja.k0 = jb.k0 SELECT jb.y AS y",
+            "TRANSFORM j FROM ja LEFT JOIN jb KEY (k0) ON ja.k0 = jb.k0 \
+             GROUP BY ja.t SELECT COUNT(*) AS n",
+        ] {
+            let def = parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            let rendered = render_definition(&def);
+            assert!(rendered.contains("jb KEY (k0"), "{rendered}");
+            let reparsed = parse(&rendered).unwrap_or_else(|e| panic!("{rendered}: {e:?}"));
+            assert_eq!(reparsed, def, "{rendered}");
         }
     }
 

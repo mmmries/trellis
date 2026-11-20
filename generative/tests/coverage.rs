@@ -1896,3 +1896,86 @@ fn the_source_key_tier_always_draws_a_nullable_key_in_one_lane() {
         }
     }
 }
+
+/// #2171: the 1-1 JOIN tier reads its joined table through a `KEY (...)`
+/// in about a quarter of its cases, and across them draws every key shape,
+/// key value class, key move and collision, `ja` rows on the `NULL` and the
+/// `''` keys, and live `NULL` and `''` `jb` rows side by side
+/// (`generative::generate::join_one_to_one::key_joined`).
+#[test]
+fn the_one_to_one_join_tier_covers_every_joined_key_variant() {
+    use generative::generate::join_one_to_one::{joined_key_drawn, one_to_one_case_strategy};
+    let mut runner = TestRunner::deterministic();
+    let strategy = one_to_one_case_strategy();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut keyed = 0;
+    for _ in 0..200 {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let names = joined_key_drawn(&case.program);
+        keyed += usize::from(!names.is_empty());
+        seen.extend(names);
+    }
+    assert!((25..=75).contains(&keyed), "{keyed} of 200 keyed");
+    for name in [
+        "joined",
+        "single",
+        "composite",
+        "not_null",
+        "nullable",
+        "primary_key",
+        "no_primary_key",
+        "value_null",
+        "value_empty",
+        "value_chr1",
+        "value_doubledchr1",
+        "value_separator",
+        "value_plain",
+        "move",
+        "move_to_null",
+        "move_from_null",
+        "collision",
+        "a_null",
+        "a_empty",
+        "twins_live",
+    ] {
+        assert!(seen.contains(name), "never drew {name}: {seen:?}");
+    }
+    assert!(!seen.contains("one_to_one") && !seen.contains("aggregate"));
+}
+
+/// #2171: the `join_one_to_one_key` sweep tier's cases always read `jb`
+/// through a nullable `KEY (...)`, so `null_key_as_empty` can fire in every
+/// case, and most have live `NULL` and `''` rows side by side.
+#[test]
+fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
+    use generative::generate::join_one_to_one::{
+        JOINED_TABLE, joined_key_case_strategy, joined_key_drawn,
+    };
+    let mut runner = TestRunner::deterministic();
+    let strategy = joined_key_case_strategy();
+    let mut twins_live = 0;
+    for _ in 0..100 {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let jb = case
+            .program
+            .tables
+            .iter()
+            .find(|t| t.name == JOINED_TABLE)
+            .expect("jb");
+        assert!(
+            !jb.source_key
+                .as_ref()
+                .expect("a keyed jb")
+                .nullable
+                .is_empty()
+        );
+        twins_live += usize::from(joined_key_drawn(&case.program).contains("twins_live"));
+    }
+    assert!(twins_live >= 50, "{twins_live} of 100");
+}
