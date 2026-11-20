@@ -24,6 +24,7 @@ mod held_keys;
 pub mod judge;
 mod noise;
 mod pause;
+mod residue;
 mod restore;
 mod source_ddl;
 mod two_instance;
@@ -39,6 +40,10 @@ pub use held_keys::{
     run_convergence_with_isolation,
 };
 pub use noise::run_convergence_with_noise;
+pub use residue::{
+    LAP_SEAL_INTERVAL, ResidueReport, TableResidue, check_residue, peak_live_rows,
+    run_epochs_lapping,
+};
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
 pub use source_ddl::{
     SourceDdlRun, run_convergence_with_source_ddl, run_convergence_with_source_ddl_allowing,
@@ -380,6 +385,12 @@ pub enum RunError {
         op_index: usize,
         event: Box<crate::model::SourceDdlEvent>,
         error: String,
+    },
+    /// A residue invariant ([`residue`]) failed at a quiet point: a Trellis
+    /// table holds dead tuples after `VACUUM`, or has grown past what its
+    /// peak live rows explain. One line per table.
+    Residue {
+        failures: Vec<String>,
     },
 }
 

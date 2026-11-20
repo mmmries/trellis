@@ -351,7 +351,7 @@ is answered as any other re-type is
    definition's share of each, so none of them is applied or re-derived
    after the resume;
 2. deletes those changes from their ring slots once drained, since a
-   group-basis or `JOIN` rebuild names groups from the old images there, and
+   group-basis or `JOIN` rebuild names groups from the images there, and
    the definition's held keys and parked images, as every resume does;
 3. re-types each column Trellis created of the old enum to the new one
    without a cast: `USING NULL`, after deleting the rows of a table whose key
