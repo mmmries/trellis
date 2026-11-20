@@ -1007,6 +1007,33 @@ fn check_collation_conflicts<'a>(
     Ok(())
 }
 
+/// [`derive_collation`]'s `check` of each comparison an [`Expr::InList`] or
+/// [`Expr::Between`] stands for: its operand beside one element or bound
+/// (`children` is the operand first). Kept out of [`derive_collation`] so its
+/// frame, which every level of an expression stacks, stays small.
+#[inline(never)]
+fn check_each_comparison<F>(
+    expr: &Expr,
+    children: Vec<Derived>,
+    check: &F,
+) -> Result<(), ValidationError>
+where
+    F: Fn(&str, Vec<Derived>) -> Result<Derived, ValidationError>,
+{
+    let construct = match expr {
+        Expr::InList { negated: false, .. } => "IN",
+        Expr::InList { negated: true, .. } => "NOT IN",
+        Expr::Between { negated: false, .. } => "BETWEEN",
+        _ => "NOT BETWEEN",
+    };
+    let mut children = children.into_iter();
+    let operand = children.next().unwrap_or(Derived::Default);
+    for other in children {
+        check(construct, vec![operand.clone(), other])?;
+    }
+    Ok(())
+}
+
 fn derive_collation<'a, 'f>(
     expr: &Expr,
     field: &str,
@@ -1102,20 +1129,8 @@ fn derive_collation<'a, 'f>(
             check(super::registry::operator_spec(*op).symbol, children)?;
             Derived::Default
         }
-        // Each comparison it stands for, its operand beside one element or
-        // bound (`children` is the operand first).
-        Expr::InList { negated, .. } | Expr::Between { negated, .. } => {
-            let construct = match (expr, negated) {
-                (Expr::InList { .. }, false) => "IN",
-                (Expr::InList { .. }, true) => "NOT IN",
-                (_, false) => "BETWEEN",
-                (_, true) => "NOT BETWEEN",
-            };
-            let mut children = children.into_iter();
-            let operand = children.next().unwrap_or(Derived::Default);
-            for other in children {
-                check(construct, vec![operand.clone(), other])?;
-            }
+        Expr::InList { .. } | Expr::Between { .. } => {
+            check_each_comparison(expr, children, &check)?;
             Derived::Default
         }
         Expr::FunctionCall { name, .. } => match name.as_str() {

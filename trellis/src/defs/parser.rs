@@ -1303,9 +1303,6 @@ impl Parser {
             }
             let node = match infix {
                 Infix::Binary(op) => {
-                    if op.is_comparison() {
-                        self.refuse_quantified_comparison(op)?;
-                    }
                     let rhs = self.parse_binary_expr(precedence + 1)?;
                     lhs_height = 1 + lhs_height.max(self.last_height);
                     non_associative = op.is_non_associative().then_some(precedence);
@@ -1325,29 +1322,14 @@ impl Parser {
                 }
                 // The list's closing `)` ends the operand, so Postgres reads
                 // a following `IN` or `BETWEEN` onto it (`a IN (1) IN (TRUE)`
-                // is `(a IN (1)) IN (TRUE)`).
-                Infix::In { negated } => {
-                    let list = self.parse_in_list()?;
-                    lhs_height = 1 + lhs_height.max(self.last_height);
-                    non_associative = None;
-                    Expr::InList {
-                        expr: Box::new(lhs),
-                        list,
-                        negated,
-                    }
-                }
-                // The upper bound is an open operand, so an `IN` or `BETWEEN`
-                // after it is a syntax error in Postgres, as after `a < b`.
-                Infix::Between { negated } => {
-                    let (low, high, height) = self.parse_between_bounds(precedence)?;
-                    lhs_height = 1 + lhs_height.max(height);
-                    non_associative = Some(precedence);
-                    Expr::Between {
-                        expr: Box::new(lhs),
-                        low: Box::new(low),
-                        high: Box::new(high),
-                        negated,
-                    }
+                // is `(a IN (1)) IN (TRUE)`). A `BETWEEN`'s upper bound is an
+                // open operand, so an `IN` or `BETWEEN` after it is a syntax
+                // error in Postgres, as after `a < b`.
+                Infix::In { .. } | Infix::Between { .. } => {
+                    let node = self.parse_in_or_between(infix, lhs, lhs_height, precedence)?;
+                    lhs_height = self.last_height;
+                    non_associative = matches!(infix, Infix::Between { .. }).then_some(precedence);
+                    node
                 }
             };
             // The tree is measured as it is built, so a chain too deep to
@@ -1382,7 +1364,7 @@ impl Parser {
                     });
                 }
                 match lookup_operator(&c.to_string()) {
-                    Some(op) => Ok(Some((Infix::Binary(op), 1))),
+                    Some(op) => self.binary_infix(op),
                     None => Err(ParseError::UnsupportedOperator {
                         operator: c.to_string(),
                     }),
@@ -1392,7 +1374,7 @@ impl Parser {
             // Postgres; a run with no registered operator is refused whole
             // rather than split (`a<=>b`, `a!=-1`, `a%-1`).
             Token::Operator(symbol) => match lookup_operator(symbol) {
-                Some(op) => Ok(Some((Infix::Binary(op), 1))),
+                Some(op) => self.binary_infix(op),
                 None => Err(ParseError::UnsupportedOperator {
                     operator: symbol.clone(),
                 }),
@@ -2186,24 +2168,62 @@ impl Parser {
         }
     }
 
-    /// Refuses `= ANY (...)`, `<> ALL (...)` and the like, with the cursor
-    /// after the comparison `op`. Postgres reserves the three words, so
-    /// none is a column or a function there either.
-    fn refuse_quantified_comparison(&self, op: Operator) -> Result<(), ParseError> {
-        match self.peek() {
-            Token::Ident(word)
-                if ["ANY", "ALL", "SOME"]
-                    .iter()
-                    .any(|q| word.eq_ignore_ascii_case(q))
-                    && self.peek_at(1) == &Token::Symbol('(') =>
-            {
-                Err(ParseError::QuantifiedComparison {
-                    operator: operator_spec(op).symbol.to_string(),
-                    quantifier: word.to_ascii_uppercase(),
-                })
-            }
-            _ => Ok(()),
+    /// The binary operator `op`, spelled by the one token at the cursor.
+    /// Refuses `= ANY (...)`, `<> ALL (...)` and the like by name: Postgres
+    /// reserves the three words, so none is a column or a function there
+    /// either. Checked here, not in [`Self::parse_binary_expr`], to keep that
+    /// recursive frame small.
+    fn binary_infix(&self, op: Operator) -> Result<Option<(Infix, usize)>, ParseError> {
+        if op.is_comparison()
+            && let Token::Ident(word) = self.peek_at(1)
+            && ["ANY", "ALL", "SOME"]
+                .iter()
+                .any(|q| word.eq_ignore_ascii_case(q))
+            && self.peek_at(2) == &Token::Symbol('(')
+        {
+            return Err(ParseError::QuantifiedComparison {
+                operator: operator_spec(op).symbol.to_string(),
+                quantifier: word.to_ascii_uppercase(),
+            });
         }
+        Ok(Some((Infix::Binary(op), 1)))
+    }
+
+    /// The `[NOT] IN` list or `[NOT] BETWEEN` bounds (`infix`, consumed)
+    /// after `lhs`, `lhs_height` high, leaving the node's height in
+    /// `last_height`. Kept out of
+    /// [`Self::parse_binary_expr`] so its frame, which every level of an
+    /// expression stacks, stays small.
+    #[inline(never)]
+    fn parse_in_or_between(
+        &mut self,
+        infix: Infix,
+        lhs: Expr,
+        lhs_height: usize,
+        precedence: u8,
+    ) -> Result<Expr, ParseError> {
+        Ok(match infix {
+            Infix::In { negated } => {
+                let list = self.parse_in_list()?;
+                self.last_height = 1 + lhs_height.max(self.last_height);
+                Expr::InList {
+                    expr: Box::new(lhs),
+                    list,
+                    negated,
+                }
+            }
+            Infix::Between { negated } => {
+                let (low, high, height) = self.parse_between_bounds(precedence)?;
+                self.last_height = 1 + lhs_height.max(height);
+                Expr::Between {
+                    expr: Box::new(lhs),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated,
+                }
+            }
+            Infix::Binary(_) | Infix::IsNull { .. } => unreachable!("an IN or a BETWEEN"),
+        })
     }
 
     /// The `(<e1>, <e2>, ...)` after `IN`, through its `)`, leaving the
@@ -2507,6 +2527,25 @@ mod depth_tests {
         assert!(too_deep(define(chain(200_000))));
         assert!(too_deep(define(parens(200_000))));
         assert!(too_deep(define(calls(200_000))));
+    }
+
+    /// `(c * (c + ...))` at the height limit, the shape that stacks the most
+    /// parser frames per level, defines on 1.875 MiB: headroom under the
+    /// 2 MiB a thread gets, which a larger frame in the recursive parse or
+    /// substitution passes (an operator's arm kept inline) would use up.
+    #[test]
+    fn the_deepest_operator_nesting_defines_with_stack_to_spare() {
+        let half = MAX_EXPRESSION_DEPTH / 2 - 1;
+        let text = format!("{}c{}", "(c * (c + ".repeat(half), "))".repeat(half));
+        let result = std::thread::Builder::new()
+            .stack_size(1920 * 1024)
+            .spawn(move || {
+                let def = parse(&format!("TRANSFORM t FROM s SELECT {text} AS out")).unwrap();
+                walk_every_way(&def);
+            })
+            .unwrap()
+            .join();
+        assert!(result.is_ok(), "the definition overflowed or panicked");
     }
 
     #[test]

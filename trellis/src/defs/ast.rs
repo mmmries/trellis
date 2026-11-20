@@ -598,26 +598,7 @@ impl Expr {
                 expr: Box::new(f(expr)?),
                 negated: *negated,
             },
-            Expr::InList {
-                expr,
-                list,
-                negated,
-            } => Expr::InList {
-                expr: Box::new(f(expr)?),
-                list: list.iter().map(&mut f).collect::<Result<_, _>>()?,
-                negated: *negated,
-            },
-            Expr::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => Expr::Between {
-                expr: Box::new(f(expr)?),
-                low: Box::new(f(low)?),
-                high: Box::new(f(high)?),
-                negated: *negated,
-            },
+            Expr::InList { .. } | Expr::Between { .. } => self.try_map_in_or_between(&mut f)?,
             Expr::Case {
                 branches,
                 otherwise,
@@ -631,6 +612,39 @@ impl Expr {
                     None => None,
                 },
             },
+        })
+    }
+
+    /// [`Self::try_map_children`] of an [`Expr::InList`] or [`Expr::Between`].
+    /// Kept out of it so its frame, which every level of a substituted
+    /// expression stacks, stays small.
+    #[inline(never)]
+    fn try_map_in_or_between<E>(
+        &self,
+        f: &mut impl FnMut(&Expr) -> Result<Expr, E>,
+    ) -> Result<Expr, E> {
+        Ok(match self {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(f(expr)?),
+                list: list.iter().map(f).collect::<Result<_, _>>()?,
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(f(expr)?),
+                low: Box::new(f(low)?),
+                high: Box::new(f(high)?),
+                negated: *negated,
+            },
+            _ => unreachable!("an IN list or a BETWEEN"),
         })
     }
 
@@ -1044,6 +1058,39 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
     render_expr(expr, &Aliases(Vec::new()))
 }
 
+/// [`render_expr`] of an [`Expr::InList`] or [`Expr::Between`], as written.
+/// Kept out of it so its frame, which every level of an expression stacks,
+/// stays small.
+#[inline(never)]
+fn render_in_or_between(expr: &Expr, aliases: &Aliases<'_>) -> String {
+    let render = |expr: &Expr| render_expr(expr, aliases);
+    match expr {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}IN ({}))",
+            render(expr),
+            if *negated { "NOT " } else { "" },
+            list.iter().map(render).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}BETWEEN {} AND {})",
+            render(expr),
+            if *negated { "NOT " } else { "" },
+            render(low),
+            render(high)
+        ),
+        _ => unreachable!("an IN list or a BETWEEN"),
+    }
+}
+
 fn render_expr(expr: &Expr, aliases: &Aliases<'_>) -> String {
     let render_field_expr = |expr: &Expr| render_expr(expr, aliases);
     match expr {
@@ -1096,31 +1143,7 @@ fn render_expr(expr: &Expr, aliases: &Aliases<'_>) -> String {
             render_field_expr(expr),
             if *negated { "NOT " } else { "" }
         ),
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => format!(
-            "({} {}IN ({}))",
-            render_field_expr(expr),
-            if *negated { "NOT " } else { "" },
-            list.iter()
-                .map(render_field_expr)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Expr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => format!(
-            "({} {}BETWEEN {} AND {})",
-            render_field_expr(expr),
-            if *negated { "NOT " } else { "" },
-            render_field_expr(low),
-            render_field_expr(high)
-        ),
+        Expr::InList { .. } | Expr::Between { .. } => render_in_or_between(expr, aliases),
         Expr::Case {
             branches,
             otherwise,
