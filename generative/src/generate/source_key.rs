@@ -407,7 +407,7 @@ pub fn twins(a: &Key, b: &Key) -> bool {
 }
 
 #[cfg(feature = "proptest")]
-pub(crate) mod strategy {
+mod strategy {
     use super::*;
     use crate::generate::ConcurrentCase;
     use proptest::prelude::*;
@@ -420,7 +420,7 @@ pub(crate) mod strategy {
     /// One key part: `NULL` (when `nullable`), or one of
     /// [`KEY_PART_VALUES`], `''` and `NULL` weighted up so the two often
     /// sit side by side.
-    pub(crate) fn part(nullable: bool) -> BoxedStrategy<Option<String>> {
+    fn part(nullable: bool) -> BoxedStrategy<Option<String>> {
         let text = prop_oneof![
             3 => Just(String::new()),
             4 => proptest::sample::select(&KEY_PART_VALUES[1..]).prop_map(str::to_string),

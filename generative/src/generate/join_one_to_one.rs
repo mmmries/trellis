@@ -856,6 +856,72 @@ pub struct JoinedKeyDraw {
     pub a_moves: Vec<Option<super::source_key::Key>>,
 }
 
+/// The [`JoinedKeyDraw`] a two-table case gets, derived from the drawn
+/// `program` (its [`crate::generate::where_clause::digest`], salted) rather
+/// than drawn beside it, so the tier's other cases, and the rest of a keyed
+/// one, are the ones it drew before (as the `WHERE` arm is derived): `None`
+/// three times in four, unless `always`, which also gives every key a
+/// nullable part. Each key part is `NULL` (where nullable) two times in
+/// seven, `''` three in seven of the rest, and otherwise another of
+/// [`super::source_key::KEY_PART_VALUES`]; four `jb` updates in five and
+/// half of `ja`'s move their key.
+pub fn derived_key_draw(program: &Program, always: bool) -> Option<JoinedKeyDraw> {
+    use super::source_key::{KEY_PART_VALUES, Key, KeyDraw, KeyShape as SourceKeyShape};
+    struct Draws(u64);
+    impl Draws {
+        fn below(&mut self, n: usize) -> usize {
+            (split_mix(&mut self.0) % n as u64) as usize
+        }
+        fn part(&mut self, nullable: bool) -> Option<String> {
+            if nullable && self.below(7) < 2 {
+                return None;
+            }
+            Some(if self.below(7) < 3 {
+                String::new()
+            } else {
+                let rest = &KEY_PART_VALUES[1..];
+                rest[self.below(rest.len())].to_string()
+            })
+        }
+        fn key(&mut self, nullable: &[bool]) -> Key {
+            nullable.iter().map(|n| self.part(*n)).collect()
+        }
+    }
+    const DRAWS: usize = 32;
+    let mut d = Draws(crate::generate::where_clause::digest(program) ^ 0x2171_6b65_7973_0002);
+    if !always && d.below(4) != 0 {
+        return None;
+    }
+    let columns = 1 + d.below(2);
+    let mut nullable: Vec<bool> = (0..columns).map(|_| d.below(2) == 0).collect();
+    if always && !nullable.contains(&true) {
+        let at = d.below(columns);
+        nullable[at] = true;
+    }
+    let shape = SourceKeyShape {
+        nullable,
+        primary_key: d.below(2) == 0,
+    };
+    let any = vec![true; columns];
+    let inserts = (0..DRAWS).map(|_| d.key(&shape.nullable)).collect();
+    let moves = (0..DRAWS)
+        .map(|_| (d.below(5) != 0).then(|| d.key(&shape.nullable)))
+        .collect();
+    let a_inserts = (0..DRAWS).map(|_| d.key(&any)).collect();
+    let a_moves = (0..DRAWS)
+        .map(|_| (d.below(2) == 0).then(|| d.key(&any)))
+        .collect();
+    Some(JoinedKeyDraw {
+        key: KeyDraw {
+            shape,
+            inserts,
+            moves,
+        },
+        a_inserts,
+        a_moves,
+    })
+}
+
 /// `program`, a two-table 1-1 `JOIN` program ([`build_one_to_one_program`]),
 /// with `jb` read through a `KEY (...)` as `draw` says: `jb` gains one or
 /// two `text` key columns (`k0`, `k1`) under a unique index, `NULLS NOT
@@ -1414,7 +1480,8 @@ pub fn star_case(
 
 #[cfg(feature = "proptest")]
 pub use strategy::{
-    joined_key_case_strategy, joined_key_draw, one_to_one_case_strategy, star_case_strategy,
+    joined_key_case_strategy, one_to_one_case_strategy, star_case_strategy,
+    unkeyed_one_to_one_case_strategy,
 };
 
 #[cfg(feature = "proptest")]
@@ -1568,49 +1635,28 @@ pub(crate) mod strategy {
     /// burst sees the truncate before later writes repair what it left. One
     /// join key in ten is `NULL`.
     pub fn one_to_one_case_strategy() -> impl Strategy<Value = JoinCase> {
-        one_to_one_cases(
-            prop_oneof![
-                3 => Just(None),
-                1 => joined_key_draw(false).prop_map(Some),
-            ]
-            .boxed(),
-        )
+        one_to_one_cases(Some(false))
+    }
+
+    /// [`one_to_one_case_strategy`]'s cases before the derived `KEY (...)`
+    /// arm ([`derived_key_draw`]): seed for seed, a case of the tier is its
+    /// twin here, keyed or not. `tests/join_star_tier.rs` pins these draws.
+    pub fn unkeyed_one_to_one_case_strategy() -> impl Strategy<Value = JoinCase> {
+        one_to_one_cases(None)
     }
 
     /// The 1-1 JOIN tier's `joined_key` case, its planted-bug gate for a
     /// joined table read through `KEY (...)`: a
     /// [`one_to_one_case_strategy`] case whose `jb` always has a nullable
-    /// key column ([`key_joined`]).
+    /// key column ([`key_joined`], [`derived_key_draw`]).
     pub fn joined_key_case_strategy() -> impl Strategy<Value = JoinCase> {
-        one_to_one_cases(joined_key_draw(true).prop_map(Some).boxed())
-    }
-
-    /// A [`JoinedKeyDraw`]: `jb`'s key as a `FROM` table's is drawn
-    /// ([`crate::generate::source_key::key_draw`], a nullable part in
-    /// every key when `nullable_only`), and `ja`'s `ON` values from the same
-    /// parts, `NULL` included, half its updates moving them.
-    pub fn joined_key_draw(nullable_only: bool) -> impl Strategy<Value = JoinedKeyDraw> {
-        use crate::generate::source_key::{key_draw, strategy::part};
-        key_draw(nullable_only).prop_flat_map(|key| {
-            let a_key: Vec<_> = key.shape.nullable.iter().map(|_| part(true)).collect();
-            (
-                Just(key),
-                proptest::collection::vec(a_key.clone(), 32),
-                proptest::collection::vec(proptest::option::of(a_key), 32),
-            )
-                .prop_map(|(key, a_inserts, a_moves)| JoinedKeyDraw {
-                    key,
-                    a_inserts,
-                    a_moves,
-                })
-        })
+        one_to_one_cases(Some(true))
     }
 
     /// [`one_to_one_case_strategy`]'s cases, `jb` read through `KEY (...)`
-    /// when `keyed` draws a key.
-    fn one_to_one_cases(
-        keyed: BoxedStrategy<Option<JoinedKeyDraw>>,
-    ) -> impl Strategy<Value = JoinCase> {
+    /// as [`derived_key_draw`] derives it (`Some(always)`), or never
+    /// (`None`).
+    fn one_to_one_cases(keyed: Option<bool>) -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             1 => Just(KeyShape::Spread),
             1 => Just(KeyShape::HotKey),
@@ -1648,7 +1694,6 @@ pub(crate) mod strategy {
                 RACING_COMMIT_STALL_MS,
                 5_000u64..=10_000,
                 proptest::collection::vec(tail_truncate(), if truncating { 2..=4 } else { 0..=0 }),
-                keyed.clone(),
             )
                 .prop_map(
                     move |(
@@ -1663,7 +1708,6 @@ pub(crate) mod strategy {
                         racing_stall_ms,
                         racing_pace_micros,
                         tails,
-                        keyed,
                     )| {
                         place_tail_truncates(&mut draws, burst_size, &tails);
                         // A `racing` case builds nothing over rows.
@@ -1688,9 +1732,11 @@ pub(crate) mod strategy {
                         // A `WHERE` (#2043), derived from the program, so
                         // the draws are what they were.
                         case.program = crate::generate::where_clause::with_predicates(case.program);
-                        // After the `WHERE`, so its draw is what it was.
-                        if let Some(keyed) = &keyed {
-                            case.program = key_joined(case.program, keyed);
+                        // Derived after the `WHERE`, so its draw is what it was.
+                        if let Some(draw) =
+                            keyed.and_then(|always| derived_key_draw(&case.program, always))
+                        {
+                            case.program = key_joined(case.program, &draw);
                         }
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
