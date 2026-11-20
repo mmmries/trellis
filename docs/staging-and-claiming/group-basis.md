@@ -92,8 +92,10 @@ What each covers (R8):
 
 - **Build or rebuild**, the plan job's whole build
   ([builds](builds.md#an-aggregates-or-a-joins-build)): the target's
-  groups, the source's, and those undrained ring changes' old images name; over
-  a partitioned source, one transaction per leaf and one for the rest.
+  groups, the source's, and those undrained ring changes' images name, old and
+  new (a same-type rewrite fires no trigger, so a row can leave the group its
+  insert's new image names with no change naming it again); over a partitioned
+  source, one transaction per leaf and one for the rest.
 - **Release** of a held key, in its own transaction: the groups
   `poison_held.agg_groups` names (all its parked images') and its current row's.
 - **A page's `Recompute`**: step 5's groups, under the page's locks.
