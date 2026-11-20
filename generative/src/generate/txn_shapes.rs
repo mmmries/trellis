@@ -401,26 +401,24 @@ pub fn shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<(&'static str
             names.push("stale_snapshot_write");
         }
         if let Some(PrepareWrap { commit, hold }) = wrap.prepare {
-            {
-                names.push(if commit {
-                    "prepared_commit"
-                } else {
-                    "prepared_rollback"
-                });
-                if hold {
-                    names.push("prepared_held");
-                    if plan.bursts.iter().any(|b| {
-                        b.lanes.iter().any(|l| l.contains(&wrap.ops[0]))
-                            && b.actions.iter().any(|a| {
-                                matches!(
-                                    a.action,
-                                    crate::model::BurstAction::Pause { .. }
-                                        | crate::model::BurstAction::Resume { .. }
-                                )
-                            })
-                    }) {
-                        names.push("prepared_held_pause");
-                    }
+            names.push(if commit {
+                "prepared_commit"
+            } else {
+                "prepared_rollback"
+            });
+            if hold {
+                names.push("prepared_held");
+                if plan.bursts.iter().any(|b| {
+                    b.lanes.iter().any(|l| l.contains(&wrap.ops[0]))
+                        && b.actions.iter().any(|a| {
+                            matches!(
+                                a.action,
+                                crate::model::BurstAction::Pause { .. }
+                                    | crate::model::BurstAction::Resume { .. }
+                            )
+                        })
+                }) {
+                    names.push("prepared_held_pause");
                 }
             }
         }
