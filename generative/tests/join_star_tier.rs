@@ -80,11 +80,34 @@ fn digests(strategy: &proptest::strategy::BoxedStrategy<JoinCase>) -> Vec<u64> {
 /// digests of their sweep budget's cases (4 seeds × 12), recorded on the
 /// generator before the star tier (#1781), and for the two-table tier again
 /// when it began drawing redefinitions (#2183). A change that means to
-/// change what they draw updates these.
+/// change what they draw updates these. The two-table tier's derived
+/// `KEY (...)` arm (#2171) is left out, as the `WHERE` is: each of its cases
+/// is its unkeyed twin, keyed or not.
 #[test]
 fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
+    use generative::generate::join_one_to_one::{
+        derived_key_draw, key_joined, unkeyed_one_to_one_case_strategy,
+    };
+    let (keyed, unkeyed) = (
+        one_to_one_case_strategy().boxed(),
+        unkeyed_one_to_one_case_strategy().boxed(),
+    );
+    for seed in 1..=4 {
+        let twins = generative::plant_sweep::seeded_cases(&unkeyed, seed, 12);
+        for (case, twin) in generative::plant_sweep::seeded_cases(&keyed, seed, 12)
+            .into_iter()
+            .zip(twins)
+        {
+            let want = match derived_key_draw(&twin.program, false) {
+                Some(draw) => key_joined(twin.program, &draw),
+                None => twin.program,
+            };
+            assert_eq!(case.program, want, "seed {seed}");
+            assert_eq!(format!("{:?}", case.plan), format!("{:?}", twin.plan));
+        }
+    }
     assert_eq!(
-        digests(&one_to_one_case_strategy().boxed()),
+        digests(&unkeyed),
         [
             4_985_686_412_385_817_550,
             10_248_547_661_753_428_030,

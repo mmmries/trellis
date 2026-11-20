@@ -1803,7 +1803,15 @@ fn key_expr(spec: &CaptureSpec, alias: &str) -> String {
         .key
         .iter()
         .map(|c| {
+            // Planted bug: a `NULL` key part renders as `''` (#2126). See
+            // `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            if crate::plant::fires(crate::plant::Plant::NullKeyAsEmpty, spec.is_nullable(c)) {
+                return format!("format('%s', {alias}.{})", quote_ident(c));
+            }
             if spec.is_nullable(c) {
+                #[cfg(any(test, feature = "test-util"))]
+                crate::plant::reach(crate::plant::Marker::CaptureNullableKey);
                 null_key_escape_sql(&value_text(alias, c))
             } else {
                 format!("format('%s', {alias}.{})", quote_ident(c))

@@ -92,8 +92,8 @@
 //!   the value type it evaluates the column as changed (`integer` to
 //!   `double precision`). The pass pauses that definition with a
 //!   `capture_failure` naming the change and, for a refusal, the validator's
-//!   reason and the remedies (`ALTER TRANSFORM` to a definition that
-//!   validates, or change the column back, then `RESUME`); `RESUME`
+//!   reason and the remedies (change the column back, then `RESUME`, or
+//!   `DROP TRANSFORM` and define it again); `RESUME`
 //!   re-validates, re-types and rebuilds. A pure widening that left every
 //!   reader valid changed no value: nothing rebuilds.
 //!
@@ -1008,8 +1008,8 @@ async fn respond(
         Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err.into()),
         Err(reason) => {
             return Ok(Some(Response::Pause(format!(
-                "{what}, and define would now refuse it: {reason}. ALTER TRANSFORM it to a \
-                 definition that validates, or change the column back, then resume it"
+                "{what}, and define would now refuse it: {reason}. {}",
+                crate::staging::schema_change::RETYPE_REMEDY
             ))));
         }
     };

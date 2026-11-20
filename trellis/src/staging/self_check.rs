@@ -418,7 +418,7 @@ pub enum SelfCheckError {
     /// The audited definition reads something the comparison can't render
     /// (a `JOIN` field outside the shapes it holds), or its recorded state
     /// is missing (a `JOIN` with no joined table, a keyset over a key that's
-    /// gone).
+    /// gone), or a page holds a `NULL` key in a column it read as `NOT NULL`.
     UnsupportedExpr {
         target: String,
         detail: String,
@@ -1175,6 +1175,16 @@ fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
     }
 }
 
+/// A page row with no key: a key column read as `NOT NULL` renders raw, so a
+/// `NULL` in it (one whose `NOT NULL` changed after the key was read) renders
+/// none. The page is refused rather than panicking.
+pub(super) fn null_key(target: &str) -> SelfCheckError {
+    SelfCheckError::UnsupportedExpr {
+        target: target.to_string(),
+        detail: "a key column read as NOT NULL holds NULL; run self_check again".to_string(),
+    }
+}
+
 /// The bounded comparison itself (ADR-0013: the target read and the
 /// recompute share one snapshot). Reads one keyset page of `def`'s source
 /// (recomputed via [`render_leaf`]) and of the persisted target in a single
@@ -1238,7 +1248,9 @@ async fn compare_once(
     for row in &rows {
         let side = row.get::<_, i32>(0);
         page_end = row.get(1);
-        let key: String = row.get(2);
+        let Some(key) = row.get::<_, Option<String>>(2) else {
+            return Err(null_key(&def.def.target));
+        };
         match side {
             3 => {
                 uncertain.keys.insert(key);

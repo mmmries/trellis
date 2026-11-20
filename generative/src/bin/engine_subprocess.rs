@@ -21,8 +21,11 @@
 //! own test-only pause hook, never by this binary — see
 //! `SubprocessBackend::spawn_engine`'s doc comment for why they only need to
 //! be present in this process's environment, not parsed here:
-//! `TRELLIS_TEST_PAUSE_TRIGGER`/`TRELLIS_TEST_PAUSE_MARKER`.
+//! `TRELLIS_TEST_PAUSE_TRIGGER`/`TRELLIS_TEST_PAUSE_MARKER`. An optional
+//! one, `TRELLIS_TEST_REACH_FILE`, names where this process writes its
+//! plant counts when the backend asks for them.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use trellis::{Client, ClientOptions};
@@ -103,7 +106,24 @@ fn main() {
     // comment). Parking the main thread is enough to keep every background
     // task `client` owns alive until that external kill arrives; `client`
     // itself is simply never dropped by this process's own control flow.
+    //
+    // The one thing the main thread does while it waits is answer the
+    // backend's requests for this process's plant counts
+    // (`generative::backend::subprocess`'s `collect_reach`), which it asks
+    // for just before each kill.
+    let reach_file = std::env::var_os(generative::backend::REACH_FILE_ENV).map(PathBuf::from);
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        let Some(reach_file) = &reach_file else {
+            std::thread::sleep(Duration::from_secs(3600));
+            continue;
+        };
+        let request = generative::backend::reach_request(reach_file);
+        if request.exists() {
+            if let Err(err) = generative::backend::write_reach(reach_file) {
+                eprintln!("engine_subprocess: failed to write plant counts {reach_file:?}: {err}");
+            }
+            let _ = std::fs::remove_file(&request);
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
