@@ -47,6 +47,11 @@ pub enum SourceDdl {
     /// (the owner's own grant), and `GRANT` back at the close: Trellis owns
     /// the table but can't read it.
     RevokeSelect,
+    /// The owner role revoked from the Trellis role, and granted back at
+    /// the close: how an operator cuts Trellis off under the
+    /// recommendations, where it reads the sources only through that
+    /// membership. The owner's own privileges are untouched.
+    RevokeMembership,
     /// `REVOKE USAGE` on `public`, where the sources are, from `PUBLIC` and
     /// the owner, and `GRANT` back at the close. Targets in `public` lose it
     /// too, so the drain's writes are refused as well.
@@ -90,6 +95,7 @@ impl SourceDdl {
             SourceDdl::OwnerToHeir
                 | SourceDdl::OwnerToOther
                 | SourceDdl::RevokeSelect
+                | SourceDdl::RevokeMembership
                 | SourceDdl::RevokeSchemaUsage
                 | SourceDdl::Rls { .. }
                 | SourceDdl::WriterChange
@@ -138,6 +144,7 @@ impl SourceDdl {
             SourceDdl::OwnerToHeir => "owner_to_heir",
             SourceDdl::OwnerToOther => "owner_to_other",
             SourceDdl::RevokeSelect => "revoke_select",
+            SourceDdl::RevokeMembership => "revoke_membership",
             SourceDdl::RevokeSchemaUsage => "revoke_schema_usage",
             SourceDdl::Rls {
                 trellis_policy: false,

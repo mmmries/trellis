@@ -47,7 +47,7 @@ impl Menu {
     fn actions(self) -> u8 {
         match self {
             Menu::Maintenance => 7,
-            Menu::Privilege => 9,
+            Menu::Privilege => 10,
         }
     }
 }
@@ -134,11 +134,12 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             },
             // A foreign key's check reads the referenced table as its owner,
             // so taking the owner's `SELECT` or `USAGE` fails the
-            // application's write in Postgres itself.
+            // application's write in Postgres itself. Revoking the owner
+            // from Trellis takes Trellis's read alone.
             SourceDdl::RevokeSelect if referenced.contains(&table.name.as_str()) => {
-                SourceDdl::OwnerToOther
+                SourceDdl::RevokeMembership
             }
-            SourceDdl::RevokeSchemaUsage if !referenced.is_empty() => SourceDdl::OwnerToOther,
+            SourceDdl::RevokeSchemaUsage if !referenced.is_empty() => SourceDdl::RevokeMembership,
             action => action,
         };
         let window = window.min(ops - 1 - op);
@@ -188,7 +189,8 @@ fn privilege(action: u8, target: String) -> SourceDdl {
         },
         6 => SourceDdl::WriterChange,
         7 => SourceDdl::RevokeTargetWrites { target },
-        _ => SourceDdl::TargetRls { target },
+        8 => SourceDdl::TargetRls { target },
+        _ => SourceDdl::RevokeMembership,
     }
 }
 

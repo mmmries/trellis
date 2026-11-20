@@ -1154,8 +1154,8 @@ The actions, cheapest-first (every one below is built):
    or repair doesn't hold.
 
 8. **Privilege and ownership changes** (bucket 3) — `REVOKE`/`GRANT` of
-   Trellis's `SELECT` or its schema's `USAGE`, an owner Trellis does or
-   doesn't inherit, row-level security on a source with and without a policy
+   Trellis's `SELECT` or its schema's `USAGE`, the owner role revoked from
+   Trellis, an owner Trellis does or doesn't inherit, row-level security on a source with and without a policy
    for its role, the application role changed, and the drain's writes to a
    target refused: `SourceDdl::privilege`, drawn by
    `generate::source_ddl::privilege_plan_for`, swept by `tests/privileges.rs`,

@@ -54,6 +54,10 @@ pub(super) fn statements(
             ],
             vec![format!("GRANT SELECT ON {table} TO {APP_ROLE}")],
         ),
+        SourceDdl::RevokeMembership => (
+            vec![format!("REVOKE {APP_ROLE} FROM {TRELLIS_ROLE}")],
+            vec![format!("GRANT {APP_ROLE} TO {TRELLIS_ROLE}")],
+        ),
         SourceDdl::RevokeSchemaUsage => (
             vec![
                 grant_writer(),
@@ -216,6 +220,7 @@ mod tests {
             SourceDdl::OwnerToHeir,
             SourceDdl::OwnerToOther,
             SourceDdl::RevokeSelect,
+            SourceDdl::RevokeMembership,
             SourceDdl::RevokeSchemaUsage,
             SourceDdl::Rls {
                 trellis_policy: false,

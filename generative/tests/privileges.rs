@@ -171,6 +171,7 @@ fn drawn_privilege_plans_stay_in_bounds_and_cover_every_change() {
         "owner_to_heir",
         "owner_to_other",
         "revoke_select",
+        "revoke_membership",
         "revoke_schema_usage",
         "rls",
         "rls_trellis_policy",
@@ -336,6 +337,16 @@ async fn an_owner_trellis_inherits_keeps_every_definition_exact() {
 async fn trellis_select_revoked_pauses_the_readers_and_fails_no_write() {
     for pass_inside in [false, true] {
         let (_, verdicts) = run_one(SourceDdl::RevokeSelect, pass_inside).await;
+        assert_all_paused(&verdicts, HALTED);
+    }
+}
+
+/// The owner role revoked from Trellis, the way an operator cuts it off
+/// under the recommendations: paused, no write fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_revoked_from_trellis_pauses_the_readers_and_fails_no_write() {
+    for pass_inside in [false, true] {
+        let (_, verdicts) = run_one(SourceDdl::RevokeMembership, pass_inside).await;
         assert_all_paused(&verdicts, HALTED);
     }
 }
