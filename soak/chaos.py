@@ -30,8 +30,11 @@ import psycopg2
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 ADMIN = os.environ.get("USER", "postgres")  # the cluster's superuser: harness plumbing only
-ROLE = "trellis"  # the role Trellis runs as: not a superuser
-APP = "app"  # the role exhaust-conns holds connections as
+# The role Trellis runs as: not a superuser, and not named after Trellis's schema (`trellis`),
+# which the default search_path would resolve first. It inherits the application role's
+# ownership of the database and the sources, as docs/recommendations.md sets it up.
+ROLE = "trellis_runner"
+APP = "app"  # owns the database and the sources; the load runs as it
 DB = "shop"
 METRICS_BASE = 59500
 
@@ -40,16 +43,23 @@ class UsageError(Exception):
     pass
 
 
+class Aborted(Exception):
+    """The run is being torn down: an action must stop and start nothing new."""
+
+
 class Harness:
     """Paths, processes and the event log for one cluster directory."""
 
     def __init__(self, root, port, bin_path=None, run_dir=None):
         self.root = root
-        self.port = port
         self.sock = os.path.join(root, "s")
         self.pids = os.path.join(root, "pids")
         self.cfg_path = os.path.join(root, "setup.json")
-        self.cfg = json.load(open(self.cfg_path)) if os.path.exists(self.cfg_path) else {}
+        self.cfg = {}
+        if os.path.exists(self.cfg_path):
+            with open(self.cfg_path) as f:
+                self.cfg = json.load(f)
+        self.port = self.cfg.get("port", port)  # a set-up cluster listens where setup put it
         self.bin = os.path.abspath(
             bin_path or self.cfg.get("bin") or os.path.join(REPO, "target", "release", "trellis")
         )
@@ -58,6 +68,7 @@ class Harness:
         self.lock = threading.Lock()
         self.failures = []
         self.cleanups = []  # callables run once, after Postgres stops
+        self.aborting = threading.Event()
         for d in (self.sock, self.pids, self.run_dir, os.path.join(root, "tmp")):
             os.makedirs(d, exist_ok=True)
 
@@ -73,6 +84,17 @@ class Harness:
     def dsn(self, user=ROLE, db=DB, tcp=False):
         host = "127.0.0.1" if tcp else self.sock
         return f"host={host} port={self.port} user={user} dbname={db}"
+
+    @property
+    def needle(self):
+        """In the command line of every worker and load generator this harness starts, and
+        specific to its port: a pid is signalled only if its command line contains it."""
+        return f" port={self.port} user="
+
+    def sleep(self, n):
+        """Sleep for an action; raises Aborted as soon as the run is torn down."""
+        if self.aborting.wait(n):
+            raise Aborted("the run is being torn down")
 
     # -- logging ---------------------------------------------------------
     def event(self, msg):
@@ -131,11 +153,14 @@ class Harness:
     def live_pid(self, name, needle):
         """The pid in <name>.pid if that process is alive and its command line has `needle`.
 
-        Processes are only ever signalled through this: `pkill -f` patterns match the
-        harness's own command line, and a recycled pid must not be killed."""
+        Processes are only ever signalled through this, with `needle` = `self.needle`:
+        `pkill -f` patterns match the harness's own command line, and a recycled pid (a
+        stale pid file's) must not be killed."""
         try:
-            pid = int(open(self.pidfile(name)).read().strip())
-            cmdline = open(f"/proc/{pid}/cmdline").read().replace("\0", " ")
+            with open(self.pidfile(name)) as f:
+                pid = int(f.read().strip())
+            with open(f"/proc/{pid}/cmdline") as f:
+                cmdline = f.read().replace("\0", " ")
         except (OSError, ValueError):
             return None
         return pid if needle in cmdline else None
@@ -160,6 +185,8 @@ class Harness:
         return sorted(self.workers, key=lambda n: int(n[1:]))
 
     def start_worker(self, name, bin_path=None):
+        if self.aborting.is_set():
+            raise Aborted(f"not starting {name}: the run is being torn down")
         bin_path = bin_path or self.workers.get(name, {}).get("bin") or self.bin
         idx = int(name[1:])
         # w1 connects over TCP so the blackhole action reaches it; the others use the socket.
@@ -192,8 +219,7 @@ class Harness:
         with self.lock:
             if name in self.workers:
                 self.workers[name]["expected_down"] = True
-        bin_path = self.workers.get(name, {}).get("bin", self.bin)
-        if self.signal_pidfile(name, bin_path, sig):
+        if self.signal_pidfile(name, self.needle, sig):
             self.event(f"{'kill -9' if sig == signal.SIGKILL else 'stop'} {name}")
         proc = self.workers.get(name, {}).get("proc")
         if proc is not None:
@@ -219,38 +245,61 @@ class Harness:
             return ""
 
     # -- teardown --------------------------------------------------------
+    def nft_table(self):
+        return f"trellis_soak_{self.port}"
+
     def stop_all(self):
-        """Stop the load and every worker by pid file, then Postgres, then run cleanups.
+        """Stop the load and every worker by pid file, then Postgres, then undo host changes.
 
         Workers stop before Postgres and before any restore, or they keep writing into
-        (or reconnecting to) the cluster being replaced."""
-        self.signal_pidfile("loadgen", "loadgen.py", signal.SIGTERM, wait=5)
-        names = set(self.workers) | {f[:-4] for f in os.listdir(self.pids) if f.startswith("w") and f.endswith(".pid")}
-        for name in sorted(names):
-            if name in self.workers:
-                self.stop_worker(name)
-            else:  # a worker from an earlier, interrupted invocation
-                self.signal_pidfile(name, " run ", signal.SIGINT)
-        self.pg_stop()
-        for fn in self.cleanups:
+        (or reconnecting to) the cluster being replaced. The host changes (the blackhole's
+        nft table, the tablespace mount) are undone even when a step before fails, and
+        even when an earlier invocation was killed before it could undo them."""
+        self.aborting.set()
+        errors = []
+
+        def attempt(what, fn):
             try:
                 fn()
             except Exception as exc:
-                self.event(f"cleanup failed: {exc}")
+                errors.append(f"{what}: {exc}")
+                self.event(f"teardown: {what} failed: {exc}")
+
+        attempt("stop the load", lambda: self.signal_pidfile("loadgen", self.needle, signal.SIGTERM, wait=5))
+        names = set(self.workers) | {f[:-4] for f in os.listdir(self.pids) if f.startswith("w") and f.endswith(".pid")}
+        for name in sorted(names, key=lambda n: int(n[1:]) if n[1:].isdigit() else 0):
+            attempt(f"stop {name}", lambda name=name: self.stop_worker(name))
+        attempt("stop Postgres", self.pg_stop)
+        for fn in self.cleanups:
+            attempt("cleanup", fn)
         self.cleanups.clear()
+        if (
+            shutil.which("nft")
+            and subprocess.run(
+                ["sudo", "-n", "nft", "list", "table", "inet", self.nft_table()], capture_output=True
+            ).returncode
+            == 0
+        ):
+            attempt(
+                "delete the blackhole's nft table",
+                lambda: self.sudo("nft", "delete", "table", "inet", self.nft_table()),
+            )
         tbs = os.path.join(self.root, "tbs")
         if os.path.ismount(tbs):
-            self.sudo("umount", tbs)
+            attempt("unmount the tablespace", lambda: self.sudo("umount", tbs))
+        if errors:
+            raise RuntimeError("teardown incomplete: " + "; ".join(errors))
 
     def restore(self):
         self.stop_all()
         for name in os.listdir(self.pids):
-            if name.startswith("w") and self.live_pid(name[:-4], " run "):
+            if name.startswith("w") and self.live_pid(name[:-4], self.needle):
                 raise RuntimeError(f"worker {name[:-4]} is still running; not restoring under it")
         replace_tree(os.path.join(self.root, "data.base"), self.data)
         if self.cfg.get("volume_mb"):
             replace_tree(os.path.join(self.root, "wal.base"), self.wal)
         self.event("restored the base snapshot")
+        self.aborting.clear()
 
 
 def replace_tree(src, dst):
@@ -426,7 +475,7 @@ def pick_worker(h, which):
 @action("sleep:SECS")
 def sleep(h, n):
     """Do nothing for SECS seconds."""
-    time.sleep(secs(n))
+    h.sleep(secs(n))
 
 
 @action("kill9:[WORKER|any][:RESTART_AFTER_SECS=2]")
@@ -434,7 +483,7 @@ def kill9(h, which="any", after="2"):
     """kill -9 one worker, then start it again."""
     name = pick_worker(h, which)
     h.stop_worker(name, signal.SIGKILL)
-    time.sleep(secs(after))
+    h.sleep(secs(after))
     h.start_worker(name)
 
 
@@ -444,7 +493,7 @@ def kill9_storm(h, n):
     rnd = __import__("random")
     end = time.time() + secs(n)
     while time.time() < end:
-        time.sleep(min(5 + rnd.random() * 40, max(0, end - time.time())))
+        h.sleep(min(5 + rnd.random() * 40, max(0, end - time.time())))
         if time.time() >= end:
             break
         name = pick_worker(h, "any")
@@ -452,9 +501,9 @@ def kill9_storm(h, n):
         if rnd.random() < 0.25:
             for _ in range(3):
                 h.start_worker(name)
-                time.sleep(1 + rnd.random() * 2)
+                h.sleep(1 + rnd.random() * 2)
                 h.stop_worker(name, signal.SIGKILL)
-        time.sleep(rnd.random() * 5)
+        h.sleep(rnd.random() * 5)
         h.start_worker(name)
 
 
@@ -476,7 +525,7 @@ def pg_outage(h, n, mode="fast"):
     """Stop Postgres, keep it down for SECS, start it."""
     h.event(f"pg stop -m {mode}")
     h.pg_stop(mode)
-    time.sleep(secs(n))
+    h.sleep(secs(n))
     h.pg_start()
     h.event("pg back")
 
@@ -492,13 +541,13 @@ def terminate_backends(h, times="5", interval="10"):
         )
         h.event(f"terminated {n} backends")
         if i + 1 < int(times):
-            time.sleep(secs(interval))
+            h.sleep(secs(interval))
 
 
 @action("blackhole:SECS")
 def blackhole(h, n):
     """Drop TCP to Postgres's port on lo for SECS (sudo nft). Only w1 connects over TCP."""
-    table = f"trellis_soak_{h.port}"
+    table = h.nft_table()
     h.sudo("nft", "add", "table", "inet", table)
 
     def undo():
@@ -510,10 +559,11 @@ def blackhole(h, n):
         for d in ("dport", "sport"):
             h.sudo("nft", "add", "rule", "inet", table, "input", "iifname", "lo", "tcp", d, str(h.port), "drop")
         h.event(f"blackhole on for {n}s")
-        time.sleep(secs(n))
+        h.sleep(secs(n))
     finally:
         undo()
-        h.cleanups.remove(undo)
+        if undo in h.cleanups:  # stop_all may have run it already
+            h.cleanups.remove(undo)
         h.event("blackhole lifted")
 
 
@@ -528,7 +578,7 @@ def exhaust_conns(h, n):
             except psycopg2.Error as exc:
                 h.event(f"holding {len(conns)} connections ({str(exc).strip().splitlines()[-1][:100]})")
                 break
-        time.sleep(secs(n))
+        h.sleep(secs(n))
     finally:
         for c in conns:
             c.close()
@@ -541,7 +591,7 @@ def worker_outage(h, n):
     names = [w for w in h.worker_names() if h.workers[w]["proc"].poll() is None]
     for w in names:
         h.stop_worker(w)
-    time.sleep(secs(n))
+    h.sleep(secs(n))
     for w in names:
         h.start_worker(w)
 
@@ -550,26 +600,26 @@ def worker_outage(h, n):
 def wait_caught_up(h, max_secs="900", age="10"):
     """Wait until the ring's oldest undrained change is younger than AGE_SECS; fail after MAX_SECS."""
     t0 = time.time()
-    time.sleep(min(30, secs(max_secs)))  # let a freshly started worker publish its gauges
+    h.sleep(min(30, secs(max_secs)))  # let a freshly started worker publish its gauges
     while time.time() - t0 < secs(max_secs):
         ages = [metric_max(h.metrics(w), "trellis_ring_oldest_undrained_age_seconds") for w in h.worker_names()]
         ages = [a for a in ages if a is not None]
         if ages and max(ages) < secs(age):
             h.event(f"caught up after {time.time() - t0:.0f}s")
             return
-        time.sleep(5)
+        h.sleep(5)
     h.fail(f"not caught up (oldest undrained age >= {age}s) within {max_secs}s")
 
 
 @action("long-txn:SECS")
 def long_txn(h, n):
     """Hold an application transaction that wrote a row open for SECS, then commit."""
-    conn = psycopg2.connect(h.dsn())
+    conn = psycopg2.connect(h.dsn(user=APP))
     try:
         with conn.cursor() as cur:
             cur.execute("update accounts set balance = balance where id = 1")
         h.event(f"long transaction open for {n}s")
-        time.sleep(secs(n))
+        h.sleep(secs(n))
         conn.commit()
         h.event("long transaction committed")
     finally:
@@ -581,7 +631,7 @@ def pg_dump(h, n):
     """Run pg_dump into a reader that stalls for SECS, so it holds ACCESS SHARE on every table."""
     p = subprocess.Popen(["pg_dump", "-U", ADMIN, DB], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=h.env())
     h.event(f"pg_dump started, stalled for {n}s")
-    time.sleep(secs(n))
+    h.sleep(secs(n))
     shutil.copyfileobj(p.stdout, open(os.devnull, "wb"))
     h.event(f"pg_dump finished ({p.wait()})")
 
@@ -613,7 +663,7 @@ def fill_and_hold(h, tablespace, n, rows_per_insert):
             break
     h.event(f"full: {err[:160]}")
     try:
-        time.sleep(secs(n))
+        h.sleep(secs(n))
     finally:
         h.psql("drop table soak_ballast")
         h.event("ballast dropped")
@@ -653,7 +703,7 @@ def handover(h, new_bin, max_secs="300"):
     old = [w for w in h.worker_names() if h.workers[w]["proc"].poll() is None]
     name = f"w{max(int(w[1:]) for w in h.workers) + 1}"
     h.start_worker(name, os.path.abspath(new_bin))
-    time.sleep(30)
+    h.sleep(30)
     for w in old:
         h.stop_worker(w, signal.SIGKILL)
     t0, log = time.time(), os.path.join(h.run_dir, f"{name}.log")
@@ -661,7 +711,7 @@ def handover(h, new_bin, max_secs="300"):
         if "taking over" in open(log, errors="replace").read():
             h.event(f"{name} took over after {time.time() - t0:.1f}s")
             return
-        time.sleep(0.5)
+        h.sleep(0.5)
     h.fail(f"{name} did not take over within {max_secs}s")
 
 
@@ -692,7 +742,9 @@ def run_step(h, text):
         except Exception as exc:
             errors.append(f"{fn.__name__}: {exc}")
 
-    threads = [threading.Thread(target=one, args=p) for p in parts]
+    # Daemon threads: after Ctrl-C, stop_all sets h.aborting and the actions stop; nothing
+    # may keep the interpreter alive starting workers after the teardown.
+    threads = [threading.Thread(target=one, args=p, daemon=True) for p in parts]
     for t in threads:
         t.start()
     for t in threads:
@@ -745,6 +797,36 @@ def logbook_path():
     return os.path.join(os.path.dirname(common), ".claude", "scripts", "logbook")
 
 
+def logbook_reserve(h, args, cmdline, expect_secs):
+    """Reserve the box (waiting while another run holds it); the entry id, or None."""
+    if args.no_logbook:
+        return None
+    cmd = [logbook_path(), "reserve", "--kind", args.kind, "--lane", args.lane, "--issue", str(args.issue)]
+    cmd += ["--expect", f"{int(expect_secs)}s", "--cmd", cmdline, "--wait"]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)  # stderr shows who holds the box
+    if r.returncode:
+        raise RuntimeError(f"logbook reserve failed ({r.returncode})")
+    entry = r.stdout.strip().splitlines()[-1]
+    h.event(f"logbook entry {entry}")
+    return entry
+
+
+def logbook_finish(h, entry, rows, outcome, note):
+    if entry:
+        r = subprocess.run(
+            [logbook_path(), "finish", entry, "--rows", str(rows), "--outcome", outcome, "--note", note[:400]]
+        )
+        if r.returncode:
+            h.event(f"logbook finish {entry} FAILED ({r.returncode}): finish it by hand")
+    h.event(f"outcome {outcome}: {note}")
+
+
+def no_interrupts():
+    """From here the teardown must complete: ignore Ctrl-C, SIGTERM and SIGHUP."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+
+
 # -- commands ----------------------------------------------------------------
 
 
@@ -758,7 +840,26 @@ def cmd_setup(args):
         raise UsageError(f"{args.dir} is already set up; pass --force to rebuild it")
     if not args.bin:
         build_cli()
+    cmdline = f"soak/chaos.py setup accounts={args.accounts} orders={args.orders} volume_mb={args.volume_mb}"
+    entry = logbook_reserve(h, args, cmdline, args.build_secs + 600)
+    outcome, note = "aborted", "setup: harness error"
+    try:
+        setup_cluster(h, args)
+        outcome, note = "ok", f"setup: {args.accounts} accounts, {args.orders} orders, 6 transforms live, oracle 0"
+    except BaseException as exc:
+        note = f"setup: aborted: {type(exc).__name__}: {exc}"
+        raise
+    finally:
+        no_interrupts()
+        try:
+            h.stop_all()
+        finally:
+            logbook_finish(h, entry, args.accounts + args.orders + 50, outcome, note)
+
+
+def setup_cluster(h, args):
     h.stop_all()
+    h.aborting.clear()
     for d in ("data", "data.base", "wal", "wal.base", "vol/data"):
         p = os.path.join(args.dir, d)
         if os.path.lexists(p):
@@ -783,6 +884,7 @@ def cmd_setup(args):
         "bin": os.path.abspath(h.bin),
         "port": args.port,
     }
+    h.port = args.port  # stop_all above used the old cluster's port
     initdb = ["initdb", "-U", ADMIN, "-A", "trust", "-D", h.data]
     if args.volume_mb:
         initdb += [f"--waldir={os.path.join(h.wal, 'pg_wal')}"]
@@ -803,12 +905,14 @@ log_min_duration_statement = 5000
 log_lock_waits = on
 """)
     h.pg_start()
-    h.psql(f"create role {ROLE} login nosuperuser", db="postgres")
+    # As docs/recommendations.md sets it up: the application role owns the database and the
+    # sources, and Trellis's role inherits that ownership.
     h.psql(f"create role {APP} login nosuperuser", db="postgres")
-    h.psql(f"create database {DB} owner {ROLE}", db="postgres")
+    h.psql(f"create role {ROLE} login nosuperuser in role {APP}", db="postgres")
+    h.psql(f"create database {DB} owner {APP}", db="postgres")
     h.psql(
         file=os.path.join(HERE, "schema.sql"),
-        user=ROLE,
+        user=APP,
         variables=(f"accounts={args.accounts}", f"orders={args.orders}"),
     )
     print(f"seeded {args.accounts} accounts and {args.orders} orders", flush=True)
@@ -834,7 +938,12 @@ log_lock_waits = on
         time.sleep(2)
     else:
         raise RuntimeError(f"oracle differs right after setup: {bad}")
-    h.stop_all()
+    targets = [d.split()[1] for d in defs]
+    counts = h.psql(" union all ".join(f"select '{t}' || '|' || count(*) from public.{t}" for t in targets))
+    empty = [t for t, n in parse_oracle(counts).items() if n == 0]
+    if empty:  # an empty target makes its oracle line pass vacuously
+        raise RuntimeError(f"targets empty after setup: {', '.join(empty)}; adjust the seed or defs.txt")
+    h.stop_all()  # the cmd_setup teardown runs it again: it is idempotent
     replace_tree(h.data, os.path.join(args.dir, "data.base"))
     if args.volume_mb:
         replace_tree(h.wal, os.path.join(args.dir, "wal.base"))
@@ -879,35 +988,10 @@ def cmd_run(args):
         f"--scenario {label}" if args.scenario else " ".join(f"--step {s}" for s in steps)
     )
     cmdline += f" load={args.load_secs}s@{args.tps:g}tps workers={args.workers}"
-    entry = None
-    if not args.no_logbook:
-        expect = int(args.load_secs + args.converge_secs / 3 + 300)
-        r = subprocess.run(
-            [
-                logbook_path(),
-                "reserve",
-                "--kind",
-                args.kind,
-                "--lane",
-                args.lane,
-                "--issue",
-                str(args.issue),
-                "--expect",
-                f"{expect}s",
-                "--cmd",
-                cmdline,
-                "--wait",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode:
-            raise RuntimeError(f"logbook reserve failed: {r.stderr.strip()}")
-        entry = r.stdout.strip().splitlines()[-1]
-        h.event(f"logbook entry {entry}")
     h.event(f"run {cmdline}; logs in {run_dir}")
     outcome, rows, note = "aborted", 0, "harness error"
     stop_mon = threading.Event()
+    entry = logbook_reserve(h, args, cmdline, args.load_secs + args.converge_secs / 3 + 300)
     try:
         h.restore()
         h.pg_start()
@@ -922,7 +1006,7 @@ def cmd_run(args):
                 sys.executable,
                 os.path.join(HERE, "loadgen.py"),
                 "--dsn",
-                h.dsn(),
+                h.dsn(user=APP),
                 "--threads",
                 str(args.threads),
                 "--tps",
@@ -963,6 +1047,9 @@ def cmd_run(args):
             time.sleep(10)
         converged = diffs is not None and not any(diffs.values())
         h.event(f"oracle {'converged' if converged else 'did NOT converge'} after {time.time() - t0:.0f}s: {diffs}")
+        stop_mon.set()
+        mon.join()
+        h.check_workers()  # the monitor's last look may predate a crash
         if not converged:
             h.fail(f"oracle differs after {args.converge_secs}s: {diffs}")
         states = definition_states(h)
@@ -982,22 +1069,17 @@ def cmd_run(args):
             f"peak RSS {h.peak_rss_kb / 1024:.0f} MB, peak age {h.peak_age:.0f}s; load err {totals['err']}"
             + (f"; failures: {'; '.join(h.failures)}" if h.failures else "")
         )
-    except UsageError:
-        raise
     except BaseException as exc:
         h.event(f"aborted: {type(exc).__name__}: {exc}")
-        note = f"{label}: aborted: {exc}"
+        note = f"{label}: aborted: {type(exc).__name__}: {exc}"
         raise
     finally:
+        no_interrupts()
         stop_mon.set()
         try:
             h.stop_all()
         finally:
-            if entry:
-                subprocess.run(
-                    [logbook_path(), "finish", entry, "--rows", str(rows), "--outcome", outcome, "--note", note[:400]]
-                )
-            h.event(f"outcome {outcome}: {note}")
+            logbook_finish(h, entry, rows, outcome, note)
     return 0 if outcome == "ok" else 1
 
 
@@ -1010,8 +1092,13 @@ def main(argv=None):
     )
     ap.add_argument("--port", type=int, default=56701, help="Postgres port (default 56701)")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    book = argparse.ArgumentParser(add_help=False)
+    book.add_argument("--no-logbook", action="store_true", help="don't reserve a logbook entry (short trials only)")
+    book.add_argument("--kind", default="soak", choices=["soak", "repro", "acceptance"])
+    book.add_argument("--lane", default=os.environ.get("TRELLIS_LANE", "x"))
+    book.add_argument("--issue", type=int, default=0)
 
-    s = sub.add_parser("setup", help="build, seed and snapshot the cluster")
+    s = sub.add_parser("setup", parents=[book], help="build, seed and snapshot the cluster")
     s.add_argument("--accounts", type=int, default=100000)
     s.add_argument("--orders", type=int, default=1000000)
     s.add_argument(
@@ -1022,7 +1109,7 @@ def main(argv=None):
     s.add_argument("--build-secs", type=int, default=900, help="how long the definitions may take to go live")
     s.add_argument("--force", action="store_true", help="rebuild an existing cluster")
 
-    r = sub.add_parser("run", help="run a scenario against the base snapshot")
+    r = sub.add_parser("run", parents=[book], help="run a scenario against the base snapshot")
     r.add_argument("--scenario", choices=sorted(SCENARIOS))
     r.add_argument("--step", action="append", default=[], help="ACTION[:ARG...][+ACTION...], repeatable, run in order")
     r.add_argument("--load-secs", type=int)
@@ -1036,15 +1123,19 @@ def main(argv=None):
     r.add_argument("--converge-secs", type=int, default=900, help="how long the oracle may take to reach 0 diffs")
     r.add_argument("--max-rss-mb", type=float, help="fail if the workers' summed RSS ever exceeds this")
     r.add_argument("--max-age-secs", type=float, help="fail if the oldest undrained change ever gets this old")
-    r.add_argument("--no-logbook", action="store_true", help="don't reserve a logbook entry (short trial runs only)")
-    r.add_argument("--kind", default="soak", choices=["soak", "repro", "acceptance"])
-    r.add_argument("--lane", default=os.environ.get("TRELLIS_LANE", "x"))
-    r.add_argument("--issue", type=int, default=0)
 
     sub.add_parser("stop", help="stop the workers, the load and Postgres")
     sub.add_parser("actions", help="list fault actions and scenarios")
     args = ap.parse_args(argv)
     args.dir = os.path.abspath(args.dir)
+
+    def interrupted(signum, _frame):
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    # SIGTERM and SIGHUP tear down like Ctrl-C: stop everything, undo host changes, finish
+    # the logbook entry. Their default action would skip every `finally`.
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
     try:
         return {"setup": cmd_setup, "run": cmd_run, "stop": cmd_stop, "actions": cmd_actions}[args.cmd](args) or 0
     except UsageError as exc:

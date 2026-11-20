@@ -1,4 +1,4 @@
--- Source schema and seed for the soak harness. Run as the Trellis role with
+-- Source schema and seed for the soak harness. Run as the application role with
 -- psql -v accounts=N -v orders=N; regions are fixed at 50.
 create table regions (id int primary key, name text not null);
 create table accounts (id bigint primary key, region int not null, name text not null, balance numeric(14,2) not null, active boolean not null default true, updated_at timestamptz not null default now());

@@ -4,7 +4,11 @@ Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s soak -p 'test_*.p
 """
 
 import os
+import signal
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 
 sys.dont_write_bytecode = True
@@ -39,13 +43,63 @@ class ParseStep(unittest.TestCase):
                     chaos.parse_step(s)
 
 
+class PidFiles(unittest.TestCase):
+    """A pid is signalled only if its command line names this harness's port."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.h = chaos.Harness(self.tmp.name, 56999)
+        self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            p.kill()
+            p.wait()
+        self.tmp.cleanup()
+
+    def spawn(self, name, *argv):
+        p = subprocess.Popen(["sh", "-c", "sleep 30; :", "sh", *argv])
+        self.procs.append(p)
+        self.h.write_pid(name, p.pid)
+        for _ in range(100):  # until the child has exec'd: before that /proc shows our cmdline
+            with open(f"/proc/{p.pid}/cmdline") as f:
+                if f.read().startswith("sh"):
+                    break
+            time.sleep(0.01)
+        return p
+
+    def test_signals_only_its_own_port(self):
+        mine = self.spawn("w1", "host=/x port=56999 user=trellis_runner")
+        other = self.spawn("w2", "host=/x port=56998 user=trellis_runner")
+        self.assertIsNone(self.h.live_pid("w2", self.h.needle))
+        self.assertFalse(self.h.signal_pidfile("w2", self.h.needle, signal.SIGTERM))
+        self.assertTrue(self.h.signal_pidfile("w1", self.h.needle, signal.SIGTERM, wait=5))
+        self.assertEqual(mine.wait(5), -signal.SIGTERM)
+        self.assertIsNone(other.poll())
+
+    def test_missing_or_garbled_pid_file(self):
+        self.assertIsNone(self.h.live_pid("w9", self.h.needle))
+        with open(self.h.pidfile("w8"), "w") as f:
+            f.write("not a pid")
+        self.assertIsNone(self.h.live_pid("w8", self.h.needle))
+
+    def test_abort_stops_sleeps_and_starts(self):
+        self.h.aborting.set()
+        with self.assertRaises(chaos.Aborted):
+            self.h.sleep(30)
+        with self.assertRaises(chaos.Aborted):
+            self.h.start_worker("w1")
+
+
 class Oracle(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(chaos.parse_oracle("acct_view|0\norder_view|12\n\nnoise"), {"acct_view": 0, "order_view": 12})
 
     def test_one_line_per_definition(self):
-        sql = open(os.path.join(chaos.HERE, "oracle.sql")).read()
-        defs = [d.split()[1] for d in open(os.path.join(chaos.HERE, "defs.txt")) if d.strip()]
+        with open(os.path.join(chaos.HERE, "oracle.sql")) as f:
+            sql = f.read()
+        with open(os.path.join(chaos.HERE, "defs.txt")) as f:
+            defs = [d.split()[1] for d in f if d.strip()]
         for target in defs:
             self.assertIn(f"'{target}'", sql)
 
