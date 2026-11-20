@@ -269,9 +269,11 @@ pub enum RunError {
     },
     /// After op `op_index` of an isolation run, the definition made to fail
     /// in combination (`target`) didn't end as the engine's isolation
-    /// promises: paused with T0247 and the page's error, or holding the key
-    /// that failed alone when the rows landed on separate pages. Or another
-    /// definition was paused beside it, or the ring didn't retire.
+    /// promises: paused with a T0247 reason naming the page's SQLSTATE and
+    /// the pair's keys, its target as it was before the pair. Or, in any
+    /// held-key run (`target` `<ring>`), the ring didn't retire once the run
+    /// settled. Another definition paused beside it is
+    /// [`RunError::UnexpectedPause`].
     Isolation {
         op_index: usize,
         target: String,
