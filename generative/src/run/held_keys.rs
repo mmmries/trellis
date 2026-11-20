@@ -38,6 +38,10 @@ use super::{Divergence, RunError, apply_and_check_outcome, source_table};
 /// status reference's "Limits and defaults").
 pub const TRANSFORM_FUSE: usize = 5;
 
+/// How long a settled run gives its ring's segments to read drained
+/// ([`ManualBackend::ring_unretired`]): a stuck page never does.
+const RING_RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One plain 1-1 definition's held keys and expected target, as the engine's
 /// contract has them after each settled check.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -344,7 +348,7 @@ async fn run(
     }
 
     if let Some(unretired) = backend
-        .ring_unretired()
+        .ring_unretired(RING_RETIRE_WAIT)
         .await
         .map_err(|e| RunError::Snapshot(format!("ring: {e:?}")))?
     {

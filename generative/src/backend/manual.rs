@@ -1253,7 +1253,26 @@ impl ManualBackend {
     /// when nothing does: every page committed, so each segment is drained
     /// and housekeeping may retire it. A page stuck failing shows here
     /// (#2130: a holdup fills the ring and stops every target).
-    pub async fn ring_unretired(&self) -> Result<Option<String>, ManualBackendError> {
+    ///
+    /// A quiesce settles on the ring's rows, not its segments' states, so a
+    /// segment can still read `sealed` or `draining` for a moment after it.
+    /// This waits up to `within` for that to clear, and answers what's
+    /// still left then.
+    pub async fn ring_unretired(
+        &self,
+        within: Duration,
+    ) -> Result<Option<String>, ManualBackendError> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let left = self.ring_unretired_now().await?;
+            if left.is_none() || std::time::Instant::now() >= deadline {
+                return Ok(left);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn ring_unretired_now(&self) -> Result<Option<String>, ManualBackendError> {
         let row = self
             .raw
             .query_one(

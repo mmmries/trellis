@@ -225,7 +225,9 @@ fn held_key_sweep_tier() -> SweepTier {
 /// The held-key plants the tier runs but rarely catches: none. Of the 48
 /// cases of seeds 1 to 4 (logbook `20261116T201534-e-sweep`),
 /// `held_key_unlisted` was caught in 46 and `held_key_delete_applies` in 11,
-/// each within its seed's first five cases.
+/// each within its seed's first five cases. With the isolation cases (logbook
+/// `20261120T052921-d-sweep`), `isolation_pauses_every_reader` was caught in
+/// all 24 of them, the first isolation case of every seed.
 const HELD_KEY_KNOWN_MISSES: &[&str] = &[];
 
 /// The plants the held-key tier gates.
