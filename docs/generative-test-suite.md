@@ -381,16 +381,33 @@ draws the program it drew before.
   re-run. An op that may fail runs in its own savepoint. A serialization
   failure or deadlock reruns the transaction from the start; the coverage
   report counts these as `txn_retries`.
+- **Application wiring.** Some tables get triggers and a foreign key, as an
+  application installs them (`ConcurrentPlan::wiring`, `generate::wiring`).
+  A shadow row `k + SHADOW_OFFSET` follows each row `k`, kept by a row or
+  statement trigger, `BEFORE` or `AFTER`, in the same table or another. An
+  `AFTER` trigger links it by a foreign key that cascades or sets `NULL`.
+  A statement trigger also flips a per-connection tally row. A rewrite
+  trigger flips a column of each even-keyed row it writes, `BEFORE` in the
+  row, `AFTER` by a nested update. Every write lands on the firing lane's
+  own row, its shadow or its connection's tally; no op names the last two.
 
-The oracle is unchanged: a transaction's keys are its lane's, and a rolled-back
-run is repeated before the commit. The meta-test
-`every_transaction_shape_is_drawn_against_every_key_space` (`tests/coverage.rs`)
-fails when a shape isn't drawn on a table each key space reads; the coverage
+The oracle is unchanged: a transaction's keys are its lane's, a rolled-back
+run is repeated before the commit, and a trigger or cascade never changes
+which rows an op finds, so every op's expected outcome holds. The meta-tests
+`every_transaction_shape_is_drawn_against_every_key_space` and
+`every_wiring_shape_is_drawn_against_every_key_space` (`tests/coverage.rs`)
+fail when a shape isn't drawn on a table each key space reads; the coverage
 report prints the tally as `txn_shapes`. The plant `capture_slot_from_snapshot`
 (capture reads its ring slot at the writer's snapshot) is the transaction
 shape's: only a snapshot taken before a seal and a write after it reach it.
 The cooling-key, cooling-backfill and mid-burst tiers gate it; the hot-key and
-steady-load tiers seal too slowly to catch it reliably.
+steady-load tiers seal too slowly to catch it reliably. The plant
+`capture_skip_nested_reread` (capture never re-reads after a nested
+statement's capture) is the wiring's: only the `AFTER` rewrite reaches it.
+It reaches a target only through a 1-1 definition: a `GROUP BY` sums the
+nested change and the outer one, right in either order. The cooling-key,
+hot-key, mid-burst and steady-load tiers gate it; the cooling-backfill tier
+has no 1-1 definition.
 
 ## 4. The properties
 
@@ -1089,10 +1106,11 @@ The actions, cheapest-first (every one below is built):
 3. **Engine lifecycle** (bucket 1) — kill/restart/scale workers; where resume and
    idempotent re-application get tested.
 4. **Transaction shapes** (bucket 1) — multi-statement transactions at each
-   isolation level, savepoints, rollbacks and serialization retries, and
-   `ON CONFLICT`, `MERGE` and writable-CTE writes (§3, "Generated transactions
-   and statement forms"); (bucket 3) a transaction held open across a batch
-   boundary (via `OpenTransaction`).
+   isolation level, savepoints, rollbacks and serialization retries,
+   `ON CONFLICT`, `MERGE` and writable-CTE writes, and application triggers
+   and foreign-key cascades (§3, "Generated transactions and statement
+   forms"); (bucket 3) a transaction held open across a batch boundary (via
+   `OpenTransaction`).
 5. **Database administration** (bucket 1) — restart PG, checkpoint, freeze,
    xid aging: `model::DbAdminAction`, driven by
    `run::run_convergence_with_db_admin`, swept by `tests/db_admin.rs`. Each

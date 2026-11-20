@@ -1731,6 +1731,7 @@ const MID_BURST_NOT_GATED: &[(&str, &str)] = &[];
 /// nothing mid-burst. It gates the plants a `request_backfill` under
 /// load reaches, and not the 1-1 or build plants.
 const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
+    NO_ONE_TO_ONE_NESTED_REREAD,
     (
         "stale_one_to_one_write",
         "it needs a 1-1 definition, and the tier's programs have none (0 of 48 \
@@ -1753,6 +1754,15 @@ const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
     ),
 ];
 const STEADY_LOAD_NOT_GATED: &[(&str, &str)] = &[SLOW_SEALS_CAPTURE];
+
+/// Why the cooling-backfill tier doesn't gate `capture_skip_nested_reread`.
+const NO_ONE_TO_ONE_NESTED_REREAD: (&str, &str) = (
+    "capture_skip_nested_reread",
+    "only an AFTER rewrite trigger on a table a 1-1 definition reads reaches a target (a \
+     GROUP BY sums the nested change and the outer one, right in either order), and the \
+     tier's programs have no 1-1 definition; the cooling-key, hot-key, mid-burst and \
+     steady-load tiers gate it",
+);
 
 /// The 1-1 plants no tier gates, each pinned by deterministic tests
 /// instead: no random schedule opens its window, or its bug never reaches

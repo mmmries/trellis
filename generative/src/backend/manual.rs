@@ -589,6 +589,9 @@ pub struct ManualBackend {
     /// every target.
     strict_audits_converged: usize,
     held_keys: sql::HeldKeys,
+    /// The application wiring [`Backend::install`](super::Backend::install)
+    /// puts on the tables it creates (#2181).
+    wiring: Vec<crate::model::Wiring>,
 }
 
 impl ManualBackend {
@@ -755,6 +758,7 @@ impl ManualBackend {
             config,
             operator: None,
             held_keys: sql::HeldKeys::Block,
+            wiring: Vec::new(),
         })
     }
 
@@ -1567,6 +1571,15 @@ impl super::Backend for ManualBackend {
             }
             self.tables.insert(table.name.clone(), table.clone());
         }
+        // Once, with the tables: a mid-burst install comes through here too.
+        let wiring = std::mem::take(&mut self.wiring);
+        if self.source_tables != SourceTables::SharedExisting {
+            for wiring in &wiring {
+                self.raw
+                    .batch_execute(&super::wiring::wiring_ddl(&self.tables, wiring))
+                    .await?;
+            }
+        }
         for def in &program.defs {
             // A definition reading an earlier one's target waits for it to
             // build (`install_definition`), which needs the engine running.
@@ -1882,6 +1895,10 @@ fn drain_audit_ddl(schema: &str) -> String {
 
 impl super::ConcurrentBackend for ManualBackend {
     type Applier = ManualApplier;
+
+    fn set_wiring(&mut self, wiring: &[crate::model::Wiring]) {
+        self.wiring = wiring.to_vec();
+    }
 
     async fn applier(&self) -> Result<ManualApplier, ManualBackendError> {
         let raw = match connect_app(&self.roles).await? {

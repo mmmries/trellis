@@ -134,6 +134,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         .filter(|(_, at)| **at == 0)
         .map(|(def, _)| def.clone())
         .collect();
+    backend.set_wiring(&plan.wiring);
     backend
         .install(&Program {
             tables: program.tables.clone(),
