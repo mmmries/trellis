@@ -358,6 +358,21 @@ function-candidate rules (a function or aggregate argument), define refuses it
 Checked in `trellis/tests/expressions/logic_key_spaces.rs`, `trellis/tests/expressions/null_literal_key_spaces.rs`,
 `trellis/tests/one_to_one/one_to_one_render.rs` and the harness.
 
+### `IN` lists
+
+`x IN (a, b)` admits each element where `x = a` is admitted; `BETWEEN`'s bounds
+are its two comparisons. Postgres compares an element that reads a column with
+its own `=`, but two or more that read none at one common type of `x` and
+those elements. Which elements read a column depends on how fields inline, so
+a list of two or more is refused where the two readings can differ:
+
+| List | Common type | Each `=` | Admitted |
+|---|---|---|---|
+| a `real` beside a number literal, `x` not `double precision` | `real`: the number rounds | `double precision` | refused |
+| a `NULL` `x`, a string beside an element of another type | the elements': the string converts to it | `text` | refused |
+| a `char(n)` or `name` `x`, an element of another string type | `x`'s type: padding ignored, `name` truncated | `text` | refused |
+| any other pair `=` admits | agrees with each `=` | | yes |
+
 ## Dates and times
 
 Date and time expressions follow Postgres, which computes every value; define
@@ -490,8 +505,9 @@ never joinable.
   and primary keys; the join/primary-key check reads the type's `typtype` from the catalog
   rather than a static list.
 - There is no typed-literal syntax: a literal's keyword would be a per-schema
-  identifier. A string literal beside an enum column under `=` is read as a
-  value of the enum, as in Postgres ([expressions](expressions.md#comparison-and-logic)).
+  identifier. A string literal beside an enum column under `=` or in an `IN`
+  list is read as a value of the enum, as in Postgres
+  ([expressions](expressions.md#comparison-and-logic)).
 
 Postgres refuses a `DROP TYPE` of an enum while a column Trellis created
 uses it, and the retype or drop of the source column that has to come first

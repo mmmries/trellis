@@ -82,7 +82,7 @@
 //! needed. Every test in this file that this bug affected is un-`#[ignore]`d
 //! below.
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ManualBackend};
 use generative::generate::{
     Mutate, build_program, program_with_client_restart, program_with_scale_out, schedule_restart,
     schedule_scale_out,
@@ -136,8 +136,8 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record_program(program);
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             let pool =

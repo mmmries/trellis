@@ -50,6 +50,7 @@ use trellis::dev::pool::Pool;
 use trellis::dev::staging::StagingError;
 
 use super::ring_wait::QuiesceBudget;
+use super::roles::{Roles, connect_app};
 use super::sql;
 use super::{DefinitionState, Snapshot};
 use crate::model::{Op, Program, Table};
@@ -306,6 +307,10 @@ pub struct SubprocessBackend {
     dsn: String,
     pool: Pool,
     raw: tokio_postgres::Client,
+    /// The application's own session, when the backend was connected with
+    /// [`SubprocessBackend::connect_as`]: source DDL and every op's writes.
+    /// `None` runs them on `raw`. `dsn` and `raw` are the Trellis role's.
+    app: Option<tokio_postgres::Client>,
     /// Path to the `engine_subprocess` binary this backend spawns — see
     /// [`SubprocessBackend::connect`]'s doc comment for how a caller
     /// resolves this (`env!("CARGO_BIN_EXE_engine_subprocess")` from an
@@ -366,6 +371,40 @@ impl SubprocessBackend {
         Self::connect_with_options(dsn, engine_bin, 1, None).await
     }
 
+    /// [`SubprocessBackend::connect`], but with the engine subprocess and the
+    /// harness's catalog reads running as `roles.trellis` and the
+    /// application's statements as `roles.app` (`super::roles`).
+    pub async fn connect_as(
+        roles: &Roles,
+        engine_bin: impl Into<PathBuf>,
+    ) -> Result<Self, SubprocessBackendError> {
+        Self::connect_as_with_options(roles, engine_bin, 1, None).await
+    }
+
+    /// [`SubprocessBackend::connect_as`]'s general form, with
+    /// [`SubprocessBackend::connect_with_options`]'s two knobs.
+    pub async fn connect_as_with_options(
+        roles: &Roles,
+        engine_bin: impl Into<PathBuf>,
+        application_threads: usize,
+        maintenance_interval: Option<Duration>,
+    ) -> Result<Self, SubprocessBackendError> {
+        let mut backend = Self::connect_with_options(
+            roles.trellis.clone(),
+            engine_bin,
+            application_threads,
+            maintenance_interval,
+        )
+        .await?;
+        backend.app = connect_app(roles).await?;
+        Ok(backend)
+    }
+
+    /// The session application statements run on.
+    fn app_session(&self) -> &tokio_postgres::Client {
+        self.app.as_ref().unwrap_or(&self.raw)
+    }
+
     /// [`SubprocessBackend::connect`]'s general form — `application_threads`
     /// app-worker tasks inside the spawned subprocess, and (when `Some`) the
     /// subprocess's maintenance-loop cadence, mirroring
@@ -411,6 +450,7 @@ impl SubprocessBackend {
             dsn,
             pool,
             raw,
+            app: None,
             engine_bin: engine_bin.into(),
             tables: HashMap::new(),
             defs: Vec::new(),
@@ -501,7 +541,7 @@ impl SubprocessBackend {
             })?
             .clone();
         let source_columns = sql::source_columns(&source_table);
-        sql::create_source_indexes(&self.raw, None, def).await?;
+        sql::create_source_indexes(self.app_session(), None, def).await?;
         let text = sql::render_definition(def);
         // Same front door real callers and `ManualBackend` use — see
         // `ManualBackend::install_definition`'s doc comment.
@@ -633,7 +673,7 @@ impl super::Backend for SubprocessBackend {
 
     async fn install(&mut self, program: &Program) -> Result<(), SubprocessBackendError> {
         for table in &program.tables {
-            sql::create_source_table(&self.raw, None, table).await?;
+            sql::create_source_table(self.app_session(), None, table).await?;
             self.tables.insert(table.name.clone(), table.clone());
         }
         for def in &program.defs {
@@ -650,7 +690,8 @@ impl super::Backend for SubprocessBackend {
     }
 
     async fn apply(&mut self, op: &Op) -> Result<u64, SubprocessBackendError> {
-        sql::apply_op(&mut self.raw, &self.tables, op)
+        let session = self.app.as_mut().unwrap_or(&mut self.raw);
+        sql::apply_op(session, &self.tables, op)
             .await
             .map_err(SubprocessBackendError::from)
     }

@@ -1135,6 +1135,40 @@ fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
                 args,
             })
             .collect(),
+        // One element, two (the second of the other type, so Postgres picks
+        // a common type for the pair), and the `NOT` form.
+        Rule::InList { lhs, rhs } => product(&[leaves(*lhs), leaves(*rhs)])
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut v)| {
+                let element = v.pop().expect("element");
+                let operand = v.pop().expect("operand");
+                let list = if i % 2 == 0 {
+                    vec![element]
+                } else {
+                    vec![operand.clone(), element]
+                };
+                Expr::InList {
+                    expr: Box::new(operand),
+                    list,
+                    negated: i % 3 == 0,
+                }
+            })
+            .collect(),
+        Rule::Between { ty } => product(&[leaves(*ty), leaves(*ty)])
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut v)| {
+                let high = v.pop().expect("high");
+                let low = v.pop().expect("low");
+                Expr::Between {
+                    expr: Box::new(low.clone()),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated: i % 2 == 1,
+                }
+            })
+            .collect(),
         Rule::Not => leaves(ValueType::Boolean)
             .into_iter()
             .map(|e| Expr::Not(Box::new(e)))
@@ -2115,11 +2149,17 @@ fn the_generator_reaches_every_registry_entry() {
                 seen.insert(format!("cast to {target}"));
                 walk(expr, seen, depth + 1, deepest);
             }
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            Expr::Not(_)
+            | Expr::IsNull { .. }
+            | Expr::InList { .. }
+            | Expr::Between { .. }
+            | Expr::Case { .. } => {
                 seen.insert(
                     match expr {
                         Expr::Not(_) => "NOT",
                         Expr::IsNull { .. } => "IS NULL",
+                        Expr::InList { .. } => "IN",
+                        Expr::Between { .. } => "BETWEEN",
                         _ => "CASE",
                     }
                     .to_string(),
@@ -2169,6 +2209,8 @@ fn the_generator_reaches_every_registry_entry() {
             "prefix -".to_string(),
             "NOT".to_string(),
             "IS NULL".to_string(),
+            "IN".to_string(),
+            "BETWEEN".to_string(),
             "CASE".to_string(),
             "boolean literal".to_string(),
             "NULL".to_string(),

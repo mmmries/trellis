@@ -93,6 +93,61 @@ async fn assert_claimed_exactly_once(client: &Client, batches: &[i64], key: &str
     );
 }
 
+/// The fenced read across the 32-bit xid epoch boundary. The cluster is
+/// aged to just short of the boundary ([`TestCluster::age_xids_to_epoch_edge`]).
+/// Batch 1 holds a row from epoch 0 and is sealed while a straddler from
+/// epoch 0 is still open; the cluster then crosses into epoch 1, the
+/// straddler commits, and batch 2 holds a row from epoch 1 and the
+/// straddler. Each row is claimed by exactly one batch: `row_txid` and the
+/// fences are full `xid8`s. The `fence_xid32` plant, which cuts the fences to
+/// 32 bits, loses batch 2's rows.
+#[tokio::test]
+async fn a_batch_fenced_past_the_epoch_boundary_reads_its_rows() {
+    const EPOCH: i64 = 1 << 32;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    cluster.age_xids_to_epoch_edge(testkit::XID_PAGE);
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    insert_recompute(&sealer, "seg_0", "before").await;
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_txn = writer.transaction().await.expect("begin writer");
+    writer_txn
+        .execute(
+            "insert into seg_0 (src_table, key, op, hop_gen) \
+             values ('orders', 'straddler', 'recompute', 0)",
+            &[],
+        )
+        .await
+        .expect("insert straddler");
+    assert_eq!(seal_both_phases(&mut sealer).await, 1);
+
+    cluster.burn_xids(testkit::XID_PAGE);
+    writer_txn.commit().await.expect("commit straddler");
+    let (_, slot) = active_pointer(&sealer).await;
+    insert_recompute(&sealer, &format!("seg_{slot}"), "after").await;
+    assert_eq!(seal_both_phases(&mut sealer).await, 2);
+
+    let txids: Vec<i64> = sealer
+        .query(
+            "select row_txid::text::bigint from (select row_txid, key from seg_0 \
+             union all select row_txid, key from seg_1) r order by key",
+            &[],
+        )
+        .await
+        .expect("read the ring's txids")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        txids[0] > EPOCH && txids[1] < EPOCH && txids[2] < EPOCH,
+        "after, before, straddler: {txids:?}"
+    );
+    for key in ["before", "straddler", "after"] {
+        assert_claimed_exactly_once(&sealer, &[1, 2], key).await;
+    }
+}
+
 #[tokio::test]
 async fn the_straddler_is_claimed_exactly_once() {
     let cluster = TestCluster::start();

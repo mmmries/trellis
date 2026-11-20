@@ -115,7 +115,20 @@ pub enum PlantPath {
     /// Only the held-key tier's isolation draw makes such a page. A plant
     /// here can stop any reader of the page, whatever its key space.
     Isolation,
+    /// The drain's transaction-id comparisons past the first 32-bit epoch.
+    /// Only the `db_admin` property's xid-aging action
+    /// (`crate::model::DbAdminAction::WrapXids`) crosses the boundary, and
+    /// it is no planted-bug sweep tier, so no tier gates these: every
+    /// tier lists them in its `not_gated` with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
+    /// and `db_admin.rs`'s wrap pin gate them.
+    XidEpoch,
 }
+
+/// Why no sweep tier gates a [`PlantPath::XidEpoch`] plant.
+pub const NO_XID_EPOCH: &str = "no sweep tier crosses the 32-bit xid epoch; the db_admin \
+     property's wrap action does, and staging's \
+     sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows and db_admin.rs's \
+     a_wrap_across_the_epoch_boundary_with_work_in_flight_converges pin it";
 
 /// The path `plant` breaks.
 pub fn plant_path(plant: Plant) -> PlantPath {
@@ -131,7 +144,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::O2oWhereNullAsTrue
         | Plant::O2oWhereBuildUnfiltered
         | Plant::O2oWhereNoTombstone
-        | Plant::O2oWhereColumnNotImaged => PlantPath::OneToOne,
+        | Plant::O2oWhereColumnNotImaged
+        | Plant::FieldReleaseBeforeWiden => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild
@@ -214,6 +228,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
         Plant::IsolationPausesEveryReader => PlantPath::Isolation,
+        Plant::FenceXid32 => PlantPath::XidEpoch,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
     }
 }
@@ -236,6 +251,8 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         // A reader of a target, or of a failing page, or of a keyed source,
         // can be of any kind.
         PlantPath::Chain | PlantPath::Isolation | PlantPath::SourceKey => true,
+        // Every target drains through the fenced read.
+        PlantPath::XidEpoch => true,
     }
 }
 
@@ -1005,7 +1022,10 @@ mod tests {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Chain | PlantPath::Isolation | PlantPath::SourceKey => {
+                PlantPath::Chain
+                | PlantPath::Isolation
+                | PlantPath::XidEpoch
+                | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");
                 }

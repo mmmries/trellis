@@ -25,7 +25,7 @@
 //! from `tests/convergence.rs` (see that file's module doc comment for why
 //! the cluster is a `thread_local`).
 
-use generative::backend::ManualBackend;
+use generative::backend::{CaseDatabase, ManualBackend};
 use generative::generate::{
     Mutate, adversarial_noise_table, build_program, checkpoint_plan_for, noise_plan_for,
     trivial_program,
@@ -69,8 +69,8 @@ fn proptest_config() -> ProptestConfig {
 fn run_one(program: &Program, noise: &NoisePlan) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             let pool = trellis::dev::pool::Pool::new(

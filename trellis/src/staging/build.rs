@@ -1087,11 +1087,15 @@ async fn capture_release(
     let images = capture_images(txn, &definition.source_table, &read)
         .await
         .map_err(build_error)?;
-    if !images
-        || crate::capture::gate::holds(txn, &definition.source_table)
+    let ready = images
+        && !crate::capture::gate::holds(txn, &definition.source_table)
             .await
-            .map_err(build_error)?
-    {
+            .map_err(build_error)?;
+    // Planted bug: release the field before its capture widen lands and
+    // its gate clears. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let ready = ready || crate::plant::fires(crate::plant::Plant::FieldReleaseBeforeWiden, true);
+    if !ready {
         return Ok(CaptureRelease::NotReady);
     }
     Ok(CaptureRelease::Ready)

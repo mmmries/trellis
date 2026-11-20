@@ -60,6 +60,9 @@ pub mod precedence {
     pub const IS: u8 = 8;
     /// `=`, `<>`, `<`, `>`, `<=`, `>=` and similar comparisons.
     pub const COMPARISON: u8 = 10;
+    /// `[NOT] IN (...)` and `[NOT] BETWEEN ... AND ...`: tighter than the
+    /// comparisons and looser than `+`, as in Postgres.
+    pub const IN_BETWEEN: u8 = 15;
     /// Binary `+`, `-`.
     pub const ADDITIVE: u8 = 20;
     /// Binary `*`, `/`, `%`.

@@ -11,7 +11,7 @@
 //! [`run_convergence_with_isolation`]: the failing definition pauses with
 //! T0247, every other one keeps converging, and the ring retires.
 
-use generative::backend::ManualBackend;
+use generative::backend::{CaseDatabase, ManualBackend};
 use generative::generate::held_keys::{DivisorSlot, raising_shape};
 use generative::generate::isolation::{
     FailKind, IsoWrite, IsolationCase, IsolationParams, isolation_program, with_isolation,
@@ -99,8 +99,8 @@ async fn run(cluster: &TestCluster, program: &Program) -> Result<HeldKeySummary,
 
 /// Drives `case` against a fresh isolated database of `cluster`.
 async fn run_case(cluster: &TestCluster, case: &HeldCase) -> Result<HeldKeySummary, String> {
-    let db = cluster.create_isolated_database().await;
-    let mut backend = ManualBackend::connect(db.dsn())
+    let db = CaseDatabase::provision(cluster).await;
+    let mut backend = ManualBackend::connect_as(db.roles())
         .await
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");

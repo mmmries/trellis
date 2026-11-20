@@ -263,7 +263,8 @@
 //! two test binaries never share a cluster or a database.
 
 use generative::backend::{
-    Backend, ConcurrentBackend, ManualBackend, SEAL_ON_DEMAND_INTERVAL, SPLIT_THRESHOLD_ROWS,
+    Backend, CaseDatabase, ConcurrentBackend, ManualBackend, SEAL_ON_DEMAND_INTERVAL,
+    SPLIT_THRESHOLD_ROWS,
 };
 use generative::baseline_quarantine;
 use generative::generate::min_max::{self, min_max_case};
@@ -460,10 +461,11 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
         h.coverage.borrow_mut().record_program(program);
 
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect_with_workers(db.dsn(), PROPERTY_WORKERS)
-                .await
-                .expect("connect concurrent backend");
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend =
+                ManualBackend::connect_as_with_options(db.roles(), PROPERTY_WORKERS, None)
+                    .await
+                    .expect("connect concurrent backend");
             if program.tables.iter().any(|t| t.partitioning.is_some()) {
                 backend.set_reconcile_interval(generative::generate::partition::RECONCILE_INTERVAL);
             }
@@ -535,9 +537,9 @@ fn run_concurrent_case(
             .record_concurrent_plan(&case.program, &case.plan);
 
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect_with_options(
-                db.dsn(),
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as_with_options(
+                db.roles(),
                 case.workers,
                 Some(std::time::Duration::from_millis(case.seal_interval_ms)),
             )
@@ -1089,6 +1091,110 @@ async fn every_mid_burst_action_runs_while_its_burst_writes_the_source() {
     let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
         .await
         .expect("every mid-burst action must be taken and the bursts must converge");
+    assert!(run.outcome.as_pass(), "run did not pass: {}", run.outcome);
+}
+
+/// #2183: every definition change, taken while its burst writes the
+/// source. One hot table of 12 rows takes 240 writes in three bursts, read
+/// by a `GROUP BY` definition (`d0`) and a 1-1 definition (`d1`). The second
+/// burst drops a field of `d1`, drops `d0` and defines it again changed
+/// under a new name, and defines a second definition beside `d1`. The third
+/// adds a field to `d1` over the column the dropped field read, which widens
+/// capture again, drops the second definition, and drops and redefines `d0`
+/// once more, unchanged under its new name. Every drop must take its target
+/// with it (`ManualBackend`'s `act`).
+#[tokio::test(flavor = "multi_thread")]
+async fn every_definition_change_runs_while_its_burst_writes_the_source() {
+    const ROWS: i64 = 12;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let mutates = (0..240)
+        .map(|i| {
+            let pk = 1 + i % ROWS;
+            if i % 3 == 0 {
+                Mutate::MoveGroup {
+                    pk,
+                    grain: Some(i % 4),
+                }
+            } else {
+                Mutate::Update {
+                    pk,
+                    c1: Some(i),
+                    c2: Some(1),
+                }
+            }
+        })
+        .collect();
+    let mut hot =
+        TableSpec::numeric_only((1..=ROWS).map(|i| (Some(i), Some(1))).collect(), mutates);
+    hot.grain_values = (1..=ROWS).map(|i| Some((i % 3).to_string())).collect();
+    let program = build_program_multi_with_shapes(
+        &[hot],
+        &[
+            (
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count, AggregateFn::Sum(AggregateColumn::C1)],
+                },
+            ),
+            (0, DefShape::OneToOne),
+        ],
+    );
+    let draw = |kind, burst, target, start| ActionDraw {
+        kind,
+        burst,
+        target,
+        start,
+        span: 300,
+    };
+    let plan = add_burst_actions(
+        concurrent_plan(&program, 84, 3),
+        &program,
+        &[
+            draw(ActionKind::DropField, 0, 0, 100),
+            // `d0` (index 0 of 2), renamed (bit 2), changed (bit 4).
+            draw(ActionKind::Redefine, 0, 6, 200),
+            draw(ActionKind::SecondDefinition, 0, 1, 400),
+            draw(ActionKind::AddField, 1, 0, 100),
+            draw(ActionKind::Redefine, 1, 0, 300),
+        ],
+    );
+    let names = |burst: usize| {
+        let mut names: Vec<&str> = plan.bursts[burst]
+            .actions
+            .iter()
+            .map(|a| a.action.name())
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert!(plan.bursts[0].actions.is_empty());
+    assert_eq!(
+        names(1),
+        [
+            "define_second",
+            "drop",
+            "drop_field",
+            "redefine_renamed_changed"
+        ]
+    );
+    assert_eq!(
+        names(2),
+        ["add_field_widen", "drop", "drop", "redefine_same"]
+    );
+
+    let mut backend = ManualBackend::connect_with_options(
+        db.dsn(),
+        4,
+        Some(std::time::Duration::from_millis(50)),
+    )
+    .await
+    .expect("connect concurrent backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
+        .await
+        .expect("every definition change must be taken and the bursts must converge");
     assert!(run.outcome.as_pass(), "run did not pass: {}", run.outcome);
 }
 
@@ -1880,7 +1986,8 @@ const FILTERED_NAMING_UNREACHED: (&str, &str) = (
 
 /// The plants of a predicate column an image lacks (#1991 rule 11), which
 /// no concurrent tier reaches: an image lacks a column only when it was
-/// staged before a capture widen, and no tier widens a source. Each
+/// staged before a capture widen, and no tier widens a source to a column
+/// a `WHERE` reads (a field `ADD` widens it to a field's). Each
 /// `an_image_without_the_predicate_column_fails_the_page` pin
 /// (`one_to_one_where`, `group_basis_where`) gates its plant.
 const UNIMAGED_COLUMN_UNREACHED: [(&str, &str); 2] = [
@@ -1897,6 +2004,26 @@ const UNIMAGED_COLUMN_UNREACHED: [(&str, &str); 2] = [
          an_image_without_the_predicate_column_fails_the_page gates it",
     ),
 ];
+
+/// The plant of a field build released before its capture widen
+/// (#2183), which only a tier that adds a field reaches: the mid-burst and
+/// steady-load tiers gate it ([`with_field_edits`]), and every other
+/// concurrent tier leaves it out.
+const FIELD_WIDEN_UNREACHED: (&str, &str) = (
+    "field_release_before_widen",
+    "it releases a field an ALTER TRANSFORM ... ADD holds for its capture widen, and only the \
+     mid_burst and steady_load tiers add a field; capture_join's \
+     a_widened_field_waits_for_the_rows_staged_before_the_widen gates it",
+);
+
+/// `not_gated` for a tier that adds fields: [`FIELD_WIDEN_UNREACHED`] is
+/// gated.
+fn with_field_edits(
+    mut not_gated: Vec<(&'static str, &'static str)>,
+) -> Vec<(&'static str, &'static str)> {
+    not_gated.retain(|(plant, _)| *plant != FIELD_WIDEN_UNREACHED.0);
+    not_gated
+}
 
 /// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates, the
 /// `JOIN` plants and [`LEAF_UNREACHED`], with their reasons.
@@ -1918,8 +2045,16 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             &[PlantPath::Isolation],
             plant_sweep::NO_ISOLATION,
         ))
+        .chain(not_on_path(
+            &[PlantPath::XidEpoch],
+            plant_sweep::NO_XID_EPOCH,
+        ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
-        .chain([LEAF_UNREACHED, FILTERED_NAMING_UNREACHED])
+        .chain([
+            LEAF_UNREACHED,
+            FILTERED_NAMING_UNREACHED,
+            FIELD_WIDEN_UNREACHED,
+        ])
         .chain(UNIMAGED_COLUMN_UNREACHED)
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
@@ -1997,6 +2132,10 @@ fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
         "the min_max tier gates the MIN/MAX extremes' plants; the plant's own path is \
          gated by the tier its comment names",
     ));
+    out.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
+    ));
     out
 }
 
@@ -2060,7 +2199,7 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             SweepTier {
                 name: "mid_burst",
                 known_misses: HOT_KEY_BASED_MISSES,
-                not_gated: not_gated(
+                not_gated: with_field_edits(not_gated(
                     &[
                         MID_BURST_NOT_GATED,
                         MID_BURST_GROUP_BASIS,
@@ -2070,7 +2209,7 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
                             .collect::<Vec<_>>(),
                     ]
                     .concat(),
-                ),
+                )),
             },
             mid_burst_case().boxed(),
         ),
@@ -2078,7 +2217,7 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             SweepTier {
                 name: "steady_load",
                 known_misses: STEADY_LOAD_MISSES,
-                not_gated: not_gated(STEADY_LOAD_NOT_GATED),
+                not_gated: with_field_edits(not_gated(STEADY_LOAD_NOT_GATED)),
             },
             steady_load_case().boxed(),
         ),
