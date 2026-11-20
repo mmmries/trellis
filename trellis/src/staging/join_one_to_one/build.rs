@@ -532,33 +532,35 @@ async fn insert_from_read(
     Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
-/// The position (its index) a planted `star_chunk_skip_j_last` or
-/// `star_chunk_skip_j_first` leaves out of a star chunk's `J` set and its
-/// insert's late-key check, with the plant. See `crate::plant`.
+/// The positions (their indexes) the planted `star_chunk_skip_j_last` and
+/// `star_chunk_skip_j_first` leave out of a star chunk's `J` set and its
+/// insert's late-key check, each with its plant: none for a chain. Each is
+/// passed to `crate::plant::fires`, armed or not, so a baseline counts its
+/// reaches. See `crate::plant`.
 #[cfg(any(test, feature = "test-util"))]
-fn chunk_skip(shape: &JoinShape) -> Option<(crate::plant::Plant, usize)> {
+fn chunk_skip(shape: &JoinShape) -> Vec<(crate::plant::Plant, usize)> {
     if !shape.is_star() {
-        return None;
+        return Vec::new();
     }
-    match crate::plant::armed() {
-        Some(plant @ crate::plant::Plant::StarChunkSkipJLast) => {
-            Some((plant, shape.positions.len() - 1))
-        }
-        Some(plant @ crate::plant::Plant::StarChunkSkipJFirst) => Some((plant, 0)),
-        _ => None,
-    }
+    vec![
+        (
+            crate::plant::Plant::StarChunkSkipJLast,
+            shape.positions.len() - 1,
+        ),
+        (crate::plant::Plant::StarChunkSkipJFirst, 0),
+    ]
 }
 
 /// The keys a chunk locks in `J`: `k`, but under a planted bug a star's keys
 /// at one position left out ([`chunk_skip`]).
 fn chunk_skip_j(shape: &JoinShape, k: &PageKeys) -> PageKeys {
     #[cfg(any(test, feature = "test-util"))]
-    if let Some((plant, i)) = chunk_skip(shape)
-        && crate::plant::fires(plant, !k[i].is_empty())
-    {
-        let mut locked = k.clone();
-        locked[i].clear();
-        return locked;
+    for (plant, i) in chunk_skip(shape) {
+        if crate::plant::fires(plant, !k[i].is_empty()) {
+            let mut locked = k.clone();
+            locked[i].clear();
+            return locked;
+        }
     }
     let _ = shape;
     k.clone()
@@ -572,15 +574,20 @@ fn chunk_moved_key(shape: &JoinShape, parts: &[Option<String>], k: &PageKeys) ->
         return false;
     }
     #[cfg(any(test, feature = "test-util"))]
-    if let Some((plant, i)) = chunk_skip(shape) {
-        let missing: Vec<usize> = shape
-            .split_key(Side::From, parts)
-            .into_iter()
-            .filter(|(position, key)| !k[position.index()].contains(key))
-            .map(|(position, _)| position.index())
-            .collect();
-        if crate::plant::fires(plant, missing == [i]) {
-            return false;
+    {
+        let skips = chunk_skip(shape);
+        if !skips.is_empty() {
+            let missing: Vec<usize> = shape
+                .split_key(Side::From, parts)
+                .into_iter()
+                .filter(|(position, key)| !k[position.index()].contains(key))
+                .map(|(position, _)| position.index())
+                .collect();
+            for (plant, i) in skips {
+                if crate::plant::fires(plant, missing == [i]) {
+                    return false;
+                }
+            }
         }
     }
     true

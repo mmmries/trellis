@@ -1810,6 +1810,8 @@ fn key_expr(spec: &CaptureSpec, alias: &str) -> String {
                 return format!("format('%s', {alias}.{})", quote_ident(c));
             }
             if spec.is_nullable(c) {
+                #[cfg(any(test, feature = "test-util"))]
+                crate::plant::reach(crate::plant::Marker::CaptureNullableKey);
                 null_key_escape_sql(&value_text(alias, c))
             } else {
                 format!("format('%s', {alias}.{})", quote_ident(c))

@@ -414,6 +414,14 @@ async fn an_image_without_the_predicate_column_fails_the_page() {
             .expect("strip the column");
     }
     assert_eq!(stripped, 1, "one ring row for key 50");
+    let reaches = || {
+        trellis::dev::plant::reached()
+            .into_iter()
+            .find(|(site, _)| *site == "o2o_where_column_not_imaged")
+            .map(|(_, n)| n)
+            .expect("the plant's site")
+    };
+    let reached_before = reaches();
     let batch = d.seal().await;
     let err = d
         .drain_frozen(batch, "a", &[])
@@ -424,6 +432,10 @@ async fn an_image_without_the_predicate_column_fails_the_page() {
     assert!(
         format!("{err:?}").contains("the row has no column w"),
         "{err:?}"
+    );
+    assert!(
+        reaches() > reached_before,
+        "the failed page counts a reach of the plant's site"
     );
     assert_eq!(
         d.rows("select id from public.one where id = 50").await,

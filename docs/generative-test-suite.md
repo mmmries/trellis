@@ -920,6 +920,40 @@ directly with `GENERATIVE_PLANT_CHILD=1` (as a repro loop does) is one of the
 sweep's workers, not a gate: it prints a `plant-sweep` row per case and exits
 0 even when a case fails, with no list or bar applied, so read its rows.
 
+### The reachability floor
+
+Coverage floors prove the generators draw a shape; the reachability floor
+proves the shape reaches the engine path. Each plant's hook counts a *reach*
+whenever its precondition holds, armed or not. A hook whose precondition
+costs a query the correct path doesn't run counts each pass instead
+(`plant::visit`), and one whose precondition shows only as the correct
+path's error counts where that error is classified. A *reach marker*
+(`trellis::dev::plant::Marker`) counts a path that has no plant, such as
+capture's nullable-key encoding. The report marks pass counts, markers
+included, `(passes)`: they prove only that the path runs. Both compile only under `test-util`. The
+subprocess backend asks each engine child for its counts before killing it
+and folds them into the sweep's own.
+
+Every sweep prints a reachability report after its baseline: per site, the
+baseline cases that reached it and its reaches in all. Then the floor holds:
+**every site is reached at least once in the tier's baseline**, unless the
+tier's `not_gated` names it, or `generative::reach_floor::EXEMPT` lists it
+for that tier (or for every tier, `*`) with why. A site the tier doesn't
+gate but reaches in a quarter or more of its baseline cases is held too,
+listed in `reach_floor::REACHED_UNGATED`: losing it is lost exploration
+that no catch rate shows. When a run's ungated reaches differ from that
+list, the report prints the entry the run would give. A site no tier reaches is
+listed for `*` and names the deterministic test that reaches it. A site a
+tier reaches only now and then is exempt for that tier, with its measured
+rate.
+
+The floor is judged on the tier's default baseline (seeds 1–4, 12 cases
+each) or a bigger run, which draws the same cases first. A smaller run, or
+`GENERATIVE_PLANT_ONLY`, prints the report and skips the floor. It costs no
+extra cases, since every sweep already runs the baseline. The meta-test
+`the_reachability_floors_exemptions_are_well_formed` checks that both lists
+name real sites and tiers, and that each exemption gives a reason.
+
 ## 7. The action space, and how it grows
 
 Every candidate action falls in one of three buckets by its effect on the oracle:
