@@ -153,7 +153,7 @@ impl JoinCoverage {
             *self.definitions.entry(shape).or_insert(0) += 1;
         }
         for op in &case.program.ops {
-            let table = match op {
+            let table = match op.write() {
                 Op::Insert { table, .. } | Op::Update { table, .. } | Op::Delete { table, .. } => {
                     table
                 }

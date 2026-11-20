@@ -140,7 +140,7 @@ impl OneToOneCoverage {
             *self.definitions.entry(shape).or_insert(0) += 1;
         }
         for op in &case.program.ops {
-            let (table, row) = match op {
+            let (table, row) = match op.write() {
                 Op::Insert { table, row, .. } => (table, Some(row)),
                 Op::Update { table, .. } | Op::Delete { table, .. } => (table, None),
                 Op::Truncate { table, .. } => {

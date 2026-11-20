@@ -359,6 +359,8 @@ fails when a shape isn't drawn on a table each key space reads; the coverage
 report prints the tally as `txn_shapes`. The plant `capture_slot_from_snapshot`
 (capture reads its ring slot at the writer's snapshot) is the transaction
 shape's: only a snapshot taken before a seal and a write after it reach it.
+The cooling-key, cooling-backfill and mid-burst tiers gate it; the hot-key and
+steady-load tiers seal too slowly to catch it reliably.
 
 ## 4. The properties
 
