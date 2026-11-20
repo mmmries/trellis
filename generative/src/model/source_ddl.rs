@@ -110,6 +110,12 @@ impl SourceDdl {
         )
     }
 
+    /// Whether the change takes away something Trellis's role needs: every
+    /// privilege change but an owner it inherits and the role change.
+    pub fn refuses_trellis(&self) -> bool {
+        self.privilege() && !matches!(self, SourceDdl::OwnerToHeir | SourceDdl::WriterChange)
+    }
+
     /// Whether the application's writes run as the writer role for the
     /// window: the change takes away what the owner's sessions need to
     /// write, or is the role change itself.

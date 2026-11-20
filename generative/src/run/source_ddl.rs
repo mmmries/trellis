@@ -132,7 +132,7 @@ pub async fn run_convergence_with_source_ddl_allowing(
                     // A pass refused what the change took away fails as
                     // the engine's own loop's would; the judged check's
                     // passes, after the close, must not.
-                    Err(error) if event.action.privilege() => {
+                    Err(error) if event.action.refuses_trellis() && refusal(&error) => {
                         run.refused_passes.push((event.clone(), error));
                     }
                     Err(error) => return Err(fired(error)),
@@ -177,6 +177,20 @@ pub async fn run_convergence_with_source_ddl_allowing(
         op_index += 1;
     }
     Ok(run)
+}
+
+/// Whether a pass's error is Postgres refusing Trellis's role something
+/// (SQLSTATE `42501`), so an in-window pass failing for any other reason
+/// still fails the run.
+fn refusal(error: &str) -> bool {
+    [
+        "permission denied",
+        "must be owner",
+        "row-level security",
+        "42501",
+    ]
+    .iter()
+    .any(|refused| error.contains(refused))
 }
 
 /// The entries `def` may end silently wrong as at the check after `event`:
@@ -313,6 +327,20 @@ fn quote(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::generate::{DefShape, TableSpec, build_program_multi_with_shapes};
+
+    /// Only a refusal, inside a change that takes something from Trellis,
+    /// may fail an in-window pass.
+    #[test]
+    fn only_a_refused_pass_inside_a_refusing_change_is_recorded() {
+        assert!(refusal("db error: ERROR: permission denied for table t0"));
+        assert!(refusal("must be owner of table t0"));
+        assert!(!refusal("db error: ERROR: deadlock detected"));
+        assert!(!refusal("connection closed"));
+        assert!(SourceDdl::RevokeMembership.refuses_trellis());
+        assert!(!SourceDdl::OwnerToHeir.refuses_trellis());
+        assert!(!SourceDdl::WriterChange.refuses_trellis());
+        assert!(!SourceDdl::VacuumFull.refuses_trellis());
+    }
 
     fn table() -> TableSpec {
         TableSpec {
