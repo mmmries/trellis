@@ -161,6 +161,17 @@ impl TestCluster {
         }
     }
 
+    /// Assigns one id when the next is the first of a new epoch (xid 3).
+    /// Postgres creates that id's commit-log page only when it assigns it,
+    /// but startup reads the page, so a server stopped in this state does
+    /// not start again (#2229). Called before every stop.
+    pub(crate) fn step_off_epoch_start(&self) {
+        let next = self.next_xid();
+        if next >= EPOCH && next % EPOCH == 3 {
+            self.burn_xids(1);
+        }
+    }
+
     /// Assigns and commits `count` transaction ids, each in a transaction of
     /// its own, from one `DO` block.
     pub fn burn_xids(&self, count: u32) {
@@ -237,6 +248,18 @@ fn reset_wal(data_dir: &Path, epoch: u64, xid: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After id `2^32 - 1` the next is xid 3 of epoch 1, whose commit-log
+    /// page does not exist yet; a restart right then still comes back.
+    #[test]
+    fn a_restart_at_the_start_of_an_epoch_comes_back() {
+        let cluster = TestCluster::start();
+        cluster.age_xids_to_epoch_edge(XID_PAGE);
+        cluster.burn_xids(XID_PAGE);
+        assert_eq!(cluster.next_xid(), EPOCH + 3);
+        cluster.restart(StopMode::Fast);
+        cluster.psql("postgres", "select pg_current_xact_id()");
+    }
 
     /// A `psql` session that creates a temporary table and then sleeps,
     /// holding it, until killed.

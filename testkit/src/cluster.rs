@@ -726,6 +726,7 @@ impl TestCluster {
     /// starts it again on the same data directory, socket and port and
     /// waits until it accepts connections.
     pub(crate) fn while_stopped(&self, mode: StopMode, while_down: impl FnOnce()) {
+        self.step_off_epoch_start();
         let mut server = self.server.lock().expect("server lock");
         run_to_completion(
             Command::new("pg_ctl")
