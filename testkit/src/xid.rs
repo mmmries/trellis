@@ -30,6 +30,20 @@ const EPOCH: u64 = 1 << 32;
 /// the 40-million-id warning band.
 const WRAP_MARGIN: u64 = 100_000_000;
 
+/// Drops temporary tables left behind by sessions a restart killed.
+/// Vacuum never touches another session's temporary table, so an orphan
+/// holds its database's `datfrozenxid` at the id it was created under for
+/// good, until autovacuum gets round to it. A restart kills every session,
+/// so a temporary table over 2^30 ids old cannot belong to a live one.
+const DROP_ORPHANED_TEMP_TABLES: &str = "do $$ declare r record; begin \
+    for r in select n.nspname, c.relname from pg_class c \
+        join pg_namespace n on n.oid = c.relnamespace \
+        where c.relpersistence = 't' and c.relkind in ('r', 'm') \
+          and age(c.relfrozenxid) > 1073741824 \
+    loop \
+        execute format('drop table %I.%I', r.nspname, r.relname); \
+    end loop; end $$";
+
 /// What [`TestCluster::age_xids_to_epoch_edge`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XidAging {
@@ -44,7 +58,8 @@ pub struct XidAging {
 impl TestCluster {
     /// `VACUUM FREEZE` in every database, `template0` included (it is
     /// opened to connections for the vacuum and closed again). A database
-    /// dropped meanwhile is skipped. Tuples a running transaction can still
+    /// dropped meanwhile is skipped. Orphaned temporary tables (see
+    /// [`DROP_ORPHANED_TEMP_TABLES`]) are dropped first. Tuples a running transaction can still
     /// see stay unfrozen: their database's `datfrozenxid` says so, and
     /// [`TestCluster::age_xids_to_epoch_edge`] reads it.
     pub fn freeze_every_database(&self) {
@@ -62,7 +77,8 @@ impl TestCluster {
                     &format!("alter database {ident} allow_connections true"),
                 );
             }
-            let vacuumed = self.try_psql(name, "vacuum freeze");
+            let dropped = self.try_psql(name, DROP_ORPHANED_TEMP_TABLES);
+            let vacuumed = dropped.and_then(|_| self.try_psql(name, "vacuum freeze"));
             if closed {
                 self.psql(
                     "postgres",
