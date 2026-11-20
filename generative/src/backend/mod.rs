@@ -175,7 +175,8 @@ pub trait OpApplier: Send + 'static {
 
     /// Resolves a transaction [`OpApplier::apply_txn`] left prepared
     /// ([`TxnApplied::held`]): commits it, or rolls it back and applies
-    /// `ops` again in a transaction that commits, whose results it returns.
+    /// `ops` again in a transaction that commits, whose results it returns
+    /// (with no `ops`, only rolls it back).
     fn finish_prepared(
         &mut self,
         held: &HeldPrepared,

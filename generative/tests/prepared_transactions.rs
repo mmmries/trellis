@@ -59,6 +59,45 @@ fn program() -> (Program, String) {
     (program, target)
 }
 
+/// One burst of one lane over the program's three ops, the last two a
+/// transaction held prepared while the burst pauses and resumes `target`.
+fn held_plan(target: &str, commit: bool) -> ConcurrentPlan {
+    ConcurrentPlan {
+        bursts: vec![Burst {
+            lanes: vec![vec![0, 1, 2]],
+            actions: vec![
+                TimedAction {
+                    after: 3,
+                    action: BurstAction::Pause {
+                        target: target.to_string(),
+                        column: None,
+                    },
+                },
+                TimedAction {
+                    after: 3,
+                    action: BurstAction::Resume {
+                        target: target.to_string(),
+                        column: None,
+                    },
+                },
+            ],
+        }],
+        steady_load: None,
+        settle_after_install: false,
+        commit_stall: None,
+        txns: vec![TxnWrap {
+            ops: vec![1, 2],
+            isolation: Isolation::RepeatableRead,
+            read_first: true,
+            think: std::time::Duration::ZERO,
+            rehearse: false,
+            savepoint: None,
+            prepare: Some(PrepareWrap { commit, hold: true }),
+        }],
+        wiring: Vec::new(),
+    }
+}
+
 /// A transaction of the program's last two ops, left prepared and resolved
 /// as the burst ends, with the definition paused and resumed while it is in
 /// doubt: the run converges, and nothing is left prepared.
@@ -68,40 +107,7 @@ async fn a_held_prepared_transaction_survives_a_pause_and_resume() {
     for commit in [true, false] {
         let db = CaseDatabase::provision(&cluster).await;
         let (program, target) = program();
-        let plan = ConcurrentPlan {
-            bursts: vec![Burst {
-                lanes: vec![vec![0, 1, 2]],
-                actions: vec![
-                    TimedAction {
-                        after: 3,
-                        action: BurstAction::Pause {
-                            target: target.clone(),
-                            column: None,
-                        },
-                    },
-                    TimedAction {
-                        after: 3,
-                        action: BurstAction::Resume {
-                            target: target.clone(),
-                            column: None,
-                        },
-                    },
-                ],
-            }],
-            steady_load: None,
-            settle_after_install: false,
-            commit_stall: None,
-            txns: vec![TxnWrap {
-                ops: vec![1, 2],
-                isolation: Isolation::RepeatableRead,
-                read_first: true,
-                think: std::time::Duration::ZERO,
-                rehearse: false,
-                savepoint: None,
-                prepare: Some(PrepareWrap { commit, hold: true }),
-            }],
-            wiring: Vec::new(),
-        };
+        let plan = held_plan(&target, commit);
         let mut backend = ManualBackend::connect_as(db.roles())
             .await
             .expect("connect manual backend");
@@ -198,5 +204,30 @@ async fn a_prepared_transaction_left_at_the_oracle_fails_the_case() {
     app.batch_execute(&format!("rollback prepared '{PREPARED_GID_PREFIX}left'"))
         .await
         .expect("resolve");
+    check_none_prepared(&oracle).await.expect("none left");
+}
+
+/// A held transaction whose op has an outcome the program doesn't expect
+/// fails the case, and is rolled back, not left prepared: the long-lived
+/// cluster a sweep shares across cases has few prepared-transaction slots,
+/// and a database with one prepared can't be dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_held_transaction_is_not_left_prepared() {
+    let cluster = TestCluster::start();
+    let db = CaseDatabase::provision(&cluster).await;
+    let (mut program, target) = program();
+    let Op::Update { expect, .. } = &mut program.ops[2] else {
+        unreachable!("the third op is the update");
+    };
+    *expect = OpOutcome::AffectsNoRows;
+    let plan = held_plan(&target, true);
+    let mut backend = ManualBackend::connect_as(db.roles())
+        .await
+        .expect("connect manual backend");
+    let oracle = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    match run_convergence_concurrent(&mut backend, &oracle, &program, &plan).await {
+        Err(RunError::UnexpectedOpOutcome { op_index: 2, .. }) => {}
+        other => panic!("expected the update's outcome to fail the case, got {other:?}"),
+    }
     check_none_prepared(&oracle).await.expect("none left");
 }

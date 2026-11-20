@@ -475,8 +475,22 @@ async fn apply_wrapped<A: OpApplier>(
             op_index: ops[0].0,
             error: format!("{e:?}"),
         })?;
-    for ((op_index, op), result) in ops.iter().zip(&applied.results) {
-        check_op_outcome(*op_index, op, result)?;
+    let checked = ops
+        .iter()
+        .zip(&applied.results)
+        .try_for_each(|((op_index, op), result)| check_op_outcome(*op_index, op, result));
+    if let Err(e) = checked {
+        // A failing case leaves nothing prepared: a sweep's cases share one
+        // cluster, with few prepared-transaction slots, and a database with
+        // a transaction prepared in it can't be dropped.
+        if let Some(held) = &applied.held {
+            let rollback = HeldPrepared {
+                commit: false,
+                ..held.clone()
+            };
+            let _ = applier.finish_prepared(&rollback, wrap, &[]).await;
+        }
+        return Err(e);
     }
     assert_eq!(
         applied.results.len(),

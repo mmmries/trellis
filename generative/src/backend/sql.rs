@@ -1963,7 +1963,7 @@ pub const PREPARED_GID_PREFIX: &str = "trellis_gen_";
 /// Resolves a transaction [`apply_txn`] left prepared, as the program says:
 /// `COMMIT PREPARED`, or `ROLLBACK PREPARED` and then `wrap`'s ops again in
 /// a transaction that commits (the oracle identity), whose result this
-/// returns.
+/// returns. With no `ops` it only rolls back.
 pub(super) async fn finish_prepared(
     raw: &mut tokio_postgres::Client,
     tables: &HashMap<String, Table>,
@@ -1979,6 +1979,9 @@ pub(super) async fn finish_prepared(
     }
     raw.batch_execute(&format!("rollback prepared '{gid}'"))
         .await?;
+    if ops.is_empty() {
+        return Ok(super::TxnApplied::default());
+    }
     let again = TxnWrap {
         prepare: None,
         rehearse: false,
