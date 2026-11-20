@@ -756,20 +756,19 @@ beside them run on every `cargo test`.
   groups by the grain, and the variant draws no partition maintenance,
   which would put the hot table in one lane.
 - **Source-key convergence** *(ADR-0026, `generate::source_key`)*. One
-  program in four that the convergence property and the concurrent backend's
-  property draw reads its first definition's source through a `KEY (...)`:
-  one or two `text` key columns, each `NOT NULL` or nullable under a `NULLS
-  NOT DISTINCT` index, with the table's primary key kept beside it or
-  dropped. Every 1-1 and `GROUP BY` definition over the table names the key.
-  Inserts write keys of `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and
-  `chr(31)`; updates move rows between keys, onto and off the `NULL` key. A
-  model of the live keys expects a write onto a taken key to fail. The oracle
-  keys a 1-1 target by its key columns, with a `NULL` part apart from `''`.
-  The concurrent tier keeps a keyed table's writes in one lane, since two
-  rows can collide on its key. The `source_keys` coverage line counts each
-  variant. Its sweep tier (`GENERATIVE_PLANT_TIER=source_key`, a nullable key
-  in every case) gates `null_key_as_empty`, #2126's capture rendering
-  restored, which it catches in about one case in two.
+  program in four drawn by the convergence property and the concurrent
+  backend's property reads its first definition's source through a
+  `KEY (...)`: one or two `text` columns, each `NOT NULL` or nullable under a
+  `NULLS NOT DISTINCT` index, beside the primary key or without one. Every
+  1-1 and `GROUP BY` definition over the table names the key. Keys take
+  `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and `chr(31)`, and updates move
+  rows between keys. A model of the live keys expects a write onto a taken
+  key to fail. The oracle keeps a `NULL` key part apart from `''`. The
+  concurrent tier keeps a keyed table's writes in one lane, since which of
+  two racing writes to one key fails depends on commit order. The
+  `source_keys` coverage line counts each variant. The sweep tier
+  `GENERATIVE_PLANT_TIER=source_key` (a nullable key in every case) gates
+  `null_key_as_empty`, #2126's capture rendering restored.
 
 ### Two runtimes, one oracle
 

@@ -803,6 +803,37 @@ impl NamePool {
 mod tests {
     use super::*;
 
+    /// #2171: `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and `chr(31)` each
+    /// key a row of their own, alone or as either part of a composite key.
+    #[test]
+    fn every_source_key_part_combination_keys_its_own_row() {
+        let parts: Vec<Option<String>> = std::iter::once(None)
+            .chain(
+                [
+                    "",
+                    "\u{1}",
+                    "\u{1}\u{1}",
+                    "a\u{1}\u{1}",
+                    "\u{1f}",
+                    "-",
+                    "0:",
+                    "1:a",
+                ]
+                .into_iter()
+                .map(|v| Some(v.to_string())),
+            )
+            .collect();
+        let mut keys: Vec<Vec<Option<String>>> = parts.iter().map(|p| vec![p.clone()]).collect();
+        for a in &parts {
+            for b in &parts {
+                keys.push(vec![a.clone(), b.clone()]);
+            }
+        }
+        let texts: std::collections::HashSet<String> =
+            keys.iter().map(|k| source_key_text(k)).collect();
+        assert_eq!(texts.len(), keys.len());
+    }
+
     #[test]
     fn name_pools_are_stable_and_independent_across_construction() {
         let mut pool = NamePool::new();
