@@ -143,8 +143,8 @@ use trellis::dev::defs::ast::{
 };
 
 use crate::model::{
-    Burst, BurstAction, Column, ConcurrentPlan, NamePool, Op, OpOutcome, PartitionStrategy,
-    Partitioning, Program, Table, TimedAction,
+    Burst, BurstAction, Column, ConcurrentPlan, DefineShape, FieldEdit, NamePool, Op, OpOutcome,
+    PartitionStrategy, Partitioning, Program, Table, TimedAction,
 };
 
 /// The inclusive upper bound of the calculated-field value domain.
@@ -1744,6 +1744,21 @@ pub enum ActionKind {
     /// A column [`BurstAction::Pause`] on a 1-1 definition, then its column
     /// [`BurstAction::Resume`] later in the same burst.
     ColumnPauseResume,
+    /// A field `ADD` on a 1-1 definition ([`FieldEdit::Add`]), of a column
+    /// no definition reads when there is one, so the source's capture
+    /// widens under the burst's writes.
+    AddField,
+    /// A field `ALTER` on a 1-1 definition ([`FieldEdit::Alter`]).
+    AlterField,
+    /// A field `DROP` on a 1-1 definition ([`FieldEdit::Drop`]).
+    DropField,
+    /// A [`BurstAction::Drop`] of a definition, then a
+    /// [`BurstAction::Define`] of it again later in the same burst, under
+    /// the same or a new name, unchanged or with a field changed.
+    Redefine,
+    /// A [`BurstAction::Define`] of a second definition over a loaded one's
+    /// source, dropped in the next burst when there is one.
+    SecondDefinition,
 }
 
 /// One drawn mid-burst action, before [`add_burst_actions`] resolves it
@@ -1769,14 +1784,22 @@ pub struct ActionDraw {
 /// then the previous burst has quiesced, so every definition installed up
 /// front is `live` and its tables are captured, which `request_backfill`
 /// and a column resume both require. Only definitions installed up front
-/// (`def_install_after_op == 0`) are paused, and their tables re-read.
+/// (`def_install_after_op == 0`) are acted on, and their tables re-read.
+///
+/// Draws resolve in burst order, against the definitions as the earlier
+/// bursts' changes left them: a field dropped in one burst is not paused in
+/// a later one, and a definition redefined under a new name is addressed by
+/// it.
 ///
 /// A draw that can't apply is dropped rather than bent into something
-/// else: a plan with one burst, a column pair with no 1-1 definition, and a
-/// second pair on a definition that already has one in that burst (two
-/// overlapping pairs on one definition would resume it twice, and a
+/// else: a plan with one burst, a field change with no 1-1 definition, and
+/// a second action on a definition that already has one in that burst (two
+/// overlapping pairs on one definition would resume it twice, a
 /// whole-transform resume leaves the definition rebuilding, where a column
-/// resume is refused).
+/// resume and an `ALTER` are refused, and a definition dropped mid-burst
+/// takes nothing else). A re-read of a table and a drop of a definition
+/// reading it don't share a burst either, since the drop may leave no
+/// definition reading it.
 pub fn add_burst_actions(
     mut plan: ConcurrentPlan,
     program: &Program,
@@ -1785,69 +1808,94 @@ pub fn add_burst_actions(
     if plan.bursts.len() < 2 {
         return plan;
     }
-    let up_front: Vec<&TransformDef> = program
+    // The definitions installed up front, as the plan's changes so far
+    // leave them.
+    let mut live: Vec<TransformDef> = program
         .defs
         .iter()
         .zip(&program.def_install_after_op)
         .filter(|(_, at)| **at == 0)
-        .map(|(def, _)| def)
+        .map(|(def, _)| def.clone())
         .collect();
-    let mut tables: Vec<&str> = Vec::new();
-    for def in &up_front {
-        if !tables.contains(&def.source.as_str()) {
-            tables.push(&def.source);
-        }
-    }
-    let one_to_one: Vec<&TransformDef> = up_front
-        .iter()
-        .copied()
-        .filter(|def| matches!(def.key_space, KeySpace::OneToOne) && !def.fields.is_empty())
-        .collect();
-    let mut paired: std::collections::HashSet<(usize, &str)> = std::collections::HashSet::new();
+    // Definitions the plan defines beside them, which a widen must not
+    // count on to leave a column unread.
+    let mut seconds: Vec<TransformDef> = Vec::new();
+    let mut fresh = 0usize;
+    let mut paired: std::collections::HashSet<(usize, String)> = std::collections::HashSet::new();
+    let mut reread: std::collections::HashSet<(usize, String)> = std::collections::HashSet::new();
+    let mut dropping: std::collections::HashSet<(usize, String)> = std::collections::HashSet::new();
 
-    for draw in draws {
-        let burst_index = 1 + draw.burst % (plan.bursts.len() - 1);
+    let mut resolved: Vec<(usize, &ActionDraw)> = draws
+        .iter()
+        .map(|draw| (1 + draw.burst % (plan.bursts.len() - 1), draw))
+        .collect();
+    // A burst's definition changes resolve ahead of its re-reads and pauses,
+    // which take any 1-1 definition a change leaves free; otherwise stable,
+    // so draws keep their order.
+    resolved.sort_by_key(|(burst, draw)| {
+        let rereads_or_pauses = matches!(
+            draw.kind,
+            ActionKind::RequestBackfill | ActionKind::PauseResume | ActionKind::ColumnPauseResume
+        );
+        (*burst, rereads_or_pauses)
+    });
+
+    for (burst_index, draw) in resolved {
         let ops = plan.bursts[burst_index].ops().len();
         let at = usize::from(draw.start.min(1000)) * ops / 1000;
         let end = (at + usize::from(draw.span.min(1000)) * ops / 1000).min(ops);
-        let actions = &mut plan.bursts[burst_index].actions;
+        let mut tables: Vec<String> = Vec::new();
+        for def in &live {
+            if !tables.contains(&def.source) {
+                tables.push(def.source.clone());
+            }
+        }
+        let one_to_one: Vec<usize> = (0..live.len())
+            .filter(|&i| {
+                matches!(live[i].key_space, KeySpace::OneToOne) && !live[i].fields.is_empty()
+            })
+            .collect();
+        let mut pushed: Vec<TimedAction> = Vec::new();
         match draw.kind {
             ActionKind::RequestBackfill => {
                 if tables.is_empty() {
                     continue;
                 }
-                actions.push(TimedAction {
+                let table = tables[draw.target % tables.len()].clone();
+                if dropping.contains(&(burst_index, table.clone())) {
+                    continue;
+                }
+                reread.insert((burst_index, table.clone()));
+                pushed.push(TimedAction {
                     after: at,
-                    action: BurstAction::RequestBackfill {
-                        table: tables[draw.target % tables.len()].to_string(),
-                    },
+                    action: BurstAction::RequestBackfill { table },
                 });
             }
             ActionKind::PauseResume | ActionKind::ColumnPauseResume => {
                 let (def, column) = if draw.kind == ActionKind::PauseResume {
-                    if up_front.is_empty() {
+                    if live.is_empty() {
                         continue;
                     }
-                    (up_front[draw.target % up_front.len()], None)
+                    (&live[draw.target % live.len()], None)
                 } else {
                     if one_to_one.is_empty() {
                         continue;
                     }
-                    let def = one_to_one[draw.target % one_to_one.len()];
+                    let def = &live[one_to_one[draw.target % one_to_one.len()]];
                     let field = &def.fields[(draw.target / one_to_one.len()) % def.fields.len()];
                     (def, Some(field.name.clone()))
                 };
-                if !paired.insert((burst_index, def.target.as_str())) {
+                if !paired.insert((burst_index, def.target.clone())) {
                     continue;
                 }
-                actions.push(TimedAction {
+                pushed.push(TimedAction {
                     after: at,
                     action: BurstAction::Pause {
                         target: def.target.clone(),
                         column: column.clone(),
                     },
                 });
-                actions.push(TimedAction {
+                pushed.push(TimedAction {
                     after: end,
                     action: BurstAction::Resume {
                         target: def.target.clone(),
@@ -1855,10 +1903,335 @@ pub fn add_burst_actions(
                     },
                 });
             }
+            ActionKind::AddField | ActionKind::AlterField | ActionKind::DropField => {
+                if one_to_one.is_empty() {
+                    continue;
+                }
+                // The source columns no definition reads, with `live[at]`
+                // read as `swap` says, which an `ADD` reading one widens
+                // capture to.
+                let unread_with = |def: &TransformDef, swap: Option<(usize, &TransformDef)>| {
+                    let deferred = program
+                        .defs
+                        .iter()
+                        .zip(&program.def_install_after_op)
+                        .filter(|(_, at)| **at != 0)
+                        .map(|(def, _)| def);
+                    let read: std::collections::HashSet<String> = live
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| match swap {
+                            Some((at, swapped)) if at == i => swapped,
+                            _ => d,
+                        })
+                        .chain(&seconds)
+                        .chain(deferred)
+                        .filter(|d| d.source == def.source)
+                        .flat_map(columns_read)
+                        .collect();
+                    program
+                        .tables
+                        .iter()
+                        .filter(|t| t.name == def.source)
+                        .flat_map(|t| t.columns.iter().filter(|c| c.name != t.pk_col))
+                        .filter(|c| !read.contains(&c.name))
+                        .cloned()
+                        .collect::<Vec<Column>>()
+                };
+                let unread = |def: &TransformDef| unread_with(def, None);
+                // An `ADD` takes a definition it can widen when there is one:
+                // only a widen reaches the capture gate's wait.
+                let widenable: Vec<usize> = one_to_one
+                    .iter()
+                    .copied()
+                    .filter(|&i| draw.kind == ActionKind::AddField && !unread(&live[i]).is_empty())
+                    .collect();
+                let candidates = if widenable.is_empty() {
+                    &one_to_one
+                } else {
+                    &widenable
+                };
+                let index = candidates[draw.target % candidates.len()];
+                let pick = draw.target / candidates.len();
+                let def = &live[index];
+                if paired.contains(&(burst_index, def.target.clone())) {
+                    continue;
+                }
+                let Some(table) = program.tables.iter().find(|t| t.name == def.source) else {
+                    continue;
+                };
+                let edited = match draw.kind {
+                    ActionKind::AddField => {
+                        let columns: Vec<&Column> = table
+                            .columns
+                            .iter()
+                            .filter(|c| c.name != table.pk_col)
+                            .collect();
+                        let unread = unread(def);
+                        let unread: Vec<&Column> = unread.iter().collect();
+                        let widens = !unread.is_empty();
+                        let from = if widens { &unread } else { &columns };
+                        let column = from[pick % from.len()];
+                        let field = format!("added{fresh}");
+                        fresh += 1;
+                        let mut edited = def.clone();
+                        edited.fields.push(FieldDef {
+                            name: field.clone(),
+                            expr: Expr::Column(column.name.clone()),
+                        });
+                        Some((edited, FieldEdit::Add { field, widens }))
+                    }
+                    ActionKind::AlterField => {
+                        let fields = editable_fields(def, table);
+                        if fields.is_empty() {
+                            None
+                        } else {
+                            let field = fields[pick % fields.len()].to_string();
+                            let mut edited = def.clone();
+                            let at = edited
+                                .fields
+                                .iter()
+                                .position(|f| f.name == field)
+                                .expect("an editable field is a field");
+                            edited.fields[at].expr = toggled(&edited.fields[at].expr, table);
+                            Some((edited, FieldEdit::Alter { field }))
+                        }
+                    }
+                    _ => {
+                        // A drop that leaves a column unread when there is
+                        // one: capture narrows, and a later `ADD` of it
+                        // widens it again.
+                        let all = unread_fields(def);
+                        let before = unread(def).len();
+                        let narrowing: Vec<&str> = all
+                            .iter()
+                            .copied()
+                            .filter(|field| {
+                                let mut after = def.clone();
+                                after.fields.retain(|f| f.name != *field);
+                                unread_with(def, Some((index, &after))).len() > before
+                            })
+                            .collect();
+                        let fields = if narrowing.is_empty() { all } else { narrowing };
+                        if def.fields.len() < 2 || fields.is_empty() {
+                            None
+                        } else {
+                            let field = fields[pick % fields.len()].to_string();
+                            let mut edited = def.clone();
+                            edited.fields.retain(|f| f.name != field);
+                            Some((edited, FieldEdit::Drop { field }))
+                        }
+                    }
+                };
+                let Some((edited, edit)) = edited else {
+                    continue;
+                };
+                // An `ADD` keeps off the burst's last quarter, so writes run
+                // the old capture body while its widen waits.
+                let after = if draw.kind == ActionKind::AddField {
+                    at * 3 / 4
+                } else {
+                    at
+                };
+                paired.insert((burst_index, def.target.clone()));
+                live[index] = edited.clone();
+                pushed.push(TimedAction {
+                    after,
+                    action: BurstAction::EditField {
+                        def: Box::new(edited),
+                        edit,
+                    },
+                });
+            }
+            ActionKind::Redefine => {
+                if live.is_empty() {
+                    continue;
+                }
+                let index = draw.target % live.len();
+                let def = &live[index];
+                if paired.contains(&(burst_index, def.target.clone()))
+                    || reread.contains(&(burst_index, def.source.clone()))
+                {
+                    continue;
+                }
+                let Some(table) = program.tables.iter().find(|t| t.name == def.source) else {
+                    continue;
+                };
+                let renamed = (draw.target / live.len()) % 2 == 1;
+                let changed = if (draw.target / live.len() / 2) % 2 == 1 {
+                    changed_definition(def, table)
+                } else {
+                    None
+                };
+                let shape = match (renamed, changed.is_some()) {
+                    (false, false) => DefineShape::Same,
+                    (false, true) => DefineShape::Changed,
+                    (true, false) => DefineShape::Renamed,
+                    (true, true) => DefineShape::RenamedChanged,
+                };
+                let mut again = changed.unwrap_or_else(|| def.clone());
+                if renamed {
+                    again.target = format!("{}_r{fresh}", def.target);
+                    fresh += 1;
+                }
+                paired.insert((burst_index, def.target.clone()));
+                paired.insert((burst_index, again.target.clone()));
+                dropping.insert((burst_index, def.source.clone()));
+                pushed.push(TimedAction {
+                    after: at,
+                    action: BurstAction::Drop {
+                        target: def.target.clone(),
+                    },
+                });
+                pushed.push(TimedAction {
+                    after: end,
+                    action: BurstAction::Define {
+                        def: Box::new(again.clone()),
+                        shape,
+                    },
+                });
+                live[index] = again;
+            }
+            ActionKind::SecondDefinition => {
+                if live.is_empty() {
+                    continue;
+                }
+                let def = &live[draw.target % live.len()];
+                let Some(table) = program.tables.iter().find(|t| t.name == def.source) else {
+                    continue;
+                };
+                let mut second = if (draw.target / live.len()) % 2 == 1 {
+                    changed_definition(def, table).unwrap_or_else(|| def.clone())
+                } else {
+                    def.clone()
+                };
+                second.target = format!("{}_s{fresh}", def.target);
+                fresh += 1;
+                pushed.push(TimedAction {
+                    after: at,
+                    action: BurstAction::Define {
+                        def: Box::new(second.clone()),
+                        shape: DefineShape::Second,
+                    },
+                });
+                if let Some(next) = plan.bursts.get_mut(burst_index + 1) {
+                    let ops = next.ops().len();
+                    next.actions.push(TimedAction {
+                        after: usize::from(draw.span.min(1000)) * ops / 1000,
+                        action: BurstAction::Drop {
+                            target: second.target.clone(),
+                        },
+                    });
+                }
+                seconds.push(second);
+            }
         }
+        plan.bursts[burst_index].actions.extend(pushed);
     }
     sort_actions(&mut plan);
     plan
+}
+
+/// Every source column `def` reads: its fields', its `WHERE`'s and its
+/// `GROUP BY`'s.
+fn columns_read(def: &TransformDef) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |expr: &Expr| {
+        expr.walk(&mut |e| match e {
+            Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
+                out.push(name.clone());
+            }
+            _ => {}
+        });
+    };
+    for field in &def.fields {
+        add(&field.expr);
+    }
+    if let Some(predicate) = def.predicate.filter() {
+        add(predicate);
+    }
+    if let KeySpace::Aggregate { group_by } = &def.key_space {
+        out.extend(group_by.iter().cloned());
+    }
+    out
+}
+
+/// The fields of a 1-1 `def` no other field reads by name.
+fn unread_fields(def: &TransformDef) -> Vec<&str> {
+    def.fields
+        .iter()
+        .filter(|field| {
+            !def.fields.iter().any(|other| {
+                let mut reads = false;
+                other.expr.walk(&mut |e| {
+                    reads |= matches!(e, Expr::Column(name) if *name == field.name);
+                });
+                other.name != field.name && reads
+            })
+        })
+        .map(|field| field.name.as_str())
+        .collect()
+}
+
+/// The fields of a 1-1 `def` an `ALTER` may rewrite: no other field reads
+/// them by name, and they aren't named after a source column (a
+/// passthrough is, and a calculated field may not be, T0107).
+fn editable_fields<'a>(def: &'a TransformDef, table: &Table) -> Vec<&'a str> {
+    unread_fields(def)
+        .into_iter()
+        .filter(|name| !table.columns.iter().any(|c| c.name == *name))
+        .collect()
+}
+
+/// `expr` changed without changing its type: `CASE WHEN <flag> THEN
+/// <expr> END` over `table`'s `boolean` column, or back to `<expr>` when it
+/// already is that.
+fn toggled(expr: &Expr, table: &Table) -> Expr {
+    let flag = table
+        .columns
+        .iter()
+        .find(|c| c.value_type == ValueType::Boolean)
+        .map(|c| c.name.clone())
+        .expect("a generated table has a boolean column");
+    if let Expr::Case {
+        branches,
+        otherwise: None,
+    } = expr
+        && let [(Expr::Column(when), inner)] = branches.as_slice()
+        && *when == flag
+    {
+        return inner.clone();
+    }
+    Expr::Case {
+        branches: vec![(Expr::Column(flag), expr.clone())],
+        otherwise: None,
+    }
+}
+
+/// `def` with one field changed, for a redefinition or a second
+/// definition: a 1-1's first editable field [`toggled`], an aggregate's
+/// `COUNT(*)` added or removed. `None` when there is nothing to change.
+fn changed_definition(def: &TransformDef, table: &Table) -> Option<TransformDef> {
+    let mut changed = def.clone();
+    match &def.key_space {
+        KeySpace::OneToOne => {
+            let field = *editable_fields(def, table).first()?;
+            let at = changed.fields.iter().position(|f| f.name == field)?;
+            changed.fields[at].expr = toggled(&changed.fields[at].expr, table);
+        }
+        KeySpace::Aggregate { .. } => {
+            let count = aggregate_field_def(AggregateFn::Count, "", "");
+            match changed.fields.iter().position(|f| f.name == count.name) {
+                Some(at) if changed.fields.len() > 2 => {
+                    changed.fields.remove(at);
+                }
+                Some(_) => return None,
+                None => changed.fields.push(count),
+            }
+        }
+        _ => return None,
+    }
+    Some(changed)
 }
 
 /// One concurrent-tier case: the program, how it is issued,
@@ -3476,7 +3849,8 @@ mod strategy {
     ///   Re-derive build runs it.
     /// - One to [`MAX_ACTION_DRAWS`] operator actions ([`ActionDraw`]),
     ///   placed by [`add_burst_actions`]: `request_backfill`, a pause and
-    ///   resume, or a column pause and resume.
+    ///   resume, a column pause and resume, a field `ADD`, `ALTER` or
+    ///   `DROP`, a drop and redefine, or a second definition.
     /// - Three cases in four that have a second table also truncate it once,
     ///   somewhere in its op stream, while the hot table keeps changing. The
     ///   second table's ops are spread through the hot table's.
@@ -3794,6 +4168,10 @@ mod strategy {
     /// The most [`ActionDraw`]s one [`mid_burst_case`] draws.
     pub const MAX_ACTION_DRAWS: usize = 4;
 
+    /// The most definition-change [`ActionDraw`]s one [`mid_burst_case`]
+    /// draws beside them.
+    pub const MAX_CHANGE_DRAWS: usize = 4;
+
     /// The longest a drawn pause lasts before its resume, in thousandths of
     /// the burst. Short enough that most resumes fire with a good part of
     /// the burst still to be written, rather than piling up at its end.
@@ -3858,37 +4236,61 @@ mod strategy {
     }
 
     fn mid_burst_draws() -> impl Strategy<Value = MidBurstDraws> {
-        let action = (
-            // A column pair only applies when the case has a 1-1
-            // definition, which about half don't, so it is drawn twice as
-            // often.
+        let draw = |kind: BoxedStrategy<ActionKind>| {
+            (
+                kind,
+                0..8usize,
+                0..64usize,
+                0..=1000u16,
+                0..=MAX_ACTION_SPAN,
+            )
+                .prop_map(|(kind, burst, target, start, span)| ActionDraw {
+                    kind,
+                    burst,
+                    target,
+                    start,
+                    span,
+                })
+        };
+        // A column pair only applies when the case has a 1-1 definition,
+        // which about half don't, so it is drawn twice as often.
+        let action = draw(
             prop_oneof![
                 1 => Just(ActionKind::RequestBackfill),
                 1 => Just(ActionKind::PauseResume),
                 2 => Just(ActionKind::ColumnPauseResume),
-            ],
-            0..8usize,
-            0..16usize,
-            0..=1000u16,
-            0..=MAX_ACTION_SPAN,
-        )
-            .prop_map(|(kind, burst, target, start, span)| ActionDraw {
-                kind,
-                burst,
-                target,
-                start,
-                span,
-            });
+            ]
+            .boxed(),
+        );
+        // The definition changes (#2183) are drawn beside them, so they don't
+        // thin the re-reads and pauses out. The field changes apply only to
+        // a 1-1 definition, so they too are drawn twice as often, and an
+        // `ADD` twice as often again: only a widening one reaches the
+        // capture gate (the `field_release_before_widen` plant).
+        let change = draw(
+            prop_oneof![
+                4 => Just(ActionKind::AddField),
+                2 => Just(ActionKind::AlterField),
+                2 => Just(ActionKind::DropField),
+                1 => Just(ActionKind::Redefine),
+                1 => Just(ActionKind::SecondDefinition),
+            ]
+            .boxed(),
+        );
         (
             prop::option::weighted(0.75, 0..=1000u16),
             prop::option::weighted(0.75, (install_functions(), 0..=1000u16)),
             prop::collection::vec(action, 1..=MAX_ACTION_DRAWS),
+            prop::collection::vec(change, 1..=MAX_CHANGE_DRAWS),
         )
-            .prop_map(|(second_truncate, deferred, actions)| MidBurstDraws {
-                second_truncate,
-                deferred,
-                actions,
-                load: None,
+            .prop_map(|(second_truncate, deferred, mut actions, changes)| {
+                actions.extend(changes);
+                MidBurstDraws {
+                    second_truncate,
+                    deferred,
+                    actions,
+                    load: None,
+                }
             })
     }
 
@@ -3972,6 +4374,30 @@ mod strategy {
                     if let (Some(at), Some(second)) = (extras.second_truncate, tables.get_mut(1)) {
                         let position = usize::from(at) * second.mutates.len() / 1000;
                         second.mutates.insert(position, Mutate::Truncate);
+                    }
+                    // A field change needs a plain 1-1 definition: the last
+                    // table's, so a two-table case's leaves the second table's
+                    // grain column unread for a widening `ADD` (#2183). An
+                    // `ADD` adds one there too when nothing reads that table.
+                    let changes_a_field = extras.actions.iter().any(|draw| {
+                        matches!(
+                            draw.kind,
+                            ActionKind::AddField | ActionKind::AlterField | ActionKind::DropField
+                        )
+                    });
+                    let adds_a_field = extras
+                        .actions
+                        .iter()
+                        .any(|draw| draw.kind == ActionKind::AddField);
+                    let last = tables.len() - 1;
+                    if (changes_a_field
+                        && !defs
+                            .iter()
+                            .any(|(_, shape)| matches!(shape, DefShape::OneToOne)))
+                        || (adds_a_field && last > 0 && !defs.iter().any(|(at, _)| *at == last))
+                    {
+                        defs.push((tables.len() - 1, DefShape::OneToOne));
+                        derived.push(None);
                     }
                     if let Some((functions, _)) = &extras.deferred {
                         let mut functions = functions.clone();
@@ -5398,6 +5824,117 @@ mod tests {
             let one_burst =
                 add_burst_actions(one_burst, &program, &[pair(ActionKind::PauseResume)]);
             assert!(one_burst.bursts[0].actions.is_empty());
+        }
+
+        /// #2183: a definition change holds for the bursts after it. A
+        /// field dropped in one burst is not paused in the next, and a
+        /// definition redefined under a new name is paused by it.
+        #[test]
+        fn definition_changes_carry_into_later_bursts() {
+            let (program, plan) = three_burst_plan();
+            let draw = |kind, burst, target| ActionDraw {
+                kind,
+                burst,
+                target,
+                start: 0,
+                span: 1000,
+            };
+            let d0 = program.defs[0].clone();
+            let dropped = d0.fields.last().expect("a field").name.clone();
+            let picks = d0.fields.len() - 1;
+            let plan = add_burst_actions(
+                plan,
+                &program,
+                &[
+                    // Burst 1: drop d0's last field, redefine d1 renamed.
+                    draw(ActionKind::DropField, 0, 2 * (picks)),
+                    draw(ActionKind::Redefine, 0, 1 + 2),
+                    // Burst 2: a column pair on every field d0 has left,
+                    // and a pause of d1 under its new name.
+                    draw(ActionKind::PauseResume, 1, 1),
+                ],
+            );
+            let BurstAction::EditField { def, edit } = &plan.bursts[1].actions[0].action else {
+                panic!("{:?}", plan.bursts[1].actions);
+            };
+            assert_eq!(
+                edit,
+                &FieldEdit::Drop {
+                    field: dropped.clone()
+                }
+            );
+            assert!(def.fields.iter().all(|f| f.name != dropped));
+            let renamed = plan.bursts[1]
+                .actions
+                .iter()
+                .find_map(|a| match &a.action {
+                    BurstAction::Define { def, shape } => Some((def.target.clone(), *shape)),
+                    _ => None,
+                })
+                .expect("the redefinition");
+            assert_eq!(renamed.1, DefineShape::Renamed);
+            assert_ne!(renamed.0, program.defs[1].target);
+            assert!(plan.bursts[2].actions.iter().any(|a| matches!(
+                &a.action,
+                BurstAction::Pause { target, column: None } if *target == renamed.0
+            )));
+        }
+
+        /// #2183: an `ADD` reads a column no definition reads when there is
+        /// one (a widen), and a redefinition and a re-read of its table
+        /// don't share a burst; a second definition is dropped in the next
+        /// burst.
+        #[test]
+        fn an_add_widens_and_a_second_definition_is_dropped_next_burst() {
+            let (program, plan) = three_burst_plan();
+            let grain = program.tables[0].columns[6].name.clone();
+            let draw = |kind, burst, target| ActionDraw {
+                kind,
+                burst,
+                target,
+                start: 0,
+                span: 500,
+            };
+            let plan = add_burst_actions(
+                plan,
+                &program,
+                &[
+                    draw(ActionKind::AddField, 0, 0),
+                    draw(ActionKind::Redefine, 0, 1),
+                    draw(ActionKind::RequestBackfill, 0, 0),
+                    draw(ActionKind::SecondDefinition, 0, 0),
+                ],
+            );
+            let actions = &plan.bursts[1].actions;
+            let BurstAction::EditField { def, edit } = &actions[0].action else {
+                panic!("{actions:?}");
+            };
+            let FieldEdit::Add { field, widens } = edit else {
+                panic!("{edit:?}");
+            };
+            assert!(widens);
+            let added = def.fields.iter().find(|f| &f.name == field).expect("added");
+            assert_eq!(added.expr, Expr::Column(grain));
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a.action, BurstAction::RequestBackfill { .. })),
+                "{actions:?}"
+            );
+            let second = actions
+                .iter()
+                .find_map(|a| match &a.action {
+                    BurstAction::Define {
+                        def,
+                        shape: DefineShape::Second,
+                    } => Some(def.target.clone()),
+                    _ => None,
+                })
+                .expect("the second definition");
+            assert!(plan.bursts[2].actions.iter().any(|a| matches!(
+                &a.action,
+                BurstAction::Drop { target } if *target == second
+            )));
         }
 
         #[cfg(feature = "proptest")]

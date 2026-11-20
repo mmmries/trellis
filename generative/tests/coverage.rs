@@ -1865,6 +1865,130 @@ fn every_drawn_where_round_trips_and_is_admitted() {
     );
 }
 
+// ---------------------------------------------------------------------
+// #2183: definition changes mid-stream under load.
+// ---------------------------------------------------------------------
+
+/// #2183: the mid-burst and steady-load tiers draw every definition change
+/// (a field `ADD`, a widening `ADD`, an `ALTER` and a `DROP`, a drop and
+/// redefine in each of its four shapes, and a second definition with its
+/// drop), over both key spaces they draw: a plain 1-1's field changes, and
+/// a redefinition of a plain 1-1 and of an aggregate. Every definition a
+/// change leaves passes define's checks, so the engine refuses none of them.
+#[test]
+fn the_mid_burst_tiers_draw_every_definition_change() {
+    use generative::generate::steady_load_case;
+    use generative::model::BurstAction;
+    use trellis::dev::defs::validate;
+
+    const SAMPLES: usize = 64;
+    let mut cases = sample(mid_burst_case(), SAMPLES);
+    cases.extend(sample(steady_load_case(), SAMPLES));
+    let mut coverage = Coverage::new();
+    let mut redefined: HashSet<&'static str> = HashSet::new();
+    for case in &cases {
+        coverage.record_concurrent_plan(&case.program, &case.plan);
+        for timed in case.plan.bursts.iter().flat_map(|b| &b.actions) {
+            let def = match &timed.action {
+                BurstAction::EditField { def, .. } | BurstAction::Define { def, .. } => def,
+                _ => continue,
+            };
+            if let BurstAction::Define { .. } = &timed.action {
+                redefined.insert(match def.key_space {
+                    KeySpace::OneToOne => "OneToOne",
+                    KeySpace::Aggregate { .. } => "Aggregate",
+                    _ => "Other",
+                });
+            }
+            let table = case
+                .program
+                .tables
+                .iter()
+                .find(|t| t.name == def.source)
+                .expect("a changed definition reads a program table");
+            let columns = table
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.value_type))
+                .collect();
+            validate(def, &columns).unwrap_or_else(|e| panic!("{def:?}: {e:?}"));
+        }
+    }
+    eprintln!(
+        "actions over {} cases: {:?}",
+        cases.len(),
+        coverage.concurrent_actions
+    );
+    for name in [
+        "add_field",
+        "add_field_widen",
+        "alter_field",
+        "drop_field",
+        "drop",
+        "define_second",
+        "redefine_same",
+        "redefine_changed",
+        "redefine_renamed",
+        "redefine_renamed_changed",
+    ] {
+        let reached = coverage.concurrent_actions.get(name).copied().unwrap_or(0);
+        assert!(
+            reached >= 4,
+            "the mid-burst tiers must draw {name} at least 4 times in {} cases, got \
+             {reached}: {coverage}",
+            cases.len()
+        );
+    }
+    assert_eq!(
+        redefined,
+        HashSet::from(["OneToOne", "Aggregate"]),
+        "a definition of each key space is redefined"
+    );
+}
+
+/// #2183: the `JOIN`, 1-1 `JOIN` and star tiers drop and redefine a
+/// definition, under its name and a new one, and define and drop a second
+/// one beside it.
+#[test]
+fn the_join_tiers_draw_every_redefinition() {
+    use generative::generate::join::join_case_strategy;
+    use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
+
+    const SAMPLES: usize = 96;
+    let plans: Vec<(&str, Program, generative::model::ConcurrentPlan)> =
+        sample(join_case_strategy(), SAMPLES)
+            .into_iter()
+            .map(|c| ("join", c.program, c.plan))
+            .chain(
+                sample(one_to_one_case_strategy(), SAMPLES)
+                    .into_iter()
+                    .map(|c| ("join_one_to_one", c.program, c.plan)),
+            )
+            .chain(
+                sample(star_case_strategy(), SAMPLES)
+                    .into_iter()
+                    .map(|c| ("join_star", c.case.program, c.case.plan)),
+            )
+            .collect();
+    let mut by_tier: std::collections::BTreeMap<&str, Coverage> = Default::default();
+    for (tier, program, plan) in &plans {
+        by_tier
+            .entry(tier)
+            .or_default()
+            .record_concurrent_plan(program, plan);
+    }
+    for (tier, coverage) in &by_tier {
+        eprintln!("{tier}: {:?}", coverage.concurrent_actions);
+        for name in ["drop", "redefine_same", "redefine_renamed", "define_second"] {
+            let reached = coverage.concurrent_actions.get(name).copied().unwrap_or(0);
+            assert!(
+                reached >= 3,
+                "{tier} must draw {name} at least 3 times in {SAMPLES} cases, got {reached}"
+            );
+        }
+    }
+}
+
 /// #2171: the convergence properties' draw reads a source through a
 /// `KEY (...)` in about a quarter of its programs, and across them draws
 /// every key shape, key space, key value class and key move the dimension

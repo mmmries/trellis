@@ -969,6 +969,18 @@ pub enum Plant {
     /// Pinned by `group_basis_where`'s
     /// `an_image_without_the_predicate_column_fails_the_page`.
     GbWhereColumnNotImaged,
+    /// #2183 (`field_release_before_widen`): a field build releases a field
+    /// an `ALTER TRANSFORM … ADD` or `ALTER` holds out of Apply until its
+    /// source's capture images the column it reads, without waiting for the
+    /// capture widen to land or for its gate to clear (`staging::build`'s
+    /// `capture_release`). A row staged without the column, by the old
+    /// capture body, then reaches the field, and its key is quarantined.
+    /// Fires on every release check of a field that awaits its capture.
+    ///
+    /// Pinned by `capture_join`'s
+    /// `a_widened_field_waits_for_the_rows_staged_before_the_widen` and
+    /// `an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen`.
+    FieldReleaseBeforeWiden,
     /// The drain compares transaction ids truncated to 32 bits: a batch's
     /// fenced read (`staging::seal`'s `window_over_fence`) takes its fences
     /// with each id cut to its low 32 bits, while the ring's `row_txid`s stay
@@ -1089,6 +1101,7 @@ impl Plant {
         Plant::JoinWhereMUnfiltered,
         Plant::O2oWhereColumnNotImaged,
         Plant::GbWhereColumnNotImaged,
+        Plant::FieldReleaseBeforeWiden,
         Plant::FenceXid32,
         Plant::NullKeyAsEmpty,
     ];
@@ -1188,6 +1201,8 @@ impl Plant {
             Plant::JoinWhereMUnfiltered => "join_where_m_unfiltered",
             Plant::O2oWhereColumnNotImaged => "o2o_where_column_not_imaged",
             Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
+            Plant::FieldReleaseBeforeWiden => "field_release_before_widen",
+
             Plant::FenceXid32 => "fence_xid32",
             Plant::NullKeyAsEmpty => "null_key_as_empty",
         }

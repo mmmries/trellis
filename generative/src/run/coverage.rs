@@ -1045,7 +1045,13 @@ fn burst_action_shapes(
                 ConcurrentShape::MidBurstInstall,
                 program.defs.get(*def).map(|d| d.source.as_str()),
             ),
-            BurstAction::Pause { .. } | BurstAction::Alter { .. } => continue,
+            BurstAction::Define { def, .. } => {
+                (ConcurrentShape::MidBurstInstall, Some(def.source.as_str()))
+            }
+            BurstAction::Pause { .. }
+            | BurstAction::Alter { .. }
+            | BurstAction::EditField { .. }
+            | BurstAction::Drop { .. } => continue,
         };
         if table.is_some_and(|table| overlaps(table, timed.after.min(ops.len()))) {
             out.insert(shape);

@@ -78,10 +78,11 @@ fn digests(strategy: &proptest::strategy::BoxedStrategy<JoinCase>) -> Vec<u64> {
 /// The two-table 1-1 JOIN tier and the chained-reader tier draw, seed for
 /// seed, the cases they drew before the generator took positions: the
 /// digests of their sweep budget's cases (4 seeds × 12), recorded on the
-/// generator before the star tier (#1781). A change that means to change
-/// what they draw updates these. The two-table tier's derived `KEY (...)`
-/// arm (#2171) is left out, as the `WHERE` is: each of its cases is its
-/// unkeyed twin, keyed or not.
+/// generator before the star tier (#1781), and for the two-table tier again
+/// when it began drawing redefinitions (#2183). A change that means to
+/// change what they draw updates these. The two-table tier's derived
+/// `KEY (...)` arm (#2171) is left out, as the `WHERE` is: each of its cases
+/// is its unkeyed twin, keyed or not.
 #[test]
 fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
     use generative::generate::join_one_to_one::{
@@ -108,10 +109,10 @@ fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
     assert_eq!(
         digests(&unkeyed),
         [
-            17_962_304_100_747_754_684,
-            4_091_506_942_938_126_918,
-            8_600_531_309_418_350_733,
-            7_267_421_071_787_496_964
+            4_985_686_412_385_817_550,
+            10_248_547_661_753_428_030,
+            7_590_271_726_177_765_789,
+            6_701_061_445_033_985_455
         ]
     );
     assert_eq!(

@@ -116,6 +116,7 @@ pub const REACHED_UNGATED: &[(&str, &[&str])] = &[
             "gb_build_no_hidden_branch",
             "gb_build_no_ring_branch",
             "gb_build_straggler_unlocked",
+            "o2o_where_no_tombstone",
         ],
     ),
     (
