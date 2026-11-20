@@ -15,8 +15,10 @@ harness itself failed and 64 on a usage error. See soak/README.md.
 """
 
 import argparse
+import datetime
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -26,6 +28,8 @@ import time
 import urllib.request
 
 import psycopg2
+
+import loadgen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -69,6 +73,10 @@ class Harness:
         self.failures = []
         self.cleanups = []  # callables run once, after Postgres stops
         self.aborting = threading.Event()
+        self.timeline = None  # (start epoch, loadgen segments) once the load starts
+        self.samples = []  # monitor rows as dicts, with "epoch"
+        self.probes = []  # {"epoch", "segment", "tag", "latency", "error"}
+        self.step_log = []  # (epoch, step text)
         for d in (self.sock, self.pids, self.run_dir, os.path.join(root, "tmp")):
             os.makedirs(d, exist_ok=True)
 
@@ -237,6 +245,17 @@ class Harness:
                 w["expected_down"] = True
                 self.fail(f"{name} exited unexpectedly with {code}; see {name}.log")
 
+    def segment_at(self, t):
+        """(index, profile) of the load schedule's segment at epoch t, or None outside it."""
+        if not self.timeline:
+            return None
+        start, segments = self.timeline
+        for i, (profile, secs, _) in enumerate(segments):
+            if start <= t < start + secs:
+                return i, profile
+            start += secs
+        return None
+
     def metrics(self, name):
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{METRICS_BASE + int(name[1:])}/metrics", timeout=2) as r:
@@ -328,6 +347,11 @@ MON_COLUMNS = [
     "trellis_conns",
     "trellis_schema_mb",
     "target_mb",
+    "wal_bytes",
+    "xmin_age",
+    "xmin_hold_s",
+    "idle_in_txn",
+    "profile",
 ]
 
 
@@ -357,7 +381,14 @@ def monitor(h, out_path, stop, interval=5.0):
         "(select round(sum(pg_total_relation_size(c.oid))/1048576.0) from pg_class c where c.oid = any(array["
         "'public.acct_view','public.region_totals','public.acct_order_totals','public.region_order_totals',"
         "'public.order_view','public.big_accts']::regclass[])), "
-        f"(select count(*) from pg_stat_activity where usename = '{ROLE}')"
+        f"(select count(*) from pg_stat_activity where usename = '{ROLE}'), "
+        "pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint, "
+        # How far Trellis's sessions hold back the vacuum horizon, in xids and in seconds.
+        f"(select coalesce(max(age(backend_xmin)), 0) from pg_stat_activity where usename = '{ROLE}'), "
+        "(select coalesce(round(extract(epoch from max(now() - xact_start))), 0)::bigint from pg_stat_activity "
+        f"where usename = '{ROLE}' and backend_xmin is not null), "
+        "(select count(*) from pg_stat_activity "
+        f"where usename = '{ROLE}' and state like 'idle in transaction%')"
     )
     with open(out_path, "w") as f:
         f.write("\t".join(MON_COLUMNS) + "\n")
@@ -386,10 +417,12 @@ def monitor(h, out_path, stop, interval=5.0):
             age = metric_max(text, "trellis_ring_oldest_undrained_age_seconds")
             if age is not None:
                 h.peak_age = max(h.peak_age, age)
+            now = time.time()
             try:
-                schema_mb, target_mb, conns = h.psql(sizes, check=True).split("|")
+                schema_mb, target_mb, conns, wal, xmin_age, xmin_hold, idle_txn = h.psql(sizes, check=True).split("|")
             except Exception:
-                schema_mb = target_mb = conns = "NA"
+                schema_mb = target_mb = conns = wal = xmin_age = xmin_hold = idle_txn = "NA"
+            seg = h.segment_at(now)
             row = [
                 time.strftime("%T"),
                 str(len(alive)),
@@ -407,9 +440,16 @@ def monitor(h, out_path, stop, interval=5.0):
                 conns,
                 schema_mb,
                 target_mb,
+                wal,
+                xmin_age,
+                xmin_hold,
+                idle_txn,
+                seg[1] if seg else "-",
             ]
             f.write("\t".join(row) + "\n")
             f.flush()
+            with h.lock:
+                h.samples.append(dict(zip(MON_COLUMNS, row, strict=True), epoch=now, rss_kb=rss))
             stop.wait(interval)
 
 
@@ -437,6 +477,245 @@ def oracle(h):
 def definition_states(h):
     rows = h.psql("select target_table || '=' || status from trellis.transform_definitions order by 1", user=ROLE)
     return dict(r.split("=", 1) for r in rows.splitlines() if "=" in r)
+
+
+# -- write probes --------------------------------------------------------------
+# A probe upserts one account outside the load's id range with a fresh name and times how
+# long the name takes to reach acct_view after the commit. The prober probes every
+# --probe-secs during steady and spike segments, every 10x that during a trickle, and once
+# a second before each idle segment ends: the first write after the idle.
+
+
+def probe_id(h):
+    return 2 * h.cfg["accounts"] + 1  # loadgen's ids stop at 1.2x the seed
+
+
+def probe(h, tag, timeout=300.0):
+    t0 = time.time()
+    seg = h.segment_at(t0)
+    rec = {"epoch": t0, "segment": seg[0] if seg else None, "tag": tag, "latency": None, "error": None}
+    name = f"probe {t0:.3f}"
+    try:
+        deadline = t0 + timeout
+        while True:  # Postgres may be restarting: retry the write until the deadline
+            try:
+                conn = psycopg2.connect(h.dsn(user=APP), connect_timeout=5)
+                break
+            except psycopg2.OperationalError:
+                if time.time() > deadline:
+                    raise
+                h.sleep(1)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "insert into accounts(id, region, name, balance) values (%s, 1, %s, 0)"
+                    " on conflict (id) do update set name = excluded.name, active = true",
+                    (probe_id(h), name),
+                )
+        finally:
+            conn.close()
+        committed = time.time()
+        reader = psycopg2.connect(h.dsn(user=ADMIN), connect_timeout=5)
+        try:
+            reader.autocommit = True
+            with reader.cursor() as cur:
+                while True:
+                    cur.execute("select 1 from public.acct_view where id = %s and uname = %s", (probe_id(h), name))
+                    if cur.fetchone():
+                        rec["latency"] = time.time() - committed
+                        break
+                    if time.time() > deadline:
+                        raise TimeoutError(f"not in acct_view after {timeout:.0f}s")
+                    h.sleep(0.05)
+        finally:
+            reader.close()
+    except Aborted:
+        raise
+    except Exception as exc:
+        rec["error"] = f"{type(exc).__name__}: {str(exc).strip()[:120]}"
+        h.event(f"probe ({tag}) failed: {rec['error']}")
+    with h.lock:
+        h.probes.append(rec)
+    return rec
+
+
+def prober(h, every):
+    """Probes along the schedule in h.timeline until it ends or the run is torn down."""
+    start, segments = h.timeline
+    try:
+        for profile, secs, _ in segments:
+            end = start + secs
+            if profile == "idle":
+                h.sleep(max(0.0, end - 1 - time.time()))
+                rec = probe(h, "after-idle")
+                if rec["latency"] is not None:
+                    h.event(f"first write after {secs:.0f}s idle: {rec['latency']:.3f}s")
+            else:
+                interval = every * (10 if profile == "trickle" else 1)
+                t = start + min(5.0, secs / 2)
+                while t < end - 1:
+                    h.sleep(max(0.0, t - time.time()))
+                    probe(h, profile)
+                    t = max(t + interval, time.time())
+            start = end
+    except Aborted:
+        pass
+
+
+# -- operational metrics ---------------------------------------------------------
+# Recorded for step 10b's thresholds; nothing here fails a run yet.
+
+LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s+(WARN|ERROR)\s+(.*)$")
+LOG_FIELD = re.compile(r"(\w+)=(\"[^\"]*\"|\S+)")
+
+
+def log_template(text):
+    """A log message with its field values and numbers blanked, to group repeats."""
+    return re.sub(r"\d+", "N", LOG_FIELD.sub(r"\1=…", text)).strip()[:160]
+
+
+def parse_log_levels(lines):
+    """Tracing lines -> [(epoch, level, template)] for WARN and ERROR."""
+    out = []
+    for line in lines:
+        m = LOG_LINE.match(line)
+        if m:
+            ts = datetime.datetime.fromisoformat(m.group(1).replace("Z", "+00:00")).timestamp()
+            out.append((ts, m.group(2), log_template(m.group(3))))
+    return out
+
+
+def percentile(values, q):
+    v = sorted(values)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else None
+
+
+def num(sample, key):
+    try:
+        return float(sample[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def summarize(start, segments, loadgen_segments, samples, probes, log_lines, steps):
+    """Per-segment operational metrics, plus first-write latency after idle against steady."""
+    out = {"segments": [], "after_idle": []}
+    steady = [p["latency"] for p in probes if p["tag"] == "steady" and p["latency"] is not None]
+    out["steady_latency_p50"] = percentile(steady, 0.5)
+    out["steady_latency_p95"] = percentile(steady, 0.95)
+    t = start
+    for i, (profile, secs, tps) in enumerate(segments):
+        s, e = t, t + secs
+        t = e
+        within = [x for x in samples if s <= x["epoch"] < e]
+        seg = {"segment": i + 1, "profile": profile, "start_offset": s - start, "secs": secs, "tps": tps}
+        if i < len(loadgen_segments):
+            seg["ok"], seg["err"] = loadgen_segments[i][1], loadgen_segments[i][2]
+        seg["steps"] = [text for at, text in steps if s <= at < e]
+        for key, col in (("xmin_age_max", "xmin_age"), ("xmin_hold_s_max", "xmin_hold_s")):
+            vals = [v for v in (num(x, col) for x in within) if v is not None]
+            seg[key] = max(vals) if vals else None
+        vals = [v for v in (num(x, "idle_in_txn") for x in within) if v is not None]
+        seg["idle_in_txn_max"] = max(vals) if vals else None
+        if within:
+            seg["rss_mb_end"] = round(within[-1]["rss_kb"] / 1024)
+            seg["trellis_conns_end"] = num(within[-1], "trellis_conns")
+        # WAL: the whole segment, and its rate after a settling time (the drain of what the
+        # load before it left, and the autovacuum after it).
+        wal = [(x["epoch"], num(x, "wal_bytes")) for x in within if num(x, "wal_bytes") is not None]
+        if len(wal) >= 2:
+            seg["wal_bytes"] = wal[-1][1] - wal[0][1]
+            settle = s + min(120.0, secs / 4)
+            settled = [w for w in wal if settle <= w[0] <= e - 2]
+            if len(settled) >= 2 and settled[-1][0] - settled[0][0] >= 30:
+                span = settled[-1][0] - settled[0][0]
+                seg["wal_bytes_per_hour_settled"] = round((settled[-1][1] - settled[0][1]) / span * 3600)
+        logs = [(lvl, tpl) for at, lvl, tpl in log_lines if s <= at < e]
+        for lvl in ("WARN", "ERROR"):
+            counts = {}
+            for level, tpl in logs:
+                if level == lvl:
+                    counts[tpl] = counts.get(tpl, 0) + 1
+            seg[lvl.lower()] = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+        if profile == "idle":
+            seg["warn_per_hour"] = round(sum(seg["warn"].values()) / secs * 3600, 1)
+        lat = [p["latency"] for p in probes if p["segment"] == i and p["latency"] is not None and p["tag"] == profile]
+        if lat:
+            seg["probe_latency_p50"], seg["probe_latency_max"] = percentile(lat, 0.5), max(lat)
+        out["segments"].append(seg)
+        for p in probes:
+            if p["segment"] == i and p["tag"] == "after-idle":
+                ratio = None
+                if p["latency"] is not None and out["steady_latency_p50"]:
+                    ratio = round(p["latency"] / out["steady_latency_p50"], 1)
+                out["after_idle"].append(
+                    {"segment": i + 1, "idle_secs": secs, "latency": p["latency"], "ratio": ratio, "error": p["error"]}
+                )
+    return out
+
+
+def metrics_lines(m):
+    """A few human lines for the event log, and a compact one for the logbook note."""
+
+    def fmt(v, unit="s"):
+        return "NA" if v is None else f"{v:.3f}{unit}"
+
+    lines = [f"steady write->target latency p50 {fmt(m['steady_latency_p50'])}, p95 {fmt(m['steady_latency_p95'])}"]
+    for a in m["after_idle"]:
+        lines.append(
+            f"first write after {a['idle_secs']:.0f}s idle (segment {a['segment']}): {fmt(a['latency'])}"
+            + (f" = {a['ratio']}x steady" if a["ratio"] is not None else "")
+            + (f" ({a['error']})" if a["error"] else "")
+        )
+    for seg in m["segments"]:
+        bits = [f"segment {seg['segment']} {seg['profile']} {seg['secs']:.0f}s"]
+        if "ok" in seg:
+            bits.append(f"{seg['ok']} writes, {seg['ok'] / seg['secs']:.4g}/s (planned {seg['tps']:.4g}/s)")
+        if "probe_latency_p50" in seg:
+            bits.append(f"latency p50 {fmt(seg['probe_latency_p50'])}")
+        if "wal_bytes_per_hour_settled" in seg:
+            bits.append(f"WAL {seg['wal_bytes_per_hour_settled'] / 1048576:.2f} MB/h settled")
+        bits.append(f"xmin hold max {seg['xmin_hold_s_max']}s / {seg['xmin_age_max']} xids")
+        if seg["profile"] == "idle":
+            bits.append(f"WARN {seg['warn_per_hour']}/h")
+        if seg["steps"]:
+            bits.append(f"steps {', '.join(seg['steps'])}")
+        lines.append("; ".join(bits))
+        for tpl, n in list(seg["warn"].items())[:5] + list(seg["error"].items())[:5]:
+            lines.append(f"    {n} x {tpl}")
+    idle = [s for s in m["segments"] if s["profile"] == "idle"]
+    wal = [s["wal_bytes_per_hour_settled"] for s in idle if "wal_bytes_per_hour_settled" in s]
+    ratios = [a["ratio"] for a in m["after_idle"] if a["ratio"] is not None]
+    holds = [s["xmin_hold_s_max"] for s in m["segments"] if s["xmin_hold_s_max"] is not None]
+    short = (
+        f"steady p50 {fmt(m['steady_latency_p50'])}"
+        + (f"; after-idle max {max(ratios)}x" if ratios else "")
+        + (f"; idle WAL max {max(wal) / 1048576:.2f} MB/h" if wal else "")
+        + (f"; xmin hold max {max(holds):.0f}s" if holds else "")
+        + (f"; idle WARN max {max(s['warn_per_hour'] for s in idle)}/h" if idle else "")
+    )
+    return lines, short
+
+
+def record_metrics(h, start, segments, loadgen_segments):
+    """Write metrics.json and log the summary; the logbook's short form. Never fails the run."""
+    try:
+        log_lines = []
+        for name in h.worker_names():
+            with open(os.path.join(h.run_dir, f"{name}.log"), errors="replace") as f:
+                log_lines += parse_log_levels(f)
+        steps = [(at, t) for at, t in h.step_log if not t.startswith(("until:", "sleep:"))]
+        m = summarize(start, segments, loadgen_segments, h.samples, h.probes, log_lines, steps)
+        with open(os.path.join(h.run_dir, "metrics.json"), "w") as f:
+            json.dump(m, f, indent=1)
+        lines, short = metrics_lines(m)
+        for line in lines:
+            h.event(f"metric: {line}")
+        return short
+    except Exception as exc:
+        h.event(f"metrics not recorded: {type(exc).__name__}: {exc}")
+        return "metrics not recorded"
 
 
 # -- fault actions -------------------------------------------------------------
@@ -476,6 +755,21 @@ def pick_worker(h, which):
 def sleep(h, n):
     """Do nothing for SECS seconds."""
     h.sleep(secs(n))
+
+
+@action("until:SEGMENT[:OFFSET_SECS=0]")
+def until(h, segment, offset="0"):
+    """Wait until OFFSET s into load segment SEGMENT (from 1); a negative OFFSET counts back from its end."""
+    if not h.timeline:
+        raise RuntimeError("until: the load hasn't started")
+    start, segments = h.timeline
+    i, off = int(segment), float(offset)
+    if not 1 <= i <= len(segments):
+        raise UsageError(f"until: segment {segment} of {len(segments)}")
+    at = start + sum(secs for _, secs, _ in segments[: i - 1]) + (off if off >= 0 else segments[i - 1][1] + off)
+    if time.time() > at:
+        h.event(f"until:{segment}:{offset} is already past by {time.time() - at:.0f}s")
+    h.sleep(max(0.0, at - time.time()))
 
 
 @action("kill9:[WORKER|any][:RESTART_AFTER_SECS=2]")
@@ -734,6 +1028,7 @@ def parse_step(text):
 def run_step(h, text):
     parts = parse_step(text)
     h.event(f"step {text}")
+    h.step_log.append((time.time(), text))
     errors = []
 
     def one(fn, args):
@@ -784,6 +1079,25 @@ SCENARIOS = {
         ["sleep:30", "tablespace-full:120"],
     ),
     "soak": ({"load_secs": 10800, "tps": 1000}, []),
+    # Load profiles (#2189). Steps at an idle point address it with until:SEGMENT:OFFSET.
+    "profiles-short": (
+        {"schedule": "steady:90,trickle:120,idle:240,spike:60:x10,idle:60", "tps": 200, "threads": 16},
+        ["until:3:60", "worker-outage:5", "until:3:150", "pg-restart:fast"],
+    ),
+    "daily": (
+        {"schedule": "idle:600,trickle:600,steady:900,spike:60:x10,steady:840,trickle:600", "tps": 100},
+        [],
+    ),
+    # The baselines for #2189's thresholds: a clean 2 h idle, the silence after a 100x spike,
+    # a trickle, then an idle hour with a worker restart and a Postgres restart in it.
+    "idle-baseline": (
+        {
+            "schedule": "steady:1200,idle:7200,spike:60:x100,idle:1800,trickle:3600,idle:3600,steady:600",
+            "tps": 50,
+            "threads": 64,  # 16 threads reached 1739 of 2000 tps in profiles-short's spike
+        },
+        ["until:6:1200", "worker-outage:5", "until:6:2400", "pg-restart:fast"],
+    ),
 }
 
 
@@ -967,12 +1281,24 @@ def cmd_run(args):
     if bool(args.scenario) == bool(args.step):
         raise UsageError("give --scenario or --step, not both or neither")
     load, steps = SCENARIOS[args.scenario] if args.scenario else ({}, args.step)
+    if args.schedule and args.load_secs:
+        raise UsageError("give --schedule or --load-secs, not both")
+    explicit_secs = args.load_secs is not None
     for k, v in load.items():
+        if getattr(args, k) is None and not (k == "schedule" and explicit_secs):
+            setattr(args, k, v)
+    if args.schedule:
+        args.load_secs = None
+    for k, v in {"tps": 1000, "threads": 12, "workers": 2}.items():
         if getattr(args, k) is None:
             setattr(args, k, v)
-    for k, v in {"load_secs": 120, "tps": 1000, "threads": 12, "workers": 2}.items():
-        if getattr(args, k) is None:
-            setattr(args, k, v)
+    if not args.schedule:
+        args.schedule = f"steady:{args.load_secs or 120}"
+    try:
+        segments = loadgen.parse_schedule(args.schedule, args.tps)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from None
+    args.load_secs = int(sum(secs for _, secs, _ in segments))
     for s in steps:
         parse_step(s)  # usage errors before anything starts
     if not os.path.exists(os.path.join(args.dir, "setup.json")):
@@ -987,7 +1313,7 @@ def cmd_run(args):
     cmdline = "soak/chaos.py run " + (
         f"--scenario {label}" if args.scenario else " ".join(f"--step {s}" for s in steps)
     )
-    cmdline += f" load={args.load_secs}s@{args.tps:g}tps workers={args.workers}"
+    cmdline += f" load={args.schedule}@{args.tps:g}tps workers={args.workers}"
     h.event(f"run {cmdline}; logs in {run_dir}")
     outcome, rows, note = "aborted", 0, "harness error"
     stop_mon = threading.Event()
@@ -1000,6 +1326,8 @@ def cmd_run(args):
         mon = threading.Thread(target=monitor, args=(h, os.path.join(run_dir, "monitor.tsv"), stop_mon), daemon=True)
         mon.start()
         time.sleep(5)
+        start_at = time.time() + 2
+        h.timeline = (start_at, segments)
         load_out = os.path.join(run_dir, "load.log")
         lg = subprocess.Popen(
             [
@@ -1011,8 +1339,10 @@ def cmd_run(args):
                 str(args.threads),
                 "--tps",
                 str(args.tps),
-                "--secs",
-                str(args.load_secs),
+                "--schedule",
+                args.schedule,
+                "--start-at",
+                repr(start_at),
                 "--accounts",
                 str(h.cfg["accounts"]),
                 "--orders",
@@ -1024,10 +1354,16 @@ def cmd_run(args):
             stderr=subprocess.STDOUT,
         )
         h.write_pid("loadgen", lg.pid)
-        h.event(f"load: {args.threads} threads at {args.tps:g} tps for {args.load_secs}s")
+        h.event(f"load: {args.threads} threads, {args.schedule} at {args.tps:g} tps ({args.load_secs}s)")
+        probes = None
+        if args.probe_secs > 0:
+            probes = threading.Thread(target=prober, args=(h, args.probe_secs), daemon=True)
+            probes.start()
         for s in steps:
             run_step(h, s)
         lg.wait()
+        if probes is not None:
+            probes.join()
         last = open(load_out).read().strip().splitlines()[-1:] or [""]
         try:
             totals = json.loads(last[0])
@@ -1062,12 +1398,14 @@ def cmd_run(args):
             h.fail(f"peak oldest-undrained age {h.peak_age:.0f}s > {args.max_age_secs}s")
         status = h.sh([h.bin, "status", "-d", h.dsn()], check=False, capture_output=True)
         open(os.path.join(run_dir, "status.txt"), "w").write(status.stdout + status.stderr)
+        short = record_metrics(h, start_at, segments, totals.get("segments", []))
         oracle_failed = not converged
         outcome = "ok" if not h.failures else ("fail" if oracle_failed else "miss")
         note = (
             f"{label}: {'oracle 0 diffs' if converged else 'ORACLE DIFF'} after {time.time() - t0:.0f}s; "
             f"peak RSS {h.peak_rss_kb / 1024:.0f} MB, peak age {h.peak_age:.0f}s; load err {totals['err']}"
             + (f"; failures: {'; '.join(h.failures)}" if h.failures else "")
+            + f"; {short}"
         )
     except BaseException as exc:
         h.event(f"aborted: {type(exc).__name__}: {exc}")
@@ -1112,7 +1450,14 @@ def main(argv=None):
     r = sub.add_parser("run", parents=[book], help="run a scenario against the base snapshot")
     r.add_argument("--scenario", choices=sorted(SCENARIOS))
     r.add_argument("--step", action="append", default=[], help="ACTION[:ARG...][+ACTION...], repeatable, run in order")
-    r.add_argument("--load-secs", type=int)
+    r.add_argument("--load-secs", type=int, help="shorthand for --schedule steady:SECS (default 120)")
+    r.add_argument(
+        "--schedule",
+        help="load profile segments PROFILE:SECS[:RATE],...; profiles idle, trickle, steady, spike (see loadgen.py)",
+    )
+    r.add_argument(
+        "--probe-secs", type=float, default=30, help="write-to-target latency probe interval while loaded; 0 disables"
+    )
     r.add_argument("--tps", type=float)
     r.add_argument("--threads", type=int)
     r.add_argument("--mix", default="", help="loadgen op weights, e.g. insert_order=50,delete_account=0")
