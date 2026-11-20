@@ -1060,8 +1060,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
 /// fourth check finds outgrown, re-validates the definition over the live
 /// types as define would ([`crate::defs::floor::on_live_retype`],
 /// ADR-0024). A refusal pauses it naming the refusal and the remedies
-/// (`ALTER TRANSFORM` to a definition that validates, or change the column
-/// back, then `RESUME`), so the pause never promises a rebuild a resume would
+/// ([`RETYPE_REMEDY`]), so the pause never promises a rebuild a resume would
 /// refuse. A definition left unpaused has its floor stamped again over the
 /// new types, in the transaction that re-records its key types.
 ///
@@ -1286,9 +1285,8 @@ pub(crate) async fn pause_readers_of_retyped(
                         changed.join(", ")
                     };
                     reasons.push(format!(
-                        "{changed}, and define would now refuse the definition: {refusal}. ALTER \
-                         TRANSFORM it to a definition that validates, or change the column back, \
-                         then resume it"
+                        "{changed}, and define would now refuse the definition: {refusal}. {}",
+                        RETYPE_REMEDY
                     ));
                     for (column, _, _) in &moved {
                         if !columns.contains(column) {
@@ -2239,6 +2237,12 @@ pub(crate) fn unpaused_readers(catalog: &CaptureCatalog, table: &str) -> Vec<i64
         })
         .collect()
 }
+
+/// The remedy a retype pause names. `ALTER TRANSFORM` is not among them: it
+/// refuses a paused definition (T0154), and `RESUME` refuses while define
+/// would, so editing first is never possible in any key space.
+pub(crate) const RETYPE_REMEDY: &str =
+    "Change the column back, then RESUME it, or DROP TRANSFORM it and define it again";
 
 #[cfg(test)]
 mod tests {

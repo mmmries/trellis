@@ -1081,8 +1081,9 @@ names first.
 
 An `ALTER TRANSFORM` of a transform that isn't `live`, or a define chaining off
 one whose build is running (`backfilling`) or that is paused or quarantined.
-Retry once it is `live`; `RESUME` a paused one first. After define: matters
-only when the statement runs.
+Retry once it is `live`; [repair](operations.md#paused-definitions) and
+`RESUME` a paused one first. After define: matters only when the statement
+runs.
 
 ### T0155 AlterFieldNotFound
 
