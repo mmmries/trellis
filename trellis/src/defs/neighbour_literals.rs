@@ -130,6 +130,15 @@ fn walk<'e>(
         Expr::BinaryOp { op, lhs, rhs } if op.is_comparison() && !op.is_ordering() => {
             each(vec![lhs, rhs]);
         }
+        Expr::InList {
+            expr: operand,
+            list,
+            ..
+        } => {
+            for element in list {
+                each(vec![operand, element]);
+            }
+        }
         Expr::FunctionCall { name, args } if name == "COALESCE" || name == "NULLIF" => {
             each(args.iter().collect());
         }

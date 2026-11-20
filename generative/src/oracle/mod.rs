@@ -458,6 +458,28 @@ fn render_expr(expr: &Expr) -> String {
             render_expr(expr),
             if *negated { "not " } else { "" }
         ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            render_expr(expr),
+            if *negated { "not " } else { "" },
+            list.iter().map(render_expr).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render_expr(expr),
+            if *negated { "not " } else { "" },
+            render_expr(low),
+            render_expr(high)
+        ),
         Expr::Case {
             branches,
             otherwise,
@@ -1159,7 +1181,9 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
             })
         }
         Expr::Cast { target, .. } => *target,
-        Expr::Not(_) | Expr::IsNull { .. } => ValueType::Boolean,
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } => {
+            ValueType::Boolean
+        }
         // The results unify as `COALESCE`'s arguments do: an exact numeric
         // beside a float is the float, two integers the wider, otherwise
         // `numeric`; equal types are themselves.
@@ -1428,6 +1452,31 @@ fn render_join_expr(expr: &Expr) -> String {
             "({} is {}null)",
             render_join_expr(expr),
             if *negated { "not " } else { "" }
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            render_join_expr(expr),
+            if *negated { "not " } else { "" },
+            list.iter()
+                .map(render_join_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render_join_expr(expr),
+            if *negated { "not " } else { "" },
+            render_join_expr(low),
+            render_join_expr(high)
         ),
         Expr::Case {
             branches,

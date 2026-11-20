@@ -126,7 +126,11 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_column_types(operand, source, out);
         }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+        Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Case { .. } => {
             for child in expr.children() {
                 collect_column_types(child, source, out);
             }

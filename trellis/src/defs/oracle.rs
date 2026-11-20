@@ -463,6 +463,30 @@ fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> St
             render(expr),
             if *negated { "not " } else { "" }
         ),
+        // Each element is an `=` operand, typed from its neighbour.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            beside(expr),
+            if *negated { "not " } else { "" },
+            list.iter().map(beside).collect::<Vec<_>>().join(", ")
+        ),
+        // The bounds are ordering operands, typed as written.
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render(expr),
+            if *negated { "not " } else { "" },
+            render(low),
+            render(high)
+        ),
         Expr::Case {
             branches,
             otherwise,

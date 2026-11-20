@@ -505,6 +505,24 @@ pub enum Expr {
     /// `<operand> IS NULL` (or `IS NOT NULL` when `negated`), which is never
     /// itself `NULL`.
     IsNull { expr: Box<Expr>, negated: bool },
+    /// `<operand> IN (<e1>, <e2>, ...)`, or `NOT IN` when `negated`: `=`
+    /// against each element joined by `OR` (`<>` joined by `AND`), with
+    /// three-valued `NULL` logic. `list` is never empty. Typed element by
+    /// element as [`Expr::comparisons`] spells it, and rendered as written.
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    /// `<operand> BETWEEN <low> AND <high>`, or `NOT BETWEEN` when
+    /// `negated`: `>= low AND <= high` (`< low OR > high`). Rendered as
+    /// written.
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
     /// The searched `CASE WHEN <condition> THEN <result> [WHEN ...]
     /// [ELSE <result>] END`. Without an `ELSE` the value is `NULL` where no
     /// condition is true.
@@ -532,6 +550,10 @@ impl Expr {
             | Expr::Cast { expr: operand, .. }
             | Expr::Not(operand)
             | Expr::IsNull { expr: operand, .. } => vec![operand],
+            Expr::InList { expr, list, .. } => std::iter::once(&**expr).chain(list).collect(),
+            Expr::Between {
+                expr, low, high, ..
+            } => vec![expr, low, high],
             Expr::Case {
                 branches,
                 otherwise,
@@ -576,6 +598,26 @@ impl Expr {
                 expr: Box::new(f(expr)?),
                 negated: *negated,
             },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(f(expr)?),
+                list: list.iter().map(&mut f).collect::<Result<_, _>>()?,
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Expr::Between {
+                expr: Box::new(f(expr)?),
+                low: Box::new(f(low)?),
+                high: Box::new(f(high)?),
+                negated: *negated,
+            },
             Expr::Case {
                 branches,
                 otherwise,
@@ -590,6 +632,41 @@ impl Expr {
                 },
             },
         })
+    }
+
+    /// The comparisons an [`Expr::InList`] or [`Expr::Between`] stands for,
+    /// each its own two-operand [`Expr::BinaryOp`]: `<operand> = <e>` for
+    /// each element of an `IN` or `NOT IN` (an element is typed as `=`
+    /// types it either way), `<operand> >= <low>` and `<operand> <= <high>`
+    /// for a `BETWEEN` (`<` and `>` for `NOT BETWEEN`, as Postgres rewrites
+    /// it). Empty for any other node. The checks that read a comparison's
+    /// two operands (typing, collations) read these.
+    pub fn comparisons(&self) -> Vec<Expr> {
+        let compare = |op: Operator, lhs: &Expr, rhs: &Expr| Expr::BinaryOp {
+            op,
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
+        };
+        match self {
+            Expr::InList { expr, list, .. } => list
+                .iter()
+                .map(|element| compare(Operator::Equal, expr, element))
+                .collect(),
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let (low_op, high_op) = if *negated {
+                    (Operator::LessThan, Operator::GreaterThan)
+                } else {
+                    (Operator::GreaterThanOrEqual, Operator::LessThanOrEqual)
+                };
+                vec![compare(low_op, expr, low), compare(high_op, expr, high)]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Calls `f` on this node, then on each node below it: depth first, in
@@ -1018,6 +1095,31 @@ fn render_expr(expr: &Expr, aliases: &Aliases<'_>) -> String {
             "({} IS {}NULL)",
             render_field_expr(expr),
             if *negated { "NOT " } else { "" }
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}IN ({}))",
+            render_field_expr(expr),
+            if *negated { "NOT " } else { "" },
+            list.iter()
+                .map(render_field_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}BETWEEN {} AND {})",
+            render_field_expr(expr),
+            if *negated { "NOT " } else { "" },
+            render_field_expr(low),
+            render_field_expr(high)
         ),
         Expr::Case {
             branches,

@@ -294,6 +294,31 @@ pub(super) fn render_expr(expr: &Expr) -> String {
             render_expr(expr),
             if *negated { "NOT " } else { "" }
         ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({}) {}IN ({})",
+            render_expr(expr),
+            if *negated { "NOT " } else { "" },
+            list.iter()
+                .map(|e| format!("({})", render_expr(e)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({}) {}BETWEEN ({}) AND ({})",
+            render_expr(expr),
+            if *negated { "NOT " } else { "" },
+            render_expr(low),
+            render_expr(high)
+        ),
         Expr::Case {
             branches,
             otherwise,

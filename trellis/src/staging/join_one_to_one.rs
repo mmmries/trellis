@@ -319,6 +319,8 @@ fn qualify(
         | Expr::FunctionCall { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
         | Expr::Case { .. } => expr.try_map_children(&mut sub)?,
     })
 }
