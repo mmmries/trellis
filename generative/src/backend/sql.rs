@@ -693,7 +693,7 @@ fn push_inserts(
 }
 
 /// `value` as a single-quoted SQL string literal.
-fn quote_literal(value: &str) -> String {
+pub(super) fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

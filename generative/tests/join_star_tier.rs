@@ -39,12 +39,16 @@ fn fnv(hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// A digest of what a case runs: its ops, its definitions' text, its plan,
-/// and its engine settings. A definition's `WHERE` is left out: the arm that
-/// draws it (#2043, `generate::where_clause`) is derived from the program,
-/// so the rest of every case is what it was before the arm existed.
+/// and its engine settings. A definition's `WHERE` and the plan's wiring are
+/// left out: the arms that draw them (#2043, `generate::where_clause`; #2181,
+/// `generate::wiring`) are derived from the program, so the rest of every
+/// case is what it was before each arm existed.
 fn digest(cases: &[JoinCase]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     for case in cases {
+        let mut plan = case.plan.clone();
+        plan.wiring.clear();
+        let plan = format!("{plan:?}").replace(", wiring: []", "");
         for def in &case.program.defs {
             let mut def = def.clone();
             def.predicate = trellis::dev::defs::ast::Predicate::True;
@@ -54,10 +58,10 @@ fn digest(cases: &[JoinCase]) -> u64 {
             );
         }
         let rest = format!(
-            "{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}",
+            "{:?}|{:?}|{}|{:?}|{}|{}|{}|{}",
             case.program.ops,
             case.program.def_install_after_op,
-            case.plan,
+            plan,
             case.shape,
             case.burst_size,
             case.workers,

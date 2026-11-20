@@ -108,7 +108,9 @@ pub enum PlantPath {
     SelfCheckExtremes,
     /// Capture of a source write into the ring, ahead of every definition's
     /// apply path: a target of any key space can go wrong. Only a drawn
-    /// transaction (#2181) holds the snapshot it needs.
+    /// transaction (#2181) holds the snapshot one plant needs, and only a
+    /// drawn application trigger writes the nested statement the other
+    /// needs.
     Capture,
 }
 
@@ -208,7 +210,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarHeldOriginFirstOnly
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
-        Plant::CaptureSlotFromSnapshot => PlantPath::Capture,
+        Plant::CaptureSlotFromSnapshot | Plant::CaptureSkipNestedReread => PlantPath::Capture,
     }
 }
 
@@ -707,9 +709,9 @@ pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggr
 
 /// Why a tier other than the hot-key-based concurrent tiers doesn't gate a
 /// capture plant.
-pub const NO_CAPTURE: &str = "it breaks capture under a drawn transaction (#2181), which \
-     every concurrent tier draws; the cooling-key tier (concurrent_convergence.rs, \
-     planted_bugs_are_caught) gates it";
+pub const NO_CAPTURE: &str = "it breaks capture under a drawn transaction or application \
+     trigger (#2181), which every concurrent tier draws; the hot-key-based tiers \
+     (concurrent_convergence.rs, planted_bugs_are_caught) gate it";
 
 /// The plants whose path a tier's programs never take, each with `why`:
 /// for a tier's `not_gated`.

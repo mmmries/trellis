@@ -832,6 +832,14 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     if node_truncate {
         body.push_str(&node_truncate_prelude(schema, spec, &span_state));
     }
+    #[allow(unused_mut)]
+    let mut nested = "st[3] <> st[1]";
+    // Planted bug: no re-read after a nested statement's capture. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(crate::plant::Plant::CaptureSkipNestedReread, rows.is_some()) {
+        nested = "st[3] < 0";
+    }
     if let Some(rows) = rows {
         body.push_str(&format!(
             "    -- How many imaged columns the table still has, or -1 for a\n    \
@@ -841,7 +849,7 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
              -- Re-read only if another capture of this table staged rows\n    \
              -- since this statement's span started.\n    \
              st := {span_state};\n    \
-             reread := st[3] <> st[1];\n    \
+             reread := {nested};\n    \
              st[2] := case when st[2] > 0 then st[2] - 1 else 0 end;\n    \
              if present >= 0 then\n        st[1] := st[1] + 1;\n    end if;\n    \
              perform pg_catalog.set_config({span}, cast(st as text), true);\n    \

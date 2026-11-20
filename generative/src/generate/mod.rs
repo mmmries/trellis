@@ -135,6 +135,7 @@ pub mod min_max;
 pub mod partition;
 pub mod txn_shapes;
 pub mod where_clause;
+pub mod wiring;
 
 use std::collections::HashMap;
 
@@ -1697,6 +1698,7 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
         settle_after_install: false,
         commit_stall: None,
         txns: Vec::new(),
+        wiring: Vec::new(),
     };
     for (def, &at) in program.def_install_after_op.iter().enumerate() {
         if at == 0 {

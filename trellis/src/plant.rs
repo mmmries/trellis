@@ -974,6 +974,18 @@ pub enum Plant {
     /// Pinned by `capture_install`'s
     /// `a_repeatable_read_writer_is_captured_into_a_batch_that_claims_it`.
     CaptureSlotFromSnapshot,
+    /// A capture re-reads only when its table's begin trigger is missing,
+    /// never because another capture of the table staged rows inside the
+    /// statement's span (`capture::sql`'s `function_body`). A nested
+    /// statement that rewrites a row the outer statement wrote (an
+    /// application `AFTER ROW` trigger) is captured first, and the outer
+    /// capture then stages its transition image, older than the row, last.
+    /// The generative tier reaches it through its drawn application
+    /// triggers (#2181).
+    ///
+    /// Pinned by `capture_reread`'s
+    /// `a_nested_write_in_a_subtransaction_is_the_live_row`.
+    CaptureSkipNestedReread,
 }
 
 impl Plant {
@@ -1072,6 +1084,7 @@ impl Plant {
         Plant::O2oWhereColumnNotImaged,
         Plant::GbWhereColumnNotImaged,
         Plant::CaptureSlotFromSnapshot,
+        Plant::CaptureSkipNestedReread,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -1170,6 +1183,7 @@ impl Plant {
             Plant::O2oWhereColumnNotImaged => "o2o_where_column_not_imaged",
             Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
             Plant::CaptureSlotFromSnapshot => "capture_slot_from_snapshot",
+            Plant::CaptureSkipNestedReread => "capture_skip_nested_reread",
         }
     }
 

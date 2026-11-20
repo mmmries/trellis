@@ -330,3 +330,37 @@ async fn a_key_the_build_read_past_its_undrained_change_is_uncertain_until_it_dr
     d.drain(pending, "page").await;
     assert_eq!(compare(&d, 10).await, (vec![], vec![], false));
 }
+
+/// An application `AFTER ROW` trigger rewrites the row its statement wrote:
+/// the nested update is captured first, with the statement's value (never
+/// committed) as its old image, then the statement's own update with the row
+/// before it. Pending, the key is expected as the target applied it, the row
+/// before the statement; once drained, as the live row.
+#[tokio::test]
+#[ignore = "#2209: the earliest pending change's old image is the statement's own value"]
+async fn a_pending_write_an_application_trigger_rewrote_is_subtracted() {
+    let mut d = start().await;
+    d.step("insert into public.src values (1, 10, 1), (2, 20, 2)")
+        .await;
+    d.write(
+        "create function public.bump() returns trigger language plpgsql as $$ \
+         begin \
+             if new.v = 500 then update public.src set v = 501 where id = new.id; end if; \
+             return null; \
+         end $$; \
+         create trigger bump after update on public.src \
+             for each row execute function public.bump()",
+    )
+    .await;
+    d.write("update public.src set v = 500 where id = 1").await;
+    for limit in [1, 100] {
+        assert_eq!(
+            compare(&d, limit).await,
+            (vec![], vec![], false),
+            "limit {limit}"
+        );
+    }
+    let batch = d.seal().await;
+    d.drain(batch, "the rewritten write").await;
+    assert_eq!(compare(&d, 100).await, (vec![], vec![], false));
+}

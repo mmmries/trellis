@@ -43,11 +43,13 @@ pub const MAX_TXN_OPS: usize = 5;
 pub const THINK_SHARE: u64 = 32;
 pub const MAX_THINK: Duration = Duration::from_millis(40);
 
-/// [`with_statement_forms`], then [`with_transactions`]: what every
-/// concurrent tier's case strategy calls last.
+/// [`with_statement_forms`], then [`with_transactions`], then
+/// [`super::wiring::with_wiring`]: what every concurrent tier's case
+/// strategy calls last.
 pub fn widen(program: Program, plan: ConcurrentPlan) -> (Program, ConcurrentPlan) {
     let program = with_statement_forms(program);
     let plan = with_transactions(plan, &program);
+    let plan = super::wiring::with_wiring(plan, &program);
     (program, plan)
 }
 
@@ -312,9 +314,10 @@ pub fn with_transactions(mut plan: ConcurrentPlan, program: &Program) -> Concurr
     plan
 }
 
-/// The transaction and statement-form shapes `program` and `plan` draw, by
-/// name, each paired with the key space of every definition reading the
-/// table it writes ([`crate::run::Coverage::txn_shapes`]).
+/// The transaction, statement-form and wiring shapes `program` and `plan`
+/// draw, by name, each paired with the key space of every definition
+/// reading the table it writes ([`crate::run::Coverage::txn_shapes`];
+/// [`super::wiring::shapes`] for the wiring's).
 pub fn shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<(&'static str, &'static str)> {
     let mut key_spaces: HashMap<&str, Vec<&'static str>> = HashMap::new();
     for def in &program.defs {
@@ -336,7 +339,7 @@ pub fn shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<(&'static str
             }
         }
     }
-    let mut out = HashSet::new();
+    let mut out = super::wiring::shapes(plan, &key_spaces);
     let mut add = |op: &Op, shape: &'static str| {
         for space in key_spaces.get(op.table()).into_iter().flatten() {
             out.insert((shape, *space));

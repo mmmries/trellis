@@ -505,6 +505,9 @@ pub struct ConcurrentPlan {
     /// an op in none is its own autocommit statement. Each wraps ops of one
     /// lane, consecutive in it.
     pub txns: Vec<TxnWrap>,
+    /// Application triggers and foreign keys on the sources (#2181),
+    /// installed with the tables, before any definition.
+    pub wiring: Vec<Wiring>,
 }
 
 /// A steady load on the engine, for a whole [`ConcurrentPlan`].
@@ -864,6 +867,90 @@ pub struct SavepointWrap {
     pub start: usize,
     pub end: usize,
     pub rollback: bool,
+}
+
+// ---------------------------------------------------------------------
+// Application wiring: triggers and foreign keys (#2181).
+// ---------------------------------------------------------------------
+
+/// Keys at or past this magnitude are the wiring's own rows: a drawn op's
+/// key is always smaller. A [`Shadow`] row of key `k` is `k + SHADOW_OFFSET`.
+pub const SHADOW_OFFSET: i64 = 1_000_000_000_000;
+
+/// A [`Shadow`]'s statement trigger toggles the row keyed
+/// `TALLY_BASE + pg_backend_pid()`: one row per connection, so per lane.
+pub const TALLY_BASE: i64 = 2 * SHADOW_OFFSET;
+
+/// Application triggers and a foreign key on one source table (#2181), as
+/// an application installs them. Every row they write is owned by the lane
+/// whose statement fired them: the written row's own key, its shadow
+/// (`k + SHADOW_OFFSET`), or the connection's tally row. No drawn op names
+/// any of those, so every op's expected outcome holds, and the oracle reads
+/// whatever they wrote from the source.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wiring {
+    /// The table whose writes fire the triggers.
+    pub table: String,
+    pub shadow: Option<Shadow>,
+    pub rewrite: Option<Rewrite>,
+}
+
+/// Before or after the row change, or the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Timing {
+    Before,
+    After,
+}
+
+/// What a foreign key from a shadow to its row does when the row goes.
+/// Every one also has `ON UPDATE CASCADE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FkAction {
+    Cascade,
+    SetNull,
+}
+
+/// Triggers on [`Wiring::table`] that keep a shadow row in `table` (which
+/// may be the same table) for each of its rows `k` under
+/// [`SHADOW_OFFSET`]: inserted with the row, its [`Shadow::toggle`] column
+/// flipped on each update of it, and deleted with it.
+///
+/// - A row trigger writes each shadow from the row's own event. A statement
+///   trigger writes them from the statement's transition tables (`AFTER`),
+///   or, as a `BEFORE` statement trigger has none, only flips the
+///   connection's tally row ([`TALLY_BASE`]). An `AFTER` statement trigger
+///   flips the tally too.
+/// - Only an `AFTER` trigger links the shadow to its row (column `lnk`),
+///   since the row doesn't exist yet before an insert. A linked shadow can
+///   carry the foreign key `fk`, which then deletes it ([`FkAction::Cascade`])
+///   or unlinks it ([`FkAction::SetNull`]) in place of the trigger.
+/// - `before_capture` names a statement trigger so it fires ahead of
+///   Trellis's capture triggers on the table (`a_…`), else after them
+///   (`zz_…`). Row triggers fire before any statement trigger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shadow {
+    pub table: String,
+    pub statement: bool,
+    pub timing: Timing,
+    pub before_capture: bool,
+    pub fk: Option<FkAction>,
+    /// The shadow row's values by column, each one the program writes to
+    /// that column of `table`. The key and `lnk` are the trigger's.
+    pub template: Vec<(String, Option<String>)>,
+    /// A column of `table` and the two values the program writes to it
+    /// that an update of the row flips its shadow's between.
+    pub toggle: (String, Option<String>, Option<String>),
+}
+
+/// A row trigger on [`Wiring::table`] that flips `column` between two
+/// values the program writes to it, on each insert or update of a row with
+/// an even key: `BEFORE`, by changing the row it writes; `AFTER`, by an
+/// update of the row it wrote, a nested statement on the same table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rewrite {
+    pub column: String,
+    pub timing: Timing,
+    pub values: (Option<String>, Option<String>),
 }
 
 #[cfg(test)]

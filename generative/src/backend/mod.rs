@@ -16,6 +16,7 @@ mod manual;
 mod ring_wait;
 mod sql;
 mod subprocess;
+mod wiring;
 
 pub use manual::{
     HeldKeyReport, ManualApplier, ManualBackend, ManualBackendError, SEAL_ON_DEMAND_INTERVAL,
@@ -173,6 +174,10 @@ pub struct TxnApplied {
 /// and claimed the batches a run produced ([`DrainAudit`]).
 pub trait ConcurrentBackend: Backend {
     type Applier: OpApplier;
+
+    /// Puts `wiring` (#2181) on the tables the next [`Backend::install`]
+    /// creates, before it installs any definition.
+    fn set_wiring(&mut self, wiring: &[crate::model::Wiring]);
 
     /// A new applier on its own connection, for tables already installed.
     fn applier(&self) -> impl Future<Output = Result<Self::Applier, Self::Error>> + Send;

@@ -694,6 +694,51 @@ async fn changes_not_applied_yet_are_subtracted_on_every_part() {
     assert_clean(&d, "after the pending changes are applied").await;
 }
 
+/// An application `AFTER ROW` trigger rewrites the row its statement wrote
+/// (#2181's wiring): the nested update is captured first, with the
+/// statement's value as its old image, and the statement's own capture
+/// follows with the value before the statement. Pending, both are
+/// subtracted to what the target applied; a page that took the earliest
+/// change's old image for it reports the statement's value instead.
+#[tokio::test]
+#[ignore = "#2209: the earliest pending change's old image is the statement's own value"]
+async fn a_pending_write_an_application_trigger_rewrote_is_subtracted() {
+    let mut d = start(true).await;
+    write(
+        &d,
+        "create function public.bump_a() returns trigger language plpgsql as $$ \
+         begin \
+             if new.r = 500 then update public.a set r = 501 where id = new.id; end if; \
+             return null; \
+         end $$; \
+         create trigger bump after update on public.a \
+             for each row execute function public.bump_a(); \
+         create function public.bump_b() returns trigger language plpgsql as $$ \
+         begin \
+             if new.img = 500 then update public.b set img = 501 where bid = new.bid; end if; \
+             return null; \
+         end $$; \
+         create trigger bump after update on public.b \
+             for each row execute function public.bump_b()",
+    )
+    .await;
+    write(&d, "update public.a set r = 500 where id = 'a03'").await;
+    write(&d, "update public.b set img = 500 where bid = 2").await;
+    for kind in KINDS {
+        for limit in [1, 1000] {
+            let (found, all, keys) = compare_walk(&d, &kind.target(), limit).await;
+            assert_eq!(found, Vec::new(), "{kind:?} at {limit}");
+            assert!(
+                !all && keys.is_empty(),
+                "{kind:?} at {limit}: {all} {keys:?}"
+            );
+        }
+    }
+    let batch = d.seal().await;
+    d.drain(batch, "the rewritten writes").await;
+    assert_clean(&d, "after the rewritten writes are applied").await;
+}
+
 #[tokio::test]
 async fn a_planted_error_beside_pending_changes_is_reported_exactly() {
     let d = start(true).await;
