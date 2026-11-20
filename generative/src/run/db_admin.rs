@@ -52,6 +52,14 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
         .await
         .map_err(|e| RunError::Install(format!("{e:?}")))?;
 
+    if let Some(limit) = plan.counters_near {
+        // Before the first op, while the ring is pristine.
+        backend
+            .advance_counters(limit)
+            .await
+            .map_err(|e| RunError::Install(format!("counters near {limit:?}: {e:?}")))?;
+    }
+
     for (op_index, op) in program.ops.iter().enumerate() {
         let events: Vec<&DbAdminAction> = plan
             .events

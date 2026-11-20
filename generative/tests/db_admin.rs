@@ -17,7 +17,9 @@ use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     db_admin_plan_for, trivial_program,
 };
-use generative::model::{DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode};
+use generative::model::{
+    CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode,
+};
 use generative::run::{RunError, run_convergence_with_db_admin};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -57,6 +59,16 @@ fn proptest_config() -> ProptestConfig {
 
 /// Runs `program` with `plan` against a fresh database on `cluster`.
 async fn run(cluster: &TestCluster, program: &Program, plan: &DbAdminPlan) -> Result<(), String> {
+    run_counting(cluster, program, plan).await.map(|_| ())
+}
+
+/// [`run`], returning how far the engine's counters got
+/// (`ManualBackend::counter_high_water`).
+async fn run_counting(
+    cluster: &TestCluster,
+    program: &Program,
+    plan: &DbAdminPlan,
+) -> Result<i64, String> {
     let db = CaseDatabase::provision(cluster).await;
     let mut backend = ManualBackend::connect_as(db.roles())
         .await
@@ -64,7 +76,10 @@ async fn run(cluster: &TestCluster, program: &Program, plan: &DbAdminPlan) -> Re
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
 
     match run_convergence_with_db_admin(&mut backend, &pool, program, plan, cluster).await {
-        Ok(outcome) if outcome.as_pass() => Ok(()),
+        Ok(outcome) if outcome.as_pass() => Ok(backend
+            .counter_high_water()
+            .await
+            .expect("read the counters")),
         Ok(outcome) => Err(format!("run did not pass: {outcome}")),
         Err(RunError::Diverged(d)) => Err(format!(
             "convergence diverged after op {} (target {}) with db-admin plan {plan:?}:\n{}",
@@ -200,6 +215,7 @@ fn plan(events: &[(usize, DbAdminAction)]) -> DbAdminPlan {
                 action: action.clone(),
             })
             .collect(),
+        counters_near: None,
     }
 }
 
@@ -251,5 +267,44 @@ async fn a_wrap_across_the_epoch_boundary_with_work_in_flight_converges() {
     assert!(
         next > EPOCH,
         "the run crossed the epoch boundary: next xid {next}"
+    );
+}
+
+/// The engine's counters start just under `2^31` and cross it mid-program:
+/// the ring's change ids and segment numbers, and the catalog's definition
+/// and build ids, are all past 32 bits by the end, and every op converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn counters_crossing_the_32_bit_limit_converge() {
+    let cluster = TestCluster::start();
+    let program = one_to_one_and_aggregate_program();
+    let plan = DbAdminPlan {
+        counters_near: Some(CounterLimit::Int32 { headroom: 4 }),
+        ..DbAdminPlan::default()
+    };
+    let high = run_counting(&cluster, &program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        high > i64::from(i32::MAX),
+        "the run crossed 2^31: high water {high}"
+    );
+}
+
+/// The counters start a million short of `i64::MAX`, so every id is 19
+/// digits, and every op converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn counters_near_the_64_bit_limit_converge() {
+    let cluster = TestCluster::start();
+    let program = one_to_one_and_aggregate_program();
+    let plan = DbAdminPlan {
+        counters_near: Some(CounterLimit::Int64),
+        ..DbAdminPlan::default()
+    };
+    let high = run_counting(&cluster, &program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        high >= CounterLimit::Int64.target() && high < i64::MAX,
+        "high water {high}"
     );
 }
