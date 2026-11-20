@@ -19,7 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use generative::backend::{Backend, SubprocessBackend};
+use generative::backend::{Backend, CaseDatabase, SubprocessBackend};
 use generative::generate::{Mutate, build_program};
 use generative::model::Program;
 use generative::run::check_program;
@@ -69,7 +69,7 @@ fn critical_pair_program() -> Program {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
+    let db = CaseDatabase::provision(&cluster).await;
 
     // The critical pair is the program's last two ops, meant to be applied
     // back-to-back with no intervening `quiesce()`; every op before it is
@@ -79,7 +79,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     let first_op = second_op - 1;
 
     let engine_bin = env!("CARGO_BIN_EXE_engine_subprocess");
-    let mut backend = SubprocessBackend::connect(db.dsn(), engine_bin)
+    let mut backend = SubprocessBackend::connect_as(db.roles(), engine_bin)
         .await
         .expect("connect subprocess backend");
 
@@ -251,11 +251,11 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_waits_for_the_killed_engines_singleton_to_free() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
+    let db = CaseDatabase::provision(&cluster).await;
     let program = critical_pair_program();
 
     let engine_bin = env!("CARGO_BIN_EXE_engine_subprocess");
-    let mut backend = SubprocessBackend::connect(db.dsn(), engine_bin)
+    let mut backend = SubprocessBackend::connect_as(db.roles(), engine_bin)
         .await
         .expect("connect subprocess backend");
     backend

@@ -348,10 +348,16 @@ impl Coverage {
                 self.expr_shapes.insert("Cast");
                 1 + self.record_expr(expr)
             }
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            Expr::Not(_)
+            | Expr::IsNull { .. }
+            | Expr::InList { .. }
+            | Expr::Between { .. }
+            | Expr::Case { .. } => {
                 self.expr_shapes.insert(match expr {
                     Expr::Not(_) => "Not",
                     Expr::IsNull { .. } => "IsNull",
+                    Expr::InList { .. } => "InList",
+                    Expr::Between { .. } => "Between",
                     _ => "Case",
                 });
                 1 + expr
@@ -406,7 +412,11 @@ fn collect_aggregate_calls(
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_aggregate_calls(operand, key_space, out);
         }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+        Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Case { .. } => {
             for child in expr.children() {
                 collect_aggregate_calls(child, key_space, out);
             }
@@ -1055,7 +1065,13 @@ fn burst_action_shapes(
                 ConcurrentShape::MidBurstInstall,
                 program.defs.get(*def).map(|d| d.source.as_str()),
             ),
-            BurstAction::Pause { .. } | BurstAction::Alter { .. } => continue,
+            BurstAction::Define { def, .. } => {
+                (ConcurrentShape::MidBurstInstall, Some(def.source.as_str()))
+            }
+            BurstAction::Pause { .. }
+            | BurstAction::Alter { .. }
+            | BurstAction::EditField { .. }
+            | BurstAction::Drop { .. } => continue,
         };
         if table.is_some_and(|table| overlaps(table, timed.after.min(ops.len()))) {
             out.insert(shape);

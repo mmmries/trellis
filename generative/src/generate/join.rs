@@ -65,8 +65,8 @@ use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
 
 use crate::model::{
-    BurstAction, Column, ConcurrentPlan, Op, OpOutcome, PRIMARY_KEY_VALUE_TYPE, Program, Table,
-    TimedAction,
+    BurstAction, Column, ConcurrentPlan, DefineShape, Op, OpOutcome, PRIMARY_KEY_VALUE_TYPE,
+    Program, Table, TimedAction,
 };
 
 /// The `FROM` table.
@@ -607,6 +607,12 @@ pub enum JoinActionKind {
     RebuildFrom,
     /// `request_backfill(jb)`.
     RebuildJoined,
+    /// `DROP TRANSFORM`, then the definition again later in the same burst,
+    /// under its name or a new one (#2183).
+    Redefine,
+    /// A second, identical definition under a new name, dropped in the next
+    /// burst when there is one (#2183).
+    SecondDefinition,
 }
 
 /// One drawn operator action, before [`add_join_actions`] resolves it. Plain
@@ -646,9 +652,15 @@ fn install_bursts(program: &Program, plan: &ConcurrentPlan) -> Vec<usize> {
 /// the earlier burst has settled, so the definition is `live` and its tables
 /// are captured, which a pause and a re-read both need.
 ///
+/// Draws resolve in burst order, so a definition redefined under a new name
+/// is addressed by it from then on.
+///
 /// A draw that can't apply is dropped rather than bent into something else:
-/// a plan with one burst, no definition installed early enough, and a second
-/// pause pair on a definition in a burst that already has one.
+/// a plan with one burst, no definition installed early enough, a second
+/// pause pair or redefinition of a definition in a burst that already has
+/// one, a second redefinition in a burst, and a re-read beside a
+/// redefinition when no other definition reads the tables (the drop would
+/// leave them unread).
 pub fn add_join_actions(
     mut plan: ConcurrentPlan,
     program: &Program,
@@ -658,9 +670,17 @@ pub fn add_join_actions(
         return plan;
     }
     let installed_in = install_bursts(program, &plan);
+    let mut current: Vec<TransformDef> = program.defs.clone();
+    let mut fresh = 0usize;
     let mut paired: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    for draw in draws {
-        let burst_index = 1 + draw.burst % (plan.bursts.len() - 1);
+    let mut rereads: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut drops: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut resolved: Vec<(usize, &JoinActionDraw)> = draws
+        .iter()
+        .map(|draw| (1 + draw.burst % (plan.bursts.len() - 1), draw))
+        .collect();
+    resolved.sort_by_key(|(burst, _)| *burst);
+    for (burst_index, draw) in resolved {
         let eligible: Vec<usize> = (0..program.defs.len())
             .filter(|&def| installed_in[def] < burst_index)
             .collect();
@@ -670,15 +690,19 @@ pub fn add_join_actions(
         let ops = plan.bursts[burst_index].ops().len();
         let at = usize::from(draw.start.min(1000)) * ops / 1000;
         let end = (at + usize::from(draw.span.min(1000)) * ops / 1000).min(ops);
-        let actions = &mut plan.bursts[burst_index].actions;
+        let mut pushed = Vec::new();
         match draw.kind {
             JoinActionKind::RebuildFrom | JoinActionKind::RebuildJoined => {
+                if drops.contains(&burst_index) && eligible.len() < 2 {
+                    continue;
+                }
+                rereads.insert(burst_index);
                 let table = if draw.kind == JoinActionKind::RebuildFrom {
                     FROM_TABLE
                 } else {
                     JOINED_TABLE
                 };
-                actions.push(TimedAction {
+                pushed.push(TimedAction {
                     after: at,
                     action: BurstAction::RequestBackfill {
                         table: table.to_string(),
@@ -690,15 +714,15 @@ pub fn add_join_actions(
                 if !paired.insert((burst_index, def)) {
                     continue;
                 }
-                let target = program.defs[def].target.clone();
-                actions.push(TimedAction {
+                let target = current[def].target.clone();
+                pushed.push(TimedAction {
                     after: at,
                     action: BurstAction::Pause {
                         target: target.clone(),
                         column: None,
                     },
                 });
-                actions.push(TimedAction {
+                pushed.push(TimedAction {
                     after: end,
                     action: BurstAction::Resume {
                         target,
@@ -706,7 +730,66 @@ pub fn add_join_actions(
                     },
                 });
             }
+            JoinActionKind::Redefine => {
+                let def = eligible[draw.target % eligible.len()];
+                // One drop a burst, and none that may leave a re-read
+                // table unread.
+                if drops.contains(&burst_index)
+                    || (rereads.contains(&burst_index) && eligible.len() < 2)
+                    || !paired.insert((burst_index, def))
+                {
+                    continue;
+                }
+                drops.insert(burst_index);
+                let renamed = (draw.target / eligible.len()) % 2 == 1;
+                let mut again = current[def].clone();
+                if renamed {
+                    again.target = format!("{}_r{fresh}", program.defs[def].target);
+                    fresh += 1;
+                }
+                pushed.push(TimedAction {
+                    after: at,
+                    action: BurstAction::Drop {
+                        target: current[def].target.clone(),
+                    },
+                });
+                pushed.push(TimedAction {
+                    after: end,
+                    action: BurstAction::Define {
+                        def: Box::new(again.clone()),
+                        shape: if renamed {
+                            DefineShape::Renamed
+                        } else {
+                            DefineShape::Same
+                        },
+                    },
+                });
+                current[def] = again;
+            }
+            JoinActionKind::SecondDefinition => {
+                let def = eligible[draw.target % eligible.len()];
+                let mut second = current[def].clone();
+                second.target = format!("{}_s{fresh}", program.defs[def].target);
+                fresh += 1;
+                pushed.push(TimedAction {
+                    after: at,
+                    action: BurstAction::Define {
+                        def: Box::new(second.clone()),
+                        shape: DefineShape::Second,
+                    },
+                });
+                if let Some(next) = plan.bursts.get_mut(burst_index + 1) {
+                    let ops = next.ops().len();
+                    next.actions.push(TimedAction {
+                        after: usize::from(draw.span.min(1000)) * ops / 1000,
+                        action: BurstAction::Drop {
+                            target: second.target,
+                        },
+                    });
+                }
+            }
         }
+        plan.bursts[burst_index].actions.extend(pushed);
     }
     for burst in &mut plan.bursts {
         burst.actions.sort_by_key(|action| action.after);
@@ -739,12 +822,21 @@ pub struct BuildCoverage {
     pub rebuilds_over_rows: usize,
     /// `ALTER TRANSFORM`s (each a field build of every row).
     pub alters: usize,
+    /// `DROP TRANSFORM`s (#2183).
+    pub drops: usize,
+    /// Definitions defined again after a drop, or beside a loaded one, and
+    /// of those, ones that fire with rows on both tables (#2183).
+    pub defines: usize,
+    pub defines_over_rows: usize,
 }
 
 impl BuildCoverage {
     /// Builds of every kind that fire over rows from earlier bursts.
     pub fn builds_over_rows(&self) -> usize {
-        self.installs_over_rows + self.resumes_over_rows + self.rebuilds_over_rows
+        self.installs_over_rows
+            + self.resumes_over_rows
+            + self.rebuilds_over_rows
+            + self.defines_over_rows
     }
 
     pub fn add(&mut self, other: &BuildCoverage) {
@@ -758,6 +850,9 @@ impl BuildCoverage {
         self.rebuilds_joined += other.rebuilds_joined;
         self.rebuilds_over_rows += other.rebuilds_over_rows;
         self.alters += other.alters;
+        self.drops += other.drops;
+        self.defines += other.defines;
+        self.defines_over_rows += other.defines_over_rows;
     }
 }
 
@@ -804,6 +899,12 @@ pub fn build_coverage(program: &Program, plan: &ConcurrentPlan) -> BuildCoverage
                     out.rebuilds_over_rows += usize::from(over_rows);
                 }
                 BurstAction::Alter { .. } => out.alters += 1,
+                BurstAction::Drop { .. } => out.drops += 1,
+                BurstAction::Define { .. } => {
+                    out.defines += 1;
+                    out.defines_over_rows += usize::from(over_rows);
+                }
+                BurstAction::EditField { .. } => {}
             }
         }
         for &i in &ops {
@@ -911,17 +1012,44 @@ pub(crate) mod strategy {
     /// rest anywhere in the stream's first 95%, so most build over rows),
     /// up to four pauses and re-reads, and (a quarter of the cases) a settle
     /// over the empty tables before the first op.
+    ///
+    /// Beside them, one or two drops and redefinitions or second
+    /// definitions (#2183), drawn apart so they don't thin the pauses and
+    /// re-reads out.
     fn builds() -> impl Strategy<Value = JoinBuildDraws> {
+        let redefinition = (
+            prop_oneof![
+                Just(JoinActionKind::Redefine),
+                Just(JoinActionKind::SecondDefinition),
+            ],
+            any::<usize>(),
+            any::<usize>(),
+            0u16..=1000,
+            0u16..=1000,
+        )
+            .prop_map(|(kind, burst, target, start, span)| JoinActionDraw {
+                kind,
+                burst,
+                target,
+                start,
+                span,
+            });
         (
             proptest::collection::vec(prop_oneof![1 => Just(0u16), 2 => 1u16..=950], 3),
             proptest::collection::vec(action(), 0..=4),
+            proptest::collection::vec(redefinition, 1..=2),
             prop_oneof![3 => Just(false), 1 => Just(true)],
         )
-            .prop_map(|(installs, actions, settle_after_install)| JoinBuildDraws {
-                installs,
-                actions,
-                settle_after_install,
-            })
+            .prop_map(
+                |(installs, mut actions, redefinitions, settle_after_install)| {
+                    actions.extend(redefinitions);
+                    JoinBuildDraws {
+                        installs,
+                        actions,
+                        settle_after_install,
+                    }
+                },
+            )
     }
 
     /// One op draw. Without `truncating`, a drawn truncate is a delete.

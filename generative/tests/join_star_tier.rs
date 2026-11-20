@@ -80,7 +80,8 @@ fn digests(strategy: &proptest::strategy::BoxedStrategy<JoinCase>) -> Vec<u64> {
 /// digests of their sweep budget's cases (4 seeds × 12), recorded on the
 /// generator before the star tier (#1781), and again when the derived
 /// transactions and statement forms changed how they issue their ops
-/// (#2181). A change that means to change what they draw updates these. The
+/// (#2181) and, for the two-table tier, when it began drawing redefinitions
+/// (#2183). A change that means to change what they draw updates these. The
 /// two-table tier's derived `KEY (...)` arm (#2171) is left out, as the
 /// `WHERE` is: each of its cases is its unkeyed twin, keyed or not.
 #[test]
@@ -110,10 +111,10 @@ fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
     assert_eq!(
         digests(&unkeyed),
         [
-            18_257_465_582_150_657_989,
-            4_855_511_058_258_724_126,
-            13_341_128_696_339_340_254,
-            9_570_587_165_085_931_689
+            11_131_835_481_847_433_720,
+            17_540_472_921_829_412_727,
+            17_416_625_543_817_065_337,
+            17_207_699_182_753_301_206
         ]
     );
     assert_eq!(

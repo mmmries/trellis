@@ -10,11 +10,12 @@ use std::collections::HashSet;
 
 use generative::generate::{
     Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan,
-    cooling_key_case, hot_key_case, mid_burst_case, noise_plan_for, partitioned_hot_key_case,
-    partitioned_program, program_with_client_restart, program_with_mid_stream_def_install,
-    program_with_scale_out, table_streams, trivial_program, trivial_program_with,
+    cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for,
+    partitioned_hot_key_case, partitioned_program, program_with_client_restart,
+    program_with_mid_stream_def_install, program_with_scale_out, table_streams, trivial_program,
+    trivial_program_with,
 };
-use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
+use generative::model::{DbAdminAction, NoiseAction, NoiseEventKind, Op, Program, Table};
 use generative::run::{ConcurrentShape, Coverage};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
@@ -126,7 +127,11 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_column_types(operand, source, out);
         }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+        Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Case { .. } => {
             for child in expr.children() {
                 collect_column_types(child, source, out);
             }
@@ -1159,6 +1164,49 @@ fn checkpoint_plan_for_sometimes_draws_at_least_one_checkpoint() {
     );
 }
 
+/// The coverage floor for the `db_admin` property's aging actions: across
+/// 400 drawn plans, at least 10% hold a `VACUUM FREEZE` and at least 10% a
+/// wrap across the xid epoch boundary, and the wraps' tails draw each band:
+/// crossing at once (0), within the next few ops (1-16), and within the
+/// engine's later drains (17-256).
+#[test]
+fn db_admin_plans_draw_freezes_and_wraps_across_every_tail_band() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|program| db_admin_plan_for(&program));
+    let samples = 400;
+    let (mut freezes, mut wraps) = (0, 0);
+    let mut bands = [false; 3];
+    for _ in 0..samples {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let mut has = (false, false);
+        for event in &plan.events {
+            match event.action {
+                DbAdminAction::VacuumFreeze => has.0 = true,
+                DbAdminAction::WrapXids { tail } => {
+                    has.1 = true;
+                    bands[match tail {
+                        0 => 0,
+                        1..=16 => 1,
+                        _ => 2,
+                    }] = true;
+                }
+                _ => {}
+            }
+        }
+        freezes += usize::from(has.0);
+        wraps += usize::from(has.1);
+    }
+    assert!(
+        freezes * 10 >= samples,
+        "{freezes} of {samples} plans freeze"
+    );
+    assert!(wraps * 10 >= samples, "{wraps} of {samples} plans wrap");
+    assert_eq!(bands, [true; 3], "tail bands drawn: {bands:?}");
+}
+
 /// The coverage floor: `program_with_mid_stream_def_install`
 /// must actually draw a deferred install (a nonzero `def_install_after_op`
 /// entry) across enough samples — sampled the same way as
@@ -1900,6 +1948,288 @@ fn every_transaction_shape_is_drawn_against_every_key_space() {
         }
     }
     assert!(missing.is_empty(), "never drawn: {missing:?}\n{coverage}");
+}
+
+/// #2185 (6a): the held-key tier's isolation family draws every kind of
+/// pair (the `interval` one only where Postgres has infinite intervals),
+/// each sibling shape, writes after the pair in some cases, and a raising
+/// 1-1 field beside it in every one, so the failing alone and failing in
+/// combination draws meet in one program. The pair is always a two-row
+/// `INSERT` with ops of the held-key program around it.
+#[test]
+fn the_isolation_family_draws_every_failure_kind_beside_rows_that_fail_alone() {
+    use generative::generate::exact_sums::interval_infinities;
+    use generative::generate::isolation::{FailKind, SIBLING, TABLE, isolation_program};
+    let cases = sample(isolation_program(), 200);
+    let mut kinds = HashSet::new();
+    let (mut aggregate_sibling, mut copy_sibling, mut after, mut among) = (0, 0, 0, 0);
+    for case in &cases {
+        kinds.insert(format!("{:?}", case.draw.kind));
+        let ops = &case.program.ops;
+        assert!(
+            matches!(&ops[case.draw.pair_op], Op::BulkInsert { table, rows, .. }
+                if table == TABLE && rows.len() == 2),
+            "{:?}",
+            ops[case.draw.pair_op]
+        );
+        let sibling = case
+            .program
+            .defs
+            .iter()
+            .find(|d| d.target == SIBLING)
+            .expect("a sibling");
+        if matches!(sibling.key_space, KeySpace::Aggregate { .. }) {
+            aggregate_sibling += 1;
+        } else {
+            copy_sibling += 1;
+        }
+        let iso_writes = |range: &[Op]| range.iter().filter(|op| op.table() == TABLE).count();
+        after += usize::from(iso_writes(&ops[case.draw.pair_op + 1..]) > 0);
+        among += usize::from(ops.iter().any(|op| op.table() != TABLE));
+        // The held-key program's first definition raises (`/ (c2 - K)`).
+        assert_eq!(case.program.defs[0].key_space, KeySpace::OneToOne);
+    }
+    let mut expected: Vec<FailKind> = vec![
+        FailKind::FloatSum,
+        FailKind::UniqueTarget,
+        FailKind::TriggerTarget,
+    ];
+    if interval_infinities() {
+        expected.push(FailKind::IntervalInfinities);
+    }
+    for kind in expected {
+        assert!(
+            kinds.contains(&format!("{kind:?}")),
+            "{kind:?} never drawn: {kinds:?}"
+        );
+    }
+    let floor = cases.len() / 5;
+    assert!(
+        aggregate_sibling >= floor,
+        "aggregate siblings: {aggregate_sibling}"
+    );
+    assert!(copy_sibling >= floor, "1-1 siblings: {copy_sibling}");
+    assert!(after >= floor, "cases writing iso after the pair: {after}");
+    assert_eq!(
+        among,
+        cases.len(),
+        "every case has the held-key program's own ops"
+    );
+}
+
+// ---------------------------------------------------------------------
+// #2183: definition changes mid-stream under load.
+// ---------------------------------------------------------------------
+
+/// #2183: the mid-burst and steady-load tiers draw every definition change
+/// (a field `ADD`, a widening `ADD`, an `ALTER` and a `DROP`, a drop and
+/// redefine in each of its four shapes, and a second definition with its
+/// drop), over both key spaces they draw: a plain 1-1's field changes, and
+/// a redefinition of a plain 1-1 and of an aggregate. Every definition a
+/// change leaves passes define's checks, so the engine refuses none of them.
+#[test]
+fn the_mid_burst_tiers_draw_every_definition_change() {
+    use generative::generate::steady_load_case;
+    use generative::model::BurstAction;
+    use trellis::dev::defs::validate;
+
+    const SAMPLES: usize = 64;
+    let mut cases = sample(mid_burst_case(), SAMPLES);
+    cases.extend(sample(steady_load_case(), SAMPLES));
+    let mut coverage = Coverage::new();
+    let mut redefined: HashSet<&'static str> = HashSet::new();
+    for case in &cases {
+        coverage.record_concurrent_plan(&case.program, &case.plan);
+        for timed in case.plan.bursts.iter().flat_map(|b| &b.actions) {
+            let def = match &timed.action {
+                BurstAction::EditField { def, .. } | BurstAction::Define { def, .. } => def,
+                _ => continue,
+            };
+            if let BurstAction::Define { .. } = &timed.action {
+                redefined.insert(match def.key_space {
+                    KeySpace::OneToOne => "OneToOne",
+                    KeySpace::Aggregate { .. } => "Aggregate",
+                    _ => "Other",
+                });
+            }
+            let table = case
+                .program
+                .tables
+                .iter()
+                .find(|t| t.name == def.source)
+                .expect("a changed definition reads a program table");
+            let columns = table
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.value_type))
+                .collect();
+            validate(def, &columns).unwrap_or_else(|e| panic!("{def:?}: {e:?}"));
+        }
+    }
+    eprintln!(
+        "actions over {} cases: {:?}",
+        cases.len(),
+        coverage.concurrent_actions
+    );
+    for name in [
+        "add_field",
+        "add_field_widen",
+        "alter_field",
+        "drop_field",
+        "drop",
+        "define_second",
+        "redefine_same",
+        "redefine_changed",
+        "redefine_renamed",
+        "redefine_renamed_changed",
+    ] {
+        let reached = coverage.concurrent_actions.get(name).copied().unwrap_or(0);
+        assert!(
+            reached >= 4,
+            "the mid-burst tiers must draw {name} at least 4 times in {} cases, got \
+             {reached}: {coverage}",
+            cases.len()
+        );
+    }
+    assert_eq!(
+        redefined,
+        HashSet::from(["OneToOne", "Aggregate"]),
+        "a definition of each key space is redefined"
+    );
+}
+
+/// #2183: the `JOIN`, 1-1 `JOIN` and star tiers drop and redefine a
+/// definition, under its name and a new one, and define and drop a second
+/// one beside it.
+#[test]
+fn the_join_tiers_draw_every_redefinition() {
+    use generative::generate::join::join_case_strategy;
+    use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
+
+    const SAMPLES: usize = 96;
+    let plans: Vec<(&str, Program, generative::model::ConcurrentPlan)> =
+        sample(join_case_strategy(), SAMPLES)
+            .into_iter()
+            .map(|c| ("join", c.program, c.plan))
+            .chain(
+                sample(one_to_one_case_strategy(), SAMPLES)
+                    .into_iter()
+                    .map(|c| ("join_one_to_one", c.program, c.plan)),
+            )
+            .chain(
+                sample(star_case_strategy(), SAMPLES)
+                    .into_iter()
+                    .map(|c| ("join_star", c.case.program, c.case.plan)),
+            )
+            .collect();
+    let mut by_tier: std::collections::BTreeMap<&str, Coverage> = Default::default();
+    for (tier, program, plan) in &plans {
+        by_tier
+            .entry(tier)
+            .or_default()
+            .record_concurrent_plan(program, plan);
+    }
+    for (tier, coverage) in &by_tier {
+        eprintln!("{tier}: {:?}", coverage.concurrent_actions);
+        for name in ["drop", "redefine_same", "redefine_renamed", "define_second"] {
+            let reached = coverage.concurrent_actions.get(name).copied().unwrap_or(0);
+            assert!(
+                reached >= 3,
+                "{tier} must draw {name} at least 3 times in {SAMPLES} cases, got {reached}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// #2187: epoch chains.
+// ---------------------------------------------------------------------
+
+/// #2187: the epoch tier draws every step at an epoch's start (a drop, each
+/// definition shape, a restore in a later epoch than its drop, a definition
+/// over a source nothing read since an earlier epoch, a restart, an epoch
+/// that leaves nothing defined), and chains of ten or more epochs. Every
+/// definition a step defines passes define's checks, under a name nothing
+/// defined holds, and both key spaces are defined again.
+#[test]
+fn the_epoch_tier_draws_every_step() {
+    use generative::generate::epoch::{
+        DEFAULT_MAX_EPOCHS, EpochStep, apply_step, chain, chain_shapes, epoch_case_with,
+    };
+    use generative::model::BurstAction;
+    use trellis::dev::defs::validate;
+
+    const SAMPLES: usize = 64;
+    let mut totals: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut long = 0;
+    let mut redefined: HashSet<&'static str> = HashSet::new();
+    // The default length, not `GENERATIVE_MAX_EPOCHS`, so the floors hold
+    // whatever a deep run exports.
+    for case in sample(epoch_case_with(DEFAULT_MAX_EPOCHS), SAMPLES) {
+        let chain = chain(&case);
+        for (name, n) in chain_shapes(&chain) {
+            *totals.entry(name).or_insert(0) += n;
+        }
+        if chain.epochs.len() > 10 {
+            long += 1;
+        }
+        let mut live = chain.program.defs.clone();
+        for step in chain.epochs.iter().flat_map(|e| &e.steps) {
+            if let EpochStep::Act(BurstAction::Define { def, .. }) = step {
+                assert!(
+                    !live.iter().any(|d| d.target == def.target),
+                    "{} is defined twice",
+                    def.target
+                );
+                redefined.insert(match def.key_space {
+                    KeySpace::OneToOne => "OneToOne",
+                    KeySpace::Aggregate { .. } => "Aggregate",
+                    _ => "Other",
+                });
+                let table = chain
+                    .program
+                    .tables
+                    .iter()
+                    .find(|t| t.name == def.source)
+                    .expect("a definition reads a program table");
+                let columns = table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.value_type))
+                    .collect();
+                validate(def, &columns).unwrap_or_else(|e| panic!("{def:?}: {e:?}"));
+            }
+            apply_step(&mut live, step);
+        }
+    }
+    eprintln!("epoch shapes over {SAMPLES} cases: {totals:?}; {long} chains past ten epochs");
+    for name in [
+        "drop",
+        "restart",
+        "define_same",
+        "define_changed",
+        "define_renamed",
+        "define_renamed_changed",
+        "define_second",
+        "restore",
+        "define_unread_table",
+        "none_defined",
+    ] {
+        let reached = totals.get(name).copied().unwrap_or(0);
+        assert!(
+            reached >= 4,
+            "the epoch tier must draw {name} at least 4 times in {SAMPLES} cases, got {reached}"
+        );
+    }
+    assert!(
+        long >= 8,
+        "only {long} of {SAMPLES} chains run past ten epochs"
+    );
+    assert_eq!(
+        redefined,
+        HashSet::from(["OneToOne", "Aggregate"]),
+        "a definition of each key space is defined again"
+    );
 }
 
 /// #2171: the convergence properties' draw reads a source through a

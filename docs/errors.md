@@ -251,6 +251,27 @@ two transforms](transforms.md#counting-distinct-values). Drop `ALL`: it is the
 default. For the others, move the condition or order out of the call. After
 define: [Text](transforms.md#text).
 
+### T0248 SubqueryInList
+
+`IN (SELECT …)`, or another subquery after `IN`. A definition reads only its
+own tables: list the values, or `JOIN` the other table. After define:
+[Text](transforms.md#text).
+
+### T0249 BetweenSymmetric
+
+`BETWEEN SYMMETRIC` or `BETWEEN ASYMMETRIC`. Write the bounds in order,
+`x BETWEEN low AND high`. After define: [Text](transforms.md#text).
+
+### T0250 QuantifiedComparison
+
+A comparison with `ANY (…)`, `SOME (…)` or `ALL (…)`. List the values with
+`IN` or `NOT IN`. After define: [Text](transforms.md#text).
+
+### T0251 RowConstructor
+
+A row constructor, `(a, b)`, as in `(a, b) IN ((1, 2))`. Compare each column on
+its own: `a = 1 AND b = 2`. After define: [Text](transforms.md#text).
+
 ## Definition checks
 
 The text parses, but what it computes isn't one Trellis maintains exactly
@@ -775,6 +796,16 @@ without its trailing blanks
 ([the key's type](type-support.md#the-types-of-the-columns-trellis-creates)),
 so the length would differ from Postgres's. Group by a `text` column.
 After define: [Retype](transforms.md#retype).
+
+### T0252 InListCommonType
+
+An `IN` list Postgres reads at one common type that differs from comparing the
+value with each element on its own
+([`IN` lists](type-support.md#in-lists)): a `real` beside an exact number, a
+`NULL` before a string and an element of another type, or a `char(n)` or
+`name` value beside an element of another string type. Write the comparisons out
+(`x = a OR x = b`), or make the elements one type. After define:
+[Retype](transforms.md#retype).
 
 ## Tables and keys
 

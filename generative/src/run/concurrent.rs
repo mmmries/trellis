@@ -249,6 +249,10 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                 if timed.action.starts_build() {
                     building.store(true, Ordering::Relaxed);
                 }
+                // The sampler stops reading a target before it is dropped.
+                if let BurstAction::Drop { target } = &timed.action {
+                    sampled.borrow_mut().retain(|t| t != target);
+                }
                 if let Err(e) = backend.act(program, &timed.action).await {
                     action_error = Some(RunError::BurstAction {
                         burst: index,
@@ -263,12 +267,20 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                         *sampled.borrow_mut() = join1_targets(&installed);
                     }
                     // The oracle checks the definition as the statement left it.
-                    BurstAction::Alter { def, .. } => {
+                    BurstAction::Alter { def, .. } | BurstAction::EditField { def, .. } => {
                         let at = installed
                             .iter()
                             .position(|d| d.target == def.target)
                             .expect("an ALTER names an installed definition — a generator bug");
                         installed[at] = (**def).clone();
+                    }
+                    BurstAction::Drop { target } => {
+                        installed.retain(|d| &d.target != target);
+                        *sampled.borrow_mut() = join1_targets(&installed);
+                    }
+                    BurstAction::Define { def, .. } => {
+                        installed.push((**def).clone());
+                        *sampled.borrow_mut() = join1_targets(&installed);
                     }
                     _ => {}
                 }
@@ -308,6 +320,8 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                     match invariant::sample(pool, target, &mut stats).await {
                         Ok(None) => {}
                         Ok(Some(failure)) => return (stats, Some(Ok(failure))),
+                        // A target dropped while its sample ran.
+                        Err(_) if !sampled.borrow().contains(target) => {}
                         Err(e) => return (stats, Some(Err(e))),
                     }
                 }

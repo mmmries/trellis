@@ -114,7 +114,25 @@ pub enum PlantPath {
     /// apply path: a target of any key space can go wrong. Only a drawn
     /// transaction (#2181) holds the snapshot it needs.
     Capture,
+    /// The drain's isolation of a failing page (`staging::quarantine`): a
+    /// page that no key fails alone, but one definition's share of it does.
+    /// Only the held-key tier's isolation draw makes such a page. A plant
+    /// here can stop any reader of the page, whatever its key space.
+    Isolation,
+    /// The drain's transaction-id comparisons past the first 32-bit epoch.
+    /// Only the `db_admin` property's xid-aging action
+    /// (`crate::model::DbAdminAction::WrapXids`) crosses the boundary, and
+    /// it is no planted-bug sweep tier, so no tier gates these: every
+    /// tier lists them in its `not_gated` with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
+    /// and `db_admin.rs`'s wrap pin gate them.
+    XidEpoch,
 }
+
+/// Why no sweep tier gates a [`PlantPath::XidEpoch`] plant.
+pub const NO_XID_EPOCH: &str = "no sweep tier crosses the 32-bit xid epoch; the db_admin \
+     property's wrap action does, and staging's \
+     sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows and db_admin.rs's \
+     a_wrap_across_the_epoch_boundary_with_work_in_flight_converges pin it";
 
 /// The path `plant` breaks.
 pub fn plant_path(plant: Plant) -> PlantPath {
@@ -130,7 +148,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::O2oWhereNullAsTrue
         | Plant::O2oWhereBuildUnfiltered
         | Plant::O2oWhereNoTombstone
-        | Plant::O2oWhereColumnNotImaged => PlantPath::OneToOne,
+        | Plant::O2oWhereColumnNotImaged
+        | Plant::FieldReleaseBeforeWiden => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild
@@ -213,6 +232,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
         Plant::CaptureSlotFromSnapshot => PlantPath::Capture,
+        Plant::IsolationPausesEveryReader => PlantPath::Isolation,
+        Plant::FenceXid32 => PlantPath::XidEpoch,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
     }
 }
@@ -232,8 +253,11 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
-        // A reader of a target, a capture's, or a keyed source can be of any kind.
-        PlantPath::Chain | PlantPath::Capture | PlantPath::SourceKey => true,
+        // A reader of a target, a capture's, a failing page's or a keyed source can be
+        // of any kind.
+        PlantPath::Chain | PlantPath::Capture | PlantPath::Isolation | PlantPath::SourceKey => true,
+        // Every target drains through the fenced read.
+        PlantPath::XidEpoch => true,
     }
 }
 
@@ -835,6 +859,12 @@ pub fn reach_report(tier: &SweepTier, results: &[SweepCase]) -> String {
     out
 }
 
+/// Why a tier other than the held-key tier leaves out a
+/// [`PlantPath::Isolation`] plant.
+pub const NO_ISOLATION: &str = "it breaks the drain's isolation of a page that fails only \
+     in combination, which only the held-key tier's isolation draw makes (held_keys.rs, \
+     held_key_planted_bugs_are_caught)";
+
 /// Why a tier whose programs define no `MIN`/`MAX` doesn't run the
 /// extremes' plants ([`PlantPath::Extremes`], [`PlantPath::SelfCheckExtremes`]).
 pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggregate, which \
@@ -1003,7 +1033,11 @@ mod tests {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Chain | PlantPath::Capture | PlantPath::SourceKey => {
+                PlantPath::Chain
+                | PlantPath::Capture
+                | PlantPath::Isolation
+                | PlantPath::XidEpoch
+                | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");
                 }

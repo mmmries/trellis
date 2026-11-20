@@ -714,7 +714,11 @@ impl Fixture {
                     stack.push(rhs);
                 }
                 Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
-                Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                Expr::Not(_)
+                | Expr::IsNull { .. }
+                | Expr::InList { .. }
+                | Expr::Between { .. }
+                | Expr::Case { .. } => {
                     stack.extend(e.children());
                 }
                 Expr::FunctionCall { name, args } => {
@@ -799,9 +803,11 @@ pub fn has_literal_zero_divisor(expr: &Expr) -> bool {
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             has_literal_zero_divisor(operand)
         }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            expr.children().into_iter().any(has_literal_zero_divisor)
-        }
+        Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Case { .. } => expr.children().into_iter().any(has_literal_zero_divisor),
         Expr::FunctionCall { args, .. } => args.iter().any(has_literal_zero_divisor),
         _ => false,
     }

@@ -59,7 +59,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ManualBackend};
 use generative::baseline_quarantine;
 use generative::generate::min_max::{
     Arg, Grouping, MinMaxDefDraw, MinMaxDraws, PK, build_min_max_program, min_max_def,
@@ -561,8 +561,8 @@ fn run_swept_tampering_case(
 ) -> Result<(), TestCaseError> {
     TAMPERING_HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
@@ -996,8 +996,8 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
     let program = case.program();
     TAMPERING_HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             // No housekeeping pass runs while the program settles: it collects
@@ -1379,10 +1379,15 @@ fn extremes_tamper_sweep_tier() -> SweepTier {
             PlantPath::Chain,
             PlantPath::Extremes,
             PlantPath::Capture,
+            PlantPath::Isolation,
             PlantPath::SourceKey,
         ],
         "the tampering tier runs a settled program and gates only self_check's comparison of \
          the extremes; the plant's own path is gated by the tier its comment names",
+    ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
     ));
     SweepTier {
         name: baseline_quarantine::EXTREMES_TAMPER_TIER,

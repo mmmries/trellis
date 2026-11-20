@@ -725,7 +725,7 @@ impl TestCluster {
     /// Stops the server in `mode`, runs `while_down` with it stopped, then
     /// starts it again on the same data directory, socket and port and
     /// waits until it accepts connections.
-    fn while_stopped(&self, mode: StopMode, while_down: impl FnOnce()) {
+    pub(crate) fn while_stopped(&self, mode: StopMode, while_down: impl FnOnce()) {
         let mut server = self.server.lock().expect("server lock");
         run_to_completion(
             Command::new("pg_ctl")

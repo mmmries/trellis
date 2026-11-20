@@ -42,7 +42,10 @@ crate's own self dev-dependency, so none can reach a production
 - **A disposable cluster** — `TestCluster` runs its own `postgres` on a private
   socket, started from a copy of a migrated template data directory and torn
   down on `Drop`. Unlocks the whole
-  database-administration action space (restart, checkpoint).
+  database-administration action space (restart, checkpoint, freeze, xid
+  aging). `TestCluster::age_xids_to_epoch_edge` ages its transaction ids in
+  about a second: it freezes every database and moves the next id with
+  `pg_resetwal -x`, in as many jumps as wraparound protection allows.
 - **Process lifecycle** — `crash::CrashGuard` supervises a child it can `SIGKILL`,
   so "kill a worker mid-drain" is a real code path.
 - **A straddler primitive** — `crash::OpenTransaction` holds a transaction open
@@ -110,6 +113,31 @@ One module drives the engine, and its job is narrow:
   first.
 - `snapshot()` — read back merged source+derived state as a deterministic,
   **ordered** map (table → pk → column), so diffs and equality are stable.
+
+### Roles
+
+A case runs as a deployment does
+([recommendations — Roles and permissions](recommendations.md#roles-and-permissions)),
+so an assumption only a superuser satisfies fails the run.
+`backend::CaseDatabase` provisions the database and the backends'
+`connect_as` takes its `backend::Roles`:
+
+- `trellis_runner`, not superuser, no `BYPASSRLS`, holding `CREATE` on the
+  database and membership in `app_owner`, runs the migrations and every
+  Trellis connection, the oracle's pool and the harness's catalog reads
+  included;
+- `app_owner` creates the sources in `public`, so it owns them, and makes
+  every write;
+- the bootstrap superuser runs only `CHECKPOINT` and `VACUUM FREEZE`
+  (`execute_admin`), and the cluster-wide xid aging.
+
+Every convergence property runs this way, the self-check tampering
+properties (their tampering writes as the Trellis role, which owns the
+targets) and the subprocess crash pins too; `tests/backend_seam.rs` pins the
+owners and each session's role. `connect` runs everything as the superuser.
+Hand-built pins outside a property's runner still use it, and so does
+`two_instance_noise.rs`, whose instances keep same-named sources in their own
+catalog schemas.
 
 ## 2. The oracle is Postgres itself
 
@@ -411,6 +439,19 @@ beside them run on every `cargo test`.
 - **Held keys** (`tests/held_keys.rs`). Programs whose rows make a plain 1-1
   field raise, and the fuse that quarantines a definition (§10, "The oracle
   and erroring rows").
+- **Isolation** (`tests/held_keys.rs`,
+  `property_a_definition_failing_in_combination_stalls_no_other`). A
+  held-key program plus a table `iso` read by `iso_d` and a sibling `iso_s`
+  (`generate::isolation`). One two-row `INSERT` fails `iso_d`'s apply only
+  in combination: two `1e308` rows in one group of a `float8` `SUM`, the
+  `interval` infinities on Postgres 17+, or a unique index or trigger on its
+  target that refuses the second row. `iso_d` must pause with
+  [T0247](errors.md#t0247-definitionfailsalone), naming the SQLSTATE and
+  both keys, its target frozen at its value before the pair. Every other
+  definition, `iso_s` over the same rows included, keeps converging and
+  none pauses. Once the run settles no holdup or undrained segment is left,
+  so the ring retires. The held-key sweep gates
+  `isolation_pauses_every_reader` on these cases.
 - **Out-of-band tampering** (`tests/self_check_cross_check.rs`). Direct writes to
   derived tables are found by `self_check`, whose SQL renderer is independently
   authored from the oracle's; the suite asserts the two agree on every generated
@@ -421,14 +462,25 @@ beside them run on every `cargo test`.
   and `self_check` must report exactly that, each extreme's recompute equal by
   value to the oracle's. Its sweep, `extremes_tamper_planted_bugs_are_caught`,
   gates `sc_extremes_uncompared`.
+- **Epoch chains** (`tests/epoch_chain.rs`, `generate::epoch`). Every other
+  property starts each case from a fresh database. This one runs many programs
+  back to back on one instance and one database: each epoch starts at a quiet
+  point with drops, redefinitions, definitions dropped in an earlier epoch
+  brought back, second definitions and restarts, then writes rows carrying on
+  from what the earlier epochs left. Every epoch ends with a quiesce, the
+  oracle and a `Strict` `self_check`, so a failure names its epoch. A failing
+  chain shrinks whole epochs first, then within the epochs left.
+  `GENERATIVE_MAX_EPOCHS` (default 12) sets the longest chain; a deep run sets
+  50 or more.
 - **Two instances** (`tests/two_instance_noise.rs`). Two Trellis instances in one
   database (or in two), each converging against its own oracle, including one
   instance reading the other's target.
 - **Concurrent convergence** (`tests/concurrent_convergence.rs`). The same
   programs and oracle against the real worker pool and multi-worker claiming, in
   tiers: small programs; hot keys and groups taking bursts from several
-  connections, also over a partitioned source; mid-burst re-reads, pauses, resumes and installs while change
-  capture for the same keys is in flight; cooling keys whose last write lands
+  connections, also over a partitioned source; mid-burst re-reads, pauses, resumes, installs and
+  definition changes while change capture for the same keys is in flight;
+  cooling keys whose last write lands
   mid-burst; and sweep-only steady-load and cooling-backfill tiers that stall
   pages and build chunks at their entry-lock step, and a fresh build inside its
   first statement so pages make stragglers (the stall is process-wide, so
@@ -876,6 +928,16 @@ with its reason.
 Every divergence report, in every backend, prints each definition's status and
 pause reason under `definitions:` beside the cell diffs.
 
+**Status tells the truth.** Every settled check reads each definition's status
+as `Trellis::definitions` reports it (`catching_up` included) beside the stored
+one. A definition reporting `live` with nothing held and no failure recorded
+claims an exact target, so one that diverges is marked `status lies` in the
+report (`run::status_lies`). Most tiers hold every target to the oracle anyway.
+The check bites where a run excuses a target, as the isolation draw does for
+its failing definition (`RunError::StatusLies`). It runs after a quiesce, so a
+window in which the harness itself took Postgres or the engine away is over by
+then. No other window is exempt.
+
 **Findings terminate as deterministic pins; generative runs are lead generation.**
 A seed reproduces the *program*, not reliably a *race*, and does not survive
 generator refactors. Three artifact kinds:
@@ -1007,19 +1069,43 @@ The actions, cheapest-first (every one below is built):
 1. **Untracked-object noise** (bucket 1) — nearly free; converged state must be
    unchanged by DML/DDL on tables Trellis doesn't track.
 2. **Definition lifecycle** (bucket 2) — unlocks define-then-load ≡ load-then-define.
-   The chained-reader tier also redefines a field mid-burst (`ALTER
-   TRANSFORM`, `model::BurstAction::Alter`), after which the oracle checks the
-   definition as the statement left it.
+   The mid-burst and steady-load tiers change definitions while the lanes
+   write (`generate::add_burst_actions`): a 1-1 field `ADD`, `ALTER` and
+   `DROP` (an `ADD` of a column no definition reads widens the source's
+   capture), a `DROP TRANSFORM` defined again under the same or a new name,
+   unchanged or with a field changed, and a second definition over a loaded
+   one's source, dropped a burst later. The `JOIN`, 1-1 `JOIN` and star
+   tiers drop and redefine a definition, unchanged, and add and drop a
+   second one (`generate::join::add_join_actions`). The chained-reader tier
+   redefines a field too (`model::BurstAction::Alter`). The epoch tier drops
+   and defines definitions between epochs, including ones dropped many epochs
+   before (§4). Draws resolve in
+   burst order, so a later burst acts on the definitions as the earlier
+   changes left them, and the oracle checks each definition as the last
+   statement left it; the backend checks that a drop took its target.
+   `tests/coverage.rs` floors each change; the sweeps of both tiers gate
+   `field_release_before_widen`, a field released before its capture widen
+   lands.
 3. **Engine lifecycle** (bucket 1) — kill/restart/scale workers; where resume and
    idempotent re-application get tested.
 4. **Transaction shapes** (bucket 1) — multi-statement transactions at each
    isolation level, savepoints, rollbacks and serialization retries, and
    `ON CONFLICT`, `MERGE` and writable-CTE writes (§3, "Generated transactions
-   and statement forms").
-5. **Database administration** (bucket 1) — restart PG, checkpoint:
-   `model::DbAdminAction`, driven by `run::run_convergence_with_db_admin`,
-   swept by `tests/db_admin.rs`. A restart or checkpoint fires with the anchor
-   op's change still in flight and the engine must reconnect by itself.
+   and statement forms"); (bucket 3) a transaction held open across a batch
+   boundary (via `OpenTransaction`).
+5. **Database administration** (bucket 1) — restart PG, checkpoint, freeze,
+   xid aging: `model::DbAdminAction`, driven by
+   `run::run_convergence_with_db_admin`, swept by `tests/db_admin.rs`. Each
+   fires with the anchor op's change still in flight, and the engine must
+   reconnect by itself after a restart. `VacuumFreeze` freezes the case
+   database; a freeze keeps each row's raw `xmin`, so capture's drift checks
+   must read no change. `WrapXids` ages the cluster to one commit-log page
+   short of the next 32-bit epoch boundary and burns all but a drawn tail of
+   the ids left, so the drains and the next ops cross the boundary with ring
+   rows, fences and bases from the old epoch live, and the program's earlier
+   rows have an `age(xmin)` wrapped negative. The `fence_xid32` plant (fences
+   compared as 32-bit ids) needs that crossing, so no planted-bug sweep tier
+   runs it; `db_admin.rs`'s wrap pin and `staging`'s sealing pin catch it.
    Backup/restore is a cold file-level copy (`model::RestorePlan`, driven by
    `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
    back up right after op *k* with its change in flight, run to the end,
@@ -1147,5 +1233,7 @@ judges a run:
   fast with a held key as without, and shrinking pays no timeout per step.
   Its fuse family gives one definition two raising fields, four rows at most
   each, so the whole-transform fuse trips before either column fuse. Only
-  the plain 1-1 key space is modelled; every other tier keeps its draws
-  raise-free.
+  the plain 1-1 key space is modelled for a row that fails alone; every
+  other tier keeps its draws raise-free. Rows that fail only in combination
+  are the isolation family's, which needs no model of them: the definition
+  pauses (T0247) and its target holds still.

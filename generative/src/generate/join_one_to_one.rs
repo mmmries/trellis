@@ -1549,6 +1549,35 @@ pub(crate) mod strategy {
             })
     }
 
+    /// [`builds`], and one or two drops and redefinitions or second
+    /// definitions beside its actions (#2183). The chained-reader tier draws
+    /// [`builds`] alone: its upstream has readers, so it can't be dropped.
+    fn builds_and_redefinitions() -> impl Strategy<Value = JoinBuildDraws> {
+        let redefinition = (
+            prop_oneof![
+                Just(JoinActionKind::Redefine),
+                Just(JoinActionKind::SecondDefinition),
+            ],
+            any::<usize>(),
+            any::<usize>(),
+            0u16..=1000,
+            0u16..=1000,
+        )
+            .prop_map(|(kind, burst, target, start, span)| JoinActionDraw {
+                kind,
+                burst,
+                target,
+                start,
+                span,
+            });
+        (builds(), proptest::collection::vec(redefinition, 1..=2)).prop_map(
+            |(mut builds, redefinitions)| {
+                builds.actions.extend(redefinitions);
+                builds
+            },
+        )
+    }
+
     /// One op draw. Without `truncating`, a drawn truncate is a delete.
     pub(crate) fn draw(
         joined_weight: u32,
@@ -1698,7 +1727,7 @@ pub(crate) mod strategy {
                 2usize..=4,
                 2usize..=6,
                 20u64..=200,
-                builds(),
+                builds_and_redefinitions(),
                 proptest::option::of(COMMIT_STALL_MS),
                 RACING_COMMIT_STALL_MS,
                 5_000u64..=10_000,
@@ -1890,7 +1919,7 @@ pub(crate) mod strategy {
                 30usize..=150,
                 2usize..=4,
                 20u64..=200,
-                builds(),
+                builds_and_redefinitions(),
                 0u64..=STAR_COMMIT_STALL_MS,
                 (
                     prop_oneof![3 => Just(false), 1 => Just(true)],

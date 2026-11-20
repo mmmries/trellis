@@ -597,6 +597,11 @@ pub enum ValidationError {
         function: String,
         column: String,
     },
+    /// An `IN` list Postgres reads at one common type that differs from
+    /// comparing its operand with each element on its own, so the two
+    /// readings Postgres chooses between can disagree (#2172). `reason`
+    /// names the mix.
+    InListCommonType { field: String, reason: &'static str },
 }
 
 /// Payload of [`ValidationError::NondeterministicKeyCollation`], boxed out of
@@ -742,6 +747,15 @@ fn collect_refusing_calls(
                 fields_by_name,
                 out,
             );
+        }
+        Expr::InList {
+            expr: operand,
+            list,
+            negated,
+        } => {
+            let operands: Vec<&Expr> = std::iter::once(&**operand).chain(list).collect();
+            let construct = if *negated { "NOT IN" } else { "IN" };
+            collect_text_comparison(construct, &operands, field, fields_by_name, out);
         }
         _ => {}
     }
@@ -919,6 +933,7 @@ const DEFAULT_COLLATION_OID: u32 = 100;
 /// (`assign_collations`): a column's own, the database default for a
 /// constant or a computed value, and a conflict where two different
 /// collations meet. The database default yields to any other collation.
+#[derive(Clone)]
 enum Derived {
     Collation {
         oid: u32,
@@ -988,6 +1003,33 @@ fn check_collation_conflicts<'a>(
             &mut HashSet::new(),
             resolve,
         )?;
+    }
+    Ok(())
+}
+
+/// [`derive_collation`]'s `check` of each comparison an [`Expr::InList`] or
+/// [`Expr::Between`] stands for: its operand beside one element or bound
+/// (`children` is the operand first). Kept out of [`derive_collation`] so its
+/// frame, which every level of an expression stacks, stays small.
+#[inline(never)]
+fn check_each_comparison<F>(
+    expr: &Expr,
+    children: Vec<Derived>,
+    check: &F,
+) -> Result<(), ValidationError>
+where
+    F: Fn(&str, Vec<Derived>) -> Result<Derived, ValidationError>,
+{
+    let construct = match expr {
+        Expr::InList { negated: false, .. } => "IN",
+        Expr::InList { negated: true, .. } => "NOT IN",
+        Expr::Between { negated: false, .. } => "BETWEEN",
+        _ => "NOT BETWEEN",
+    };
+    let mut children = children.into_iter();
+    let operand = children.next().unwrap_or(Derived::Default);
+    for other in children {
+        check(construct, vec![operand.clone(), other])?;
     }
     Ok(())
 }
@@ -1085,6 +1127,10 @@ fn derive_collation<'a, 'f>(
         ),
         Expr::BinaryOp { op, .. } if op.is_comparison() => {
             check(super::registry::operator_spec(*op).symbol, children)?;
+            Derived::Default
+        }
+        Expr::InList { .. } | Expr::Between { .. } => {
+            check_each_comparison(expr, children, &check)?;
             Derived::Default
         }
         Expr::FunctionCall { name, .. } => match name.as_str() {
@@ -1247,6 +1293,7 @@ impl ValidationError {
             ValidationError::JoinPredicateJoinedSideUnderLeft { .. } => ErrorId(244),
             ValidationError::JoinPredicateReadsNoColumn { .. } => ErrorId(245),
             ValidationError::CharKeyPaddingFunction { .. } => ErrorId(246),
+            ValidationError::InListCommonType { .. } => ErrorId(252),
         }
     }
 
@@ -1668,6 +1715,13 @@ impl std::fmt::Display for FieldMessage<'_> {
                  depends on the column's collation, which Trellis does not evaluate. Only \
                  =, <>, != and IS [NOT] DISTINCT FROM compare text; order by a non-text value, \
                  or compare length(s) with CHAR_LENGTH"
+            ),
+            ValidationError::InListCommonType { field, reason } => write!(
+                f,
+                "calculated field '{field}': an IN list with {reason} is not supported: \
+                 Postgres compares such a list's elements at one common type, which reads \
+                 differently from comparing each element on its own. Write the comparisons \
+                 out, as in x = a OR x = b"
             ),
             ValidationError::ComparisonTypeMismatch {
                 field,
@@ -2446,8 +2500,10 @@ impl StringType {
 /// Resolves the types of a field's expressions for
 /// [`padding_function_key_reads`].
 struct StringTypes<'d, 'c> {
-    fields_by_name: HashMap<&'d str, &'d FieldDef>,
-    column: &'d dyn Fn(&str) -> Option<&'c JoinColumnInfo>,
+    fields_by_name: &'d HashMap<&'d str, &'d FieldDef>,
+    /// A column's live type, read through the table named (`None` for a
+    /// bare read).
+    column: &'d dyn Fn(Option<&str>, &str) -> Option<&'c JoinColumnInfo>,
 }
 
 impl<'d> StringTypes<'d, '_> {
@@ -2459,8 +2515,9 @@ impl<'d> StringTypes<'d, '_> {
             .filter(|_| name != field)
     }
 
-    fn column_type(&self, name: &str) -> StringType {
-        (self.column)(name).map_or(StringType::Other, |info| StringType::of_oid(info.type_oid))
+    fn column_type(&self, table: Option<&str>, name: &str) -> StringType {
+        (self.column)(table, name)
+            .map_or(StringType::Other, |info| StringType::of_oid(info.type_oid))
     }
 
     /// `expr`'s type inside `field`; `depth` bounds a field cycle, which
@@ -2473,9 +2530,9 @@ impl<'d> StringTypes<'d, '_> {
         match expr {
             Expr::Column(name) => match self.field_read(name, field) {
                 Some(other) => self.of(&other.expr, &other.name, depth + 1),
-                None => self.column_type(name),
+                None => self.column_type(None, name),
             },
-            Expr::SourceColumn { column, .. } => self.column_type(column),
+            Expr::SourceColumn { table, column, .. } => self.column_type(Some(table), column),
             Expr::StringLiteral(_) | Expr::Null => StringType::Unknown,
             Expr::Cast { target, .. } if *target == ValueType::Text => StringType::Text,
             Expr::FunctionCall { name, args } => match name.as_str() {
@@ -2564,9 +2621,11 @@ pub(crate) fn padding_function_key_reads<'c>(
             walk(child, field, types, out);
         }
     }
+    let fields_by_name = def.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    let column = |_: Option<&str>, name: &str| column(name);
     let types = StringTypes {
-        fields_by_name: def.fields.iter().map(|f| (f.name.as_str(), f)).collect(),
-        column,
+        fields_by_name: &fields_by_name,
+        column: &column,
     };
     let mut reads = Vec::new();
     for field in &def.fields {
@@ -3543,6 +3602,8 @@ fn check_join_field_expr<'a>(
         | Expr::Cast { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
         | Expr::Case { .. } => {
             for child in expr.children() {
                 check_join_field_expr(
@@ -3641,6 +3702,8 @@ pub(crate) fn validate_qualified_columns(
             | Expr::Cast { .. }
             | Expr::Not(_)
             | Expr::IsNull { .. }
+            | Expr::InList { .. }
+            | Expr::Between { .. }
             | Expr::Case { .. } => expr
                 .children()
                 .into_iter()
@@ -3840,6 +3903,8 @@ fn validate_aggregate_field_expr(
         | Expr::Cast { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
         | Expr::Case { .. } => {
             let in_aggregate_call = in_aggregate_call
                 || matches!(expr, Expr::FunctionCall { name, .. }
@@ -4320,6 +4385,21 @@ impl<'a> ColumnTypes<'a> {
             ColumnTypes::Live(columns) => find(columns),
             ColumnTypes::Join { root, joined, .. } => {
                 find(root).or_else(|| joined.iter().find_map(|columns| find(columns)))
+            }
+        }
+    }
+
+    /// The live column `column`, read through `table` (`None` for a bare
+    /// read). `None` for a `Source` read, which has only types.
+    fn info(&self, table: Option<&str>, column: &str) -> Option<&'a JoinColumnInfo> {
+        match (self, table) {
+            (ColumnTypes::Source(_), _) | (ColumnTypes::Join { .. }, None) => None,
+            (ColumnTypes::Live(columns), _) => columns.get(column),
+            (ColumnTypes::Join { def, root, joined }, Some(table)) => {
+                let side = super::join::spec(def)
+                    .and_then(|join| super::join::side_of_written(def, join, table))
+                    .unwrap_or(super::join::JOINED);
+                side_columns(side, root, joined).get(column)
             }
         }
     }
@@ -4928,6 +5008,14 @@ fn infer_expr(
             }
             Ok(ValueType::Boolean)
         }
+        Expr::InList { .. } | Expr::Between { .. } => infer_in_or_between(
+            expr,
+            field_name,
+            columns,
+            fields_by_name,
+            types,
+            in_progress,
+        ),
         // `NULL IS NULL` needs no type.
         Expr::IsNull { expr: operand, .. } => {
             infer_operand(
@@ -5266,6 +5354,200 @@ fn infer_expr(
             Ok(spec.return_type)
         }
     }
+}
+
+/// The type of an [`Expr::InList`] or [`Expr::Between`]: `boolean`, once
+/// each comparison it stands for ([`Expr::comparisons`]) types as written
+/// on its own, and an `IN` list's elements agree on one common type
+/// ([`check_in_list_common_type`]). A refusal of one of the comparisons
+/// names the construct (`IN`, `NOT BETWEEN`), not its `=` or `>=`. Kept out
+/// of [`infer_expr`] so its frame stays small.
+#[inline(never)]
+fn infer_in_or_between(
+    expr: &Expr,
+    field_name: &str,
+    columns: &ColumnTypes<'_>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    types: &mut HashMap<String, ValueType>,
+    in_progress: &mut HashSet<String>,
+) -> Result<ValueType, ValidationError> {
+    let (operand, construct) = match expr {
+        Expr::InList {
+            expr: operand,
+            negated,
+            ..
+        } => (operand, if *negated { "NOT IN" } else { "IN" }),
+        Expr::Between {
+            expr: operand,
+            negated,
+            ..
+        } => (operand, if *negated { "NOT BETWEEN" } else { "BETWEEN" }),
+        _ => unreachable!("an IN list or a BETWEEN"),
+    };
+    let operand_t = infer_operand(
+        operand,
+        field_name,
+        columns,
+        fields_by_name,
+        types,
+        in_progress,
+    )?;
+    let mut other_ts = Vec::new();
+    for compared in expr.comparisons() {
+        let Expr::BinaryOp { op, lhs, rhs } = &compared else {
+            unreachable!("a comparison");
+        };
+        let other_t = infer_operand(rhs, field_name, columns, fields_by_name, types, in_progress)?;
+        infer_binary_op(&compared, *op, lhs, rhs, operand_t, other_t, field_name)
+            .map_err(|err| name_construct(err, construct))?;
+        check_enum_literal(*op, lhs, rhs, operand_t, other_t, columns, field_name)?;
+        other_ts.push(other_t);
+    }
+    if let Expr::InList { list, .. } = expr {
+        check_in_list_common_type(
+            operand,
+            list,
+            operand_t,
+            &other_ts,
+            columns,
+            fields_by_name,
+            field_name,
+        )?;
+    }
+    Ok(ValueType::Boolean)
+}
+
+/// `err`, a refusal of one comparison an `IN` or `BETWEEN` stands for,
+/// naming `construct` as the operator.
+fn name_construct(err: ValidationError, construct: &'static str) -> ValidationError {
+    match err {
+        ValidationError::TypeMismatch {
+            field,
+            expected,
+            found,
+            ..
+        } => ValidationError::TypeMismatch {
+            field,
+            operator: construct,
+            expected,
+            found,
+        },
+        ValidationError::MixedFloatExactComparison {
+            field, lhs, rhs, ..
+        } => ValidationError::MixedFloatExactComparison {
+            field,
+            operator: construct,
+            lhs,
+            rhs,
+        },
+        ValidationError::MixedTemporalComparison {
+            field, lhs, rhs, ..
+        } => ValidationError::MixedTemporalComparison {
+            field,
+            operator: construct,
+            lhs,
+            rhs,
+        },
+        ValidationError::TextOrderingComparison { field, .. } => {
+            ValidationError::TextOrderingComparison {
+                field,
+                operator: construct,
+            }
+        }
+        ValidationError::ComparisonTypeMismatch {
+            field, lhs, rhs, ..
+        } => ValidationError::ComparisonTypeMismatch {
+            field,
+            operator: construct,
+            lhs,
+            rhs,
+        },
+        other => other,
+    }
+}
+
+/// Refuses an `IN` list whose reading depends on which of its elements
+/// read a column. Postgres (`transformAExprIn`) compares the operand with
+/// each element that reads one on its own, as `=` does, but with two or
+/// more that read none at one common type of the operand and those
+/// elements (`select_common_type`), converting each to it. Which elements
+/// read a column depends on how a definition's fields are inlined, so the
+/// list is admitted only where both readings agree whatever the split
+/// (`operand_t` and `element_ts` are the types each comparison was
+/// admitted at, `None` for a `NULL`). A list of one element has no common
+/// type to pick. They disagree where:
+///
+/// * a `real` meets an exact number beside an operand that is not `double
+///   precision` (which the common type always is when the operand is): the
+///   common type can be `real`, so a number rounds to `real`, where `=`
+///   compares the two as `double precision`;
+/// * the operand is a `NULL` and a string meets an element of another type:
+///   a string literal is converted to the elements' common type, which
+///   `NULL = 'a'` never does (Postgres fails the statement for `'a'` beside
+///   an integer). Any other mix compares `NULL` and is `NULL` either way;
+/// * the operand is `char(n)` or `name` and an element is another string
+///   type: the element converts to the operand's type (padding ignored,
+///   `name` truncated to 63 bytes), where `=` compares the two as `text`.
+///   Read over the live columns only: a `Source` read has no declared types,
+///   and define and every `RESUME` also type the definition live.
+fn check_in_list_common_type(
+    operand: &Expr,
+    list: &[Expr],
+    operand_t: Option<ValueType>,
+    element_ts: &[Option<ValueType>],
+    columns: &ColumnTypes<'_>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    field_name: &str,
+) -> Result<(), ValidationError> {
+    let refuse = |reason| {
+        Err(ValidationError::InListCommonType {
+            field: field_name.to_string(),
+            reason,
+        })
+    };
+    if list.len() < 2 {
+        return Ok(());
+    }
+    let all = || {
+        std::iter::once(operand_t)
+            .chain(element_ts.iter().copied())
+            .flatten()
+    };
+    if operand_t != Some(ValueType::Float(crate::float::FloatWidth::Float8))
+        && all().any(|t| t == ValueType::Float(crate::float::FloatWidth::Float4))
+        && all().any(ValueType::is_exact_numeric_family)
+    {
+        return refuse("a real value beside an exact number");
+    }
+    if operand_t.is_none()
+        && element_ts.contains(&Some(ValueType::Text))
+        && element_ts.iter().flatten().any(|t| *t != ValueType::Text)
+    {
+        return refuse("a NULL operand, a string and an element of another type");
+    }
+    if operand_t != Some(ValueType::Text) {
+        return Ok(());
+    }
+    let info = |table: Option<&str>, column: &str| columns.info(table, column);
+    let strings = StringTypes {
+        fields_by_name,
+        column: &info,
+    };
+    let padded = match strings.of(operand, field_name, 0) {
+        padded @ (StringType::Bpchar | StringType::Name) => padded,
+        _ => return Ok(()),
+    };
+    if list.iter().any(|element| {
+        let t = strings.of(element, field_name, 0);
+        t != StringType::Unknown && t != padded
+    }) {
+        return refuse(if padded == StringType::Bpchar {
+            "a char(n) operand and an element of another string type"
+        } else {
+            "a name operand and an element of another string type"
+        });
+    }
+    Ok(())
 }
 
 /// The type of `lhs <op> rhs` (an operator other than `AND` and `OR`) from

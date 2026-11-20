@@ -871,6 +871,18 @@ pub enum Plant {
     /// and pinned by its
     /// `erroring_inserts_and_updates_follow_the_held_key_model`.
     HeldKeyDeleteApplies,
+    /// #2130 (`isolation_pauses_every_reader`): when a page fails and one
+    /// definition's share of it fails alone
+    /// (`staging::quarantine::pause_definitions_failing_alone`), every
+    /// definition reading the page's tables is paused (T0247), not just the
+    /// one that fails: an innocent reader of the same table stops with it.
+    /// Fires only when such a page has a reader whose share applies.
+    ///
+    /// Gated by the held-key tier's isolation draw
+    /// (`held_key_planted_bugs_are_caught`), whose failing definition has a
+    /// sibling reader of its table, and pinned by its
+    /// `a_sum_overflowing_in_one_page_pauses_only_its_definition`.
+    IsolationPausesEveryReader,
     /// ADR-0002, #1991 (`gb_where_old_image`): a plain aggregate's page
     /// stages an update's old image whatever its `WHERE` gives
     /// (`staging::group_basis`'s stage statement), so a row that was no
@@ -980,6 +992,29 @@ pub enum Plant {
     /// Pinned by `capture_install`'s
     /// `a_repeatable_read_writer_is_captured_into_a_batch_that_claims_it`.
     CaptureSlotFromSnapshot,
+    /// #2183 (`field_release_before_widen`): a field build releases a field
+    /// an `ALTER TRANSFORM … ADD` or `ALTER` holds out of Apply until its
+    /// source's capture images the column it reads, without waiting for the
+    /// capture widen to land or for its gate to clear (`staging::build`'s
+    /// `capture_release`). A row staged without the column, by the old
+    /// capture body, then reaches the field, and its key is quarantined.
+    /// Fires on every release check of a field that awaits its capture.
+    ///
+    /// Pinned by `capture_join`'s
+    /// `a_widened_field_waits_for_the_rows_staged_before_the_widen` and
+    /// `an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen`.
+    FieldReleaseBeforeWiden,
+    /// The drain compares transaction ids truncated to 32 bits: a batch's
+    /// fenced read (`staging::seal`'s `window_over_fence`) takes its fences
+    /// with each id cut to its low 32 bits, while the ring's `row_txid`s stay
+    /// full `xid8`s. Past the first 32-bit epoch a fence then sees none of
+    /// the rows it fenced, and their changes never apply.
+    ///
+    /// Pinned by `staging`'s `sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows`.
+    /// Only the `db_admin` property's xid-aging action crosses the
+    /// boundary, so no planted-bug sweep tier gates it
+    /// (`generative::plant_sweep`'s `PlantPath::XidEpoch`).
+    FenceXid32,
     /// #2126 (`null_key_as_empty`): capture renders a nullable `KEY (...)`
     /// column's part of the ring key as its bare text
     /// (`capture::sql`'s `key_expr`), so a `NULL` part reads as `''` rather
@@ -1078,6 +1113,7 @@ impl Plant {
         Plant::StarReadsFirstOnly,
         Plant::HeldKeyUnlisted,
         Plant::HeldKeyDeleteApplies,
+        Plant::IsolationPausesEveryReader,
         Plant::GbWhereOldImage,
         Plant::GbWhereNullAsTrue,
         Plant::GbWhereBuildUnfiltered,
@@ -1090,6 +1126,8 @@ impl Plant {
         Plant::O2oWhereColumnNotImaged,
         Plant::GbWhereColumnNotImaged,
         Plant::CaptureSlotFromSnapshot,
+        Plant::FieldReleaseBeforeWiden,
+        Plant::FenceXid32,
         Plant::NullKeyAsEmpty,
     ];
 
@@ -1177,6 +1215,7 @@ impl Plant {
             Plant::StarReadsFirstOnly => "star_reads_first_only",
             Plant::HeldKeyUnlisted => "held_key_unlisted",
             Plant::HeldKeyDeleteApplies => "held_key_delete_applies",
+            Plant::IsolationPausesEveryReader => "isolation_pauses_every_reader",
             Plant::GbWhereOldImage => "gb_where_old_image",
             Plant::GbWhereNullAsTrue => "gb_where_null_as_true",
             Plant::GbWhereBuildUnfiltered => "gb_where_build_unfiltered",
@@ -1189,6 +1228,9 @@ impl Plant {
             Plant::O2oWhereColumnNotImaged => "o2o_where_column_not_imaged",
             Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
             Plant::CaptureSlotFromSnapshot => "capture_slot_from_snapshot",
+            Plant::FieldReleaseBeforeWiden => "field_release_before_widen",
+
+            Plant::FenceXid32 => "fence_xid32",
             Plant::NullKeyAsEmpty => "null_key_as_empty",
         }
     }
@@ -1269,6 +1311,34 @@ pub fn fires(plant: Plant, changes_behavior: bool) -> bool {
         FIRED.fetch_add(1, Ordering::Relaxed);
     }
     fires
+}
+
+/// Whether a `pg_snapshot`'s text names an id past the first 32-bit epoch,
+/// so cutting its ids to 32 bits changes it ([`Plant::FenceXid32`]).
+pub(crate) fn snapshot_past_first_epoch(snapshot: &str) -> bool {
+    snapshot_ids(snapshot).any(|id| id > u64::from(u32::MAX))
+}
+
+/// A `pg_snapshot`'s text with each id cut to its low 32 bits
+/// ([`Plant::FenceXid32`]).
+pub(crate) fn snapshot_as_32_bit(snapshot: &str) -> String {
+    let (head, xip) = snapshot.rsplit_once(':').unwrap_or((snapshot, ""));
+    let cut = |part: &str| {
+        part.split(',')
+            .filter(|id| !id.is_empty())
+            .map(|id| (id.parse::<u64>().expect("a snapshot id") & u64::from(u32::MAX)).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (xmin, xmax) = head.split_once(':').expect("xmin:xmax:xip");
+    format!("{}:{}:{}", cut(xmin), cut(xmax), cut(xip))
+}
+
+fn snapshot_ids(snapshot: &str) -> impl Iterator<Item = u64> + '_ {
+    snapshot
+        .split([':', ','])
+        .filter(|id| !id.is_empty())
+        .map(|id| id.parse::<u64>().expect("a snapshot id"))
 }
 
 /// The hook of a site whose precondition costs a query the correct path
@@ -1488,6 +1558,15 @@ mod tests {
         assert!(fired() >= fired_before + 2);
         assert!(count(plant.name()) >= plant_before + 31);
         assert!(count(marker.name()) >= marker_before + 41);
+    }
+
+    #[test]
+    fn a_snapshot_cut_to_32_bits() {
+        let snapshot = "4294967300:4294967310:4294967301,4294967305";
+        assert!(snapshot_past_first_epoch(snapshot));
+        assert_eq!(snapshot_as_32_bit(snapshot), "4:14:5,9");
+        assert!(!snapshot_past_first_epoch("700:710:"));
+        assert_eq!(snapshot_as_32_bit("700:710:"), "700:710:");
     }
 
     #[test]

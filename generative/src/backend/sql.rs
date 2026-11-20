@@ -242,7 +242,22 @@ pub(super) async fn create_source_indexes(
     schema: Option<&str>,
     def: &TransformDef,
 ) -> Result<(), tokio_postgres::Error> {
+    create_source_indexes_where(raw, schema, def, |_| true).await
+}
+
+/// [`create_source_indexes`], only on the tables `on` accepts: a table's
+/// owner creates its index, so the application indexes its sources and
+/// Trellis the targets a chained definition reads.
+pub(super) async fn create_source_indexes_where(
+    raw: &tokio_postgres::Client,
+    schema: Option<&str>,
+    def: &TransformDef,
+    on: impl Fn(&str) -> bool,
+) -> Result<(), tokio_postgres::Error> {
     for (table, columns) in required_source_indexes(def) {
+        if !on(&table) {
+            continue;
+        }
         let qualified = match schema {
             Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table)),
             None => quote_ident(&table),
@@ -306,6 +321,31 @@ pub(super) fn render_expr(expr: &Expr) -> String {
             "({}) IS {}NULL",
             render_expr(expr),
             if *negated { "NOT " } else { "" }
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({}) {}IN ({})",
+            render_expr(expr),
+            if *negated { "NOT " } else { "" },
+            list.iter()
+                .map(|e| format!("({})", render_expr(e)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({}) {}BETWEEN ({}) AND ({})",
+            render_expr(expr),
+            if *negated { "NOT " } else { "" },
+            render_expr(low),
+            render_expr(high)
         ),
         Expr::Case {
             branches,
@@ -406,7 +446,8 @@ pub(super) fn assignment(
 /// every set in `table.unique_sets`.
 ///
 /// `schema` qualifies the table's name (`None` leaves it to the session's
-/// `search_path`, which is the instance schema): a source table that more than
+/// `search_path`: `public` for the application's own session, the instance
+/// schema for the backend's raw one): a source table that more than
 /// one Trellis instance reads is created in `public`, outside every
 /// instance's catalog schema.
 pub(super) async fn create_source_table(
@@ -1126,6 +1167,7 @@ async fn unsettled_definitions(
 pub(super) async fn definition_states(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
+    reported: &HashMap<String, String>,
 ) -> Result<Vec<DefinitionState>, tokio_postgres::Error> {
     let targets: Vec<String> = defs.iter().map(|d| d.target.clone()).collect();
     let rows = raw
@@ -1158,11 +1200,39 @@ pub(super) async fn definition_states(
             let (status, reason) = found
                 .remove(&target)
                 .unwrap_or_else(|| ("<missing>".to_string(), None));
+            let reported = reported
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| "<missing>".to_string());
             DefinitionState {
                 target,
                 status,
+                reported,
                 reason,
             }
+        })
+        .collect())
+}
+
+/// Every definition's status as an operator reads it, by bare target name:
+/// `Trellis::definitions` through a facade connected for the call, so a
+/// stored `live` reads `catching_up` exactly when the engine says so.
+pub(super) async fn reported_statuses(
+    config: trellis::Config,
+) -> Result<HashMap<String, String>, trellis::TrellisError> {
+    let facade = trellis::Trellis::connect(config, trellis::TrellisOptions::default()).await?;
+    let listed = facade.definitions().await;
+    facade.shutdown().await?;
+    Ok(listed?
+        .into_iter()
+        .map(|d| {
+            let bare = d
+                .target_table
+                .rsplit('.')
+                .next()
+                .unwrap_or(&d.target_table)
+                .to_string();
+            (bare, d.status.as_str().to_string())
         })
         .collect())
 }

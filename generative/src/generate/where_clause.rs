@@ -20,7 +20,8 @@
 //! # The predicates
 //!
 //! Every template is total ([`docs/expressions.md`, "WHERE"]): comparisons
-//! with a number or string literal, `IS [NOT] NULL`, `AND`, `OR`, `NOT`,
+//! with a number or string literal, `[NOT] IN`, `[NOT] BETWEEN`,
+//! `IS [NOT] NULL`, `AND`, `OR`, `NOT`,
 //! `COALESCE` and `%` by a nonzero literal, over the columns the generators
 //! update, so rows cross the predicate both ways. A few are degenerate
 //! (`FALSE`, `NULL`, `(TRUE)`), which define accepts (#1991 rule 6). A plain
@@ -157,6 +158,23 @@ fn is_null(expr: Expr, negated: bool) -> Expr {
     }
 }
 
+fn in_list(expr: Expr, list: Vec<Expr>, negated: bool) -> Expr {
+    Expr::InList {
+        expr: Box::new(expr),
+        list,
+        negated,
+    }
+}
+
+fn between(expr: Expr, low: Expr, high: Expr, negated: bool) -> Expr {
+    Expr::Between {
+        expr: Box::new(expr),
+        low: Box::new(low),
+        high: Box::new(high),
+        negated,
+    }
+}
+
 fn coalesce(expr: Expr, otherwise: Expr) -> Expr {
     Expr::FunctionCall {
         name: "COALESCE".to_string(),
@@ -174,7 +192,7 @@ fn degenerate(draw: u64) -> Expr {
 }
 
 /// How many templates [`aggregate_predicate`] draws from.
-pub const AGGREGATE_TEMPLATES: u64 = 11;
+pub const AGGREGATE_TEMPLATES: u64 = 14;
 
 /// A plain aggregate's predicate over `table`, the generators' uniform
 /// shape (`generate::build_program_multi_with_shapes`: `c1`, `c2` numeric,
@@ -221,12 +239,19 @@ pub fn aggregate_predicate(draw: u64, table: &Table) -> Option<Expr> {
             is_null(column(c1), false),
             binary(Operator::GreaterThan, column(c2), number(k)),
         ),
+        10 => in_list(
+            column(c1),
+            vec![number(k), number(k + 10), number(g * 40)],
+            false,
+        ),
+        11 => between(column(c2), number(k - 20), number(k), g == 1),
+        12 => in_list(column(grain), vec![number(0), number(g)], true),
         _ => degenerate(draw >> 24),
     })
 }
 
 /// How many templates [`join_one_to_one_predicate`] draws from.
-pub const JOIN_ONE_TO_ONE_TEMPLATES: u64 = 11;
+pub const JOIN_ONE_TO_ONE_TEMPLATES: u64 = 14;
 
 /// A 1-1 `JOIN`'s predicate over its root `source` and its `joined` tables
 /// (the generators' shape: `x`, `t` on the root; `id`, `y`, `t`, `w` on each
@@ -268,13 +293,23 @@ pub fn join_one_to_one_predicate(draw: u64, source: &str, joined: &[&str]) -> Ex
             binary(Operator::GreaterThan, j("y"), number(k)),
         ),
         9 => binary(Operator::GreaterThanOrEqual, j("y"), qualified(other, "y")),
+        10 => between(a("x"), number(k), j("y"), false),
+        11 => in_list(j("y"), vec![number(k), number(0)], true),
+        12 => in_list(
+            j("w"),
+            vec![
+                Expr::StringLiteral("w0".to_string()),
+                Expr::StringLiteral("w1".to_string()),
+            ],
+            false,
+        ),
         _ => degenerate(draw >> 24),
     }
 }
 
 /// How many conjunct templates [`join_aggregate_predicate`] draws each
 /// conjunct from.
-pub const JOIN_AGGREGATE_CONJUNCTS: u64 = 6;
+pub const JOIN_AGGREGATE_CONJUNCTS: u64 = 8;
 
 /// A join aggregate's predicate over its `FROM` table `source` and its
 /// `joined` table (the JOIN tier's shape, `generate::join`: `ga`, `t`, `k`
@@ -301,6 +336,8 @@ pub fn join_aggregate_predicate(draw: u64, source: &str, joined: &str, left: boo
                 binary(Operator::Modulo, c("k"), number(2)),
                 number(0),
             ),
+            5 => in_list(c(group), vec![number(g), number(g + 1)], false),
+            6 => between(c("k"), number(0), number(g), true),
             _ => binary(
                 Operator::Or,
                 binary(Operator::Equal, c("t"), number(0)),
@@ -442,19 +479,49 @@ fn value(expr: &Expr, read: &dyn Fn(Option<&str>, &str) -> Option<String>) -> Va
             .map(|a| value(a, read))
             .find(|v| *v != Value::Null)
             .unwrap_or(Value::Null),
+        // `=` joined by `OR`, or `<>` joined by `AND`.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let operand = value(expr, read);
+            let (op, join) = if *negated {
+                (Operator::NotEqual, and3 as fn(Value, Value) -> Value)
+            } else {
+                (Operator::Equal, or3 as fn(Value, Value) -> Value)
+            };
+            list.iter()
+                .map(|element| compare(op, &operand, &value(element, read)))
+                .reduce(join)
+                .expect("a list has an element")
+        }
+        // `>= low AND <= high`, or `< low OR > high`.
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let operand = value(expr, read);
+            let (low, high) = (value(low, read), value(high, read));
+            if *negated {
+                or3(
+                    compare(Operator::LessThan, &operand, &low),
+                    compare(Operator::GreaterThan, &operand, &high),
+                )
+            } else {
+                and3(
+                    compare(Operator::GreaterThanOrEqual, &operand, &low),
+                    compare(Operator::LessThanOrEqual, &operand, &high),
+                )
+            }
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let (l, r) = (value(lhs, read), value(rhs, read));
             match op {
-                Operator::And => match (l.as_bool(), r.as_bool()) {
-                    (Some(false), _) | (_, Some(false)) => Value::Bool(false),
-                    (Some(true), Some(true)) => Value::Bool(true),
-                    _ => Value::Null,
-                },
-                Operator::Or => match (l.as_bool(), r.as_bool()) {
-                    (Some(true), _) | (_, Some(true)) => Value::Bool(true),
-                    (Some(false), Some(false)) => Value::Bool(false),
-                    _ => Value::Null,
-                },
+                Operator::And => and3(l, r),
+                Operator::Or => or3(l, r),
                 Operator::Modulo => match (l.as_num(), r.as_num()) {
                     (Some(a), Some(b)) if a.is_nan() => Value::Num(a + b),
                     (Some(a), Some(b)) => Value::Num(a % b),
@@ -464,6 +531,24 @@ fn value(expr: &Expr, read: &dyn Fn(Option<&str>, &str) -> Option<String>) -> Va
             }
         }
         other => panic!("eval: the WHERE generator draws no {other:?}"),
+    }
+}
+
+/// Three-valued `AND`.
+fn and3(l: Value, r: Value) -> Value {
+    match (l.as_bool(), r.as_bool()) {
+        (Some(false), _) | (_, Some(false)) => Value::Bool(false),
+        (Some(true), Some(true)) => Value::Bool(true),
+        _ => Value::Null,
+    }
+}
+
+/// Three-valued `OR`.
+fn or3(l: Value, r: Value) -> Value {
+    match (l.as_bool(), r.as_bool()) {
+        (Some(true), _) | (_, Some(true)) => Value::Bool(true),
+        (Some(false), Some(false)) => Value::Bool(false),
+        _ => Value::Null,
     }
 }
 
@@ -588,6 +673,45 @@ mod tests {
             }
         }
         assert!(joined > 200 && both > 100, "joined {joined}, both {both}");
+    }
+
+    #[test]
+    fn in_and_between_follow_three_valued_logic() {
+        let r = row(&[("a", Some("5")), ("b", None)]);
+        let list = |c: &str, items: Vec<Expr>, negated| in_list(column(c), items, negated);
+        assert_eq!(
+            eval_on(&list("a", vec![number(1), number(5)], false), &r),
+            Some(true)
+        );
+        assert_eq!(
+            eval_on(&list("a", vec![number(1), Expr::Null], false), &r),
+            None
+        );
+        assert_eq!(
+            eval_on(&list("a", vec![number(5), Expr::Null], false), &r),
+            Some(true)
+        );
+        assert_eq!(
+            eval_on(&list("a", vec![number(1), Expr::Null], true), &r),
+            None
+        );
+        assert_eq!(
+            eval_on(&list("a", vec![number(5), Expr::Null], true), &r),
+            Some(false)
+        );
+        assert_eq!(eval_on(&list("b", vec![number(1)], true), &r), None);
+        let range = |lo, hi, negated| between(column("a"), number(lo), number(hi), negated);
+        assert_eq!(eval_on(&range(5, 9, false), &r), Some(true));
+        assert_eq!(eval_on(&range(6, 9, false), &r), Some(false));
+        assert_eq!(eval_on(&range(6, 9, true), &r), Some(true));
+        assert_eq!(
+            eval_on(&between(column("a"), number(6), Expr::Null, false), &r),
+            Some(false)
+        );
+        assert_eq!(
+            eval_on(&between(column("a"), number(1), Expr::Null, false), &r),
+            None
+        );
     }
 
     #[test]

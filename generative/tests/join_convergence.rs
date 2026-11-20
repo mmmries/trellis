@@ -91,7 +91,7 @@
 //! The fast tests below (not ignored) run one hand-built case end to end,
 //! and check that the oracle tells a corrupted target from a good one.
 
-use generative::backend::{Backend, ConcurrentBackend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ConcurrentBackend, ManualBackend};
 use generative::generate::join::{
     BuildCoverage, JoinActionDraw, JoinActionKind, JoinBuildDraws, JoinCase, JoinDefSpec,
     JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape, RACING_DRAIN_BATCH_CAP,
@@ -303,9 +303,9 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record(case);
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect_with_options(
-                db.dsn(),
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as_with_options(
+                db.roles(),
                 case.workers,
                 Some(std::time::Duration::from_millis(case.seal_interval_ms)),
             )
@@ -429,6 +429,14 @@ fn join_sweep_tier() -> SweepTier {
     not_gated.extend(not_on_path(
         &[PlantPath::Capture],
         generative::plant_sweep::NO_CAPTURE,
+    ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::Isolation],
+        generative::plant_sweep::NO_ISOLATION,
+    ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::SourceKey],

@@ -21,7 +21,7 @@
 //! worth keeping is transcribed into a hand-built pin, since a seed replays into
 //! a different program once the strategy changes shape.
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ManualBackend};
 use generative::generate::source_key::{KeyDraw, KeyShape, key_source, trivial_or_keyed_program};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, DerivedShape, Mutate, TableSpec, build_program,
@@ -122,11 +122,11 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
             // timing above for the env-var convention.
             let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
             let start = timing_enabled.then(std::time::Instant::now);
-            let db = h.cluster.create_isolated_database().await;
+            let db = CaseDatabase::provision(&h.cluster).await;
             if let Some(start) = start {
                 eprintln!("COST_TIMING db_provision {}", start.elapsed().as_millis());
             }
-            let mut backend = ManualBackend::connect(db.dsn())
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             if program.tables.iter().any(|t| t.partitioning.is_some()) {

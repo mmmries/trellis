@@ -66,7 +66,17 @@ const MAX_PREFIX_NOT: usize = 100;
 #[derive(Debug, Clone, Copy)]
 enum Infix {
     Binary(Operator),
-    IsNull { negated: bool },
+    IsNull {
+        negated: bool,
+    },
+    /// `[NOT] IN (...)`.
+    In {
+        negated: bool,
+    },
+    /// `[NOT] BETWEEN ... AND ...`.
+    Between {
+        negated: bool,
+    },
 }
 
 impl Infix {
@@ -74,6 +84,7 @@ impl Infix {
         match self {
             Infix::Binary(op) => operator_spec(op).precedence,
             Infix::IsNull { .. } => super::registry::precedence::IS,
+            Infix::In { .. } | Infix::Between { .. } => super::registry::precedence::IN_BETWEEN,
         }
     }
 
@@ -82,6 +93,10 @@ impl Infix {
             Infix::Binary(op) => operator_spec(op).symbol,
             Infix::IsNull { negated: false } => "IS NULL",
             Infix::IsNull { negated: true } => "IS NOT NULL",
+            Infix::In { negated: false } => "IN",
+            Infix::In { negated: true } => "NOT IN",
+            Infix::Between { negated: false } => "BETWEEN",
+            Infix::Between { negated: true } => "NOT BETWEEN",
         }
     }
 }
@@ -282,6 +297,18 @@ fn resolve_expr_aliases(
         | Expr::Not(operand)
         | Expr::Cast { expr: operand, .. }
         | Expr::IsNull { expr: operand, .. } => resolve_expr_aliases(operand, resolve),
+        Expr::InList { expr, list, .. } => {
+            resolve_expr_aliases(expr, resolve)?;
+            list.iter_mut()
+                .try_for_each(|element| resolve_expr_aliases(element, resolve))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            resolve_expr_aliases(expr, resolve)?;
+            resolve_expr_aliases(low, resolve)?;
+            resolve_expr_aliases(high, resolve)
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -322,6 +349,11 @@ struct Parser {
     joined: Option<String>,
     /// How the grammar version being read reads identifiers.
     identifiers: Identifiers,
+    /// Set while a `BETWEEN`'s lower bound is parsed: Postgres reads it as
+    /// its restricted operand (`b_expr`), which takes no prefix `NOT` and no
+    /// `AT TIME ZONE` outside parentheses. [`Self::parse_expr`] clears it
+    /// for what it parses (a parenthesized expression, a call's arguments).
+    restricted: bool,
 }
 
 /// The keywords a `JOIN` clause starts with, the refused kinds included so
@@ -340,6 +372,7 @@ impl Parser {
             source_alias: None,
             joined: None,
             identifiers,
+            restricted: false,
         }
     }
 
@@ -1228,7 +1261,9 @@ impl Parser {
             });
         }
         self.nest += 1;
+        let restricted = std::mem::replace(&mut self.restricted, false);
         let result = self.parse_binary_expr(0);
+        self.restricted = restricted;
         self.nest -= 1;
         result
     }
@@ -1285,6 +1320,17 @@ impl Parser {
                         negated,
                     }
                 }
+                // The list's closing `)` ends the operand, so Postgres reads
+                // a following `IN` or `BETWEEN` onto it (`a IN (1) IN (TRUE)`
+                // is `(a IN (1)) IN (TRUE)`). A `BETWEEN`'s upper bound is an
+                // open operand, so an `IN` or `BETWEEN` after it is a syntax
+                // error in Postgres, as after `a < b`.
+                Infix::In { .. } | Infix::Between { .. } => {
+                    let node = self.parse_in_or_between(infix, lhs, lhs_height, precedence)?;
+                    lhs_height = self.last_height;
+                    non_associative = matches!(infix, Infix::Between { .. }).then_some(precedence);
+                    node
+                }
             };
             // The tree is measured as it is built, so a chain too deep to
             // walk is refused before it exists (and before it must be dropped).
@@ -1318,7 +1364,7 @@ impl Parser {
                     });
                 }
                 match lookup_operator(&c.to_string()) {
-                    Some(op) => Ok(Some((Infix::Binary(op), 1))),
+                    Some(op) => self.binary_infix(op),
                     None => Err(ParseError::UnsupportedOperator {
                         operator: c.to_string(),
                     }),
@@ -1328,7 +1374,7 @@ impl Parser {
             // Postgres; a run with no registered operator is refused whole
             // rather than split (`a<=>b`, `a!=-1`, `a%-1`).
             Token::Operator(symbol) => match lookup_operator(symbol) {
-                Some(op) => Ok(Some((Infix::Binary(op), 1))),
+                Some(op) => self.binary_infix(op),
                 None => Err(ParseError::UnsupportedOperator {
                     operator: symbol.clone(),
                 }),
@@ -1341,8 +1387,30 @@ impl Parser {
                     && matches!(self.peek_at(1), Token::Ident(w) if w.eq_ignore_ascii_case("TIME"))
                     && matches!(self.peek_at(2), Token::Ident(w) if w.eq_ignore_ascii_case("ZONE")) =>
             {
+                if self.restricted {
+                    return Err(Self::restricted_bound("'AT TIME ZONE'"));
+                }
                 Ok(Some((Infix::Binary(Operator::AtTimeZone), 3)))
             }
+            // `IN` is reserved; `BETWEEN` is a keyword only here, after a
+            // complete operand, so a column named `between` is still one
+            // wherever an operand starts (ADR-0018). `NOT IN` and
+            // `NOT BETWEEN` are one operator each, as in Postgres.
+            Token::Ident(word) if word.eq_ignore_ascii_case("IN") => {
+                Ok(Some((Infix::In { negated: false }, 1)))
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("BETWEEN") => {
+                Ok(Some((Infix::Between { negated: false }, 1)))
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("NOT") => match self.peek_at(1) {
+                Token::Ident(next) if next.eq_ignore_ascii_case("IN") => {
+                    Ok(Some((Infix::In { negated: true }, 2)))
+                }
+                Token::Ident(next) if next.eq_ignore_ascii_case("BETWEEN") => {
+                    Ok(Some((Infix::Between { negated: true }, 2)))
+                }
+                _ => Ok(None),
+            },
             Token::Ident(word) if word.eq_ignore_ascii_case("AND") => {
                 Ok(Some((Infix::Binary(Operator::And), 1)))
             }
@@ -1412,6 +1480,9 @@ impl Parser {
         // so a long run costs no stack. The operand's own parse is a nesting
         // level (`a + NOT b + NOT c + ...` would otherwise recurse once per
         // `NOT`).
+        if self.restricted && self.peek_prefix_keyword("NOT") {
+            return Err(Self::restricted_bound("'NOT'"));
+        }
         let mut nots = 0usize;
         while self.peek_prefix_keyword("NOT") {
             self.advance();
@@ -1519,6 +1590,9 @@ impl Parser {
                 // information of its own once parsing is done, so the
                 // parenthesized expression's own tree is returned unwrapped.
                 let expr = self.parse_expr()?;
+                if self.peek_is_symbol(',') {
+                    return Err(ParseError::RowConstructor);
+                }
                 self.expect_symbol(')')?;
                 Ok(expr)
             }
@@ -2084,6 +2158,129 @@ impl Parser {
         }
     }
 
+    /// The error for a `NOT` or `AT TIME ZONE` (`found`) in a `BETWEEN`'s
+    /// lower bound outside parentheses, a syntax error in Postgres.
+    fn restricted_bound(found: &str) -> ParseError {
+        ParseError::UnexpectedToken {
+            expected: "a BETWEEN lower bound without NOT or AT TIME ZONE outside parentheses"
+                .to_string(),
+            found: found.to_string(),
+        }
+    }
+
+    /// The binary operator `op`, spelled by the one token at the cursor.
+    /// Refuses `= ANY (...)`, `<> ALL (...)` and the like by name: Postgres
+    /// reserves the three words, so none is a column or a function there
+    /// either. Checked here, not in [`Self::parse_binary_expr`], to keep that
+    /// recursive frame small.
+    fn binary_infix(&self, op: Operator) -> Result<Option<(Infix, usize)>, ParseError> {
+        if op.is_comparison()
+            && let Token::Ident(word) = self.peek_at(1)
+            && ["ANY", "ALL", "SOME"]
+                .iter()
+                .any(|q| word.eq_ignore_ascii_case(q))
+            && self.peek_at(2) == &Token::Symbol('(')
+        {
+            return Err(ParseError::QuantifiedComparison {
+                operator: operator_spec(op).symbol.to_string(),
+                quantifier: word.to_ascii_uppercase(),
+            });
+        }
+        Ok(Some((Infix::Binary(op), 1)))
+    }
+
+    /// The `[NOT] IN` list or `[NOT] BETWEEN` bounds (`infix`, consumed)
+    /// after `lhs`, `lhs_height` high, leaving the node's height in
+    /// `last_height`. Kept out of
+    /// [`Self::parse_binary_expr`] so its frame, which every level of an
+    /// expression stacks, stays small.
+    #[inline(never)]
+    fn parse_in_or_between(
+        &mut self,
+        infix: Infix,
+        lhs: Expr,
+        lhs_height: usize,
+        precedence: u8,
+    ) -> Result<Expr, ParseError> {
+        Ok(match infix {
+            Infix::In { negated } => {
+                let list = self.parse_in_list()?;
+                self.last_height = 1 + lhs_height.max(self.last_height);
+                Expr::InList {
+                    expr: Box::new(lhs),
+                    list,
+                    negated,
+                }
+            }
+            Infix::Between { negated } => {
+                let (low, high, height) = self.parse_between_bounds(precedence)?;
+                self.last_height = 1 + lhs_height.max(height);
+                Expr::Between {
+                    expr: Box::new(lhs),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated,
+                }
+            }
+            Infix::Binary(_) | Infix::IsNull { .. } => unreachable!("an IN or a BETWEEN"),
+        })
+    }
+
+    /// The `(<e1>, <e2>, ...)` after `IN`, through its `)`, leaving the
+    /// tallest element's height in `last_height`. Each element is any
+    /// expression; an empty list is a syntax error, as in Postgres, and a
+    /// subquery is refused by name.
+    fn parse_in_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+        self.expect_symbol('(')?;
+        let word_at = |n: usize, kw: &str| matches!(self.peek_at(n), Token::Ident(w) if w.eq_ignore_ascii_case(kw));
+        if word_at(0, "SELECT")
+            || word_at(0, "WITH")
+            || word_at(0, "TABLE")
+            || (word_at(0, "VALUES") && self.peek_at(1) == &Token::Symbol('('))
+        {
+            return Err(ParseError::SubqueryInList);
+        }
+        let mut list = Vec::new();
+        let mut tallest = 0;
+        loop {
+            list.push(self.parse_expr()?);
+            tallest = tallest.max(self.last_height);
+            if self.peek_is_symbol(',') {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_symbol(')')?;
+        self.last_height = tallest;
+        Ok(list)
+    }
+
+    /// A `BETWEEN`'s `<low> AND <high>`, with `BETWEEN` consumed, and the
+    /// taller bound's height. As in Postgres, the lower bound is the
+    /// restricted operand ([`Self::restricted`]) and binds tighter than
+    /// `BETWEEN` (`precedence`), so its `AND` is the first one outside
+    /// parentheses; the upper bound takes what binds tighter than `BETWEEN`,
+    /// so `a BETWEEN 1 AND 2 AND b` is `(a BETWEEN 1 AND 2) AND b`.
+    /// `SYMMETRIC` and `ASYMMETRIC` are refused by name.
+    fn parse_between_bounds(&mut self, precedence: u8) -> Result<(Expr, Expr, usize), ParseError> {
+        if let Token::Ident(word) = self.peek()
+            && (word.eq_ignore_ascii_case("SYMMETRIC") || word.eq_ignore_ascii_case("ASYMMETRIC"))
+        {
+            return Err(ParseError::BetweenSymmetric {
+                modifier: word.to_ascii_uppercase(),
+            });
+        }
+        let restricted = std::mem::replace(&mut self.restricted, true);
+        let low = self.parse_binary_expr(precedence + 1);
+        self.restricted = restricted;
+        let low = low?;
+        let low_height = self.last_height;
+        self.expect_keyword("AND")?;
+        let high = self.parse_binary_expr(precedence + 1)?;
+        Ok((low, high, low_height.max(self.last_height)))
+    }
+
     /// The expression after `WHERE`. Only the lone unquoted token `TRUE`
     /// ending the text is [`Predicate::True`], the text 0.2.0 accepted; any
     /// other expression, `(TRUE)` included, is a filter, which the validator
@@ -2330,6 +2527,25 @@ mod depth_tests {
         assert!(too_deep(define(chain(200_000))));
         assert!(too_deep(define(parens(200_000))));
         assert!(too_deep(define(calls(200_000))));
+    }
+
+    /// `(c * (c + ...))` at the height limit, the shape that stacks the most
+    /// parser frames per level, defines on 1.875 MiB: headroom under the
+    /// 2 MiB a thread gets, which a larger frame in the recursive parse or
+    /// substitution passes (an operator's arm kept inline) would use up.
+    #[test]
+    fn the_deepest_operator_nesting_defines_with_stack_to_spare() {
+        let half = MAX_EXPRESSION_DEPTH / 2 - 1;
+        let text = format!("{}c{}", "(c * (c + ".repeat(half), "))".repeat(half));
+        let result = std::thread::Builder::new()
+            .stack_size(1920 * 1024)
+            .spawn(move || {
+                let def = parse(&format!("TRANSFORM t FROM s SELECT {text} AS out")).unwrap();
+                walk_every_way(&def);
+            })
+            .unwrap()
+            .join();
+        assert!(result.is_ok(), "the definition overflowed or panicked");
     }
 
     #[test]
