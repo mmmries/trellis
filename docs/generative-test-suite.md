@@ -75,7 +75,7 @@ prints on failure:
 
 ```
 Program {
-  tables:      [ { name, pk_col, columns: [{name, type}] } ]
+  tables:      [ { name, pk_col, columns: [{name, type}], source_key } ]
   defs:        [ TransformDef ]         // reuses trellis::defs::ast, see §2
   ops:         [ Insert{table,row} | Update{table,pk,changes} | Delete{table,pk} ]
 }
@@ -84,7 +84,9 @@ Program {
 Use small fixed name pools (`t0`, `d0`, `c0`): a shrunk counterexample you can
 read at a glance beats one that is technically smaller. Give every table its PK
 column **unconditionally**, so no shrink step can strand a definition referencing
-it.
+it. A table read through a `KEY (...)` (`source_key`, ADR-0026) keeps `pk_col` as
+the column ops address rows by, as its primary key or a plain `NOT NULL UNIQUE`
+column.
 
 `defs` reuses `trellis::defs::ast::TransformDef` directly — 1-1 definitions
 (including numeric `+`), `GROUP BY` aggregates, and two-table `JOIN … GROUP BY`
@@ -777,6 +779,26 @@ beside them run on every `cargo test`.
   race and several workers drain them. Every definition over the hot table
   groups by the grain, and the variant draws no partition maintenance,
   which would put the hot table in one lane.
+- **Source-key convergence** *(ADR-0026, `generate::source_key`)*. One
+  program in four drawn by the convergence property and the concurrent
+  backend's property reads its first definition's source through a
+  `KEY (...)`: one or two `text` columns, each `NOT NULL` or nullable under a
+  `NULLS NOT DISTINCT` index, beside the primary key or without one. Every
+  1-1 and `GROUP BY` definition over the table names the key. Keys take
+  `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and `chr(31)`, and updates move
+  rows between keys. A model of the live keys expects a write onto a taken
+  key to fail. The oracle keeps a `NULL` key part apart from `''`. The
+  concurrent tier keeps a keyed table's writes in one lane, since which of
+  two racing writes to one key fails depends on commit order. The
+  `source_keys` coverage line counts each variant. One 1-1 JOIN tier case
+  in four reads its joined table `jb` through such a key
+  (`join_one_to_one::key_joined`): every definition joins
+  `ON ja.k0 = jb.k0 [AND ja.k1 = jb.k1]` with `jb KEY (...)`, and `ja`'s
+  `text` `ON` columns take the same values, `NULL` included, so `ja` rows
+  point at both `jb`'s `''` row and its `NULL` row. The sweep tier
+  `GENERATIVE_PLANT_TIER=source_key` and the 1-1 JOIN tier's
+  `joined_key_planted_bugs_are_caught` (a nullable key in every case) gate
+  `null_key_as_empty`, #2126's capture rendering restored, on each side.
 
 ### Two runtimes, one oracle
 
@@ -864,7 +886,8 @@ The planted-bug sweep (`generative::plant_sweep`; `planted_bugs_are_caught` in
 `join_planted_bugs_are_caught` in `generative/tests/join_convergence.rs` for the
 `JOIN` tier, `one_to_one_join_planted_bugs_are_caught` in
 `generative/tests/join_one_to_one_convergence.rs` for the 1-1 `JOIN` tier,
-`star_join_planted_bugs_are_caught` in the same file for its star tier,
+`star_join_planted_bugs_are_caught` and `joined_key_planted_bugs_are_caught`
+in the same file for its star and keyed-joined-table tiers,
 `chained_join_planted_bugs_are_caught` in
 `generative/tests/join_chained_convergence.rs` for the chained-reader tier,
 `extremes_tamper_planted_bugs_are_caught` in
@@ -876,7 +899,8 @@ once per planted bug, and judges each plant only on cases the baseline passed.
 only with **zero failures outside the quarantine list**,
 `generative/baseline-quarantine.txt`. The rule is the same for every tier
 (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
-`min_max`, `join`, `join_one_to_one`, `join_star`, `join_chained`,
+`min_max`, `source_key`, `join`, `join_one_to_one`, `join_one_to_one_key`,
+`join_star`, `join_chained`,
 `extremes_tamper`, `held_keys`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
@@ -919,6 +943,40 @@ tiers are calibrated for a tmpfs cluster, so run sweeps there. A process run
 directly with `GENERATIVE_PLANT_CHILD=1` (as a repro loop does) is one of the
 sweep's workers, not a gate: it prints a `plant-sweep` row per case and exits
 0 even when a case fails, with no list or bar applied, so read its rows.
+
+### The reachability floor
+
+Coverage floors prove the generators draw a shape; the reachability floor
+proves the shape reaches the engine path. Each plant's hook counts a *reach*
+whenever its precondition holds, armed or not. A hook whose precondition
+costs a query the correct path doesn't run counts each pass instead
+(`plant::visit`), and one whose precondition shows only as the correct
+path's error counts where that error is classified. A *reach marker*
+(`trellis::dev::plant::Marker`) counts a path that has no plant, such as
+capture's nullable-key encoding. The report marks pass counts, markers
+included, `(passes)`: they prove only that the path runs. Both compile only under `test-util`. The
+subprocess backend asks each engine child for its counts before killing it
+and folds them into the sweep's own.
+
+Every sweep prints a reachability report after its baseline: per site, the
+baseline cases that reached it and its reaches in all. Then the floor holds:
+**every site is reached at least once in the tier's baseline**, unless the
+tier's `not_gated` names it, or `generative::reach_floor::EXEMPT` lists it
+for that tier (or for every tier, `*`) with why. A site the tier doesn't
+gate but reaches in a quarter or more of its baseline cases is held too,
+listed in `reach_floor::REACHED_UNGATED`: losing it is lost exploration
+that no catch rate shows. When a run's ungated reaches differ from that
+list, the report prints the entry the run would give. A site no tier reaches is
+listed for `*` and names the deterministic test that reaches it. A site a
+tier reaches only now and then is exempt for that tier, with its measured
+rate.
+
+The floor is judged on the tier's default baseline (seeds 1–4, 12 cases
+each) or a bigger run, which draws the same cases first. A smaller run, or
+`GENERATIVE_PLANT_ONLY`, prints the report and skips the floor. It costs no
+extra cases, since every sweep already runs the baseline. The meta-test
+`the_reachability_floors_exemptions_are_well_formed` checks that both lists
+name real sites and tiers, and that each exemption gives a reason.
 
 ## 7. The action space, and how it grows
 

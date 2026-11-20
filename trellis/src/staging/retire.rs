@@ -530,7 +530,7 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
             // Planted bug: collect every zero group, whatever its
             // basis and stamp. See `crate::plant`.
             #[cfg(any(test, feature = "test-util"))]
-            if *basis && crate::plant::armed() == Some(crate::plant::Plant::GbEarlyZeroGc) {
+            if *basis && crate::plant::visit(crate::plant::Plant::GbEarlyZeroGc) {
                 let row = txn
                     .query_one(
                         &planted_collect_every_zero_group_sql(hidden, group_cols),

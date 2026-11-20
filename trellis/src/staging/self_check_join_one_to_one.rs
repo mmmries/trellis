@@ -774,13 +774,18 @@ async fn build<'a>(
 
 /// A page of the statements' rows `(side, page_end, key, values)` as the two
 /// sides' pages, the keys the page can't vouch for, and where it ends.
-fn read_pages(rows: &[tokio_postgres::Row]) -> (Page, Page, Uncertain, Option<String>) {
+fn read_pages(
+    rows: &[tokio_postgres::Row],
+    target: &str,
+) -> Result<(Page, Page, Uncertain, Option<String>), SelfCheckError> {
     let (mut one, mut two) = (Page::new(), Page::new());
     let mut uncertain = Uncertain::default();
     let mut page_end = None;
     for row in rows {
         page_end = row.get(1);
-        let key: String = row.get(2);
+        let Some(key) = row.get::<_, Option<String>>(2) else {
+            return Err(super::self_check::null_key(target));
+        };
         match row.get::<_, i32>(0) {
             3 => {
                 uncertain.keys.insert(key);
@@ -796,7 +801,7 @@ fn read_pages(rows: &[tokio_postgres::Row]) -> (Page, Page, Uncertain, Option<St
             }
         }
     }
-    (one, two, uncertain, page_end)
+    Ok((one, two, uncertain, page_end))
 }
 
 /// A page of the target part.
@@ -812,7 +817,7 @@ async fn target_page(
     keyset.set_cursor(after)?;
     let sql = audit.target_sql(&keyset, &audit.on_collations(&client).await?);
     let rows = client.query(sql.as_str(), &[&limit]).await?;
-    let (recomputed, persisted, uncertain, page_end) = read_pages(&rows);
+    let (recomputed, persisted, uncertain, page_end) = read_pages(&rows, &audit.def.def.target)?;
     let columns: Vec<&str> = audit.fields.iter().map(|f| f.name.as_str()).collect();
     let diff = diff_page(&columns, recomputed, persisted, page_end);
     Ok(Pass {
@@ -853,7 +858,7 @@ async fn ledger_page(
     keyset.set_cursor(after)?;
     let sql = audit.ledger_sql(side, &keyset);
     let rows = client.query(sql.as_str(), &[&limit]).await?;
-    let (expected, persisted, uncertain, page_end) = read_pages(&rows);
+    let (expected, persisted, uncertain, page_end) = read_pages(&rows, &audit.def.def.target)?;
     let mut divergences = Vec::new();
     for (key, values) in &expected {
         let Some(held) = persisted.get(key) else {

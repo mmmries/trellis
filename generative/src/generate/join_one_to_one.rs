@@ -58,6 +58,10 @@
 //! change fans out over many target rows. A star's joined tables are each
 //! written the same way, each on a lane of its own per burst.
 //!
+//! One two-table case in four reads `jb` through a `KEY (...)` instead
+//! ([`key_joined`], #2171): `jb`'s unique keys give way to one or two `text`
+//! key columns, and every definition joins on them.
+//!
 //! Builds, pauses, resumes and re-reads are drawn as the aggregate JOIN tier
 //! draws them ([`super::join::JoinBuildDraws`]).
 //!
@@ -157,6 +161,7 @@ pub fn star_tables(tables: usize) -> Vec<Table> {
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     };
     let named = |columns: &[(&str, ValueType)]| -> Vec<(String, ValueType)> {
         columns
@@ -835,6 +840,271 @@ pub fn one_joined_lane(
     plan
 }
 
+/// A 1-1 `JOIN` case's joined table read through `KEY (...)` (#2171,
+/// ADR-0026), as [`key_joined`] applies it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinedKeyDraw {
+    /// `jb`'s key: its shape, the key each insert writes and each update's
+    /// key move, as [`super::source_key::key_source`] draws a `FROM`
+    /// table's.
+    pub key: super::source_key::KeyDraw,
+    /// The `ON` values each `ja` insert writes, in op order, reused from the
+    /// start when `ja` inserts more rows. Never empty.
+    pub a_inserts: Vec<super::source_key::Key>,
+    /// For each `ja` update, in op order (reused likewise): `Some(values)`
+    /// also moves the row to other `ON` values. Never empty.
+    pub a_moves: Vec<Option<super::source_key::Key>>,
+}
+
+/// The [`JoinedKeyDraw`] a two-table case gets, derived from the drawn
+/// `program` (its [`crate::generate::where_clause::digest`], salted) rather
+/// than drawn beside it, so the tier's other cases, and the rest of a keyed
+/// one, are the ones it drew before (as the `WHERE` arm is derived): `None`
+/// three times in four, unless `always`, which also gives every key a
+/// nullable part. Each key part is `NULL` (where nullable) two times in
+/// seven, `''` three in seven of the rest, and otherwise another of
+/// [`super::source_key::KEY_PART_VALUES`]; four `jb` updates in five and
+/// half of `ja`'s move their key.
+pub fn derived_key_draw(program: &Program, always: bool) -> Option<JoinedKeyDraw> {
+    use super::source_key::{KEY_PART_VALUES, Key, KeyDraw, KeyShape as SourceKeyShape};
+    struct Draws(u64);
+    impl Draws {
+        fn below(&mut self, n: usize) -> usize {
+            (split_mix(&mut self.0) % n as u64) as usize
+        }
+        fn part(&mut self, nullable: bool) -> Option<String> {
+            if nullable && self.below(7) < 2 {
+                return None;
+            }
+            Some(if self.below(7) < 3 {
+                String::new()
+            } else {
+                let rest = &KEY_PART_VALUES[1..];
+                rest[self.below(rest.len())].to_string()
+            })
+        }
+        fn key(&mut self, nullable: &[bool]) -> Key {
+            nullable.iter().map(|n| self.part(*n)).collect()
+        }
+    }
+    const DRAWS: usize = 32;
+    let mut d = Draws(crate::generate::where_clause::digest(program) ^ 0x2171_6b65_7973_0002);
+    if !always && d.below(4) != 0 {
+        return None;
+    }
+    let columns = 1 + d.below(2);
+    let mut nullable: Vec<bool> = (0..columns).map(|_| d.below(2) == 0).collect();
+    if always && !nullable.contains(&true) {
+        let at = d.below(columns);
+        nullable[at] = true;
+    }
+    let shape = SourceKeyShape {
+        nullable,
+        primary_key: d.below(2) == 0,
+    };
+    let any = vec![true; columns];
+    let inserts = (0..DRAWS).map(|_| d.key(&shape.nullable)).collect();
+    let moves = (0..DRAWS)
+        .map(|_| (d.below(5) != 0).then(|| d.key(&shape.nullable)))
+        .collect();
+    let a_inserts = (0..DRAWS).map(|_| d.key(&any)).collect();
+    let a_moves = (0..DRAWS)
+        .map(|_| (d.below(2) == 0).then(|| d.key(&any)))
+        .collect();
+    Some(JoinedKeyDraw {
+        key: KeyDraw {
+            shape,
+            inserts,
+            moves,
+        },
+        a_inserts,
+        a_moves,
+    })
+}
+
+/// `program`, a two-table 1-1 `JOIN` program ([`build_one_to_one_program`]),
+/// with `jb` read through a `KEY (...)` as `draw` says: `jb` gains one or
+/// two `text` key columns (`k0`, `k1`) under a unique index, `NULLS NOT
+/// DISTINCT` when any is nullable, keeps or drops its primary key and loses
+/// its other unique keys; `ja` gains nullable `text` columns of the same
+/// names; and every definition joins `ON ja.k0 = jb.k0 [AND ja.k1 = jb.k1]`
+/// with `jb KEY (k0[, k1])`. Every insert on either table writes drawn key
+/// values and updates may move them, from
+/// [`super::source_key::KEY_PART_VALUES`] and `NULL`, so `ja` rows point at
+/// `jb`'s `''` row and (matching nothing) at its `NULL` row.
+///
+/// `jb`'s expectations are recomputed ([`super::source_key::resimulate`]):
+/// an insert, key move or rekey onto a live row's key or id fails. `ja` has
+/// no unique key but its primary key, so its ops keep theirs. Every `jb` op
+/// of a burst is on one lane already ([`one_joined_lane`]), so no two
+/// lanes race a key.
+///
+/// # Panics
+///
+/// If `program` isn't a two-table 1-1 `JOIN` program, or a draw is empty.
+pub fn key_joined(mut program: Program, draw: &JoinedKeyDraw) -> Program {
+    use super::source_key::{Key, key_column};
+    use trellis::dev::defs::ast::{JoinOn, KeySpace, QualifiedColumn};
+    assert!(
+        !draw.key.inserts.is_empty()
+            && !draw.key.moves.is_empty()
+            && !draw.a_inserts.is_empty()
+            && !draw.a_moves.is_empty()
+    );
+    let columns: Vec<String> = (0..draw.key.shape.nullable.len()).map(key_column).collect();
+    for table in &mut program.tables {
+        assert!(
+            table.name == FROM_TABLE || table.name == JOINED_TABLE,
+            "a two-table 1-1 JOIN program, not {}",
+            table.name
+        );
+        table.columns.extend(columns.iter().map(|c| Column {
+            name: c.clone(),
+            value_type: ValueType::Text,
+        }));
+        if table.name == JOINED_TABLE {
+            table.unique_cols.clear();
+            table.unique_sets.clear();
+            table.source_key = Some(crate::model::SourceKey {
+                columns: columns.clone(),
+                nullable: columns
+                    .iter()
+                    .zip(&draw.key.shape.nullable)
+                    .filter(|(_, nullable)| **nullable)
+                    .map(|(c, _)| c.clone())
+                    .collect(),
+                primary_key: draw.key.shape.primary_key,
+            });
+        }
+    }
+    let column_of = |table: &str, column: &str| QualifiedColumn {
+        schema: None,
+        table: table.to_string(),
+        column: column.to_string(),
+    };
+    for def in &mut program.defs {
+        let KeySpace::JoinOneToOne(join) = &mut def.key_space else {
+            panic!("{} isn't a 1-1 JOIN", def.target);
+        };
+        let [joined] = join.joins.as_mut_slice() else {
+            panic!("{} isn't a two-table 1-1 JOIN", def.target);
+        };
+        joined.right_key = Some(columns.clone());
+        joined.on = columns
+            .iter()
+            .map(|c| JoinOn {
+                lhs: column_of(FROM_TABLE, c),
+                rhs: column_of(JOINED_TABLE, c),
+            })
+            .collect();
+    }
+
+    let with_key = |key: &Key| -> Vec<(String, Option<String>)> {
+        columns.iter().cloned().zip(key.iter().cloned()).collect()
+    };
+    let mut counts = [[0usize; 2]; 2];
+    for op in &mut program.ops {
+        let joined = op.table() == JOINED_TABLE;
+        let (inserts, moves) = if joined {
+            (&draw.key.inserts, &draw.key.moves)
+        } else {
+            (&draw.a_inserts, &draw.a_moves)
+        };
+        let [inserted, updated] = &mut counts[usize::from(joined)];
+        match op {
+            Op::Insert { row, .. } => {
+                row.extend(with_key(&inserts[*inserted % inserts.len()]));
+                *inserted += 1;
+            }
+            Op::Update { changes, .. } => {
+                if let Some(key) = &moves[*updated % moves.len()] {
+                    changes.extend(with_key(key));
+                }
+                *updated += 1;
+            }
+            Op::Delete { .. } | Op::Truncate { .. } => {}
+            other => unreachable!("the 1-1 JOIN tier draws no {other:?}"),
+        }
+    }
+    super::source_key::resimulate(&mut program, JOINED_TABLE);
+    program
+}
+
+/// What a [`key_joined`] program draws, by name, for the coverage floors:
+/// [`super::source_key::drawn`]'s names for `jb` (with `joined` its key
+/// space), `a_null` and `a_empty` when a `ja` row's `ON` values hold a
+/// `NULL` or a `''`, and `twins_live` when two live `jb` rows' keys are
+/// twins ([`super::source_key::twins`]: the `NULL` and `''` rows side by
+/// side). Empty for a program without a keyed `jb`.
+pub fn joined_key_drawn(program: &Program) -> std::collections::BTreeSet<String> {
+    use super::source_key::{Key, twins};
+    let mut out = super::source_key::drawn(program);
+    let Some(key) = program
+        .tables
+        .iter()
+        .find(|t| t.name == JOINED_TABLE)
+        .and_then(|t| t.source_key.as_ref())
+    else {
+        return out;
+    };
+    let key_of = |values: &[(String, Option<String>)]| -> Option<Key> {
+        key.columns
+            .iter()
+            .map(|c| values.iter().find(|(n, _)| n == c).map(|(_, v)| v.clone()))
+            .collect()
+    };
+    let mut live: std::collections::HashMap<String, Key> = Default::default();
+    for op in &program.ops {
+        let succeeded = *op.expect() == OpOutcome::Succeeds;
+        match op {
+            Op::Insert { table, row, .. } if table == FROM_TABLE => {
+                for value in key_of(row).into_iter().flatten() {
+                    match value.as_deref() {
+                        None => out.insert("a_null".into()),
+                        Some("") => out.insert("a_empty".into()),
+                        Some(_) => false,
+                    };
+                }
+            }
+            Op::Insert { row, .. } if succeeded => {
+                let id = row
+                    .iter()
+                    .find(|(c, _)| c == "id")
+                    .and_then(|(_, v)| v.clone());
+                live.insert(id.expect("an id"), key_of(row).expect("a key"));
+            }
+            Op::Update {
+                table, pk, changes, ..
+            } if table == JOINED_TABLE && succeeded => {
+                let mut k = live.remove(pk).expect("a live row");
+                if let Some(moved) = key_of(changes) {
+                    k = moved;
+                }
+                let id = changes
+                    .iter()
+                    .find(|(c, _)| c == "id")
+                    .and_then(|(_, v)| v.clone())
+                    .unwrap_or_else(|| pk.clone());
+                live.insert(id, k);
+            }
+            Op::Delete { table, pk, .. } if table == JOINED_TABLE => {
+                live.remove(pk);
+            }
+            Op::Truncate { table, .. } if table == JOINED_TABLE => live.clear(),
+            _ => {}
+        }
+        let keys: Vec<&Key> = live.values().collect();
+        if keys
+            .iter()
+            .enumerate()
+            .any(|(i, a)| keys[i + 1..].iter().any(|b| twins(a, b)))
+        {
+            out.insert("twins_live".into());
+        }
+    }
+    out
+}
+
 /// [`build_one_to_one_program`] issued by [`super::concurrent_plan`] in bursts
 /// of `burst_size` over `lanes` lanes ([`one_joined_lane`]), with `builds`'
 /// installs and actions (the aggregate JOIN tier's, [`super::join::add_join_actions`]).
@@ -1209,7 +1479,10 @@ pub fn star_case(
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::{one_to_one_case_strategy, star_case_strategy};
+pub use strategy::{
+    joined_key_case_strategy, one_to_one_case_strategy, star_case_strategy,
+    unkeyed_one_to_one_case_strategy,
+};
 
 #[cfg(feature = "proptest")]
 pub(crate) mod strategy {
@@ -1362,6 +1635,28 @@ pub(crate) mod strategy {
     /// burst sees the truncate before later writes repair what it left. One
     /// join key in ten is `NULL`.
     pub fn one_to_one_case_strategy() -> impl Strategy<Value = JoinCase> {
+        one_to_one_cases(Some(false))
+    }
+
+    /// [`one_to_one_case_strategy`]'s cases before the derived `KEY (...)`
+    /// arm ([`derived_key_draw`]): seed for seed, a case of the tier is its
+    /// twin here, keyed or not. `tests/join_star_tier.rs` pins these draws.
+    pub fn unkeyed_one_to_one_case_strategy() -> impl Strategy<Value = JoinCase> {
+        one_to_one_cases(None)
+    }
+
+    /// The 1-1 JOIN tier's `joined_key` case, its planted-bug gate for a
+    /// joined table read through `KEY (...)`: a
+    /// [`one_to_one_case_strategy`] case whose `jb` always has a nullable
+    /// key column ([`key_joined`], [`derived_key_draw`]).
+    pub fn joined_key_case_strategy() -> impl Strategy<Value = JoinCase> {
+        one_to_one_cases(Some(true))
+    }
+
+    /// [`one_to_one_case_strategy`]'s cases, `jb` read through `KEY (...)`
+    /// as [`derived_key_draw`] derives it (`Some(always)`), or never
+    /// (`None`).
+    fn one_to_one_cases(keyed: Option<bool>) -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             1 => Just(KeyShape::Spread),
             1 => Just(KeyShape::HotKey),
@@ -1370,7 +1665,7 @@ pub(crate) mod strategy {
             2 => Just(KeyShape::Racing)
         ]
         .prop_flat_map(|shape| (Just(shape), prop_oneof![1 => Just(false), 3 => Just(true)]))
-        .prop_flat_map(|(shape, truncating)| {
+        .prop_flat_map(move |(shape, truncating)| {
             let racing = shape == KeyShape::Racing;
             let truncating = truncating && !racing;
             let joined_weight =
@@ -1437,6 +1732,12 @@ pub(crate) mod strategy {
                         // A `WHERE` (#2043), derived from the program, so
                         // the draws are what they were.
                         case.program = crate::generate::where_clause::with_predicates(case.program);
+                        // Derived after the `WHERE`, so its draw is what it was.
+                        if let Some(draw) =
+                            keyed.and_then(|always| derived_key_draw(&case.program, always))
+                        {
+                            case.program = key_joined(case.program, &draw);
+                        }
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
                         if racing {
@@ -1794,6 +2095,85 @@ mod tests {
         }
     }
 
+    /// [`key_joined`] reads `jb` through its key on every definition, and
+    /// models the key's collisions: `jb`'s `NULL` and `''` rows are two
+    /// rows, a repeat of either collides, and a key move onto a live key
+    /// fails while one onto a freed key succeeds. `ja`'s ops keep their
+    /// expectations.
+    #[test]
+    fn a_keyed_joined_table_is_joined_on_its_key_and_its_collisions_fail() {
+        use super::super::source_key::{KeyDraw, KeyShape as SourceKeyShape};
+        let k = |v: Option<&str>| vec![v.map(str::to_string)];
+        let mut moving = draw(true, JoinOpKind::Update, 0, 0, 0);
+        moving.columns = 8;
+        let draws = [
+            draw(true, JoinOpKind::Insert, 0, 0, 0),
+            draw(true, JoinOpKind::Insert, 0, 1, 1),
+            draw(true, JoinOpKind::Insert, 0, 2, 2),
+            // Row 0 (NULL) onto row 1's '': fails.
+            moving,
+            draw(true, JoinOpKind::Delete, 1, 1, 0),
+            // Row 0 onto the freed '': succeeds.
+            moving,
+            draw(false, JoinOpKind::Insert, 0, 0, 0),
+            draw(false, JoinOpKind::Insert, 0, 0, 1),
+        ];
+        let spec = OneToOneSpec {
+            left: true,
+            on: OnShape::KeyUnique,
+            fields: vec![OneToOneField::BW],
+            more: Vec::new(),
+        };
+        let program = build_one_to_one_program(&[spec], KeyShape::Spread, &draws, &[]);
+        let program = key_joined(
+            program,
+            &JoinedKeyDraw {
+                key: KeyDraw {
+                    shape: SourceKeyShape {
+                        nullable: vec![true],
+                        primary_key: false,
+                    },
+                    inserts: vec![k(None), k(Some("")), k(None)],
+                    moves: vec![Some(k(Some("")))],
+                },
+                a_inserts: vec![k(Some("")), k(None)],
+                a_moves: vec![None],
+            },
+        );
+        use OpOutcome::{Fails, Succeeds};
+        let expects: Vec<&OpOutcome> = program.ops.iter().map(Op::expect).collect();
+        assert_eq!(
+            expects,
+            [
+                &Succeeds, &Succeeds, &Fails, &Fails, &Succeeds, &Succeeds, &Succeeds, &Succeeds
+            ]
+        );
+        let jb = &program.tables[1];
+        assert!(jb.unique_cols.is_empty() && jb.unique_sets.is_empty());
+        assert_eq!(jb.source_key.as_ref().unwrap().nullable, ["k0"]);
+        assert_eq!(
+            program.defs[0],
+            trellis::dev::defs::parse(
+                "TRANSFORM j0 FROM ja LEFT JOIN jb KEY (k0) ON ja.k0 = jb.k0 SELECT jb.w AS b_w"
+            )
+            .unwrap()
+        );
+        let drawn = joined_key_drawn(&program);
+        for name in [
+            "joined",
+            "nullable",
+            "no_primary_key",
+            "collision",
+            "move",
+            "move_from_null",
+            "a_null",
+            "a_empty",
+            "twins_live",
+        ] {
+            assert!(drawn.contains(name), "{name}: {drawn:?}");
+        }
+    }
+
     /// A tail truncate lands `back` ops before its burst's last op (the
     /// stream's last op for a short last burst), and never before the burst.
     #[test]
@@ -1871,7 +2251,9 @@ mod tests {
     /// constraints as Postgres judges them (a `NULL` in a set conflicts with
     /// nothing), every update and delete names a live row, and every burst
     /// keeps its `jb` ops on one lane. This checks the rows the stream
-    /// writes, not the generator's own model of them.
+    /// writes, not the generator's own model of them. In a keyed case
+    /// ([`key_joined`]) only the writes expected to succeed are applied, and
+    /// they never give two live `jb` rows one key (`NULL` parts equal).
     #[cfg(feature = "proptest")]
     #[test]
     fn drawn_streams_never_break_a_joined_unique_constraint() {
@@ -1879,11 +2261,24 @@ mod tests {
         use std::collections::{BTreeMap, BTreeSet};
         type Row = BTreeMap<String, Option<String>>;
         let strategy = one_to_one_case_strategy().boxed();
-        let (mut jb_writes, mut half_null_writes) = (0usize, 0usize);
+        let (mut jb_writes, mut half_null_writes, mut keyed_cases) = (0usize, 0usize, 0usize);
         for seed in 1..=8 {
             for case in crate::plant_sweep::seeded_cases(&strategy, seed, 40) {
                 let mut live: [BTreeMap<String, Row>; 2] = [BTreeMap::new(), BTreeMap::new()];
+                // A keyed `jb` (#2171) has its `KEY (...)` alone, `NULLS NOT
+                // DISTINCT`, and its expectations say which writes fail.
+                let keyed = case
+                    .program
+                    .tables
+                    .iter()
+                    .find(|t| t.name == JOINED_TABLE)
+                    .and_then(|t| t.source_key.clone());
+                keyed_cases += usize::from(keyed.is_some());
                 for (index, op) in case.program.ops.iter().enumerate() {
+                    if *op.expect() != OpOutcome::Succeeds {
+                        assert!(keyed.is_some(), "seed {seed} op {index}: {op:?}");
+                        continue;
+                    }
                     let (table, written) = match op {
                         Op::Insert { table, row, .. } => {
                             let side = usize::from(table == JOINED_TABLE);
@@ -1925,6 +2320,18 @@ mod tests {
                     jb_writes += 1;
                     let row = &live[1][&id];
                     half_null_writes += usize::from(row["c1"].is_some() && row["c2"].is_none());
+                    if let Some(key) = &keyed {
+                        let key_of = |row: &Row| -> Vec<Option<String>> {
+                            key.columns.iter().map(|c| row[c].clone()).collect()
+                        };
+                        for (other_id, other) in &live[1] {
+                            assert!(
+                                *other_id == id || key_of(other) != key_of(row),
+                                "seed {seed} op {index}: jb {id} and {other_id} share a key"
+                            );
+                        }
+                        continue;
+                    }
                     for set in [&["u"][..], &["s"], &["c1", "c2"]] {
                         let key: Option<Vec<&String>> =
                             set.iter().map(|c| row[*c].as_ref()).collect();
@@ -1960,6 +2367,10 @@ mod tests {
         }
         assert!(jb_writes > 10_000, "{jb_writes}");
         assert!(half_null_writes > 100, "{half_null_writes}");
+        assert!(
+            (40..=120).contains(&keyed_cases),
+            "{keyed_cases} of 320 keyed"
+        );
     }
 
     /// A star over `tables` tables with every position `LEFT` or `INNER` in

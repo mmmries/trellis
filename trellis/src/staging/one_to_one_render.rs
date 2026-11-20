@@ -194,12 +194,12 @@ impl OneToOneRender {
             return "(select 1 as __none) s".to_string();
         }
         // Planted bug: a column the image lacks reads as `NULL`. See
-        // `crate::plant`.
+        // `crate::plant`. Whether an image lacks one shows only when the
+        // statement runs, so `quarantine::classify` counts the reach.
         #[cfg(any(test, feature = "test-util"))]
-        let unimaged_as_null = crate::plant::fires(
-            crate::plant::Plant::O2oWhereColumnNotImaged,
-            self.predicate.is_some(),
-        );
+        let unimaged_as_null = self.predicate.is_some()
+            && crate::plant::armed() == Some(crate::plant::Plant::O2oWhereColumnNotImaged)
+            && crate::plant::fires(crate::plant::Plant::O2oWhereColumnNotImaged, true);
         #[cfg(not(any(test, feature = "test-util")))]
         let unimaged_as_null = false;
         let casts: Vec<String> = self
@@ -217,7 +217,7 @@ impl OneToOneRender {
                 } else {
                     format!(
                         "({} || pg_catalog.left({image}::text, 0))::integer::text",
-                        quote_literal(&format!("the row has no column {}", c.name))
+                        quote_literal(&format!("{UNIMAGED_COLUMN} {}", c.name))
                     )
                 };
                 format!(
@@ -304,6 +304,11 @@ pub(crate) fn on_conflict_by_text(
         excluded.join(", ")
     )
 }
+
+/// The start of the data exception a page's statement raises for an image
+/// that lacks a column it reads, followed by the column's name
+/// ([`OneToOneRender::row_sql`], `group_basis`'s `contributes`).
+pub(crate) const UNIMAGED_COLUMN: &str = "the row has no column";
 
 /// Whether `err` is a data exception, SQLSTATE class 22: a value a field
 /// can't be computed from (an overflow, an invalid regex, an out-of-range

@@ -215,6 +215,7 @@ async fn a_build_over_an_out_of_range_interval_sum_pauses_where_the_oracle_raise
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     };
     let def = TransformDef {
         target: "ov_t".to_string(),
