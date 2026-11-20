@@ -88,9 +88,22 @@ enum Form {
 
 /// Whether `table` takes statement forms: a plain table keyed by its
 /// primary key alone. `ON CONFLICT` names that key, and `MERGE` moving a row
-/// between partitions stays pinned out (#942).
+/// between partitions stays pinned out (#942). An upserted update proposes
+/// a row of the key and the written columns alone, so a `NOT NULL` column
+/// it doesn't write (a `KEY (...)` column, #2171) fails it before the
+/// conflict is found.
+///
+/// The pattern names every field, so a new one is decided here.
 fn takes_forms(table: &Table) -> bool {
-    table.partitioning.is_none() && table.unique_cols.is_empty() && table.unique_sets.is_empty()
+    let Table {
+        name: _,
+        pk_col: _,
+        columns: _,
+        unique_cols,
+        unique_sets,
+        partitioning,
+    } = table;
+    partitioning.is_none() && unique_cols.is_empty() && unique_sets.is_empty()
 }
 
 /// Rewrites some of `program`'s single-row writes into a statement form

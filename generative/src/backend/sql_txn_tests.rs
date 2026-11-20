@@ -251,6 +251,24 @@ async fn an_unexpected_failure_rolls_the_transaction_back() {
 /// and runs again from the start, then commits.
 #[tokio::test]
 async fn a_serialization_failure_is_retried_from_the_start() {
+    retried_after_a_concurrent_update(OpOutcome::Succeeds).await;
+}
+
+/// The same failure in an op that may fail, which runs in its own
+/// savepoint, reruns the whole transaction too: it isn't the op's failure.
+#[tokio::test]
+async fn a_serialization_failure_in_an_op_that_may_fail_is_retried_from_the_start() {
+    retried_after_a_concurrent_update(OpOutcome::AnyOf(vec![
+        OpOutcome::Succeeds,
+        OpOutcome::Fails,
+    ]))
+    .await;
+}
+
+/// [`apply_txn`] of one `REPEATABLE READ` update of row 1, expecting
+/// `expect`, whose snapshot predates another session's update of the row:
+/// it is retried once, then commits.
+async fn retried_after_a_concurrent_update(expect: OpOutcome) {
     use OpOutcome::Succeeds;
     let cluster = testkit::TestCluster::start();
     let db = database(&cluster).await;
@@ -270,7 +288,7 @@ async fn a_serialization_failure_is_retried_from_the_start() {
     let dsn = db.dsn().to_string();
     let wrapped = tokio::spawn(async move {
         let mut raw = connect(&dsn).await;
-        let ops = [update(1, "2.00", Succeeds)];
+        let ops = [update(1, "2.00", expect)];
         apply_txn(&mut raw, &tables, &wrap(1, Isolation::RepeatableRead), &ops).await
     });
     let watcher = connect(db.dsn()).await;

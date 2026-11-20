@@ -1564,85 +1564,81 @@ pub(crate) mod strategy {
     /// any table. One case in four also runs its metamorphic twin, under a
     /// drawn `JOIN` order.
     pub fn star_case_strategy() -> impl Strategy<Value = StarCase> {
-        (2usize..=MAX_TABLES)
-            .prop_flat_map(|tables| {
-                let positions = (1..tables as u8).collect::<Vec<u8>>();
+        // Transaction shapes and statement forms (#2181), derived from the
+        // program, so the draws are what they were.
+        unwidened_star_cases().prop_map(crate::generate::txn_shapes::widen_star)
+    }
+
+    /// [`star_case_strategy`]'s cases before [`crate::generate::txn_shapes::widen_star`].
+    fn unwidened_star_cases() -> impl Strategy<Value = StarCase> {
+        (2usize..=MAX_TABLES).prop_flat_map(|tables| {
+            let positions = (1..tables as u8).collect::<Vec<u8>>();
+            (
+                proptest::collection::vec(star_spec(tables), 1..=2),
+                proptest::collection::vec(star_draw(tables), 200..=600),
+                proptest::collection::vec(page(), 8..=32),
+                proptest::sample::select(positions.clone()),
+                1usize..=STAR_MAX_PAGE_ROWS,
+                Just(positions).prop_shuffle(),
+                30usize..=150,
+                2usize..=4,
+                20u64..=200,
+                builds(),
+                0u64..=STAR_COMMIT_STALL_MS,
                 (
-                    proptest::collection::vec(star_spec(tables), 1..=2),
-                    proptest::collection::vec(star_draw(tables), 200..=600),
-                    proptest::collection::vec(page(), 8..=32),
-                    proptest::sample::select(positions.clone()),
-                    1usize..=STAR_MAX_PAGE_ROWS,
-                    Just(positions).prop_shuffle(),
-                    30usize..=150,
-                    2usize..=4,
-                    20u64..=200,
-                    builds(),
-                    0u64..=STAR_COMMIT_STALL_MS,
-                    (
-                        prop_oneof![3 => Just(false), 1 => Just(true)],
-                        1u64..=STAR_LOCK_STEP_STALL_MS,
-                        proptest::option::of(1usize..=STAR_MAX_FAN_OUT_CHUNK_ROWS),
-                        proptest::option::weighted(0.75, 2i64..=STAR_MAX_SPLIT_ROWS),
-                        proptest::option::weighted(0.75, 2_000u64..=STAR_MAX_PACE_MICROS),
-                        proptest::collection::vec(
-                            proptest::option::weighted(0.75, tail_race(tables)),
-                            1..=8,
-                        ),
+                    prop_oneof![3 => Just(false), 1 => Just(true)],
+                    1u64..=STAR_LOCK_STEP_STALL_MS,
+                    proptest::option::of(1usize..=STAR_MAX_FAN_OUT_CHUNK_ROWS),
+                    proptest::option::weighted(0.75, 2i64..=STAR_MAX_SPLIT_ROWS),
+                    proptest::option::weighted(0.75, 2_000u64..=STAR_MAX_PACE_MICROS),
+                    proptest::collection::vec(
+                        proptest::option::weighted(0.75, tail_race(tables)),
+                        1..=8,
                     ),
-                )
-                    .prop_map(
-                        move |(
-                            specs,
-                            mut draws,
-                            pages,
-                            late_position,
-                            drain_batch_cap,
-                            join_order,
+                ),
+            )
+                .prop_map(
+                    move |(
+                        specs,
+                        mut draws,
+                        pages,
+                        late_position,
+                        drain_batch_cap,
+                        join_order,
+                        burst_size,
+                        lanes,
+                        seal_interval_ms,
+                        builds,
+                        stall_ms,
+                        (metamorphic, lock_step_ms, fan_out_chunk_rows, split_rows, pace, races),
+                    )| {
+                        shape_pages(&mut draws, &pages, tables, late_position);
+                        place_tail_races(&mut draws, burst_size, &races, tables, late_position);
+                        star_case(
+                            &specs,
+                            tables,
+                            &draws,
+                            &builds,
                             burst_size,
                             lanes,
                             seal_interval_ms,
-                            builds,
-                            stall_ms,
-                            (
-                                metamorphic,
-                                lock_step_ms,
+                            std::time::Duration::from_millis(stall_ms),
+                            StarKnobs {
+                                drain_batch_cap,
+                                lock_step_stall: std::time::Duration::from_millis(lock_step_ms),
+                                stalled_lock_steps_per_mille: STAR_STALLED_LOCK_STEPS_PER_MILLE,
+                                rederived_pages_per_mille: STAR_REDERIVED_PAGES_PER_MILLE,
                                 fan_out_chunk_rows,
                                 split_rows,
-                                pace,
-                                races,
-                            ),
-                        )| {
-                            shape_pages(&mut draws, &pages, tables, late_position);
-                            place_tail_races(&mut draws, burst_size, &races, tables, late_position);
-                            star_case(
-                                &specs,
-                                tables,
-                                &draws,
-                                &builds,
-                                burst_size,
-                                lanes,
-                                seal_interval_ms,
-                                std::time::Duration::from_millis(stall_ms),
-                                StarKnobs {
-                                    drain_batch_cap,
-                                    lock_step_stall: std::time::Duration::from_millis(lock_step_ms),
-                                    stalled_lock_steps_per_mille: STAR_STALLED_LOCK_STEPS_PER_MILLE,
-                                    rederived_pages_per_mille: STAR_REDERIVED_PAGES_PER_MILLE,
-                                    fan_out_chunk_rows,
-                                    split_rows,
-                                    pace: pace.map(std::time::Duration::from_micros),
-                                    late_position,
-                                    metamorphic,
-                                },
-                                join_order,
-                            )
-                        },
-                    )
-            })
-            // Transaction shapes and statement forms (#2181), derived from the
-            // program, so the draws are what they were.
-            .prop_map(crate::generate::txn_shapes::widen_star)
+                                pace: pace.map(std::time::Duration::from_micros),
+                                late_position,
+                                metamorphic,
+                            },
+                            join_order,
+                        )
+                    },
+                )
+        })
     }
 }
 
