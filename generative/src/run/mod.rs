@@ -21,6 +21,7 @@ mod coverage;
 mod db_admin;
 mod epoch;
 mod held_keys;
+mod hidden;
 mod noise;
 mod pause;
 mod residue;
@@ -37,6 +38,7 @@ pub use held_keys::{
     DefModel, HeldExpectation, HeldKeySummary, TRANSFORM_FUSE, run_convergence_with_held_keys,
     run_convergence_with_isolation,
 };
+pub use hidden::{HiddenReport, SETTLE, check_hidden};
 pub use noise::run_convergence_with_noise;
 pub use residue::{
     LAP_SEAL_INTERVAL, ResidueReport, TableResidue, check_residue, peak_live_rows,

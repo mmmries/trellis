@@ -250,6 +250,11 @@ mod residue {
     use generative::backend::CaseDatabase;
     use generative::run::{LAP_SEAL_INTERVAL, ResidueReport, check_residue, run_epochs_lapping};
 
+    /// The engine's housekeeping interval, where the ring's tail retires and
+    /// the tombstones and zero groups are collected. At the engine's 5s
+    /// default, settling at each epoch's quiet point would be most of the run.
+    const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
     /// Runs `case`'s chain, lapping the ring, against a provisioned database.
     pub(super) fn run_lapping_case(case: &EpochCase) -> Result<ResidueReport, TestCaseError> {
         let chain = chain(case);
@@ -266,6 +271,7 @@ mod residue {
                 .expect("connect backend");
                 backend.set_strict_audit(true);
                 backend.set_reconcile_interval(RECONCILE_INTERVAL);
+                backend.set_housekeeping_interval(HOUSEKEEPING_INTERVAL);
                 let config = Config::from_dsn(db.dsn().to_string()).expect("config");
                 let pool = Pool::new(&config).expect("pool");
                 match run_epochs_lapping(&mut backend, &pool, &config, db.roles(), &chain).await {
@@ -349,6 +355,16 @@ mod residue {
             report.laps()
         );
         assert!(!report.last.is_empty(), "no table was checked: {report:?}");
+        assert!(
+            report.hidden.hidden.keys().any(|t| t.ends_with("__ledger"))
+                && report
+                    .hidden
+                    .hidden
+                    .keys()
+                    .any(|t| t.starts_with("trellis.agg_")),
+            "no hidden table was counted: {report:?}"
+        );
+        assert!(!report.hidden.captured.is_empty(), "no capture: {report:?}");
         assert!(
             report.last.iter().any(|t| t.table.ends_with("__ledger\"")),
             "no 1-1 ledger was checked: {report:?}"
@@ -435,6 +451,210 @@ mod residue {
                         "{failures:?}"
                     ),
                     other => panic!("growth went unseen: {other:?}"),
+                }
+            })
+        });
+    }
+    /// What the planted tests below keep of a chain that ran.
+    struct Kept {
+        db: CaseDatabase,
+        backend: ManualBackend,
+        config: Config,
+        pool: Pool,
+        program: generative::model::Program,
+        defined: Vec<trellis::dev::defs::ast::TransformDef>,
+    }
+
+    impl Kept {
+        /// [`check_hidden`] over the instance, given `settle` to settle in.
+        async fn hidden(
+            &self,
+            settle: std::time::Duration,
+        ) -> Result<generative::run::HiddenReport, RunError> {
+            generative::run::check_hidden(
+                &self.config,
+                self.db.roles(),
+                &self.pool,
+                &self.program,
+                &self.defined,
+                settle,
+            )
+            .await
+        }
+    }
+
+    /// Runs `case`'s chain, lapping the ring, and keeps the instance.
+    async fn run_keeping(h: &Harness, case: &EpochCase) -> Kept {
+        let chain = chain(case);
+        let db = CaseDatabase::provision(&h.cluster).await;
+        let mut backend =
+            ManualBackend::connect_as_with_options(db.roles(), WORKERS, Some(LAP_SEAL_INTERVAL))
+                .await
+                .expect("connect backend");
+        backend.set_strict_audit(true);
+        backend.set_reconcile_interval(RECONCILE_INTERVAL);
+        backend.set_housekeeping_interval(HOUSEKEEPING_INTERVAL);
+        let config = Config::from_dsn(db.dsn().to_string()).expect("config");
+        let pool = Pool::new(&config).expect("pool");
+        run_epochs_lapping(&mut backend, &pool, &config, db.roles(), &chain)
+            .await
+            .unwrap_or_else(|e| panic!("the chain should leave no residue: {e:?}"));
+        let mut defined = chain.program.defs.clone();
+        for epoch in &chain.epochs {
+            for step in &epoch.steps {
+                generative::generate::epoch::apply_step(&mut defined, step);
+            }
+        }
+        Kept {
+            db,
+            backend,
+            config,
+            pool,
+            program: chain.program.clone(),
+            defined,
+        }
+    }
+
+    /// Plants: each leaves a row, table or trigger behind that no current
+    /// definition owns, as a drop that forgot it would. The oracle passes
+    /// throughout, so only [`check_hidden`] can name them.
+    #[test]
+    fn plant_hidden_rows_left_by_a_drop_are_caught() {
+        use generative::backend::Backend;
+        use generative::generate::epoch::{EpochChangeDraw, EpochChangeKind, EpochDraw};
+        use generative::generate::{AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec};
+        use generative::run::check_defs;
+
+        let case = EpochCase {
+            tables: vec![TableSpec::numeric_only(
+                vec![(Some(1), Some(2)), (Some(3), None), (None, Some(5))],
+                vec![Mutate::Delete { pk: 2 }],
+            )],
+            defs: vec![
+                (0, DefShape::OneToOne, None),
+                (
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![AggregateFn::Sum(AggregateColumn::C1)],
+                    },
+                    None,
+                ),
+            ],
+            epochs: vec![
+                EpochDraw {
+                    changes: vec![EpochChangeDraw {
+                        kind: EpochChangeKind::Redefine,
+                        target: 0,
+                    }],
+                    mutates: vec![vec![Mutate::Update {
+                        pk: 1,
+                        c1: Some(8),
+                        c2: Some(2),
+                    }]],
+                },
+                EpochDraw {
+                    changes: Vec::new(),
+                    mutates: vec![vec![Mutate::Update {
+                        pk: 3,
+                        c1: Some(4),
+                        c2: Some(6),
+                    }]],
+                },
+            ],
+        };
+        HARNESS.with(|h| {
+            h.runtime.block_on(async {
+                let mut kept = run_keeping(h, &case).await;
+                let operator = operator(&kept.db).await;
+                let one_to_one = kept
+                    .defined
+                    .iter()
+                    .find(|d| matches!(d.key_space, trellis::dev::defs::ast::KeySpace::OneToOne))
+                    .expect("a 1-1 definition")
+                    .target
+                    .clone();
+                kept.hidden(generative::run::SETTLE).await.expect("no residue before any plant");
+
+                // Each plant, with what the failure must name, and its undo.
+                let plants: Vec<(String, &str, String, &str)> = vec![
+                    (
+                        // A dropped key's entry, kept in a live ledger.
+                        format!(
+                            "insert into public.\"{one_to_one}__ledger\" (__from_key) values ('999')"
+                        ),
+                        "ledger",
+                        format!("delete from public.\"{one_to_one}__ledger\" where __from_key = '999'"),
+                        "hidden tables",
+                    ),
+                    (
+                        // A dropped aggregate's group table.
+                        "create table trellis.agg_9999 as select 1 as g".into(),
+                        "agg_9999",
+                        "drop table trellis.agg_9999".into(),
+                        "hidden tables",
+                    ),
+                    (
+                        // A dropped 1-1's ledger.
+                        "create table public.gone__ledger (__from_key text primary key)".into(),
+                        "gone__ledger",
+                        "drop table public.gone__ledger".into(),
+                        "hidden tables",
+                    ),
+                    (
+                        // A dropped definition's catalog row.
+                        "insert into trellis.schema_nodes (table_name, is_source, is_target) \
+                         values ('public.gone', false, true)"
+                            .into(),
+                        "public.gone",
+                        "delete from trellis.schema_nodes where table_name = 'public.gone'".into(),
+                        "catalog",
+                    ),
+                    (
+                        // A row a drained ring slot kept.
+                        "insert into trellis.seg_1 (src_table, key, op) values ('public.t0', '1', 'recompute')"
+                            .into(),
+                        "seg_1",
+                        "truncate trellis.seg_1".into(),
+                        "ring",
+                    ),
+                    (
+                        // A capture trigger on a table nothing reads.
+                        "create table public.unread (id int primary key); \
+                         do $$ declare f text; begin \
+                           select p.oid::regproc::text into f from pg_proc p \
+                           join pg_namespace n on n.oid = p.pronamespace \
+                           where n.nspname = 'trellis' and p.proname like 'cap\\_insert\\_%' limit 1; \
+                           execute format('create trigger trellis_capture_insert after insert on public.unread \
+                                           for each row execute function %s()', f); end $$"
+                            .into(),
+                        "public.unread",
+                        "drop table public.unread".into(),
+                        "capture",
+                    ),
+                ];
+                for (plant, names, undo, class) in &plants {
+                    operator.batch_execute(plant).await.expect("plant");
+                    match kept.hidden(std::time::Duration::ZERO).await {
+                        Err(RunError::Residue { failures }) => assert!(
+                            failures
+                                .iter()
+                                .any(|f| f.starts_with(class) && f.contains(names)),
+                            "{plant}: {failures:?}"
+                        ),
+                        other => panic!("{plant} went unseen: {other:?}"),
+                    }
+                    // The oracle sees nothing wrong.
+                    kept.backend.quiesce().await.expect("quiesce");
+                    let snapshot = kept.backend.snapshot().await.expect("snapshot");
+                    let diverged =
+                        check_defs(&kept.pool, &kept.program, &kept.defined, &snapshot)
+                            .await
+                            .expect("oracle");
+                    assert!(diverged.is_empty(), "{plant}: the oracle saw it");
+                    operator.batch_execute(undo).await.expect("undo");
+                    kept.hidden(generative::run::SETTLE)
+                        .await
+                        .expect("clean again after the undo");
                 }
             })
         });
