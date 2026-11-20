@@ -915,6 +915,10 @@ fn sweep_tier(
         generative::plant_sweep::NO_EXTREMES,
     ));
     not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
+    ));
+    not_gated.extend(not_on_path(
         &[PlantPath::SourceKey],
         generative::plant_sweep::NO_SOURCE_KEY,
     ));

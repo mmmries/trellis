@@ -244,6 +244,15 @@ pub trait ClusterControl {
     /// Stops the server in `mode` and starts it again, returning once it
     /// accepts connections. Every open connection is severed.
     fn restart_postgres(&self, mode: RestartMode);
+
+    /// Freezes every database and moves the next transaction id to `lead`
+    /// ids short of the next 32-bit epoch boundary, restarting the server
+    /// for each jump (`testkit::TestCluster::age_xids_to_epoch_edge`).
+    /// `lead` is a multiple of `testkit::XID_PAGE`.
+    fn age_xids_to_epoch_edge(&self, lead: u32);
+
+    /// Assigns and commits `count` transaction ids.
+    fn burn_xids(&self, count: u32);
 }
 
 impl ClusterControl for testkit::TestCluster {
@@ -252,6 +261,14 @@ impl ClusterControl for testkit::TestCluster {
             RestartMode::Fast => testkit::StopMode::Fast,
             RestartMode::Immediate => testkit::StopMode::Immediate,
         });
+    }
+
+    fn age_xids_to_epoch_edge(&self, lead: u32) {
+        testkit::TestCluster::age_xids_to_epoch_edge(self, lead);
+    }
+
+    fn burn_xids(&self, count: u32) {
+        testkit::TestCluster::burn_xids(self, count);
     }
 }
 

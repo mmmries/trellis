@@ -4165,6 +4165,12 @@ mod strategy {
             2 => Just(DbAdminAction::Checkpoint),
             2 => Just(DbAdminAction::RestartPostgres(RestartMode::Fast)),
             1 => Just(DbAdminAction::RestartPostgres(RestartMode::Immediate)),
+            2 => Just(DbAdminAction::VacuumFreeze),
+            // A wrap restarts the server once or more (about a second), and
+            // its tail lands the crossing anywhere from the action itself to
+            // a few ops later.
+            1 => prop_oneof![Just(0u32), 1u32..=16, 17u32..=256]
+                .prop_map(|tail| DbAdminAction::WrapXids { tail }),
         ]
     }
 

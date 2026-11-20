@@ -110,7 +110,20 @@ pub enum PlantPath {
     /// the source (its side 7). Only a tier that audits a `MIN`/`MAX`
     /// definition by `self_check` reaches it.
     SelfCheckExtremes,
+    /// The drain's transaction-id comparisons past the first 32-bit epoch.
+    /// Only the `db_admin` property's xid-aging action
+    /// (`crate::model::DbAdminAction::WrapXids`) crosses the boundary, and
+    /// it is no planted-bug sweep tier, so no tier gates these: every
+    /// tier lists them in its `not_gated` with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
+    /// and `db_admin.rs`'s wrap pin gate them.
+    XidEpoch,
 }
+
+/// Why no sweep tier gates a [`PlantPath::XidEpoch`] plant.
+pub const NO_XID_EPOCH: &str = "no sweep tier crosses the 32-bit xid epoch; the db_admin \
+     property's wrap action does, and staging's \
+     sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows and db_admin.rs's \
+     a_wrap_across_the_epoch_boundary_with_work_in_flight_converges pin it";
 
 /// The path `plant` breaks.
 pub fn plant_path(plant: Plant) -> PlantPath {
@@ -208,6 +221,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarHeldOriginFirstOnly
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
+        Plant::FenceXid32 => PlantPath::XidEpoch,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
     }
 }
@@ -230,6 +244,8 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         // A reader of a target can be of any kind, and so can a reader of a
         // keyed source.
         PlantPath::Chain | PlantPath::SourceKey => true,
+        // Every target drains through the fenced read.
+        PlantPath::XidEpoch => true,
     }
 }
 
@@ -993,7 +1009,7 @@ mod tests {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Chain | PlantPath::SourceKey => {
+                PlantPath::Chain | PlantPath::XidEpoch | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");
                 }

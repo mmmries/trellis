@@ -1383,6 +1383,10 @@ fn extremes_tamper_sweep_tier() -> SweepTier {
         "the tampering tier runs a settled program and gates only self_check's comparison of \
          the extremes; the plant's own path is gated by the tier its comment names",
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
+    ));
     SweepTier {
         name: baseline_quarantine::EXTREMES_TAMPER_TIER,
         known_misses: &[],

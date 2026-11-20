@@ -969,6 +969,17 @@ pub enum Plant {
     /// Pinned by `group_basis_where`'s
     /// `an_image_without_the_predicate_column_fails_the_page`.
     GbWhereColumnNotImaged,
+    /// The drain compares transaction ids truncated to 32 bits: a batch's
+    /// fenced read (`staging::seal`'s `window_over_fence`) takes its fences
+    /// with each id cut to its low 32 bits, while the ring's `row_txid`s stay
+    /// full `xid8`s. Past the first 32-bit epoch a fence then sees none of
+    /// the rows it fenced, and their changes never apply.
+    ///
+    /// Pinned by `staging`'s `sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows`.
+    /// Only the `db_admin` property's xid-aging action crosses the
+    /// boundary, so no planted-bug sweep tier gates it
+    /// (`generative::plant_sweep`'s `PlantPath::XidEpoch`).
+    FenceXid32,
     /// #2126 (`null_key_as_empty`): capture renders a nullable `KEY (...)`
     /// column's part of the ring key as its bare text
     /// (`capture::sql`'s `key_expr`), so a `NULL` part reads as `''` rather
@@ -1078,6 +1089,7 @@ impl Plant {
         Plant::JoinWhereMUnfiltered,
         Plant::O2oWhereColumnNotImaged,
         Plant::GbWhereColumnNotImaged,
+        Plant::FenceXid32,
         Plant::NullKeyAsEmpty,
     ];
 
@@ -1176,6 +1188,7 @@ impl Plant {
             Plant::JoinWhereMUnfiltered => "join_where_m_unfiltered",
             Plant::O2oWhereColumnNotImaged => "o2o_where_column_not_imaged",
             Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
+            Plant::FenceXid32 => "fence_xid32",
             Plant::NullKeyAsEmpty => "null_key_as_empty",
         }
     }
@@ -1255,6 +1268,34 @@ pub fn fires(plant: Plant, changes_behavior: bool) -> bool {
         FIRED.fetch_add(1, Ordering::Relaxed);
     }
     fires
+}
+
+/// Whether a `pg_snapshot`'s text names an id past the first 32-bit epoch,
+/// so cutting its ids to 32 bits changes it ([`Plant::FenceXid32`]).
+pub(crate) fn snapshot_past_first_epoch(snapshot: &str) -> bool {
+    snapshot_ids(snapshot).any(|id| id > u64::from(u32::MAX))
+}
+
+/// A `pg_snapshot`'s text with each id cut to its low 32 bits
+/// ([`Plant::FenceXid32`]).
+pub(crate) fn snapshot_as_32_bit(snapshot: &str) -> String {
+    let (head, xip) = snapshot.rsplit_once(':').unwrap_or((snapshot, ""));
+    let cut = |part: &str| {
+        part.split(',')
+            .filter(|id| !id.is_empty())
+            .map(|id| (id.parse::<u64>().expect("a snapshot id") & u64::from(u32::MAX)).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (xmin, xmax) = head.split_once(':').expect("xmin:xmax:xip");
+    format!("{}:{}:{}", cut(xmin), cut(xmax), cut(xip))
+}
+
+fn snapshot_ids(snapshot: &str) -> impl Iterator<Item = u64> + '_ {
+    snapshot
+        .split([':', ','])
+        .filter(|id| !id.is_empty())
+        .map(|id| id.parse::<u64>().expect("a snapshot id"))
 }
 
 /// The hook of a site whose precondition costs a query the correct path
@@ -1474,6 +1515,15 @@ mod tests {
         assert!(fired() >= fired_before + 2);
         assert!(count(plant.name()) >= plant_before + 31);
         assert!(count(marker.name()) >= marker_before + 41);
+    }
+
+    #[test]
+    fn a_snapshot_cut_to_32_bits() {
+        let snapshot = "4294967300:4294967310:4294967301,4294967305";
+        assert!(snapshot_past_first_epoch(snapshot));
+        assert_eq!(snapshot_as_32_bit(snapshot), "4:14:5,9");
+        assert!(!snapshot_past_first_epoch("700:710:"));
+        assert_eq!(snapshot_as_32_bit("700:710:"), "700:710:");
     }
 
     #[test]
