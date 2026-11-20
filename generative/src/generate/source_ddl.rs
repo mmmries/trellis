@@ -47,7 +47,7 @@ impl Menu {
     fn actions(self) -> u8 {
         match self {
             Menu::Maintenance => 7,
-            Menu::Privilege => 10,
+            Menu::Privilege => 11,
         }
     }
 }
@@ -190,6 +190,7 @@ fn privilege(action: u8, target: String) -> SourceDdl {
         6 => SourceDdl::WriterChange,
         7 => SourceDdl::RevokeTargetWrites { target },
         8 => SourceDdl::TargetRls { target },
+        9 => SourceDdl::TargetTriggerRefused { target },
         _ => SourceDdl::RevokeMembership,
     }
 }

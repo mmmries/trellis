@@ -72,10 +72,15 @@ pub enum SourceDdl {
     /// that owns it, and granted back at the close.
     RevokeTargetWrites { target: String },
     /// The drain's own refusal: row-level security enabled and forced on
-    /// `target`, with no policy; disabled at the close. The catalog can't
-    /// pin it on a table, so a drain meeting it holds the page up
-    /// (`docs/observability.md`, "A halting failure").
+    /// `target`, with no policy; disabled at the close. The catalog pins it
+    /// on the target, so the target's writer halts.
     TargetRls { target: String },
+    /// The drain's own refusal through the application's trigger on
+    /// `target`: a statement trigger writing a table the Trellis role can't
+    /// write, dropped at the close. The catalog can't pin that on a table,
+    /// so a drain meeting it holds the page up (`docs/observability.md`,
+    /// "A halting failure").
+    TargetTriggerRefused { target: String },
 }
 
 impl SourceDdl {
@@ -101,6 +106,7 @@ impl SourceDdl {
                 | SourceDdl::WriterChange
                 | SourceDdl::RevokeTargetWrites { .. }
                 | SourceDdl::TargetRls { .. }
+                | SourceDdl::TargetTriggerRefused { .. }
         )
     }
 
@@ -122,9 +128,9 @@ impl SourceDdl {
     /// drain's own refusals.
     pub fn refused_target(&self) -> Option<&str> {
         match self {
-            SourceDdl::RevokeTargetWrites { target } | SourceDdl::TargetRls { target } => {
-                Some(target)
-            }
+            SourceDdl::RevokeTargetWrites { target }
+            | SourceDdl::TargetRls { target }
+            | SourceDdl::TargetTriggerRefused { target } => Some(target),
             _ => None,
         }
     }
@@ -155,6 +161,7 @@ impl SourceDdl {
             SourceDdl::WriterChange => "writer_change",
             SourceDdl::RevokeTargetWrites { .. } => "revoke_target_writes",
             SourceDdl::TargetRls { .. } => "target_rls",
+            SourceDdl::TargetTriggerRefused { .. } => "target_trigger_refused",
         }
     }
 }

@@ -178,6 +178,7 @@ fn drawn_privilege_plans_stay_in_bounds_and_cover_every_change() {
         "writer_change",
         "revoke_target_writes",
         "target_rls",
+        "target_trigger_refused",
     ] {
         for pass in [false, true] {
             // #2227: drawn only across a pass until the fix.
@@ -448,6 +449,23 @@ async fn row_level_security_on_a_target_halts_its_writer_only() {
         "{verdicts:?}"
     );
     assert_eq!(verdicts[1], Verdict::Exact);
+}
+
+/// The application's trigger on the 1-1's target writes a table Trellis
+/// can't write: the catalog can't pin that on a table, so the drain holds
+/// the page up, reports it as `drain_failure`, and commits it once the
+/// trigger is dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_trigger_refused_holds_the_page_up_until_dropped() {
+    let (program, _) = rewired_program();
+    let target = program.defs[0].target.clone();
+    let (run, verdicts) = run_one(SourceDdl::TargetTriggerRefused { target }, false).await;
+    assert!(
+        matches!(&run.refusals[..], [(_, RefusalSeen::HeldUp { .. })]),
+        "{:?}",
+        run.refusals
+    );
+    assert_eq!(verdicts, vec![Verdict::Exact, Verdict::Exact]);
 }
 
 /// The I6 check's control: an application statement failing inside a

@@ -120,6 +120,27 @@ pub(super) fn statements(
                 )],
             )
         }
+        SourceDdl::TargetTriggerRefused { .. } => {
+            let target = target.expect("a drain refusal names its target");
+            (
+                vec![
+                    "CREATE TABLE public.gen_refused (n int)".to_string(),
+                    "CREATE FUNCTION public.gen_refused_write() RETURNS trigger \
+                     LANGUAGE plpgsql AS $$ BEGIN INSERT INTO public.gen_refused VALUES (1); \
+                     RETURN NULL; END $$"
+                        .to_string(),
+                    format!(
+                        "CREATE TRIGGER gen_refused AFTER INSERT OR UPDATE OR DELETE ON {target} \
+                         FOR EACH STATEMENT EXECUTE FUNCTION public.gen_refused_write()"
+                    ),
+                ],
+                vec![
+                    format!("DROP TRIGGER gen_refused ON {target}"),
+                    "DROP FUNCTION public.gen_refused_write()".to_string(),
+                    "DROP TABLE public.gen_refused".to_string(),
+                ],
+            )
+        }
         other => unreachable!("{other:?} is not a privilege change"),
     }
 }
@@ -234,13 +255,16 @@ mod tests {
             SourceDdl::TargetRls {
                 target: "d0".to_string(),
             },
+            SourceDdl::TargetTriggerRefused {
+                target: "d0".to_string(),
+            },
         ] {
             assert!(action.privilege(), "{action:?}");
             let (opens, closes) = statements(&action, "\"public\".\"t\"", Some(target));
             assert!(!opens.is_empty() && !closes.is_empty(), "{action:?}");
             if action.refused_target().is_some() {
                 assert!(
-                    opens.iter().chain(&closes).all(|s| s.contains(target)),
+                    opens.iter().chain(&closes).any(|s| s.contains(target)),
                     "{action:?}"
                 );
             }

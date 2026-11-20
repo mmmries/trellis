@@ -1157,7 +1157,7 @@ The actions, cheapest-first (every one below is built):
    Trellis's `SELECT` or its schema's `USAGE`, the owner role revoked from
    Trellis, an owner Trellis does or doesn't inherit, row-level security on a source with and without a policy
    for its role, the application role changed, and the drain's writes to a
-   target refused: `SourceDdl::privilege`, drawn by
+   target refused, directly or by the application's trigger on it: `SourceDdl::privilege`, drawn by
    `generate::source_ddl::privilege_plan_for`, swept by `tests/privileges.rs`,
    on the source-DDL runner and judge. A change the application's writes
    can't make as the owner moves them to `app_writer`, a login holding
