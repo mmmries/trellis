@@ -349,6 +349,10 @@ mod residue {
             report.laps()
         );
         assert!(!report.last.is_empty(), "no table was checked: {report:?}");
+        assert!(
+            report.last.iter().any(|t| t.table.ends_with("__ledger\"")),
+            "no 1-1 ledger was checked: {report:?}"
+        );
     }
 
     /// Opens a session as the operator, on `db`.

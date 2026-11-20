@@ -1,5 +1,6 @@
 //! Residue invariants of the epoch tier (#2187, sub-step 8b): what a chain
-//! leaves behind in the Trellis tables, checked at each quiet point after a
+//! leaves behind in the Trellis tables (the instance schema's, and each
+//! defined target with its 1-1 ledger), checked at each quiet point after a
 //! `VACUUM`.
 //!
 //! - `n_dead_tup` is `0`: nothing holds the vacuum horizon back, and no
@@ -36,6 +37,10 @@ pub const LAP_SEAL_INTERVAL: Duration = Duration::from_millis(50);
 /// and the pause between.
 const VACUUM_ATTEMPTS: u32 = 40;
 const VACUUM_RETRY: Duration = Duration::from_millis(50);
+
+/// The suffix of the ledger a 1-1 target keeps beside it
+/// (`trellis::defs::ledger::LEDGER_SUFFIX`, not exported).
+const LEDGER_SUFFIX: &str = "__ledger";
 
 /// The ring's slot count (`trellis::staging`): a seal advances one slot.
 pub const RING_SLOTS: i64 = 4;
@@ -259,7 +264,7 @@ async fn sealed_segments(config: &Config, roles: &Roles) -> Result<i64, tokio_po
 }
 
 /// Vacuums every table of the instance schema and each of `defined`'s
-/// targets, then checks each one's `n_dead_tup` and page count. `widths`
+/// targets and their ledgers, then checks each one's `n_dead_tup` and page count. `widths`
 /// carries each table's widest row over the earlier quiet points. `ever`
 /// is every definition the chain has defined, which says what each target
 /// reads.
@@ -296,12 +301,29 @@ pub async fn check_residue(
     {
         tables.push((row.get(0), row.get(1)));
     }
+    // Each target, and the ledger a 1-1 target keeps beside it
+    // (`trellis::defs::ledger`, `<target>__ledger`): a Trellis table outside
+    // the instance schema.
+    let mut beside: BTreeMap<String, String> = BTreeMap::new();
     for def in defined {
         let schema = def
             .explicit_target_schema
             .clone()
             .unwrap_or_else(|| config.target_schema().to_string());
-        tables.push((schema, def.target.clone()));
+        tables.push((schema.clone(), def.target.clone()));
+        let ledger = format!("{}{LEDGER_SUFFIX}", def.target);
+        let exists: bool = admin
+            .query_one(
+                "select to_regclass($1) is not null",
+                &[&format!("\"{schema}\".\"{ledger}\"")],
+            )
+            .await
+            .map_err(|e| fail(&format!("find {ledger}"), e))?
+            .get(0);
+        if exists {
+            beside.insert(ledger.clone(), def.target.clone());
+            tables.push((schema, ledger));
+        }
     }
 
     // The source of each target, ever.
@@ -371,7 +393,8 @@ pub async fn check_residue(
                 holders(&admin).await
             ));
         }
-        let peak = match sources.get(name.as_str()) {
+        let target = beside.get(&name).unwrap_or(&name);
+        let peak = match sources.get(target.as_str()) {
             Some(source) if schema != config.schema() => peaks.get(*source).copied().unwrap_or(0),
             _ => total_peak,
         };
