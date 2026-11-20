@@ -426,6 +426,10 @@ fn join_sweep_tier() -> SweepTier {
         &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
         generative::plant_sweep::NO_EXTREMES,
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_TIER,
         known_misses: &["gb_early_zero_gc"],

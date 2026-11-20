@@ -1909,6 +1909,10 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
             plant_sweep::NO_EXTREMES,
         ))
+        .chain(not_on_path(
+            &[PlantPath::XidEpoch],
+            plant_sweep::NO_XID_EPOCH,
+        ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
         .chain([LEAF_UNREACHED, FILTERED_NAMING_UNREACHED])
         .chain(UNIMAGED_COLUMN_UNREACHED)
@@ -1986,6 +1990,10 @@ fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
         ],
         "the min_max tier gates the MIN/MAX extremes' plants; the plant's own path is \
          gated by the tier its comment names",
+    ));
+    out.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
     ));
     out
 }

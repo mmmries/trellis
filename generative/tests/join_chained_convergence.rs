@@ -340,7 +340,7 @@ const CHAINED_KNOWN_MISSES: &[&str] = &["seam_token_early"];
 /// take that path gates.
 fn chained_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
-    let not_gated = not_on_path(
+    let mut not_gated: Vec<(&'static str, &'static str)> = not_on_path(
         &[
             PlantPath::OneToOne,
             PlantPath::GroupBasis,
@@ -354,6 +354,10 @@ fn chained_sweep_tier() -> SweepTier {
          tiers gate; this tier gates the seam's feed to a JOIN reading a target",
     )
     .collect();
+    not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_CHAINED_TIER,
         known_misses: CHAINED_KNOWN_MISSES,

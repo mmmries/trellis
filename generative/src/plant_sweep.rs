@@ -110,7 +110,7 @@ pub enum PlantPath {
     /// Only the `db_admin` property's xid-aging action
     /// (`crate::model::DbAdminAction::WrapXids`) crosses the boundary, and
     /// it is no planted-bug sweep tier, so no tier gates these: every
-    /// sweep leaves them out with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
+    /// tier lists them in its `not_gated` with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
     /// and `db_admin.rs`'s wrap pin gate them.
     XidEpoch,
 }
@@ -503,16 +503,10 @@ fn judge(test: &str, tier: &SweepTier, requested: &str) {
                 tier.name
             );
         }
-        for plant in Plant::ALL {
-            if plant_path(*plant) == PlantPath::XidEpoch {
-                eprintln!("{test}: {} not run: {NO_XID_EPOCH}", plant.name());
-            }
-        }
         Plant::ALL
             .iter()
             .copied()
             .filter(|p| !tier.not_gated.iter().any(|(name, _)| *name == p.name()))
-            .filter(|p| plant_path(*p) != PlantPath::XidEpoch)
             .collect()
     } else {
         requested
