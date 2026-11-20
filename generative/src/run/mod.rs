@@ -21,9 +21,11 @@ mod coverage;
 mod db_admin;
 mod epoch;
 mod held_keys;
+pub mod judge;
 mod noise;
 mod pause;
 mod restore;
+mod source_ddl;
 mod two_instance;
 
 pub use concurrent::{
@@ -38,6 +40,9 @@ pub use held_keys::{
 };
 pub use noise::run_convergence_with_noise;
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
+pub use source_ddl::{
+    SourceDdlRun, run_convergence_with_source_ddl, run_convergence_with_source_ddl_allowing,
+};
 pub use two_instance::{
     InstanceLabel, InstanceRun, TwoInstanceError, chain_off, run_two_instance_convergence,
     share_source,
@@ -355,6 +360,26 @@ pub enum RunError {
     Epoch {
         epoch: usize,
         error: Box<RunError>,
+    },
+    /// After op `op_index`, definition `target` ended neither exact, nor
+    /// paused with a reason and exact after its `RESUME` (or refused by it
+    /// with a code), nor a listed gap the drawn shape names, detected by
+    /// `self_check` and made exact by the entry's repair ([`judge`]).
+    /// `problem` says which step broke; `detail` holds the statuses and the
+    /// oracle's report.
+    NeverSilentlyWrong {
+        op_index: usize,
+        target: String,
+        problem: String,
+        detail: String,
+    },
+    /// Carrying out a source-DDL event failed (the harness's side of it: a
+    /// statement the generator drew that Postgres refused, or a reconcile
+    /// pass the harness stepped).
+    SourceDdl {
+        op_index: usize,
+        event: Box<crate::model::SourceDdlEvent>,
+        error: String,
     },
 }
 
@@ -768,41 +793,53 @@ pub async fn check_defs(
 ) -> Result<Vec<(String, OracleReport)>, String> {
     let mut diverged = Vec::new();
     for def in defs {
-        let source = source_table(program, defs, &def.source).unwrap_or_else(|| {
-            panic!(
-                "program references source table {:?} it does not declare — a generator bug",
-                def.source
-            )
-        });
-        let source_columns: HashMap<String, ValueType> = source
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.value_type))
-            .collect();
-
-        let target = snapshot.get(&def.target).ok_or_else(|| {
-            format!(
-                "target table {:?} missing from snapshot — the backend did not install it",
-                def.target
-            )
-        })?;
-
-        let report = oracle::check_over(
-            pool,
-            program,
-            defs,
-            def,
-            &source.pk_col,
-            &source_columns,
-            target,
-        )
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+        let report = check_def(pool, program, defs, def, snapshot).await?;
         if report.diverged() {
             diverged.push((def.target.clone(), report));
         }
     }
     Ok(diverged)
+}
+
+/// [`check_defs`] for one definition of `defs`: its target in `snapshot`
+/// against the oracle's recompute, diverged or not.
+pub async fn check_def(
+    pool: &Pool,
+    program: &Program,
+    defs: &[TransformDef],
+    def: &TransformDef,
+    snapshot: &Snapshot,
+) -> Result<OracleReport, String> {
+    let source = source_table(program, defs, &def.source).unwrap_or_else(|| {
+        panic!(
+            "program references source table {:?} it does not declare — a generator bug",
+            def.source
+        )
+    });
+    let source_columns: HashMap<String, ValueType> = source
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.value_type))
+        .collect();
+
+    let target = snapshot.get(&def.target).ok_or_else(|| {
+        format!(
+            "target table {:?} missing from snapshot — the backend did not install it",
+            def.target
+        )
+    })?;
+
+    oracle::check_over(
+        pool,
+        program,
+        defs,
+        def,
+        &source.pk_col,
+        &source_columns,
+        target,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))
 }
 
 /// The table `name` a definition reads: one of `program`'s tables, or the

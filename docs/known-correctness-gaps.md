@@ -1,5 +1,7 @@
 # Known correctness gaps
 
+<!-- Each entry's <a id> is stable: the generative suite names it (generative/src/gaps.rs). Never rename one; a closed entry's anchor goes with it. -->
+
 Trellis keeps each target equal to what its definition computes from its
 sources. This page lists every known way a target can end up different from
 that **while Trellis reports it healthy**: the definition reads `live` (or is
@@ -107,6 +109,8 @@ changed ([capture drift — What rebuilds, what pauses, and what's
 missed](staging-and-claiming/capture-drift.md#what-rebuilds-what-pauses-and-whats-missed)).
 These changes look like routine maintenance to it.
 
+<a id="alter-type-rewrite"></a>
+
 ### A column's values rewritten in place by `ALTER COLUMN TYPE`
 
 **When:** an `ALTER COLUMN … TYPE … USING` changes the values of a column a
@@ -141,7 +145,9 @@ A widening that outgrows a copy Trellis keeps (`integer` to `bigint` under
 **What goes wrong:** the statement rewrites the table without firing a
 trigger, so every target reading the column keeps the old values. A 1-1
 target's row is repaired by the next write that changes a column it reads in
-its source row; an aggregate or `JOIN` target stays wrong until it's rebuilt.
+its source row, unless the column is a key column: the row stays under its
+old key, and that write adds one under the new key. An aggregate or `JOIN`
+target stays wrong until it's rebuilt.
 
 **Detected by:** `self_check`.
 
@@ -152,6 +158,8 @@ a false-positive study ([ADR-0027](decisions/0027-operating-principles.md),
 rule 3) of signals that would catch these shapes. Event triggers would see
 every rewrite but need superuser (rule 1), and logical decoding has the same
 blind spot: `pgoutput` never sends a rewrite's rows.
+
+<a id="enum-label-readded"></a>
 
 ### An enum label renamed and added again
 
@@ -183,6 +191,8 @@ no error. Without the re-add, the label fails to cast and the key is held
 **Repair:** `request_backfill` the table.
 
 **Ends with:** documented.
+
+<a id="column-name-swap"></a>
 
 ### A read column's name swapped with another's and back within one pass
 
@@ -226,6 +236,8 @@ while the transforms that read the table are paused.
 
 **Ends with:** documented.
 
+<a id="nondeterministic-collation"></a>
+
 ### A read column given a nondeterministic collation
 
 **When:** a column a definition reads, other than a key column, changes only
@@ -267,6 +279,8 @@ read the column before changing its collation.
 **Ends with:** [#1643](https://github.com/salesforce-misc/trellis/issues/1643),
 research on detecting a collation change the way a retype is detected.
 
+<a id="key-not-null-flip"></a>
+
 ### A `KEY` column's `NOT NULL` set or dropped with changes in flight
 
 **When:** a table read through `KEY (…)` on a `UNIQUE NULLS NOT DISTINCT`
@@ -289,6 +303,8 @@ that key and keeps the old values under the right one.
 **Ends with:** [#2147](https://github.com/salesforce-misc/trellis/issues/2147).
 
 ## Writes past a unique key
+
+<a id="deferrable-key-replica-duplicate"></a>
 
 ### A duplicate in `b` past a deferrable key under `session_replication_role = replica`
 
@@ -324,6 +340,8 @@ live entry in that position's `M`.
 can write it.
 
 ## Writes capture never sees
+
+<a id="capture-disrupted-between-passes"></a>
 
 ### Capture disrupted and restored between two passes
 
@@ -369,6 +387,8 @@ studies a signal for the attach and inherit shapes. The others are documented:
 a replaced function's footprint also moves on routine `GRANT`s and owner
 changes, and a restore leaves nothing to compare.
 
+<a id="unlogged-source-reset"></a>
+
 ### An unlogged source emptied by a crash or failover
 
 **When:** a source table is `UNLOGGED` (created so, or `SET UNLOGGED` after
@@ -386,6 +406,8 @@ apply over the empty table.
 source. Better, don't use unlogged tables as sources: define accepts them.
 
 **Ends with:** nothing filed.
+
+<a id="merge-moves-partition"></a>
 
 ### A `MERGE` that moves a row to another partition
 
@@ -413,6 +435,8 @@ with `DELETE` and `INSERT`.
 
 **Ends with:** a Postgres fix; it's reported upstream.
 
+<a id="source-rename-roundtrip"></a>
+
 ### The source renamed or re-parented and back within one pass
 
 **When:** before the next reconcile pass, the source is renamed away and back
@@ -433,6 +457,8 @@ its transforms are paused.
 
 **Ends with:** [#1652](https://github.com/salesforce-misc/trellis/issues/1652).
 
+<a id="default-partition-short-leaf"></a>
+
 ### A short-lived leaf beside a `DEFAULT` partition
 
 **When:** a leaf is created or attached beside a `DEFAULT` partition, written
@@ -451,6 +477,8 @@ partition for the sweep to find.
 the parent before removing it, or keep it until a pass has run.
 
 **Ends with:** documented; accepted in the design.
+
+<a id="leaf-reattach-around-upgrade"></a>
 
 ### A leaf detached and attached again around a `pg_upgrade`
 
@@ -473,6 +501,8 @@ attaching a partition.
 **Ends with:** [#1652](https://github.com/salesforce-misc/trellis/issues/1652).
 
 ## Changes made outside Trellis to what it owns
+
+<a id="owned-tables-written"></a>
 
 ### Rows written into a target, a hidden table or Trellis's schema
 
@@ -531,6 +561,8 @@ table's. A change to Trellis's schema isn't detected.
 weighs refusing or detecting such writes. Until then it's a rule
 ([transforms — Target tables are Trellis-owned](transforms.md#target-tables-are-trellis-owned)).
 
+<a id="partial-restore"></a>
+
 ### Part of the database restored from another point in time
 
 **When:** a restore rewinds part of what Trellis keeps in step, without the
@@ -558,6 +590,8 @@ TRANSFORM` and define each affected transform again.
 
 ## Transaction-id age
 
+<a id="repeatable-read-old-key"></a>
+
 ### An old key deleted and re-created under `REPEATABLE READ`
 
 **When:** a source row was written between `2^31` and `2^32` transaction ids
@@ -579,6 +613,8 @@ with the deleted row's values.
 **Ends with:** [#2205](https://github.com/salesforce-misc/trellis/issues/2205).
 
 ## Connections through a pooler
+
+<a id="transaction-pooler"></a>
 
 ### A Trellis process behind a transaction-mode pooler
 

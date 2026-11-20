@@ -938,9 +938,9 @@ would also fail without naming the cause. The reason is the definition's
 
 The allowlist is `run::pause::allowance`: a tier on it may find a definition
 paused, and a tier not on it treats any pause as a failure. On it: any program
-with partition maintenance (`Op::Partition`). A tier that starts provoking
-pauses (a source schema change or a capture disruption, say) is added there,
-with its reason.
+with partition maintenance (`Op::Partition`). The source-DDL tier (§7) is
+judged by "never silently wrong" instead, where a pause is one of the
+endings.
 
 Every divergence report, in every backend, prints each definition's status and
 pause reason under `definitions:` beside the cell diffs.
@@ -1134,6 +1134,19 @@ The actions, cheapest-first (every one below is built):
    upgrade battery's `basebackup` scenario restores one taken while writers ran).
 6. **Out-of-band tampering** (bucket 1, detection) — direct writes to derived
    tables, found by `self_check` (`tests/self_check_cross_check.rs`).
+7. **Source DDL** (bucket 3) — schema and maintenance changes to a tracked
+   source with changes in flight: `model::SourceDdl`, driven by
+   `run::run_convergence_with_source_ddl`, swept by `tests/source_ddl.rs`.
+   The engine runs with a reconcile interval longer than a case and the run
+   steps the passes, so each event lands inside one interval or across a
+   pass as drawn. The oracle doesn't model the pause policy: after each op,
+   `run::judge` holds every definition to **never silently wrong**. It is
+   exact; or paused with a reason, and exact after its `RESUME` (or the
+   `RESUME` refuses with a code); or wrong only as an entry of
+   [known correctness gaps](known-correctness-gaps.md) the drawn shape names
+   (`gaps::Gap`, by the entry's stable anchor), which `self_check` reports
+   and the entry's repair fixes. Anything else fails, so the register is a
+   checked allowlist: an entry that understates what goes wrong fails too.
 
 Two structural notes for when faults enter the stream:
 
