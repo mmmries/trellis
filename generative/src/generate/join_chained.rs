@@ -240,7 +240,7 @@ fn chain_program(
 
 /// Whether `op` updates its row's primary key.
 pub fn is_rekey(op: &Op) -> bool {
-    matches!(op, Op::Update { changes, .. } if changes.iter().any(|(c, _)| c == "id"))
+    matches!(op.write(), Op::Update { changes, .. } if changes.iter().any(|(c, _)| c == "id"))
 }
 
 /// `plan` with all of a burst's ops on `table` on one lane, in program

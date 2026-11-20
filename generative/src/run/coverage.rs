@@ -500,7 +500,7 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                 };
                 let mut rows: HashMap<String, SimRow> = HashMap::new();
                 for op in program.ops.iter().filter(|op| op.table() == def.source) {
-                    let write = match op {
+                    let write = match op.write() {
                         Op::Leaf { op, .. } => op,
                         op => op,
                     };
@@ -558,7 +558,7 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                     };
                     let mut rows: HashMap<String, SimRow> = HashMap::new();
                     for op in program.ops.iter().filter(|op| op.table() == table) {
-                        if let Op::Update { pk, .. } = op
+                        if let Op::Update { pk, .. } = op.write()
                             && let Some(row) = rows.get(pk)
                         {
                             let before = member(row);
@@ -883,7 +883,7 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
             for pk in &pks {
                 let (old, new) = (before.get(pk), after.get(pk));
                 let touched = old != new
-                    || (new.is_some() && matches!(op, Op::Update { pk: p, .. } if p == pk));
+                    || (new.is_some() && matches!(op.write(), Op::Update { pk: p, .. } if p == pk));
                 if !touched {
                     continue;
                 }
@@ -1029,6 +1029,9 @@ fn numeric_nan_writes(program: &Program, op: &Op) -> usize {
         Op::Update { table, changes, .. } => nans(table, changes),
         Op::BulkInsert { table, rows, .. } => rows.iter().map(|row| nans(table, row)).sum(),
         Op::Leaf { op, .. } => numeric_nan_writes(program, op),
+        Op::Upsert { op, .. } | Op::Merge { op, .. } | Op::Cte { op, .. } => {
+            numeric_nan_writes(program, op)
+        }
         _ => 0,
     }
 }
