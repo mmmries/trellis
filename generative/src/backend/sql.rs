@@ -240,7 +240,22 @@ pub(super) async fn create_source_indexes(
     schema: Option<&str>,
     def: &TransformDef,
 ) -> Result<(), tokio_postgres::Error> {
+    create_source_indexes_where(raw, schema, def, |_| true).await
+}
+
+/// [`create_source_indexes`], only on the tables `on` accepts: a table's
+/// owner creates its index, so the application indexes its sources and
+/// Trellis the targets a chained definition reads.
+pub(super) async fn create_source_indexes_where(
+    raw: &tokio_postgres::Client,
+    schema: Option<&str>,
+    def: &TransformDef,
+    on: impl Fn(&str) -> bool,
+) -> Result<(), tokio_postgres::Error> {
     for (table, columns) in required_source_indexes(def) {
+        if !on(&table) {
+            continue;
+        }
         let qualified = match schema {
             Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table)),
             None => quote_ident(&table),
@@ -429,7 +444,8 @@ pub(super) fn assignment(
 /// every set in `table.unique_sets`.
 ///
 /// `schema` qualifies the table's name (`None` leaves it to the session's
-/// `search_path`, which is the instance schema): a source table that more than
+/// `search_path`: `public` for the application's own session, the instance
+/// schema for the backend's raw one): a source table that more than
 /// one Trellis instance reads is created in `public`, outside every
 /// instance's catalog schema.
 pub(super) async fn create_source_table(

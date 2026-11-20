@@ -19,7 +19,7 @@
 //! specific scenarios the task calls out directly, plus a dedicated property
 //! for the bulk-insert row-count dimension.
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ManualBackend};
 use generative::generate::{Mutate, build_bulk_insert_program, build_program, bulk_insert_program};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use generative::run::{RunError, run_convergence};
@@ -72,8 +72,8 @@ fn run_one(program: &Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record_program(program);
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             let pool =

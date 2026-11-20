@@ -65,7 +65,7 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
             match action {
                 DbAdminAction::Checkpoint => {
                     backend
-                        .execute_raw("CHECKPOINT")
+                        .execute_admin("CHECKPOINT")
                         .await
                         .map_err(|e| admin_error(op_index, action, e))?;
                 }

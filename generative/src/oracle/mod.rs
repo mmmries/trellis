@@ -759,6 +759,27 @@ async fn as_persisted(
     {
         join.joins[0].explicit_right_schema = schema_of(joined);
     }
+    // A star's joined tables past the first (`definition_join_tables`).
+    if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &mut def.key_space
+        && join.joins.len() > 1
+    {
+        let later = client
+            .query(
+                "select j.position, j.table_name from definition_join_tables j \
+                 join transform_definitions d on d.id = j.transform_id \
+                 where split_part(d.target_table, '.', 2) = $1",
+                &[&def.target],
+            )
+            .await?;
+        for row in later {
+            let position = usize::try_from(row.get::<_, i16>(0)).expect("position >= 2");
+            if let Some(joined) = join.joins.get_mut(position - 1)
+                && joined.explicit_right_schema.is_none()
+            {
+                joined.explicit_right_schema = schema_of(row.get::<_, &str>(1));
+            }
+        }
+    }
     Ok(def)
 }
 
