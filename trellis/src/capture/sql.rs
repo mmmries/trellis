@@ -1404,8 +1404,8 @@ impl Render {
 ///   for one committed before the snapshot. A frozen version more than
 ///   `2^31` ids old keeps its raw `xmin`, so its `age` wraps negative too;
 ///   ordering by `age` descending takes the version nearest the writer,
-///   which is the writer's own whenever it has one. What that leaves is in
-///   `docs/known-correctness-gaps.md`.
+///   which is the writer's own whenever it has one at the id `age` counts
+///   from. What that leaves is in `docs/known-correctness-gaps.md`.
 /// - **Its key renders the same**: the typed `=` finds the version through
 ///   the index, but the ring keys by the key's text, and a type's `=` can be
 ///   looser (`numeric` `1.0 = 1.00`). Without the text check, a key move

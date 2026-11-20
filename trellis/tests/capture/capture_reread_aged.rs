@@ -115,10 +115,11 @@ fn combos() -> Vec<(i32, IsolationLevel, Event, Nested)> {
 
 /// The writer's statement for one combo, writing `a = 50` to key `k`, with
 /// the nested write set off by `nest` (the trigger's own write) or `shift`
-/// (the FK cascade of the trigger's write to `public.p`). A cascade lands in
-/// the span of the statement whose trigger caused it; a cascade of the
-/// statement's own write fires after its capture, so it can't make that
-/// capture re-read. An update is the optimistic-lock shape (`and a = 40`):
+/// (the FK cascade of the trigger's write to `public.p`), which lands in the
+/// outer statement's span. A cascade of the statement's own write joins its
+/// transition tables instead, and re-reads only when a key occurs twice
+/// ([`a_self_referencing_cascade_images_the_writers_own_version`]). An
+/// update is the optimistic-lock shape (`and a = 40`):
 /// under `REPEATABLE READ` a plain `where id = k` reaches the stale version
 /// too and fails with a serialization error.
 fn statement(base: i32, event: Event, nested: Nested) -> String {
@@ -270,21 +271,64 @@ async fn the_writers_own_version_wins_just_outside_the_band() {
     .await;
 }
 
+/// A statement's own self-referencing `ON UPDATE CASCADE` joins its
+/// transition tables, and a key occurring twice there makes the capture
+/// re-read every key it wrote: key 1, moved onto from key 2, has the stale
+/// version beside the writer's own.
+#[tokio::test]
+async fn a_self_referencing_cascade_images_the_writers_own_version() {
+    let mut h = H::new_aged(
+        "create table public.t (id int primary key, a int, \
+             pid int references public.t (id) on update cascade); \
+         insert into public.t values (0, 0, null), (1, 7, null), (2, 8, null), (3, 9, null); \
+         update public.t set pid = 3 where id = 3",
+        &["TRANSFORM tt FROM public.t SELECT a AS a"],
+        Some(XID_PAGE),
+    )
+    .await;
+    h.assert_exact("tt", TARGET, ORACLE).await;
+    let age = age_of(&h.raw, "select age(xmin) from public.t where id = 1").await;
+    assert!(age < 0, "key 1 is more than 2^31 ids old: age {age}");
+    let mut writer = connect(h.db.dsn()).await;
+    let txn = writer
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await
+        .expect("begin");
+    txn.query_one("select count(*) from public.t", &[])
+        .await
+        .expect("take the snapshot");
+    h.write("delete from public.t where id = 1").await;
+    // Row 3 references itself, so its move cascades onto itself.
+    txn.batch_execute(
+        "update public.t set id = case id when 2 then 1 else 1003 end, a = 50 \
+         where id in (2, 3)",
+    )
+    .await
+    .expect("move key 2 onto key 1, and self-referencing key 3");
+    txn.commit().await.expect("commit");
+    h.converge("after the writer").await;
+    h.assert_exact("tt", TARGET, ORACLE).await;
+}
+
 // ------------------------------------------------------------ residual pins
 
 /// `public.t` with sentinel row 0 and stale key 1 (`a = 7`): an application
-/// trigger deletes a row written with `a = 0` and bumps the sentinel for one
-/// written with `nest`.
+/// trigger deletes a row inserted or updated with `a = 0`, and bumps the
+/// sentinel for a row written, or deleted, with `nest`.
 const RESIDUAL_DDL: &str = "create table public.t (id int primary key, a int, \
          nest bool not null default false); \
      insert into public.t (id, a) values (0, 0), (1, 7); \
      create function public.nested() returns trigger language plpgsql as $$ \
      begin \
-         if new.a = 0 and new.id <> 0 then delete from public.t where id = new.id and a = 0; \
+         if tg_op = 'DELETE' then \
+             if old.nest then update public.t set a = a + 1 where id = 0; end if; \
+         elsif new.a = 0 and new.id <> 0 then delete from public.t where id = new.id and a = 0; \
          elsif new.nest then update public.t set a = a + 1 where id = 0; end if; \
          return null; \
      end $$; \
-     create trigger nested after insert or update on public.t \
+     create trigger nested after insert or update or delete on public.t \
          for each row execute function public.nested()";
 
 const TARGET: &str = "select id, a from public.tt";
@@ -322,87 +366,116 @@ async fn assert_detected_and_repaired(mut h: H, wrong: &[&str]) {
     h.assert_exact("tt", TARGET, ORACLE).await;
 }
 
-/// Residual shape 1: the writer re-creates key 1 and its own trigger
-/// deletes it again in the same statement, so the writer has no version of
-/// the key and the stale one is the only candidate.
+/// Residual shape 1: the writer re-creates key 1 and then removes its own
+/// version again, in a statement with a nested write, so it has no version
+/// of the key and the stale one is the only candidate. The removal is its
+/// own trigger's delete in the re-creating statement, a later delete, or a
+/// later key move, each with a condition the stale version doesn't meet.
 #[tokio::test]
-async fn a_key_recreated_and_deleted_in_one_span_images_the_stale_version() {
-    let h = aged_harness().await;
-    let mut writer = connect(h.db.dsn()).await;
-    let txn = writer
-        .build_transaction()
-        .isolation_level(IsolationLevel::RepeatableRead)
-        .start()
-        .await
-        .expect("begin");
-    txn.query_one("select count(*) from public.t", &[])
-        .await
-        .expect("take the snapshot");
-    h.write("delete from public.t where id = 1").await;
-    txn.batch_execute("insert into public.t (id, a) values (1, 0)")
-        .await
-        .expect("re-create key 1; the trigger deletes it");
-    txn.commit().await.expect("commit");
-    assert_detected_and_repaired(h, &["(1,7)"]).await;
+async fn a_key_recreated_and_removed_again_images_the_stale_version() {
+    for statements in [
+        &["insert into public.t (id, a) values (1, 0)"][..],
+        &[
+            "insert into public.t (id, a, nest) values (1, 50, true)",
+            "delete from public.t where id = 1 and a = 50",
+        ],
+        &[
+            "insert into public.t (id, a, nest) values (1, 50, true)",
+            "update public.t set id = 2 where id = 1 and a = 50",
+        ],
+    ] {
+        let h = aged_harness().await;
+        let mut writer = connect(h.db.dsn()).await;
+        let txn = writer
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .start()
+            .await
+            .expect("begin");
+        txn.query_one("select count(*) from public.t", &[])
+            .await
+            .expect("take the snapshot");
+        h.write("delete from public.t where id = 1").await;
+        for sql in statements {
+            txn.batch_execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        txn.commit().await.expect("commit");
+        assert_detected_and_repaired(h, &["(1,7)"]).await;
+    }
 }
 
-/// Residual shape 2: the stale version's raw `xmin` lies between the
-/// writer's top-level xid and its own version's xmin (written in a
-/// subtransaction), so the stale version is nearer the writer.
+/// Residual shape 2: the writer's own version of key 1 has an `xmin` past
+/// the id `age` counts from, and the stale version's raw `xmin` lies
+/// between the two, so the stale version is nearer the writer. The own
+/// version is past that id when a subtransaction writes it, or when the
+/// transaction called `age` before its first write (the id is then the
+/// next xid as of that call).
 #[tokio::test]
 async fn a_stale_xmin_between_the_writers_xids_images_the_stale_version() {
-    let h = aged_harness().await;
-    let xmin: i64 = h
-        .raw
-        .query_one("select xmin::text::bigint from public.t where id = 1", &[])
-        .await
-        .expect("key 1's xmin")
-        .get(0);
-    let xmin = u32::try_from(xmin).expect("a 32-bit xmin");
-    // The writer's top-level xid lands a few ids short of the stale xmin.
-    age_next_xid_to(&h.cluster, xmin - 8);
+    for subtransaction in [true, false] {
+        let h = aged_harness().await;
+        let xmin: i64 = h
+            .raw
+            .query_one("select xmin::text::bigint from public.t where id = 1", &[])
+            .await
+            .expect("key 1's xmin")
+            .get(0);
+        let xmin = u32::try_from(xmin).expect("a 32-bit xmin");
+        // The id `age` counts from lands a few ids short of the stale xmin.
+        age_next_xid_to(&h.cluster, xmin - 8);
 
-    let mut writer = connect(h.db.dsn()).await;
-    let txn = writer
-        .build_transaction()
-        .isolation_level(IsolationLevel::RepeatableRead)
-        .start()
-        .await
-        .expect("begin");
-    txn.query_one("select count(*) from public.t", &[])
-        .await
-        .expect("take the snapshot");
-    let top: i64 = txn
-        .query_one(
-            "select pg_current_xact_id()::text::bigint % 4294967296",
-            &[],
-        )
-        .await
-        .expect("assign the top-level xid")
-        .get(0);
-    assert!(top < i64::from(xmin), "top-level xid {top} below {xmin}");
-    h.write("delete from public.t where id = 1").await;
-    // Its own version's subtransaction xid lands past it.
-    age_next_xid_to(&h.cluster, xmin + 4);
-    txn.batch_execute(
-        "savepoint s; insert into public.t (id, a, nest) values (1, 50, true); release s",
-    )
-    .await
-    .expect("re-create key 1 in a subtransaction, with a nested write");
-    let ages: Vec<(i32, i32)> = txn
-        .query(
-            "select a, age(xmin) from public.t where id = 1 order by a",
-            &[],
-        )
-        .await
-        .expect("both versions of key 1")
-        .iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect();
-    assert!(
-        matches!(ages[..], [(7, stale), (50, own)] if own < stale && stale <= 0),
-        "the stale version is nearer the writer: {ages:?}"
-    );
-    txn.commit().await.expect("commit");
-    assert_detected_and_repaired(h, &["(1,7)"]).await;
+        let mut writer = connect(h.db.dsn()).await;
+        let txn = writer
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .start()
+            .await
+            .expect("begin");
+        txn.query_one("select count(*) from public.t", &[])
+            .await
+            .expect("take the snapshot");
+        let fix_the_id = if subtransaction {
+            "select pg_current_xact_id()::text::bigint % 4294967296"
+        } else {
+            "select (pg_catalog.age('100'::xid) + 100)::bigint"
+        };
+        let from: i64 = txn
+            .query_one(fix_the_id, &[])
+            .await
+            .expect("fix the id age counts from")
+            .get(0);
+        assert!(
+            from < i64::from(xmin),
+            "age counts from {from}, below {xmin}"
+        );
+        h.write("delete from public.t where id = 1").await;
+        // The writer's own version's xid lands past the stale xmin.
+        age_next_xid_to(&h.cluster, xmin + 4);
+        let write = if subtransaction {
+            "savepoint s; insert into public.t (id, a, nest) values (1, 50, true); release s"
+        } else {
+            "insert into public.t (id, a, nest) values (1, 50, true)"
+        };
+        txn.batch_execute(write)
+            .await
+            .expect("re-create key 1, with a nested write");
+        let ages: Vec<(i32, i32)> = txn
+            .query(
+                "select a, age(xmin) from public.t where id = 1 order by a",
+                &[],
+            )
+            .await
+            .expect("both versions of key 1")
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert!(
+            matches!(ages[..], [(7, stale), (50, own)] if own < stale && stale <= 0),
+            "the stale version is nearer the writer: {ages:?}"
+        );
+        txn.commit().await.expect("commit");
+        assert_detected_and_repaired(h, &["(1,7)"]).await;
+    }
 }

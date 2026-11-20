@@ -563,15 +563,16 @@ TRANSFORM` and define each affected transform again.
 **When:** a source row was written between `2^31` and `2^32` transaction ids
 ago (modulo `2^32`). Another session deletes or re-keys it after a
 `REPEATABLE READ` or `SERIALIZABLE` transaction took its snapshot. That
-transaction then writes the key again, in a statement where another write to
-the same table also runs (such as a trigger), and either:
+transaction then writes the key again and, in a statement with another write
+to the same table in it (such as a trigger), either:
 
-* deletes it again in the same statement, with a condition the old row
-  doesn't meet (one that reaches the old row fails with a serialization
-  error); or
-* writes it in a subtransaction (a savepoint or an `EXCEPTION` block), and
-  the old row's raw `xmin` falls between the transaction's own id and the
-  subtransaction's.
+* removes the transaction's own version again: deletes or re-keys it, with a
+  condition the old row doesn't meet (one that reaches the old row fails
+  with a serialization error); or
+* writes a version whose `xmin` is past the id `age` counts from, with the
+  old row's raw `xmin` between the two. That takes a subtransaction (a
+  savepoint or an `EXCEPTION` block), or a call of `age` before the
+  transaction's first write.
 
 **What goes wrong:** capture re-reads the live row and keeps the version
 nearest the transaction whose `age(xmin)` is not positive, taking it to be
@@ -649,7 +650,8 @@ fixes and what it costs:
   ([type support — Text rendering](type-support.md#text-rendering)).
 * **A `default_transaction_isolation` of `repeatable read` or
   `serializable`.** Trellis's connections use `read committed` whatever the
-  setting, and capture works at every level.
+  setting, and capture works at every level, except for an old key
+  ([above](#an-old-key-deleted-and-re-created-under-repeatable-read)).
 * **A whole-database physical backup and restore, PITR or `pg_upgrade`.**
   Sources and Trellis's state stay in step, except an unlogged source's data
   after a physical restore or PITR
