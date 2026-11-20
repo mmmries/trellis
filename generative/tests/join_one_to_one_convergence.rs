@@ -912,6 +912,10 @@ fn sweep_tier(
         &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
         generative::plant_sweep::NO_EXTREMES,
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::SourceKey],
+        generative::plant_sweep::NO_SOURCE_KEY,
+    ));
     SweepTier {
         name,
         known_misses,

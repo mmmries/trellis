@@ -157,6 +157,7 @@ pub fn star_tables(tables: usize) -> Vec<Table> {
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     };
     let named = |columns: &[(&str, ValueType)]| -> Vec<(String, ValueType)> {
         columns

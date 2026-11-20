@@ -121,6 +121,9 @@ pub struct Coverage {
     /// `"middle_default"`, `"attach_middle"`, `"detach_middle"`,
     /// `"drop_middle"`, `"middle_leaf_write"`).
     pub partition_ops: HashMap<&'static str, usize>,
+    /// How many recorded programs read a source through a `KEY (...)` and
+    /// draw each variant [`crate::generate::source_key::drawn`] names.
+    pub source_keys: std::collections::BTreeMap<String, usize>,
     /// Bursts recorded by [`Coverage::record_concurrent_plan`].
     pub concurrent_bursts: usize,
     /// How many recorded concurrent-tier cases contain at least one burst of
@@ -168,6 +171,9 @@ impl Coverage {
     pub fn record_program(&mut self, program: &Program) {
         self.cases += 1;
 
+        for name in crate::generate::source_key::drawn(program) {
+            *self.source_keys.entry(name).or_insert(0) += 1;
+        }
         for name in crate::generate::partition::tree_change_names(program) {
             *self.partition_ops.entry(name).or_insert(0) += 1;
         }
@@ -409,9 +415,43 @@ fn collect_aggregate_calls(
 /// the inserting op didn't name).
 type SimRow = HashMap<String, Option<String>>;
 
+/// [`apply_to_rows`] on a table whose unique `key` columns (its
+/// `KEY (...)`, `NULLS NOT DISTINCT`; empty for none) also reject a write:
+/// an insert or update that would give two rows one key changes nothing.
+fn apply_to_keyed_rows(op: &Op, pk_col: &str, key: &[String], rows: &mut HashMap<String, SimRow>) {
+    let key_of = |row: &SimRow| -> Vec<Option<String>> {
+        key.iter().map(|c| row.get(c).cloned().flatten()).collect()
+    };
+    let taken = |rows: &HashMap<String, SimRow>, new: &SimRow, except: Option<&String>| {
+        rows.iter()
+            .any(|(pk, row)| Some(pk) != except && key_of(row) == key_of(new))
+    };
+    let collides = !key.is_empty()
+        && match op {
+            Op::Insert { row, .. } => taken(rows, &row.iter().cloned().collect(), None),
+            Op::BulkInsert { rows: new, .. } => {
+                let new: Vec<SimRow> = new.iter().map(|r| r.iter().cloned().collect()).collect();
+                new.iter().enumerate().any(|(i, row)| {
+                    taken(rows, row, None) || new[..i].iter().any(|r| key_of(r) == key_of(row))
+                })
+            }
+            Op::Update { pk, changes, .. } => rows.get(pk).is_some_and(|row| {
+                let mut moved = row.clone();
+                moved.extend(changes.iter().cloned());
+                taken(rows, &moved, Some(pk))
+            }),
+            _ => false,
+        };
+    if !collides {
+        apply_to_rows(op, pk_col, rows);
+    }
+}
+
 /// Applies `op` to `rows` (one table, keyed by rendered pk) exactly as
-/// Postgres would. It ignores `op.expect()`, so the replay's accounting
-/// can't be skewed by a generator bug in the expected outcomes.
+/// Postgres would, for a table whose only unique key is its pk
+/// ([`apply_to_keyed_rows`] for one with a `KEY (...)`). It ignores
+/// `op.expect()`, so the replay's accounting can't be skewed by a generator
+/// bug in the expected outcomes.
 fn apply_to_rows(op: &Op, pk_col: &str, rows: &mut HashMap<String, SimRow>) {
     let pk_of = |row: &[(String, Option<String>)]| {
         row.iter()
@@ -484,6 +524,10 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                     where_clause::eval(predicate, &|_, c| row.get(c).cloned().flatten())
                         == Some(true)
                 };
+                let key: &[String] = table
+                    .source_key
+                    .as_ref()
+                    .map_or(&[], |k| k.columns.as_slice());
                 let mut rows: HashMap<String, SimRow> = HashMap::new();
                 for op in program.ops.iter().filter(|op| op.table() == def.source) {
                     let write = match op {
@@ -494,13 +538,13 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                         && let Some(row) = rows.get(pk)
                     {
                         let before = member(row);
-                        apply_to_rows(op, &table.pk_col, &mut rows);
+                        apply_to_keyed_rows(op, &table.pk_col, key, &mut rows);
                         if let Some(row) = rows.get(pk) {
                             add(before, member(row));
                         }
                         continue;
                     }
-                    apply_to_rows(op, &table.pk_col, &mut rows);
+                    apply_to_keyed_rows(op, &table.pk_col, key, &mut rows);
                 }
             }
             KeySpace::JoinOneToOne(_) => {
@@ -758,6 +802,11 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
         .iter()
         .map(|t| (t.name.as_str(), t.pk_col.as_str()))
         .collect();
+    let keys: HashMap<&str, &[String]> = program
+        .tables
+        .iter()
+        .filter_map(|t| Some((t.name.as_str(), t.source_key.as_ref()?.columns.as_slice())))
+        .collect();
     let mut groupings: Vec<(&str, &str)> = Vec::new();
     for def in &program.defs {
         if let KeySpace::Aggregate { group_by } = &def.key_space {
@@ -857,7 +906,8 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
                 .iter()
                 .filter_map(|pk| Some((pk.clone(), rows.get(pk)?.clone())))
                 .collect();
-            apply_to_rows(op, pk_col, rows);
+            let key = keys.get(table).copied().unwrap_or_default();
+            apply_to_keyed_rows(op, pk_col, key, rows);
             let after = &state[table];
 
             for pk in &pks {
@@ -1237,6 +1287,12 @@ impl fmt::Display for Coverage {
         }
         writeln!(f)?;
 
+        write!(f, "source_keys:")?;
+        for (name, count) in &self.source_keys {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+
         write!(f, "aggregate_call_cases:")?;
         let mut calls: Vec<_> = self.aggregate_call_cases.iter().collect();
         calls.sort_unstable();
@@ -1294,6 +1350,40 @@ mod tests {
         AggregateFn, DefShape, Mutate, TableSpec, build_program, build_program_multi_with_shapes,
     };
     use crate::model::Burst;
+
+    /// #2171: the replay rejects a write that gives two rows one
+    /// `KEY (...)` (`NULL` parts equal), as Postgres's unique index does.
+    #[test]
+    fn the_replay_rejects_a_write_onto_a_taken_key() {
+        let key = ["k0".to_string()];
+        let row = |pk: &str, k: Option<&str>| Op::Insert {
+            table: "t".into(),
+            row: vec![
+                ("c0".into(), Some(pk.into())),
+                ("k0".into(), k.map(str::to_string)),
+            ],
+            expect: OpOutcome::Succeeds,
+        };
+        let mut rows = HashMap::new();
+        for op in [row("1", None), row("2", Some("")), row("3", None)] {
+            apply_to_keyed_rows(&op, "c0", &key, &mut rows);
+        }
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let mut update = |pk: &str, k: Option<&str>| {
+            let op = Op::Update {
+                table: "t".into(),
+                pk: pk.into(),
+                changes: vec![("k0".into(), k.map(str::to_string))],
+                expect: OpOutcome::Succeeds,
+            };
+            apply_to_keyed_rows(&op, "c0", &key, &mut rows);
+            rows[pk]["k0"].clone()
+        };
+        assert_eq!(update("2", None), Some(String::new()));
+        assert_eq!(update("2", Some("")), Some(String::new()));
+        assert_eq!(update("1", Some("a")), Some("a".to_string()));
+        assert_eq!(update("2", None), None);
+    }
 
     /// Four rows grouped by grain (`0`, `0`, `1`, `1`) under a
     /// `COUNT(*)` `GROUP BY`. After the seeds, one burst moves both rows of
