@@ -499,7 +499,7 @@ def probe(h, tag, timeout=300.0):
         deadline = t0 + timeout
         while True:  # Postgres may be restarting: retry the write until the deadline
             try:
-                conn = psycopg2.connect(h.dsn(user=APP), connect_timeout=5)
+                conn = psycopg2.connect(h.dsn(user=APP), connect_timeout=5, options="-c statement_timeout=30s")
                 break
             except psycopg2.OperationalError:
                 if time.time() > deadline:
@@ -516,7 +516,7 @@ def probe(h, tag, timeout=300.0):
         finally:
             conn.close()
         committed = time.time()
-        reader = psycopg2.connect(h.dsn(user=ADMIN), connect_timeout=5)
+        reader = psycopg2.connect(h.dsn(user=ADMIN), connect_timeout=5, options="-c statement_timeout=30s")
         try:
             reader.autocommit = True
             with reader.cursor() as cur:
@@ -570,9 +570,14 @@ LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s+(WARN|ERROR)\s+(.*)$")
 LOG_FIELD = re.compile(r"(\w+)=(\"[^\"]*\"|\S+)")
 
 
+LOG_KEEP_FIELDS = {"error", "err", "reason", "cause"}  # what tells two failures apart
+
+
 def log_template(text):
-    """A log message with its field values and numbers blanked, to group repeats."""
-    return re.sub(r"\d+", "N", LOG_FIELD.sub(r"\1=…", text)).strip()[:160]
+    """A log message with numbers and most field values blanked, to group repeats. Error
+    fields and T-codes stay, so failures that differ only in their cause stay apart."""
+    text = LOG_FIELD.sub(lambda m: m.group(0) if m.group(1) in LOG_KEEP_FIELDS else f"{m.group(1)}=…", text)
+    return re.sub(r"\b(T\d{4})\b|\d+", lambda m: m.group(1) or "N", text).strip()[:400]
 
 
 def parse_log_levels(lines):

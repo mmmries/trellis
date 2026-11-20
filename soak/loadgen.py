@@ -14,6 +14,7 @@ rows is the sum of affected rows.
 
 import argparse
 import json
+import math
 import random
 import threading
 import time
@@ -82,8 +83,8 @@ def parse_rate(text, base_tps):
             v = float(text)
     except ValueError:
         raise ValueError(f"bad rate {text!r}; use N (per second), N/m (per minute) or xN (times --tps)") from None
-    if v < 0:
-        raise ValueError(f"negative rate {text!r}")
+    if not 0 <= v < math.inf:
+        raise ValueError(f"rate {text!r} is negative or not finite")
     return v
 
 
@@ -98,7 +99,7 @@ def parse_schedule(text, base_tps):
             secs = float(rest[0])
         except ValueError:
             raise ValueError(f"bad duration in {part!r}") from None
-        if secs <= 0:
+        if not 0 < secs < math.inf:
             raise ValueError(f"segment {part!r} has no duration")
         if profile == "idle" and len(rest) == 2:
             raise ValueError(f"idle takes no rate: {part!r}")
@@ -112,7 +113,9 @@ class Pacer:
     """Hands out statement start times so all threads together follow the schedule.
 
     A slot never jumps over a segment boundary, so a slow segment (a trickle) doesn't
-    delay the first statement of the next one, and an idle segment hands out none."""
+    delay the first statement of the next one, and an idle segment hands out none. A
+    backlog never carries into a later segment or past the end, so a spike the threads
+    can't keep up with doesn't keep writing into the idle after it."""
 
     def __init__(self, segments, start):
         self.lock = threading.Lock()
@@ -133,8 +136,13 @@ class Pacer:
     def take(self, now):
         """(start time, segment index) of the next statement, or None after the schedule."""
         with self.lock:
+            if now >= self.end:
+                return None
             t = self.next
             if now - t > 5:  # far behind (an outage, or more rate than the threads give): don't burst
+                t = now
+            current = self.segment_at(now)
+            if current and t < current[0]:  # behind into a later segment: drop the backlog
                 t = now
             while True:
                 seg = self.segment_at(t)

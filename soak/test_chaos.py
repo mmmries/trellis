@@ -136,8 +136,9 @@ class Schedule(unittest.TestCase):
         self.assertEqual(loadgen.parse_rate("250", 100), 250)
         self.assertEqual(loadgen.parse_rate("6/m", 100), 0.1)
         self.assertEqual(loadgen.parse_rate("x100", 50), 5000)
-        with self.assertRaises(ValueError):
-            loadgen.parse_rate("fast", 100)
+        for bad in ("fast", "x", "/m", "-1", "x-2", "nan", "inf", "1/s"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                loadgen.parse_rate(bad, 100)
 
     def test_defaults_and_overrides(self):
         segs = loadgen.parse_schedule("steady:60,trickle:120,idle:3600,spike:60,spike:30:x100", 50)
@@ -147,7 +148,18 @@ class Schedule(unittest.TestCase):
         )
 
     def test_rejects(self):
-        for bad in ("", "burst:60", "idle", "idle:60:5", "steady:0", "steady:x", "steady:60:1:2"):
+        bad_segments = (
+            "",
+            "burst:60",
+            "idle",
+            "idle:60:5",
+            "steady:0",
+            "steady:-5",
+            "idle:nan",
+            "steady:x",
+            "steady:60:1:2",
+        )
+        for bad in bad_segments:
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 loadgen.parse_schedule(bad, 100)
 
@@ -178,6 +190,20 @@ class PacerTest(unittest.TestCase):
         p = loadgen.Pacer(loadgen.parse_schedule("steady:100:10", 1), 1000.0)
         p.take(1000.0)
         self.assertEqual(p.take(1060.0), (1060.0, 0))
+
+    def test_a_backlog_does_not_carry_into_the_next_segment(self):
+        # A spike 3 s behind at its end: no spike slot in the idle, the next one on time.
+        p = loadgen.Pacer(loadgen.parse_schedule("spike:10:100,idle:10,steady:10:1", 1), 1000.0)
+        p.next = 1007.0
+        self.assertEqual(p.take(1011.0), (1020.0, 2))
+        p = loadgen.Pacer(loadgen.parse_schedule("spike:10:100,idle:10", 1), 1000.0)
+        p.next = 1007.0
+        self.assertIsNone(p.take(1011.0))
+
+    def test_nothing_after_the_end(self):
+        p = loadgen.Pacer(loadgen.parse_schedule("steady:10:100", 1), 1000.0)
+        p.next = 1008.0
+        self.assertIsNone(p.take(1010.0))
 
 
 class Until(unittest.TestCase):
@@ -215,6 +241,24 @@ class OperationalMetrics(unittest.TestCase):
         self.assertEqual(lines[1][2], lines[2][2])
         self.assertEqual(lines[1][2], "trellis::client: LISTEN closed trellis_instance=… retry_in=…")
         self.assertEqual(lines[3][1:], ("ERROR", "trellis: boom N"))
+
+    def test_log_templates_keep_the_cause(self):
+        prefix = (
+            "2026-11-20T10:00:10.000000Z  WARN trellis::client: maintenance step failed; retrying"
+            ' trellis_instance=shop/trellis step="self_check" error=T0224: failed to acquire a connection: Error'
+            " occurred while creating a new object: db error: FATAL: "
+        )
+        a, b, c = chaos.parse_log_levels(
+            [
+                prefix + "the database system is shutting down failures=1",
+                prefix + "the database system is shutting down failures=12",
+                prefix + "too many connections for role failures=1",
+            ]
+        )
+        self.assertEqual(a[2], b[2])
+        self.assertNotEqual(a[2], c[2])
+        self.assertIn("error=T0224: failed", a[2])
+        self.assertIn('error="cause N"', chaos.log_template('x error="cause 7"'))
 
     def test_summarize(self):
         start = chaos.parse_log_levels(self.LOG[:1])[0][0] - 10  # 10:00:00
