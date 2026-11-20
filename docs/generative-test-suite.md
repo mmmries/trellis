@@ -387,6 +387,16 @@ beside them run on every `cargo test`.
   and `self_check` must report exactly that, each extreme's recompute equal by
   value to the oracle's. Its sweep, `extremes_tamper_planted_bugs_are_caught`,
   gates `sc_extremes_uncompared`.
+- **Epoch chains** (`tests/epoch_chain.rs`, `generate::epoch`). Every other
+  property starts each case from a fresh database. This one runs many programs
+  back to back on one instance and one database: each epoch starts at a quiet
+  point with drops, redefinitions, definitions dropped in an earlier epoch
+  brought back, second definitions and restarts, then writes rows carrying on
+  from what the earlier epochs left. Every epoch ends with a quiesce, the
+  oracle and a `Strict` `self_check`, so a failure names its epoch. A failing
+  chain shrinks whole epochs first, then within the epochs left.
+  `GENERATIVE_MAX_EPOCHS` (default 12) sets the longest chain; a deep run sets
+  50 or more.
 - **Two instances** (`tests/two_instance_noise.rs`). Two Trellis instances in one
   database (or in two), each converging against its own oracle, including one
   instance reading the other's target.
@@ -926,7 +936,9 @@ The actions, cheapest-first (every one below is built):
    one's source, dropped a burst later. The `JOIN`, 1-1 `JOIN` and star
    tiers drop and redefine a definition, unchanged, and add and drop a
    second one (`generate::join::add_join_actions`). The chained-reader tier
-   redefines a field too (`model::BurstAction::Alter`). Draws resolve in
+   redefines a field too (`model::BurstAction::Alter`). The epoch tier drops
+   and defines definitions between epochs, including ones dropped many epochs
+   before (§4). Draws resolve in
    burst order, so a later burst acts on the definitions as the earlier
    changes left them, and the oracle checks each definition as the last
    statement left it; the backend checks that a drop took its target.

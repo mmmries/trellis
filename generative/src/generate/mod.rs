@@ -126,6 +126,7 @@
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
+pub mod epoch;
 pub mod exact_sums;
 pub mod held_keys;
 pub mod join;
@@ -3090,7 +3091,7 @@ mod strategy {
     /// rather than independent vectors zipped up later — so an illegal
     /// pairing (a derived field on an `Aggregate` def) is unrepresentable
     /// rather than merely unlikely.
-    fn def_draw(
+    pub(super) fn def_draw(
         table_count: usize,
     ) -> impl Strategy<Value = (usize, DefShape, Option<DerivedShape>)> {
         (0..table_count, def_shape_and_derived())
@@ -3147,7 +3148,7 @@ mod strategy {
     /// and only with awkward values on (it writes `NULL`). It thins the other
     /// variants by about an eighth; see [`Mutate::ToggleNull`] for what it
     /// buys.
-    fn mutate(seed_count: usize, awkward_values: bool) -> BoxedStrategy<Mutate> {
+    pub(super) fn mutate(seed_count: usize, awkward_values: bool) -> BoxedStrategy<Mutate> {
         let pk = 1..=(seed_count as i64 + 1);
         let dup_pk = 1..=(seed_count as i64);
         let update = (pk.clone(), value(awkward_values), value(awkward_values))
@@ -3198,7 +3199,7 @@ mod strategy {
     /// comment's "Scope" section) — the per-table shape
     /// [`trivial_program_with`] draws, reusable once per table in a
     /// multi-table program.
-    fn table_spec(awkward_values: bool) -> impl Strategy<Value = TableSpec> {
+    pub(super) fn table_spec(awkward_values: bool) -> impl Strategy<Value = TableSpec> {
         (1..=MAX_SEED_ROWS)
             .prop_flat_map(move |seed_count| {
                 let seeds = prop::collection::vec(

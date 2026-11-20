@@ -42,6 +42,8 @@ pub(super) enum RunKind {
     /// quarantines a definition, leave it `live` or `quarantined`, never
     /// `paused`.
     HeldKeys,
+    /// `run_epochs`: many programs back to back on one instance.
+    Epoch,
 }
 
 /// Why a run may find a definition paused, for the allowlist's reader.
@@ -71,7 +73,8 @@ pub(super) struct Allowance {
 /// db-admin and restore tiers (a restart, a checkpoint or a cold copy keeps
 /// every table, oid and trigger, so nothing pauses: each of their actions
 /// leaves the converged state unchanged); the held-key tier (a held key and
-/// the whole-transform fuse end `live` or `quarantined`, not `paused`).
+/// the whole-transform fuse end `live` or `quarantined`, not `paused`); the
+/// epoch tier (its only pause is the one before each `DROP TRANSFORM`).
 pub(super) fn allowance(kind: RunKind, program: &Program) -> Option<Allowance> {
     match kind {
         RunKind::Sequential | RunKind::Bursty | RunKind::Concurrent
@@ -92,7 +95,8 @@ pub(super) fn allowance(kind: RunKind, program: &Program) -> Option<Allowance> {
         | RunKind::DbAdmin
         | RunKind::Restore
         | RunKind::TwoInstance
-        | RunKind::HeldKeys => None,
+        | RunKind::HeldKeys
+        | RunKind::Epoch => None,
     }
 }
 
@@ -169,6 +173,7 @@ mod tests {
             RunKind::DbAdmin,
             RunKind::Restore,
             RunKind::TwoInstance,
+            RunKind::Epoch,
         ] {
             let allowed = allowance(kind, &program);
             assert_eq!(allowed, None, "{kind:?}");
