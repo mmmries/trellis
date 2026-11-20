@@ -20,6 +20,7 @@ mod capture_partition_pass;
 mod capture_partitioned;
 mod capture_partitioned_staging;
 mod capture_reread;
+mod capture_reread_aged;
 mod capture_retype_floor;
 mod capture_schema_change;
 mod capture_ssi;

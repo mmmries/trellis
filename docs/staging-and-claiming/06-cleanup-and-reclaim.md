@@ -250,7 +250,7 @@ them:
   enum relabel deletes its tables' rows that every definition has already
   drained and that were staged before the relabel, which still hold the old
   label. Nothing applies a drained row again, but a group-basis or `JOIN`
-  rebuild names groups from the old images of every row left in a slot, and
+  rebuild names groups from the images of every row left in a slot, and
   would fail to cast the old label
   ([capture drift — An enum value relabelled](capture-drift.md#an-enum-value-relabelled)).
 
