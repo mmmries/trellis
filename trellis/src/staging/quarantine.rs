@@ -4915,7 +4915,7 @@ async fn complete_resume(
     // waited until every change staged before the change had drained
     // ([`relabel_changes_pending`]);
     // those still in their ring slot are discarded, since a group-basis or
-    // JOIN rebuild reads the old images in the ring. A 1-1 ledger keyed by a
+    // JOIN rebuild reads the images in the ring. A 1-1 ledger keyed by a
     // source key with an enum column holds the old label as `__from_key`,
     // which the rebuild's sweep would cast: such a target starts again from
     // empty.
