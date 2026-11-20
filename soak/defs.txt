@@ -1,0 +1,6 @@
+TRANSFORM acct_view FROM accounts SELECT name AS uname, balance * 2 AS dbl, region AS region WHERE active
+TRANSFORM region_totals FROM accounts GROUP BY region SELECT region AS region, COUNT(*) AS n, SUM(balance) AS total, AVG(balance) AS avg_bal
+TRANSFORM acct_order_totals FROM orders GROUP BY account_id SELECT account_id AS account_id, COUNT(*) AS n, SUM(amount) AS total, MIN(amount) AS mn, MAX(amount) AS mx
+TRANSFORM region_order_totals FROM orders JOIN accounts ON orders.account_id = accounts.id GROUP BY accounts.region SELECT accounts.region AS region, SUM(orders.amount) AS total, COUNT(*) AS n
+TRANSFORM order_view FROM orders LEFT JOIN accounts ON orders.account_id = accounts.id SELECT accounts.name AS acct_name, accounts.region AS region, orders.amount AS amount, orders.status AS status
+TRANSFORM big_accts FROM acct_order_totals SELECT total AS total, n AS n WHERE total > 2000
