@@ -47,7 +47,7 @@ Postgres, hidden tables included, detects and never repairs
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | **Transaction-id age** | | |
-| [An old key deleted and re-created under `REPEATABLE READ`](#an-old-key-deleted-and-re-created-under-repeatable-read) | `self_check` | [#2205](https://github.com/salesforce-misc/trellis/issues/2205) |
+| [An old key deleted and re-created under `REPEATABLE READ`](#an-old-key-deleted-and-re-created-under-repeatable-read) | `self_check` | documented |
 | **Connections through a pooler** | | |
 | [A Trellis process behind a transaction-mode pooler](#a-trellis-process-behind-a-transaction-mode-pooler) | nothing | configuration |
 
@@ -563,20 +563,31 @@ TRANSFORM` and define each affected transform again.
 **When:** a source row was written between `2^31` and `2^32` transaction ids
 ago (modulo `2^32`). Another session deletes or re-keys it after a
 `REPEATABLE READ` or `SERIALIZABLE` transaction took its snapshot. That
-transaction then re-creates the key in a statement where another write to the
-same table also runs, such as a trigger or an FK cascade.
+transaction then writes the key again and, in a statement with another write
+to the same table in it (such as a trigger), either:
+
+* removes the transaction's own version again: deletes or re-keys it, with a
+  condition the old row doesn't meet (one that reaches the old row fails
+  with a serialization error); or
+* writes a version whose `xmin` is past the id `age` counts from, with the
+  old row's raw `xmin` between the two. That takes a subtransaction (a
+  savepoint or an `EXCEPTION` block), or a call of `age` before the
+  transaction's first write.
 
 **What goes wrong:** capture re-reads the live row and keeps the version
-whose `age(xmin)` is not positive, taking it to be the transaction's own. A
-frozen row keeps its raw `xmin`, so the deleted row's `age` has wrapped
-negative, and that row is still visible in the snapshot. The insert is imaged
-with the deleted row's values.
+nearest the transaction whose `age(xmin)` is not positive, taking it to be
+the transaction's own. A frozen row keeps its raw `xmin`, so the deleted
+row's `age` has wrapped negative, and that row is still visible in the
+snapshot. In the first shape the transaction has no version of its own; in
+the second the old row is nearer. The write is imaged with the deleted row's
+values.
 
 **Detected by:** `self_check`.
 
 **Repair:** `request_backfill` the table.
 
-**Ends with:** [#2205](https://github.com/salesforce-misc/trellis/issues/2205).
+**Ends with:** documented. Telling a frozen `xmin` from the transaction's
+own needs the frozen bit, which only superuser functions expose.
 
 ## Connections through a pooler
 
@@ -639,7 +650,8 @@ fixes and what it costs:
   ([type support — Text rendering](type-support.md#text-rendering)).
 * **A `default_transaction_isolation` of `repeatable read` or
   `serializable`.** Trellis's connections use `read committed` whatever the
-  setting, and capture works at every level.
+  setting, and capture works at every level, except for an old key
+  ([above](#an-old-key-deleted-and-re-created-under-repeatable-read)).
 * **A whole-database physical backup and restore, PITR or `pg_upgrade`.**
   Sources and Trellis's state stay in step, except an unlogged source's data
   after a physical restore or PITR
