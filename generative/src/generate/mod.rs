@@ -135,6 +135,7 @@ pub mod join_chained;
 pub mod join_one_to_one;
 pub mod min_max;
 pub mod partition;
+#[cfg(feature = "proptest")]
 pub mod source_ddl;
 pub mod source_key;
 pub mod txn_shapes;
