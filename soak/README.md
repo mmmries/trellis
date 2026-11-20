@@ -9,6 +9,7 @@ tablespace and volume actions.
 soak/chaos.py setup                                    # once: build, seed, define, snapshot
 soak/chaos.py run --scenario smoke --lane f --issue 2188
 soak/chaos.py run --step sleep:60 --step 'pg-restart:immediate+kill9:w2' --load-secs 300
+soak/chaos.py run --schedule steady:600,idle:3600,spike:60:x100 --tps 50 --step until:2:1800 --step pg-restart
 soak/chaos.py actions                                  # every action and scenario
 soak/chaos.py stop                                     # after an interrupted run
 ```
@@ -30,18 +31,32 @@ soak/chaos.py stop                                     # after an interrupted ru
 - **Workers.** Each worker runs under `systemd-run --scope -p MemoryMax=6G` and serves
   `/metrics` on port 59501, 59502 and so on. `w1` connects over TCP so `blackhole` reaches it.
   A worker that exits when no action stopped it fails the run.
-- **Load.** `loadgen.py` runs `--threads` connections at `--tps`, with the op weights in
-  `--mix`, for `--load-secs`. It reconnects after every error.
+- **Load.** `loadgen.py` runs `--threads` connections with the op weights in `--mix`,
+  following `--schedule` (default `steady:120`). It reconnects after every error.
+- **Profiles.** A schedule is `PROFILE:SECS[:RATE],...`: `idle` (no writes), `trickle` (one
+  a minute), `steady` (`--tps`) and `spike` (10× `--tps`). `RATE` is `N` per second, `N/m`
+  per minute or `xN` times `--tps`.
 - **Steps.** Each `--step` runs in order while the load runs. `a+b` runs `a` and `b` at the
-  same time. A `--scenario` is a named step list with load defaults.
+  same time. `until:SEGMENT:OFFSET` waits for a point in the schedule, which places the next
+  step at an idle point. A `--scenario` is a named step list with load defaults.
+- **Probes.** Every `--probe-secs` while loaded, and a second before each idle segment ends,
+  the harness writes one row and times how long it takes to reach its target.
 - **Monitor.** It writes `monitor.tsv` every 5 s: worker RSS, ring rows, bytes and age,
-  definitions by status, drain failures, held keys, Trellis connections, and schema and target
-  sizes.
+  definitions by status, drain failures, held keys, Trellis connections, schema and target
+  sizes, the WAL position, and the `backend_xmin` hold of Trellis's sessions.
 - **Oracle.** After the load ends, `oracle.sql` (a two-way `EXCEPT` per target) runs every
   10 s until it reports no differences or `--converge-secs` passes.
 
-Each run's events, worker logs, load log, monitor series and final `trellis status` are
-under `target/soak/logs/<time>-<scenario>/`.
+Each run's events, worker logs, load log, monitor series, `metrics.json` and final
+`trellis status` are under `target/soak/logs/<time>-<scenario>/`.
+
+## Operational metrics
+
+`metrics.json` has, per schedule segment: the write rate achieved, probe latency, WAL bytes
+(and the hourly rate after a settling time), the longest `backend_xmin` hold, idle-in-transaction
+sessions, and WARN and ERROR lines grouped by message. Across segments, it compares each first
+write after an idle with the steady-state latency. The run prints a summary and puts a short
+form in the logbook note. These metrics don't fail a run yet; #2189 sets their thresholds.
 
 ## Outcome
 
