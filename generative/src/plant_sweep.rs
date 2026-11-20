@@ -772,12 +772,15 @@ pub fn reach_report(tier: &SweepTier, results: &[SweepCase]) -> String {
     );
     for site in trellis::dev::plant::sites() {
         let (reached, total) = reach.get(site).copied().unwrap_or((0, 0));
-        let floor = if tier.not_gated.iter().any(|(name, _)| *name == site) {
+        let ungated = tier.not_gated.iter().any(|(name, _)| *name == site);
+        let floor = if ungated && !crate::reach_floor::reached_ungated(tier.name, site) {
             "not gated here"
         } else if crate::reach_floor::exemption(tier.name, site).is_some() {
             "exempt"
         } else if reached == 0 {
             "MISSED"
+        } else if ungated {
+            "held, not gated"
         } else {
             "held"
         };

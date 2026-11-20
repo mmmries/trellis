@@ -131,6 +131,16 @@ pub enum FailureClass {
 /// structural `Ddl(NoPrimaryKey)` is [`FailureClass::Halting`] whether it
 /// arrives bare or wrapped.
 pub fn classify(err: &ApplyError) -> FailureClass {
+    // The reach of the plants that read a column an image lacks as `NULL`:
+    // the correct path fails the page instead, and the error doesn't say
+    // which path's statement raised it, so it counts for both.
+    #[cfg(any(test, feature = "test-util"))]
+    if super::one_to_one_render::is_data_exception(err)
+        && pg_message(err).is_some_and(|m| m.contains(super::one_to_one_render::UNIMAGED_COLUMN))
+    {
+        crate::plant::reach_plant(crate::plant::Plant::O2oWhereColumnNotImaged);
+        crate::plant::reach_plant(crate::plant::Plant::GbWhereColumnNotImaged);
+    }
     match innermost_apply_error(err) {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
         ApplyError::HopBoundExceeded { .. }

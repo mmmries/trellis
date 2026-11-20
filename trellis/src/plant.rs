@@ -44,8 +44,10 @@
 //!    Pass [`fires`] a condition that is true only when the plant actually
 //!    changes what the engine does here, so [`fired`] counts real
 //!    misbehavior, not visits, and [`reached`] counts the times it would
-//!    have. Keep the hook to a few lines: the correct
-//!    path must read exactly as it did before.
+//!    have. Compute the condition armed or not, so an unarmed baseline
+//!    counts its reaches; where it costs a query the correct path doesn't
+//!    run, guard the query with [`visit`]. Keep the hook to a few lines: the
+//!    correct path must read exactly as it did before.
 //! 3. Pin it: name the deterministic interleaving test that fails with it
 //!    armed (`TRELLIS_TEST_PLANT=<name> cargo test -p trellis --test <file>
 //!    <test>`) in its doc comment.
@@ -1215,13 +1217,33 @@ pub fn armed() -> Option<Plant> {
 /// counted as a reach of `plant`'s site ([`reached`]).
 pub fn fires(plant: Plant, changes_behavior: bool) -> bool {
     if changes_behavior {
-        reach_slot(&REACHED, plant as usize, plant.name()).fetch_add(1, Ordering::Relaxed);
+        reach_plant(plant);
     }
     let fires = changes_behavior && armed() == Some(plant);
     if fires {
         FIRED.fetch_add(1, Ordering::Relaxed);
     }
     fires
+}
+
+/// The hook of a site whose precondition costs a query the correct path
+/// doesn't run: true when `plant` is armed, and the caller runs the query
+/// and passes its answer to [`fires`]. Unarmed, it counts a reach of the
+/// site for each pass of the hook instead ([`reached`]): a count of the
+/// path, not of the precondition.
+pub fn visit(plant: Plant) -> bool {
+    if armed() == Some(plant) {
+        return true;
+    }
+    reach_plant(plant);
+    false
+}
+
+/// Counts one reach of `plant`'s site: for a site whose precondition shows
+/// only where the correct path acts on it (a statement it fails), not at
+/// its hook.
+pub fn reach_plant(plant: Plant) {
+    reach_slot(&REACHED, plant as usize, plant.name()).fetch_add(1, Ordering::Relaxed);
 }
 
 /// How many times the armed plant has changed the engine's behavior in this

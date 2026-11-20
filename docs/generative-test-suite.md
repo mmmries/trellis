@@ -900,7 +900,10 @@ sweep's workers, not a gate: it prints a `plant-sweep` row per case and exits
 
 Coverage floors prove the generators draw a shape; the reachability floor
 proves the shape reaches the engine path. Each plant's hook counts a *reach*
-whenever its precondition holds, armed or not, and a *reach marker*
+whenever its precondition holds, armed or not. A hook whose precondition
+costs a query the correct path doesn't run counts each pass instead
+(`plant::visit`), and one whose precondition shows only as the correct
+path's error counts where that error is classified. A *reach marker*
 (`trellis::dev::plant::Marker`) counts a path that has no plant, such as
 capture's nullable-key encoding. Both compile only under `test-util`. The
 subprocess backend asks each engine child for its counts before killing it
@@ -910,7 +913,10 @@ Every sweep prints a reachability report after its baseline: per site, the
 baseline cases that reached it and its reaches in all. Then the floor holds:
 **every site is reached at least once in the tier's baseline**, unless the
 tier's `not_gated` names it, or `generative::reach_floor::EXEMPT` lists it
-for that tier (or for every tier, `*`) with why. A site no tier reaches is
+for that tier (or for every tier, `*`) with why. A site the tier doesn't
+gate but reaches in a quarter or more of its baseline cases is held too,
+listed in `reach_floor::REACHED_UNGATED`: losing it is lost exploration
+that no catch rate shows. A site no tier reaches is
 listed for `*` and names the deterministic test that reaches it. A site a
 tier reaches only now and then is exempt for that tier, with its measured
 rate.
@@ -919,8 +925,8 @@ The floor is judged on the tier's default baseline (seeds 1–4, 12 cases
 each) or a bigger run, which draws the same cases first. A smaller run, or
 `GENERATIVE_PLANT_ONLY`, prints the report and skips the floor. It costs no
 extra cases, since every sweep already runs the baseline. The meta-test
-`the_reachability_floors_exemptions_are_well_formed` checks that the list
-names real sites and tiers, with reasons.
+`the_reachability_floors_exemptions_are_well_formed` checks that both lists
+name real sites and tiers, and that each exemption gives a reason.
 
 ## 7. The action space, and how it grows
 

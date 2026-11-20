@@ -328,8 +328,7 @@ impl TargetMutations {
             // as a definition's reads, so a star reading the target at a
             // later position is no reader. See `crate::plant`.
             #[cfg(any(test, feature = "test-util"))]
-            let readers = if crate::plant::armed() == Some(crate::plant::Plant::StarReadsFirstOnly)
-            {
+            let readers = if crate::plant::visit(crate::plant::Plant::StarReadsFirstOnly) {
                 let first = readers_of(txn, target, |d, table| {
                     format!("({d}.source_table = {table} or {d}.join_table = {table})")
                 })
@@ -480,7 +479,9 @@ impl TargetMutations {
                 None => {
                     let token = read_write_token(txn).await?;
                     // Planted bug: stage with the token read when the page
-                    // began. See `crate::plant`.
+                    // began. See `crate::plant`. Unarmed, there is no early
+                    // token to compare, so the stage itself counts as a
+                    // reach.
                     #[cfg(any(test, feature = "test-util"))]
                     let token = match self.early_token {
                         Some(early)
@@ -491,7 +492,11 @@ impl TargetMutations {
                         {
                             early
                         }
-                        _ => token,
+                        Some(_) => token,
+                        None => {
+                            crate::plant::reach_plant(crate::plant::Plant::SeamTokenEarly);
+                            token
+                        }
                     };
                     propagation.write_token = Some(token);
                     token
