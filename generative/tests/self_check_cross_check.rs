@@ -1378,6 +1378,7 @@ fn extremes_tamper_sweep_tier() -> SweepTier {
             PlantPath::OneToOneJoin,
             PlantPath::Chain,
             PlantPath::Extremes,
+            PlantPath::Isolation,
         ],
         "the tampering tier runs a settled program and gates only self_check's comparison of \
          the extremes; the plant's own path is gated by the tier its comment names",

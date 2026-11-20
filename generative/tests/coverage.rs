@@ -1816,3 +1816,70 @@ fn every_drawn_where_round_trips_and_is_admitted() {
         "only {filtered} drawn definitions have a WHERE"
     );
 }
+
+/// #2185 (6a): the held-key tier's isolation family draws every kind of
+/// pair (the `interval` one only where Postgres has infinite intervals),
+/// each sibling shape, writes after the pair in some cases, and a raising
+/// 1-1 field beside it in every one, so the failing alone and failing in
+/// combination draws meet in one program. The pair is always a two-row
+/// `INSERT` with ops of the held-key program around it.
+#[test]
+fn the_isolation_family_draws_every_failure_kind_beside_rows_that_fail_alone() {
+    use generative::generate::exact_sums::interval_infinities;
+    use generative::generate::isolation::{FailKind, SIBLING, TABLE, isolation_program};
+    let cases = sample(isolation_program(), 200);
+    let mut kinds = HashSet::new();
+    let (mut aggregate_sibling, mut copy_sibling, mut after, mut among) = (0, 0, 0, 0);
+    for case in &cases {
+        kinds.insert(format!("{:?}", case.draw.kind));
+        let ops = &case.program.ops;
+        assert!(
+            matches!(&ops[case.draw.pair_op], Op::BulkInsert { table, rows, .. }
+                if table == TABLE && rows.len() == 2),
+            "{:?}",
+            ops[case.draw.pair_op]
+        );
+        let sibling = case
+            .program
+            .defs
+            .iter()
+            .find(|d| d.target == SIBLING)
+            .expect("a sibling");
+        if matches!(sibling.key_space, KeySpace::Aggregate { .. }) {
+            aggregate_sibling += 1;
+        } else {
+            copy_sibling += 1;
+        }
+        let iso_writes = |range: &[Op]| range.iter().filter(|op| op.table() == TABLE).count();
+        after += usize::from(iso_writes(&ops[case.draw.pair_op + 1..]) > 0);
+        among += usize::from(ops.iter().any(|op| op.table() != TABLE));
+        // The held-key program's first definition raises (`/ (c2 - K)`).
+        assert_eq!(case.program.defs[0].key_space, KeySpace::OneToOne);
+    }
+    let mut expected: Vec<FailKind> = vec![
+        FailKind::FloatSum,
+        FailKind::UniqueTarget,
+        FailKind::TriggerTarget,
+    ];
+    if interval_infinities() {
+        expected.push(FailKind::IntervalInfinities);
+    }
+    for kind in expected {
+        assert!(
+            kinds.contains(&format!("{kind:?}")),
+            "{kind:?} never drawn: {kinds:?}"
+        );
+    }
+    let floor = cases.len() / 5;
+    assert!(
+        aggregate_sibling >= floor,
+        "aggregate siblings: {aggregate_sibling}"
+    );
+    assert!(copy_sibling >= floor, "1-1 siblings: {copy_sibling}");
+    assert!(after >= floor, "cases writing iso after the pair: {after}");
+    assert_eq!(
+        among,
+        cases.len(),
+        "every case has the held-key program's own ops"
+    );
+}

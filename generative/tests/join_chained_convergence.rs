@@ -353,6 +353,10 @@ fn chained_sweep_tier() -> SweepTier {
         "it breaks a definition's own apply path, which the concurrent, JOIN and 1-1 JOIN \
          tiers gate; this tier gates the seam's feed to a JOIN reading a target",
     )
+    .chain(not_on_path(
+        &[PlantPath::Isolation],
+        generative::plant_sweep::NO_ISOLATION,
+    ))
     .collect();
     SweepTier {
         name: generative::baseline_quarantine::JOIN_CHAINED_TIER,

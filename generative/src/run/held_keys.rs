@@ -25,12 +25,13 @@ use std::fmt;
 use trellis::dev::defs::ast::{KeySpace, ValueType};
 use trellis::dev::pool::Pool;
 
-use crate::backend::{Backend, HeldKeyReport, HeldKeys, ManualBackend};
+use crate::backend::{Backend, DefinitionState, HeldKeyReport, HeldKeys, ManualBackend};
+use crate::generate::isolation::{self, IsolationCase, IsolationDraw};
 use crate::model::{Op, Program};
 use crate::oracle::{self, Rows};
 
-use super::pause::RunKind;
-use super::{Divergence, RunError, apply_and_check_outcome, settled_states, source_table};
+use super::pause::{RunKind, allowance, check_no_unexpected_pause};
+use super::{Divergence, RunError, apply_and_check_outcome, source_table};
 
 /// How many held keys trip a definition's whole-transform fuse
 /// (`trellis::staging::quarantine::DEFAULT_TRANSFORM_DEATH_THRESHOLD`; the
@@ -138,17 +139,50 @@ pub struct HeldKeySummary {
     pub held: usize,
     /// Definitions the fuse quarantined.
     pub quarantined: usize,
+    /// Definitions paused because their share of a page failed alone
+    /// (T0247): the isolation draw's.
+    pub paused_alone: usize,
 }
 
 /// Installs `program`, then applies each op and, once the engine settles
 /// around its held keys, checks every target against the held-key model and
 /// every definition's reported held keys against it. Sequential, like
 /// [`super::run_convergence`]; a program with deferred installs, restarts or
-/// scale-outs is a generator bug here.
+/// scale-outs is a generator bug here. Once the last op settled, nothing
+/// may keep the ring from retiring
+/// ([`ManualBackend::ring_unretired`]).
 pub async fn run_convergence_with_held_keys(
     backend: &mut ManualBackend,
     pool: &Pool,
     program: &Program,
+) -> Result<HeldKeySummary, RunError> {
+    run(backend, pool, program, None).await
+}
+
+/// [`run_convergence_with_held_keys`] over an isolation case
+/// ([`crate::generate::isolation`]): the definitions are installed, then
+/// the target-side refusal the draw names, then the ops run. Until the
+/// pair, `iso_d` is held to the oracle like every definition. From the
+/// pair on, the #2130 invariant: `iso_d` is paused with T0247, naming the
+/// page's SQLSTATE and both of the pair's keys, and its target holds what
+/// it had before the pair, while every other definition, `iso_s` over the
+/// same rows included, keeps converging and none is paused; and once the
+/// last op settled the ring retires. `iso_d` is the one target the run
+/// excuses from the oracle, so it is where "status tells the truth" bites
+/// ([`RunError::StatusLies`]): it may not report `live` while inexact.
+pub async fn run_convergence_with_isolation(
+    backend: &mut ManualBackend,
+    pool: &Pool,
+    case: &IsolationCase,
+) -> Result<HeldKeySummary, RunError> {
+    run(backend, pool, &case.program, Some(&case.draw)).await
+}
+
+async fn run(
+    backend: &mut ManualBackend,
+    pool: &Pool,
+    program: &Program,
+    isolation: Option<&IsolationDraw>,
 ) -> Result<HeldKeySummary, RunError> {
     assert!(
         program.def_install_after_op.iter().all(|&at| at == 0)
@@ -161,7 +195,21 @@ pub async fn run_convergence_with_held_keys(
         .install(program)
         .await
         .map_err(|e| RunError::Install(format!("{e:?}")))?;
+    if let Some(draw) = isolation {
+        for ddl in draw
+            .kind
+            .target_ddl(&backend.qualified_target(isolation::FAILING))
+        {
+            backend
+                .execute_raw(&ddl)
+                .await
+                .map_err(|e| RunError::Install(format!("{ddl}: {e:?}")))?;
+        }
+    }
     let mut models: BTreeMap<String, DefModel> = BTreeMap::new();
+    // `iso_d`'s target as the last check before the pair read it.
+    let mut before_pair: Option<Rows> = None;
+    let mut paused_alone = 0;
 
     for (op_index, op) in program.ops.iter().enumerate() {
         apply_and_check_outcome(backend, op_index, op, false).await?;
@@ -169,8 +217,20 @@ pub async fn run_convergence_with_held_keys(
             .quiesce()
             .await
             .map_err(|e| RunError::Quiesce(format!("{e:?}")))?;
-        let states =
-            settled_states(backend, program, op_index, &program.defs, RunKind::HeldKeys).await?;
+        // From the pair on, `iso_d` is the isolation's to judge.
+        let excused = |target: &str| {
+            isolation.is_some_and(|draw| op_index >= draw.pair_op && target == isolation::FAILING)
+        };
+        let states = backend
+            .definition_states(&program.defs)
+            .await
+            .map_err(|e| RunError::Snapshot(format!("definition states: {e:?}")))?;
+        let judged: Vec<DefinitionState> = states
+            .iter()
+            .filter(|state| !excused(&state.target))
+            .cloned()
+            .collect();
+        check_no_unexpected_pause(op_index, &judged, allowance(RunKind::HeldKeys, program))?;
         let snapshot = backend
             .snapshot()
             .await
@@ -188,7 +248,7 @@ pub async fn run_convergence_with_held_keys(
             let target = snapshot.get(&def.target).ok_or_else(|| {
                 RunError::Snapshot(format!("target {:?} missing from snapshot", def.target))
             })?;
-            let report = if matches!(def.key_space, KeySpace::OneToOne) {
+            let report = if matches!(def.key_space, KeySpace::OneToOne) && !excused(&def.target) {
                 let (rows, raised) = oracle::sql_oracle_per_row(pool, def, &source.pk_col)
                     .await
                     .map_err(|e| RunError::Oracle(format!("{e:?}")))?;
@@ -212,6 +272,36 @@ pub async fn run_convergence_with_held_keys(
                 .await
                 .map_err(|e| RunError::Oracle(format!("{e:?}")))?
             };
+            if excused(&def.target) {
+                let draw = isolation.expect("only an isolation run excuses a target");
+                let state = states
+                    .iter()
+                    .find(|state| state.target == def.target)
+                    .expect("a state per definition");
+                if let Some(lie) =
+                    super::status_lies(std::slice::from_ref(state), |_| report.diverged()).pop()
+                {
+                    return Err(RunError::StatusLies {
+                        op_index,
+                        state: lie.clone(),
+                    });
+                }
+                let problem = isolation_problem(draw, state, target, before_pair.as_ref());
+                if let Some(problem) = problem {
+                    return Err(RunError::Isolation {
+                        op_index,
+                        target: def.target.clone(),
+                        problem,
+                        program: format!("{program:#?}"),
+                    });
+                }
+                continue;
+            }
+            if isolation.is_some_and(|draw| op_index + 1 == draw.pair_op)
+                && def.target == isolation::FAILING
+            {
+                before_pair = Some(target.clone());
+            }
             if report.diverged() {
                 diverged.push((def.target.clone(), report));
             }
@@ -221,6 +311,9 @@ pub async fn run_convergence_with_held_keys(
         }
 
         for def in &program.defs {
+            if excused(&def.target) {
+                continue;
+            }
             let expected = models
                 .get(&def.target)
                 .map(DefModel::expectation)
@@ -245,12 +338,67 @@ pub async fn run_convergence_with_held_keys(
                 });
             }
         }
+        if isolation.is_some_and(|draw| op_index == draw.pair_op) {
+            paused_alone += 1;
+        }
+    }
+
+    if let Some(unretired) = backend
+        .ring_unretired()
+        .await
+        .map_err(|e| RunError::Snapshot(format!("ring: {e:?}")))?
+    {
+        return Err(RunError::Isolation {
+            op_index: program.ops.len().saturating_sub(1),
+            target: "<ring>".to_string(),
+            problem: format!("the ring didn't retire once the run settled: {unretired}"),
+            program: format!("{program:#?}"),
+        });
     }
 
     Ok(HeldKeySummary {
         held: models.values().map(|m| m.held().len()).sum(),
         quarantined: models.values().filter(|m| m.is_quarantined()).count(),
+        paused_alone,
     })
+}
+
+/// What's wrong with `iso_d` at a check from the pair on, or `None`: it must
+/// be paused, with a T0247 reason naming the page's SQLSTATE and both of
+/// the pair's keys, and its `target` must still read `before_pair`.
+fn isolation_problem(
+    draw: &IsolationDraw,
+    state: &DefinitionState,
+    target: &BTreeMap<String, BTreeMap<String, Option<String>>>,
+    before_pair: Option<&Rows>,
+) -> Option<String> {
+    if state.status != "paused" || state.reported != "paused" {
+        return Some(format!(
+            "expected paused (T0247), found {state}; the {:?} pair should have paused it",
+            draw.kind
+        ));
+    }
+    let reason = state.reason.as_deref().unwrap_or("");
+    let mut wants = vec![
+        "T0247".to_string(),
+        draw.kind.sqlstate().to_string(),
+        format!("'{}'", isolation::FAILING),
+    ];
+    wants.extend(draw.pair_keys.iter().map(|key| format!("key={key}")));
+    let missing: Vec<&String> = wants
+        .iter()
+        .filter(|want| !reason.contains(*want))
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!("its pause reason lacks {missing:?}: {reason:?}"));
+    }
+    match before_pair {
+        Some(before) if before != target => Some(format!(
+            "its target moved after the pause: before the pair {before:?}, now {target:?}"
+        )),
+        Some(_) => None,
+        None => Some("no check read its target before the pair".to_string()),
+    }
 }
 
 #[cfg(test)]

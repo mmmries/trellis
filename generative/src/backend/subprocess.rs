@@ -664,7 +664,8 @@ impl super::Backend for SubprocessBackend {
         &mut self,
         defs: &[TransformDef],
     ) -> Result<Vec<DefinitionState>, SubprocessBackendError> {
-        Ok(sql::definition_states(&self.raw, defs).await?)
+        let reported = sql::reported_statuses(Config::from_dsn(self.dsn.clone())?).await?;
+        Ok(sql::definition_states(&self.raw, defs, &reported).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SubprocessBackendError> {

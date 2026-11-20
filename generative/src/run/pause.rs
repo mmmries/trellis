@@ -40,7 +40,8 @@ pub(super) enum RunKind {
     TwoInstance,
     /// `run_convergence_with_held_keys`. A held key, and the fuse that
     /// quarantines a definition, leave it `live` or `quarantined`, never
-    /// `paused`.
+    /// `paused`. `run_convergence_with_isolation` judges its failing
+    /// definition's pause itself and holds every other one to this.
     HeldKeys,
 }
 
@@ -138,6 +139,7 @@ mod tests {
         DefinitionState {
             target: target.to_string(),
             status: status.to_string(),
+            reported: status.to_string(),
             reason: reason.map(str::to_string),
         }
     }

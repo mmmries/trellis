@@ -128,6 +128,7 @@
 
 pub mod exact_sums;
 pub mod held_keys;
+pub mod isolation;
 pub mod join;
 pub mod join_chained;
 pub mod join_one_to_one;

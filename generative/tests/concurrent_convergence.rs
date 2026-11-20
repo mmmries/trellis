@@ -1907,6 +1907,10 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
             plant_sweep::NO_EXTREMES,
         ))
+        .chain(not_on_path(
+            &[PlantPath::Isolation],
+            plant_sweep::NO_ISOLATION,
+        ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
         .chain([LEAF_UNREACHED, FILTERED_NAMING_UNREACHED])
         .chain(UNIMAGED_COLUMN_UNREACHED)
