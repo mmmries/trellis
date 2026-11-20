@@ -80,9 +80,13 @@ pub const EXEMPT: &[Exemption] = &[
     Exemption {
         tier: EVERY_TIER,
         site: "capture_widen",
-        why: "no tier changes a running program's definitions (#2183 adds it); \
-              capture_install's a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate \
-              reaches it",
+        why: "a tier widens capture only when a definition installed after another over its \
+              source needs a column or group key the installed capture doesn't image, which \
+              the drawn programs do in 0 to 22 of 48 \
+              baseline cases by tier (join_chained 22, join_one_to_one 15, join_star 12, \
+              logbooks 20261120T014255-d-sweep and 20261120T023839-d-sweep); #2183 changes \
+              a running program's definitions; capture_install's \
+              a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate reaches it",
     },
     Exemption {
         tier: EVERY_TIER,
@@ -96,9 +100,11 @@ pub const EXEMPT: &[Exemption] = &[
 /// more of its cases, so the floor holds them too: a reach lost there is
 /// exploration lost, though no catch rate shows it. A quarter keeps a
 /// timing-dependent reach from dropping to none by chance. Read off each
-/// tier's reachability report; a site the tier gates later leaves its list.
-/// A site whose hook counts passes rather than its precondition
-/// (`trellis::dev::plant::visit`) isn't listed: its count says less.
+/// tier's reachability report, which prints the list its run would give
+/// ([`suggested_reached_ungated`]); a site the tier gates later leaves its
+/// list. A site whose reach counts passes of its path rather than its
+/// precondition (`trellis::dev::plant::counts_passes`) isn't listed: its
+/// count says less.
 pub const REACHED_UNGATED: &[(&str, &[&str])] = &[
     ("join", &["gb_where_old_image"]),
     (
@@ -296,6 +302,46 @@ pub fn misses(tier: &SweepTier, reached: &BTreeMap<String, u64>) -> Vec<&'static
         .collect()
 }
 
+/// The sites [`REACHED_UNGATED`] would list for `tier` from a baseline of
+/// `cases` cases whose per-site reach is `reached` (cases that reached it,
+/// keyed by site): each site the tier doesn't gate, isn't exempt from and
+/// whose count isn't of passes, reached in a quarter or more of the cases.
+pub fn suggested_reached_ungated(
+    tier: &SweepTier,
+    cases: usize,
+    reached: &BTreeMap<String, usize>,
+) -> Vec<&'static str> {
+    trellis::dev::plant::sites()
+        .filter(|site| tier.not_gated.iter().any(|(name, _)| name == site))
+        .filter(|site| exemption(tier.name, site).is_none())
+        .filter(|site| !trellis::dev::plant::counts_passes(site))
+        .filter(|site| cases > 0 && 4 * reached.get(*site).copied().unwrap_or(0) >= cases)
+        .collect()
+}
+
+/// The sweep's failure for `tier`'s baseline missing `missed`
+/// ([`misses`]), with what to change for each kind of site.
+pub fn failure(tier: &SweepTier, missed: &[&str]) -> String {
+    let (held_ungated, gated): (Vec<&str>, Vec<&str>) = missed
+        .iter()
+        .partition(|site| tier.not_gated.iter().any(|(name, _)| name == *site));
+    let mut out = format!(
+        "the {} tier's baseline never reached {missed:?} (see the reachability report above).",
+        tier.name
+    );
+    if !gated.is_empty() {
+        out.push_str(&format!(
+            " {gated:?}: the tier gates each, so draw a shape that reaches it, or add it to              generative/src/reach_floor.rs's EXEMPT for this tier with why (and its              deterministic pin if no tier reaches it). A plant whose hook computes its              precondition only when armed counts no reach: compute it armed or not, or guard              it with plant::visit (trellis/src/plant.rs, \"Adding a plant\")."
+        ));
+    }
+    if !held_ungated.is_empty() {
+        out.push_str(&format!(
+            " {held_ungated:?}: the tier doesn't gate these, so only REACHED_UNGATED holds              them; if the tier's draws changed on purpose, replace its entry there with the              list the report above suggests."
+        ));
+    }
+    out
+}
+
 /// What's wrong with [`EXEMPT`] and [`REACHED_UNGATED`]: an entry naming
 /// no site or no tier, an exemption with no reason, or an entry repeating
 /// another.
@@ -319,6 +365,11 @@ pub fn list_problems() -> Vec<String> {
             if exemption(tier, site).is_some() {
                 problems.push(format!(
                     "REACHED_UNGATED's {tier} lists {site}, which is exempt"
+                ));
+            }
+            if trellis::dev::plant::counts_passes(site) {
+                problems.push(format!(
+                    "REACHED_UNGATED's {tier} lists {site}, whose reach counts passes"
                 ));
             }
         }
@@ -388,6 +439,46 @@ mod tests {
             ),
             vec!["stale_one_to_one_write", "chunk_without_entry_lock"],
             "an ungated site REACHED_UNGATED lists is still held"
+        );
+    }
+
+    /// The suggested list holds the tier's ungated sites reached in a
+    /// quarter of the cases, leaving out exempt and pass-counted sites; the
+    /// failure names the remedy for gated and ungated misses apart.
+    #[test]
+    fn the_suggested_list_and_the_failure_follow_the_rules() {
+        let tier = tier(vec![
+            ("chunk_without_entry_lock", "not gated"),
+            ("o2o_where_no_tombstone", "not gated"),
+            ("gb_early_zero_gc", "not gated"),
+            ("capture_widen", "not gated"),
+        ]);
+        let reached: BTreeMap<String, usize> = [
+            ("chunk_without_entry_lock", 12),
+            ("o2o_where_no_tombstone", 11),
+            ("gb_early_zero_gc", 48),
+            ("capture_widen", 48),
+            ("stale_one_to_one_write", 48),
+        ]
+        .into_iter()
+        .map(|(site, n)| (site.to_string(), n))
+        .collect();
+        assert_eq!(
+            suggested_reached_ungated(&tier, 48, &reached),
+            vec!["chunk_without_entry_lock"],
+            "12 of 48 is a quarter; a gated, an exempt and a pass-counted site aren't listed"
+        );
+        let text = failure(
+            &tier,
+            &["stale_one_to_one_write", "chunk_without_entry_lock"],
+        );
+        assert!(
+            text.contains("[\"stale_one_to_one_write\"]: the tier gates each"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[\"chunk_without_entry_lock\"]: the tier doesn't gate these"),
+            "{text}"
         );
     }
 

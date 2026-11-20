@@ -494,7 +494,7 @@ impl TargetMutations {
                         }
                         Some(_) => token,
                         None => {
-                            crate::plant::reach_plant(crate::plant::Plant::SeamTokenEarly);
+                            crate::plant::reach_pass(crate::plant::Plant::SeamTokenEarly);
                             token
                         }
                     };

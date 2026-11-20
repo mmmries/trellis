@@ -228,7 +228,9 @@ pub mod build {
 /// reached; it never arms one, since
 /// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.
 pub mod plant {
-    pub use crate::plant::{Marker, PLANT_ENV, Plant, absorb, armed, fired, reached, sites};
+    pub use crate::plant::{
+        Marker, PLANT_ENV, Plant, absorb, armed, counts_passes, fired, reached, sites,
+    };
 }
 
 /// Sample values of the public status and report structs, which are

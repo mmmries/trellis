@@ -623,10 +623,8 @@ fn judge(test: &str, tier: &SweepTier, requested: &str) {
         let missed = crate::reach_floor::misses(tier, &totals);
         assert!(
             missed.is_empty(),
-            "the {} tier's baseline never reached {missed:?} (see the reachability report \
-             above): draw the shape that reaches each, or exempt it, with why, in \
-             generative/src/reach_floor.rs's EXEMPT",
-            tier.name
+            "{}",
+            crate::reach_floor::failure(tier, &missed)
         );
     } else {
         eprintln!(
@@ -776,7 +774,11 @@ pub fn reach_report(tier: &SweepTier, results: &[SweepCase]) -> String {
         let floor = if ungated && !crate::reach_floor::reached_ungated(tier.name, site) {
             "not gated here"
         } else if crate::reach_floor::exemption(tier.name, site).is_some() {
-            "exempt"
+            if reached == 0 {
+                "exempt"
+            } else {
+                "exempt, but reached"
+            }
         } else if reached == 0 {
             "MISSED"
         } else if ungated {
@@ -784,7 +786,41 @@ pub fn reach_report(tier: &SweepTier, results: &[SweepCase]) -> String {
         } else {
             "held"
         };
-        let _ = writeln!(out, "{site} | {reached}/{cases} | {total} | {floor}");
+        // A pass count shows only that the path ran.
+        let passes = if trellis::dev::plant::counts_passes(site) {
+            " (passes)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "{site} | {reached}/{cases} | {total} | {floor}{passes}"
+        );
+    }
+    let suggested = crate::reach_floor::suggested_reached_ungated(
+        tier,
+        cases,
+        &reach
+            .iter()
+            .map(|(site, (cases, _))| (site.clone(), *cases))
+            .collect(),
+    );
+    let listed: Vec<&str> = crate::reach_floor::REACHED_UNGATED
+        .iter()
+        .find(|(name, _)| *name == tier.name)
+        .map_or(Vec::new(), |(_, sites)| sites.to_vec());
+    let mut sorted = suggested.clone();
+    sorted.sort_unstable();
+    let mut now = listed;
+    now.sort_unstable();
+    if sorted != now {
+        let _ = writeln!(
+            out,
+            "REACHED_UNGATED's entry for this run would be (ungated sites reached in a \
+             quarter of the cases; it differs from the list, which is updated only on \
+             purpose): (\"{}\", &{suggested:?}),",
+            tier.name
+        );
     }
     out
 }

@@ -905,7 +905,8 @@ costs a query the correct path doesn't run counts each pass instead
 (`plant::visit`), and one whose precondition shows only as the correct
 path's error counts where that error is classified. A *reach marker*
 (`trellis::dev::plant::Marker`) counts a path that has no plant, such as
-capture's nullable-key encoding. Both compile only under `test-util`. The
+capture's nullable-key encoding. The report marks pass counts, markers
+included, `(passes)`: they prove only that the path runs. Both compile only under `test-util`. The
 subprocess backend asks each engine child for its counts before killing it
 and folds them into the sweep's own.
 
@@ -916,7 +917,8 @@ tier's `not_gated` names it, or `generative::reach_floor::EXEMPT` lists it
 for that tier (or for every tier, `*`) with why. A site the tier doesn't
 gate but reaches in a quarter or more of its baseline cases is held too,
 listed in `reach_floor::REACHED_UNGATED`: losing it is lost exploration
-that no catch rate shows. A site no tier reaches is
+that no catch rate shows. When a run's ungated reaches differ from that
+list, the report prints the entry the run would give. A site no tier reaches is
 listed for `*` and names the deterministic test that reaches it. A site a
 tier reaches only now and then is exempt for that tier, with its measured
 rate.

@@ -46,7 +46,8 @@
 //!    misbehavior, not visits, and [`reached`] counts the times it would
 //!    have. Compute the condition armed or not, so an unarmed baseline
 //!    counts its reaches; where it costs a query the correct path doesn't
-//!    run, guard the query with [`visit`]. Keep the hook to a few lines: the
+//!    run, guard the query with [`visit`] and name the plant in
+//!    [`Plant::reach_counts_passes`]. Keep the hook to a few lines: the
 //!    correct path must read exactly as it did before.
 //! 3. Pin it: name the deterministic interleaving test that fails with it
 //!    armed (`TRELLIS_TEST_PLANT=<name> cargo test -p trellis --test <file>
@@ -1169,6 +1170,22 @@ impl Plant {
     pub fn from_name(name: &str) -> Option<Plant> {
         Plant::ALL.iter().copied().find(|p| p.name() == name)
     }
+
+    /// Whether the site's reach counts passes of its hook ([`visit`],
+    /// [`reach_pass`]) rather than times its precondition held: a reach
+    /// shows only that the path ran.
+    pub fn reach_counts_passes(self) -> bool {
+        matches!(
+            self,
+            Plant::GbEarlyZeroGc
+                | Plant::GbLsnNotVisibility
+                | Plant::JoinOtherSideBeforeJ
+                | Plant::JoinDropFlip
+                | Plant::StarReadsFirstOnly
+                | Plant::Join1FanOutHeldRow
+                | Plant::SeamTokenEarly
+        )
+    }
 }
 
 /// Parses [`PLANT_ENV`]'s value: `None` for unset or empty.
@@ -1235,8 +1252,21 @@ pub fn visit(plant: Plant) -> bool {
     if armed() == Some(plant) {
         return true;
     }
-    reach_plant(plant);
+    reach_pass(plant);
     false
+}
+
+/// Counts one pass of `plant`'s hook as a reach of its site, for a site
+/// that can't see its precondition unarmed. The plant must be one
+/// [`Plant::reach_counts_passes`] names, so a report can say its count is
+/// of the path.
+pub fn reach_pass(plant: Plant) {
+    debug_assert!(
+        plant.reach_counts_passes(),
+        "{} counts passes of its hook: add it to Plant::reach_counts_passes",
+        plant.name()
+    );
+    reach_plant(plant);
 }
 
 /// Counts one reach of `plant`'s site: for a site whose precondition shows
@@ -1321,6 +1351,15 @@ fn reach_slot<'a>(counters: &'a [AtomicU64], index: usize, name: &str) -> &'a At
 /// Counts one pass of `marker`'s path.
 pub fn reach(marker: Marker) {
     reach_slot(&MARKED, marker as usize, marker.name()).fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether `site`'s reach counts passes of a path rather than times a
+/// plant's precondition held: a marker's, or a plant's that
+/// [`Plant::reach_counts_passes`] names.
+pub fn counts_passes(site: &str) -> bool {
+    Plant::from_name(site).map_or(Marker::ALL.iter().any(|m| m.name() == site), |p| {
+        p.reach_counts_passes()
+    })
 }
 
 /// Every site's name: each plant's, then each marker's.
