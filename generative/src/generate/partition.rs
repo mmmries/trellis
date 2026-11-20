@@ -754,7 +754,11 @@ impl PartitionSim {
             }
             Op::Delete { pk, .. } => self.delete(within, parse_pk(pk)),
             Op::Truncate { .. } => self.truncate(within),
-            Op::Leaf { .. } | Op::Partition { .. } => {
+            Op::Leaf { .. }
+            | Op::Partition { .. }
+            | Op::Upsert { .. }
+            | Op::Merge { .. }
+            | Op::Cte { .. } => {
                 panic!("PartitionSim::write takes a single write — a generator bug")
             }
         }
@@ -1592,6 +1596,7 @@ mod tests {
             Op::Delete { .. } => "delete".into(),
             Op::Truncate { .. } => "truncate".into(),
             Op::BulkInsert { .. } => "bulk insert".into(),
+            Op::Upsert { op, .. } | Op::Merge { op, .. } | Op::Cte { op, .. } => describe(op),
         }
     }
 

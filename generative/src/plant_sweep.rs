@@ -106,6 +106,10 @@ pub enum PlantPath {
     /// the source (its side 7). Only a tier that audits a `MIN`/`MAX`
     /// definition by `self_check` reaches it.
     SelfCheckExtremes,
+    /// Capture of a source write into the ring, ahead of every definition's
+    /// apply path: a target of any key space can go wrong. Only a drawn
+    /// transaction (#2181) holds the snapshot it needs.
+    Capture,
 }
 
 /// The path `plant` breaks.
@@ -204,6 +208,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarHeldOriginFirstOnly
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
+        Plant::CaptureSlotFromSnapshot => PlantPath::Capture,
     }
 }
 
@@ -222,8 +227,8 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
-        // A reader of a target can be of any kind.
-        PlantPath::Chain => true,
+        // A reader of a target, or a capture's, can be of any kind.
+        PlantPath::Chain | PlantPath::Capture => true,
     }
 }
 
@@ -700,6 +705,12 @@ pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggr
      GENERATIVE_PLANT_TIER=min_max) and the tampering tier (self_check_cross_check.rs, \
      extremes_tamper_planted_bugs_are_caught) draw";
 
+/// Why a tier other than the hot-key-based concurrent tiers doesn't gate a
+/// capture plant.
+pub const NO_CAPTURE: &str = "it breaks capture under a drawn transaction (#2181), which \
+     every concurrent tier draws; the cooling-key tier (concurrent_convergence.rs, \
+     planted_bugs_are_caught) gates it";
+
 /// The plants whose path a tier's programs never take, each with `why`:
 /// for a tier's `not_gated`.
 pub fn not_on_path(
@@ -805,7 +816,7 @@ mod tests {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Chain => {
+                PlantPath::Chain | PlantPath::Capture => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");
                 }

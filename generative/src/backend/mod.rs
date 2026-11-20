@@ -143,6 +143,29 @@ pub trait OpApplier: Send + 'static {
     type Error: std::fmt::Debug + Send;
 
     fn apply(&mut self, op: &Op) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+
+    /// Applies `ops`, the ops `wrap` names, in order, as the one
+    /// transaction `wrap` describes (#2181), retrying it from the start on a
+    /// serialization failure or deadlock. `Err` only when the transaction
+    /// itself couldn't commit; an op's own rejection is its entry in
+    /// [`TxnApplied::results`].
+    fn apply_txn(
+        &mut self,
+        wrap: &crate::model::TxnWrap,
+        ops: &[Op],
+    ) -> impl Future<Output = Result<TxnApplied, Self::Error>> + Send;
+}
+
+/// What [`OpApplier::apply_txn`] did (#2181).
+#[derive(Debug, Default)]
+pub struct TxnApplied {
+    /// Each op's affected-row count, or its error's text, from the run that
+    /// committed, in order. An op that failed where the program expected it
+    /// to succeed ends the list: the transaction rolled back there.
+    pub results: Vec<Result<u64, String>>,
+    /// How many times the transaction was rolled back and run again after a
+    /// serialization failure or deadlock.
+    pub retries: u64,
 }
 
 /// A [`Backend`] the concurrent tier can drive: it hands out

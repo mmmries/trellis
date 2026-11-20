@@ -996,6 +996,9 @@ mod strategy {
                     )
                 },
             )
+            // Transaction shapes and statement forms (#2181), derived from
+            // the program, so the draws are what they were.
+            .prop_map(crate::generate::txn_shapes::widen_case)
     }
 }
 

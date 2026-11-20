@@ -773,7 +773,7 @@ pub fn build_coverage(program: &Program, plan: &ConcurrentPlan) -> BuildCoverage
         // doesn't truncate it.
         let mut emptying = [0i64; 2];
         for &i in &ops {
-            let (table, by) = match &program.ops[i] {
+            let (table, by) = match program.ops[i].write() {
                 Op::Delete { table, .. } => (table, 1),
                 Op::Truncate { table, .. } => (table, i64::MAX),
                 _ => continue,
@@ -806,7 +806,7 @@ pub fn build_coverage(program: &Program, plan: &ConcurrentPlan) -> BuildCoverage
             }
         }
         for &i in &ops {
-            let (table, delta) = match &program.ops[i] {
+            let (table, delta) = match program.ops[i].write() {
                 Op::Insert { table, .. } => (table, 1),
                 Op::Delete { table, .. } => (table, -1),
                 Op::Truncate { table, .. } => (table, i64::MIN),
@@ -1166,6 +1166,9 @@ pub(crate) mod strategy {
                     },
                 )
         })
+        // Transaction shapes and statement forms (#2181), derived from the
+        // program, so the draws are what they were.
+        .prop_map(crate::generate::txn_shapes::widen_join)
     }
 }
 

@@ -14,7 +14,7 @@ use super::pause::RunKind;
 use super::{Outcome, RunError, check_op_outcome, quiesce_snapshot_and_check};
 use crate::backend::{ConcurrentBackend, DrainAudit, OpApplier};
 use crate::invariant::{self, InRunInvariant, SampleStats};
-use crate::model::{BurstAction, ConcurrentPlan, Op, Program};
+use crate::model::{BurstAction, ConcurrentPlan, Op, Program, TxnWrap};
 
 /// What [`run_convergence_concurrent`] reports alongside [`Outcome::Ran`]:
 /// how the engine actually sealed and claimed the run's batches, and what
@@ -24,6 +24,9 @@ pub struct ConcurrentRun {
     pub outcome: Outcome,
     pub drain: DrainAudit,
     pub invariant: SampleStats,
+    /// How many times a drawn transaction (#2181) was rolled back and run
+    /// again after a serialization failure or deadlock.
+    pub txn_retries: u64,
 }
 
 /// Installs `program`, then runs `plan`'s bursts one after another. Within a
@@ -121,6 +124,8 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
          generator bug"
     );
     let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
+    let txn_at = txn_starts(plan);
+    let txn_retries = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let mut installed: Vec<TransformDef> = program
         .defs
@@ -192,17 +197,36 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                 .take()
                 .expect("each lane's applier is returned before the next burst");
             let ops: Vec<(usize, Op)> = lane.iter().map(|&i| (i, program.ops[i].clone())).collect();
+            let wraps: Vec<Option<TxnWrap>> = lane.iter().map(|i| txn_at.get(i).cloned()).collect();
             let progress = Arc::clone(&progress);
+            let txn_retries = Arc::clone(&txn_retries);
             tasks.spawn(async move {
                 let mut result = Ok(());
-                for (done, (op_index, op)) in ops.iter().enumerate() {
-                    let applied = applier.apply(op).await;
-                    if let Err(e) = check_op_outcome(*op_index, op, &applied) {
+                let mut done = 0;
+                while done < ops.len() {
+                    // One autocommit op, or the transaction drawn from it.
+                    let step = match &wraps[done] {
+                        Some(wrap) => {
+                            let span = &ops[done..done + wrap.ops.len()];
+                            let checked = apply_wrapped(&mut applier, wrap, span).await;
+                            if let Ok(retries) = &checked {
+                                txn_retries.fetch_add(*retries, Ordering::Relaxed);
+                            }
+                            (span.len(), checked.map(|_| ()))
+                        }
+                        None => {
+                            let (op_index, op) = &ops[done];
+                            let applied = applier.apply(op).await;
+                            (1, check_op_outcome(*op_index, op, &applied))
+                        }
+                    };
+                    if let Err(e) = step.1 {
                         result = Err(e);
                         progress.send_modify(|n| *n += ops.len() - done);
                         break;
                     }
-                    progress.send_modify(|n| *n += 1);
+                    done += step.0;
+                    progress.send_modify(|n| *n += step.0);
                     if let Some(pace) = pace.filter(|_| building.load(Ordering::Relaxed)) {
                         tokio::time::sleep(pace).await;
                     }
@@ -349,7 +373,66 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         outcome: Outcome::Ran,
         drain,
         invariant: stats,
+        txn_retries: txn_retries.load(Ordering::Relaxed),
     })
+}
+
+/// Each drawn transaction of `plan` (#2181), by its first op.
+///
+/// # Panics
+///
+/// If a transaction is empty, overlaps another, or its ops aren't
+/// consecutive in one lane: a generator bug.
+fn txn_starts(plan: &ConcurrentPlan) -> std::collections::HashMap<usize, TxnWrap> {
+    let mut lane_of = std::collections::HashMap::new();
+    for lane in plan.bursts.iter().flat_map(|b| &b.lanes) {
+        for (at, &op) in lane.iter().enumerate() {
+            lane_of.insert(op, (lane, at));
+        }
+    }
+    let mut wrapped = std::collections::HashSet::new();
+    let mut starts = std::collections::HashMap::new();
+    for wrap in &plan.txns {
+        let first = *wrap
+            .ops
+            .first()
+            .expect("run_convergence_concurrent: an empty transaction — a generator bug");
+        let (lane, at) = lane_of[&first];
+        assert!(
+            lane.get(at..at + wrap.ops.len()) == Some(&wrap.ops[..])
+                && wrap.ops.iter().all(|op| wrapped.insert(*op)),
+            "run_convergence_concurrent: a transaction wraps ops consecutive in one lane, once \
+             — a generator bug"
+        );
+        starts.insert(first, wrap.clone());
+    }
+    starts
+}
+
+/// Applies `ops` as `wrap`'s transaction and checks each op's outcome, as
+/// an autocommit op's is checked. Returns how many times it was retried.
+async fn apply_wrapped<A: OpApplier>(
+    applier: &mut A,
+    wrap: &TxnWrap,
+    ops: &[(usize, Op)],
+) -> Result<u64, RunError> {
+    let plain: Vec<Op> = ops.iter().map(|(_, op)| op.clone()).collect();
+    let applied = applier
+        .apply_txn(wrap, &plain)
+        .await
+        .map_err(|e| RunError::Transaction {
+            op_index: ops[0].0,
+            error: format!("{e:?}"),
+        })?;
+    for ((op_index, op), result) in ops.iter().zip(&applied.results) {
+        check_op_outcome(*op_index, op, result)?;
+    }
+    assert_eq!(
+        applied.results.len(),
+        ops.len(),
+        "apply_txn ends its results early only at an op that failed unexpectedly"
+    );
+    Ok(applied.retries)
 }
 
 /// The targets of `installed`'s 1-1 `JOIN` definitions, stars included,

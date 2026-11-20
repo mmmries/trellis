@@ -867,6 +867,9 @@ mod strategy {
     /// half the cases a commit stall of up to 5 to 40 ms.
     pub fn chained_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![aggregate_case(), one_to_one_case()]
+            // Transaction shapes and statement forms (#2181), derived from
+            // the program, so the draws are what they were.
+            .prop_map(crate::generate::txn_shapes::widen_join)
     }
 }
 

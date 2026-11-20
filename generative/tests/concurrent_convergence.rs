@@ -590,6 +590,7 @@ fn run_concurrent_case(
             match run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan).await {
                 Ok(run) => {
                     coverage.borrow_mut().record_drain(&run.drain);
+                    coverage.borrow_mut().txn_retries += run.txn_retries;
                     if run.outcome.as_pass() {
                         Ok(())
                     } else {
@@ -1981,6 +1982,7 @@ fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
             PlantPath::Join,
             PlantPath::OneToOneJoin,
             PlantPath::Chain,
+            PlantPath::Capture,
         ],
         "the min_max tier gates the MIN/MAX extremes' plants; the plant's own path is \
          gated by the tier its comment names",

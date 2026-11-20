@@ -208,7 +208,7 @@ fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
     program
         .ops
         .iter()
-        .flat_map(|op| match op {
+        .flat_map(|op| match op.write() {
             Op::Insert { table, row, .. } => row
                 .iter()
                 .filter(|(name, _)| not_grain(table, name))
@@ -219,9 +219,13 @@ fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
                 .filter(|(name, _)| not_grain(table, name))
                 .map(|(_, v)| v.clone())
                 .collect(),
-            Op::Delete { .. } | Op::Truncate { .. } | Op::Leaf { .. } | Op::Partition { .. } => {
-                Vec::new()
-            }
+            Op::Delete { .. }
+            | Op::Truncate { .. }
+            | Op::Leaf { .. }
+            | Op::Partition { .. }
+            | Op::Upsert { .. }
+            | Op::Merge { .. }
+            | Op::Cte { .. } => Vec::new(),
             Op::BulkInsert { table, rows, .. } => rows
                 .iter()
                 .flat_map(|row| {
@@ -1815,4 +1819,85 @@ fn every_drawn_where_round_trips_and_is_admitted() {
         filtered > 50,
         "only {filtered} drawn definitions have a WHERE"
     );
+}
+
+// ---------------------------------------------------------------------
+// Transaction shapes and statement forms (#2181).
+// ---------------------------------------------------------------------
+
+/// The concurrent tiers' cases, sampled, with their plans tallied.
+fn txn_shape_coverage() -> Coverage {
+    use generative::generate::join::join_case_strategy;
+    use generative::generate::join_chained::chained_case_strategy;
+    use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
+    use generative::generate::min_max::min_max_case;
+
+    let mut coverage = Coverage::new();
+    let mut cases: Vec<(Program, generative::model::ConcurrentPlan)> = Vec::new();
+    for strategy in [
+        hot_key_case().boxed(),
+        cooling_key_case().boxed(),
+        mid_burst_case().boxed(),
+    ] {
+        cases.extend(sample(strategy, 4).into_iter().map(|c| (c.program, c.plan)));
+    }
+    cases.extend(
+        sample(min_max_case(false), 4)
+            .into_iter()
+            .map(|c| (c.program, c.plan)),
+    );
+    for strategy in [
+        join_case_strategy().boxed(),
+        one_to_one_case_strategy().boxed(),
+        chained_case_strategy().boxed(),
+    ] {
+        cases.extend(
+            sample(strategy, 12)
+                .into_iter()
+                .map(|c| (c.program, c.plan)),
+        );
+    }
+    cases.extend(
+        sample(star_case_strategy(), 12)
+            .into_iter()
+            .map(|c| (c.case.program, c.case.plan)),
+    );
+    for (program, plan) in &cases {
+        coverage.record_program(program);
+        coverage.record_concurrent_plan(program, plan);
+    }
+    coverage
+}
+
+/// #2181: every transaction shape and statement form is drawn, on a table
+/// a definition of each key space reads. The `JOIN` tiers draw no write that
+/// fails, so the shapes made from one (a failing statement in its own
+/// savepoint, an insert of an existing row that `ON CONFLICT DO NOTHING` or
+/// `MERGE` skips) are the plain key spaces' only.
+#[test]
+fn every_transaction_shape_is_drawn_against_every_key_space() {
+    const FROM_A_FAILING_WRITE: [&str; 3] = [
+        "failing_statement",
+        "upsert_nothing_conflict",
+        "merge_insert_matched",
+    ];
+    let coverage = txn_shape_coverage();
+    let mut missing = Vec::new();
+    for shape in generative::generate::txn_shapes::SHAPES {
+        for key_space in ["Aggregate", "OneToOne", "Join", "JoinOneToOne"] {
+            if FROM_A_FAILING_WRITE.contains(shape) && key_space.starts_with("Join") {
+                continue;
+            }
+            if coverage
+                .txn_shapes
+                .get(&(*shape, key_space))
+                .copied()
+                .unwrap_or(0)
+                == 0
+            {
+                missing.push(format!("{shape}:{key_space}"));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "never drawn: {missing:?}\n{coverage}");
 }

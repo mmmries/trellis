@@ -34,7 +34,9 @@ use super::ring_wait::{
     Expiry, ProgressDeadline, QuiesceBudget, await_ring, dump_state, expiry_reason,
 };
 
-use crate::model::{Column, Op, PartitionAction, PartitionStrategy, Partitioning, Table};
+use crate::model::{
+    Column, Op, OpOutcome, PartitionAction, PartitionStrategy, Partitioning, Table, TxnWrap,
+};
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text,
 /// mirroring `trellis::pool`'s own (crate-private) helper of the same name.
@@ -575,6 +577,9 @@ pub(super) async fn apply_op(
                 .await?;
             Ok(1)
         }
+        Op::Upsert { .. } | Op::Merge { .. } | Op::Cte { .. } => {
+            apply_statement_form(raw, tables, op).await
+        }
         _ => apply_write(raw, tables, op, None).await,
     }
 }
@@ -848,7 +853,11 @@ async fn apply_write(
                 .collect();
             raw.execute(&sql, &params).await?
         }
-        Op::Leaf { .. } | Op::Partition { .. } => {
+        Op::Leaf { .. }
+        | Op::Partition { .. }
+        | Op::Upsert { .. }
+        | Op::Merge { .. }
+        | Op::Cte { .. } => {
             unreachable!("apply_op handles these before apply_write")
         }
     };
@@ -1341,6 +1350,522 @@ pub(super) async fn settled(
     }
     let token = watermark_token(raw).await?;
     Ok(converged_through(raw, token).await?)
+}
+
+// ---------------------------------------------------------------------
+// Statement forms and transactions (#2181).
+// ---------------------------------------------------------------------
+
+/// A statement's SQL text and its bound values, each cast in the text from
+/// `text`.
+struct Rendered {
+    sql: String,
+    params: Vec<Option<String>>,
+}
+
+impl Rendered {
+    /// `$n::text::<type>` for the next bound value, `value`.
+    fn bind(&mut self, value: Option<String>, pg_type: &str) -> String {
+        self.params.push(value);
+        format!("${}::text::{pg_type}", self.params.len())
+    }
+
+    fn params(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+        self.params
+            .iter()
+            .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect()
+    }
+}
+
+/// `table`'s primary-key column, or [`ApplyOpError::UnknownTable`].
+fn pk_col<'a>(tables: &'a HashMap<String, Table>, table: &str) -> Result<&'a str, ApplyOpError> {
+    tables
+        .get(table)
+        .map(|t| t.pk_col.as_str())
+        .ok_or_else(|| ApplyOpError::UnknownTable(table.to_string()))
+}
+
+/// A plain [`Op::Insert`], [`Op::Update`] or [`Op::Delete`] as one
+/// statement, `RETURNING 1` when `returning`.
+fn render_plain(
+    tables: &HashMap<String, Table>,
+    op: &Op,
+    returning: bool,
+) -> Result<Rendered, ApplyOpError> {
+    let mut r = Rendered {
+        sql: String::new(),
+        params: Vec::new(),
+    };
+    match op {
+        Op::Insert { table, row, .. } => {
+            let columns: Vec<String> = row.iter().map(|(c, _)| quote_ident(c)).collect();
+            let values: Vec<String> = row
+                .iter()
+                .map(|(c, v)| r.bind(v.clone(), &column_pg_type(tables, table, c)))
+                .collect();
+            r.sql = format!(
+                "insert into {} ({}) values ({})",
+                quote_ident(table),
+                columns.join(", "),
+                values.join(", ")
+            );
+        }
+        Op::Update {
+            table, pk, changes, ..
+        } => {
+            let key = pk_col(tables, table)?;
+            let set: Vec<String> = changes
+                .iter()
+                .map(|(c, v)| {
+                    let value = r.bind(v.clone(), &column_pg_type(tables, table, c));
+                    format!("{}={value}", quote_ident(c))
+                })
+                .collect();
+            let pk_value = r.bind(Some(pk.clone()), &column_pg_type(tables, table, key));
+            r.sql = format!(
+                "update {} set {} where {}={pk_value}",
+                quote_ident(table),
+                set.join(", "),
+                quote_ident(key)
+            );
+        }
+        Op::Delete { table, pk, .. } => {
+            let key = pk_col(tables, table)?;
+            let pk_value = r.bind(Some(pk.clone()), &column_pg_type(tables, table, key));
+            r.sql = format!(
+                "delete from {} where {}={pk_value}",
+                quote_ident(table),
+                quote_ident(key)
+            );
+        }
+        other => panic!("render_plain: {other:?} is no plain write — a generator bug"),
+    }
+    if returning {
+        r.sql.push_str(" returning 1");
+    }
+    Ok(r)
+}
+
+/// The SQL of an [`Op::Upsert`], [`Op::Merge`] or [`Op::Cte`], and whether
+/// it reports its count as a row (`SELECT count(*)`) rather than as its
+/// command tag.
+fn render_statement_form(
+    tables: &HashMap<String, Table>,
+    op: &Op,
+) -> Result<(Rendered, bool), ApplyOpError> {
+    let write = op.write();
+    let table = write.table();
+    let key = pk_col(tables, table)?;
+    let key_type = column_pg_type(tables, table, key);
+    let quoted = quote_ident(table);
+    let mut r = Rendered {
+        sql: String::new(),
+        params: Vec::new(),
+    };
+    match (op, write) {
+        (Op::Cte { .. }, _) => {
+            let inner = render_plain(tables, write, true)?;
+            return Ok((
+                Rendered {
+                    sql: format!("with w as ({}) select count(*) from w", inner.sql),
+                    params: inner.params,
+                },
+                true,
+            ));
+        }
+        (Op::Upsert { update, .. }, Op::Insert { row, .. }) => {
+            let columns: Vec<&str> = row.iter().map(|(c, _)| c.as_str()).collect();
+            let values: Vec<String> = row
+                .iter()
+                .map(|(c, v)| r.bind(v.clone(), &column_pg_type(tables, table, c)))
+                .collect();
+            r.sql = format!(
+                "insert into {quoted} ({}) values ({}) {}",
+                columns
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                values.join(", "),
+                conflict_clause(key, &columns, *update)
+            );
+        }
+        (Op::Upsert { update, .. }, Op::Update { pk, changes, .. }) => {
+            assert!(*update, "an upserted update is DO UPDATE — a generator bug");
+            let mut columns = vec![key];
+            let mut values = vec![r.bind(Some(pk.clone()), &key_type)];
+            for (c, v) in changes {
+                columns.push(c);
+                values.push(r.bind(v.clone(), &column_pg_type(tables, table, c)));
+            }
+            r.sql = format!(
+                "insert into {quoted} ({}) values ({}) {}",
+                columns
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                values.join(", "),
+                conflict_clause(key, &columns, true)
+            );
+        }
+        (Op::Merge { .. }, Op::Insert { row, .. }) => {
+            let source: Vec<String> = row
+                .iter()
+                .map(|(c, v)| {
+                    let value = r.bind(v.clone(), &column_pg_type(tables, table, c));
+                    format!("{value} as {}", quote_ident(c))
+                })
+                .collect();
+            let columns: Vec<String> = row.iter().map(|(c, _)| quote_ident(c)).collect();
+            let values: Vec<String> = row
+                .iter()
+                .map(|(c, _)| format!("s.{}", quote_ident(c)))
+                .collect();
+            r.sql = format!(
+                "merge into {quoted} t using (select {}) s on t.{k} = s.{k} \
+                 when not matched then insert ({}) values ({})",
+                source.join(", "),
+                columns.join(", "),
+                values.join(", "),
+                k = quote_ident(key),
+            );
+        }
+        (Op::Merge { .. }, Op::Update { pk, changes, .. }) => {
+            let set: Vec<String> = changes
+                .iter()
+                .map(|(c, v)| {
+                    let value = r.bind(v.clone(), &column_pg_type(tables, table, c));
+                    format!("{}={value}", quote_ident(c))
+                })
+                .collect();
+            let pk_value = r.bind(Some(pk.clone()), &key_type);
+            r.sql = format!(
+                "merge into {quoted} t using (select {pk_value} as k) s on t.{} = s.k \
+                 when matched then update set {}",
+                quote_ident(key),
+                set.join(", ")
+            );
+        }
+        (Op::Merge { .. }, Op::Delete { pk, .. }) => {
+            let pk_value = r.bind(Some(pk.clone()), &key_type);
+            r.sql = format!(
+                "merge into {quoted} t using (select {pk_value} as k) s on t.{} = s.k \
+                 when matched then delete",
+                quote_ident(key)
+            );
+        }
+        (form, write) => {
+            panic!("no statement form renders {form:?} over {write:?} — a generator bug")
+        }
+    }
+    Ok((r, false))
+}
+
+/// `ON CONFLICT (<key>) DO NOTHING`, or `DO UPDATE SET` every column of
+/// `columns` but the key from `EXCLUDED`.
+fn conflict_clause(key: &str, columns: &[&str], update: bool) -> String {
+    let set: Vec<String> = columns
+        .iter()
+        .filter(|c| **c != key)
+        .map(|c| format!("{q} = excluded.{q}", q = quote_ident(c)))
+        .collect();
+    if !update || set.is_empty() {
+        return format!("on conflict ({}) do nothing", quote_ident(key));
+    }
+    format!(
+        "on conflict ({}) do update set {}",
+        quote_ident(key),
+        set.join(", ")
+    )
+}
+
+/// [`apply_op`] for an [`Op::Upsert`], [`Op::Merge`] or [`Op::Cte`].
+async fn apply_statement_form(
+    raw: &mut tokio_postgres::Client,
+    tables: &HashMap<String, Table>,
+    op: &Op,
+) -> Result<u64, ApplyOpError> {
+    let (rendered, counted) = render_statement_form(tables, op)?;
+    if counted {
+        let row = raw.query_one(&rendered.sql, &rendered.params()).await?;
+        let count: i64 = row.get(0);
+        return Ok(count as u64);
+    }
+    Ok(raw.execute(&rendered.sql, &rendered.params()).await?)
+}
+
+/// How many times [`apply_txn`] runs a transaction again after a
+/// serialization failure or deadlock before it gives up.
+const MAX_TXN_RETRIES: u64 = 50;
+
+/// Whether `err` is a serialization failure or a deadlock: the errors an
+/// application retries its transaction on.
+fn retryable(err: &ApplyOpError) -> bool {
+    use tokio_postgres::error::SqlState;
+    matches!(err, ApplyOpError::Db(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE)
+        || e.code() == Some(&SqlState::T_R_DEADLOCK_DETECTED))
+}
+
+/// How one run of a [`TxnWrap`] ended.
+enum Attempt {
+    /// Committed, with each op's result.
+    Committed(Vec<Result<u64, String>>),
+    /// An op the program expected to succeed failed, the last result: the
+    /// transaction is aborted.
+    Aborted(Vec<Result<u64, String>>),
+    /// A serialization failure or deadlock: run it again.
+    Retry(ApplyOpError),
+    /// Anything else outside an op.
+    Fatal(ApplyOpError),
+}
+
+/// Applies `ops`, the ops of `wrap`, as the transaction `wrap` describes,
+/// on `raw` (see [`TxnWrap`]): the body behind every backend's
+/// [`super::OpApplier::apply_txn`].
+///
+/// # Panics
+///
+/// If `ops` isn't as long as `wrap.ops`, or holds an op that can't run
+/// inside a transaction block (a `TRUNCATE`, whose count runs its own
+/// transaction, or partition maintenance): a generator bug.
+pub(super) async fn apply_txn(
+    raw: &mut tokio_postgres::Client,
+    tables: &HashMap<String, Table>,
+    wrap: &TxnWrap,
+    ops: &[Op],
+) -> Result<super::TxnApplied, ApplyOpError> {
+    assert_eq!(
+        wrap.ops.len(),
+        ops.len(),
+        "apply_txn: one op per index — a generator bug"
+    );
+    assert!(
+        ops.iter()
+            .all(|op| !matches!(op, Op::Truncate { .. } | Op::Partition { .. })),
+        "apply_txn: a TRUNCATE or partition maintenance never runs in a wrap — a generator bug"
+    );
+    let mut retries = 0;
+    loop {
+        let attempt = txn_attempt(raw, tables, wrap, ops).await;
+        match attempt {
+            Attempt::Committed(results) => return Ok(super::TxnApplied { results, retries }),
+            Attempt::Aborted(results) => {
+                raw.batch_execute("rollback").await?;
+                return Ok(super::TxnApplied { results, retries });
+            }
+            Attempt::Retry(err) => {
+                raw.batch_execute("rollback").await?;
+                retries += 1;
+                if retries > MAX_TXN_RETRIES {
+                    return Err(err);
+                }
+                tokio::time::sleep(Duration::from_millis(retries.min(20))).await;
+            }
+            Attempt::Fatal(err) => {
+                // The session may already be out of the transaction.
+                let _ = raw.batch_execute("rollback").await;
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// One run of `wrap`, from `BEGIN` to `COMMIT`.
+async fn txn_attempt(
+    raw: &mut tokio_postgres::Client,
+    tables: &HashMap<String, Table>,
+    wrap: &TxnWrap,
+    ops: &[Op],
+) -> Attempt {
+    macro_rules! step {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(err) => {
+                    let err = ApplyOpError::from(err);
+                    return if retryable(&err) {
+                        Attempt::Retry(err)
+                    } else {
+                        Attempt::Fatal(err)
+                    };
+                }
+            }
+        };
+    }
+    let begin = async |raw: &mut tokio_postgres::Client| -> Result<(), ApplyOpError> {
+        raw.batch_execute(&format!("begin isolation level {}", wrap.isolation.sql()))
+            .await?;
+        if wrap.read_first {
+            first_read(raw, tables, &ops[0]).await?;
+            think(wrap).await;
+        }
+        Ok(())
+    };
+    step!(begin(raw).await);
+    if wrap.rehearse {
+        match run_ops(raw, tables, wrap, ops, 0..ops.len()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(results)) => return Attempt::Aborted(results),
+            Err(err) => return classify(err),
+        }
+        step!(raw.batch_execute("rollback").await);
+        step!(begin(raw).await);
+    }
+    let mut results = Vec::with_capacity(ops.len());
+    let savepoint = wrap
+        .savepoint
+        .filter(|sp| sp.start < sp.end && sp.end <= ops.len());
+    let mut at = 0;
+    while at < ops.len() {
+        let (range, sp) = match savepoint {
+            Some(sp) if sp.start == at => (sp.start..sp.end, Some(sp)),
+            Some(sp) if sp.start > at => (at..sp.start, None),
+            _ => (at..ops.len(), None),
+        };
+        at = range.end;
+        if let Some(sp) = sp {
+            step!(raw.batch_execute("savepoint trellis_gen_wrap").await);
+            if sp.rollback {
+                match run_ops(raw, tables, wrap, ops, range.clone()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(results)) => return Attempt::Aborted(results),
+                    Err(err) => return classify(err),
+                }
+                step!(
+                    raw.batch_execute("rollback to savepoint trellis_gen_wrap")
+                        .await
+                );
+            }
+        }
+        match run_ops(raw, tables, wrap, ops, range).await {
+            Ok(Ok(done)) => results.extend(done),
+            Ok(Err(done)) => {
+                results.extend(done);
+                return Attempt::Aborted(results);
+            }
+            Err(err) => return classify(err),
+        }
+        if sp.is_some() {
+            step!(
+                raw.batch_execute("release savepoint trellis_gen_wrap")
+                    .await
+            );
+        }
+    }
+    step!(raw.batch_execute("commit").await);
+    Attempt::Committed(results)
+}
+
+#[cfg(test)]
+#[path = "sql_txn_tests.rs"]
+mod txn_tests;
+
+fn classify(err: ApplyOpError) -> Attempt {
+    if retryable(&err) {
+        Attempt::Retry(err)
+    } else {
+        Attempt::Fatal(err)
+    }
+}
+
+/// `wrap`'s think time, if any.
+async fn think(wrap: &TxnWrap) {
+    if !wrap.think.is_zero() {
+        tokio::time::sleep(wrap.think).await;
+    }
+}
+
+/// A read of `op`'s row by key, or of any one row of its table for an op
+/// with no single key.
+async fn first_read(
+    raw: &tokio_postgres::Client,
+    tables: &HashMap<String, Table>,
+    op: &Op,
+) -> Result<(), ApplyOpError> {
+    let write = op.write();
+    let write = match write {
+        Op::Leaf { op, .. } => op.as_ref(),
+        other => other,
+    };
+    let table = write.table();
+    let key = pk_col(tables, table)?;
+    let pk = match write {
+        Op::Insert { row, .. } => row
+            .iter()
+            .find(|(c, _)| c == key)
+            .and_then(|(_, v)| v.clone()),
+        Op::Update { pk, .. } | Op::Delete { pk, .. } => Some(pk.clone()),
+        _ => None,
+    };
+    match pk {
+        Some(pk) => {
+            raw.query(
+                &format!(
+                    "select 1 from {} where {}=$1::text::{}",
+                    quote_ident(table),
+                    quote_ident(key),
+                    column_pg_type(tables, table, key)
+                ),
+                &[&pk],
+            )
+            .await?;
+        }
+        None => {
+            raw.query(
+                &format!("select 1 from {} limit 1", quote_ident(table)),
+                &[],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs `ops[range]` inside the open transaction. An op that may fail runs
+/// in a savepoint of its own. `Err` is a serialization failure or another
+/// error outside an op's own statement; `Ok(Err(results))` ends at an op
+/// that failed where the program expected it to succeed.
+async fn run_ops(
+    raw: &mut tokio_postgres::Client,
+    tables: &HashMap<String, Table>,
+    wrap: &TxnWrap,
+    ops: &[Op],
+    range: std::ops::Range<usize>,
+) -> Result<Result<Vec<Result<u64, String>>, Vec<Result<u64, String>>>, ApplyOpError> {
+    let mut results = Vec::with_capacity(range.len());
+    for i in range {
+        let op = &ops[i];
+        let may_fail = op.expect().matches(&OpOutcome::Fails);
+        if may_fail {
+            raw.batch_execute("savepoint trellis_gen_stmt").await?;
+        }
+        match apply_op(raw, tables, op).await {
+            Ok(count) => {
+                if may_fail {
+                    raw.batch_execute("release savepoint trellis_gen_stmt")
+                        .await?;
+                }
+                results.push(Ok(count));
+            }
+            Err(err) if retryable(&err) => return Err(err),
+            Err(err) => {
+                results.push(Err(format!("{err:?}")));
+                if !may_fail {
+                    return Ok(Err(results));
+                }
+                raw.batch_execute(
+                    "rollback to savepoint trellis_gen_stmt; release savepoint trellis_gen_stmt",
+                )
+                .await?;
+            }
+        }
+        if i + 1 < ops.len() {
+            think(wrap).await;
+        }
+    }
+    Ok(Ok(results))
 }
 
 #[cfg(test)]

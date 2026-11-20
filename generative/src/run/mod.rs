@@ -28,7 +28,7 @@ mod two_instance;
 pub use concurrent::{
     ConcurrentRun, run_convergence_concurrent, run_convergence_concurrent_sampled,
 };
-pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES};
+pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES, key_space_name};
 pub use db_admin::run_convergence_with_db_admin;
 pub use held_keys::{
     DefModel, HeldExpectation, HeldKeySummary, TRANSFORM_FUSE, run_convergence_with_held_keys,
@@ -280,6 +280,13 @@ pub enum RunError {
         burst: usize,
         settled: bool,
         failure: Result<crate::invariant::Failure, String>,
+    },
+    /// A drawn transaction (#2181) whose first op is `op_index` couldn't
+    /// commit: an error outside its ops' own statements, or a serialization
+    /// failure every retry hit.
+    Transaction {
+        op_index: usize,
+        error: String,
     },
 }
 

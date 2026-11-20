@@ -330,6 +330,36 @@ tier; the 1-1 `JOIN` ones in the two-table tier (the star tier gates
 correction, the `*_column_not_imaged` plants a capture widen, and
 `o2o_where_no_tombstone` only grows the ledger, which no check reads.
 
+### Generated transactions and statement forms
+
+`generate::txn_shapes` widens how every concurrent tier issues its ops
+(the hot-key family, `min_max`, `JOIN`, 1-1 `JOIN`, star and chained). Like
+the predicates, it is derived from the program's digest, so each strategy
+draws the program it drew before.
+
+- **Statement forms.** Some single-row writes on a plain table become `INSERT
+  … ON CONFLICT (key) DO NOTHING` or `DO UPDATE`, a one-row `MERGE`, or a
+  writable CTE (`Op::Upsert`, `Op::Merge`, `Op::Cte`). Each has its plain
+  write's source effect (`Op::write`): an insert of an existing row becomes a
+  skip expected to affect no rows, and an update of a missing row is never
+  upserted.
+- **Transactions.** A lane wraps runs of up to five of its ops in one
+  transaction (`model::TxnWrap`, run by `OpApplier::apply_txn`) at `READ
+  COMMITTED`, `REPEATABLE READ` or `SERIALIZABLE`. Most read their first row
+  before writing, some wait between statements, some rehearse (run, roll
+  back, run again) and some hold a savepoint, released or rolled back to and
+  re-run. An op that may fail runs in its own savepoint. A serialization
+  failure or deadlock reruns the transaction from the start; the coverage
+  report counts these as `txn_retries`.
+
+The oracle is unchanged: a transaction's keys are its lane's, and a rolled-back
+run is repeated before the commit. The meta-test
+`every_transaction_shape_is_drawn_against_every_key_space` (`tests/coverage.rs`)
+fails when a shape isn't drawn on a table each key space reads; the coverage
+report prints the tally as `txn_shapes`. The plant `capture_slot_from_snapshot`
+(capture reads its ring slot at the writer's snapshot) is the transaction
+shape's: only a snapshot taken before a seal and a write after it reach it.
+
 ## 4. The properties
 
 Each property is a test under `generative/tests/`. The properties are
@@ -922,8 +952,10 @@ The actions, cheapest-first (every one below is built):
    definition as the statement left it.
 3. **Engine lifecycle** (bucket 1) — kill/restart/scale workers; where resume and
    idempotent re-application get tested.
-4. **Transaction shapes** (bucket 3) — a transaction held open across a batch
-   boundary (via `OpenTransaction`).
+4. **Transaction shapes** (bucket 1) — multi-statement transactions at each
+   isolation level, savepoints, rollbacks and serialization retries, and
+   `ON CONFLICT`, `MERGE` and writable-CTE writes (§3, "Generated transactions
+   and statement forms").
 5. **Database administration** (bucket 1) — restart PG, checkpoint:
    `model::DbAdminAction`, driven by `run::run_convergence_with_db_admin`,
    swept by `tests/db_admin.rs`. A restart or checkpoint fires with the anchor

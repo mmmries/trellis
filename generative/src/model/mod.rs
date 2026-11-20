@@ -229,6 +229,28 @@ pub enum Op {
         action: PartitionAction,
         expect: OpOutcome,
     },
+    /// `op` (an [`Op::Insert`] or [`Op::Update`]) as one `INSERT … ON
+    /// CONFLICT (<key>)` statement (#2181): `DO UPDATE SET` the columns `op`
+    /// writes from `EXCLUDED` when `update`, else `DO NOTHING`. Its source
+    /// effect is `op`'s: an update upserts only a row that exists, and a
+    /// `DO NOTHING` insert of a row that exists changes nothing
+    /// ([`OpOutcome::AffectsNoRows`] where `op` expects
+    /// [`OpOutcome::Fails`]). See [`Op::write`].
+    Upsert {
+        op: Box<Op>,
+        update: bool,
+        expect: OpOutcome,
+    },
+    /// `op` (an [`Op::Insert`], [`Op::Update`] or [`Op::Delete`]) as one
+    /// `MERGE` statement on one source row, matched by key (#2181): `WHEN
+    /// NOT MATCHED THEN INSERT`, `WHEN MATCHED THEN UPDATE` or `WHEN MATCHED
+    /// THEN DELETE`. An insert of a row that exists matches and changes
+    /// nothing. See [`Op::write`].
+    Merge { op: Box<Op>, expect: OpOutcome },
+    /// `op` (an [`Op::Insert`], [`Op::Update`] or [`Op::Delete`]) as a
+    /// writable CTE, `WITH w AS (<op> RETURNING 1) SELECT count(*) FROM w`
+    /// (#2181). Same effect and outcome as `op`. See [`Op::write`].
+    Cte { op: Box<Op>, expect: OpOutcome },
 }
 
 /// One [`Op::Partition`] statement. Every leaf is named unqualified, beside
@@ -279,7 +301,10 @@ impl Op {
             | Op::Delete { expect, .. }
             | Op::Truncate { expect, .. }
             | Op::BulkInsert { expect, .. }
-            | Op::Partition { expect, .. } => expect,
+            | Op::Partition { expect, .. }
+            | Op::Upsert { expect, .. }
+            | Op::Merge { expect, .. }
+            | Op::Cte { expect, .. } => expect,
             Op::Leaf { op, .. } => op.expect(),
         }
     }
@@ -293,7 +318,10 @@ impl Op {
             | Op::Delete { expect, .. }
             | Op::Truncate { expect, .. }
             | Op::BulkInsert { expect, .. }
-            | Op::Partition { expect, .. } => *expect = outcome,
+            | Op::Partition { expect, .. }
+            | Op::Upsert { expect, .. }
+            | Op::Merge { expect, .. }
+            | Op::Cte { expect, .. } => *expect = outcome,
             Op::Leaf { op, .. } => op.set_expect(outcome),
         }
     }
@@ -307,7 +335,21 @@ impl Op {
             | Op::Truncate { table, .. }
             | Op::BulkInsert { table, .. }
             | Op::Partition { table, .. } => table,
-            Op::Leaf { op, .. } => op.table(),
+            Op::Leaf { op, .. }
+            | Op::Upsert { op, .. }
+            | Op::Merge { op, .. }
+            | Op::Cte { op, .. } => op.table(),
+        }
+    }
+
+    /// The plain write whose source effect this op has: the wrapped op of
+    /// an [`Op::Upsert`], [`Op::Merge`] or [`Op::Cte`] (#2181), and the op
+    /// itself otherwise. A replay of the program's source state (coverage,
+    /// lanes) reads ops through it.
+    pub fn write(&self) -> &Op {
+        match self {
+            Op::Upsert { op, .. } | Op::Merge { op, .. } | Op::Cte { op, .. } => op,
+            _ => self,
         }
     }
 }
@@ -459,6 +501,10 @@ pub struct ConcurrentPlan {
     /// or `None`. The JOIN tier draws it for some cases, so a page
     /// that skipped a lock reads another's uncommitted write now and then.
     pub commit_stall: Option<std::time::Duration>,
+    /// The transactions the lanes wrap around runs of their ops (#2181);
+    /// an op in none is its own autocommit statement. Each wraps ops of one
+    /// lane, consecutive in it.
+    pub txns: Vec<TxnWrap>,
 }
 
 /// A steady load on the engine, for a whole [`ConcurrentPlan`].
@@ -755,6 +801,69 @@ impl NamePool {
         self.columns += 1;
         format!("c{n}")
     }
+}
+
+// ---------------------------------------------------------------------
+// Transaction shapes (#2181).
+// ---------------------------------------------------------------------
+
+/// A transaction's isolation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Isolation {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl Isolation {
+    pub const ALL: [Isolation; 3] = [
+        Isolation::ReadCommitted,
+        Isolation::RepeatableRead,
+        Isolation::Serializable,
+    ];
+
+    /// The level as `BEGIN ISOLATION LEVEL` takes it.
+    pub fn sql(self) -> &'static str {
+        match self {
+            Isolation::ReadCommitted => "read committed",
+            Isolation::RepeatableRead => "repeatable read",
+            Isolation::Serializable => "serializable",
+        }
+    }
+}
+
+/// One transaction a lane draws around a run of its ops (#2181):
+/// `BEGIN ISOLATION LEVEL <isolation>`, the ops, `COMMIT`. A
+/// serialization failure or deadlock anywhere in it rolls it back and runs
+/// it again from the start. An op that may fail runs in a savepoint of its
+/// own, so its error doesn't abort the transaction, as an application's
+/// would. A rolled-back transaction or savepoint is an oracle identity:
+/// its ops run again before the commit, so every op's outcome is what the
+/// program expects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxnWrap {
+    /// The program op indices it wraps, in lane order.
+    pub ops: Vec<usize>,
+    pub isolation: Isolation,
+    /// Whether it first reads the first op's row (`SELECT … WHERE <key> =
+    /// …`), so a `REPEATABLE READ` or `SERIALIZABLE` snapshot is taken
+    /// before any write assigns the transaction an id.
+    pub read_first: bool,
+    /// How long it waits after the read and after each op but the last, as
+    /// an application doing work between statements does.
+    pub think: std::time::Duration,
+    /// Whether it runs once and rolls back before the run that commits.
+    pub rehearse: bool,
+    pub savepoint: Option<SavepointWrap>,
+}
+
+/// A savepoint around `ops[start..end]` of a [`TxnWrap`]: released, or
+/// rolled back to and the ops run again inside it before the release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavepointWrap {
+    pub start: usize,
+    pub end: usize,
+    pub rollback: bool,
 }
 
 #[cfg(test)]
