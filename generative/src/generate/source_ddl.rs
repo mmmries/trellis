@@ -50,7 +50,7 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
         })
         .collect();
     placed.sort_by_key(|(op, _)| *op);
-    for (op, &(_, action, table, column, window, pass_inside)) in placed {
+    for (op, &(_, action, table, pick, window, pass_inside)) in placed {
         // Only a table a definition reads is a tracked source: the others
         // have no capture to disrupt.
         let tracked: Vec<_> = program
@@ -71,12 +71,13 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
             .filter(|c| !grouped_by(program, &table.name, &c.name))
             .map(|c| c.name.as_str())
             .collect();
-        let column = (!numeric.is_empty()).then(|| numeric[column % numeric.len()].to_string());
+        let column = (!numeric.is_empty()).then(|| numeric[pick % numeric.len()].to_string());
         let action = match (action, column) {
             (0, _) => SourceDdl::VacuumFull,
             (1, _) => SourceDdl::Cluster,
+            // The column pick's parity: drawn apart from the pass.
             (2, _) => SourceDdl::Reindex {
-                concurrently: pass_inside,
+                concurrently: pick % 2 == 1,
             },
             (3, Some(column)) => SourceDdl::RewriteColumn { column },
             (4, Some(column)) => SourceDdl::RewriteBesideDefault { column },

@@ -316,7 +316,9 @@ async fn look(
 }
 
 /// Judges every one of `defs` at the check after op `op_index`, letting a
-/// definition end silently wrong only as one of `allowed`. Takes each step
+/// definition end silently wrong only as one of `allowed(def)`: the entries
+/// the drawn shape may reproduce in that definition (none for one that
+/// doesn't read what the shape changed). Takes each step
 /// the verdict needs (a `RESUME`, a `self_check` and a repair) through the
 /// library calls an operator would make, and leaves every definition exact
 /// or refused by its `RESUME`.
@@ -327,7 +329,7 @@ pub async fn judge(
     program: &Program,
     defs: &[TransformDef],
     op_index: usize,
-    allowed: &[Gap],
+    allowed: impl Fn(&TransformDef) -> Vec<Gap>,
 ) -> Result<Vec<Judged>, RunError> {
     let fail = |target: &str, problem: String, detail: String| RunError::NeverSilentlyWrong {
         op_index,
@@ -341,7 +343,7 @@ pub async fn judge(
     let mut to_resume: Vec<(usize, String)> = Vec::new();
     let mut to_repair: Vec<(usize, Gap)> = Vec::new();
     for (i, (def, (state, diverged, report))) in defs.iter().zip(&looks).enumerate() {
-        match first_look(state, *diverged, allowed) {
+        match first_look(state, *diverged, &allowed(def)) {
             FirstLook::Done(verdict) => judged[i] = Some(verdict),
             FirstLook::Fail(problem) => {
                 return Err(fail(&def.target, problem, format!("{state}\n{report}")));

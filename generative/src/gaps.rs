@@ -107,19 +107,22 @@ impl Gap {
 
     /// The first repair the entry's **Repair** names that the harness can
     /// run, or [`Repair::None`] when it names only a configuration change,
-    /// a restore, or a redefinition.
+    /// a restore, or a redefinition, or needs a change to the source first
+    /// (a duplicate removed, a collation changed back).
     pub fn repair(self) -> Repair {
         match self {
-            Gap::DeferrableKeyReplicaDuplicate
-            | Gap::MergeMovesPartition
+            Gap::MergeMovesPartition
             | Gap::SourceRenameRoundtrip
             | Gap::DefaultPartitionShortLeaf
             | Gap::LeafReattachAroundUpgrade => Repair::PauseResume,
-            Gap::OwnedTablesWritten | Gap::PartialRestore | Gap::TransactionPooler => Repair::None,
+            Gap::NondeterministicCollation
+            | Gap::DeferrableKeyReplicaDuplicate
+            | Gap::OwnedTablesWritten
+            | Gap::PartialRestore
+            | Gap::TransactionPooler => Repair::None,
             Gap::AlterTypeRewrite
             | Gap::EnumLabelReadded
             | Gap::ColumnNameSwap
-            | Gap::NondeterministicCollation
             | Gap::KeyNotNullFlip
             | Gap::CaptureDisruptedBetweenPasses
             | Gap::UnloggedSourceReset

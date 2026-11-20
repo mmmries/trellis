@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use trellis::dev::defs::ast::TransformDef;
 use trellis::dev::pool::Pool;
 
 use crate::backend::{Backend, ManualBackend};
@@ -117,7 +118,7 @@ pub async fn run_convergence_with_source_ddl_allowing(
             execute(backend, &statements.closes).await.map_err(fired)?;
             op_index = event.last_op();
         }
-        let allowed = event.map(&allowed).unwrap_or_default();
+        let gaps = event.map(&allowed).unwrap_or_default();
         let judged = judge(
             backend,
             &passes,
@@ -125,13 +126,23 @@ pub async fn run_convergence_with_source_ddl_allowing(
             program,
             &program.defs,
             op_index,
-            &allowed,
+            |def| allowed_for(event, def, &gaps),
         )
         .await?;
         run.checks.push((event.cloned(), judged));
         op_index += 1;
     }
     Ok(run)
+}
+
+/// The entries `def` may end silently wrong as at the check after `event`:
+/// `gaps` when it reads the event's table, none otherwise, so a shape's
+/// entry never excuses a definition the shape didn't touch.
+fn allowed_for(event: Option<&SourceDdlEvent>, def: &TransformDef, gaps: &[Gap]) -> Vec<Gap> {
+    match event {
+        Some(event) if def.source == event.table => gaps.to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 /// An event's statements, with the names they need read from the catalog.
@@ -242,4 +253,46 @@ async fn execute(backend: &ManualBackend, statements: &[String]) -> Result<(), S
 
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generate::{DefShape, TableSpec, build_program_multi_with_shapes};
+
+    fn table() -> TableSpec {
+        TableSpec {
+            seed_values: vec![(Some(1), Some(1))],
+            text_values: vec![None],
+            bool_values: vec![None],
+            uuid_values: vec![None],
+            grain_values: vec![Some("0".to_string())],
+            mutates: Vec::new(),
+        }
+    }
+
+    /// A shape's entry excuses only the definitions that read the table it
+    /// changed: a wrong reader of another table still fails the run.
+    #[test]
+    fn a_shapes_gaps_reach_only_the_readers_of_its_table() {
+        let program = build_program_multi_with_shapes(
+            &[table(), table()],
+            &[(0, DefShape::OneToOne), (1, DefShape::OneToOne)],
+        );
+        let event = SourceDdlEvent {
+            op: 0,
+            table: program.defs[0].source.clone(),
+            action: SourceDdl::RewriteBesideDefault {
+                column: "c1".to_string(),
+            },
+            window: 0,
+            pass_inside: false,
+        };
+        assert_ne!(program.defs[0].source, program.defs[1].source);
+        let gaps = event.listed_gaps();
+        assert_eq!(gaps, vec![Gap::AlterTypeRewrite]);
+        assert_eq!(allowed_for(Some(&event), &program.defs[0], &gaps), gaps);
+        assert!(allowed_for(Some(&event), &program.defs[1], &gaps).is_empty());
+        assert!(allowed_for(None, &program.defs[0], &gaps).is_empty());
+    }
 }

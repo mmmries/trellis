@@ -137,6 +137,8 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     for kind in [
         "vacuum_full",
         "cluster",
+        "reindex",
+        "reindex_concurrently",
         "rewrite_column",
         "rewrite_beside_default",
         "disable_capture_triggers",
@@ -148,7 +150,6 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
             );
         }
     }
-    assert!(seen.contains(&("reindex", false)) && seen.contains(&("reindex_concurrently", true)));
     assert!(windows, "no event drew ops in flight");
 }
 
@@ -246,6 +247,21 @@ async fn run_one(program: &Program, event: SourceDdlEvent) -> Vec<Verdict> {
     verdicts_after(&run, &event)
 }
 
+/// Every verdict is a pause by the pass's capture check, exact after its
+/// `RESUME`.
+fn assert_paused_by_the_capture_check(verdicts: Vec<Verdict>) {
+    for verdict in verdicts {
+        assert!(
+            matches!(
+                &verdict,
+                Verdict::ResumedExact { reason }
+                    if reason.contains("capture of public.") && reason.contains("was changed outside Trellis")
+            ),
+            "{verdict:?}"
+        );
+    }
+}
+
 /// #2184's decision 4: capture triggers disabled and enabled again by name,
 /// with a delete and an update in between and no reconcile pass until
 /// after, pause both readers with a reason; their `RESUME` makes them
@@ -254,12 +270,7 @@ async fn run_one(program: &Program, event: SourceDdlEvent) -> Vec<Verdict> {
 async fn capture_disabled_and_restored_inside_one_interval_pauses_its_readers() {
     let program = one_to_one_and_aggregate_program();
     let event = event(&program, 3, SourceDdl::DisableCaptureTriggers, 2, false);
-    for verdict in run_one(&program, event).await {
-        assert!(
-            matches!(verdict, Verdict::ResumedExact { .. }),
-            "{verdict:?}"
-        );
-    }
+    assert_paused_by_the_capture_check(run_one(&program, event).await);
 }
 
 /// The same with a pass while the triggers are disabled.
@@ -267,12 +278,7 @@ async fn capture_disabled_and_restored_inside_one_interval_pauses_its_readers() 
 async fn capture_disabled_across_a_pass_pauses_its_readers() {
     let program = one_to_one_and_aggregate_program();
     let event = event(&program, 3, SourceDdl::DisableCaptureTriggers, 2, true);
-    for verdict in run_one(&program, event).await {
-        assert!(
-            matches!(verdict, Verdict::ResumedExact { .. }),
-            "{verdict:?}"
-        );
-    }
+    assert_paused_by_the_capture_check(run_one(&program, event).await);
 }
 
 /// `VACUUM FULL`, `CLUSTER` and `REINDEX` (plain and `CONCURRENTLY`) with
@@ -441,6 +447,11 @@ async fn a_key_column_rewrite_beside_a_default_leaves_the_old_keys_in_a_one_to_o
     passes.settle(&mut backend).await.expect("settle");
 
     let one_to_one = &program.defs[0].target;
+    let states = backend
+        .definition_states(&program.defs)
+        .await
+        .expect("definition states");
+    assert_eq!(states[0].status, "live", "the 1-1 reports healthy");
     let snapshot = backend.snapshot().await.expect("snapshot");
     let keys: Vec<&String> = snapshot[one_to_one].keys().collect();
     // pk 2 was deleted; pks 1 and 3 are now 11 and 13.
