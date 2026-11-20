@@ -6,9 +6,9 @@
 use crate::gaps::Gap;
 
 /// One drawn change to a tracked source table. Each runs as one or two
-/// groups of statements: [`SourceDdl::opens`] when the event fires and,
-/// for a change undone or completed later, [`SourceDdl::closes`] once the
-/// event's window of ops has been applied. The statements run as the
+/// groups of statements: one when the event fires and, for a change undone
+/// or completed later ([`SourceDdl::closes`]), one once the event's window
+/// of ops has been applied. The statements run as the
 /// bootstrap superuser (`execute_admin`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceDdl {

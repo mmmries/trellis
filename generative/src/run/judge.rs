@@ -214,7 +214,7 @@ pub struct PassStepper {
 
 /// How often [`PassStepper::settle`] runs a pass while it waits, standing
 /// in for the engine's own interval.
-const SETTLE_PASS_EVERY: Duration = Duration::from_millis(100);
+pub const SETTLE_PASS_EVERY: Duration = Duration::from_millis(100);
 
 impl PassStepper {
     /// Connects to `backend`'s database as the role the engine runs as.
