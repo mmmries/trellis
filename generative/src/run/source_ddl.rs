@@ -90,6 +90,8 @@ pub async fn run_convergence_with_source_ddl_allowing(
     let passes = PassStepper::connect(backend)
         .await
         .map_err(RunError::Install)?;
+    // The first pass installs capture, so an event on the first op finds it.
+    passes.step().await.map_err(RunError::Install)?;
 
     let mut run = SourceDdlRun::default();
     let mut op_index = 0;

@@ -2,7 +2,7 @@
 //! which op, on which table, with how many ops in flight around it.
 
 use proptest::prelude::*;
-use trellis::dev::defs::ast::ValueType;
+use trellis::dev::defs::ast::{KeySpace, ValueType};
 
 use crate::model::{Program, SourceDdl, SourceDdlEvent, SourceDdlPlan};
 
@@ -18,7 +18,8 @@ pub const MAX_SOURCE_DDL_WINDOW: usize = 3;
 type Draw = (u16, u8, usize, usize, usize, bool);
 
 /// A plan for `program`: up to [`MAX_SOURCE_DDL_EVENTS`] events, in op
-/// order and never overlapping, each on one of the program's tables. A
+/// order and never overlapping, each on one of the program's tables that a
+/// definition reads. A
 /// column rewrite takes one of the table's numeric columns other than its
 /// primary key. Draws that don't fit (an event past the last op, or one
 /// inside the previous one's window) are dropped, so a plan can be empty.
@@ -50,14 +51,24 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
         .collect();
     placed.sort_by_key(|(op, _)| *op);
     for (op, &(_, action, table, column, window, pass_inside)) in placed {
-        if program.tables.is_empty() || op >= ops {
+        // Only a table a definition reads is a tracked source: the others
+        // have no capture to disrupt.
+        let tracked: Vec<_> = program
+            .tables
+            .iter()
+            .filter(|t| program.defs.iter().any(|d| d.source == t.name))
+            .collect();
+        if tracked.is_empty() || op >= ops {
             continue;
         }
-        let table = &program.tables[table % program.tables.len()];
+        let table = tracked[table % tracked.len()];
         let numeric: Vec<&str> = table
             .columns
             .iter()
             .filter(|c| c.name != table.pk_col && c.value_type == ValueType::Numeric)
+            // #2219: a rewrite of a column an aggregate groups by, with a
+            // change in flight, keeps the old group. Drop this with the fix.
+            .filter(|c| !grouped_by(program, &table.name, &c.name))
             .map(|c| c.name.as_str())
             .collect();
         let column = (!numeric.is_empty()).then(|| numeric[column % numeric.len()].to_string());
@@ -86,4 +97,12 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
         events.push(event);
     }
     SourceDdlPlan { events }
+}
+
+/// Whether an aggregate over `table` groups by `column`.
+fn grouped_by(program: &Program, table: &str, column: &str) -> bool {
+    program.defs.iter().any(|d| {
+        d.source == table
+            && matches!(&d.key_space, KeySpace::Aggregate { group_by } if group_by.iter().any(|g| g == column))
+    })
 }

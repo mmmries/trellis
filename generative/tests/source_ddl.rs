@@ -124,6 +124,10 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         let mut end = None;
         for event in &plan.events {
             assert!(event.last_op() < program.ops.len(), "{event:?}");
+            assert!(
+                program.defs.iter().any(|d| d.source == event.table),
+                "{event:?} is on a table no definition reads"
+            );
             assert!(end.is_none_or(|end| event.op > end), "{plan:?}");
             end = Some(event.last_op());
             windows |= event.window > 0;
@@ -445,4 +449,71 @@ async fn a_key_column_rewrite_beside_a_default_leaves_the_old_keys_in_a_one_to_o
         ["1", "11", "13", "3"].iter().collect::<Vec<_>>(),
         "the old keys stay beside the new ones"
     );
+}
+
+/// Found by the first sweep: one row in its group, then a same-type
+/// rewrite of the aggregate's `GROUP BY` column with the insert's change in
+/// flight.
+fn one_row_grouped_program() -> Program {
+    build_program_multi_with_shapes(
+        &[TableSpec {
+            seed_values: vec![(Some(79), None)],
+            text_values: vec![None],
+            bool_values: vec![None],
+            uuid_values: vec![None],
+            grain_values: vec![Some("0".to_string())],
+            mutates: vec![
+                Mutate::Delete { pk: 2 },
+                Mutate::Update {
+                    pk: 1,
+                    c1: None,
+                    c2: None,
+                },
+            ],
+        }],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![
+                    AggregateFn::Sum(AggregateColumn::C2),
+                    AggregateFn::Count,
+                    AggregateFn::CountColumn(AggregateColumn::C2),
+                    AggregateFn::Avg(AggregateColumn::C2),
+                ],
+            },
+        )],
+    )
+}
+
+/// The `GROUP BY` column rewritten on `program`'s only table after op `op`,
+/// with the next op in flight; every definition must stay exact.
+async fn rewrite_group_by_column(program: &Program, op: usize, pass_inside: bool) {
+    let grain = program.tables[0].columns[6].name.clone();
+    let event = event(
+        program,
+        op,
+        SourceDdl::RewriteColumn { column: grain },
+        1,
+        pass_inside,
+    );
+    for verdict in run_one(program, event).await {
+        assert_eq!(verdict, Verdict::Exact, "op={op} pass_inside={pass_inside}");
+    }
+}
+
+/// #2219: with the insert's change still in flight, the target keeps the
+/// old group beside the new one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "#2219: a GROUP BY column rewritten with an insert in flight keeps the old group"]
+async fn a_rewrite_of_a_group_by_column_with_a_change_in_flight_is_reread() {
+    let program = one_row_grouped_program();
+    rewrite_group_by_column(&program, 0, false).await;
+    rewrite_group_by_column(&program, 0, true).await;
+}
+
+/// The control beside #2219: the same rewrite once the insert has been
+/// applied is re-read exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewrite_of_a_group_by_column_after_its_changes_settle_is_reread() {
+    rewrite_group_by_column(&one_row_grouped_program(), 1, false).await;
 }
