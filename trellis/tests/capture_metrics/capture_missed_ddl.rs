@@ -921,3 +921,139 @@ async fn a_same_type_rewrite_of_a_partitioned_source_rebuilds_its_readers() {
         .await,
     );
 }
+
+/// A same-type rewrite of an aggregate's `GROUP BY` key while a captured
+/// insert is still unapplied (#2219): the insert's staged image holds the
+/// key's old value, which the rewrite changed in the source. The re-read
+/// rebuilds the group under its new key, and the staged change leaves no
+/// group behind under the old one.
+#[tokio::test]
+async fn a_rewrite_of_a_group_by_key_with_a_change_in_flight_leaves_no_old_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.k (id int primary key, g int not null, b int); \
+         insert into public.k select i, i % 3, i from generate_series(1, 30) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let text = "TRANSFORM ksum FROM public.k GROUP BY g WITHOUT SOURCE INDEX \
+                SELECT g AS g, SUM(b) AS total, COUNT(*) AS n";
+    trellis.apply(text).await.expect(text);
+    bring_live_all(&mut raw, &db.pool).await;
+
+    // Captured, not applied: a new group 7 with one row.
+    raw.batch_execute("insert into public.k values (100, 7, 5)")
+        .await
+        .expect("insert in flight");
+    raw.batch_execute("alter table public.k alter column g type int using g + 1")
+        .await
+        .expect("rewrite g");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(statuses(&raw).await["ksum"], TransformStatus::Backfilling);
+    bring_live_all(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select g::text, total::text, n::text from public.ksum order by g"
+        )
+        .await,
+        rows(
+            &raw,
+            "select g::text, sum(b)::text, count(*)::text from public.k group by g order by g"
+        )
+        .await,
+    );
+}
+
+/// #2219's shape on a `JOIN`'s `ON` column: an insert into the joined table
+/// in flight under the old join value leaves no cell, and so no group,
+/// behind under it.
+#[tokio::test]
+async fn a_rewrite_of_a_join_key_with_a_change_in_flight_leaves_no_old_cell() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.ja (id int primary key, k int not null, g int not null); \
+         create table public.jb (id int primary key, k int not null, x int); \
+         insert into public.ja select i, i % 6, i % 2 from generate_series(1, 24) i; \
+         insert into public.jb select i, i % 4, i from generate_series(1, 8) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let text = "TRANSFORM jsum FROM public.ja JOIN public.jb ON ja.k = jb.k \
+                GROUP BY ja.g WITHOUT SOURCE INDEX SELECT ja.g AS g, COUNT(*) AS n, SUM(jb.x) AS sx";
+    trellis.apply(text).await.expect(text);
+    bring_live_all(&mut raw, &db.pool).await;
+
+    // Captured, not applied: the first `jb` row with k = 5, which joins
+    // the `ja` rows with k = 5 until the rewrite moves every `jb` row past
+    // every `ja` row.
+    raw.batch_execute("insert into public.jb values (100, 5, 1000)")
+        .await
+        .expect("insert in flight");
+    raw.batch_execute("alter table public.jb alter column k type int using k + 10")
+        .await
+        .expect("rewrite jb.k");
+    capture_pass(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(
+            &raw,
+            "select g::text, n::text, sx::text from public.jsum order by g"
+        )
+        .await,
+        rows(
+            &raw,
+            "select a.g::text, count(*)::text, sum(b.x)::text from public.ja a \
+             join public.jb b on a.k = b.k group by a.g order by a.g"
+        )
+        .await,
+    );
+}
+
+/// #2219's shape on a `WHERE` column: an insert in flight that met the
+/// `WHERE` before the rewrite and fails it after leaves no group behind.
+/// The rebuild enumerates the groups of every source row, whatever the
+/// `WHERE` says, so the row's group is enumerated and its basis refuses
+/// the insert.
+#[tokio::test]
+async fn a_rewrite_of_a_where_column_with_a_change_in_flight_leaves_no_old_group() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.wq (id int primary key, g int not null, s int not null); \
+         insert into public.wq select i, i % 3, 0 from generate_series(1, 30) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let text = "TRANSFORM wqn FROM public.wq GROUP BY g WITHOUT SOURCE INDEX \
+                SELECT g AS g, COUNT(*) AS n WHERE s = 0";
+    trellis.apply(text).await.expect(text);
+    bring_live_all(&mut raw, &db.pool).await;
+
+    // Captured, not applied: group 7's only row, which the rewrite moves
+    // out of the `WHERE`.
+    raw.batch_execute("insert into public.wq values (100, 7, 0)")
+        .await
+        .expect("insert in flight");
+    raw.batch_execute("alter table public.wq alter column s type int using id / 100")
+        .await
+        .expect("rewrite s");
+    capture_pass(&mut raw, &db.pool).await;
+    bring_live_all(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(&raw, "select g::text, n::text from public.wqn order by g").await,
+        rows(
+            &raw,
+            "select g::text, count(*)::text from public.wq where s = 0 group by g order by g"
+        )
+        .await,
+    );
+}
