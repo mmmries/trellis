@@ -1531,6 +1531,11 @@ impl super::Backend for ManualBackend {
                 }
                 // The 1-1 JOIN tier: a target keyed by `a`'s primary key,
                 // read as a 1-1 target is.
+                // A 1-1 target over a `KEY (...)` source is keyed by the key.
+                KeySpace::OneToOne if def.source_key.is_some() => {
+                    let key = def.source_key.as_deref().unwrap_or_default();
+                    sql::read_keyed_table(&self.raw, &qualified, key, &def.fields).await?
+                }
                 KeySpace::JoinOneToOne(_) | KeySpace::OneToOne => {
                     // `source_primary_key` accepts an arbitrary-arity source
                     // primary key, and the

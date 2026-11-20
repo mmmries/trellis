@@ -781,7 +781,11 @@ pub(crate) async fn reconcile_for(
     let progress = match action {
         CaptureAction::Unchanged => Progress::Done(()),
         CaptureAction::Install => install_tree(client, schema, floors, desired, deadline).await?,
-        CaptureAction::Widen => run(client, schema, Op::Widen(desired), deadline).await?,
+        CaptureAction::Widen => {
+            #[cfg(any(test, feature = "test-util"))]
+            crate::plant::reach(crate::plant::Marker::CaptureWiden);
+            run(client, schema, Op::Widen(desired), deadline).await?
+        }
         CaptureAction::Narrow => Progress::Done(narrow(client, schema, desired).await?),
     };
     Ok(progress.map(|()| action))

@@ -137,8 +137,8 @@ pub struct PrimaryKeyColumn {
     /// to interpolate directly into DDL text since it comes from the
     /// catalog, not user input.
     pub data_type: String,
-    /// Whether this key column can actually hold SQL `NULL` (`not
-    /// pg_attribute.attnotnull`), which is what selects between this crate's
+    /// Whether this key column can actually hold SQL `NULL` (no validated
+    /// `NOT NULL`, `not_null_sql`), which is what selects between this crate's
     /// two key-component encodings — see [`encode_key_part`]'s
     /// "[`nullable`](PrimaryKeyColumn::nullable) selects the encoding"
     /// section.
@@ -626,6 +626,29 @@ impl From<super::backfill::BackfillError> for DdlError {
     }
 }
 
+/// SQL text, for the `pg_attribute` row aliased `$a`: whether the column
+/// can't hold `NULL`. `attnotnull` alone doesn't say it: on Postgres 18 a
+/// `NOT NULL … NOT VALID` constraint sets it while existing rows may still
+/// hold `NULL` (its `pg_constraint` row, `contype = 'n'`, is
+/// `convalidated = false`). Every key read takes nullability from this, so
+/// such a column is nullable until `VALIDATE CONSTRAINT` runs. Before 18 no
+/// `contype = 'n'` row exists and this is `attnotnull`.
+macro_rules! not_null_sql {
+    ($a:literal) => {
+        concat!(
+            "(",
+            $a,
+            ".attnotnull and not exists (select 1 from pg_catalog.pg_constraint nn \
+             where nn.conrelid = ",
+            $a,
+            ".attrelid and nn.contype = 'n' and not nn.convalidated and ",
+            $a,
+            ".attnum = any(nn.conkey)))"
+        )
+    };
+}
+pub(crate) use not_null_sql;
+
 /// The key `source_table` (an unquoted `schema.table`, [`regclass_arg`]) is
 /// keyed by: its `identity_key_columns`, in key order, each column's type
 /// admitted by the key-type allowlist ([`DdlError::UnsupportedPrimaryKeyType`]
@@ -819,7 +842,7 @@ pub(crate) async fn identity_key_columns_over(
                            join pg_attribute a
                              on a.attrelid = i.indrelid and a.attnum = k.attnum
                            where k.ord <= i.indnkeyatts
-                             and not a.attnotnull
+                             and not {not_null}
                          )
                        )
                      )
@@ -840,7 +863,7 @@ pub(crate) async fn identity_key_columns_over(
              )
              select a.attname::text,
                     {},
-                    not a.attnotnull,
+                    not {not_null},
                     (select pg_catalog.format('%I.%I', n.nspname, co.collname)
                      from pg_catalog.pg_collation co
                      join pg_catalog.pg_namespace n on n.oid = co.collnamespace
@@ -859,7 +882,8 @@ pub(crate) async fn identity_key_columns_over(
              order by coalesce(pg_catalog.array_position(r.key_columns, a.attname::text),
                                k.ord)",
                 super::recorded_keys::tied_to("$1"),
-                super::copy_type::type_sql("a.atttypid")
+                super::copy_type::type_sql("a.atttypid"),
+                not_null = not_null_sql!("a"),
             ),
             &[
                 (&regclass_arg(table), Type::TEXT),

@@ -92,6 +92,7 @@ pub fn join_tables() -> Vec<Table> {
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     };
     vec![
         table(FROM_TABLE, &["ga", "t", "k", "x"]),

@@ -365,3 +365,15 @@ mod proptest_scanner_tests {
         );
     }
 }
+
+/// The reachability floor's exemptions (`generative::reach_floor::EXEMPT`)
+/// each name a real site and sweep tier, give a reason, and say it once.
+/// The floor itself is judged on each sweep's baseline
+/// (`generative::plant_sweep`).
+#[test]
+fn the_reachability_floors_exemptions_are_well_formed() {
+    assert_eq!(
+        generative::reach_floor::list_problems(),
+        Vec::<String>::new()
+    );
+}

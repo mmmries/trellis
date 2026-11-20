@@ -459,6 +459,7 @@ pub fn chain_off(program: &Program) -> Option<Program> {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         });
     }
     (!defs.is_empty()).then(|| read_only_program(tables, defs))
