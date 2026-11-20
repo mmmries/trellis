@@ -522,14 +522,20 @@ impl GroupShape {
         };
         let mut sql = member.sql.clone();
         // Planted bug: a predicate column the image lacks reads as `NULL`.
-        // See `crate::plant`.
+        // See `crate::plant`. Whether an image lacks one shows only when the
+        // statement runs, so `quarantine::classify` counts the reach.
         #[cfg(any(test, feature = "test-util"))]
-        if crate::plant::fires(crate::plant::Plant::GbWhereColumnNotImaged, true) {
+        if crate::plant::armed() == Some(crate::plant::Plant::GbWhereColumnNotImaged)
+            && crate::plant::fires(crate::plant::Plant::GbWhereColumnNotImaged, true)
+        {
             return format!(" and {sql}");
         }
         for column in member.columns.iter().rev() {
             let name = quote_literal(column);
-            let missing = quote_literal(&format!("the row has no column {column}"));
+            let missing = quote_literal(&format!(
+                "{} {column}",
+                super::one_to_one_render::UNIMAGED_COLUMN
+            ));
             sql = format!(
                 "(case when {image} operator(pg_catalog.?) {name} then {sql} \
                  else ({missing} || pg_catalog.left({image}::text, 0))::integer > 0 end)"
@@ -4884,7 +4890,7 @@ pub(crate) async fn apply_locked_groups(
     // Planted bug: count the pages whose basis test the plant
     // changes. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    if crate::plant::armed() == Some(crate::plant::Plant::GbLsnNotVisibility) {
+    if crate::plant::visit(crate::plant::Plant::GbLsnNotVisibility) {
         let sql = plan.planted_in_flight_sql();
         let row = match &plan.floor_key {
             Some(key) => txn.query_one(&sql, &[key]).await?,

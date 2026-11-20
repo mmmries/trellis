@@ -102,8 +102,12 @@ fn takes_forms(table: &Table) -> bool {
         unique_cols,
         unique_sets,
         partitioning,
+        source_key,
     } = table;
-    partitioning.is_none() && unique_cols.is_empty() && unique_sets.is_empty()
+    partitioning.is_none()
+        && unique_cols.is_empty()
+        && unique_sets.is_empty()
+        && source_key.is_none()
 }
 
 /// Rewrites some of `program`'s single-row writes into a statement form

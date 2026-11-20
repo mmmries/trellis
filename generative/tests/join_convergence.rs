@@ -430,6 +430,10 @@ fn join_sweep_tier() -> SweepTier {
         &[PlantPath::Capture],
         generative::plant_sweep::NO_CAPTURE,
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::SourceKey],
+        generative::plant_sweep::NO_SOURCE_KEY,
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_TIER,
         known_misses: &["gb_early_zero_gc"],

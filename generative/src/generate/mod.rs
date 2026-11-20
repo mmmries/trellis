@@ -133,6 +133,7 @@ pub mod join_chained;
 pub mod join_one_to_one;
 pub mod min_max;
 pub mod partition;
+pub mod source_key;
 pub mod txn_shapes;
 pub mod where_clause;
 
@@ -1651,11 +1652,20 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
         program.restart_after_ops.is_empty() && program.scale_out_after_ops.is_empty(),
         "concurrent_plan: the concurrent tier doesn't schedule a restart or a scale-out"
     );
+    // A keyed table's writes can collide on its `KEY (...)` from any two
+    // rows, so they keep to one lane (`source_key`'s module doc comment).
     let whole_table: std::collections::HashSet<&str> = program
         .ops
         .iter()
         .filter(|op| op_touches_whole_table(op))
         .map(op_table)
+        .chain(
+            program
+                .tables
+                .iter()
+                .filter(|t| t.source_key.is_some())
+                .map(|t| t.name.as_str()),
+        )
         .collect();
     let lane_key = |op: &Op| -> (String, Option<String>) {
         let table = op_table(op);
@@ -2273,6 +2283,11 @@ pub fn ops_commute(program: &Program, a: &Op, b: &Op) -> bool {
         // independence.
         return false;
     };
+    // Two rows of a keyed table can collide on its `KEY (...)`, so which
+    // of two writes fails depends on their order.
+    if table.source_key.is_some() {
+        return false;
+    }
 
     let same_row = match (op_pk_value(a, table), op_pk_value(b, table)) {
         (Some(pk_a), Some(pk_b)) => pk_a == pk_b,
@@ -2411,6 +2426,7 @@ pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueT
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     }
 }
 

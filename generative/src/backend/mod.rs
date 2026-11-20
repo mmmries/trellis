@@ -23,7 +23,9 @@ pub use manual::{
     await_pool_usable,
 };
 pub use sql::HeldKeys;
-pub use subprocess::{SubprocessBackend, SubprocessBackendError};
+pub use subprocess::{
+    REACH_FILE_ENV, SubprocessBackend, SubprocessBackendError, reach_request, write_reach,
+};
 
 use std::collections::BTreeMap;
 use std::future::Future;

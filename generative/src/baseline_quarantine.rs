@@ -27,6 +27,7 @@ pub const CONCURRENT_TIERS: &[&str] = &[
     "mid_burst",
     "steady_load",
     "min_max",
+    "source_key",
 ];
 
 /// The `JOIN` tier's sweep tier (`join_convergence.rs`).
@@ -34,6 +35,10 @@ pub const JOIN_TIER: &str = "join";
 
 /// The 1-1 `JOIN` tier's sweep tier (`join_one_to_one_convergence.rs`).
 pub const JOIN_ONE_TO_ONE_TIER: &str = "join_one_to_one";
+
+/// The 1-1 `JOIN` tier's sweep tier for a joined table read through a
+/// nullable `KEY (...)` (`join_one_to_one_convergence.rs`, #2171).
+pub const JOIN_ONE_TO_ONE_KEY_TIER: &str = "join_one_to_one_key";
 
 /// The 1-1 `JOIN` tier's star sweep tier (`join_one_to_one_convergence.rs`,
 /// #1781).
@@ -56,8 +61,10 @@ pub const TIERS: &[&str] = &[
     "mid_burst",
     "steady_load",
     "min_max",
+    "source_key",
     JOIN_TIER,
     JOIN_ONE_TO_ONE_TIER,
+    JOIN_ONE_TO_ONE_KEY_TIER,
     JOIN_STAR_TIER,
     JOIN_CHAINED_TIER,
     EXTREMES_TAMPER_TIER,
