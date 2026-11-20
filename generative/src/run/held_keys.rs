@@ -205,7 +205,7 @@ async fn run(
             .target_ddl(&backend.qualified_target(isolation::FAILING))
         {
             backend
-                .execute_raw(&ddl)
+                .execute_admin(&ddl)
                 .await
                 .map_err(|e| RunError::Install(format!("{ddl}: {e:?}")))?;
         }
