@@ -572,6 +572,9 @@ fn check_op_outcome<E: std::fmt::Debug>(
 /// Whether an error's text (a database error's `Debug`, which carries its
 /// `where` context) says it was raised inside a Trellis capture function:
 /// a PL/pgSQL frame of a function named `cap_<event>_…` in any schema.
+/// A quoted name may arrive escaped once or twice (a wrapped transaction's
+/// results are `Debug` of a `Debug`), as may a compile error's
+/// `function "…"` context.
 pub fn raised_in_capture(error: &str) -> bool {
     error.match_indices("function ").any(|(at, _)| {
         let name = error[at + "function ".len()..]
@@ -582,7 +585,7 @@ pub fn raised_in_capture(error: &str) -> bool {
             .rsplit('.')
             .next()
             .unwrap_or_default()
-            .trim_matches('"');
+            .trim_matches(|c| c == '"' || c == '\\');
         ["insert", "update", "delete", "truncate", "begin"]
             .iter()
             .any(|event| bare.starts_with(&format!("cap_{event}_")))
@@ -918,6 +921,13 @@ mod tests {
         assert!(raised_in_capture(
             "PL/pgSQL function \"inst_b\".\"cap_update_t_0123\"() line 3"
         ));
+        // Escaped by a `Debug` of a `Debug`, and a compile error's context.
+        let quoted = "PL/pgSQL function \"inst_b\".\"cap_update_T_0123\"() line 3";
+        assert!(raised_in_capture(&format!("{:?}", format!("{quoted:?}"))));
+        assert!(raised_in_capture(&format!(
+            "{:?}",
+            "compilation of PL/pgSQL function \"cap_insert_t_0123\" near line 2"
+        )));
         assert!(!raised_in_capture(
             "PL/pgSQL function public.wire_rewrite_t() line 2 at SQL statement"
         ));
