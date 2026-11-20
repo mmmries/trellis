@@ -374,9 +374,10 @@ The cooling-key, cooling-backfill and mid-burst tiers gate it; the hot-key and
 steady-load tiers seal too slowly to catch it reliably. The plant
 `capture_skip_nested_reread` (capture never re-reads after a nested
 statement's capture) is the wiring's: only the `AFTER` rewrite reaches it.
-The cooling-key, hot-key and mid-burst tiers gate it through their 1-1
-definitions; the steady-load and cooling-backfill tiers read only `GROUP BY`
-and never caught it.
+It reaches a target only through a 1-1 definition: a `GROUP BY` sums the
+nested change and the outer one, right in either order. The cooling-key,
+hot-key, mid-burst and steady-load tiers gate it; the cooling-backfill tier
+has no 1-1 definition.
 
 ## 4. The properties
 
