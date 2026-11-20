@@ -318,6 +318,12 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// A drain page failed `ring_wait::MAX_DRAIN_ATTEMPTS` times in a
+    /// row with no commit and is still failing (#2185 6c): the engine
+    /// retries without bound. `holdups` names each such page.
+    RetriesUnbounded {
+        holdups: String,
+    },
     /// A `DROP TRANSFORM` returned and left its target table behind, which
     /// it drops (`docs/transforms.md`).
     DroppedTargetRemains {
@@ -386,6 +392,9 @@ impl From<sql::QuiesceError> for ManualBackendError {
             }
             sql::QuiesceError::PartitionsUnsettled { unsettled, waited } => {
                 ManualBackendError::PartitionSettleTimeout { unsettled, waited }
+            }
+            sql::QuiesceError::RetriesUnbounded { holdups } => {
+                ManualBackendError::RetriesUnbounded { holdups }
             }
         }
     }
