@@ -1324,8 +1324,14 @@ impl ManualBackend {
     /// segment number moves only while the ring is pristine (its one segment
     /// the active one, nothing parked against it): a sealed or draining
     /// segment's `seal_step2` is written by the *next* seal, and renumbering
-    /// the active segment would strand it. Call it before the first op. Fails
-    /// if the ring isn't pristine.
+    /// the active segment would strand it. Call it before the install, so the
+    /// definitions and their builds draw past the start too, and no engine
+    /// races the renumbering. Fails if the ring isn't pristine.
+    ///
+    /// The result is a state the engine reaches on its own: one active
+    /// segment numbered above every earlier one, with none left below it, is
+    /// what retiring every drained segment leaves, and what a restore's
+    /// response (`capture::restore::respond`) writes.
     ///
     /// Returns the segment number the ring is at afterwards.
     pub async fn advance_counters(&self, limit: CounterLimit) -> Result<i64, ManualBackendError> {
@@ -1396,6 +1402,20 @@ impl ManualBackend {
         drop(admin);
         let _ = connection.await;
         Ok(result?)
+    }
+
+    /// The ids of the instance's definitions, in order: whether
+    /// [`Self::advance_counters`] started them past a limit.
+    pub async fn definition_ids(&self) -> Result<Vec<i64>, ManualBackendError> {
+        let q = quote_ident(self.config.schema());
+        let rows = self
+            .raw
+            .query(
+                &format!("select id from {q}.transform_definitions order by id"),
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     /// The connection string every Trellis connection of this backend logs

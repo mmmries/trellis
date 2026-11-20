@@ -829,10 +829,10 @@ pub struct DbAdminEvent {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DbAdminPlan {
     pub events: Vec<DbAdminEvent>,
-    /// Start the engine's counters near this limit before the first op
-    /// (`ManualBackend::advance_counters`), so the whole program runs across
-    /// it. Not an event: the ring's segment number can only be moved while
-    /// the ring is pristine.
+    /// Start the engine's counters near this limit before the install
+    /// (`ManualBackend::advance_counters`), so the definitions and the whole
+    /// program run across it. Not an event: the ring's segment number can
+    /// only be moved while the ring is pristine.
     pub counters_near: Option<CounterLimit>,
 }
 

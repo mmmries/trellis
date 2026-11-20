@@ -1125,14 +1125,13 @@ The actions, cheapest-first (every one below is built):
    compared as 32-bit ids) needs that crossing, so no planted-bug sweep tier
    runs it; `db_admin.rs`'s wrap pin and `staging`'s sealing pin catch it.
    `DbAdminPlan::counters_near` starts the engine's `bigint` counters (ring
-   change ids and segment numbers, catalog ids) just under `2^31` or a
-   million short of `2^63` before the first op, so the program crosses 32 bits
-   or runs on 19-digit ids. It is plain SQL as the operator
-   (`ManualBackend::advance_counters`): the counters are Postgres sequences
-   and columns, so there is no engine hook. `ring_slot_mirror` is a
-   four-value `smallint` and has no headroom. The segment number moves only
-   while the ring is pristine, so the start is before the first op, not an
-   event.
+   change ids and segment numbers, definition, build and catalog ids) just
+   under `2^31` or a million short of `2^63` before the install, so the
+   program crosses 32 bits or runs on 19-digit ids. It is plain SQL as the
+   operator (`ManualBackend::advance_counters`): the counters are Postgres
+   sequences and columns, so there is no engine hook. The renumbered ring
+   (one active segment, none below it) is the state retiring every segment
+   leaves. `ring_slot_mirror` is a four-value `smallint` and has no headroom.
    Backup/restore is a cold file-level copy (`model::RestorePlan`, driven by
    `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
    back up right after op *k* with its change in flight, run to the end,

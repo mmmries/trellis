@@ -47,18 +47,19 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
     // A restart can strand a claim the engine then waits a reclaim TTL to
     // free (see `SERVER_STOP_RECLAIM_TTL`).
     backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
-    backend
-        .install(program)
-        .await
-        .map_err(|e| RunError::Install(format!("{e:?}")))?;
-
     if let Some(limit) = plan.counters_near {
-        // Before the first op, while the ring is pristine.
+        // Before the install, while the ring is pristine and no engine runs:
+        // the definitions, their builds and every later draw take ids past
+        // the start.
         backend
             .advance_counters(limit)
             .await
             .map_err(|e| RunError::Install(format!("counters near {limit:?}: {e:?}")))?;
     }
+    backend
+        .install(program)
+        .await
+        .map_err(|e| RunError::Install(format!("{e:?}")))?;
 
     for (op_index, op) in program.ops.iter().enumerate() {
         let events: Vec<&DbAdminAction> = plan
