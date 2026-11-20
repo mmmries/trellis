@@ -290,11 +290,14 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
             for timed in &burst.actions {
                 // A held transaction prepares as its lane ends, so a pause
                 // or resume that fires on an earlier count would land before
-                // it is in doubt: these wait for every lane's last op. A held
-                // transaction is released only once the actions have fired,
-                // so the wait ends.
+                // it is in doubt: a resume waits for every lane's last op,
+                // and so does a pause drawn at an even count. A pause at an
+                // odd count keeps its place, so writes still land while it
+                // is paused. A held transaction is released only once the
+                // actions have fired (or the cap passes), so the wait ends.
                 let after = match &timed.action {
-                    BurstAction::Pause { .. } | BurstAction::Resume { .. } if holds => {
+                    BurstAction::Resume { .. } if holds => timed.after.max(burst_ops),
+                    BurstAction::Pause { .. } if holds && timed.after % 2 == 0 => {
                         timed.after.max(burst_ops)
                     }
                     _ => timed.after,

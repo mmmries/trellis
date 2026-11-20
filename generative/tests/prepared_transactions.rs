@@ -303,3 +303,35 @@ async fn generated_actions_run_while_a_transaction_is_in_doubt() {
     }
     assert!(overlapped >= cases.len() as u64);
 }
+
+/// #2181 2d: in a burst that holds a prepared transaction, the runner moves
+/// a pause drawn at an even count to the burst's end, and leaves one at an
+/// odd count in place. Generated cases draw both, so a pause is still taken
+/// mid-burst, with writes landing while it is paused, in some held bursts.
+#[test]
+fn held_bursts_pause_both_mid_burst_and_at_the_end() {
+    let (mut moved, mut kept) = (false, false);
+    for case in held_pause_cases(16) {
+        let txns = &case.plan.txns;
+        for burst in &case.plan.bursts {
+            let holds = burst.lanes.iter().flatten().any(|&i| {
+                txns.iter()
+                    .any(|t| t.ops[0] == i && t.prepare.is_some_and(|p| p.hold))
+            });
+            if !holds {
+                continue;
+            }
+            let ops = burst.ops().len();
+            for a in &burst.actions {
+                if matches!(a.action, BurstAction::Pause { .. }) && a.after < ops {
+                    if a.after % 2 == 0 {
+                        moved = true;
+                    } else {
+                        kept = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(moved && kept, "moved {moved}, kept {kept}");
+}

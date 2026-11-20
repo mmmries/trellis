@@ -1959,11 +1959,12 @@ fn every_transaction_shape_is_drawn_against_every_key_space() {
     assert!(missing.is_empty(), "never drawn: {missing:?}\n{coverage}");
 }
 
-/// #2181 2d: a prepared transaction is drawn held in doubt across a burst's
-/// pause and resume (a restart is a hand-built test, as no concurrent plan
-/// restarts the engine).
+/// #2181 2d: a held prepared transaction is drawn in a burst that pauses or
+/// resumes. This counts draws; that an action really runs while one is in
+/// doubt is floored by
+/// `prepared_transactions::generated_actions_run_while_a_transaction_is_in_doubt`.
 #[test]
-fn a_prepared_transaction_is_held_across_a_pause() {
+fn a_held_prepared_transaction_is_drawn_in_a_pausing_burst() {
     let coverage = concurrent_tier_coverage(4);
     let drawn: usize = coverage
         .txn_shapes
