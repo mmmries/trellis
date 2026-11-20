@@ -19,6 +19,7 @@
 mod concurrent;
 mod coverage;
 mod db_admin;
+mod epoch;
 mod held_keys;
 mod noise;
 mod pause;
@@ -30,6 +31,7 @@ pub use concurrent::{
 };
 pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES};
 pub use db_admin::run_convergence_with_db_admin;
+pub use epoch::run_epochs;
 pub use held_keys::{
     DefModel, HeldExpectation, HeldKeySummary, TRANSFORM_FUSE, run_convergence_with_held_keys,
 };
@@ -280,6 +282,12 @@ pub enum RunError {
         burst: usize,
         settled: bool,
         failure: Result<crate::invariant::Failure, String>,
+    },
+    /// Epoch `epoch` of an epoch chain ([`run_epochs`]) failed with
+    /// `error`. Epoch `0` is the chain's first program.
+    Epoch {
+        epoch: usize,
+        error: Box<RunError>,
     },
 }
 

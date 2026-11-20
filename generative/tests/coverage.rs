@@ -1989,6 +1989,97 @@ fn the_join_tiers_draw_every_redefinition() {
     }
 }
 
+// ---------------------------------------------------------------------
+// #2187: epoch chains.
+// ---------------------------------------------------------------------
+
+/// #2187: the epoch tier draws every step at an epoch's start (a drop, each
+/// definition shape, a restore in a later epoch than its drop, a definition
+/// over a source nothing read since an earlier epoch, a restart, an epoch
+/// that leaves nothing defined), and chains of ten or more epochs. Every
+/// definition a step defines passes define's checks, under a name nothing
+/// defined holds, and both key spaces are defined again.
+#[test]
+fn the_epoch_tier_draws_every_step() {
+    use generative::generate::epoch::{
+        DEFAULT_MAX_EPOCHS, EpochStep, apply_step, chain, chain_shapes, epoch_case_with,
+    };
+    use generative::model::BurstAction;
+    use trellis::dev::defs::validate;
+
+    const SAMPLES: usize = 64;
+    let mut totals: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut long = 0;
+    let mut redefined: HashSet<&'static str> = HashSet::new();
+    // The default length, not `GENERATIVE_MAX_EPOCHS`, so the floors hold
+    // whatever a deep run exports.
+    for case in sample(epoch_case_with(DEFAULT_MAX_EPOCHS), SAMPLES) {
+        let chain = chain(&case);
+        for (name, n) in chain_shapes(&chain) {
+            *totals.entry(name).or_insert(0) += n;
+        }
+        if chain.epochs.len() > 10 {
+            long += 1;
+        }
+        let mut live = chain.program.defs.clone();
+        for step in chain.epochs.iter().flat_map(|e| &e.steps) {
+            if let EpochStep::Act(BurstAction::Define { def, .. }) = step {
+                assert!(
+                    !live.iter().any(|d| d.target == def.target),
+                    "{} is defined twice",
+                    def.target
+                );
+                redefined.insert(match def.key_space {
+                    KeySpace::OneToOne => "OneToOne",
+                    KeySpace::Aggregate { .. } => "Aggregate",
+                    _ => "Other",
+                });
+                let table = chain
+                    .program
+                    .tables
+                    .iter()
+                    .find(|t| t.name == def.source)
+                    .expect("a definition reads a program table");
+                let columns = table
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.value_type))
+                    .collect();
+                validate(def, &columns).unwrap_or_else(|e| panic!("{def:?}: {e:?}"));
+            }
+            apply_step(&mut live, step);
+        }
+    }
+    eprintln!("epoch shapes over {SAMPLES} cases: {totals:?}; {long} chains past ten epochs");
+    for name in [
+        "drop",
+        "restart",
+        "define_same",
+        "define_changed",
+        "define_renamed",
+        "define_renamed_changed",
+        "define_second",
+        "restore",
+        "define_unread_table",
+        "none_defined",
+    ] {
+        let reached = totals.get(name).copied().unwrap_or(0);
+        assert!(
+            reached >= 4,
+            "the epoch tier must draw {name} at least 4 times in {SAMPLES} cases, got {reached}"
+        );
+    }
+    assert!(
+        long >= 8,
+        "only {long} of {SAMPLES} chains run past ten epochs"
+    );
+    assert_eq!(
+        redefined,
+        HashSet::from(["OneToOne", "Aggregate"]),
+        "a definition of each key space is defined again"
+    );
+}
+
 /// #2171: the convergence properties' draw reads a source through a
 /// `KEY (...)` in about a quarter of its programs, and across them draws
 /// every key shape, key space, key value class and key move the dimension
