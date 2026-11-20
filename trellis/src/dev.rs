@@ -224,10 +224,11 @@ pub mod build {
 }
 
 /// Planted ordering bugs. A harness reads which plant
-/// this process runs with and how often it fired; it never arms one, since
+/// this process runs with, how often it fired and how often each site was
+/// reached; it never arms one, since
 /// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.
 pub mod plant {
-    pub use crate::plant::{PLANT_ENV, Plant, armed, fired};
+    pub use crate::plant::{Marker, PLANT_ENV, Plant, absorb, armed, fired, reached, sites};
 }
 
 /// Sample values of the public status and report structs, which are

@@ -166,7 +166,11 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // it, so isolating would charge, and eventually evict, each of them
         // for nothing. Halt the definitions it reaches instead
         // (`staging::halt`).
-        _ if is_insufficient_privilege(err) => FailureClass::Halting,
+        _ if is_insufficient_privilege(err) => {
+            #[cfg(any(test, feature = "test-util"))]
+            crate::plant::reach(crate::plant::Marker::PrivilegeHalts);
+            FailureClass::Halting
+        }
         _ if is_transient(err) => FailureClass::Transient,
         _ => FailureClass::Isolate,
     }

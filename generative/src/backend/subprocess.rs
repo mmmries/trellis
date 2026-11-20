@@ -211,6 +211,92 @@ impl From<sql::ApplyOpError> for SubprocessBackendError {
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The environment variable naming the file an `engine_subprocess` writes
+/// its plant counts to ([`write_reach`]) when asked.
+pub const REACH_FILE_ENV: &str = "TRELLIS_TEST_REACH_FILE";
+
+/// How long [`collect_reach`] waits for a child to answer.
+const REACH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The file that asks the child holding `reach_file` for its counts; the
+/// child removes it once the counts are written.
+pub fn reach_request(reach_file: &std::path::Path) -> PathBuf {
+    reach_file.with_extension("request")
+}
+
+/// Writes this process's plant counts to `reach_file`, atomically: a
+/// `fired` line, then one `<site>\t<count>` line per site reached. The
+/// `engine_subprocess` side of [`collect_reach`].
+pub fn write_reach(reach_file: &std::path::Path) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    let mut text = format!("fired\t{}\n", trellis::dev::plant::fired());
+    for (site, count) in trellis::dev::plant::reached() {
+        if count > 0 {
+            let _ = writeln!(text, "{site}\t{count}");
+        }
+    }
+    let partial = reach_file.with_extension("partial");
+    std::fs::write(&partial, text)?;
+    std::fs::rename(&partial, reach_file)
+}
+
+/// Asks the child holding `reach_file` for its plant counts, waits (bounded
+/// by [`REACH_TIMEOUT`]) for its answer and folds them into this process's
+/// (`trellis::dev::plant::absorb`), so a sweep reading this process's
+/// counts covers the engine it ran in a child. Called just before the
+/// child is killed, since a killed child can't report; what the child
+/// reaches between the answer and the kill is lost. A child that doesn't
+/// answer (it exited, or hangs) is reported on stderr and skipped.
+fn collect_reach(reach_file: &std::path::Path) {
+    let request = reach_request(reach_file);
+    let _ = std::fs::remove_file(reach_file);
+    if let Err(err) = std::fs::write(&request, b"") {
+        eprintln!("generative: can't ask an engine subprocess for its plant counts: {err}");
+        return;
+    }
+    let deadline = Instant::now() + REACH_TIMEOUT;
+    while request.exists() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "generative: an engine subprocess didn't report its plant counts within \
+                 {REACH_TIMEOUT:?}; its reach is left out"
+            );
+            let _ = std::fs::remove_file(&request);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = match std::fs::read_to_string(reach_file) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("generative: can't read an engine subprocess's plant counts: {err}");
+            return;
+        }
+    };
+    let mut fired = 0;
+    let mut reached = Vec::new();
+    for line in text.lines() {
+        let Some((name, count)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u64>() else {
+            continue;
+        };
+        if name == "fired" {
+            fired = count;
+        } else {
+            reached.push((name, count));
+        }
+    }
+    // Not a panic: this runs in `Drop`, maybe while unwinding.
+    let unknown = trellis::dev::plant::absorb(fired, reached);
+    if !unknown.is_empty() {
+        eprintln!(
+            "generative: an engine subprocess reported sites this process doesn't know: {unknown:?}"
+        );
+    }
+}
+
 /// The subprocess-supervised backend. Owns a raw connection (DDL, DML,
 /// watermark reads, snapshot reads — identical role to `ManualBackend::raw`)
 /// and, once [`SubprocessBackend::install`] has run, a real child process
@@ -229,13 +315,15 @@ pub struct SubprocessBackend {
     defs: Vec<TransformDef>,
     application_threads: usize,
     maintenance_interval: Duration,
-    /// The primary engine subprocess, once spawned. `None` before the first
+    /// The primary engine subprocess, once spawned, with the file it reports
+    /// its plant counts to ([`collect_reach`]). `None` before the first
     /// [`SubprocessBackend::install`] call that has at least one table.
-    child: Option<CrashGuard>,
+    child: Option<(CrashGuard, PathBuf)>,
     /// Additional application-worker-only subprocesses started by
     /// [`SubprocessBackend::scale_out`], kept alive for this backend's own
-    /// lifetime — same role as `ManualBackend::scale_out_clients`.
-    scale_out_children: Vec<CrashGuard>,
+    /// lifetime — same role as `ManualBackend::scale_out_clients` — each
+    /// with its plant-count file.
+    scale_out_children: Vec<(CrashGuard, PathBuf)>,
     /// The exit status [`SubprocessBackend::restart`] observed the last time
     /// it killed a running child, if any — exposed via
     /// [`SubprocessBackend::last_kill_status`] so a crash test can confirm
@@ -436,6 +524,10 @@ impl SubprocessBackend {
     /// [`SubprocessBackendError::EngineNotReady`].
     async fn spawn_engine(&mut self, staging_worker: bool) -> Result<(), SubprocessBackendError> {
         let _ = std::fs::remove_file(&self.ready_marker_path);
+        let reach_file = self.scratch_dir.join(format!(
+            "reach-{}",
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
 
         let mut command = Command::new(&self.engine_bin);
         command
@@ -457,6 +549,7 @@ impl SubprocessBackend {
                 self.maintenance_interval.as_millis().to_string(),
             )
             .env("TRELLIS_READY_MARKER", &self.ready_marker_path)
+            .env(REACH_FILE_ENV, &reach_file)
             // The pause hook — see this module's doc comment. Set
             // unconditionally (every spawned subprocess, primary or
             // scale-out): a no-op unless `arm_pause_before_commit` later
@@ -468,10 +561,10 @@ impl SubprocessBackend {
             .stderr(Stdio::inherit());
 
         let guard = CrashGuard::spawn(&mut command).map_err(SubprocessBackendError::Spawn)?;
-        let guard = if staging_worker {
-            self.child.insert(guard)
+        let (guard, _) = if staging_worker {
+            self.child.insert((guard, reach_file))
         } else {
-            self.scale_out_children.push(guard);
+            self.scale_out_children.push((guard, reach_file));
             self.scale_out_children.last_mut().expect("just pushed")
         };
 
@@ -525,8 +618,12 @@ impl Drop for SubprocessBackend {
     fn drop(&mut self) {
         // `self.child`/`self.scale_out_children` drop right after this body
         // (struct-field drop order), which is what actually SIGKILLs any
-        // still-running subprocess (`CrashGuard::drop`) — this only cleans
-        // up the scratch directory those processes' marker files lived in.
+        // still-running subprocess (`CrashGuard::drop`) — this only collects
+        // their plant counts first, and cleans up the scratch directory
+        // those processes' marker files lived in.
+        for (_, reach_file) in self.child.iter().chain(&self.scale_out_children) {
+            collect_reach(reach_file);
+        }
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
     }
 }
@@ -644,10 +741,11 @@ impl super::Backend for SubprocessBackend {
     /// transaction rollback (triggered by the killed process's connection
     /// dropping) already guarantees was never partially applied.
     async fn restart(&mut self) -> Result<(), SubprocessBackendError> {
-        let mut guard = self
+        let (mut guard, reach_file) = self
             .child
             .take()
             .ok_or(SubprocessBackendError::NoClientStarted)?;
+        collect_reach(&reach_file);
         // `kill` (SIGKILL) then `wait`, not just letting `guard` drop:
         // `CrashGuard::drop` performs the same two calls best-effort, but
         // doing it explicitly here means this method can surface the real
@@ -667,5 +765,50 @@ impl super::Backend for SubprocessBackend {
     /// `ManualBackend::scale_out`.
     async fn scale_out(&mut self) -> Result<(), SubprocessBackendError> {
         self.spawn_engine(false).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child's counts reach the parent's: the parent asks, the child
+    /// answers with [`write_reach`], and [`collect_reach`] folds the answer
+    /// in. Here the "child" is a thread of this process answering as
+    /// `engine_subprocess` does, so the fold doubles this process's counts.
+    #[test]
+    fn collect_reach_folds_the_answer_into_this_process() {
+        use trellis::dev::plant::{Marker, absorb, reached};
+        let dir = std::env::temp_dir().join(format!(
+            "trellis-reach-test-{}-{}",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let reach_file = dir.join("reach");
+        let count = || {
+            reached()
+                .into_iter()
+                .find(|(site, _)| *site == Marker::PrivilegeHalts.name())
+                .map(|(_, n)| n)
+                .expect("a site")
+        };
+        absorb(0, [(Marker::PrivilegeHalts.name(), 1)]);
+        let before = count();
+        let answer = {
+            let reach_file = reach_file.clone();
+            std::thread::spawn(move || {
+                let request = reach_request(&reach_file);
+                while !request.exists() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                write_reach(&reach_file).expect("write the counts");
+                std::fs::remove_file(&request).expect("answer the request");
+            })
+        };
+        collect_reach(&reach_file);
+        answer.join().expect("the answering thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(count() >= 2 * before, "{} after {before}", count());
     }
 }

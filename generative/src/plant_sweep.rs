@@ -290,6 +290,9 @@ pub struct SweepCase {
     /// "timed out" column says how much of "caught" that is.
     pub timed_out: bool,
     pub secs: f64,
+    /// How many times the case reached each site it reached
+    /// (`trellis::dev::plant::reached`), armed or not.
+    pub reached: Vec<(String, u64)>,
     pub reason: String,
 }
 
@@ -325,7 +328,7 @@ impl SweepCase {
 
     pub fn to_line(&self) -> String {
         format!(
-            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}",
+            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}",
             self.plant,
             self.seed,
             self.case,
@@ -334,13 +337,22 @@ impl SweepCase {
             self.reachable,
             self.timed_out,
             self.secs,
+            if self.reached.is_empty() {
+                "-".to_string()
+            } else {
+                self.reached
+                    .iter()
+                    .map(|(site, n)| format!("{site}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
             self.reason
         )
     }
 
     pub fn from_line(line: &str) -> Option<SweepCase> {
-        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(9, '\t');
-        let mut next = || fields.next().expect("a sweep line has 9 fields");
+        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(10, '\t');
+        let mut next = || fields.next().expect("a sweep line has 10 fields");
         Some(SweepCase {
             plant: next().to_string(),
             seed: next().parse().ok()?,
@@ -350,6 +362,16 @@ impl SweepCase {
             reachable: next().parse().ok()?,
             timed_out: next().parse().ok()?,
             secs: next().parse().ok()?,
+            reached: match next() {
+                "-" => Vec::new(),
+                sites => sites
+                    .split(',')
+                    .map(|site| {
+                        let (name, n) = site.split_once('=')?;
+                        Some((name.to_string(), n.parse().ok()?))
+                    })
+                    .collect::<Option<_>>()?,
+            },
             reason: next().to_string(),
         })
     }
@@ -416,6 +438,7 @@ fn run_cases<C>(
                 continue;
             }
             let fired_before = trellis::dev::plant::fired();
+            let reached_before = trellis::dev::plant::reached();
             let started = std::time::Instant::now();
             let result = run(case);
             let reachable = match &result {
@@ -450,6 +473,12 @@ fn run_cases<C>(
                     .as_ref()
                     .is_err_and(|f| is_quiesce_timeout(&f.message)),
                 secs: started.elapsed().as_secs_f64(),
+                reached: trellis::dev::plant::reached()
+                    .into_iter()
+                    .zip(reached_before)
+                    .filter(|((_, after), (_, before))| after > before)
+                    .map(|((site, after), (_, before))| (site.to_string(), after - before))
+                    .collect(),
                 reason,
             }
             .to_line();
@@ -583,6 +612,28 @@ fn judge(test: &str, tier: &SweepTier, requested: &str) {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    eprintln!("{}", reach_report(tier, &results));
+    let seeds: u64 = env_or(PLANT_SEEDS_ENV, PLANT_SEEDS);
+    let cases: usize = env_or(PLANT_CASES_ENV, PLANT_CASES);
+    if crate::reach_floor::judges(seeds, cases, std::env::var_os(PLANT_ONLY_ENV).is_none()) {
+        let totals = baseline_reach(&results)
+            .into_iter()
+            .map(|(site, (_, total))| (site, total))
+            .collect();
+        let missed = crate::reach_floor::misses(tier, &totals);
+        assert!(
+            missed.is_empty(),
+            "the {} tier's baseline never reached {missed:?} (see the reachability report \
+             above): draw the shape that reaches each, or exempt it, with why, in \
+             generative/src/reach_floor.rs's EXEMPT",
+            tier.name
+        );
+    } else {
+        eprintln!(
+            "{test}: reachability floor not judged: it holds on the default baseline \
+             ({PLANT_SEEDS} seeds x {PLANT_CASES} cases) or more, every case run"
+        );
+    }
     let caught = |name: &str| {
         results
             .iter()
@@ -693,6 +744,48 @@ fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) ->
     out
 }
 
+/// Each site's reach over the baseline's cases: how many cases reached it
+/// and how often in all, keyed by site name.
+pub fn baseline_reach(results: &[SweepCase]) -> std::collections::BTreeMap<String, (usize, u64)> {
+    let mut reach = std::collections::BTreeMap::new();
+    for r in results.iter().filter(|r| r.plant == "baseline") {
+        for (site, n) in &r.reached {
+            let (cases, total) = reach.entry(site.clone()).or_insert((0, 0));
+            *cases += 1;
+            *total += n;
+        }
+    }
+    reach
+}
+
+/// The reachability report: every site (`trellis::dev::plant::sites`),
+/// with the baseline's cases that reached it and its reaches in all, and
+/// what the floor makes of it (`crate::reach_floor`).
+pub fn reach_report(tier: &SweepTier, results: &[SweepCase]) -> String {
+    use std::fmt::Write;
+    let reach = baseline_reach(results);
+    let cases = results.iter().filter(|r| r.plant == "baseline").count();
+    let mut out = format!(
+        "reachability ({} tier, {cases} baseline cases):\n\
+         site | cases reached | reaches | floor\n",
+        tier.name
+    );
+    for site in trellis::dev::plant::sites() {
+        let (reached, total) = reach.get(site).copied().unwrap_or((0, 0));
+        let floor = if tier.not_gated.iter().any(|(name, _)| *name == site) {
+            "not gated here"
+        } else if crate::reach_floor::exemption(tier.name, site).is_some() {
+            "exempt"
+        } else if reached == 0 {
+            "MISSED"
+        } else {
+            "held"
+        };
+        let _ = writeln!(out, "{site} | {reached}/{cases} | {total} | {floor}");
+    }
+    out
+}
+
 /// Why a tier whose programs define no `MIN`/`MAX` doesn't run the
 /// extremes' plants ([`PlantPath::Extremes`], [`PlantPath::SelfCheckExtremes`]).
 pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggregate, which \
@@ -727,6 +820,7 @@ mod tests {
             reachable: true,
             timed_out,
             secs: 1.0,
+            reached: Vec::new(),
             reason: String::new(),
         }
     }
@@ -749,6 +843,47 @@ mod tests {
         assert!(out.contains("p | 2/3 | 1 | 3/3 | 0 |"), "{out}");
         let line = results[0].to_line();
         assert!(SweepCase::from_line(&line).unwrap().timed_out);
+    }
+
+    /// A row's reach survives its line, and the report counts the
+    /// baseline's reaches per site with what the floor makes of each.
+    #[test]
+    fn reach_round_trips_and_is_reported_per_site() {
+        let tier = SweepTier {
+            name: "cooling_key",
+            known_misses: &[],
+            not_gated: vec![("early_tombstone_gc", "not gated")],
+        };
+        let mut reached = case("baseline", 1, false, false);
+        reached.reached = vec![("stale_one_to_one_write".into(), 3)];
+        reached.reason = "a reason".into();
+        let back = SweepCase::from_line(&reached.to_line()).unwrap();
+        assert_eq!(back.reached, reached.reached);
+        assert_eq!(back.reason, "a reason");
+        let none = case("baseline", 2, false, false);
+        assert!(
+            SweepCase::from_line(&none.to_line())
+                .unwrap()
+                .reached
+                .is_empty()
+        );
+
+        let mut planted = case("stale_one_to_one_write", 1, false, false);
+        planted.reached = vec![("chunk_without_entry_lock".into(), 5)];
+        let out = reach_report(&tier, &[reached, none, planted]);
+        assert!(
+            out.contains("stale_one_to_one_write | 1/2 | 3 | held"),
+            "{out}"
+        );
+        assert!(
+            out.contains("early_tombstone_gc | 0/2 | 0 | not gated here"),
+            "{out}"
+        );
+        assert!(
+            out.contains("chunk_without_entry_lock | 0/2 | 0 | MISSED"),
+            "{out}"
+        );
+        assert!(out.contains("capture_widen | 0/2 | 0 | exempt"), "{out}");
     }
 
     #[test]
