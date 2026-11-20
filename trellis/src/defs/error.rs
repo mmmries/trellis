@@ -151,6 +151,18 @@ pub enum ParseError {
     /// this binary knows (ADR-0018): a downgrade, or an older binary running
     /// beside a newer one. Nothing is read or written.
     GrammarVersionTooNew { stored: i32, current: i32 },
+    /// `IN (SELECT ...)` and the other subquery forms of `IN`.
+    SubqueryInList,
+    /// `BETWEEN SYMMETRIC` or `BETWEEN ASYMMETRIC` (`modifier`).
+    BetweenSymmetric { modifier: String },
+    /// `= ANY (...)`, `<> ALL (...)` and the like: `operator` is the
+    /// comparison, `quantifier` `ANY`, `ALL` or `SOME`.
+    QuantifiedComparison {
+        operator: String,
+        quantifier: String,
+    },
+    /// A row constructor, `(a, b)`, as in `(a, b) IN ((1, 2))`.
+    RowConstructor,
 }
 
 impl ParseError {
@@ -208,6 +220,10 @@ impl ParseError {
             ParseError::GrammarVersionTooOld { .. } => ErrorId(38),
             ParseError::GrammarVersionTooNew { .. } => ErrorId(39),
             ParseError::UnsupportedAggregateModifier { .. } => ErrorId(240),
+            ParseError::SubqueryInList => ErrorId(248),
+            ParseError::BetweenSymmetric { .. } => ErrorId(249),
+            ParseError::QuantifiedComparison { .. } => ErrorId(250),
+            ParseError::RowConstructor => ErrorId(251),
         }
     }
 }
@@ -327,6 +343,29 @@ impl crate::error_code::Message for ParseError {
                     .map(|t| t.value_type.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            ParseError::SubqueryInList => write!(
+                f,
+                "IN (SELECT ...) is not supported: a definition reads only its own tables. \
+                 List the values, as in x IN (1, 2), or JOIN the other table"
+            ),
+            ParseError::BetweenSymmetric { modifier } => write!(
+                f,
+                "BETWEEN {modifier} is not supported; write the bounds in order, as in \
+                 x BETWEEN low AND high"
+            ),
+            ParseError::QuantifiedComparison {
+                operator,
+                quantifier,
+            } => write!(
+                f,
+                "'{operator} {quantifier} (...)' is not supported; list the values with IN, \
+                 as in x IN (1, 2) or x NOT IN (1, 2)"
+            ),
+            ParseError::RowConstructor => write!(
+                f,
+                "a row constructor such as (a, b) is not supported; compare each column on \
+                 its own, as in a = 1 AND b = 2"
             ),
             ParseError::NonAssociativeComparison { operator } => write!(
                 f,

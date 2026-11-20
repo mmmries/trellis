@@ -337,10 +337,16 @@ impl Coverage {
                 self.expr_shapes.insert("Cast");
                 1 + self.record_expr(expr)
             }
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            Expr::Not(_)
+            | Expr::IsNull { .. }
+            | Expr::InList { .. }
+            | Expr::Between { .. }
+            | Expr::Case { .. } => {
                 self.expr_shapes.insert(match expr {
                     Expr::Not(_) => "Not",
                     Expr::IsNull { .. } => "IsNull",
+                    Expr::InList { .. } => "InList",
+                    Expr::Between { .. } => "Between",
                     _ => "Case",
                 });
                 1 + expr
@@ -395,7 +401,11 @@ fn collect_aggregate_calls(
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_aggregate_calls(operand, key_space, out);
         }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+        Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Case { .. } => {
             for child in expr.children() {
                 collect_aggregate_calls(child, key_space, out);
             }

@@ -5,7 +5,7 @@
 //! does with a held key and checks what `status()` and `sample_quarantined`
 //! report. Shares one cluster per test thread, like `convergence.rs`.
 
-use generative::backend::ManualBackend;
+use generative::backend::{CaseDatabase, ManualBackend};
 use generative::generate::held_keys::{DivisorSlot, raising_shape};
 use generative::generate::{
     Mutate, TableSpec, build_program_multi_with_derived, held_key_fuse_program, held_key_program,
@@ -64,8 +64,8 @@ fn proptest_config() -> ProptestConfig {
 
 /// Drives `program` against a fresh isolated database of `cluster`.
 async fn run(cluster: &TestCluster, program: &Program) -> Result<HeldKeySummary, String> {
-    let db = cluster.create_isolated_database().await;
-    let mut backend = ManualBackend::connect(db.dsn())
+    let db = CaseDatabase::provision(cluster).await;
+    let mut backend = ManualBackend::connect_as(db.roles())
         .await
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");

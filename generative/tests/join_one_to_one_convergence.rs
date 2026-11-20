@@ -74,7 +74,7 @@
 //! check that the oracle and the `Strict` audit tell a damaged target or
 //! ledger from a good one.
 
-use generative::backend::{Backend, ConcurrentBackend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ConcurrentBackend, ManualBackend};
 use generative::generate::join::{
     BuildCoverage, JoinActionDraw, JoinActionKind, JoinBuildDraws, JoinCase, JoinOpKind, KeyShape,
     build_coverage,
@@ -309,9 +309,9 @@ fn run_case_with(case: &JoinCase, drain_batch_cap: Option<usize>) -> Result<(), 
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record(case);
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect_with_options(
-                db.dsn(),
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as_with_options(
+                db.roles(),
                 case.workers,
                 Some(std::time::Duration::from_millis(case.seal_interval_ms)),
             )
@@ -913,6 +913,10 @@ fn sweep_tier(
     not_gated.extend(not_on_path(
         &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
         generative::plant_sweep::NO_EXTREMES,
+    ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::SourceKey],

@@ -23,6 +23,8 @@ feature Expr(Negate) 0.2.0
 feature Expr(Not) 0.2.0
 feature Expr(IsNull) 0.2.0
 feature Expr(Case) 0.2.0
+feature Expr(InList) 0.4.0
+feature Expr(Between) 0.4.0
 feature Operator(Add) 0.2.0
 feature Operator(Subtract) 0.2.0
 feature Operator(Multiply) 0.2.0

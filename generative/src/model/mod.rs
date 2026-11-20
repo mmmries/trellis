@@ -743,6 +743,26 @@ pub enum DbAdminAction {
     /// the engine has to reconnect by itself: the harness never restarts the
     /// engine client for it.
     RestartPostgres(RestartMode),
+    /// `VACUUM FREEZE` of the whole case database as the superuser
+    /// (catalogs, Trellis's ring, ledgers and hidden tables, sources and
+    /// targets), at the same point as `Checkpoint`. A freeze keeps each
+    /// row's raw `xmin`, so capture's drift checks, which compare catalog
+    /// rows' `xmin`s with their recorded values, must read no change.
+    VacuumFreeze,
+    /// Ages the cluster's transaction ids, at the same point as
+    /// `Checkpoint`: freezes every database and moves the next id with
+    /// `pg_resetwal` to one commit-log page short of the next 32-bit epoch
+    /// boundary (`testkit::TestCluster::age_xids_to_epoch_edge`; each jump
+    /// restarts the server, as `RestartPostgres(Fast)` does), then burns all
+    /// but `tail` of the ids left. The engine's own transactions and the
+    /// program's next ops then cross the boundary while ring rows, fences
+    /// and bases from the old epoch are live. Rows written before the action
+    /// are frozen, and are usually more than `2^31` ids old after it, so
+    /// their `age(xmin)` has wrapped negative.
+    WrapXids {
+        /// Ids left before the boundary once the action ends.
+        tail: u32,
+    },
 }
 
 /// One [`DbAdminAction`], anchored to `ops[op]` (so `op < ops.len()`). See

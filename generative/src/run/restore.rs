@@ -175,10 +175,11 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
     drop(backup);
     let dsn = restored_cluster.database_dsn(database);
     let mut restored = backend
-        .connect_to_restore(dsn.clone())
+        .connect_to_restore(dsn)
         .await
         .map_err(|e| restore_error(k, "start the engine on the restore", e))?;
-    let restored_pool = Config::from_dsn(dsn)
+    // The oracle reads as the restored engine's role, not `dsn`'s superuser.
+    let restored_pool = Config::from_dsn(restored.trellis_dsn().to_string())
         .and_then(|config| Pool::new(&config))
         .map_err(|e| restore_error(k, "open the oracle's pool on the restore", e))?;
 

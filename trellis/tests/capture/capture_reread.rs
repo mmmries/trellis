@@ -443,6 +443,70 @@ async fn a_version_another_session_removed_after_the_snapshot_is_never_imaged() 
     }
 }
 
+/// The re-read's `age(t.xmin) <= 0` filter after the source has aged: key
+/// 1's version was frozen more than `2^31` transaction ids ago. A frozen row
+/// keeps its raw `xmin`, so its `age` has wrapped negative and the filter
+/// reads it as one this transaction wrote. Under `REPEATABLE READ`, another
+/// session deletes key 1 after the writer's snapshot and the writer
+/// re-creates it in a statement whose nested write (the undo trigger on key
+/// 2) makes the capture re-read: the old version is still visible, and is
+/// imaged in place of the writer's own.
+#[tokio::test]
+#[ignore = "#2205: a frozen row more than 2^31 xids old passes `age(xmin) <= 0`"]
+async fn a_version_frozen_past_half_the_xid_space_is_never_imaged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = held_table(db.dsn()).await;
+    raw.batch_execute(
+        "create function public.undo_insert() returns trigger language plpgsql as $$ \
+         begin \
+             if new.a = 0 then delete from public.t where id = new.id; end if; \
+             return null; \
+         end $$; \
+         create trigger undo_insert after insert on public.t \
+             for each row execute function public.undo_insert()",
+    )
+    .await
+    .expect("create the undo trigger");
+    drop(raw);
+    cluster.age_xids_to_epoch_edge(testkit::XID_PAGE);
+    let raw = connect(db.dsn()).await;
+    let age: i32 = raw
+        .query_one("select age(xmin) from public.t where id = 1", &[])
+        .await
+        .expect("age of key 1")
+        .get(0);
+    assert!(age < 0, "key 1 is more than 2^31 ids old: age {age}");
+
+    let mut writer = connect(db.dsn()).await;
+    let txn = writer
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .start()
+        .await
+        .expect("begin");
+    txn.query_one("select count(*) from public.t", &[])
+        .await
+        .expect("take the snapshot");
+    raw.batch_execute("delete from public.t where id = 1")
+        .await
+        .expect("another session deletes key 1");
+    txn.batch_execute(
+        "delete from public.t where id = 2; \
+         insert into public.t values (1, 50, 1), (2, 0, 2)",
+    )
+    .await
+    .expect("re-create key 1 beside a nested write");
+    let id = txid(txn.client()).await;
+    txn.commit().await.expect("commit");
+
+    let staged = staged_by(&raw, "public.t", &id).await;
+    assert!(
+        staged.contains(&row("1", "insert", None, Some(r#"{"a": "50", "id": "1"}"#))),
+        "key 1's insert images the writer's row: {staged:?}"
+    );
+}
+
 /// A key move between two values its type's `=` calls equal but that render
 /// differently (`numeric` `1.0` to `1.00`) is a delete of the old key text
 /// and an insert of the new one: the ring keys by the text, so the re-read

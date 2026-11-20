@@ -146,6 +146,8 @@ mod floor_manifest;
 #[cfg(test)]
 mod identifier_tests;
 #[cfg(test)]
+mod in_between_tests;
+#[cfg(test)]
 mod literal_tests;
 #[cfg(test)]
 mod logic_tests;

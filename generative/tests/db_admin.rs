@@ -1,7 +1,8 @@
 //! Layer-3 bucket 5 (`docs/generative-test-suite.md` §7):
 //! database-administration actions interleaved with a program's ops —
-//! `CHECKPOINT`, and a Postgres restart (fast, and immediate so the next
-//! start runs crash recovery). Each is an oracle identity, so every op is
+//! `CHECKPOINT`, a Postgres restart (fast, and immediate so the next
+//! start runs crash recovery), `VACUUM FREEZE`, and transaction-id aging
+//! across the 32-bit epoch boundary. Each is an oracle identity, so every op is
 //! still judged by the unchanged recompute oracle at quiescence; see
 //! `generative::run::run_convergence_with_db_admin` for what each action
 //! demands of the engine.
@@ -11,7 +12,7 @@
 //! properties, restarting it under earlier cases' leftovers, which is
 //! harmless: those cases are finished.
 
-use generative::backend::ManualBackend;
+use generative::backend::{CaseDatabase, ManualBackend};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     db_admin_plan_for, trivial_program,
@@ -56,8 +57,8 @@ fn proptest_config() -> ProptestConfig {
 
 /// Runs `program` with `plan` against a fresh database on `cluster`.
 async fn run(cluster: &TestCluster, program: &Program, plan: &DbAdminPlan) -> Result<(), String> {
-    let db = cluster.create_isolated_database().await;
-    let mut backend = ManualBackend::connect(db.dsn())
+    let db = CaseDatabase::provision(cluster).await;
+    let mut backend = ManualBackend::connect_as(db.roles())
         .await
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
@@ -105,7 +106,8 @@ proptest! {
 fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let mut runner = TestRunner::deterministic();
     let strategy = program_with_db_admin_plan();
-    let (mut checkpoint, mut fast, mut immediate) = (false, false, false);
+    let (mut checkpoint, mut fast, mut immediate, mut freeze, mut wrap) =
+        (false, false, false, false, false);
     for _ in 0..300 {
         let (program, plan) = strategy
             .new_tree(&mut runner)
@@ -118,12 +120,17 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                 DbAdminAction::Checkpoint => checkpoint = true,
                 DbAdminAction::RestartPostgres(RestartMode::Fast) => fast = true,
                 DbAdminAction::RestartPostgres(RestartMode::Immediate) => immediate = true,
+                DbAdminAction::VacuumFreeze => freeze = true,
+                DbAdminAction::WrapXids { tail } => {
+                    assert!(*tail <= 256, "{event:?}");
+                    wrap = true;
+                }
             }
         }
     }
     assert!(
-        checkpoint && fast && immediate,
-        "checkpoint={checkpoint} fast={fast} immediate={immediate}"
+        checkpoint && fast && immediate && freeze && wrap,
+        "checkpoint={checkpoint} fast={fast} immediate={immediate} freeze={freeze} wrap={wrap}"
     );
 }
 
@@ -214,4 +221,35 @@ async fn postgres_restarts_with_work_in_flight_converge() {
     run(&cluster, &program, &plan)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The cluster's transaction ids aged past the 32-bit epoch boundary with
+/// work in flight. A freeze after the first seed; a wrap after the second
+/// lands the next id one commit-log page short of the boundary, and burns all
+/// but 8 of the ids left, so the engine's drains and the next ops cross it
+/// with ring rows, fences and the aggregate's bases from epoch 0 still live.
+/// The seeds written before the wrap are frozen and more than `2^31` ids old
+/// by then, so their `age(xmin)` reads negative. Every op converges.
+///
+/// With the `fence_xid32` plant armed (`TRELLIS_TEST_PLANT=fence_xid32`),
+/// the drain's fences lose the changes from past the boundary, and this
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrap_across_the_epoch_boundary_with_work_in_flight_converges() {
+    const EPOCH: u64 = 1 << 32;
+    let cluster = TestCluster::start();
+    let program = one_to_one_and_aggregate_program();
+    let plan = plan(&[
+        (0, DbAdminAction::VacuumFreeze),
+        (1, DbAdminAction::WrapXids { tail: 8 }),
+        (4, DbAdminAction::VacuumFreeze),
+    ]);
+    run(&cluster, &program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let next = cluster.next_xid();
+    assert!(
+        next > EPOCH,
+        "the run crossed the epoch boundary: next xid {next}"
+    );
 }
