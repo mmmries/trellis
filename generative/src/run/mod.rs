@@ -24,6 +24,7 @@ mod held_keys;
 pub mod judge;
 mod noise;
 mod pause;
+pub mod privilege;
 mod restore;
 mod source_ddl;
 mod two_instance;
@@ -248,6 +249,8 @@ pub enum RunError {
         op_index: usize,
         expected: OpOutcome,
         actual: OpOutcome,
+        /// The statement's error, when it failed.
+        error: Option<String>,
     },
     /// A definition was `paused` at a settled check in a run that never
     /// expects one (the allowlist is `pause::allowance`). `message` is one
@@ -379,6 +382,14 @@ pub enum RunError {
     SourceDdl {
         op_index: usize,
         event: Box<crate::model::SourceDdlEvent>,
+        error: String,
+    },
+    /// Op `op_index`'s application statement failed with an error raised
+    /// inside one of Trellis's capture functions: capture failed a writer
+    /// (ADR-0002 I6, #2182). Checked whatever the op was expected to do, so
+    /// an op expected to fail can't hide it.
+    CaptureFailedWriter {
+        op_index: usize,
         error: String,
     },
 }
@@ -530,11 +541,17 @@ async fn apply_and_check_outcome<B: Backend>(
 /// `op` returned: an `Err` is a rejected statement ([`OpOutcome::Fails`]),
 /// `Ok(0)` a source no-op. Shared with the concurrent runner, whose lanes
 /// apply on their own connections.
-fn check_op_outcome<E>(
+fn check_op_outcome<E: std::fmt::Debug>(
     op_index: usize,
     op: &Op,
     apply_result: &Result<u64, E>,
 ) -> Result<(), RunError> {
+    if let Err(error) = apply_result {
+        let error = format!("{error:?}");
+        if raised_in_capture(&error) {
+            return Err(RunError::CaptureFailedWriter { op_index, error });
+        }
+    }
     let actual = match apply_result {
         Err(_) => OpOutcome::Fails,
         Ok(0) => OpOutcome::AffectsNoRows,
@@ -546,9 +563,30 @@ fn check_op_outcome<E>(
             op_index,
             expected: expected.clone(),
             actual,
+            error: apply_result.as_ref().err().map(|e| format!("{e:?}")),
         });
     }
     Ok(())
+}
+
+/// Whether an error's text (a database error's `Debug`, which carries its
+/// `where` context) says it was raised inside a Trellis capture function:
+/// a PL/pgSQL frame of a function named `cap_<event>_…` in any schema.
+pub fn raised_in_capture(error: &str) -> bool {
+    error.match_indices("function ").any(|(at, _)| {
+        let name = error[at + "function ".len()..]
+            .split(|c: char| c == '(' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        let bare = name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .trim_matches('"');
+        ["insert", "update", "delete", "truncate", "begin"]
+            .iter()
+            .any(|event| bare.starts_with(&format!("cap_{event}_")))
+    })
 }
 
 /// Quiesces, snapshots, and runs the oracle check against `defs`,
@@ -862,8 +900,31 @@ pub fn source_table(
 
 #[cfg(test)]
 mod tests {
-    use super::{DefinitionState, Divergence, OracleReport, Outcome, bursts, status_lies};
+    use super::{
+        DefinitionState, Divergence, OracleReport, Outcome, bursts, raised_in_capture, status_lies,
+    };
     use crate::model::{Op, OpOutcome, PartitionAction, PartitionStrategy, Program};
+
+    /// #2154's error: the capture function's frame in the `where` context
+    /// marks it, in any schema and quoted or not; an application's own
+    /// trigger function doesn't.
+    #[test]
+    fn a_capture_function_frame_marks_an_error_raised_in_capture() {
+        assert!(raised_in_capture(
+            "Db(Error { kind: Db, cause: Some(DbError { message: \"permission denied for table s\", \
+             where_: Some(\"SQL statement ...\\nPL/pgSQL function trellis.cap_insert_s_0123456789abcdef() \
+             line 88 at SQL statement\") }) })"
+        ));
+        assert!(raised_in_capture(
+            "PL/pgSQL function \"inst_b\".\"cap_update_t_0123\"() line 3"
+        ));
+        assert!(!raised_in_capture(
+            "PL/pgSQL function public.wire_rewrite_t() line 2 at SQL statement"
+        ));
+        assert!(!raised_in_capture(
+            "duplicate key value violates unique constraint"
+        ));
+    }
 
     /// A one-table program partitioned by `strategy`, its ops replaced by
     /// `ops`.

@@ -1,10 +1,12 @@
-//! Source-DDL plans for a program (#2184): which [`SourceDdl`] fires after
-//! which op, on which table, with how many ops in flight around it.
+//! Source-DDL plans for a program (#2184), and privilege-change plans
+//! (#2182): which [`SourceDdl`] fires after which op, on which table, with
+//! how many ops in flight around it.
 
 use proptest::prelude::*;
 use trellis::dev::defs::ast::{KeySpace, ValueType};
 
-use crate::model::{Program, SourceDdl, SourceDdlEvent, SourceDdlPlan};
+use super::wiring::with_wiring;
+use crate::model::{ConcurrentPlan, Program, SourceDdl, SourceDdlEvent, SourceDdlPlan};
 
 /// The most events one plan draws.
 pub const MAX_SOURCE_DDL_EVENTS: usize = 2;
@@ -24,20 +26,47 @@ type Draw = (u16, u8, usize, usize, usize, bool);
 /// primary key. Draws that don't fit (an event past the last op, or one
 /// inside the previous one's window) are dropped, so a plan can be empty.
 pub fn source_ddl_plan_for(program: &Program) -> impl Strategy<Value = SourceDdlPlan> + use<> {
+    plan_for(program, Menu::Maintenance)
+}
+
+/// [`source_ddl_plan_for`]'s privilege and ownership changes
+/// ([`SourceDdl::privilege`]) in place of its schema and maintenance ones.
+/// A drain refusal names a target reading the event's table.
+pub fn privilege_plan_for(program: &Program) -> impl Strategy<Value = SourceDdlPlan> + use<> {
+    plan_for(program, Menu::Privilege)
+}
+
+/// Which actions a plan draws from.
+#[derive(Debug, Clone, Copy)]
+enum Menu {
+    Maintenance,
+    Privilege,
+}
+
+impl Menu {
+    fn actions(self) -> u8 {
+        match self {
+            Menu::Maintenance => 7,
+            Menu::Privilege => 9,
+        }
+    }
+}
+
+fn plan_for(program: &Program, menu: Menu) -> impl Strategy<Value = SourceDdlPlan> + use<> {
     let program = program.clone();
     let draw = (
         any::<u16>(),
-        0u8..7,
+        0u8..menu.actions(),
         any::<usize>(),
         any::<usize>(),
         0..=MAX_SOURCE_DDL_WINDOW,
         any::<bool>(),
     );
     prop::collection::vec(draw, 0..=MAX_SOURCE_DDL_EVENTS)
-        .prop_map(move |draws| fit(&program, &draws))
+        .prop_map(move |draws| fit(&program, &draws, menu))
 }
 
-fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
+fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
     let ops = program.ops.len();
     let mut events: Vec<SourceDdlEvent> = Vec::new();
     let mut placed: Vec<(usize, &Draw)> = draws
@@ -50,6 +79,17 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
         })
         .collect();
     placed.sort_by_key(|(op, _)| *op);
+    // The tables a wiring's foreign key references (#2181): the wiring is
+    // a function of the program.
+    let wiring = match menu {
+        Menu::Privilege => with_wiring(ConcurrentPlan::default(), program).wiring,
+        Menu::Maintenance => Vec::new(),
+    };
+    let referenced: Vec<&str> = wiring
+        .iter()
+        .filter(|w| w.shadow.as_ref().is_some_and(|s| s.fk.is_some()))
+        .map(|w| w.table.as_str())
+        .collect();
     for (op, &(_, action, table, pick, window, pass_inside)) in placed {
         // Only a table a definition reads is a tracked source: the others
         // have no capture to disrupt.
@@ -72,17 +112,34 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
             .map(|c| c.name.as_str())
             .collect();
         let column = (!numeric.is_empty()).then(|| numeric[pick % numeric.len()].to_string());
-        let action = match (action, column) {
-            (0, _) => SourceDdl::VacuumFull,
-            (1, _) => SourceDdl::Cluster,
-            // The column pick's parity: drawn apart from the pass.
-            (2, _) => SourceDdl::Reindex {
-                concurrently: pick % 2 == 1,
+        let readers: Vec<&str> = program
+            .defs
+            .iter()
+            .filter(|d| d.source == table.name)
+            .map(|d| d.target.as_str())
+            .collect();
+        let target = readers[pick % readers.len()].to_string();
+        let action = match menu {
+            Menu::Maintenance => maintenance(action, column, pick),
+            Menu::Privilege => privilege(action, target),
+        };
+        let action = match action {
+            // #2227: row-level security hiding rows from capture's re-read
+            // inside one interval leaves a target wrong. Drop this with the
+            // fix.
+            SourceDdl::Rls {
+                trellis_policy: false,
+            } if !pass_inside => SourceDdl::Rls {
+                trellis_policy: true,
             },
-            (3, Some(column)) => SourceDdl::RewriteColumn { column },
-            (4, Some(column)) => SourceDdl::RewriteBesideDefault { column },
-            (3 | 4, None) => SourceDdl::VacuumFull,
-            _ => SourceDdl::DisableCaptureTriggers,
+            // A foreign key's check reads the referenced table as its owner,
+            // so taking the owner's `SELECT` or `USAGE` fails the
+            // application's write in Postgres itself.
+            SourceDdl::RevokeSelect if referenced.contains(&table.name.as_str()) => {
+                SourceDdl::OwnerToOther
+            }
+            SourceDdl::RevokeSchemaUsage if !referenced.is_empty() => SourceDdl::OwnerToOther,
+            action => action,
         };
         let window = window.min(ops - 1 - op);
         let event = SourceDdlEvent {
@@ -98,6 +155,41 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
         events.push(event);
     }
     SourceDdlPlan { events }
+}
+
+/// The maintenance action `action` names, on `column` where it takes one.
+fn maintenance(action: u8, column: Option<String>, pick: usize) -> SourceDdl {
+    match (action, column) {
+        (0, _) => SourceDdl::VacuumFull,
+        (1, _) => SourceDdl::Cluster,
+        // The column pick's parity: drawn apart from the pass.
+        (2, _) => SourceDdl::Reindex {
+            concurrently: pick % 2 == 1,
+        },
+        (3, Some(column)) => SourceDdl::RewriteColumn { column },
+        (4, Some(column)) => SourceDdl::RewriteBesideDefault { column },
+        (3 | 4, None) => SourceDdl::VacuumFull,
+        _ => SourceDdl::DisableCaptureTriggers,
+    }
+}
+
+/// The privilege change `action` names, a drain refusal on `target`.
+fn privilege(action: u8, target: String) -> SourceDdl {
+    match action {
+        0 => SourceDdl::OwnerToHeir,
+        1 => SourceDdl::OwnerToOther,
+        2 => SourceDdl::RevokeSelect,
+        3 => SourceDdl::RevokeSchemaUsage,
+        4 => SourceDdl::Rls {
+            trellis_policy: false,
+        },
+        5 => SourceDdl::Rls {
+            trellis_policy: true,
+        },
+        6 => SourceDdl::WriterChange,
+        7 => SourceDdl::RevokeTargetWrites { target },
+        _ => SourceDdl::TargetRls { target },
+    }
 }
 
 /// Whether an aggregate over `table` groups by `column`.

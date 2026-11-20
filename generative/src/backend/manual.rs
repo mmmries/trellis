@@ -568,6 +568,10 @@ pub struct ManualBackend {
     /// would collide for reasons that have nothing to do with instance
     /// isolation.
     target_schema: String,
+    /// Whether the first [`Backend::install`] draws [`Self::target_schema`]
+    /// between `public` and [`super::TARGETS_SCHEMA`]: a backend connected
+    /// as a provisioned case's roles to the default target schema.
+    draw_target_schema: bool,
     /// Where [`Backend::install`] puts a program's source tables.
     source_tables: SourceTables,
     /// The resolved [`Config`] this backend's [`Pool`] and every
@@ -633,7 +637,57 @@ impl ManualBackend {
         .await?;
         backend.app = connect_app(roles).await?;
         backend.roles = roles.clone();
+        backend.draw_target_schema = roles.separate_app() && backend.target_schema == "public";
         Ok(backend)
+    }
+
+    /// Moves the application's session to a login of `dsn`
+    /// ([`super::Roles::writer`], say), or back to [`super::Roles::app`]
+    /// for `None`: the application role changed mid-stream. A backend
+    /// without a separate application role refuses.
+    pub async fn write_as(&mut self, dsn: Option<&str>) -> Result<(), ManualBackendError> {
+        assert!(
+            self.roles.separate_app(),
+            "write_as needs a backend connected with separate roles"
+        );
+        let dsn = dsn.unwrap_or(&self.roles.app).to_string();
+        self.app = Some(super::roles::connect_app_as(&dsn).await?);
+        Ok(())
+    }
+
+    /// Who runs what.
+    pub fn roles(&self) -> &Roles {
+        &self.roles
+    }
+
+    /// The schema this backend's targets are created in.
+    pub fn target_schema(&self) -> &str {
+        &self.target_schema
+    }
+
+    /// The first install's draw (`docs/recommendations.md`, "One Trellis
+    /// role"): targets in [`super::TARGETS_SCHEMA`], which Trellis owns,
+    /// for half the programs, by the program's digest so a seed replays
+    /// it. A program with a definition reading another's target keeps
+    /// `public`: its bare source names resolve there.
+    fn draw_target_schema(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        if !std::mem::take(&mut self.draw_target_schema) {
+            return Ok(());
+        }
+        let chained = program
+            .defs
+            .iter()
+            .any(|d| !program.tables.iter().any(|t| t.name == d.source));
+        if chained || crate::generate::where_clause::digest(program) & 1 == 0 {
+            return Ok(());
+        }
+        self.target_schema = super::TARGETS_SCHEMA.to_string();
+        self.config = self
+            .config
+            .clone()
+            .with_target_schema(self.target_schema.clone())?;
+        self.pool = Pool::new(&self.config)?;
+        Ok(())
     }
 
     /// Like [`ManualBackend::connect`], but starts the underlying
@@ -754,6 +808,7 @@ impl ManualBackend {
             strict_audit: false,
             strict_audits_converged: 0,
             target_schema,
+            draw_target_schema: false,
             source_tables: SourceTables::Own,
             config,
             operator: None,
@@ -1565,6 +1620,9 @@ impl super::Backend for ManualBackend {
     type Error = ManualBackendError;
 
     async fn install(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        if self.engine_client.is_none() && self.defs.is_empty() {
+            self.draw_target_schema(program)?;
+        }
         for table in &program.tables {
             if self.source_tables != SourceTables::SharedExisting {
                 self.create_source_table(table).await?;

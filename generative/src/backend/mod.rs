@@ -24,7 +24,10 @@ pub use manual::{
     SERVER_STOP_RECLAIM_TTL, SHUTDOWN_TIMEOUT, SourceTables, activity_summary, activity_summary_on,
     await_pool_usable,
 };
-pub use roles::{APP_ROLE, CaseDatabase, Roles, TRELLIS_ROLE, as_role};
+pub use roles::{
+    APP_ROLE, CaseDatabase, HEIR_ROLE, OTHER_OWNER_ROLE, Roles, TARGETS_SCHEMA, TRELLIS_ROLE,
+    WRITER_ROLE, as_role,
+};
 pub use sql::HeldKeys;
 pub use subprocess::{
     REACH_FILE_ENV, SubprocessBackend, SubprocessBackendError, reach_request, write_reach,

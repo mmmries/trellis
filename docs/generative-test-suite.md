@@ -129,7 +129,11 @@ so an assumption only a superuser satisfies fails the run.
 - `app_owner` creates the sources in `public`, so it owns them, and makes
   every write;
 - the bootstrap superuser runs only `CHECKPOINT` and `VACUUM FREEZE`
-  (`execute_admin`), and the cluster-wide xid aging.
+  (`execute_admin`), the cluster-wide xid aging, and the privilege tier's
+  grants and owner changes (§7).
+
+Targets go in `public` or in `trellis_targets`, which `trellis_runner` owns,
+drawn from the program's digest at the first install.
 
 Every convergence property runs this way, the self-check tampering
 properties (their tampering writes as the Trellis role, which owns the
@@ -1148,6 +1152,18 @@ The actions, cheapest-first (every one below is built):
    and the entry's repair fixes. Anything else fails, so the register is a
    checked allowlist: a missing entry fails, and so does one whose detection
    or repair doesn't hold.
+
+8. **Privilege and ownership changes** (bucket 3) — `REVOKE`/`GRANT` of
+   Trellis's `SELECT` or its schema's `USAGE`, an owner Trellis does or
+   doesn't inherit, row-level security on a source with and without a policy
+   for its role, the application role changed, and the drain's writes to a
+   target refused: `SourceDdl::privilege`, drawn by
+   `generate::source_ddl::privilege_plan_for`, swept by `tests/privileges.rs`,
+   on the source-DDL runner and judge. A change the application's writes
+   can't make as the owner moves them to `app_writer`, a login holding
+   grants on the sources and nothing Trellis inherits. Every run fails on an
+   application statement that fails inside a capture function
+   (`RunError::CaptureFailedWriter`, ADR-0002 I6).
 
 Two structural notes for when faults enter the stream:
 

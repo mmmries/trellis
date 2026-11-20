@@ -141,6 +141,7 @@ impl<B: Backend> InstanceRun<'_, B> {
                 op_index,
                 expected: expected.clone(),
                 actual,
+                error: None,
             }));
         }
         Ok(())

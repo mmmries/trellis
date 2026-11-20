@@ -1,5 +1,7 @@
 //! Source DDL in the op stream (#2184, `docs/generative-test-suite.md` §7,
-//! bucket 3), judged by "never silently wrong" ([`super::judge`]).
+//! bucket 3), judged by "never silently wrong" ([`super::judge`]), and the
+//! privilege and ownership changes run the same way (#2182,
+//! [`super::privilege`]).
 //!
 //! The engine runs with a reconcile interval too long to fire during a
 //! case, and the run steps the passes itself ([`PassStepper`]): an event's
@@ -20,6 +22,7 @@ use crate::gaps::Gap;
 use crate::model::{Program, SourceDdl, SourceDdlEvent, SourceDdlPlan};
 
 use super::judge::{Judged, PassStepper, judge};
+use super::privilege::{self, RefusalSeen};
 use super::{Outcome, RunError, apply_and_check_outcome};
 
 /// The engine's reconcile interval in this tier: longer than any case, so
@@ -31,6 +34,12 @@ const NO_PASS_DURING_A_CASE: Duration = Duration::from_secs(3600);
 #[derive(Debug, Clone, Default)]
 pub struct SourceDdlRun {
     pub checks: Vec<(Option<SourceDdlEvent>, Vec<Judged>)>,
+    /// What the drain did on each drain refusal's target while it lasted
+    /// ([`SourceDdl::refused_target`]).
+    pub refusals: Vec<(SourceDdlEvent, RefusalSeen)>,
+    /// The reconcile passes stepped inside a privilege change that failed,
+    /// with their errors: the engine's own loop logs one and runs the next.
+    pub refused_passes: Vec<(SourceDdlEvent, String)>,
 }
 
 impl SourceDdlRun {
@@ -105,17 +114,52 @@ pub async fn run_convergence_with_source_ddl_allowing(
                 event: Box::new(event.clone()),
                 error,
             };
-            let statements = Statements::resolve(&passes, program, event)
+            let statements = Statements::resolve(&passes, backend, program, event)
                 .await
                 .map_err(fired)?;
             execute(backend, &statements.opens).await.map_err(fired)?;
+            let writer = event.action.writes_as_writer();
+            if writer {
+                let dsn = backend.roles().writer();
+                backend
+                    .write_as(Some(&dsn))
+                    .await
+                    .map_err(|e| fired(format!("write as {dsn}: {e:?}")))?;
+            }
             if event.pass_inside {
-                passes.step().await.map_err(fired)?;
+                match passes.step().await {
+                    Ok(()) => {}
+                    // A pass refused what the change took away fails as
+                    // the engine's own loop's would; the judged check's
+                    // passes, after the close, must not.
+                    Err(error) if event.action.privilege() => {
+                        run.refused_passes.push((event.clone(), error));
+                    }
+                    Err(error) => return Err(fired(error)),
+                }
             }
             for window_op in op_index + 1..=event.last_op() {
                 apply_and_check_outcome(backend, window_op, &program.ops[window_op], false).await?;
             }
+            if let Some(target) = event.action.refused_target() {
+                let seen =
+                    privilege::observe_refusal(backend, target)
+                        .await
+                        .map_err(|problem| RunError::NeverSilentlyWrong {
+                            op_index: event.last_op(),
+                            target: target.to_string(),
+                            problem,
+                            detail: format!("{event:?}"),
+                        })?;
+                run.refusals.push((event.clone(), seen));
+            }
             execute(backend, &statements.closes).await.map_err(fired)?;
+            if writer {
+                backend
+                    .write_as(None)
+                    .await
+                    .map_err(|e| fired(format!("write as the application again: {e:?}")))?;
+            }
             op_index = event.last_op();
         }
         let gaps = event.map(&allowed).unwrap_or_default();
@@ -154,10 +198,19 @@ struct Statements {
 impl Statements {
     async fn resolve(
         passes: &PassStepper,
+        backend: &ManualBackend,
         program: &Program,
         event: &SourceDdlEvent,
     ) -> Result<Self, String> {
         let table = format!("public.{}", quote(&event.table));
+        if event.action.privilege() {
+            let target = event
+                .action
+                .refused_target()
+                .map(|target| backend.qualified_target(target));
+            let (opens, closes) = privilege::statements(&event.action, &table, target.as_deref());
+            return Ok(Self { opens, closes });
+        }
         let rewrite = |column: &str, ty: &str| {
             let column = quote(column);
             format!("ALTER TABLE {table} ALTER COLUMN {column} TYPE {ty} USING {column} + 1")
@@ -220,6 +273,7 @@ impl Statements {
                 };
                 (alter("DISABLE"), alter("ENABLE ALWAYS"))
             }
+            other => unreachable!("{other:?} is a privilege change"),
         };
         debug_assert!(program.tables.iter().any(|t| t.name == event.table));
         Ok(Self { opens, closes })
