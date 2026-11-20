@@ -75,7 +75,7 @@ prints on failure:
 
 ```
 Program {
-  tables:      [ { name, pk_col, columns: [{name, type}] } ]
+  tables:      [ { name, pk_col, columns: [{name, type}], source_key } ]
   defs:        [ TransformDef ]         // reuses trellis::defs::ast, see §2
   ops:         [ Insert{table,row} | Update{table,pk,changes} | Delete{table,pk} ]
 }
@@ -84,7 +84,9 @@ Program {
 Use small fixed name pools (`t0`, `d0`, `c0`): a shrunk counterexample you can
 read at a glance beats one that is technically smaller. Give every table its PK
 column **unconditionally**, so no shrink step can strand a definition referencing
-it.
+it. A table read through a `KEY (...)` (`source_key`, ADR-0026) keeps `pk_col` as
+the column ops address rows by, as its primary key or a plain `NOT NULL UNIQUE`
+column.
 
 `defs` reuses `trellis::defs::ast::TransformDef` directly — 1-1 definitions
 (including numeric `+`), `GROUP BY` aggregates, and two-table `JOIN … GROUP BY`
@@ -753,6 +755,21 @@ beside them run on every `cargo test`.
   race and several workers drain them. Every definition over the hot table
   groups by the grain, and the variant draws no partition maintenance,
   which would put the hot table in one lane.
+- **Source-key convergence** *(ADR-0026, `generate::source_key`)*. One
+  program in four that the convergence property and the concurrent backend's
+  property draw reads its first definition's source through a `KEY (...)`:
+  one or two `text` key columns, each `NOT NULL` or nullable under a `NULLS
+  NOT DISTINCT` index, with the table's primary key kept beside it or
+  dropped. Every 1-1 and `GROUP BY` definition over the table names the key.
+  Inserts write keys of `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and
+  `chr(31)`; updates move rows between keys, onto and off the `NULL` key. A
+  model of the live keys expects a write onto a taken key to fail. The oracle
+  keys a 1-1 target by its key columns, with a `NULL` part apart from `''`.
+  The concurrent tier keeps a keyed table's writes in one lane, since two
+  rows can collide on its key. The `source_keys` coverage line counts each
+  variant. Its sweep tier (`GENERATIVE_PLANT_TIER=source_key`, a nullable key
+  in every case) gates `null_key_as_empty`, #2126's capture rendering
+  restored, which it catches in about one case in two.
 
 ### Two runtimes, one oracle
 
@@ -852,7 +869,7 @@ once per planted bug, and judges each plant only on cases the baseline passed.
 only with **zero failures outside the quarantine list**,
 `generative/baseline-quarantine.txt`. The rule is the same for every tier
 (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
-`min_max`, `join`, `join_one_to_one`, `join_star`, `join_chained`,
+`min_max`, `source_key`, `join`, `join_one_to_one`, `join_star`, `join_chained`,
 `extremes_tamper`, `held_keys`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.

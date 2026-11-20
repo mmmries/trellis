@@ -167,8 +167,12 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         Predicate::True => String::new(),
         Predicate::Filter(expr) => format!(" WHERE ({})", render_expr(expr)),
     };
+    let key = match &def.source_key {
+        Some(columns) => format!(" KEY ({})", columns.join(", ")),
+        None => String::new(),
+    };
     format!(
-        "TRANSFORM {} FROM {}{key_space_clause}{opt_out} SELECT {}{filter}",
+        "TRANSFORM {} FROM {}{key}{key_space_clause}{opt_out} SELECT {}{filter}",
         def.target,
         def.source,
         fields.join(", ")
@@ -417,14 +421,21 @@ pub(super) async fn create_source_table(
         }
         sql.push_str(&quote_ident(&column.name));
         sql.push(' ');
+        sql.push_str(&column_ddl_type(column.value_type));
         if column.name == table.pk_col {
-            sql.push_str(&column_ddl_type(column.value_type));
-            sql.push_str(" primary key");
-        } else {
-            sql.push_str(&column_ddl_type(column.value_type));
-            if table.unique_cols.iter().any(|c| c == &column.name) {
-                sql.push_str(" unique");
-            }
+            // A table read through a `KEY (...)` without a primary key
+            // still names each row by `pk_col`.
+            sql.push_str(match &table.source_key {
+                Some(key) if !key.primary_key => " not null unique",
+                _ => " primary key",
+            });
+        } else if table.unique_cols.iter().any(|c| c == &column.name) {
+            sql.push_str(" unique");
+        } else if let Some(key) = &table.source_key
+            && key.columns.contains(&column.name)
+            && !key.is_nullable(&column.name)
+        {
+            sql.push_str(" not null");
         }
     }
     for set in &table.unique_sets {
@@ -438,6 +449,21 @@ pub(super) async fn create_source_table(
         sql.push(')');
     }
     sql.push(')');
+    if let Some(key) = &table.source_key {
+        sql.push_str(&format!(
+            "; create unique index on {name} ({}){}",
+            key.columns
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if key.nullable.is_empty() {
+                ""
+            } else {
+                " nulls not distinct"
+            }
+        ));
+    }
     raw.batch_execute(&sql).await?;
     Ok(())
 }
@@ -908,6 +934,38 @@ pub(super) async fn read_table(
     Ok(result)
 }
 
+/// Reads a 1-1 target over a `KEY (...)` source (ADR-0026) back as text,
+/// each row keyed by its `key` columns' [`crate::model::source_key_text`],
+/// with `fields` as its columns.
+pub(super) async fn read_keyed_table(
+    client: &tokio_postgres::Client,
+    qualified_table: &str,
+    key: &[String],
+    fields: &[FieldDef],
+) -> Result<
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>,
+    tokio_postgres::Error,
+> {
+    let select_list: Vec<String> = key
+        .iter()
+        .map(|c| c.as_str())
+        .chain(fields.iter().map(|f| f.name.as_str()))
+        .map(|c| format!("{}::text", quote_ident(c)))
+        .collect();
+    let sql = format!("select {} from {qualified_table}", select_list.join(", "));
+    let mut result = std::collections::BTreeMap::new();
+    for row in client.query(&sql, &[]).await? {
+        let parts: Vec<Option<String>> = (0..key.len()).map(|i| row.get(i)).collect();
+        let by_column = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), row.get(key.len() + i)))
+            .collect();
+        result.insert(crate::model::source_key_text(&parts), by_column);
+    }
+    Ok(result)
+}
+
 /// Reads an `Aggregate` key-space target table back as text, keyed by the
 /// same composite [`crate::model::group_key`] convention the SQL
 /// oracles use — see `ManualBackend`'s former doc comment (git history) for
@@ -1368,6 +1426,7 @@ mod tests {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         };
         let ddl = |strategy| {
             partitioned_source_ddl(

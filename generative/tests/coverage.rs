@@ -1816,3 +1816,83 @@ fn every_drawn_where_round_trips_and_is_admitted() {
         "only {filtered} drawn definitions have a WHERE"
     );
 }
+
+/// #2171: the convergence properties' draw reads a source through a
+/// `KEY (...)` in about a quarter of its programs, and across them draws
+/// every key shape, key space, key value class and key move the dimension
+/// exists for (`generative::generate::source_key`).
+#[test]
+fn the_convergence_draw_covers_every_source_key_variant() {
+    use generative::generate::source_key::{drawn, trivial_or_keyed_program};
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_or_keyed_program();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut keyed = 0;
+    for _ in 0..1000 {
+        let program = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let names = drawn(&program);
+        keyed += usize::from(!names.is_empty());
+        seen.extend(names);
+    }
+    assert!((150..=350).contains(&keyed), "{keyed} of 1000 keyed");
+    for name in [
+        "single",
+        "composite",
+        "not_null",
+        "nullable",
+        "primary_key",
+        "no_primary_key",
+        "one_to_one",
+        "aggregate",
+        "value_null",
+        "value_empty",
+        "value_chr1",
+        "value_doubledchr1",
+        "value_separator",
+        "value_plain",
+        "twins",
+        "move",
+        "move_to_null",
+        "move_from_null",
+        "collision",
+    ] {
+        assert!(seen.contains(name), "never drew {name}: {seen:?}");
+    }
+}
+
+/// #2171: the `source_key` sweep tier's cases always read a source through
+/// a nullable `KEY (...)`, so its plant (`null_key_as_empty`) can fire in
+/// every case, and keep that table's writes in one lane.
+#[test]
+fn the_source_key_tier_always_draws_a_nullable_key_in_one_lane() {
+    use generative::generate::source_key::keyed_case;
+    let mut runner = TestRunner::deterministic();
+    let strategy = keyed_case();
+    for _ in 0..200 {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let table = case
+            .program
+            .tables
+            .iter()
+            .find(|t| t.source_key.is_some())
+            .expect("a keyed table");
+        assert!(!table.source_key.as_ref().unwrap().nullable.is_empty());
+        for burst in &case.plan.bursts {
+            let lanes = burst
+                .lanes
+                .iter()
+                .filter(|lane| {
+                    lane.iter()
+                        .any(|&i| case.program.ops[i].table() == table.name)
+                })
+                .count();
+            assert!(lanes <= 1, "{:?}", case.plan);
+        }
+    }
+}

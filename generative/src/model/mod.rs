@@ -42,6 +42,33 @@ pub struct Table {
     /// (`unique_cols` is empty): Postgres requires every unique index on a
     /// partitioned table to hold the partition key.
     pub partitioning: Option<Partitioning>,
+    /// The unique index a `KEY (...)` reads the table by (ADR-0026), or
+    /// `None` for a table every definition reads by its primary key.
+    pub source_key: Option<SourceKey>,
+}
+
+/// A source [`Table`]'s `KEY (...)` (ADR-0026): the unique index every
+/// definition over the table names in its `KEY (...)`, its columns' `NULL`
+/// rule, and whether the table keeps a primary key beside it.
+///
+/// `pk_col` still names every row (ops address rows by it): without a
+/// primary key it is `NOT NULL UNIQUE`, an index no definition reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceKey {
+    /// The key's columns in index order, each a `Text` column of the table.
+    pub columns: Vec<String>,
+    /// The key columns that can hold `NULL`; the rest are `NOT NULL`. When
+    /// any can, the index is `NULLS NOT DISTINCT`.
+    pub nullable: Vec<String>,
+    /// Whether `pk_col` is the table's primary key.
+    pub primary_key: bool,
+}
+
+impl SourceKey {
+    /// Whether `column` is a key column that can hold `NULL`.
+    pub fn is_nullable(&self, column: &str) -> bool {
+        self.nullable.iter().any(|c| c == column)
+    }
 }
 
 /// A partitioned [`Table`]'s single level: the column it is partitioned by,
@@ -111,6 +138,7 @@ impl Table {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         }
     }
 
@@ -718,6 +746,20 @@ pub fn group_key(values: &[Option<String>]) -> String {
         .iter()
         .map(|v| v.clone().unwrap_or_default())
         .map(|v| format!("{}:{v}", v.len()))
+        .collect()
+}
+
+/// The text a `KEY (...)` row is keyed by on both sides of a comparison:
+/// each part length-prefixed like [`group_key`]'s, but a `NULL` part is `-`,
+/// which no prefixed part starts with, so a `NULL` part never stands for
+/// `''` (the #2126 shape).
+pub fn source_key_text(values: &[Option<String>]) -> String {
+    values
+        .iter()
+        .map(|v| match v {
+            None => "-".to_string(),
+            Some(v) => format!("{}:{v}", v.len()),
+        })
         .collect()
 }
 

@@ -15,7 +15,8 @@
 //! # The properties
 //!
 //! [`property_convergence_holds_under_the_concurrent_backend`] is the
-//! original tier: `trivial_program`'s small programs, applied **in the
+//! original tier: `trivial_program`'s small programs (one in four read
+//! through a `KEY (...)`, `generate::source_key`), applied **in the
 //! exact order `Program::ops` generated them**, one at a time from one
 //! harness task, with only the quiesce points changed (the burst-batching
 //! knob below). Its programs never come near the engine's split threshold.
@@ -266,12 +267,13 @@ use generative::backend::{
 };
 use generative::baseline_quarantine;
 use generative::generate::min_max::{self, min_max_case};
+use generative::generate::source_key::{keyed_case, trivial_or_keyed_program};
 use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
     cooling_backfill_case, cooling_key_case, defer_def_install, hot_key_case, mid_burst_case,
     partitioned_hot_key_case, partitioned_program, schedule_restart, schedule_scale_out,
-    steady_load_case, trivial_program,
+    steady_load_case,
 };
 use generative::plant_sweep::{self, PLANT_CHILD_ENV, PLANT_TIER_ENV, SweepTier};
 use generative::run::{
@@ -625,7 +627,7 @@ proptest! {
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_under_the_concurrent_backend(
-        program in trivial_program(),
+        program in trivial_or_keyed_program(),
         burst_size in burst_size(),
     ) {
         run_one(&program, burst_size)?;
@@ -1258,6 +1260,7 @@ fn pin_table(
         unique_cols: unique.iter().map(|c| c.to_string()).collect(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     }
 }
 
@@ -1904,6 +1907,10 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
         .chain(not_on_path(&[PlantPath::OneToOneJoin], NO_ONE_TO_ONE_JOIN))
         .chain(not_on_path(&[PlantPath::Chain], NO_CHAIN))
         .chain(not_on_path(
+            &[PlantPath::SourceKey],
+            plant_sweep::NO_SOURCE_KEY,
+        ))
+        .chain(not_on_path(
             &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
             plant_sweep::NO_EXTREMES,
         ))
@@ -1981,11 +1988,30 @@ fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
             PlantPath::Join,
             PlantPath::OneToOneJoin,
             PlantPath::Chain,
+            PlantPath::SourceKey,
         ],
         "the min_max tier gates the MIN/MAX extremes' plants; the plant's own path is \
          gated by the tier its comment names",
     ));
     out
+}
+
+/// The `source_key` tier's `not_gated` (#2171): every plant but the
+/// source-key path's ([`generative::plant_sweep::PlantPath::SourceKey`]),
+/// which the tiers whose programs take their paths gate.
+fn source_key_not_gated() -> Vec<(&'static str, &'static str)> {
+    use generative::plant_sweep::{PlantPath, plant_path};
+    trellis::dev::plant::Plant::ALL
+        .iter()
+        .filter(|plant| plant_path(**plant) != PlantPath::SourceKey)
+        .map(|plant| {
+            (
+                plant.name(),
+                "the source_key tier gates capture's key for a source read through a \
+                 nullable KEY (...); the plant's own path is gated by the tier its comment names",
+            )
+        })
+        .collect()
 }
 
 /// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
@@ -2070,6 +2096,14 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
                 not_gated: min_max_not_gated(),
             },
             min_max_case(true).boxed(),
+        ),
+        "source_key" => (
+            SweepTier {
+                name: "source_key",
+                known_misses: &[],
+                not_gated: source_key_not_gated(),
+            },
+            keyed_case().boxed(),
         ),
         _ => return None,
     })

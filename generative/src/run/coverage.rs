@@ -121,6 +121,9 @@ pub struct Coverage {
     /// `"middle_default"`, `"attach_middle"`, `"detach_middle"`,
     /// `"drop_middle"`, `"middle_leaf_write"`).
     pub partition_ops: HashMap<&'static str, usize>,
+    /// How many recorded programs read a source through a `KEY (...)` and
+    /// draw each variant [`crate::generate::source_key::drawn`] names.
+    pub source_keys: std::collections::BTreeMap<String, usize>,
     /// Bursts recorded by [`Coverage::record_concurrent_plan`].
     pub concurrent_bursts: usize,
     /// How many recorded concurrent-tier cases contain at least one burst of
@@ -168,6 +171,9 @@ impl Coverage {
     pub fn record_program(&mut self, program: &Program) {
         self.cases += 1;
 
+        for name in crate::generate::source_key::drawn(program) {
+            *self.source_keys.entry(name).or_insert(0) += 1;
+        }
         for name in crate::generate::partition::tree_change_names(program) {
             *self.partition_ops.entry(name).or_insert(0) += 1;
         }
@@ -1233,6 +1239,12 @@ impl fmt::Display for Coverage {
         writeln!(f)?;
         write!(f, "partition_ops:")?;
         for (name, count) in sorted_counts(&self.partition_ops) {
+            write!(f, " {name}={count}")?;
+        }
+        writeln!(f)?;
+
+        write!(f, "source_keys:")?;
+        for (name, count) in &self.source_keys {
             write!(f, " {name}={count}")?;
         }
         writeln!(f)?;
