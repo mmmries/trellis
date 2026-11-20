@@ -125,13 +125,13 @@ so an assumption only a superuser satisfies fails the run.
   every write;
 - the bootstrap superuser runs only `CHECKPOINT` (`execute_admin`).
 
-Every convergence property runs this way, and so do the subprocess crash
-pins; `tests/backend_seam.rs` pins the owners and each session's role.
-`connect` runs everything as the superuser. Hand-built pins outside a
-property's runner still use it, and so do two property families:
-`self_check_cross_check.rs`, whose tampering writes targets no application
-may write, and `two_instance_noise.rs`, whose instances keep same-named
-sources in their own catalog schemas.
+Every convergence property runs this way, the self-check tampering
+properties (their tampering writes as the Trellis role, which owns the
+targets) and the subprocess crash pins too; `tests/backend_seam.rs` pins the
+owners and each session's role. `connect` runs everything as the superuser.
+Hand-built pins outside a property's runner still use it, and so does
+`two_instance_noise.rs`, whose instances keep same-named sources in their own
+catalog schemas.
 
 ## 2. The oracle is Postgres itself
 

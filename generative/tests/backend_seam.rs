@@ -9,10 +9,13 @@ use generative::backend::{
     APP_ROLE, Backend, CaseDatabase, ManualBackend, SEAL_ON_DEMAND_INTERVAL, TRELLIS_ROLE,
 };
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
+use generative::run::run_convergence;
 use testkit::TestCluster;
+use trellis::Config;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
+use trellis::dev::pool::Pool;
 
 #[tokio::test]
 async fn installs_a_trivial_def_and_converges_dml_to_the_expected_snapshot() {
@@ -326,7 +329,9 @@ async fn a_straggler_in_a_long_drained_segment_needs_retirement_to_converge() {
 /// A [`CaseDatabase`] runs each role as `docs/recommendations.md` ("Roles
 /// and permissions") sets a deployment up: Trellis as an ordinary role that
 /// owns its schema and targets, the application as the sources' owner, and
-/// no session of the case as the bootstrap superuser.
+/// no session of the case as the bootstrap superuser. It runs the way a
+/// property's runner does: `run_convergence`, with the oracle on a pool of
+/// the Trellis role and a restart mid-program.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provisioned_case_runs_trellis_and_the_application_as_ordinary_roles() {
     let cluster = TestCluster::start();
@@ -355,27 +360,37 @@ async fn a_provisioned_case_runs_trellis_and_the_application_as_ordinary_roles()
         table: source.name.clone(),
         row: vec![
             (source.pk_col.clone(), Some("1".to_string())),
-            (a, Some("7.00".to_string())),
+            (a.clone(), Some("7.00".to_string())),
         ],
+        expect: OpOutcome::Succeeds,
+    };
+    let update = Op::Update {
+        table: source.name.clone(),
+        pk: "1".to_string(),
+        changes: vec![(a, Some("8.00".to_string()))],
         expect: OpOutcome::Succeeds,
     };
     let program = Program {
         tables: vec![source.clone()],
         defs: vec![def],
         def_install_after_op: vec![0],
-        ops: vec![insert.clone()],
-        restart_after_ops: Vec::new(),
+        ops: vec![insert, update],
+        restart_after_ops: vec![0],
         scale_out_after_ops: Vec::new(),
     };
 
     let mut backend = ManualBackend::connect_as(db.roles())
         .await
         .expect("connect manual backend");
-    backend.install(&program).await.expect("install program");
-    backend.apply(&insert).await.expect("apply op");
-    backend.quiesce().await.expect("quiesce");
+    let oracle = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let outcome = run_convergence(&mut backend, &oracle, &program)
+        .await
+        .expect("the program converges");
+    assert!(outcome.as_pass(), "{outcome}");
     let snapshot = backend.snapshot().await.expect("snapshot");
-    assert_eq!(snapshot[&target]["1"]["copy"], Some("7.00".to_string()));
+    assert_eq!(snapshot[&target]["1"]["copy"], Some("8.00".to_string()));
+    // Held open, so the sessions read below include the oracle's.
+    let _oracle_session = oracle.get().await.expect("an oracle session");
 
     let (admin, connection) = tokio_postgres::connect(&db.roles().admin, tokio_postgres::NoTls)
         .await

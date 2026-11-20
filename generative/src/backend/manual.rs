@@ -452,9 +452,12 @@ fn noise_sql_literal(value: &Option<String>) -> String {
 /// installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceTables {
-    /// In the instance's own catalog schema, which is first on the backend's
-    /// `search_path`. The instance's own writes are the only ones the table
-    /// sees, which is what every single-instance run wants.
+    /// Created unqualified, through the application's `search_path`: in
+    /// `public` when the application has a role of its own
+    /// ([`super::Roles`]), else in the instance's own catalog schema, which
+    /// is first on the backend's `search_path`. The instance's own writes
+    /// are the only ones the table sees, which is what every
+    /// single-instance run wants.
     #[default]
     Own,
     /// In `public`, created by this backend. Several instances can read a
@@ -1291,6 +1294,12 @@ impl ManualBackend {
         drop(admin);
         let _ = connection.await;
         Ok(result?)
+    }
+
+    /// The connection string every Trellis connection of this backend logs
+    /// in with ([`super::Roles::trellis`]); an oracle's pool uses it too.
+    pub fn trellis_dsn(&self) -> &str {
+        self.config.dsn()
     }
 
     /// The session application statements run on: the application's own, or

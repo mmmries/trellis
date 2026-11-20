@@ -59,7 +59,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ManualBackend};
 use generative::baseline_quarantine;
 use generative::generate::min_max::{
     Arg, Grouping, MinMaxDefDraw, MinMaxDraws, PK, build_min_max_program, min_max_def,
@@ -561,8 +561,8 @@ fn run_swept_tampering_case(
 ) -> Result<(), TestCaseError> {
     TAMPERING_HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
@@ -996,8 +996,8 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
     let program = case.program();
     TAMPERING_HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             // No housekeeping pass runs while the program settles: it collects

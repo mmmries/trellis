@@ -408,7 +408,8 @@ pub(super) fn assignment(
 /// every set in `table.unique_sets`.
 ///
 /// `schema` qualifies the table's name (`None` leaves it to the session's
-/// `search_path`, which is the instance schema): a source table that more than
+/// `search_path`: `public` for the application's own session, the instance
+/// schema for the backend's raw one): a source table that more than
 /// one Trellis instance reads is created in `public`, outside every
 /// instance's catalog schema.
 pub(super) async fn create_source_table(
