@@ -1393,15 +1393,19 @@ impl Render {
 /// the key's live version, if any, is one this transaction wrote. Two more
 /// conditions keep the probe on that version:
 ///
-/// - **It was written by this transaction**: `age(t.xmin) <= 0`. Under
-///   `REPEATABLE READ` and `SERIALIZABLE` the snapshot predates the
-///   statement, so a version of the key that another transaction deleted or
-///   re-keyed after the snapshot, and that this statement then re-created,
-///   is still visible beside this transaction's own. `age`
-///   measures against the transaction's own xid, or the next xid as of its
-///   first call in the transaction, so it is `<= 0` for every version this
-///   transaction or its subtransactions wrote, and positive for one
-///   committed before the snapshot.
+/// - **It was written by this transaction**: `age(t.xmin) <= 0`, nearest
+///   first. Under `REPEATABLE READ` and `SERIALIZABLE` the snapshot
+///   predates the statement, so a version of the key that another
+///   transaction deleted or re-keyed after the snapshot, and that this
+///   statement then re-created, is still visible beside this transaction's
+///   own. `age` measures against the transaction's own xid, or the next xid
+///   as of its first call in the transaction, so it is `<= 0` for every
+///   version this transaction or its subtransactions wrote, and positive
+///   for one committed before the snapshot. A frozen version more than
+///   `2^31` ids old keeps its raw `xmin`, so its `age` wraps negative too;
+///   ordering by `age` descending takes the version nearest the writer,
+///   which is the writer's own whenever it has one. What that leaves is in
+///   `docs/known-correctness-gaps.md`.
 /// - **Its key renders the same**: the typed `=` finds the version through
 ///   the index, but the ring keys by the key's text, and a type's `=` can be
 ///   looser (`numeric` `1.0 = 1.00`). Without the text check, a key move
@@ -1434,8 +1438,8 @@ fn ring_select(spec: &CaptureSpec, event: CaptureEvent, render: Render, live: bo
     // [`PLANNER_SETTINGS`] for the probe's index scan. `of` is the typed
     // key's source per key column.
     // `key` is the row's own ring key, which the live version's must match
-    // as text; `age(t.xmin) <= 0` keeps the probe on a version this
-    // transaction wrote (see "The image is the live row" above).
+    // as text; `age(t.xmin) <= 0`, nearest first, keeps the probe on a
+    // version this transaction wrote (see "The image is the live row" above).
     match event {
         CaptureEvent::Insert => format!(
             "{indent}select {src}, case when {live} then {} else {} end,\n{indent}    \
@@ -1667,6 +1671,13 @@ fn transition_images(
 /// can't narrow by that column.
 const NULL_SAFE_BRANCH_COLUMNS: usize = 3;
 
+/// The order [`live_probe`] takes a key's candidate versions in: the one
+/// nearest the writer first, so a frozen version whose `age` has wrapped
+/// negative never wins over the writer's own (see "The image is the live
+/// row" on [`ring_select`]). A top-N sort over the few visible versions of
+/// one key, after the index probe.
+const NEAREST_FIRST: &str = "order by pg_catalog.age(t.xmin) desc";
+
 /// The live re-read of the row whose key columns `of` renders and whose
 /// ring key is `key`: a lateral probe of the table `t` by the key's typed
 /// equality, kept to a version this transaction wrote whose key renders as
@@ -1704,7 +1715,7 @@ fn live_probe(spec: &CaptureSpec, of: &dyn Fn(&str) -> String, key: &str) -> Str
             .collect();
         return format!(
             "{indent}left join lateral (select * from {table} t where {}\n{indent}    \
-             and {filter} limit 1) t on true",
+             and {filter} {NEAREST_FIRST} limit 1) t on true",
             on.join(" and "),
         );
     }
@@ -1733,7 +1744,8 @@ fn live_probe(spec: &CaptureSpec, of: &dyn Fn(&str) -> String, key: &str) -> Str
                 })
                 .collect();
             format!(
-                "select {select} from {table} t where {}\n{indent}        and {filter}",
+                "(select {select} from {table} t where {}\n{indent}        and {filter} \
+                 {NEAREST_FIRST} limit 1)",
                 on.join(" and ")
             )
         })
@@ -2585,7 +2597,8 @@ mod tests {
                 sql.contains(&format!(
                     "left join lateral (select * from \"public\".\"orders\" t \
                      where {on}\n            and format('%s', t.\"id\") = {key} collate \"C\" \
-                     and pg_catalog.age(t.xmin) <= 0 limit 1) t on true"
+                     and pg_catalog.age(t.xmin) <= 0 \
+                     order by pg_catalog.age(t.xmin) desc limit 1) t on true"
                 )),
                 "a probe per row, never a join the planner could hash:\n{sql}"
             );
@@ -2693,14 +2706,22 @@ mod tests {
         assert!(
             sql.contains(
                 "left join lateral (select * from (\n            \
-                 select t.ctid, t.* from \"public\".\"nk\" t where t.\"code\" = n.\"code\"\n"
+                 (select t.ctid, t.* from \"public\".\"nk\" t where t.\"code\" = n.\"code\"\n"
             ),
             "{sql}"
         );
         assert!(
             sql.contains(
-                "union all select t.ctid, t.* from \"public\".\"nk\" t \
+                "union all (select t.ctid, t.* from \"public\".\"nk\" t \
                  where t.\"code\" is null and n.\"code\" is null\n"
+            ),
+            "{sql}"
+        );
+        // Each branch takes its nearest version itself (#2205): at most one
+        // branch reads rows for a given outer row.
+        assert!(
+            sql.contains(
+                "and pg_catalog.age(t.xmin) <= 0 order by pg_catalog.age(t.xmin) desc limit 1)\n"
             ),
             "{sql}"
         );
@@ -2727,7 +2748,7 @@ mod tests {
         // 2^3 branches, so 7 `union all`s, in each static re-read (trapped
         // and bare) and the schema-changed branch's template.
         assert_eq!(
-            sql.matches("union all select").count(),
+            sql.matches("union all (select").count(),
             (2 * RING_SIZE as usize + 1) * 7
         );
         assert!(
