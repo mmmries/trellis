@@ -343,6 +343,7 @@ mod tests {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         }
     }
 
