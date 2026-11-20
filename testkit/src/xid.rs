@@ -30,18 +30,21 @@ const EPOCH: u64 = 1 << 32;
 /// the 40-million-id warning band.
 const WRAP_MARGIN: u64 = 100_000_000;
 
-/// Drops temporary tables left behind by sessions a restart killed.
-/// Vacuum never touches another session's temporary table, so an orphan
-/// holds its database's `datfrozenxid` at the id it was created under for
-/// good, until autovacuum gets round to it. A restart kills every session,
-/// so a temporary table over 2^30 ids old cannot belong to a live one.
+/// Drops temporary tables left behind by sessions an immediate restart
+/// killed. Vacuum never touches another session's temporary table, so an
+/// orphan holds its database's `datfrozenxid` at the id it was created
+/// under until autovacuum gets round to it. Every jump restarts the server,
+/// and a jump between freezes is over 2^30 ids, so a temporary table over
+/// 2^30 ids old cannot belong to a live session. `if exists`: autovacuum
+/// may drop the orphan first.
 const DROP_ORPHANED_TEMP_TABLES: &str = "do $$ declare r record; begin \
     for r in select n.nspname, c.relname from pg_class c \
         join pg_namespace n on n.oid = c.relnamespace \
-        where c.relpersistence = 't' and c.relkind in ('r', 'm') \
+        where c.relpersistence = 't' and c.relkind = 'r' \
+          and n.nspname like 'pg\\_temp\\_%' \
           and age(c.relfrozenxid) > 1073741824 \
     loop \
-        execute format('drop table %I.%I', r.nspname, r.relname); \
+        execute format('drop table if exists %I.%I', r.nspname, r.relname); \
     end loop; end $$";
 
 /// What [`TestCluster::age_xids_to_epoch_edge`] did.
@@ -59,8 +62,8 @@ impl TestCluster {
     /// `VACUUM FREEZE` in every database, `template0` included (it is
     /// opened to connections for the vacuum and closed again). A database
     /// dropped meanwhile is skipped. Orphaned temporary tables (see
-    /// [`DROP_ORPHANED_TEMP_TABLES`]) are dropped first. Tuples a running transaction can still
-    /// see stay unfrozen: their database's `datfrozenxid` says so, and
+    /// [`DROP_ORPHANED_TEMP_TABLES`]) are dropped first. Tuples a running
+    /// transaction can still see stay unfrozen: their database's `datfrozenxid` says so, and
     /// [`TestCluster::age_xids_to_epoch_edge`] reads it.
     pub fn freeze_every_database(&self) {
         let rows = self.psql(
@@ -234,6 +237,73 @@ fn reset_wal(data_dir: &Path, epoch: u64, xid: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `psql` session that creates a temporary table and then sleeps,
+    /// holding it, until killed.
+    fn hold_temp_table(cluster: &TestCluster, table: &str) -> std::process::Child {
+        let child = Command::new("psql")
+            .arg("-h")
+            .arg(cluster.socket_dir())
+            .arg("-p")
+            .arg(cluster.port().to_string())
+            .args(["-U", "postgres", "-d", "postgres", "-XAtq"])
+            .arg("-c")
+            .arg(format!(
+                "create temp table {table} (a int) on commit delete rows"
+            ))
+            .arg("-c")
+            .arg("select pg_sleep(600)")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn psql");
+        let exists = format!("select count(*) from pg_class where relname = '{table}'");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while cluster.psql("postgres", &exists).trim() != "1" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{table} never appeared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child
+    }
+
+    /// An immediate restart orphans a session's temporary table, and
+    /// [`TestCluster::freeze_every_database`] drops it once it is over 2^30
+    /// ids old, while a live session's keeps. Autovacuum is off (and the
+    /// wraparound limits are made real by a freeze and checkpoint after the
+    /// jump), so nothing else drops the orphan; its `relfrozenxid` is set
+    /// back by hand to the age a jump would give it.
+    #[test]
+    fn freezing_drops_an_old_orphaned_temp_table_and_keeps_a_live_one() {
+        let cluster = TestCluster::start_with_settings(&["autovacuum=off"]);
+        cluster.reset_next_xid(u64::from(XID_PAGE) * 40_000);
+        cluster.freeze_every_database();
+        cluster.psql("postgres", "checkpoint");
+
+        let mut doomed = hold_temp_table(&cluster, "orphan");
+        cluster.restart(StopMode::Immediate);
+        let _ = doomed.wait();
+        cluster.psql(
+            "postgres",
+            "update pg_class set relfrozenxid = \
+                 (pg_snapshot_xmax(pg_current_snapshot())::text::bigint \
+                  - 1100000000)::text::xid \
+             where relname = 'orphan'",
+        );
+        let mut live = hold_temp_table(&cluster, "live");
+
+        cluster.freeze_every_database();
+        let left = cluster.psql(
+            "postgres",
+            "select string_agg(relname, ',' order by relname) from pg_class \
+             where relname in ('orphan', 'live')",
+        );
+        let _ = live.kill();
+        let _ = live.wait();
+        assert_eq!(left.trim(), "live");
+    }
 
     /// From a fresh cluster the edge is more than one jump away. A frozen
     /// row keeps its raw `xmin`, so after the jumps its `age` has wrapped
