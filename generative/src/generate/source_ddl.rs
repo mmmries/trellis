@@ -2,7 +2,7 @@
 //! which op, on which table, with how many ops in flight around it.
 
 use proptest::prelude::*;
-use trellis::dev::defs::ast::{KeySpace, ValueType};
+use trellis::dev::defs::ast::ValueType;
 
 use crate::model::{Program, SourceDdl, SourceDdlEvent, SourceDdlPlan};
 
@@ -66,9 +66,6 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
             .columns
             .iter()
             .filter(|c| c.name != table.pk_col && c.value_type == ValueType::Numeric)
-            // #2219: a rewrite of a column an aggregate groups by, with a
-            // change in flight, keeps the old group. Drop this with the fix.
-            .filter(|c| !grouped_by(program, &table.name, &c.name))
             .map(|c| c.name.as_str())
             .collect();
         let column = (!numeric.is_empty()).then(|| numeric[pick % numeric.len()].to_string());
@@ -98,12 +95,4 @@ fn fit(program: &Program, draws: &[Draw]) -> SourceDdlPlan {
         events.push(event);
     }
     SourceDdlPlan { events }
-}
-
-/// Whether an aggregate over `table` groups by `column`.
-fn grouped_by(program: &Program, table: &str, column: &str) -> bool {
-    program.defs.iter().any(|d| {
-        d.source == table
-            && matches!(&d.key_space, KeySpace::Aggregate { group_by } if group_by.iter().any(|g| g == column))
-    })
 }

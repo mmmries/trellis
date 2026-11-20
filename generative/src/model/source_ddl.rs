@@ -27,7 +27,8 @@ pub enum SourceDdl {
     /// same rewrite as [`SourceDdl::RewriteColumn`] at its close. Within one
     /// reconcile interval this is the register's
     /// [`Gap::AlterTypeRewrite`] shape (a metadata change beside the
-    /// rewrite); across a pass the pass sees the rewrite alone.
+    /// rewrite), unless the server versions attributes and a read column
+    /// follows this one; across a pass the pass sees the rewrite alone.
     RewriteBesideDefault { column: String },
     /// Every capture trigger on the table disabled by name when the event
     /// fires and enabled again (`ENABLE ALWAYS`, as Trellis installs them)

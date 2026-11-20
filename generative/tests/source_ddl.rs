@@ -28,6 +28,7 @@ use proptest::test_runner::{
 };
 use testkit::TestCluster;
 use trellis::Config;
+use trellis::dev::defs::ast::KeySpace;
 use trellis::dev::pool::Pool;
 
 struct Harness {
@@ -203,6 +204,46 @@ fn one_to_one_and_aggregate_program() -> Program {
     program
 }
 
+/// The table's last column, the aggregate's `GROUP BY` column: no column
+/// after it is read, so a rewrite of it moves no other read column's row.
+fn grain(program: &Program) -> String {
+    let table = &program.tables[0];
+    let grain = table.columns.last().expect("a column").name.clone();
+    assert!(
+        matches!(&program.defs[1].key_space, KeySpace::Aggregate { group_by } if group_by.as_slice() == std::slice::from_ref(&grain))
+    );
+    grain
+}
+
+/// Whether `cluster`'s server versions attributes the way PostgreSQL's
+/// 2026-11 minors do (15.20, 16.16, 17.12, 18.7): an `ALTER COLUMN ... TYPE`
+/// stamps `pg_attver` into the `attoptions` of the column and of every
+/// column after it.
+async fn server_versions_attributes(cluster: &TestCluster) -> bool {
+    let db = CaseDatabase::provision(cluster).await;
+    let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("connect the probe");
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "create temp table attver_probe (c int); \
+             alter table attver_probe alter column c type bigint",
+        )
+        .await
+        .expect("probe a retype");
+    client
+        .query_one(
+            "select coalesce(array_to_string(attoptions, ','), '') like '%pg_attver=%' \
+             from pg_catalog.pg_attribute \
+             where attrelid = 'pg_temp.attver_probe'::regclass and attname = 'c'",
+            &[],
+        )
+        .await
+        .expect("read the probe")
+        .get(0)
+}
+
 /// `c1`, the column both definitions read.
 fn c1(program: &Program) -> String {
     program.tables[0].columns[1].name.clone()
@@ -333,13 +374,15 @@ async fn a_same_type_rewrite_of_a_read_column_is_reread() {
 }
 
 /// The register's `alter-type-rewrite` shape: a `SET DEFAULT` and a
-/// same-type rewrite of the read column inside one reconcile interval. The
-/// pass reads it as routine work, so both readers keep the old values;
-/// `self_check` reports them and `request_backfill` repairs them.
+/// same-type rewrite of the table's last read column (the aggregate's
+/// `GROUP BY` column) inside one reconcile interval. The pass reads it as
+/// routine work, so the aggregate keeps the old groups; `self_check`
+/// reports them and `request_backfill` repairs them. The 1-1 doesn't read
+/// the column.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rewrite_beside_a_default_inside_one_interval_is_the_listed_gap() {
+async fn a_rewrite_of_the_last_read_column_beside_a_default_is_the_listed_gap() {
     let program = one_to_one_and_aggregate_program();
-    let column = c1(&program);
+    let column = grain(&program);
     let event = event(
         &program,
         3,
@@ -348,8 +391,42 @@ async fn a_rewrite_beside_a_default_inside_one_interval_is_the_listed_gap() {
         false,
     );
     assert_eq!(event.listed_gaps(), vec![Gap::AlterTypeRewrite]);
-    for verdict in run_one(&program, event).await {
-        assert_eq!(verdict, Verdict::ListedGap(Gap::AlterTypeRewrite));
+    assert_eq!(
+        run_one(&program, event).await,
+        [Verdict::Exact, Verdict::ListedGap(Gap::AlterTypeRewrite)]
+    );
+}
+
+/// The same shape on `c1`, which read columns follow. A server that
+/// versions attributes moves their rows too, so the pass sees a same-type
+/// rewrite on them and re-reads the table: every definition exact. An older
+/// server leaves the listed gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rewrite_beside_a_default_is_reread_through_a_later_read_column_where_attributes_are_versioned()
+ {
+    let program = one_to_one_and_aggregate_program();
+    let cluster = TestCluster::start();
+    let expected = if server_versions_attributes(&cluster).await {
+        Verdict::Exact
+    } else {
+        Verdict::ListedGap(Gap::AlterTypeRewrite)
+    };
+    let column = c1(&program);
+    let event = event(
+        &program,
+        3,
+        SourceDdl::RewriteBesideDefault { column },
+        1,
+        false,
+    );
+    let plan = SourceDdlPlan {
+        events: vec![event.clone()],
+    };
+    let run = run(&cluster, &program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    for verdict in verdicts_after(&run, &event) {
+        assert_eq!(verdict, expected);
     }
 }
 
@@ -378,7 +455,7 @@ async fn a_rewrite_after_a_default_across_a_pass_is_reread() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_same_shape_without_its_register_entry_fails_as_silently_wrong() {
     let program = one_to_one_and_aggregate_program();
-    let column = c1(&program);
+    let column = grain(&program);
     let plan = SourceDdlPlan {
         events: vec![event(
             &program,
@@ -409,12 +486,15 @@ async fn the_same_shape_without_its_register_entry_fails_as_silently_wrong() {
     }
 }
 
-/// The register's `alter-type-rewrite` entry, for a key column: a 1-1
-/// target's rows under the old keys stay after the next write to each row,
-/// which lands under its new key. The entry said that write repairs the
-/// row; it repairs nothing for a key column.
+/// The register's `alter-type-rewrite` entry, for a key column: on a
+/// server that doesn't version attributes, a 1-1 target's rows under the
+/// old keys stay after the next write to each row, which lands under its
+/// new key. That write repairs nothing for a key column. A server that
+/// versions attributes moves the rows of the read columns after the key,
+/// so the pass re-reads the table and only the new keys remain.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_key_column_rewrite_beside_a_default_leaves_the_old_keys_in_a_one_to_one_target() {
+async fn a_key_column_rewrite_beside_a_default_leaves_the_old_keys_unless_attributes_are_versioned()
+{
     use generative::backend::Backend;
     use generative::run::judge::PassStepper;
 
@@ -423,6 +503,7 @@ async fn a_key_column_rewrite_beside_a_default_leaves_the_old_keys_in_a_one_to_o
     let pk = program.tables[0].pk_col.clone();
     let c1 = c1(&program);
     let cluster = TestCluster::start();
+    let versioned = server_versions_attributes(&cluster).await;
     let db = CaseDatabase::provision(&cluster).await;
     let mut backend = ManualBackend::connect_as(db.roles())
         .await
@@ -455,11 +536,15 @@ async fn a_key_column_rewrite_beside_a_default_leaves_the_old_keys_in_a_one_to_o
     let snapshot = backend.snapshot().await.expect("snapshot");
     let keys: Vec<&String> = snapshot[one_to_one].keys().collect();
     // pk 2 was deleted; pks 1 and 3 are now 11 and 13.
-    assert_eq!(
-        keys,
-        ["1", "11", "13", "3"].iter().collect::<Vec<_>>(),
-        "the old keys stay beside the new ones"
-    );
+    if versioned {
+        assert_eq!(keys, ["11", "13"].iter().collect::<Vec<_>>(), "re-read");
+    } else {
+        assert_eq!(
+            keys,
+            ["1", "11", "13", "3"].iter().collect::<Vec<_>>(),
+            "the old keys stay beside the new ones"
+        );
+    }
 }
 
 /// Found by the first sweep: one row in its group, then a same-type
@@ -512,10 +597,9 @@ async fn rewrite_group_by_column(program: &Program, op: usize, pass_inside: bool
     }
 }
 
-/// #2219: with the insert's change still in flight, the target keeps the
-/// old group beside the new one.
+/// The same with the insert's change still in flight (#2219): the
+/// rebuild reads every ring image, so no old group stays beside the new one.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "#2219: a GROUP BY column rewritten with an insert in flight keeps the old group"]
 async fn a_rewrite_of_a_group_by_column_with_a_change_in_flight_is_reread() {
     let program = one_row_grouped_program();
     rewrite_group_by_column(&program, 0, false).await;

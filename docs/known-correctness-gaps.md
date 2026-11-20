@@ -114,7 +114,11 @@ These changes look like routine maintenance to it.
 ### A column's values rewritten in place by `ALTER COLUMN TYPE`
 
 **When:** an `ALTER COLUMN … TYPE … USING` changes the values of a column a
-definition reads, in one of these shapes:
+definition reads, in one of the shapes below. On PostgreSQL 15.20, 16.16,
+17.12, 18.7 and later minors, only when no column after it is read: those
+servers version attributes, so the rewrite also moves each later column's
+catalog row, and a read one the window left otherwise alone shows the pass
+the rewrite.
 
 ```sql
 -- A metadata change to the same column within one reconcile interval
