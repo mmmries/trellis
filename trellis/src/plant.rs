@@ -1268,6 +1268,7 @@ impl Plant {
                 | Plant::Join1FanOutHeldRow
                 | Plant::SeamTokenEarly
                 | Plant::CaptureSlotFromSnapshot
+                | Plant::CaptureSkipNestedReread
         )
     }
 }
