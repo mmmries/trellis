@@ -157,6 +157,12 @@ jobs:
             { echo "::error::pg_config on PATH reports no libxml"; exit 1; }
           postgres --version
 
+      - name: Install libfaketime
+        # As in ci.yml: the clock-step tests need it, and must not skip.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y faketime
+
       - name: Generate a non-default locale
         # The lc_monetary pinning tests need a locale whose `money` rendering
         # differs from `C`'s; see testkit/src/locale.rs and the same step in
@@ -181,4 +187,5 @@ jobs:
         # failure. The throwaway clusters run with `jit=off`, as in ci.yml.
         env:
           TRELLIS_TESTKIT_PG_OPTIONS: jit=off
+          TRELLIS_REQUIRE_FAKETIME: "1"
         run: cargo test --workspace --features benchmark/engine-access --no-fail-fast

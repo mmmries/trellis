@@ -15,10 +15,10 @@
 use generative::backend::{CaseDatabase, ManualBackend};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
-    db_admin_plan_for, trivial_program,
+    db_admin_plan_for, db_admin_plan_with_clock_for, trivial_program,
 };
 use generative::model::{
-    CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode,
+    ClockStep, CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode,
 };
 use generative::run::{RunError, run_convergence_with_db_admin};
 use proptest::prelude::*;
@@ -120,6 +120,39 @@ proptest! {
     }
 }
 
+thread_local! {
+    /// A thread's cluster with a fake clock, or `None` after a loud skip.
+    static CLOCK_HARNESS: Option<Harness> = testkit::faketime::require("the clock-step property")
+        .map(|lib| Harness {
+            runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
+            cluster: TestCluster::start_with_fake_clock(&lib).long_lived(),
+        });
+}
+
+proptest! {
+    #![proptest_config(proptest_config())]
+
+    /// Wall-clock steps (and every other action) anywhere in a generated
+    /// program never perturb convergence. Steps accumulate across a thread's
+    /// cases, which is harmless: each case reads time only relative to its
+    /// own database's writes.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_clock_steps_never_perturb_convergence(
+        (program, plan) in trivial_program().prop_flat_map(|program| {
+            let plan = db_admin_plan_with_clock_for(&program);
+            (Just(program), plan)
+        })
+    ) {
+        CLOCK_HARNESS.with(|h| {
+            let Some(h) = h else { return Ok(()) };
+            h.runtime
+                .block_on(run(&h.cluster, &program, &plan))
+                .map_err(TestCaseError::fail)
+        })?;
+    }
+}
+
 /// No database: every drawn plan is anchored inside its program and holds at
 /// most three events, and across enough draws every action shows up, so
 /// none silently drops out of the sweep.
@@ -145,6 +178,9 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                 DbAdminAction::WrapXids { tail } => {
                     assert!(*tail <= 256, "{event:?}");
                     wrap = true;
+                }
+                DbAdminAction::StepClock(_) => {
+                    panic!("a plan for a cluster without a fake clock drew {event:?}")
                 }
             }
         }
@@ -318,4 +354,144 @@ async fn counters_near_the_64_bit_limit_converge() {
         ids.iter().all(|&id| id > start),
         "the definitions drew past the start: {ids:?}"
     );
+}
+
+/// How far the server's clock is ahead of this process's, in seconds, read
+/// from a session on `cluster`.
+async fn server_clock_lead(cluster: &TestCluster) -> f64 {
+    let client = testkit::connect_with(&cluster.database_dsn("postgres"), "").await;
+    let row = client
+        .query_one("select extract(epoch from now())::float8", &[])
+        .await
+        .expect("read now()");
+    let server: f64 = row.get(0);
+    let local = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs_f64();
+    server - local
+}
+
+/// The shim itself: a step moves `now()` for sessions already open and new
+/// ones, steps replace one another (a step back lands behind real time), and a
+/// restart keeps the offset.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clock_step_moves_now_and_survives_a_restart() {
+    let Some(lib) = testkit::faketime::require("a_clock_step_moves_now_and_survives_a_restart")
+    else {
+        return;
+    };
+    let cluster = TestCluster::start_with_fake_clock(&lib);
+    let near = |lead: f64, want: f64| (lead - want).abs() < 5.0;
+    let lead = server_clock_lead(&cluster).await;
+    assert!(near(lead, 0.0), "no step yet: {lead}");
+
+    cluster.step_clock(ClockStep::ForwardHours.seconds());
+    let lead = server_clock_lead(&cluster).await;
+    assert!(near(lead, 10_800.0), "three hours forward: {lead}");
+
+    cluster.step_clock(ClockStep::ForwardHours.seconds() + ClockStep::BackMinutes.seconds());
+    let lead = server_clock_lead(&cluster).await;
+    assert!(near(lead, 10_500.0), "five minutes back: {lead}");
+
+    cluster.restart(testkit::StopMode::Fast);
+    let lead = server_clock_lead(&cluster).await;
+    assert!(near(lead, 10_500.0), "after a restart: {lead}");
+}
+
+/// A plan with the given clock steps, one per `(op, step)`.
+fn clock_plan(steps: &[(usize, ClockStep)]) -> DbAdminPlan {
+    plan(
+        &steps
+            .iter()
+            .map(|(op, step)| (*op, DbAdminAction::StepClock(*step)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Runs `plan` on a cluster with a fake clock, or skips loudly.
+async fn run_on_fake_clock(test: &str, plan: &DbAdminPlan) {
+    let Some(lib) = testkit::faketime::require(test) else {
+        return;
+    };
+    let cluster = TestCluster::start_with_fake_clock(&lib);
+    run(&cluster, &one_to_one_and_aggregate_program(), plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The clock steps three hours forward with the first seed in flight, then
+/// ten minutes more after the second: no definition pauses, no claim or
+/// registry row of the live engine reads as expired for good, and every op
+/// converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn forward_clock_steps_with_work_in_flight_converge() {
+    run_on_fake_clock(
+        "forward_clock_steps_with_work_in_flight_converge",
+        &clock_plan(&[
+            (0, ClockStep::ForwardHours),
+            (1, ClockStep::ForwardMinutes),
+            (4, ClockStep::ForwardHours),
+        ]),
+    )
+    .await;
+}
+
+/// The clock steps back five minutes (an NTP correction) after the seeds,
+/// so rows written in the future are older than the present, and again
+/// mid-program.
+#[tokio::test(flavor = "multi_thread")]
+async fn backward_clock_steps_with_work_in_flight_converge() {
+    run_on_fake_clock(
+        "backward_clock_steps_with_work_in_flight_converge",
+        &clock_plan(&[
+            (0, ClockStep::ForwardHours),
+            (2, ClockStep::BackMinutes),
+            (3, ClockStep::BackMinutes),
+            (5, ClockStep::ForwardMinutes),
+        ]),
+    )
+    .await;
+}
+
+/// A clock step, a restart and an xid wrap in one program: the shim and the
+/// other administration actions compose.
+#[tokio::test(flavor = "multi_thread")]
+async fn clock_steps_compose_with_restarts_and_wraps() {
+    run_on_fake_clock(
+        "clock_steps_compose_with_restarts_and_wraps",
+        &plan(&[
+            (0, DbAdminAction::StepClock(ClockStep::ForwardHours)),
+            (1, DbAdminAction::RestartPostgres(RestartMode::Fast)),
+            (2, DbAdminAction::StepClock(ClockStep::BackMinutes)),
+            (3, DbAdminAction::WrapXids { tail: 8 }),
+            (4, DbAdminAction::StepClock(ClockStep::ForwardMinutes)),
+        ]),
+    )
+    .await;
+}
+
+/// No database: plans for a fake-clock cluster draw every step, and each
+/// step's direction is as named.
+#[test]
+fn drawn_clock_plans_cover_every_step() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|p| db_admin_plan_with_clock_for(&p));
+    let mut seen = [false; 3];
+    for _ in 0..300 {
+        for event in strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current()
+            .events
+        {
+            if let DbAdminAction::StepClock(step) = event.action {
+                seen[step as usize] = true;
+            }
+        }
+    }
+    assert_eq!(seen, [true; 3], "steps drawn: {seen:?}");
+    assert!(ClockStep::ForwardMinutes.seconds() > 0);
+    assert!(ClockStep::ForwardHours.seconds() > ClockStep::ForwardMinutes.seconds());
+    assert!(ClockStep::BackMinutes.seconds() < 0);
 }

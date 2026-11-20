@@ -203,6 +203,15 @@ jobs:
           echo "using PostgreSQL server binaries from: $pg_bin"
           echo "$pg_bin" >> "$GITHUB_PATH"
 
+      - name: Install libfaketime
+        # The generative clock-step tests preload it into the test server (see
+        # "Wall-clock steps" in docs/generative-test-suite.md); the
+        # `faketime` package ships the library.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y faketime
+          ls /usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1
+
       - name: Generate a non-default locale
         # The lc_monetary pinning tests need a locale whose
         # `money` rendering differs from `C`'s; see testkit/src/locale.rs.
@@ -254,8 +263,12 @@ jobs:
         # and aggregate statements the data-heavy tests run; those ran ~17x
         # slower here than on a machine whose Postgres has no JIT. JIT is
         # chosen after planning, so it changes no results or plans.
+        #
+        # `TRELLIS_REQUIRE_FAKETIME` makes a missing libfaketime fail the
+        # clock tests instead of skipping them.
         env:
           TRELLIS_TESTKIT_PG_OPTIONS: jit=off
+          TRELLIS_REQUIRE_FAKETIME: "1"
         run: python3 .github/scripts/test-shards.py run ${{ matrix.shard }}
 
   ci:

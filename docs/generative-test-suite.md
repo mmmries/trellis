@@ -1132,6 +1132,14 @@ The actions, cheapest-first (every one below is built):
    sequences and columns, so there is no engine hook. The renumbered ring
    (one active segment, none below it) is the state retiring every segment
    leaves. `ring_slot_mirror` is a four-value `smallint` and has no headroom.
+   `DbAdminAction::StepClock` steps the server's wall clock (ten minutes or
+   three hours forward, five minutes back; steps add up) with libfaketime
+   preloaded into Postgres. `now()` and every stored timestamp move, so
+   heartbeats, claims and gauges compared against `now()` see the jump,
+   and no definition may pause for it. The engine reads no wall clock of its
+   own, and tokio's monotonic clock does not move. A steppable engine clock
+   is a later step. See [Wall-clock steps](#wall-clock-steps-libfaketime) for
+   the prerequisite.
    Backup/restore is a cold file-level copy (`model::RestorePlan`, driven by
    `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
    back up right after op *k* with its change in flight, run to the end,
@@ -1234,6 +1242,27 @@ judges a run:
   armed, named in its doc comment.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
+
+### Wall-clock steps (libfaketime)
+
+The clock-step tests (`generative/tests/db_admin.rs`, `*clock*`) preload
+libfaketime into the test Postgres server and move its clock by rewriting an
+offset file (`FAKETIME_TIMESTAMP_FILE` with `FAKETIME_NO_CACHE`), so a step
+needs no restart. Linux only (the preload is `LD_PRELOAD`); on macOS set
+`TRELLIS_SKIP_FAKETIME=1`.
+
+- **Install.** Fedora: `sudo dnf install libfaketime`. Debian and Ubuntu:
+  `sudo apt-get install faketime` (it pulls in the library).
+- **Lookup.** `TRELLIS_LIBFAKETIME` (a path to `libfaketime.so.1`), then
+  `/usr/lib64/`, `/usr/lib/{x86_64,aarch64}-linux-gnu/faketime/` and
+  `/usr/lib/faketime/`. A `TRELLIS_LIBFAKETIME` naming a missing file fails.
+- **Missing library.** The clock tests skip, printing `!!!! SKIPPED` to
+  stderr (run with `--nocapture` to see it on a passing run).
+- **Skip on purpose.** `TRELLIS_SKIP_FAKETIME=1` skips them with the same
+  message.
+- **CI.** `TRELLIS_REQUIRE_FAKETIME=1` turns a missing library into a failure;
+  `ci.yml` installs `faketime` and sets it. Setting it together with
+  `TRELLIS_SKIP_FAKETIME` fails.
 
 ## 10. Settled decisions
 
