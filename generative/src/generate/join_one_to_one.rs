@@ -1762,7 +1762,7 @@ mod tests {
             program
                 .ops
                 .iter()
-                .filter_map(|op| match op {
+                .filter_map(|op| match op.write() {
                     Op::Insert { table, row, .. } if table == wanted => Some(key_of(row, column)),
                     _ => None,
                 })
@@ -1898,7 +1898,7 @@ mod tests {
             for case in crate::plant_sweep::seeded_cases(&strategy, seed, 40) {
                 let mut live: [BTreeMap<String, Row>; 2] = [BTreeMap::new(), BTreeMap::new()];
                 for (index, op) in case.program.ops.iter().enumerate() {
-                    let (table, written) = match op {
+                    let (table, written) = match op.write() {
                         Op::Insert { table, row, .. } => {
                             let side = usize::from(table == JOINED_TABLE);
                             let row: Row = row.iter().cloned().collect();
@@ -2099,7 +2099,7 @@ mod tests {
             let keys: Vec<Option<String>> = program
                 .ops
                 .iter()
-                .filter_map(|op| match op {
+                .filter_map(|op| match op.write() {
                     Op::Insert { table, row, .. } if table == table_at(position) => {
                         Some(key_of(row, "u"))
                     }

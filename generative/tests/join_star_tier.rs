@@ -78,26 +78,27 @@ fn digests(strategy: &proptest::strategy::BoxedStrategy<JoinCase>) -> Vec<u64> {
 /// The two-table 1-1 JOIN tier and the chained-reader tier draw, seed for
 /// seed, the cases they drew before the generator took positions: the
 /// digests of their sweep budget's cases (4 seeds × 12), recorded on the
-/// generator before the star tier (#1781). A change that means to change
-/// what they draw updates these.
+/// generator before the star tier (#1781), and again when the derived
+/// transactions and statement forms changed how they issue their ops
+/// (#2181). A change that means to change what they draw updates these.
 #[test]
 fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
     assert_eq!(
         digests(&one_to_one_case_strategy().boxed()),
         [
-            17_962_304_100_747_754_684,
-            4_091_506_942_938_126_918,
-            8_600_531_309_418_350_733,
-            7_267_421_071_787_496_964
+            6_087_195_259_762_024_636,
+            15_184_229_555_769_205_907,
+            7_467_191_831_678_639_982,
+            11_163_129_269_753_019_689
         ]
     );
     assert_eq!(
         digests(&chained_case_strategy().boxed()),
         [
-            13_184_901_160_770_402_170,
-            5_538_369_240_495_716_062,
-            8_137_699_462_753_141_007,
-            1_132_712_386_592_658_724
+            15_761_626_294_785_547_851,
+            6_679_572_026_344_521_627,
+            8_161_984_791_923_102_522,
+            1_793_015_111_759_041_798
         ]
     );
 }
@@ -111,7 +112,7 @@ fn star_cases() -> Vec<StarCase> {
 }
 
 fn op_table(op: &Op) -> &str {
-    match op {
+    match op.write() {
         Op::Insert { table, .. }
         | Op::Update { table, .. }
         | Op::Delete { table, .. }
@@ -204,7 +205,7 @@ fn the_star_strategy_draws_root_rows_hot_at_several_positions() {
     let (mut root_writes, mut hot, mut hot_at_two, mut hot_at_three) = (0, 0, 0, 0);
     for case in star_cases().iter().filter(|c| c.tables >= 3) {
         for op in &case.case.program.ops {
-            let columns = match op {
+            let columns = match op.write() {
                 Op::Insert { table, row, .. } if table == "ja" => row,
                 Op::Update { table, changes, .. } if table == "ja" => changes,
                 _ => continue,
@@ -239,7 +240,7 @@ fn the_star_strategy_draws_mixed_pages_spanning_positions() {
     let (mut tiles, mut spanning, mut late_last) = (0, 0, 0);
     for case in star_cases().iter().filter(|c| c.tables >= 3) {
         let key_of = |op: &Op| -> Option<(u8, String)> {
-            let (table, columns) = match op {
+            let (table, columns) = match op.write() {
                 Op::Insert { table, row, .. } => (table, row),
                 Op::Update { table, changes, .. } => (table, changes),
                 _ => return None,
@@ -385,7 +386,7 @@ fn the_star_strategy_draws_one_position_moves_and_tail_races() {
             let hot: BTreeSet<(&str, &str)> = tail
                 .iter()
                 .filter_map(|op| {
-                    let (table, columns) = match op {
+                    let (table, columns) = match op.write() {
                         Op::Insert { table, row, .. } => (table, row),
                         Op::Update { table, changes, .. } => (table, changes),
                         _ => return None,
@@ -414,7 +415,7 @@ fn star_streams_keep_each_joined_key_unique_and_on_one_lane() {
         let mut model = Model::new(&case.case.program.tables);
         for (index, op) in case.case.program.ops.iter().enumerate() {
             model.apply(op);
-            let (table, id) = match op {
+            let (table, id) = match op.write() {
                 Op::Insert { table, row, .. } => (table, written(row, "id").unwrap().to_string()),
                 Op::Update {
                     table, pk, changes, ..
@@ -476,7 +477,7 @@ impl Model {
     }
 
     fn apply(&mut self, op: &Op) {
-        match op {
+        match op.write() {
             Op::Insert { table, row, .. } => {
                 let row: Row = row.iter().cloned().collect();
                 let id = row["id"].clone().expect("an id");
@@ -611,7 +612,7 @@ fn literal(value: &Option<String>) -> String {
 
 fn op_sql(op: &Op) -> String {
     let ident = |name: &str| format!("\"{name}\"");
-    match op {
+    match op.write() {
         Op::Insert { table, row, .. } => format!(
             "insert into {} ({}) values ({})",
             ident(table),
