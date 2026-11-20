@@ -424,6 +424,45 @@ pub fn render_expr_sql(expr: &Expr) -> String {
     render_with(expr, &|_, name| quote_ident(name))
 }
 
+/// [`render_with`] of an [`Expr::InList`] or [`Expr::Between`]: an `IN`'s
+/// operand and elements are `=` operands, typed from their neighbour; a
+/// `BETWEEN`'s are ordering ones, typed as written. Kept out of
+/// [`render_with`] so its frame, which every level of an expression stacks,
+/// stays small.
+#[inline(never)]
+fn render_in_or_between(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> String {
+    let render = |e: &Expr| render_with(e, column);
+    let beside = |e: &Expr| match e {
+        Expr::StringLiteral(text) => quoted(text),
+        _ => render(e),
+    };
+    match expr {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            beside(expr),
+            if *negated { "not " } else { "" },
+            list.iter().map(beside).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render(expr),
+            if *negated { "not " } else { "" },
+            render(low),
+            render(high)
+        ),
+        _ => unreachable!("an IN list or a BETWEEN"),
+    }
+}
+
 /// [`render_expr_sql`] and [`render_qualified_expr_sql`]: the expression
 /// with each column read rendered by `column` (of the table it names, if
 /// any, and its name).
@@ -463,6 +502,7 @@ fn render_with(expr: &Expr, column: &dyn Fn(Option<&str>, &str) -> String) -> St
             render(expr),
             if *negated { "not " } else { "" }
         ),
+        Expr::InList { .. } | Expr::Between { .. } => render_in_or_between(expr, column),
         Expr::Case {
             branches,
             otherwise,

@@ -409,6 +409,8 @@ fn features() -> Vec<Feature> {
         ExprNode::Not,
         ExprNode::IsNull,
         ExprNode::Case,
+        ExprNode::InList,
+        ExprNode::Between,
     ];
     features.extend(
         every(&nodes, |n| match n {
@@ -422,6 +424,8 @@ fn features() -> Vec<Feature> {
             ExprNode::Not => 7,
             ExprNode::IsNull => 8,
             ExprNode::Case => 9,
+            ExprNode::InList => 10,
+            ExprNode::Between => 11,
         })
         .into_iter()
         .map(Feature::Expr),

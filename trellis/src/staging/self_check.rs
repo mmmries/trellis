@@ -1813,6 +1813,9 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
             let test = if *negated { "is not null" } else { "is null" };
             format!("({} {test})", sub(expr, false)?)
         }
+        Expr::InList { .. } | Expr::Between { .. } => {
+            return render_in_or_between(renderer, expr, depth);
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -1846,6 +1849,53 @@ pub(super) fn render_audit<'e, R: AuditRender<'e>>(
             }
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
+    })
+}
+
+/// [`render_audit`] of an [`Expr::InList`] or [`Expr::Between`]: an `IN`'s
+/// operand and elements are `=` operands, typed from their neighbour; a
+/// `BETWEEN`'s are ordering ones. Kept out of [`render_audit`] so its frame,
+/// which every level of an inlined expression stacks, stays small.
+#[inline(never)]
+fn render_in_or_between<'e, R: AuditRender<'e>>(
+    renderer: &mut R,
+    expr: &'e Expr,
+    depth: usize,
+) -> Result<String, R::Error> {
+    let mut sub = |e: &'e Expr, beside: bool| match e {
+        Expr::StringLiteral(text) if beside => Ok(match renderer.special(e, depth + 1)? {
+            Some(special) => special,
+            None => format!("'{}'", text.replace('\'', "''")),
+        }),
+        _ => render_audit(renderer, e, depth + 1),
+    };
+    Ok(match expr {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let operand = sub(expr, true)?;
+            let mut elements = Vec::with_capacity(list.len());
+            for element in list {
+                elements.push(sub(element, true)?);
+            }
+            let not = if *negated { "not " } else { "" };
+            format!("({operand} {not}in ({}))", elements.join(", "))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let operand = sub(expr, false)?;
+            let low = sub(low, false)?;
+            let high = sub(high, false)?;
+            let not = if *negated { "not " } else { "" };
+            format!("({operand} {not}between {low} and {high})")
+        }
+        _ => unreachable!("an IN list or a BETWEEN"),
     })
 }
 

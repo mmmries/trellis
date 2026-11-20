@@ -1149,7 +1149,11 @@ impl DerivedShape {
                     name: name.clone(),
                     args: args.iter().map(|arg| rename(arg, names)).collect(),
                 },
-                Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+                Expr::Not(_)
+                | Expr::IsNull { .. }
+                | Expr::InList { .. }
+                | Expr::Between { .. }
+                | Expr::Case { .. } => expr
                     .try_map_children(|child| Ok::<_, ()>(rename(child, names)))
                     .expect("renaming cannot fail"),
                 other => other.clone(),
