@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use super::where_clause;
 use crate::model::{
-    ConcurrentPlan, Isolation, Op, OpOutcome, Program, SavepointWrap, Table, TxnWrap,
+    ConcurrentPlan, Isolation, Op, OpOutcome, PrepareWrap, Program, SavepointWrap, Table, TxnWrap,
 };
 
 /// How many eligible ops in 256 get a statement form.
@@ -304,6 +304,7 @@ pub fn with_transactions(mut plan: ConcurrentPlan, program: &Program) -> Concurr
                     rollback: (d >> 50).is_multiple_of(2),
                 }
             });
+            let prepare = prepare_draw(mix(d ^ 0x2d), &ops, at == lane.len(), program);
             txns.push(TxnWrap {
                 ops,
                 isolation,
@@ -311,11 +312,36 @@ pub fn with_transactions(mut plan: ConcurrentPlan, program: &Program) -> Concurr
                 think,
                 rehearse,
                 savepoint,
+                prepare,
             });
         }
     }
     plan.txns = txns;
     plan
+}
+
+/// How many transactions in 256 end in `PREPARE TRANSACTION` (2d).
+pub const PREPARE_SHARE: u64 = 64;
+
+/// The preparation of a transaction over `ops`, drawn from `p`. One that
+/// ends its lane (`last`) may stay prepared until the burst's actions have
+/// fired, so nothing of the lane waits on its locks, and only on tables with
+/// no unique columns, whose values another lane's insert could wait on.
+fn prepare_draw(p: u64, ops: &[usize], last: bool, program: &Program) -> Option<PrepareWrap> {
+    if p % 256 >= PREPARE_SHARE {
+        return None;
+    }
+    let plain_tables = ops.iter().all(|&i| {
+        program
+            .tables
+            .iter()
+            .find(|t| t.name == program.ops[i].table())
+            .is_some_and(|t| t.unique_cols.is_empty() && t.unique_sets.is_empty())
+    });
+    Some(PrepareWrap {
+        commit: (p >> 8).is_multiple_of(2),
+        hold: last && plain_tables && (p >> 9).is_multiple_of(2),
+    })
 }
 
 /// The transaction, statement-form and wiring shapes `program` and `plan`
@@ -374,6 +400,30 @@ pub fn shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<(&'static str
         if wrap.read_first && wrap.isolation != Isolation::ReadCommitted && !wrap.think.is_zero() {
             names.push("stale_snapshot_write");
         }
+        if let Some(PrepareWrap { commit, hold }) = wrap.prepare {
+            {
+                names.push(if commit {
+                    "prepared_commit"
+                } else {
+                    "prepared_rollback"
+                });
+                if hold {
+                    names.push("prepared_held");
+                    if plan.bursts.iter().any(|b| {
+                        b.lanes.iter().any(|l| l.contains(&wrap.ops[0]))
+                            && b.actions.iter().any(|a| {
+                                matches!(
+                                    a.action,
+                                    crate::model::BurstAction::Pause { .. }
+                                        | crate::model::BurstAction::Resume { .. }
+                                )
+                            })
+                    }) {
+                        names.push("prepared_held_pause");
+                    }
+                }
+            }
+        }
         if wrap
             .ops
             .iter()
@@ -428,4 +478,12 @@ pub const SHAPES: &[&str] = &[
     "cte_insert",
     "cte_update",
     "cte_delete",
+    "prepared_commit",
+    "prepared_rollback",
+    "prepared_held",
 ];
+
+/// A held prepared transaction in a burst that pauses or resumes a
+/// definition: reported by [`shapes`], but too rare for a floor per key
+/// space ([`SHAPES`]).
+pub const HELD_ACROSS_PAUSE: &str = "prepared_held_pause";

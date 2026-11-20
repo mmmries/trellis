@@ -1959,6 +1959,21 @@ fn every_transaction_shape_is_drawn_against_every_key_space() {
     assert!(missing.is_empty(), "never drawn: {missing:?}\n{coverage}");
 }
 
+/// #2181 2d: a prepared transaction is drawn held in doubt across a burst's
+/// pause and resume (a restart is a hand-built test, as no concurrent plan
+/// restarts the engine).
+#[test]
+fn a_prepared_transaction_is_held_across_a_pause() {
+    let coverage = concurrent_tier_coverage(4);
+    let drawn: usize = coverage
+        .txn_shapes
+        .iter()
+        .filter(|((shape, _), _)| *shape == generative::generate::txn_shapes::HELD_ACROSS_PAUSE)
+        .map(|(_, n)| n)
+        .sum();
+    assert!(drawn > 0, "never drawn\n{coverage}");
+}
+
 /// #2181 2c: every application wiring shape (a shadow kept by each kind of
 /// trigger, in the same table and another, each foreign-key action, each
 /// rewrite) is drawn, on a table a definition of each key space reads. The

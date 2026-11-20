@@ -994,7 +994,29 @@ pub struct TxnWrap {
     /// Whether it runs once and rolls back before the run that commits.
     pub rehearse: bool,
     pub savepoint: Option<SavepointWrap>,
+    /// Whether it ends in `PREPARE TRANSACTION` and a `COMMIT PREPARED` or
+    /// `ROLLBACK PREPARED` instead of `COMMIT` (#2181, 2d).
+    pub prepare: Option<PrepareWrap>,
 }
+
+/// How a [`TxnWrap`] is prepared. A rolled-back prepared transaction is an
+/// oracle identity like a rehearsal: its ops run again in a transaction that
+/// commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrepareWrap {
+    /// `COMMIT PREPARED` (else `ROLLBACK PREPARED`).
+    pub commit: bool,
+    /// Whether it stays prepared, its locks held, until the burst's actions
+    /// have all fired (or [`PREPARED_HOLD_MAX`] has passed), so a restart,
+    /// pause or resume lands while it is in doubt. Only the last position
+    /// of a lane holds, so nothing of the lane waits on its locks.
+    pub hold: bool,
+}
+
+/// The longest a held prepared transaction waits for its burst's actions
+/// before it is resolved anyway, so an action that waits on old
+/// transactions can't wait forever on it.
+pub const PREPARED_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// A savepoint around `ops[start..end]` of a [`TxnWrap`]: released, or
 /// rolled back to and the ops run again inside it before the release.

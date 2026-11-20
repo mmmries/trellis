@@ -12,7 +12,7 @@ use trellis::dev::pool::Pool;
 
 use super::pause::RunKind;
 use super::{Outcome, RunError, check_op_outcome, quiesce_snapshot_and_check};
-use crate::backend::{ConcurrentBackend, DrainAudit, OpApplier};
+use crate::backend::{ConcurrentBackend, DrainAudit, HeldPrepared, OpApplier};
 use crate::invariant::{self, InRunInvariant, SampleStats};
 use crate::model::{BurstAction, ConcurrentPlan, Op, Program, TxnWrap};
 
@@ -187,6 +187,9 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         // is what an action waits on. A lane that stops at a failed op
         // counts the rest of its ops as applied, so no action waits forever.
         let progress = Arc::new(watch::channel(0usize).0);
+        // Set once the burst's actions have all fired, which releases the
+        // prepared transactions its lanes hold.
+        let actions_fired = Arc::new(watch::channel(false).0);
         // Set once one of the burst's actions starts a build (or from the
         // start, for a load paced from it): from then on, under a steady
         // load, the lanes keep to its pace.
@@ -200,20 +203,27 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
             let ops: Vec<(usize, Op)> = lane.iter().map(|&i| (i, program.ops[i].clone())).collect();
             let wraps: Vec<Option<TxnWrap>> = lane.iter().map(|i| txn_at.get(i).cloned()).collect();
             let progress = Arc::clone(&progress);
+            let actions_fired = Arc::clone(&actions_fired);
             let txn_retries = Arc::clone(&txn_retries);
             tasks.spawn(async move {
                 let mut result = Ok(());
                 let mut done = 0;
+                let mut held = None;
                 while done < ops.len() {
                     // One autocommit op, or the transaction drawn from it.
                     let step = match &wraps[done] {
                         Some(wrap) => {
                             let span = &ops[done..done + wrap.ops.len()];
                             let checked = apply_wrapped(&mut applier, wrap, span).await;
-                            if let Ok(retries) = &checked {
+                            if let Ok((retries, _)) = &checked {
                                 txn_retries.fetch_add(*retries, Ordering::Relaxed);
                             }
-                            (span.len(), checked.map(|_| ()))
+                            (
+                                span.len(),
+                                checked.map(|(_, left)| {
+                                    held = left.map(|h| (h, wrap.clone(), span.to_vec()));
+                                }),
+                            )
                         }
                         None => {
                             let (op_index, op) = &ops[done];
@@ -230,6 +240,29 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                     progress.send_modify(|n| *n += step.0);
                     if let Some(pace) = pace.filter(|_| building.load(Ordering::Relaxed)) {
                         tokio::time::sleep(pace).await;
+                    }
+                }
+                // A prepared transaction the lane left in doubt is resolved
+                // once the burst's actions have fired, or after a while.
+                if let Some((left, wrap, span)) = held {
+                    let mut fired = actions_fired.subscribe();
+                    let _ = tokio::time::timeout(
+                        crate::model::PREPARED_HOLD_MAX,
+                        fired.wait_for(|&fired| fired),
+                    )
+                    .await;
+                    let plain: Vec<Op> = span.iter().map(|(_, op)| op.clone()).collect();
+                    let finished = match applier.finish_prepared(&left, &wrap, &plain).await {
+                        Ok(applied) => applied.results.iter().zip(&span).try_for_each(
+                            |(result, (op_index, op))| check_op_outcome(*op_index, op, result),
+                        ),
+                        Err(e) => Err(RunError::Transaction {
+                            op_index: span[0].0,
+                            error: format!("finish prepared: {e:?}"),
+                        }),
+                    };
+                    if result.is_ok() {
+                        result = finished;
                     }
                 }
                 (lane_index, applier, result)
@@ -286,6 +319,8 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                     _ => {}
                 }
             }
+
+            actions_fired.send_replace(true);
 
             // Every lane runs to completion (or its own first failure) before
             // any error is reported, so no task outlives the burst.
@@ -425,12 +460,13 @@ fn txn_starts(plan: &ConcurrentPlan) -> std::collections::HashMap<usize, TxnWrap
 }
 
 /// Applies `ops` as `wrap`'s transaction and checks each op's outcome, as
-/// an autocommit op's is checked. Returns how many times it was retried.
+/// an autocommit op's is checked. Returns how many times it was retried, and the
+/// transaction if it was left prepared.
 async fn apply_wrapped<A: OpApplier>(
     applier: &mut A,
     wrap: &TxnWrap,
     ops: &[(usize, Op)],
-) -> Result<u64, RunError> {
+) -> Result<(u64, Option<HeldPrepared>), RunError> {
     let plain: Vec<Op> = ops.iter().map(|(_, op)| op.clone()).collect();
     let applied = applier
         .apply_txn(wrap, &plain)
@@ -447,7 +483,7 @@ async fn apply_wrapped<A: OpApplier>(
         ops.len(),
         "apply_txn ends its results early only at an op that failed unexpectedly"
     );
-    Ok(applied.retries)
+    Ok((applied.retries, applied.held))
 }
 
 /// The targets of `installed`'s 1-1 `JOIN` definitions, stars included,

@@ -25,7 +25,7 @@ pub use manual::{
     await_pool_usable,
 };
 pub use roles::{APP_ROLE, CaseDatabase, Roles, TRELLIS_ROLE, as_role};
-pub use sql::HeldKeys;
+pub use sql::{HeldKeys, PREPARED_GID_PREFIX};
 pub use subprocess::{
     REACH_FILE_ENV, SubprocessBackend, SubprocessBackendError, reach_request, write_reach,
 };
@@ -172,6 +172,24 @@ pub trait OpApplier: Send + 'static {
         wrap: &crate::model::TxnWrap,
         ops: &[Op],
     ) -> impl Future<Output = Result<TxnApplied, Self::Error>> + Send;
+
+    /// Resolves a transaction [`OpApplier::apply_txn`] left prepared
+    /// ([`TxnApplied::held`]): commits it, or rolls it back and applies
+    /// `ops` again in a transaction that commits, whose results it returns.
+    fn finish_prepared(
+        &mut self,
+        held: &HeldPrepared,
+        wrap: &crate::model::TxnWrap,
+        ops: &[Op],
+    ) -> impl Future<Output = Result<TxnApplied, Self::Error>> + Send;
+}
+
+/// A transaction left in `PREPARE TRANSACTION` (#2181, 2d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldPrepared {
+    pub gid: String,
+    /// Whether the program commits it (else rolls it back).
+    pub commit: bool,
 }
 
 /// What [`OpApplier::apply_txn`] did (#2181).
@@ -184,6 +202,9 @@ pub struct TxnApplied {
     /// How many times the transaction was rolled back and run again after a
     /// serialization failure or deadlock.
     pub retries: u64,
+    /// Set when the transaction is left prepared, to be resolved by
+    /// [`OpApplier::finish_prepared`] before the oracle reads the source.
+    pub held: Option<HeldPrepared>,
 }
 
 /// A [`Backend`] the concurrent tier can drive: it hands out
