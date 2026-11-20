@@ -1893,8 +1893,52 @@ pub fn add_burst_actions(
                 if one_to_one.is_empty() {
                     continue;
                 }
-                let index = one_to_one[draw.target % one_to_one.len()];
-                let pick = draw.target / one_to_one.len();
+                // The source columns no definition reads, with `live[at]`
+                // read as `swap` says, which an `ADD` reading one widens
+                // capture to.
+                let unread_with = |def: &TransformDef, swap: Option<(usize, &TransformDef)>| {
+                    let deferred = program
+                        .defs
+                        .iter()
+                        .zip(&program.def_install_after_op)
+                        .filter(|(_, at)| **at != 0)
+                        .map(|(def, _)| def);
+                    let read: std::collections::HashSet<String> = live
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| match swap {
+                            Some((at, swapped)) if at == i => swapped,
+                            _ => d,
+                        })
+                        .chain(&seconds)
+                        .chain(deferred)
+                        .filter(|d| d.source == def.source)
+                        .flat_map(columns_read)
+                        .collect();
+                    program
+                        .tables
+                        .iter()
+                        .filter(|t| t.name == def.source)
+                        .flat_map(|t| t.columns.iter().filter(|c| c.name != t.pk_col))
+                        .filter(|c| !read.contains(&c.name))
+                        .cloned()
+                        .collect::<Vec<Column>>()
+                };
+                let unread = |def: &TransformDef| unread_with(def, None);
+                // An `ADD` takes a definition it can widen when there is one:
+                // only a widen reaches the capture gate's wait.
+                let widenable: Vec<usize> = one_to_one
+                    .iter()
+                    .copied()
+                    .filter(|&i| draw.kind == ActionKind::AddField && !unread(&live[i]).is_empty())
+                    .collect();
+                let candidates = if widenable.is_empty() {
+                    &one_to_one
+                } else {
+                    &widenable
+                };
+                let index = candidates[draw.target % candidates.len()];
+                let pick = draw.target / candidates.len();
                 let def = &live[index];
                 if paired.contains(&(burst_index, def.target.clone())) {
                     continue;
@@ -1904,29 +1948,13 @@ pub fn add_burst_actions(
                 };
                 let edited = match draw.kind {
                     ActionKind::AddField => {
-                        let deferred = program
-                            .defs
-                            .iter()
-                            .zip(&program.def_install_after_op)
-                            .filter(|(_, at)| **at != 0)
-                            .map(|(def, _)| def);
-                        let read: std::collections::HashSet<String> = live
-                            .iter()
-                            .chain(&seconds)
-                            .chain(deferred)
-                            .filter(|d| d.source == def.source)
-                            .flat_map(columns_read)
-                            .collect();
                         let columns: Vec<&Column> = table
                             .columns
                             .iter()
                             .filter(|c| c.name != table.pk_col)
                             .collect();
-                        let unread: Vec<&Column> = columns
-                            .iter()
-                            .copied()
-                            .filter(|c| !read.contains(&c.name))
-                            .collect();
+                        let unread = unread(def);
+                        let unread: Vec<&Column> = unread.iter().collect();
                         let widens = !unread.is_empty();
                         let from = if widens { &unread } else { &columns };
                         let column = from[pick % from.len()];
@@ -1956,7 +1984,21 @@ pub fn add_burst_actions(
                         }
                     }
                     _ => {
-                        let fields = unread_fields(def);
+                        // A drop that leaves a column unread when there is
+                        // one: capture narrows, and a later `ADD` of it
+                        // widens it again.
+                        let all = unread_fields(def);
+                        let before = unread(def).len();
+                        let narrowing: Vec<&str> = all
+                            .iter()
+                            .copied()
+                            .filter(|field| {
+                                let mut after = def.clone();
+                                after.fields.retain(|f| f.name != *field);
+                                unread_with(def, Some((index, &after))).len() > before
+                            })
+                            .collect();
+                        let fields = if narrowing.is_empty() { all } else { narrowing };
                         if def.fields.len() < 2 || fields.is_empty() {
                             None
                         } else {
@@ -1970,10 +2012,17 @@ pub fn add_burst_actions(
                 let Some((edited, edit)) = edited else {
                     continue;
                 };
+                // An `ADD` keeps off the burst's last quarter, so writes run
+                // the old capture body while its widen waits.
+                let after = if draw.kind == ActionKind::AddField {
+                    at * 3 / 4
+                } else {
+                    at
+                };
                 paired.insert((burst_index, def.target.clone()));
                 live[index] = edited.clone();
                 pushed.push(TimedAction {
-                    after: at,
+                    after,
                     action: BurstAction::EditField {
                         def: Box::new(edited),
                         edit,
@@ -4195,10 +4244,12 @@ mod strategy {
         );
         // The definition changes (#2183) are drawn beside them, so they don't
         // thin the re-reads and pauses out. The field changes apply only to
-        // a 1-1 definition, so they too are drawn twice as often.
+        // a 1-1 definition, so they too are drawn twice as often, and an
+        // `ADD` twice as often again: only a widening one reaches the
+        // capture gate (the `field_release_before_widen` plant).
         let change = draw(
             prop_oneof![
-                2 => Just(ActionKind::AddField),
+                4 => Just(ActionKind::AddField),
                 2 => Just(ActionKind::AlterField),
                 2 => Just(ActionKind::DropField),
                 1 => Just(ActionKind::Redefine),
@@ -4306,17 +4357,24 @@ mod strategy {
                     }
                     // A field change needs a plain 1-1 definition: the last
                     // table's, so a two-table case's leaves the second table's
-                    // grain column unread for a widening `ADD` (#2183).
+                    // grain column unread for a widening `ADD` (#2183). An
+                    // `ADD` adds one there too when nothing reads that table.
                     let changes_a_field = extras.actions.iter().any(|draw| {
                         matches!(
                             draw.kind,
                             ActionKind::AddField | ActionKind::AlterField | ActionKind::DropField
                         )
                     });
-                    if changes_a_field
+                    let adds_a_field = extras
+                        .actions
+                        .iter()
+                        .any(|draw| draw.kind == ActionKind::AddField);
+                    let last = tables.len() - 1;
+                    if (changes_a_field
                         && !defs
                             .iter()
-                            .any(|(_, shape)| matches!(shape, DefShape::OneToOne))
+                            .any(|(_, shape)| matches!(shape, DefShape::OneToOne)))
+                        || (adds_a_field && last > 0 && !defs.iter().any(|(at, _)| *at == last))
                     {
                         defs.push((tables.len() - 1, DefShape::OneToOne));
                         derived.push(None);

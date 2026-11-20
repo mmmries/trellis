@@ -317,6 +317,11 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// A `DROP TRANSFORM` returned and left its target table behind, which
+    /// it drops (`docs/transforms.md`).
+    DroppedTargetRemains {
+        target: String,
+    },
     /// A statement sent through the `Trellis` facade (the
     /// operator's `RESUME TRANSFORM`) failed.
     Facade(trellis::TrellisError),
@@ -1913,6 +1918,21 @@ impl super::ConcurrentBackend for ManualBackend {
             BurstAction::Drop { target } => {
                 operator.apply(&format!("PAUSE TRANSFORM {target}")).await?;
                 operator.apply(&format!("DROP TRANSFORM {target}")).await?;
+                // The oracle stops checking the definition, so check here
+                // that the drop took its target with it.
+                if let Some(def) = self.defs.iter().find(|def| &def.target == target) {
+                    let qualified = qualified_target_table(&self.target_schema, def);
+                    let remains: bool = self
+                        .raw
+                        .query_one("select to_regclass($1) is not null", &[&qualified])
+                        .await?
+                        .get(0);
+                    if remains {
+                        return Err(ManualBackendError::DroppedTargetRemains {
+                            target: target.clone(),
+                        });
+                    }
+                }
                 self.defs.retain(|def| &def.target != target);
             }
             BurstAction::Define { def, .. } => {

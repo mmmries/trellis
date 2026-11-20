@@ -929,7 +929,7 @@ The actions, cheapest-first (every one below is built):
    redefines a field too (`model::BurstAction::Alter`). Draws resolve in
    burst order, so a later burst acts on the definitions as the earlier
    changes left them, and the oracle checks each definition as the last
-   statement left it.
+   statement left it; the backend checks that a drop took its target.
    `tests/coverage.rs` floors each change; the sweeps of both tiers gate
    `field_release_before_widen`, a field released before its capture widen
    lands.

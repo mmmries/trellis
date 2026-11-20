@@ -1090,6 +1090,110 @@ async fn every_mid_burst_action_runs_while_its_burst_writes_the_source() {
     assert!(run.outcome.as_pass(), "run did not pass: {}", run.outcome);
 }
 
+/// #2183: every definition change, taken while its burst writes the
+/// source. One hot table of 12 rows takes 240 writes in three bursts, read
+/// by a `GROUP BY` definition (`d0`) and a 1-1 definition (`d1`). The second
+/// burst drops a field of `d1`, drops `d0` and defines it again changed
+/// under a new name, and defines a second definition beside `d1`. The third
+/// adds a field to `d1` over the column the dropped field read, which widens
+/// capture again, drops the second definition, and drops and redefines `d0`
+/// once more, unchanged under its new name. Every drop must take its target
+/// with it (`ManualBackend`'s `act`).
+#[tokio::test(flavor = "multi_thread")]
+async fn every_definition_change_runs_while_its_burst_writes_the_source() {
+    const ROWS: i64 = 12;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    let mutates = (0..240)
+        .map(|i| {
+            let pk = 1 + i % ROWS;
+            if i % 3 == 0 {
+                Mutate::MoveGroup {
+                    pk,
+                    grain: Some(i % 4),
+                }
+            } else {
+                Mutate::Update {
+                    pk,
+                    c1: Some(i),
+                    c2: Some(1),
+                }
+            }
+        })
+        .collect();
+    let mut hot =
+        TableSpec::numeric_only((1..=ROWS).map(|i| (Some(i), Some(1))).collect(), mutates);
+    hot.grain_values = (1..=ROWS).map(|i| Some((i % 3).to_string())).collect();
+    let program = build_program_multi_with_shapes(
+        &[hot],
+        &[
+            (
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count, AggregateFn::Sum(AggregateColumn::C1)],
+                },
+            ),
+            (0, DefShape::OneToOne),
+        ],
+    );
+    let draw = |kind, burst, target, start| ActionDraw {
+        kind,
+        burst,
+        target,
+        start,
+        span: 300,
+    };
+    let plan = add_burst_actions(
+        concurrent_plan(&program, 84, 3),
+        &program,
+        &[
+            draw(ActionKind::DropField, 0, 0, 100),
+            // `d0` (index 0 of 2), renamed (bit 2), changed (bit 4).
+            draw(ActionKind::Redefine, 0, 6, 200),
+            draw(ActionKind::SecondDefinition, 0, 1, 400),
+            draw(ActionKind::AddField, 1, 0, 100),
+            draw(ActionKind::Redefine, 1, 0, 300),
+        ],
+    );
+    let names = |burst: usize| {
+        let mut names: Vec<&str> = plan.bursts[burst]
+            .actions
+            .iter()
+            .map(|a| a.action.name())
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert!(plan.bursts[0].actions.is_empty());
+    assert_eq!(
+        names(1),
+        [
+            "define_second",
+            "drop",
+            "drop_field",
+            "redefine_renamed_changed"
+        ]
+    );
+    assert_eq!(
+        names(2),
+        ["add_field_widen", "drop", "drop", "redefine_same"]
+    );
+
+    let mut backend = ManualBackend::connect_with_options(
+        db.dsn(),
+        4,
+        Some(std::time::Duration::from_millis(50)),
+    )
+    .await
+    .expect("connect concurrent backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
+        .await
+        .expect("every definition change must be taken and the bursts must converge");
+    assert!(run.outcome.as_pass(), "run did not pass: {}", run.outcome);
+}
+
 /// The fixture [`group_moves_converge_on_disk`] runs: one table of 12 rows
 /// spread over groups `0..3`, then 1,488 updates that each move one row to
 /// another group (`Mutate::MoveGroup`, nothing else), read by one `GROUP BY`
