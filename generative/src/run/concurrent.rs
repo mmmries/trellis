@@ -27,6 +27,11 @@ pub struct ConcurrentRun {
     /// How many times a drawn transaction (#2181) was rolled back and run
     /// again after a serialization failure or deadlock.
     pub txn_retries: u64,
+    /// How many of the burst actions started while a transaction of the
+    /// suite was in `pg_prepared_xacts` (#2181 2d): a real overlap of an
+    /// action with an in-doubt transaction, counted by reading the view as
+    /// the action starts, not drawn.
+    pub in_doubt_actions: u64,
 }
 
 /// Installs `program`, then runs `plan`'s bursts one after another. Within a
@@ -126,6 +131,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
     let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
     let txn_at = txn_starts(plan);
     let txn_retries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut in_doubt_actions = 0u64;
 
     let mut installed: Vec<TransformDef> = program
         .defs
@@ -275,9 +281,26 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         let burst_run = async {
             let mut action_error: Option<RunError> = None;
             let mut applied = progress.subscribe();
+            let holds = burst.lanes.iter().flatten().any(|i| {
+                txn_at
+                    .get(i)
+                    .is_some_and(|w| w.prepare.is_some_and(|p| p.hold))
+            });
+            let burst_ops = burst.ops().len();
             for timed in &burst.actions {
+                // A held transaction prepares as its lane ends, so a pause
+                // or resume that fires on an earlier count would land before
+                // it is in doubt: these wait for every lane's last op. A held
+                // transaction is released only once the actions have fired,
+                // so the wait ends.
+                let after = match &timed.action {
+                    BurstAction::Pause { .. } | BurstAction::Resume { .. } if holds => {
+                        timed.after.max(burst_ops)
+                    }
+                    _ => timed.after,
+                };
                 applied
-                    .wait_for(|&n| n >= timed.after)
+                    .wait_for(|&n| n >= after)
                     .await
                     .expect("this task holds the sender");
                 if timed.action.starts_build() {
@@ -286,6 +309,9 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                 // The sampler stops reading a target before it is dropped.
                 if let BurstAction::Drop { target } = &timed.action {
                     sampled.borrow_mut().retain(|t| t != target);
+                }
+                if holds && prepared_in_doubt(pool).await {
+                    in_doubt_actions += 1;
                 }
                 if let Err(e) = backend.act(program, &timed.action).await {
                     action_error = Some(RunError::BurstAction {
@@ -424,6 +450,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         drain,
         invariant: stats,
         txn_retries: txn_retries.load(Ordering::Relaxed),
+        in_doubt_actions,
     })
 }
 
@@ -550,6 +577,21 @@ impl Drop for CommitStallGuard {
     fn drop(&mut self) {
         trellis::dev::interleave::set_commit_stall(None);
     }
+}
+
+/// Whether a transaction of the suite is in `pg_prepared_xacts` now.
+async fn prepared_in_doubt(pool: &Pool) -> bool {
+    let Ok(client) = pool.get().await else {
+        return false;
+    };
+    client
+        .query_opt(
+            "select 1 from pg_prepared_xacts \
+             where database = current_database() and gid like $1 limit 1",
+            &[&format!("{}%", crate::backend::PREPARED_GID_PREFIX)],
+        )
+        .await
+        .is_ok_and(|row| row.is_some())
 }
 
 #[cfg(test)]

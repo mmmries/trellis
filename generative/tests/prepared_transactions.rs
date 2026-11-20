@@ -231,3 +231,75 @@ async fn a_failing_held_transaction_is_not_left_prepared() {
     }
     check_none_prepared(&oracle).await.expect("none left");
 }
+
+/// Generated mid-burst cases whose plan holds a prepared transaction in a
+/// burst that pauses or resumes: the first `want` of a deterministic sample.
+fn held_pause_cases(want: usize) -> Vec<generative::generate::ConcurrentCase> {
+    use generative::generate::mid_burst_case;
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+    let strategy = mid_burst_case();
+    let mut runner = TestRunner::deterministic();
+    let mut found = Vec::new();
+    for _ in 0..4000 {
+        let case = strategy.new_tree(&mut runner).expect("a case").current();
+        let txns = &case.plan.txns;
+        let held = |first: usize| {
+            txns.iter()
+                .any(|t| t.ops[0] == first && t.prepare.is_some_and(|p| p.hold))
+        };
+        let wanted = case.plan.bursts.iter().any(|b| {
+            b.lanes.iter().flatten().any(|&i| held(i))
+                && b.actions.iter().any(|a| {
+                    matches!(
+                        a.action,
+                        BurstAction::Pause { .. } | BurstAction::Resume { .. }
+                    )
+                })
+        });
+        if wanted {
+            found.push(case);
+            if found.len() == want {
+                break;
+            }
+        }
+    }
+    assert_eq!(found.len(), want, "too few generated held-pause cases");
+    found
+}
+
+/// #2181 2d, the floor on real overlap: in generated cases that draw a held
+/// transaction in a burst that pauses or resumes, an action starts while a
+/// gid is in `pg_prepared_xacts` (read by the runner as the action starts),
+/// in every such case.
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_actions_run_while_a_transaction_is_in_doubt() {
+    let cluster = TestCluster::start();
+    let mut overlapped = 0;
+    let cases = held_pause_cases(4);
+    for (n, case) in cases.iter().enumerate() {
+        let db = CaseDatabase::provision(&cluster).await;
+        let mut backend = ManualBackend::connect_as_with_options(
+            db.roles(),
+            case.workers,
+            Some(std::time::Duration::from_millis(case.seal_interval_ms)),
+        )
+        .await
+        .expect("connect backend");
+        if let Some(rows) = case.build_chunk_rows {
+            backend.set_build_chunk_rows(rows);
+        }
+        let oracle =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let run = run_convergence_concurrent(&mut backend, &oracle, &case.program, &case.plan)
+            .await
+            .unwrap_or_else(|e| panic!("case {n}: {e:?}"));
+        assert!(run.outcome.as_pass(), "case {n}: {}", run.outcome);
+        assert!(
+            run.in_doubt_actions > 0,
+            "case {n}: no action ran while a transaction was in doubt"
+        );
+        overlapped += run.in_doubt_actions;
+    }
+    assert!(overlapped >= cases.len() as u64);
+}
