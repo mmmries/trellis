@@ -157,6 +157,14 @@ pub struct Coverage {
     /// changes, `a`'s updates and every joined table's writes alike. An
     /// empty bucket is coverage that dropped out.
     pub where_crossings: HashMap<(&'static str, &'static str), usize>,
+    /// How many recorded concurrent-tier cases draw each transaction or
+    /// statement-form shape (#2181) on a table a definition of each key
+    /// space reads, keyed `(shape, key space)`
+    /// ([`crate::generate::txn_shapes::shapes`]).
+    pub txn_shapes: HashMap<(&'static str, &'static str), usize>,
+    /// How many times the recorded runs' drawn transactions were rolled back
+    /// and run again after a serialization failure or deadlock.
+    pub txn_retries: u64,
 }
 
 impl Coverage {
@@ -270,6 +278,9 @@ impl Coverage {
         }
         for shape in concurrent_shapes(program, plan) {
             *self.concurrent_shape_cases.entry(shape.name()).or_insert(0) += 1;
+        }
+        for shape in crate::generate::txn_shapes::shapes(program, plan) {
+            *self.txn_shapes.entry(shape).or_insert(0) += 1;
         }
     }
 
@@ -469,7 +480,7 @@ fn apply_to_rows(op: &Op, pk_col: &str, rows: &mut HashMap<String, SimRow>) {
             .and_then(|(_, v)| v.clone())
     };
     let to_row = |row: &[(String, Option<String>)]| row.iter().cloned().collect::<SimRow>();
-    match op {
+    match op.write() {
         Op::Insert { row, .. } => {
             if let Some(pk) = pk_of(row)
                 && !rows.contains_key(&pk)
@@ -507,6 +518,9 @@ fn apply_to_rows(op: &Op, pk_col: &str, rows: &mut HashMap<String, SimRow>) {
         // maintenance as touching nothing.
         Op::Leaf { op, .. } => apply_to_rows(op, pk_col, rows),
         Op::Partition { .. } => {}
+        Op::Upsert { .. } | Op::Merge { .. } | Op::Cte { .. } => {
+            unreachable!("Op::write unwraps a statement form")
+        }
     }
 }
 
@@ -540,7 +554,7 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                     .map_or(&[], |k| k.columns.as_slice());
                 let mut rows: HashMap<String, SimRow> = HashMap::new();
                 for op in program.ops.iter().filter(|op| op.table() == def.source) {
-                    let write = match op {
+                    let write = match op.write() {
                         Op::Leaf { op, .. } => op,
                         op => op,
                     };
@@ -605,7 +619,7 @@ pub fn where_crossings(program: &Program) -> HashMap<(&'static str, &'static str
                     };
                     let mut rows: HashMap<String, SimRow> = HashMap::new();
                     for op in program.ops.iter().filter(|op| op.table() == table) {
-                        if let Op::Update { pk, .. } = op
+                        if let Op::Update { pk, .. } = op.write()
                             && let Some(row) = rows.get(pk)
                         {
                             let before = member(row);
@@ -840,7 +854,7 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
     // reads, for `CoolingKey`.
     let mut last_write: HashMap<(&str, String), usize> = HashMap::new();
     for (index, op) in program.ops.iter().enumerate() {
-        let (table, pk) = match op {
+        let (table, pk) = match op.write() {
             Op::Insert { table, row, .. } => {
                 let pk_col = pk_cols.get(table.as_str()).copied().unwrap_or_default();
                 let pk = row
@@ -855,7 +869,10 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
             Op::Truncate { .. }
             | Op::BulkInsert { .. }
             | Op::Leaf { .. }
-            | Op::Partition { .. } => continue,
+            | Op::Partition { .. }
+            | Op::Upsert { .. }
+            | Op::Merge { .. }
+            | Op::Cte { .. } => continue,
         };
         if let Some(pk) = pk {
             last_write.insert((table.as_str(), pk), index);
@@ -901,7 +918,7 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
             // Only the rows `op` can reach are copied: a hot-key case replays
             // thousands of ops, nearly all of them on one row.
             let rows = state.entry(table).or_default();
-            let mut pks: Vec<String> = match op {
+            let mut pks: Vec<String> = match op.write() {
                 Op::Insert { row, .. } => row
                     .iter()
                     .filter(|(c, _)| c == pk_col)
@@ -913,9 +930,12 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
                     .filter_map(|(_, v)| v.clone())
                     .collect(),
                 Op::Update { pk, .. } | Op::Delete { pk, .. } => vec![pk.clone()],
-                Op::Truncate { .. } | Op::Leaf { .. } | Op::Partition { .. } => {
-                    rows.keys().cloned().collect()
-                }
+                Op::Truncate { .. }
+                | Op::Leaf { .. }
+                | Op::Partition { .. }
+                | Op::Upsert { .. }
+                | Op::Merge { .. }
+                | Op::Cte { .. } => rows.keys().cloned().collect(),
             };
             pks.sort_unstable();
             pks.dedup();
@@ -930,7 +950,7 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
             for pk in &pks {
                 let (old, new) = (before.get(pk), after.get(pk));
                 let touched = old != new
-                    || (new.is_some() && matches!(op, Op::Update { pk: p, .. } if p == pk));
+                    || (new.is_some() && matches!(op.write(), Op::Update { pk: p, .. } if p == pk));
                 if !touched {
                     continue;
                 }
@@ -1082,6 +1102,9 @@ fn numeric_nan_writes(program: &Program, op: &Op) -> usize {
         Op::Update { table, changes, .. } => nans(table, changes),
         Op::BulkInsert { table, rows, .. } => rows.iter().map(|row| nans(table, row)).sum(),
         Op::Leaf { op, .. } => numeric_nan_writes(program, op),
+        Op::Upsert { op, .. } | Op::Merge { op, .. } | Op::Cte { op, .. } => {
+            numeric_nan_writes(program, op)
+        }
         _ => 0,
     }
 }
@@ -1095,6 +1118,9 @@ fn op_kind(op: &Op) -> &'static str {
         Op::BulkInsert { .. } => "BulkInsert",
         Op::Leaf { .. } => "Leaf",
         Op::Partition { .. } => "Partition",
+        Op::Upsert { .. } => "Upsert",
+        Op::Merge { .. } => "Merge",
+        Op::Cte { .. } => "Cte",
     }
 }
 
@@ -1107,7 +1133,8 @@ fn op_outcome_name(outcome: &OpOutcome) -> &'static str {
     }
 }
 
-fn key_space_name(key_space: &KeySpace) -> &'static str {
+/// The name coverage reports a key space under.
+pub fn key_space_name(key_space: &KeySpace) -> &'static str {
     match key_space {
         KeySpace::Join(_) => "Join",
         KeySpace::JoinOneToOne(_) => "JoinOneToOne",
@@ -1157,7 +1184,11 @@ fn partition_op_name(program: &Program, op: &Op) -> Option<&'static str> {
             Op::Insert { .. } | Op::BulkInsert { .. } => Some("leaf_insert"),
             Op::Update { .. } => Some("leaf_update"),
             Op::Delete { .. } => Some("leaf_delete"),
-            Op::Leaf { .. } | Op::Partition { .. } => None,
+            Op::Leaf { .. }
+            | Op::Partition { .. }
+            | Op::Upsert { .. }
+            | Op::Merge { .. }
+            | Op::Cte { .. } => None,
         },
         Op::Update {
             table,
@@ -1362,7 +1393,15 @@ impl fmt::Display for Coverage {
         for ((key_space, bucket), count) in crossings {
             write!(f, " {key_space}:{bucket}={count}")?;
         }
-        writeln!(f)
+        writeln!(f)?;
+        write!(f, "txn_shapes:")?;
+        let mut shapes: Vec<_> = self.txn_shapes.iter().collect();
+        shapes.sort_unstable();
+        for ((shape, key_space), count) in shapes {
+            write!(f, " {shape}:{key_space}={count}")?;
+        }
+        writeln!(f)?;
+        writeln!(f, "txn_retries: {}", self.txn_retries)
     }
 }
 

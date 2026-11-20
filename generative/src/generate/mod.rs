@@ -136,6 +136,7 @@ pub mod join_one_to_one;
 pub mod min_max;
 pub mod partition;
 pub mod source_key;
+pub mod txn_shapes;
 pub mod where_clause;
 
 use std::collections::HashMap;
@@ -1711,6 +1712,7 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
         steady_load: None,
         settle_after_install: false,
         commit_stall: None,
+        txns: Vec::new(),
     };
     for (def, &at) in program.def_install_after_op.iter().enumerate() {
         if at == 0 {
@@ -2534,7 +2536,12 @@ fn op_touches_whole_table(op: &Op) -> bool {
     match op {
         Op::Truncate { .. } | Op::BulkInsert { .. } | Op::Partition { .. } => true,
         Op::Leaf { op, .. } => op_touches_whole_table(op),
-        Op::Insert { .. } | Op::Update { .. } | Op::Delete { .. } => false,
+        Op::Insert { .. }
+        | Op::Update { .. }
+        | Op::Delete { .. }
+        | Op::Upsert { .. }
+        | Op::Merge { .. }
+        | Op::Cte { .. } => false,
     }
 }
 
@@ -2559,7 +2566,9 @@ fn op_pk_value(op: &Op, table: &Table) -> Option<String> {
             .find(|(name, _)| name == &table.pk_col)
             .and_then(|(_, value)| value.clone()),
         Op::Update { pk, .. } | Op::Delete { pk, .. } => Some(pk.clone()),
-        Op::Leaf { op, .. } => op_pk_value(op, table),
+        Op::Leaf { op, .. } | Op::Upsert { op, .. } | Op::Merge { op, .. } | Op::Cte { op, .. } => {
+            op_pk_value(op, table)
+        }
         Op::Truncate { .. } | Op::BulkInsert { .. } | Op::Partition { .. } => None,
     }
 }
@@ -2617,7 +2626,10 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
             Op::Truncate { .. } | Op::BulkInsert { .. } => None,
             // ADR-0017: a write naming a leaf lands in the same group as
             // through the root; partition maintenance can touch any group.
-            Op::Leaf { op, .. } => target_key_for(def, table, op),
+            Op::Leaf { op, .. }
+            | Op::Upsert { op, .. }
+            | Op::Merge { op, .. }
+            | Op::Cte { op, .. } => target_key_for(def, table, op),
             Op::Partition { .. } => None,
         },
     }
@@ -4487,6 +4499,9 @@ mod strategy {
                     }
                 },
             )
+            // Transaction shapes and statement forms (#2181), derived from
+            // the program, so the draws are what they were.
+            .prop_map(crate::generate::txn_shapes::widen_case)
     }
 
     /// An [`interleave_tables`] schedule that spreads every table's ops

@@ -981,6 +981,17 @@ pub enum Plant {
     /// Pinned by `group_basis_where`'s
     /// `an_image_without_the_predicate_column_fails_the_page`.
     GbWhereColumnNotImaged,
+    /// The capture functions read the active ring slot from
+    /// `segment_pointer` (`capture::sql`'s `function_body`), not from the
+    /// `ring_slot_mirror` sequence. At `REPEATABLE READ` or `SERIALIZABLE`
+    /// the table answers from the transaction's snapshot: a transaction that
+    /// read before a seal and writes after it stages its rows in a slot
+    /// already sealed, above the batch's fence, where no batch claims them.
+    /// The generative tier reaches it through its drawn transactions (#2181).
+    ///
+    /// Pinned by `capture_install`'s
+    /// `a_repeatable_read_writer_is_captured_into_a_batch_that_claims_it`.
+    CaptureSlotFromSnapshot,
     /// #2183 (`field_release_before_widen`): a field build releases a field
     /// an `ALTER TRANSFORM … ADD` or `ALTER` holds out of Apply until its
     /// source's capture images the column it reads, without waiting for the
@@ -1114,6 +1125,7 @@ impl Plant {
         Plant::JoinWhereMUnfiltered,
         Plant::O2oWhereColumnNotImaged,
         Plant::GbWhereColumnNotImaged,
+        Plant::CaptureSlotFromSnapshot,
         Plant::FieldReleaseBeforeWiden,
         Plant::FenceXid32,
         Plant::NullKeyAsEmpty,
@@ -1215,6 +1227,7 @@ impl Plant {
             Plant::JoinWhereMUnfiltered => "join_where_m_unfiltered",
             Plant::O2oWhereColumnNotImaged => "o2o_where_column_not_imaged",
             Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
+            Plant::CaptureSlotFromSnapshot => "capture_slot_from_snapshot",
             Plant::FieldReleaseBeforeWiden => "field_release_before_widen",
 
             Plant::FenceXid32 => "fence_xid32",
@@ -1240,6 +1253,7 @@ impl Plant {
                 | Plant::StarReadsFirstOnly
                 | Plant::Join1FanOutHeldRow
                 | Plant::SeamTokenEarly
+                | Plant::CaptureSlotFromSnapshot
         )
     }
 }

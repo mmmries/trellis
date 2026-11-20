@@ -355,6 +355,10 @@ fn chained_sweep_tier() -> SweepTier {
          tiers gate; this tier gates the seam's feed to a JOIN reading a target",
     )
     .chain(not_on_path(
+        &[PlantPath::Capture],
+        generative::plant_sweep::NO_CAPTURE,
+    ))
+    .chain(not_on_path(
         &[PlantPath::Isolation],
         generative::plant_sweep::NO_ISOLATION,
     ))

@@ -153,7 +153,7 @@ impl JoinCoverage {
             *self.definitions.entry(shape).or_insert(0) += 1;
         }
         for op in &case.program.ops {
-            let table = match op {
+            let table = match op.write() {
                 Op::Insert { table, .. } | Op::Update { table, .. } | Op::Delete { table, .. } => {
                     table
                 }
@@ -425,6 +425,10 @@ fn join_sweep_tier() -> SweepTier {
     not_gated.extend(not_on_path(
         &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
         generative::plant_sweep::NO_EXTREMES,
+    ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::Capture],
+        generative::plant_sweep::NO_CAPTURE,
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::Isolation],

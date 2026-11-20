@@ -1807,6 +1807,21 @@ impl super::OpApplier for ManualApplier {
                 sql::ApplyOpError::Db(err) => ManualBackendError::Db(err),
             })
     }
+
+    async fn apply_txn(
+        &mut self,
+        wrap: &crate::model::TxnWrap,
+        ops: &[Op],
+    ) -> Result<super::TxnApplied, ManualBackendError> {
+        sql::apply_txn(&mut self.raw, &self.tables, wrap, ops)
+            .await
+            .map_err(|err| match err {
+                sql::ApplyOpError::UnknownTable(table) => {
+                    ManualBackendError::UnknownTable { table }
+                }
+                sql::ApplyOpError::Db(err) => ManualBackendError::Db(err),
+            })
+    }
 }
 
 /// The drain audit's tables, triggers and trigger functions,

@@ -144,6 +144,9 @@ pub fn key_source(mut program: Program, draw: &KeyDraw) -> Program {
     let (mut inserted, mut updated) = (0, 0);
     for op in program.ops.iter_mut().filter(|op| op.table() == name) {
         match op {
+            Op::Upsert { .. } | Op::Merge { .. } | Op::Cte { .. } => {
+                unreachable!("statement forms are derived after the key")
+            }
             Op::Insert { row, .. } => {
                 row.extend(with_key(&draw.inserts[inserted % draw.inserts.len()]));
                 inserted += 1;
@@ -207,6 +210,9 @@ pub fn resimulate(program: &mut Program, name: &str) {
     };
     for op in program.ops.iter_mut().filter(|op| op.table() == name) {
         let outcome = match op {
+            Op::Upsert { .. } | Op::Merge { .. } | Op::Cte { .. } => {
+                unreachable!("statement forms are derived after the key")
+            }
             Op::Insert { row, .. } => {
                 let pk = pk_of(row, &pk_col);
                 let k = written_key(&key, row).expect("an insert writes the key");

@@ -23,8 +23,8 @@ use generative::generate::join_chained::chained_case_strategy;
 use generative::generate::join_one_to_one::{
     MAX_TABLES, OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, STAR_COMMIT_STALL_MS,
     STAR_LOCK_STEP_STALL_MS, STAR_MAX_FAN_OUT_CHUNK_ROWS, STAR_MAX_PACE_MICROS,
-    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program,
-    one_to_one_case_strategy, own_key_column, star_case_strategy, star_definition_text, table_at,
+    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program, own_key_column,
+    star_case_strategy, star_definition_text, table_at,
 };
 use generative::model::{Op, Program, Table};
 use proptest::strategy::Strategy;
@@ -78,23 +78,25 @@ fn digests(strategy: &proptest::strategy::BoxedStrategy<JoinCase>) -> Vec<u64> {
 /// The two-table 1-1 JOIN tier and the chained-reader tier draw, seed for
 /// seed, the cases they drew before the generator took positions: the
 /// digests of their sweep budget's cases (4 seeds × 12), recorded on the
-/// generator before the star tier (#1781), and for the two-table tier again
-/// when it began drawing redefinitions (#2183). A change that means to
-/// change what they draw updates these. The two-table tier's derived
-/// `KEY (...)` arm (#2171) is left out, as the `WHERE` is: each of its cases
-/// is its unkeyed twin, keyed or not.
+/// generator before the star tier (#1781), and again when the derived
+/// transactions and statement forms changed how they issue their ops
+/// (#2181) and, for the two-table tier, when it began drawing redefinitions
+/// (#2183). A change that means to change what they draw updates these. The
+/// two-table tier's derived `KEY (...)` arm (#2171) is left out, as the
+/// `WHERE` is: each of its cases is its unkeyed twin, keyed or not.
 #[test]
 fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
     use generative::generate::join_one_to_one::{
-        derived_key_draw, key_joined, unkeyed_one_to_one_case_strategy,
+        derived_key_draw, key_joined, unkeyed_one_to_one_case_strategy, unwidened_one_to_one_cases,
     };
-    let (keyed, unkeyed) = (
-        one_to_one_case_strategy().boxed(),
-        unkeyed_one_to_one_case_strategy().boxed(),
+    let unkeyed = unkeyed_one_to_one_case_strategy().boxed();
+    let (keyed_bare, unkeyed_bare) = (
+        unwidened_one_to_one_cases(Some(false)).boxed(),
+        unwidened_one_to_one_cases(None).boxed(),
     );
     for seed in 1..=4 {
-        let twins = generative::plant_sweep::seeded_cases(&unkeyed, seed, 12);
-        for (case, twin) in generative::plant_sweep::seeded_cases(&keyed, seed, 12)
+        let twins = generative::plant_sweep::seeded_cases(&unkeyed_bare, seed, 12);
+        for (case, twin) in generative::plant_sweep::seeded_cases(&keyed_bare, seed, 12)
             .into_iter()
             .zip(twins)
         {
@@ -109,19 +111,19 @@ fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
     assert_eq!(
         digests(&unkeyed),
         [
-            4_985_686_412_385_817_550,
-            10_248_547_661_753_428_030,
-            7_590_271_726_177_765_789,
-            6_701_061_445_033_985_455
+            11_131_835_481_847_433_720,
+            17_540_472_921_829_412_727,
+            17_416_625_543_817_065_337,
+            17_207_699_182_753_301_206
         ]
     );
     assert_eq!(
         digests(&chained_case_strategy().boxed()),
         [
-            13_184_901_160_770_402_170,
-            5_538_369_240_495_716_062,
-            8_137_699_462_753_141_007,
-            1_132_712_386_592_658_724
+            2_494_047_860_043_232_346,
+            2_112_652_516_905_704_222,
+            15_028_786_216_076_697_068,
+            17_482_332_216_544_625_726
         ]
     );
 }
@@ -135,7 +137,7 @@ fn star_cases() -> Vec<StarCase> {
 }
 
 fn op_table(op: &Op) -> &str {
-    match op {
+    match op.write() {
         Op::Insert { table, .. }
         | Op::Update { table, .. }
         | Op::Delete { table, .. }
@@ -228,7 +230,7 @@ fn the_star_strategy_draws_root_rows_hot_at_several_positions() {
     let (mut root_writes, mut hot, mut hot_at_two, mut hot_at_three) = (0, 0, 0, 0);
     for case in star_cases().iter().filter(|c| c.tables >= 3) {
         for op in &case.case.program.ops {
-            let columns = match op {
+            let columns = match op.write() {
                 Op::Insert { table, row, .. } if table == "ja" => row,
                 Op::Update { table, changes, .. } if table == "ja" => changes,
                 _ => continue,
@@ -263,7 +265,7 @@ fn the_star_strategy_draws_mixed_pages_spanning_positions() {
     let (mut tiles, mut spanning, mut late_last) = (0, 0, 0);
     for case in star_cases().iter().filter(|c| c.tables >= 3) {
         let key_of = |op: &Op| -> Option<(u8, String)> {
-            let (table, columns) = match op {
+            let (table, columns) = match op.write() {
                 Op::Insert { table, row, .. } => (table, row),
                 Op::Update { table, changes, .. } => (table, changes),
                 _ => return None,
@@ -409,7 +411,7 @@ fn the_star_strategy_draws_one_position_moves_and_tail_races() {
             let hot: BTreeSet<(&str, &str)> = tail
                 .iter()
                 .filter_map(|op| {
-                    let (table, columns) = match op {
+                    let (table, columns) = match op.write() {
                         Op::Insert { table, row, .. } => (table, row),
                         Op::Update { table, changes, .. } => (table, changes),
                         _ => return None,
@@ -438,7 +440,7 @@ fn star_streams_keep_each_joined_key_unique_and_on_one_lane() {
         let mut model = Model::new(&case.case.program.tables);
         for (index, op) in case.case.program.ops.iter().enumerate() {
             model.apply(op);
-            let (table, id) = match op {
+            let (table, id) = match op.write() {
                 Op::Insert { table, row, .. } => (table, written(row, "id").unwrap().to_string()),
                 Op::Update {
                     table, pk, changes, ..
@@ -500,7 +502,7 @@ impl Model {
     }
 
     fn apply(&mut self, op: &Op) {
-        match op {
+        match op.write() {
             Op::Insert { table, row, .. } => {
                 let row: Row = row.iter().cloned().collect();
                 let id = row["id"].clone().expect("an id");
@@ -635,7 +637,7 @@ fn literal(value: &Option<String>) -> String {
 
 fn op_sql(op: &Op) -> String {
     let ident = |name: &str| format!("\"{name}\"");
-    match op {
+    match op.write() {
         Op::Insert { table, row, .. } => format!(
             "insert into {} ({}) values ({})",
             ident(table),

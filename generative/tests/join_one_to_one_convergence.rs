@@ -142,7 +142,7 @@ impl OneToOneCoverage {
             *self.definitions.entry(shape).or_insert(0) += 1;
         }
         for op in &case.program.ops {
-            let (table, row) = match op {
+            let (table, row) = match op.write() {
                 Op::Insert { table, row, .. } => (table, Some(row)),
                 Op::Update { table, .. } | Op::Delete { table, .. } => (table, None),
                 Op::Truncate { table, .. } => {
@@ -913,6 +913,10 @@ fn sweep_tier(
     not_gated.extend(not_on_path(
         &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
         generative::plant_sweep::NO_EXTREMES,
+    ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::Capture],
+        generative::plant_sweep::NO_CAPTURE,
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::Isolation],

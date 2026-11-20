@@ -110,6 +110,10 @@ pub enum PlantPath {
     /// the source (its side 7). Only a tier that audits a `MIN`/`MAX`
     /// definition by `self_check` reaches it.
     SelfCheckExtremes,
+    /// Capture of a source write into the ring, ahead of every definition's
+    /// apply path: a target of any key space can go wrong. Only a drawn
+    /// transaction (#2181) holds the snapshot it needs.
+    Capture,
     /// The drain's isolation of a failing page (`staging::quarantine`): a
     /// page that no key fails alone, but one definition's share of it does.
     /// Only the held-key tier's isolation draw makes such a page. A plant
@@ -227,6 +231,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarHeldOriginFirstOnly
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
+        Plant::CaptureSlotFromSnapshot => PlantPath::Capture,
         Plant::IsolationPausesEveryReader => PlantPath::Isolation,
         Plant::FenceXid32 => PlantPath::XidEpoch,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
@@ -248,9 +253,9 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
-        // A reader of a target, or of a failing page, or of a keyed source,
-        // can be of any kind.
-        PlantPath::Chain | PlantPath::Isolation | PlantPath::SourceKey => true,
+        // A reader of a target, a capture's, a failing page's or a keyed source can be
+        // of any kind.
+        PlantPath::Chain | PlantPath::Capture | PlantPath::Isolation | PlantPath::SourceKey => true,
         // Every target drains through the fenced read.
         PlantPath::XidEpoch => true,
     }
@@ -867,6 +872,12 @@ pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggr
      GENERATIVE_PLANT_TIER=min_max) and the tampering tier (self_check_cross_check.rs, \
      extremes_tamper_planted_bugs_are_caught) draw";
 
+/// Why a tier other than the hot-key-based concurrent tiers doesn't gate a
+/// capture plant.
+pub const NO_CAPTURE: &str = "it breaks capture under a drawn transaction (#2181), which \
+     every concurrent tier draws; the cooling-key tier (concurrent_convergence.rs, \
+     planted_bugs_are_caught) gates it";
+
 /// Why a tier that draws no table read through a nullable `KEY (...)`, or
 /// draws one only now and then, doesn't run its plants
 /// ([`PlantPath::SourceKey`]).
@@ -1023,6 +1034,7 @@ mod tests {
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
                 PlantPath::Chain
+                | PlantPath::Capture
                 | PlantPath::Isolation
                 | PlantPath::XidEpoch
                 | PlantPath::SourceKey => {

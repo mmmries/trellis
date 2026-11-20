@@ -849,10 +849,21 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
             column_probe("count(*)", &spec.columns),
         ));
     }
+    #[allow(unused_mut)]
+    let mut slot_read = format!("pg_sequence_last_value(({mirror})::regclass)::smallint");
+    // Planted bug: the slot comes from `segment_pointer`, at the writer's
+    // snapshot. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(crate::plant::Plant::CaptureSlotFromSnapshot, true) {
+        slot_read = format!(
+            "(select ring_slot from {}.segment_pointer)",
+            quote_ident(schema)
+        );
+    }
     body.push_str(&format!(
         "    -- The xid is assigned in the same expression that reads the mirror.\n    \
          slot := case when pg_current_xact_id() is not null\n        \
-         then pg_sequence_last_value(({mirror})::regclass)::smallint end;\n    \
+         then {slot_read} end;\n    \
          l := pg_current_wal_insert_lsn();\n    \
          ts := clock_timestamp();\n"
     ));

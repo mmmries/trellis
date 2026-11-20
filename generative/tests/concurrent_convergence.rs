@@ -594,6 +594,7 @@ fn run_concurrent_case(
             match run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan).await {
                 Ok(run) => {
                     coverage.borrow_mut().record_drain(&run.drain);
+                    coverage.borrow_mut().txn_retries += run.txn_retries;
                     if run.outcome.as_pass() {
                         Ok(())
                     } else {
@@ -1713,7 +1714,16 @@ const NO_BUILD_OVER_ROWS: (&str, &str) = (
      cases, caught in none); the mid-burst and steady-load tiers gate it",
 );
 const COOLING_KEY_NOT_GATED: &[(&str, &str)] = &[NO_BUILD_OVER_ROWS];
-const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[NO_BUILD_OVER_ROWS];
+const HOT_KEY_NOT_GATED: &[(&str, &str)] = &[NO_BUILD_OVER_ROWS, SLOW_SEALS_CAPTURE];
+
+/// Why the hot-key and steady-load tiers don't gate
+/// `capture_slot_from_snapshot` (logbook `20261119T221107-a-sweep`).
+const SLOW_SEALS_CAPTURE: (&str, &str) = (
+    "capture_slot_from_snapshot",
+    "it needs two seals between a transaction's first read and its first write, and the \
+     tier seals every 20 to 200ms, longer than a transaction waits (caught in 3 and 2 of \
+     12); the cooling-key (12 of 12), cooling-backfill (7) and mid-burst (6) tiers gate it",
+);
 const MID_BURST_NOT_GATED: &[(&str, &str)] = &[];
 
 /// The cooling-backfill tier's programs are the hot table and the cooling
@@ -1742,7 +1752,7 @@ const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[
          steady-load tiers gate it",
     ),
 ];
-const STEADY_LOAD_NOT_GATED: &[(&str, &str)] = &[];
+const STEADY_LOAD_NOT_GATED: &[(&str, &str)] = &[SLOW_SEALS_CAPTURE];
 
 /// The 1-1 plants no tier gates, each pinned by deterministic tests
 /// instead: no random schedule opens its window, or its bug never reaches
@@ -2127,6 +2137,7 @@ fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
             PlantPath::Join,
             PlantPath::OneToOneJoin,
             PlantPath::Chain,
+            PlantPath::Capture,
             PlantPath::SourceKey,
         ],
         "the min_max tier gates the MIN/MAX extremes' plants; the plant's own path is \

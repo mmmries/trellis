@@ -1481,7 +1481,7 @@ pub fn star_case(
 #[cfg(feature = "proptest")]
 pub use strategy::{
     joined_key_case_strategy, one_to_one_case_strategy, star_case_strategy,
-    unkeyed_one_to_one_case_strategy,
+    unkeyed_one_to_one_case_strategy, unwidened_one_to_one_cases,
 };
 
 #[cfg(feature = "proptest")]
@@ -1686,6 +1686,15 @@ pub(crate) mod strategy {
     /// as [`derived_key_draw`] derives it (`Some(always)`), or never
     /// (`None`).
     fn one_to_one_cases(keyed: Option<bool>) -> impl Strategy<Value = JoinCase> {
+        // Transaction shapes and statement forms (#2181), derived from the
+        // program, so the draws are what they were.
+        unwidened_one_to_one_cases(keyed).prop_map(crate::generate::txn_shapes::widen_join)
+    }
+
+    /// [`one_to_one_cases`] before [`crate::generate::txn_shapes::widen_join`]:
+    /// `tests/join_star_tier.rs` compares a keyed case with its unkeyed twin
+    /// here, where the forms haven't yet been derived from either.
+    pub fn unwidened_one_to_one_cases(keyed: Option<bool>) -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             1 => Just(KeyShape::Spread),
             1 => Just(KeyShape::HotKey),
@@ -1891,6 +1900,13 @@ pub(crate) mod strategy {
     /// any table. One case in four also runs its metamorphic twin, under a
     /// drawn `JOIN` order.
     pub fn star_case_strategy() -> impl Strategy<Value = StarCase> {
+        // Transaction shapes and statement forms (#2181), derived from the
+        // program, so the draws are what they were.
+        unwidened_star_cases().prop_map(crate::generate::txn_shapes::widen_star)
+    }
+
+    /// [`star_case_strategy`]'s cases before [`crate::generate::txn_shapes::widen_star`].
+    fn unwidened_star_cases() -> impl Strategy<Value = StarCase> {
         (2usize..=MAX_TABLES).prop_flat_map(|tables| {
             let positions = (1..tables as u8).collect::<Vec<u8>>();
             (
@@ -2078,7 +2094,7 @@ mod tests {
             program
                 .ops
                 .iter()
-                .filter_map(|op| match op {
+                .filter_map(|op| match op.write() {
                     Op::Insert { table, row, .. } if table == wanted => Some(key_of(row, column)),
                     _ => None,
                 })
@@ -2308,7 +2324,7 @@ mod tests {
                         assert!(keyed.is_some(), "seed {seed} op {index}: {op:?}");
                         continue;
                     }
-                    let (table, written) = match op {
+                    let (table, written) = match op.write() {
                         Op::Insert { table, row, .. } => {
                             let side = usize::from(table == JOINED_TABLE);
                             let row: Row = row.iter().cloned().collect();
@@ -2525,7 +2541,7 @@ mod tests {
             let keys: Vec<Option<String>> = program
                 .ops
                 .iter()
-                .filter_map(|op| match op {
+                .filter_map(|op| match op.write() {
                     Op::Insert { table, row, .. } if table == table_at(position) => {
                         Some(key_of(row, "u"))
                     }

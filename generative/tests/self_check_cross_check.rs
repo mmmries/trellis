@@ -1378,6 +1378,7 @@ fn extremes_tamper_sweep_tier() -> SweepTier {
             PlantPath::OneToOneJoin,
             PlantPath::Chain,
             PlantPath::Extremes,
+            PlantPath::Capture,
             PlantPath::Isolation,
             PlantPath::SourceKey,
         ],
