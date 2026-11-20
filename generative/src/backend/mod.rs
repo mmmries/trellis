@@ -14,6 +14,7 @@
 
 mod manual;
 mod ring_wait;
+mod roles;
 mod sql;
 mod subprocess;
 
@@ -22,6 +23,7 @@ pub use manual::{
     SERVER_STOP_RECLAIM_TTL, SHUTDOWN_TIMEOUT, SourceTables, activity_summary, activity_summary_on,
     await_pool_usable,
 };
+pub use roles::{APP_ROLE, CaseDatabase, Roles, TRELLIS_ROLE, as_role};
 pub use sql::HeldKeys;
 pub use subprocess::{SubprocessBackend, SubprocessBackendError};
 

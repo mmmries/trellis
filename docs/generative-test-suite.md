@@ -109,6 +109,30 @@ One module drives the engine, and its job is narrow:
 - `snapshot()` — read back merged source+derived state as a deterministic,
   **ordered** map (table → pk → column), so diffs and equality are stable.
 
+### Roles
+
+A case runs as a deployment does
+([recommendations — Roles and permissions](recommendations.md#roles-and-permissions)),
+so an assumption only a superuser satisfies fails the run.
+`backend::CaseDatabase` provisions the database and the backends'
+`connect_as` takes its `backend::Roles`:
+
+- `trellis_runner`, not superuser, no `BYPASSRLS`, holding `CREATE` on the
+  database and membership in `app_owner`, runs the migrations and every
+  Trellis connection, the oracle's pool and the harness's catalog reads
+  included;
+- `app_owner` creates the sources in `public`, so it owns them, and makes
+  every write;
+- the bootstrap superuser runs only `CHECKPOINT` (`execute_admin`).
+
+Every convergence property runs this way, and so do the subprocess crash
+pins; `tests/backend_seam.rs` pins the owners and each session's role.
+`connect` runs everything as the superuser. Hand-built pins outside a
+property's runner still use it, and so do two property families:
+`self_check_cross_check.rs`, whose tampering writes targets no application
+may write, and `two_instance_noise.rs`, whose instances keep same-named
+sources in their own catalog schemas.
+
 ## 2. The oracle is Postgres itself
 
 Per ADR-0004, the calculation grammar is an *immutable subset of PostgreSQL's

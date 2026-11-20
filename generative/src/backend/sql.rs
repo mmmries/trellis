@@ -229,7 +229,22 @@ pub(super) async fn create_source_indexes(
     schema: Option<&str>,
     def: &TransformDef,
 ) -> Result<(), tokio_postgres::Error> {
+    create_source_indexes_where(raw, schema, def, |_| true).await
+}
+
+/// [`create_source_indexes`], only on the tables `on` accepts: a table's
+/// owner creates its index, so the application indexes its sources and
+/// Trellis the targets a chained definition reads.
+pub(super) async fn create_source_indexes_where(
+    raw: &tokio_postgres::Client,
+    schema: Option<&str>,
+    def: &TransformDef,
+    on: impl Fn(&str) -> bool,
+) -> Result<(), tokio_postgres::Error> {
     for (table, columns) in required_source_indexes(def) {
+        if !on(&table) {
+            continue;
+        }
         let qualified = match schema {
             Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table)),
             None => quote_ident(&table),

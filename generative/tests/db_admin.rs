@@ -11,7 +11,7 @@
 //! properties, restarting it under earlier cases' leftovers, which is
 //! harmless: those cases are finished.
 
-use generative::backend::ManualBackend;
+use generative::backend::{CaseDatabase, ManualBackend};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     db_admin_plan_for, trivial_program,
@@ -56,8 +56,8 @@ fn proptest_config() -> ProptestConfig {
 
 /// Runs `program` with `plan` against a fresh database on `cluster`.
 async fn run(cluster: &TestCluster, program: &Program, plan: &DbAdminPlan) -> Result<(), String> {
-    let db = cluster.create_isolated_database().await;
-    let mut backend = ManualBackend::connect(db.dsn())
+    let db = CaseDatabase::provision(cluster).await;
+    let mut backend = ManualBackend::connect_as(db.roles())
         .await
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
