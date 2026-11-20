@@ -13,9 +13,10 @@
 //!    the entry's repair makes it exact ([`Verdict::ListedGap`]).
 //!
 //! Anything else fails the run ([`RunError::NeverSilentlyWrong`]). Case 3
-//! makes `docs/known-correctness-gaps.md` a checked allowlist: an entry
-//! that understates what goes wrong (a repair that doesn't repair, a
-//! detection that doesn't detect), or a missing one, fails.
+//! makes `docs/known-correctness-gaps.md` a checked allowlist: a missing
+//! entry fails, and so does one whose detection doesn't detect or whose
+//! repair doesn't repair. The judge doesn't check that the divergence is
+//! the one the entry describes.
 //!
 //! The decision at each step is a pure function ([`first_look`],
 //! [`after_resume`], [`after_repair`]), unit-tested below. [`judge`] drives

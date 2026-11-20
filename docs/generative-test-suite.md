@@ -1146,7 +1146,8 @@ The actions, cheapest-first (every one below is built):
    [known correctness gaps](known-correctness-gaps.md) the drawn shape names
    (`gaps::Gap`, by the entry's stable anchor), which `self_check` reports
    and the entry's repair fixes. Anything else fails, so the register is a
-   checked allowlist: an entry that understates what goes wrong fails too.
+   checked allowlist: a missing entry fails, and so does one whose detection
+   or repair doesn't hold.
 
 Two structural notes for when faults enter the stream:
 
