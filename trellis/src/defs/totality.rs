@@ -235,6 +235,15 @@ fn check_node(expr: &Expr, columns: &ColumnTypes<'_>) -> Result<(), NotTotal> {
         | Expr::Null
         | Expr::Not(_)
         | Expr::IsNull { .. } => Ok(()),
+        // The comparisons they stand for, each checked as written.
+        Expr::InList { .. } | Expr::Between { .. } => {
+            for compared in expr.comparisons() {
+                if let Expr::BinaryOp { lhs, rhs, .. } = &compared {
+                    comparison(expr, lhs, rhs, columns)?;
+                }
+            }
+            Ok(())
+        }
         Expr::NumberLiteral(text) => {
             let (integer, fraction) = text.split_once('.').unwrap_or((text, ""));
             let digits = integer.trim_start_matches('-').trim_start_matches('0');

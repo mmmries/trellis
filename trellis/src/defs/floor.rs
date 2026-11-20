@@ -161,6 +161,10 @@ pub enum ExprNode {
     Not,
     IsNull,
     Case,
+    /// `[NOT] IN (...)`.
+    InList,
+    /// `[NOT] BETWEEN ... AND ...`.
+    Between,
 }
 
 /// The hidden tables and per-definition state Trellis keeps for a
@@ -332,6 +336,7 @@ impl Feature {
                 | ExprNode::Not
                 | ExprNode::IsNull
                 | ExprNode::Case => BASELINE,
+                ExprNode::InList | ExprNode::Between => Release::new(0, 4, 0),
             }),
             Feature::Operator(operator) => Some(match operator {
                 Operator::Add
@@ -572,6 +577,17 @@ impl Used {
                 branches: _,
                 otherwise: _,
             } => self.add(Feature::Expr(ExprNode::Case)),
+            Expr::InList {
+                expr: _,
+                list: _,
+                negated: _,
+            } => self.add(Feature::Expr(ExprNode::InList)),
+            Expr::Between {
+                expr: _,
+                low: _,
+                high: _,
+                negated: _,
+            } => self.add(Feature::Expr(ExprNode::Between)),
         });
     }
 }

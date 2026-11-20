@@ -23,8 +23,8 @@ use generative::generate::join_chained::chained_case_strategy;
 use generative::generate::join_one_to_one::{
     MAX_TABLES, OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, STAR_COMMIT_STALL_MS,
     STAR_LOCK_STEP_STALL_MS, STAR_MAX_FAN_OUT_CHUNK_ROWS, STAR_MAX_PACE_MICROS,
-    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program,
-    one_to_one_case_strategy, own_key_column, star_case_strategy, star_definition_text, table_at,
+    STAR_MAX_SPLIT_ROWS, STAR_WORKERS, StarCase, StarPosition, build_star_program, own_key_column,
+    star_case_strategy, star_definition_text, table_at,
 };
 use generative::model::{Op, Program, Table};
 use proptest::strategy::Strategy;
@@ -84,25 +84,50 @@ fn digests(strategy: &proptest::strategy::BoxedStrategy<JoinCase>) -> Vec<u64> {
 /// digests of their sweep budget's cases (4 seeds × 12), recorded on the
 /// generator before the star tier (#1781), and again when the derived
 /// transactions and statement forms changed how they issue their ops
-/// (#2181). A change that means to change what they draw updates these.
+/// (#2181) and, for the two-table tier, when it began drawing redefinitions
+/// (#2183). A change that means to change what they draw updates these. The
+/// two-table tier's derived `KEY (...)` arm (#2171) is left out, as the
+/// `WHERE` is: each of its cases is its unkeyed twin, keyed or not.
 #[test]
 fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
+    use generative::generate::join_one_to_one::{
+        derived_key_draw, key_joined, unkeyed_one_to_one_case_strategy, unwidened_one_to_one_cases,
+    };
+    let unkeyed = unkeyed_one_to_one_case_strategy().boxed();
+    let (keyed_bare, unkeyed_bare) = (
+        unwidened_one_to_one_cases(Some(false)).boxed(),
+        unwidened_one_to_one_cases(None).boxed(),
+    );
+    for seed in 1..=4 {
+        let twins = generative::plant_sweep::seeded_cases(&unkeyed_bare, seed, 12);
+        for (case, twin) in generative::plant_sweep::seeded_cases(&keyed_bare, seed, 12)
+            .into_iter()
+            .zip(twins)
+        {
+            let want = match derived_key_draw(&twin.program, false) {
+                Some(draw) => key_joined(twin.program, &draw),
+                None => twin.program,
+            };
+            assert_eq!(case.program, want, "seed {seed}");
+            assert_eq!(format!("{:?}", case.plan), format!("{:?}", twin.plan));
+        }
+    }
     assert_eq!(
-        digests(&one_to_one_case_strategy().boxed()),
+        digests(&unkeyed),
         [
-            6_087_195_259_762_024_636,
-            15_184_229_555_769_205_907,
-            7_467_191_831_678_639_982,
-            11_163_129_269_753_019_689
+            11_131_835_481_847_433_720,
+            17_540_472_921_829_412_727,
+            17_416_625_543_817_065_337,
+            17_207_699_182_753_301_206
         ]
     );
     assert_eq!(
         digests(&chained_case_strategy().boxed()),
         [
-            15_761_626_294_785_547_851,
-            6_679_572_026_344_521_627,
-            8_161_984_791_923_102_522,
-            1_793_015_111_759_041_798
+            2_494_047_860_043_232_346,
+            2_112_652_516_905_704_222,
+            15_028_786_216_076_697_068,
+            17_482_332_216_544_625_726
         ]
     );
 }

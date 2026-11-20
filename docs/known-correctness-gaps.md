@@ -46,6 +46,8 @@ Postgres, hidden tables included, detects and never repairs
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
+| **Transaction-id age** | | |
+| [An old key deleted and re-created under `REPEATABLE READ`](#an-old-key-deleted-and-re-created-under-repeatable-read) | `self_check` | [#2205](https://github.com/salesforce-misc/trellis/issues/2205) |
 | **Connections through a pooler** | | |
 | [A Trellis process behind a transaction-mode pooler](#a-trellis-process-behind-a-transaction-mode-pooler) | nothing | configuration |
 
@@ -89,8 +91,8 @@ while every rule holds.
 * **Connect every Trellis process directly or through a session-mode
   pooler**
   ([below](#a-trellis-process-behind-a-transaction-mode-pooler)).
-* **Set or drop `NOT NULL` on a `KEY (…)` column only while the transforms
-  that read the table are paused**
+* **Set, drop or validate `NOT NULL` on a `KEY (…)` column only while the
+  transforms that read the table are paused**
   ([below](#a-key-columns-not-null-set-or-dropped-with-changes-in-flight)).
 * **Don't write a 1-1 `JOIN`'s joined table (`b`, or the table at any
   position of a star) under `session_replication_role = replica`** when its
@@ -268,9 +270,10 @@ research on detecting a collation change the way a retype is detected.
 ### A `KEY` column's `NOT NULL` set or dropped with changes in flight
 
 **When:** a table read through `KEY (…)` on a `UNIQUE NULLS NOT DISTINCT`
-index has `ALTER COLUMN … SET NOT NULL` or `DROP NOT NULL` run on a key
-column while changes to rows whose key holds `NULL` or `chr(1)` are captured
-but not yet applied.
+index has `ALTER COLUMN … SET NOT NULL`, `DROP NOT NULL` or (Postgres 18)
+`VALIDATE CONSTRAINT` of a `NOT NULL … NOT VALID` run on a key column while
+changes to rows whose key holds `NULL` or `chr(1)` are captured but not yet
+applied. An unvalidated `NOT NULL` column is nullable until it is validated.
 
 **What goes wrong:** a nullable key column's part is encoded (`NULL` is
 `chr(1)`, a real `chr(1)` doubled) and a `NOT NULL` one's is not. Capture
@@ -552,6 +555,28 @@ ring held.
 TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
+
+## Transaction-id age
+
+### An old key deleted and re-created under `REPEATABLE READ`
+
+**When:** a source row was written between `2^31` and `2^32` transaction ids
+ago (modulo `2^32`). Another session deletes or re-keys it after a
+`REPEATABLE READ` or `SERIALIZABLE` transaction took its snapshot. That
+transaction then re-creates the key in a statement where another write to the
+same table also runs, such as a trigger or an FK cascade.
+
+**What goes wrong:** capture re-reads the live row and keeps the version
+whose `age(xmin)` is not positive, taking it to be the transaction's own. A
+frozen row keeps its raw `xmin`, so the deleted row's `age` has wrapped
+negative, and that row is still visible in the snapshot. The insert is imaged
+with the deleted row's values.
+
+**Detected by:** `self_check`.
+
+**Repair:** `request_backfill` the table.
+
+**Ends with:** [#2205](https://github.com/salesforce-misc/trellis/issues/2205).
 
 ## Connections through a pooler
 

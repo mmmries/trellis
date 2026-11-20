@@ -9,6 +9,7 @@ mod support;
 mod deferrable_key;
 mod include_key_upgrade;
 mod key_backing_index;
+mod not_valid_not_null_key;
 mod nullable_key_capture;
 mod probe_index_grace;
 mod resume_after_source_key_change;

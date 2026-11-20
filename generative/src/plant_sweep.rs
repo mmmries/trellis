@@ -102,6 +102,10 @@ pub enum PlantPath {
     /// definition with `MIN` or `MAX` reaches it, which only the concurrent
     /// tier's `min_max` shape draws.
     Extremes,
+    /// Capture's ring key for a source read through a `KEY (...)` with a
+    /// nullable column (ADR-0026): only the concurrent tier's `source_key`
+    /// shape draws one, and it reaches every target over that source.
+    SourceKey,
     /// `self_check`'s comparison of a group-basis aggregate's extremes with
     /// the source (its side 7). Only a tier that audits a `MIN`/`MAX`
     /// definition by `self_check` reaches it.
@@ -112,7 +116,25 @@ pub enum PlantPath {
     /// drawn application trigger writes the nested statement the other
     /// needs.
     Capture,
+    /// The drain's isolation of a failing page (`staging::quarantine`): a
+    /// page that no key fails alone, but one definition's share of it does.
+    /// Only the held-key tier's isolation draw makes such a page. A plant
+    /// here can stop any reader of the page, whatever its key space.
+    Isolation,
+    /// The drain's transaction-id comparisons past the first 32-bit epoch.
+    /// Only the `db_admin` property's xid-aging action
+    /// (`crate::model::DbAdminAction::WrapXids`) crosses the boundary, and
+    /// it is no planted-bug sweep tier, so no tier gates these: every
+    /// tier lists them in its `not_gated` with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
+    /// and `db_admin.rs`'s wrap pin gate them.
+    XidEpoch,
 }
+
+/// Why no sweep tier gates a [`PlantPath::XidEpoch`] plant.
+pub const NO_XID_EPOCH: &str = "no sweep tier crosses the 32-bit xid epoch; the db_admin \
+     property's wrap action does, and staging's \
+     sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows and db_admin.rs's \
+     a_wrap_across_the_epoch_boundary_with_work_in_flight_converges pin it";
 
 /// The path `plant` breaks.
 pub fn plant_path(plant: Plant) -> PlantPath {
@@ -128,7 +150,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::O2oWhereNullAsTrue
         | Plant::O2oWhereBuildUnfiltered
         | Plant::O2oWhereNoTombstone
-        | Plant::O2oWhereColumnNotImaged => PlantPath::OneToOne,
+        | Plant::O2oWhereColumnNotImaged
+        | Plant::FieldReleaseBeforeWiden => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild
@@ -211,6 +234,9 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
         Plant::CaptureSlotFromSnapshot | Plant::CaptureSkipNestedReread => PlantPath::Capture,
+        Plant::IsolationPausesEveryReader => PlantPath::Isolation,
+        Plant::FenceXid32 => PlantPath::XidEpoch,
+        Plant::NullKeyAsEmpty => PlantPath::SourceKey,
     }
 }
 
@@ -229,8 +255,11 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
-        // A reader of a target, or a capture's, can be of any kind.
-        PlantPath::Chain | PlantPath::Capture => true,
+        // A reader of a target, a capture's, a failing page's or a keyed source can be
+        // of any kind.
+        PlantPath::Chain | PlantPath::Capture | PlantPath::Isolation | PlantPath::SourceKey => true,
+        // Every target drains through the fenced read.
+        PlantPath::XidEpoch => true,
     }
 }
 
@@ -297,6 +326,9 @@ pub struct SweepCase {
     /// "timed out" column says how much of "caught" that is.
     pub timed_out: bool,
     pub secs: f64,
+    /// How many times the case reached each site it reached
+    /// (`trellis::dev::plant::reached`), armed or not.
+    pub reached: Vec<(String, u64)>,
     pub reason: String,
 }
 
@@ -332,7 +364,7 @@ impl SweepCase {
 
     pub fn to_line(&self) -> String {
         format!(
-            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}",
+            "{SWEEP_LINE}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}",
             self.plant,
             self.seed,
             self.case,
@@ -341,13 +373,22 @@ impl SweepCase {
             self.reachable,
             self.timed_out,
             self.secs,
+            if self.reached.is_empty() {
+                "-".to_string()
+            } else {
+                self.reached
+                    .iter()
+                    .map(|(site, n)| format!("{site}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
             self.reason
         )
     }
 
     pub fn from_line(line: &str) -> Option<SweepCase> {
-        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(9, '\t');
-        let mut next = || fields.next().expect("a sweep line has 9 fields");
+        let mut fields = line.strip_prefix(SWEEP_LINE)?.splitn(10, '\t');
+        let mut next = || fields.next().expect("a sweep line has 10 fields");
         Some(SweepCase {
             plant: next().to_string(),
             seed: next().parse().ok()?,
@@ -357,6 +398,16 @@ impl SweepCase {
             reachable: next().parse().ok()?,
             timed_out: next().parse().ok()?,
             secs: next().parse().ok()?,
+            reached: match next() {
+                "-" => Vec::new(),
+                sites => sites
+                    .split(',')
+                    .map(|site| {
+                        let (name, n) = site.split_once('=')?;
+                        Some((name.to_string(), n.parse().ok()?))
+                    })
+                    .collect::<Option<_>>()?,
+            },
             reason: next().to_string(),
         })
     }
@@ -423,6 +474,7 @@ fn run_cases<C>(
                 continue;
             }
             let fired_before = trellis::dev::plant::fired();
+            let reached_before = trellis::dev::plant::reached();
             let started = std::time::Instant::now();
             let result = run(case);
             let reachable = match &result {
@@ -457,6 +509,12 @@ fn run_cases<C>(
                     .as_ref()
                     .is_err_and(|f| is_quiesce_timeout(&f.message)),
                 secs: started.elapsed().as_secs_f64(),
+                reached: trellis::dev::plant::reached()
+                    .into_iter()
+                    .zip(reached_before)
+                    .filter(|((_, after), (_, before))| after > before)
+                    .map(|((site, after), (_, before))| (site.to_string(), after - before))
+                    .collect(),
                 reason,
             }
             .to_line();
@@ -590,6 +648,26 @@ fn judge(test: &str, tier: &SweepTier, requested: &str) {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    eprintln!("{}", reach_report(tier, &results));
+    let seeds: u64 = env_or(PLANT_SEEDS_ENV, PLANT_SEEDS);
+    let cases: usize = env_or(PLANT_CASES_ENV, PLANT_CASES);
+    if crate::reach_floor::judges(seeds, cases, std::env::var_os(PLANT_ONLY_ENV).is_none()) {
+        let totals = baseline_reach(&results)
+            .into_iter()
+            .map(|(site, (_, total))| (site, total))
+            .collect();
+        let missed = crate::reach_floor::misses(tier, &totals);
+        assert!(
+            missed.is_empty(),
+            "{}",
+            crate::reach_floor::failure(tier, &missed)
+        );
+    } else {
+        eprintln!(
+            "{test}: reachability floor not judged: it holds on the default baseline \
+             ({PLANT_SEEDS} seeds x {PLANT_CASES} cases) or more, every case run"
+        );
+    }
     let caught = |name: &str| {
         results
             .iter()
@@ -700,6 +778,95 @@ fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) ->
     out
 }
 
+/// Each site's reach over the baseline's cases: how many cases reached it
+/// and how often in all, keyed by site name.
+pub fn baseline_reach(results: &[SweepCase]) -> std::collections::BTreeMap<String, (usize, u64)> {
+    let mut reach = std::collections::BTreeMap::new();
+    for r in results.iter().filter(|r| r.plant == "baseline") {
+        for (site, n) in &r.reached {
+            let (cases, total) = reach.entry(site.clone()).or_insert((0, 0));
+            *cases += 1;
+            *total += n;
+        }
+    }
+    reach
+}
+
+/// The reachability report: every site (`trellis::dev::plant::sites`),
+/// with the baseline's cases that reached it and its reaches in all, and
+/// what the floor makes of it (`crate::reach_floor`).
+pub fn reach_report(tier: &SweepTier, results: &[SweepCase]) -> String {
+    use std::fmt::Write;
+    let reach = baseline_reach(results);
+    let cases = results.iter().filter(|r| r.plant == "baseline").count();
+    let mut out = format!(
+        "reachability ({} tier, {cases} baseline cases):\n\
+         site | cases reached | reaches | floor\n",
+        tier.name
+    );
+    for site in trellis::dev::plant::sites() {
+        let (reached, total) = reach.get(site).copied().unwrap_or((0, 0));
+        let ungated = tier.not_gated.iter().any(|(name, _)| *name == site);
+        let floor = if ungated && !crate::reach_floor::reached_ungated(tier.name, site) {
+            "not gated here"
+        } else if crate::reach_floor::exemption(tier.name, site).is_some() {
+            if reached == 0 {
+                "exempt"
+            } else {
+                "exempt, but reached"
+            }
+        } else if reached == 0 {
+            "MISSED"
+        } else if ungated {
+            "held, not gated"
+        } else {
+            "held"
+        };
+        // A pass count shows only that the path ran.
+        let passes = if trellis::dev::plant::counts_passes(site) {
+            " (passes)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "{site} | {reached}/{cases} | {total} | {floor}{passes}"
+        );
+    }
+    let suggested = crate::reach_floor::suggested_reached_ungated(
+        tier,
+        cases,
+        &reach
+            .iter()
+            .map(|(site, (cases, _))| (site.clone(), *cases))
+            .collect(),
+    );
+    let listed: Vec<&str> = crate::reach_floor::REACHED_UNGATED
+        .iter()
+        .find(|(name, _)| *name == tier.name)
+        .map_or(Vec::new(), |(_, sites)| sites.to_vec());
+    let mut sorted = suggested.clone();
+    sorted.sort_unstable();
+    let mut now = listed;
+    now.sort_unstable();
+    if sorted != now {
+        let _ = writeln!(
+            out,
+            "REACHED_UNGATED's entry for this run would be (ungated sites reached in a \
+             quarter of the cases; it differs from the list, which is updated only on \
+             purpose): (\"{}\", &{suggested:?}),",
+            tier.name
+        );
+    }
+    out
+}
+
+/// Why a tier other than the held-key tier leaves out a
+/// [`PlantPath::Isolation`] plant.
+pub const NO_ISOLATION: &str = "it breaks the drain's isolation of a page that fails only \
+     in combination, which only the held-key tier's isolation draw makes (held_keys.rs, \
+     held_key_planted_bugs_are_caught)";
+
 /// Why a tier whose programs define no `MIN`/`MAX` doesn't run the
 /// extremes' plants ([`PlantPath::Extremes`], [`PlantPath::SelfCheckExtremes`]).
 pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggregate, which \
@@ -712,6 +879,14 @@ pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggr
 pub const NO_CAPTURE: &str = "it breaks capture under a drawn transaction or application \
      trigger (#2181), which every concurrent tier draws; the hot-key-based tiers \
      (concurrent_convergence.rs, planted_bugs_are_caught) gate it";
+
+/// Why a tier that draws no table read through a nullable `KEY (...)`, or
+/// draws one only now and then, doesn't run its plants
+/// ([`PlantPath::SourceKey`]).
+pub const NO_SOURCE_KEY: &str = "it breaks capture's key for a table read through a nullable \
+     KEY (...), which the concurrent tier's source_key shape (concurrent_convergence.rs, \
+     GENERATIVE_PLANT_TIER=source_key) and the 1-1 JOIN tier's joined_key sweep \
+     (join_one_to_one_convergence.rs, joined_key_planted_bugs_are_caught) draw in every case";
 
 /// The plants whose path a tier's programs never take, each with `why`:
 /// for a tier's `not_gated`.
@@ -740,6 +915,7 @@ mod tests {
             reachable: true,
             timed_out,
             secs: 1.0,
+            reached: Vec::new(),
             reason: String::new(),
         }
     }
@@ -762,6 +938,47 @@ mod tests {
         assert!(out.contains("p | 2/3 | 1 | 3/3 | 0 |"), "{out}");
         let line = results[0].to_line();
         assert!(SweepCase::from_line(&line).unwrap().timed_out);
+    }
+
+    /// A row's reach survives its line, and the report counts the
+    /// baseline's reaches per site with what the floor makes of each.
+    #[test]
+    fn reach_round_trips_and_is_reported_per_site() {
+        let tier = SweepTier {
+            name: "cooling_key",
+            known_misses: &[],
+            not_gated: vec![("early_tombstone_gc", "not gated")],
+        };
+        let mut reached = case("baseline", 1, false, false);
+        reached.reached = vec![("stale_one_to_one_write".into(), 3)];
+        reached.reason = "a reason".into();
+        let back = SweepCase::from_line(&reached.to_line()).unwrap();
+        assert_eq!(back.reached, reached.reached);
+        assert_eq!(back.reason, "a reason");
+        let none = case("baseline", 2, false, false);
+        assert!(
+            SweepCase::from_line(&none.to_line())
+                .unwrap()
+                .reached
+                .is_empty()
+        );
+
+        let mut planted = case("stale_one_to_one_write", 1, false, false);
+        planted.reached = vec![("chunk_without_entry_lock".into(), 5)];
+        let out = reach_report(&tier, &[reached, none, planted]);
+        assert!(
+            out.contains("stale_one_to_one_write | 1/2 | 3 | held"),
+            "{out}"
+        );
+        assert!(
+            out.contains("early_tombstone_gc | 0/2 | 0 | not gated here"),
+            "{out}"
+        );
+        assert!(
+            out.contains("chunk_without_entry_lock | 0/2 | 0 | MISSED"),
+            "{out}"
+        );
+        assert!(out.contains("capture_widen | 0/2 | 0 | exempt"), "{out}");
     }
 
     #[test]
@@ -818,7 +1035,11 @@ mod tests {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Chain | PlantPath::Capture => {
+                PlantPath::Chain
+                | PlantPath::Capture
+                | PlantPath::Isolation
+                | PlantPath::XidEpoch
+                | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");
                 }

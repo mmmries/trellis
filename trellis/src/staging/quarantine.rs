@@ -131,6 +131,16 @@ pub enum FailureClass {
 /// structural `Ddl(NoPrimaryKey)` is [`FailureClass::Halting`] whether it
 /// arrives bare or wrapped.
 pub fn classify(err: &ApplyError) -> FailureClass {
+    // The reach of the plants that read a column an image lacks as `NULL`:
+    // the correct path fails the page instead, and the error doesn't say
+    // which path's statement raised it, so it counts for both.
+    #[cfg(any(test, feature = "test-util"))]
+    if super::one_to_one_render::is_data_exception(err)
+        && pg_message(err).is_some_and(|m| m.contains(super::one_to_one_render::UNIMAGED_COLUMN))
+    {
+        crate::plant::reach_plant(crate::plant::Plant::O2oWhereColumnNotImaged);
+        crate::plant::reach_plant(crate::plant::Plant::GbWhereColumnNotImaged);
+    }
     match innermost_apply_error(err) {
         ApplyError::VersionFenceMiss { .. } => FailureClass::VersionFenceMiss,
         ApplyError::HopBoundExceeded { .. }
@@ -166,7 +176,11 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // it, so isolating would charge, and eventually evict, each of them
         // for nothing. Halt the definitions it reaches instead
         // (`staging::halt`).
-        _ if is_insufficient_privilege(err) => FailureClass::Halting,
+        _ if is_insufficient_privilege(err) => {
+            #[cfg(any(test, feature = "test-util"))]
+            crate::plant::reach(crate::plant::Marker::PrivilegeHalts);
+            FailureClass::Halting
+        }
         _ if is_transient(err) => FailureClass::Transient,
         _ => FailureClass::Isolate,
     }
@@ -1999,6 +2013,17 @@ pub(super) async fn pause_definitions_failing_alone(
         return Ok(Vec::new());
     }
 
+    // Planted bug: pause every reader of the page, the innocent ones too.
+    // See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let failing: BTreeSet<i64> = if crate::plant::fires(
+        crate::plant::Plant::IsolationPausesEveryReader,
+        readers.len() > failing.len(),
+    ) {
+        readers.keys().copied().collect()
+    } else {
+        failing
+    };
     let message = pg_message(err).unwrap_or_else(|| err.to_string());
     let mut pauses = Vec::with_capacity(failing.len());
     for id in &failing {

@@ -251,6 +251,27 @@ two transforms](transforms.md#counting-distinct-values). Drop `ALL`: it is the
 default. For the others, move the condition or order out of the call. After
 define: [Text](transforms.md#text).
 
+### T0248 SubqueryInList
+
+`IN (SELECT …)`, or another subquery after `IN`. A definition reads only its
+own tables: list the values, or `JOIN` the other table. After define:
+[Text](transforms.md#text).
+
+### T0249 BetweenSymmetric
+
+`BETWEEN SYMMETRIC` or `BETWEEN ASYMMETRIC`. Write the bounds in order,
+`x BETWEEN low AND high`. After define: [Text](transforms.md#text).
+
+### T0250 QuantifiedComparison
+
+A comparison with `ANY (…)`, `SOME (…)` or `ALL (…)`. List the values with
+`IN` or `NOT IN`. After define: [Text](transforms.md#text).
+
+### T0251 RowConstructor
+
+A row constructor, `(a, b)`, as in `(a, b) IN ((1, 2))`. Compare each column on
+its own: `a = 1 AND b = 2`. After define: [Text](transforms.md#text).
+
 ## Definition checks
 
 The text parses, but what it computes isn't one Trellis maintains exactly
@@ -776,6 +797,16 @@ without its trailing blanks
 so the length would differ from Postgres's. Group by a `text` column.
 After define: [Retype](transforms.md#retype).
 
+### T0252 InListCommonType
+
+An `IN` list Postgres reads at one common type that differs from comparing the
+value with each element on its own
+([`IN` lists](type-support.md#in-lists)): a `real` beside an exact number, a
+`NULL` before a string and an element of another type, or a `char(n)` or
+`name` value beside an element of another string type. Write the comparisons out
+(`x = a OR x = b`), or make the elements one type. After define:
+[Retype](transforms.md#retype).
+
 ## Tables and keys
 
 What a definition reads or writes can't be maintained as it stands
@@ -815,7 +846,8 @@ After define: [Key](transforms.md#key).
 No unique index backs a `KEY (…)` exactly ([the
 key](transforms.md#the-key-a-transform-keys-each-table-by)). Create a valid,
 non-partial unique index over exactly those columns, `NULLS NOT DISTINCT` if one
-can be `NULL`. After define: [Key](transforms.md#key).
+can be `NULL`, as a `NOT NULL … NOT VALID` column can until `VALIDATE
+CONSTRAINT`. After define: [Key](transforms.md#key).
 
 ### T0117 KeyDiffersFromReaders
 
@@ -1081,8 +1113,9 @@ names first.
 
 An `ALTER TRANSFORM` of a transform that isn't `live`, or a define chaining off
 one whose build is running (`backfilling`) or that is paused or quarantined.
-Retry once it is `live`; `RESUME` a paused one first. After define: matters
-only when the statement runs.
+Retry once it is `live`; [repair](operations.md#paused-definitions) and
+`RESUME` a paused one first. After define: matters only when the statement
+runs.
 
 ### T0155 AlterFieldNotFound
 
@@ -1234,7 +1267,8 @@ A `self_check` limit that isn't a positive row count. Pass a positive limit.
 ### T0194 UnsupportedExpr
 
 A `self_check` of a field it can't render, or of a definition whose recorded
-state is missing. Report it as a bug.
+state is missing. Report it as a bug. A `NULL` key in a column read as
+`NOT NULL` means the column's `NOT NULL` changed during the check: run it again.
 
 ### T0195 PageTimedOut
 

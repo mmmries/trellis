@@ -458,6 +458,28 @@ fn render_expr(expr: &Expr) -> String {
             render_expr(expr),
             if *negated { "not " } else { "" }
         ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            render_expr(expr),
+            if *negated { "not " } else { "" },
+            list.iter().map(render_expr).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render_expr(expr),
+            if *negated { "not " } else { "" },
+            render_expr(low),
+            render_expr(high)
+        ),
         Expr::Case {
             branches,
             otherwise,
@@ -505,7 +527,15 @@ fn render_select(def: &TransformDef, pk_column: &str, exact: &ExactFields) -> St
             unreachable!("the generator never produces a JOIN definition")
         }
         KeySpace::OneToOne => {
-            let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
+            // A `KEY (...)` source's rows are keyed by its key columns.
+            let key = def
+                .source_key
+                .clone()
+                .unwrap_or_else(|| vec![pk_column.to_string()]);
+            let mut select_list: Vec<String> = key
+                .iter()
+                .map(|c| format!("{}::text", quote_ident(c)))
+                .collect();
             for field in &def.fields {
                 select_list.push(format!(
                     "({})::text as {}",
@@ -729,6 +759,27 @@ async fn as_persisted(
     {
         join.joins[0].explicit_right_schema = schema_of(joined);
     }
+    // A star's joined tables past the first (`definition_join_tables`).
+    if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &mut def.key_space
+        && join.joins.len() > 1
+    {
+        let later = client
+            .query(
+                "select j.position, j.table_name from definition_join_tables j \
+                 join transform_definitions d on d.id = j.transform_id \
+                 where split_part(d.target_table, '.', 2) = $1",
+                &[&def.target],
+            )
+            .await?;
+        for row in later {
+            let position = usize::try_from(row.get::<_, i16>(0)).expect("position >= 2");
+            if let Some(joined) = join.joins.get_mut(position - 1)
+                && joined.explicit_right_schema.is_none()
+            {
+                joined.explicit_right_schema = schema_of(row.get::<_, &str>(1));
+            }
+        }
+    }
     Ok(def)
 }
 
@@ -777,12 +828,24 @@ async fn sql_oracle_exact(
         }
         KeySpace::OneToOne => {
             let mut rows: Rows = BTreeMap::new();
+            let key_len = def.source_key.as_ref().map_or(1, Vec::len);
             for db_row in db_rows {
-                let pk: Option<String> = db_row.get(0);
-                let pk = pk.expect("primary key column is never NULL");
+                let pk = match &def.source_key {
+                    // Keyed exactly as `read_keyed_table` keys the target.
+                    Some(_) => crate::model::source_key_text(
+                        &(0..key_len).map(|i| db_row.get(i)).collect::<Vec<_>>(),
+                    ),
+                    None => {
+                        let pk: Option<String> = db_row.get(0);
+                        pk.expect("primary key column is never NULL")
+                    }
+                };
                 let mut by_column = BTreeMap::new();
                 for (i, field) in def.fields.iter().enumerate() {
-                    by_column.insert(field.name.clone(), db_row.get::<_, Option<String>>(i + 1));
+                    by_column.insert(
+                        field.name.clone(),
+                        db_row.get::<_, Option<String>>(i + key_len),
+                    );
                 }
                 rows.insert(pk, by_column);
             }
@@ -843,8 +906,8 @@ pub async fn sql_oracle_per_row(
     pk_column: &str,
 ) -> Result<(Rows, std::collections::BTreeSet<String>), OracleError> {
     assert!(
-        matches!(def.key_space, KeySpace::OneToOne),
-        "the per-row oracle models a plain 1-1 definition only"
+        matches!(def.key_space, KeySpace::OneToOne) && def.source_key.is_none(),
+        "the per-row oracle models a plain 1-1 definition over a primary key only"
     );
     let mut raised = std::collections::BTreeSet::new();
     match sql_oracle(pool, def, pk_column).await {
@@ -1159,7 +1222,9 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
             })
         }
         Expr::Cast { target, .. } => *target,
-        Expr::Not(_) | Expr::IsNull { .. } => ValueType::Boolean,
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } => {
+            ValueType::Boolean
+        }
         // The results unify as `COALESCE`'s arguments do: an exact numeric
         // beside a float is the float, two integers the wider, otherwise
         // `numeric`; equal types are themselves.
@@ -1429,6 +1494,31 @@ fn render_join_expr(expr: &Expr) -> String {
             render_join_expr(expr),
             if *negated { "not " } else { "" }
         ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            render_join_expr(expr),
+            if *negated { "not " } else { "" },
+            list.iter()
+                .map(render_join_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render_join_expr(expr),
+            if *negated { "not " } else { "" },
+            render_join_expr(low),
+            render_join_expr(high)
+        ),
         Expr::Case {
             branches,
             otherwise,
@@ -1569,6 +1659,7 @@ pub fn one_to_one_target_table(def: &TransformDef, source: &Table) -> Table {
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     }
 }
 

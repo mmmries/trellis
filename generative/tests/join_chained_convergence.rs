@@ -54,7 +54,7 @@
 //! below (not ignored) run a hand-built case of each kind end to end, and
 //! check that the oracle reads the upstream's query rather than its target.
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ManualBackend};
 use generative::generate::join::{
     BuildCoverage, JoinActionDraw, JoinActionKind, JoinBuildDraws, JoinCase, JoinDefSpec,
     JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape, build_coverage,
@@ -240,9 +240,9 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record(case);
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect_with_options(
-                db.dsn(),
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as_with_options(
+                db.roles(),
                 case.workers,
                 Some(std::time::Duration::from_millis(case.seal_interval_ms)),
             )
@@ -340,7 +340,7 @@ const CHAINED_KNOWN_MISSES: &[&str] = &["seam_token_early"];
 /// take that path gates.
 fn chained_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
-    let not_gated = not_on_path(
+    let mut not_gated: Vec<(&'static str, &'static str)> = not_on_path(
         &[
             PlantPath::OneToOne,
             PlantPath::GroupBasis,
@@ -349,6 +349,7 @@ fn chained_sweep_tier() -> SweepTier {
             PlantPath::OneToOneJoin,
             PlantPath::Extremes,
             PlantPath::SelfCheckExtremes,
+            PlantPath::SourceKey,
         ],
         "it breaks a definition's own apply path, which the concurrent, JOIN and 1-1 JOIN \
          tiers gate; this tier gates the seam's feed to a JOIN reading a target",
@@ -357,7 +358,15 @@ fn chained_sweep_tier() -> SweepTier {
         &[PlantPath::Capture],
         generative::plant_sweep::NO_CAPTURE,
     ))
+    .chain(not_on_path(
+        &[PlantPath::Isolation],
+        generative::plant_sweep::NO_ISOLATION,
+    ))
     .collect();
+    not_gated.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_CHAINED_TIER,
         known_misses: CHAINED_KNOWN_MISSES,

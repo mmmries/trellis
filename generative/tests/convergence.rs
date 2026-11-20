@@ -1,5 +1,6 @@
 //! The convergence property, first end-to-end green (design doc
-//! §4). Generates trivial 1-1 numeric-`+` programs, drives each through the
+//! §4). Generates trivial 1-1 numeric-`+` programs (one in four read
+//! through a `KEY (...)`, `generate::source_key`), drives each through the
 //! real [`ManualBackend`] one op at a time, and after every op asserts the
 //! materialized target equals the [`generative::oracle`] recompute.
 //!
@@ -20,11 +21,12 @@
 //! worth keeping is transcribed into a hand-built pin, since a seed replays into
 //! a different program once the strategy changes shape.
 
-use generative::backend::{Backend, ManualBackend};
+use generative::backend::{Backend, CaseDatabase, ManualBackend};
+use generative::generate::source_key::{KeyDraw, KeyShape, key_source, trivial_or_keyed_program};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, DerivedShape, Mutate, TableSpec, build_program,
     build_program_multi, build_program_multi_with_derived, build_program_multi_with_shapes,
-    partition_table, partitioned_program, trivial_program,
+    partition_table, partitioned_program,
 };
 use generative::model::group_key;
 use generative::run::{RunError, check_program, run_convergence};
@@ -120,11 +122,11 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
             // timing above for the env-var convention.
             let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
             let start = timing_enabled.then(std::time::Instant::now);
-            let db = h.cluster.create_isolated_database().await;
+            let db = CaseDatabase::provision(&h.cluster).await;
             if let Some(start) = start {
                 eprintln!("COST_TIMING db_provision {}", start.elapsed().as_millis());
             }
-            let mut backend = ManualBackend::connect(db.dsn())
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             if program.tables.iter().any(|t| t.partitioning.is_some()) {
@@ -160,7 +162,7 @@ proptest! {
 
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
-    fn property_convergence_holds_for_trivial_programs(program in trivial_program()) {
+    fn property_convergence_holds_for_trivial_programs(program in trivial_or_keyed_program()) {
         run_one(&program)?;
     }
 
@@ -171,6 +173,122 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_convergence_holds_over_a_partitioned_source(program in partitioned_program()) {
         run_one(&program)?;
+    }
+}
+
+/// #2171 (ADR-0026): a hand-built program whose source is read through a
+/// nullable `KEY (...)` converges end to end, with a 1-1 and a `GROUP BY`
+/// definition over it: a `NULL` key beside `''`, `chr(1)` and a doubled
+/// `chr(1)`, a key collision, and key moves onto and off the `NULL` key.
+/// Single and composite keys, without a primary key and beside one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_read_through_a_nullable_key_converges_end_to_end() {
+    let cluster = TestCluster::start();
+    let s = |v: &str| Some(v.to_string());
+    let update = |pk| Mutate::Update {
+        pk,
+        c1: Some(7),
+        c2: None,
+    };
+    let mutates = vec![
+        update(1),
+        update(2),
+        update(3),
+        update(1),
+        Mutate::Delete { pk: 2 },
+        update(4),
+        Mutate::DuplicateInsert {
+            pk: 2,
+            c1: Some(3),
+            c2: Some(4),
+        },
+    ];
+    let draws = [
+        KeyDraw {
+            shape: KeyShape {
+                nullable: vec![true],
+                primary_key: false,
+            },
+            inserts: vec![
+                vec![None],
+                vec![s("")],
+                vec![s("\u{1}")],
+                vec![s("\u{1}\u{1}")],
+                vec![None],
+            ],
+            moves: vec![
+                Some(vec![s("b")]),
+                Some(vec![None]),
+                None,
+                Some(vec![None]),
+                Some(vec![s("")]),
+            ],
+        },
+        KeyDraw {
+            shape: KeyShape {
+                nullable: vec![true, true],
+                primary_key: true,
+            },
+            inserts: vec![
+                vec![None, s("x")],
+                vec![s(""), s("x")],
+                vec![None, None],
+                vec![s("\u{1}"), s("\u{1f}")],
+                vec![s(""), None],
+            ],
+            moves: vec![
+                Some(vec![s(""), s("")]),
+                Some(vec![None, s("x")]),
+                None,
+                Some(vec![None, None]),
+                Some(vec![s("\u{1}\u{1}"), None]),
+            ],
+        },
+    ];
+    for draw in &draws {
+        let program = key_source(
+            build_program_multi_with_shapes(
+                &[TableSpec::numeric_only(
+                    vec![
+                        (Some(1), Some(2)),
+                        (Some(3), None),
+                        (None, Some(5)),
+                        (Some(6), Some(7)),
+                    ],
+                    mutates.clone(),
+                )],
+                &[
+                    (0, DefShape::OneToOne),
+                    (
+                        0,
+                        DefShape::Aggregate {
+                            functions: vec![
+                                AggregateFn::Count,
+                                AggregateFn::Sum(AggregateColumn::C1),
+                            ],
+                        },
+                    ),
+                ],
+            ),
+            draw,
+        );
+        assert!(
+            program
+                .ops
+                .iter()
+                .any(|op| *op.expect() == generative::model::OpOutcome::Fails),
+            "the pin draws a key collision"
+        );
+        let db = cluster.create_isolated_database().await;
+        let mut backend = ManualBackend::connect(db.dsn())
+            .await
+            .expect("connect manual backend");
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let outcome = run_convergence(&mut backend, &pool, &program)
+            .await
+            .unwrap_or_else(|e| panic!("{draw:?}: {e:?}"));
+        assert!(outcome.as_pass(), "run did not pass: {outcome}");
     }
 }
 

@@ -105,12 +105,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         KeySpace::Join(join) => {
             let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
             format!(
-                " {} {} ON {} GROUP BY {}",
+                " {} {}{} ON {} GROUP BY {}",
                 match join.joins[0].kind {
                     JoinKind::Inner => "INNER JOIN",
                     JoinKind::Left => "LEFT JOIN",
                 },
                 join.joins[0].right,
+                render_key(join.joins[0].right_key.as_deref()),
                 join.joins[0]
                     .on
                     .iter()
@@ -132,12 +133,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                 .iter()
                 .map(|joined| {
                     format!(
-                        " {} {} ON {}",
+                        " {} {}{} ON {}",
                         match joined.kind {
                             JoinKind::Inner => "INNER JOIN",
                             JoinKind::Left => "LEFT JOIN",
                         },
                         joined.right,
+                        render_key(joined.right_key.as_deref()),
                         joined
                             .on
                             .iter()
@@ -169,12 +171,21 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         Predicate::True => String::new(),
         Predicate::Filter(expr) => format!(" WHERE ({})", render_expr(expr)),
     };
+    let key = render_key(def.source_key.as_deref());
     format!(
-        "TRANSFORM {} FROM {}{key_space_clause}{opt_out} SELECT {}{filter}",
+        "TRANSFORM {} FROM {}{key}{key_space_clause}{opt_out} SELECT {}{filter}",
         def.target,
         def.source,
         fields.join(", ")
     )
+}
+
+/// ` KEY (<columns>)` for a table read through an explicit key (ADR-0026),
+/// or nothing.
+fn render_key(columns: Option<&[String]>) -> String {
+    columns.map_or_else(String::new, |columns| {
+        format!(" KEY ({})", columns.join(", "))
+    })
 }
 
 /// The source indexes `def` needs, as `(table, leading columns)`: an
@@ -231,7 +242,22 @@ pub(super) async fn create_source_indexes(
     schema: Option<&str>,
     def: &TransformDef,
 ) -> Result<(), tokio_postgres::Error> {
+    create_source_indexes_where(raw, schema, def, |_| true).await
+}
+
+/// [`create_source_indexes`], only on the tables `on` accepts: a table's
+/// owner creates its index, so the application indexes its sources and
+/// Trellis the targets a chained definition reads.
+pub(super) async fn create_source_indexes_where(
+    raw: &tokio_postgres::Client,
+    schema: Option<&str>,
+    def: &TransformDef,
+    on: impl Fn(&str) -> bool,
+) -> Result<(), tokio_postgres::Error> {
     for (table, columns) in required_source_indexes(def) {
+        if !on(&table) {
+            continue;
+        }
         let qualified = match schema {
             Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table)),
             None => quote_ident(&table),
@@ -295,6 +321,31 @@ pub(super) fn render_expr(expr: &Expr) -> String {
             "({}) IS {}NULL",
             render_expr(expr),
             if *negated { "NOT " } else { "" }
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({}) {}IN ({})",
+            render_expr(expr),
+            if *negated { "NOT " } else { "" },
+            list.iter()
+                .map(|e| format!("({})", render_expr(e)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({}) {}BETWEEN ({}) AND ({})",
+            render_expr(expr),
+            if *negated { "NOT " } else { "" },
+            render_expr(low),
+            render_expr(high)
         ),
         Expr::Case {
             branches,
@@ -395,7 +446,8 @@ pub(super) fn assignment(
 /// every set in `table.unique_sets`.
 ///
 /// `schema` qualifies the table's name (`None` leaves it to the session's
-/// `search_path`, which is the instance schema): a source table that more than
+/// `search_path`: `public` for the application's own session, the instance
+/// schema for the backend's raw one): a source table that more than
 /// one Trellis instance reads is created in `public`, outside every
 /// instance's catalog schema.
 pub(super) async fn create_source_table(
@@ -419,14 +471,21 @@ pub(super) async fn create_source_table(
         }
         sql.push_str(&quote_ident(&column.name));
         sql.push(' ');
+        sql.push_str(&column_ddl_type(column.value_type));
         if column.name == table.pk_col {
-            sql.push_str(&column_ddl_type(column.value_type));
-            sql.push_str(" primary key");
-        } else {
-            sql.push_str(&column_ddl_type(column.value_type));
-            if table.unique_cols.iter().any(|c| c == &column.name) {
-                sql.push_str(" unique");
-            }
+            // A table read through a `KEY (...)` without a primary key
+            // still names each row by `pk_col`.
+            sql.push_str(match &table.source_key {
+                Some(key) if !key.primary_key => " not null unique",
+                _ => " primary key",
+            });
+        } else if table.unique_cols.iter().any(|c| c == &column.name) {
+            sql.push_str(" unique");
+        } else if let Some(key) = &table.source_key
+            && key.columns.contains(&column.name)
+            && !key.is_nullable(&column.name)
+        {
+            sql.push_str(" not null");
         }
     }
     for set in &table.unique_sets {
@@ -440,6 +499,21 @@ pub(super) async fn create_source_table(
         sql.push(')');
     }
     sql.push(')');
+    if let Some(key) = &table.source_key {
+        sql.push_str(&format!(
+            "; create unique index on {name} ({}){}",
+            key.columns
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if key.nullable.is_empty() {
+                ""
+            } else {
+                " nulls not distinct"
+            }
+        ));
+    }
     raw.batch_execute(&sql).await?;
     Ok(())
 }
@@ -917,6 +991,38 @@ pub(super) async fn read_table(
     Ok(result)
 }
 
+/// Reads a 1-1 target over a `KEY (...)` source (ADR-0026) back as text,
+/// each row keyed by its `key` columns' [`crate::model::source_key_text`],
+/// with `fields` as its columns.
+pub(super) async fn read_keyed_table(
+    client: &tokio_postgres::Client,
+    qualified_table: &str,
+    key: &[String],
+    fields: &[FieldDef],
+) -> Result<
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>,
+    tokio_postgres::Error,
+> {
+    let select_list: Vec<String> = key
+        .iter()
+        .map(|c| c.as_str())
+        .chain(fields.iter().map(|f| f.name.as_str()))
+        .map(|c| format!("{}::text", quote_ident(c)))
+        .collect();
+    let sql = format!("select {} from {qualified_table}", select_list.join(", "));
+    let mut result = std::collections::BTreeMap::new();
+    for row in client.query(&sql, &[]).await? {
+        let parts: Vec<Option<String>> = (0..key.len()).map(|i| row.get(i)).collect();
+        let by_column = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), row.get(key.len() + i)))
+            .collect();
+        result.insert(crate::model::source_key_text(&parts), by_column);
+    }
+    Ok(result)
+}
+
 /// Reads an `Aggregate` key-space target table back as text, keyed by the
 /// same composite [`crate::model::group_key`] convention the SQL
 /// oracles use — see `ManualBackend`'s former doc comment (git history) for
@@ -1061,6 +1167,7 @@ async fn unsettled_definitions(
 pub(super) async fn definition_states(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
+    reported: &HashMap<String, String>,
 ) -> Result<Vec<DefinitionState>, tokio_postgres::Error> {
     let targets: Vec<String> = defs.iter().map(|d| d.target.clone()).collect();
     let rows = raw
@@ -1093,11 +1200,39 @@ pub(super) async fn definition_states(
             let (status, reason) = found
                 .remove(&target)
                 .unwrap_or_else(|| ("<missing>".to_string(), None));
+            let reported = reported
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| "<missing>".to_string());
             DefinitionState {
                 target,
                 status,
+                reported,
                 reason,
             }
+        })
+        .collect())
+}
+
+/// Every definition's status as an operator reads it, by bare target name:
+/// `Trellis::definitions` through a facade connected for the call, so a
+/// stored `live` reads `catching_up` exactly when the engine says so.
+pub(super) async fn reported_statuses(
+    config: trellis::Config,
+) -> Result<HashMap<String, String>, trellis::TrellisError> {
+    let facade = trellis::Trellis::connect(config, trellis::TrellisOptions::default()).await?;
+    let listed = facade.definitions().await;
+    facade.shutdown().await?;
+    Ok(listed?
+        .into_iter()
+        .map(|d| {
+            let bare = d
+                .target_table
+                .rsplit('.')
+                .next()
+                .unwrap_or(&d.target_table)
+                .to_string();
+            (bare, d.status.as_str().to_string())
         })
         .collect())
 }
@@ -1893,6 +2028,7 @@ mod tests {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         };
         let ddl = |strategy| {
             partitioned_source_ddl(
@@ -2000,6 +2136,26 @@ mod tests {
                     assert_eq!(reparsed, def, "{text}");
                 }
             }
+        }
+    }
+
+    /// A joined table's `KEY (...)` (#2171) renders back after the table's
+    /// name, beside the `FROM` side's: dropped, the definition would read
+    /// the joined table by its primary key, or fail define without one.
+    #[test]
+    fn render_definition_round_trips_a_joined_tables_key() {
+        for text in [
+            "TRANSFORM j FROM ja KEY (k0) LEFT JOIN jb KEY (k0, k1) \
+             ON ja.k0 = jb.k0 AND ja.k1 = jb.k1 SELECT jb.y AS y",
+            "TRANSFORM j FROM ja INNER JOIN jb KEY (k0) ON ja.k0 = jb.k0 SELECT jb.y AS y",
+            "TRANSFORM j FROM ja LEFT JOIN jb KEY (k0) ON ja.k0 = jb.k0 \
+             GROUP BY ja.t SELECT COUNT(*) AS n",
+        ] {
+            let def = parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            let rendered = render_definition(&def);
+            assert!(rendered.contains("jb KEY (k0"), "{rendered}");
+            let reparsed = parse(&rendered).unwrap_or_else(|e| panic!("{rendered}: {e:?}"));
+            assert_eq!(reparsed, def, "{rendered}");
         }
     }
 

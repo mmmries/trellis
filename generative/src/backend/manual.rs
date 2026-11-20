@@ -48,10 +48,11 @@ use trellis::dev::staging::{
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config};
 
 use super::ring_wait::{ProgressDeadline, QuiesceBudget};
+use super::roles::{Roles, connect_app};
 use super::sql::{self, quote_ident};
 use super::{DefinitionState, Snapshot};
 use crate::model::{
-    BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
+    BurstAction, Column, FieldEdit, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
 };
 
 /// How long [`ManualBackend::quiesce`] waits without the ring making any
@@ -317,6 +318,11 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// A `DROP TRANSFORM` returned and left its target table behind, which
+    /// it drops (`docs/transforms.md`).
+    DroppedTargetRemains {
+        target: String,
+    },
     /// A statement sent through the `Trellis` facade (the
     /// operator's `RESUME TRANSFORM`) failed.
     Facade(trellis::TrellisError),
@@ -451,9 +457,12 @@ fn noise_sql_literal(value: &Option<String>) -> String {
 /// installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceTables {
-    /// In the instance's own catalog schema, which is first on the backend's
-    /// `search_path`. The instance's own writes are the only ones the table
-    /// sees, which is what every single-instance run wants.
+    /// Created unqualified, through the application's `search_path`: in
+    /// `public` when the application has a role of its own
+    /// ([`super::Roles`]), else in the instance's own catalog schema, which
+    /// is first on the backend's `search_path`. The instance's own writes
+    /// are the only ones the table sees, which is what every
+    /// single-instance run wants.
     #[default]
     Own,
     /// In `public`, created by this backend. Several instances can read a
@@ -485,6 +494,13 @@ pub struct HeldKeyReport {
 pub struct ManualBackend {
     pool: Pool,
     raw: tokio_postgres::Client,
+    /// Who runs what (`super::roles`): `raw` and every engine connection
+    /// log in as `roles.trellis`.
+    roles: Roles,
+    /// The application's own session, when [`Self::roles`] gives it a role
+    /// of its own: source DDL, every op's writes and [`Self::execute_raw`].
+    /// `None` runs them on `raw`.
+    app: Option<tokio_postgres::Client>,
     engine_client: Option<EngineClient>,
     /// The options the primary `engine_client` was started with — remembered
     /// so [`ManualBackend::restart`] can start a
@@ -595,6 +611,31 @@ impl ManualBackend {
         Self::connect_with_options(dsn, 1, None).await
     }
 
+    /// [`ManualBackend::connect`], but with Trellis, the application and the
+    /// operator each logging in as its own role (`super::roles`), as a
+    /// [`super::CaseDatabase`] provisions them.
+    pub async fn connect_as(roles: &Roles) -> Result<Self, ManualBackendError> {
+        Self::connect_as_with_options(roles, 1, None).await
+    }
+
+    /// [`ManualBackend::connect_as`]'s general form, with
+    /// [`ManualBackend::connect_with_options`]'s two knobs.
+    pub async fn connect_as_with_options(
+        roles: &Roles,
+        application_threads: usize,
+        maintenance_interval: Option<Duration>,
+    ) -> Result<Self, ManualBackendError> {
+        let mut backend = Self::connect_with_options(
+            roles.trellis.clone(),
+            application_threads,
+            maintenance_interval,
+        )
+        .await?;
+        backend.app = connect_app(roles).await?;
+        backend.roles = roles.clone();
+        Ok(backend)
+    }
+
     /// Like [`ManualBackend::connect`], but starts the underlying
     /// [`EngineClient`] with `application_threads` app-worker tasks instead
     /// of a hardcoded `1` (the concurrent runtime —
@@ -694,6 +735,8 @@ impl ManualBackend {
         Ok(Self {
             pool,
             raw,
+            roles: Roles::single(dsn),
+            app: None,
             engine_client: None,
             client_options: None,
             scale_out_clients: Vec::new(),
@@ -1104,7 +1147,7 @@ impl ManualBackend {
             SourceTables::Own => None,
             SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
         };
-        Ok(sql::create_source_table(&self.raw, schema, table).await?)
+        Ok(sql::create_source_table(self.app_session(), schema, table).await?)
     }
 
     /// Starts the first engine client (its staging worker included), unless
@@ -1195,7 +1238,11 @@ impl ManualBackend {
             SourceTables::Own => None,
             SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
         };
-        sql::create_source_indexes(&self.raw, schema, def).await?;
+        // A table's owner indexes it: the application its sources, Trellis
+        // the upstream targets a chained definition reads.
+        let source = |table: &str| self.tables.contains_key(table);
+        sql::create_source_indexes_where(self.app_session(), schema, def, source).await?;
+        sql::create_source_indexes_where(&self.raw, schema, def, |table| !source(table)).await?;
 
         let text = sql::render_definition(def);
 
@@ -1234,12 +1281,98 @@ impl ManualBackend {
 
     /// Runs one arbitrary SQL statement directly against this backend's own
     /// connection, bypassing [`ManualBackend::apply`]'s op-shaped DML
-    /// entirely (noise DDL/DML and `CHECKPOINT`). Returns the
-    /// statement's affected-row count (`0` for a DDL statement or
-    /// `CHECKPOINT`, same as any other statement that doesn't affect table
-    /// rows).
+    /// entirely (noise DDL/DML, a pin's hand-made statement). Returns the
+    /// statement's affected-row count (`0` for a DDL statement).
+    ///
+    /// It runs as the application ([`super::Roles::app`]), like every other
+    /// write; [`ManualBackend::execute_admin`] runs an operator's statement.
     pub async fn execute_raw(&self, sql: &str) -> Result<u64, ManualBackendError> {
-        Ok(self.raw.execute(sql, &[]).await?)
+        Ok(self.app_session().execute(sql, &[]).await?)
+    }
+
+    /// Runs one statement as the operator ([`super::Roles::admin`]), on a
+    /// session of its own: `CHECKPOINT`, which neither the application nor
+    /// Trellis may run.
+    pub async fn execute_admin(&self, sql: &str) -> Result<u64, ManualBackendError> {
+        if !self.roles.separate_app() {
+            return self.execute_raw(sql).await;
+        }
+        let (admin, connection) = tokio_postgres::connect(&self.roles.admin, NoTls).await?;
+        let connection = tokio::spawn(connection);
+        let result = admin.execute(sql, &[]).await;
+        drop(admin);
+        let _ = connection.await;
+        Ok(result?)
+    }
+
+    /// The connection string every Trellis connection of this backend logs
+    /// in with ([`super::Roles::trellis`]); an oracle's pool uses it too.
+    pub fn trellis_dsn(&self) -> &str {
+        self.config.dsn()
+    }
+
+    /// The session application statements run on: the application's own, or
+    /// `raw` when it has none.
+    fn app_session(&self) -> &tokio_postgres::Client {
+        self.app.as_ref().unwrap_or(&self.raw)
+    }
+
+    /// `target`'s qualified, quoted name in this backend's target schema,
+    /// for DDL a run puts on a target (a unique index, a trigger).
+    pub fn qualified_target(&self, target: &str) -> String {
+        format!(
+            "{}.{}",
+            quote_ident(&self.target_schema),
+            quote_ident(target)
+        )
+    }
+
+    /// What, once the engine has settled, still keeps the ring from
+    /// retiring: a drain holdup, or a segment sealed or draining. `None`
+    /// when nothing does: every page committed, so each segment is drained
+    /// and housekeeping may retire it. A page stuck failing shows here
+    /// (#2130: a holdup fills the ring and stops every target).
+    ///
+    /// A quiesce settles on the ring's rows, not its segments' states, so a
+    /// segment can still read `sealed` or `draining` for a moment after it.
+    /// This waits up to `within` for that to clear, and answers what's
+    /// still left then.
+    pub async fn ring_unretired(
+        &self,
+        within: Duration,
+    ) -> Result<Option<String>, ManualBackendError> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let left = self.ring_unretired_now().await?;
+            if left.is_none() || std::time::Instant::now() >= deadline {
+                return Ok(left);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn ring_unretired_now(&self) -> Result<Option<String>, ManualBackendError> {
+        let row = self
+            .raw
+            .query_one(
+                "select (select string_agg(seg_seq || ' ' || state, ', ' order by seg_seq) \
+                           from segments where state in ('sealed', 'draining')), \
+                        (select string_agg(seg_seq || ': ' || left(error, 200), '; ' \
+                                           order by seg_seq) \
+                           from drain_holdups)",
+                &[],
+            )
+            .await?;
+        let segments: Option<String> = row.get(0);
+        let holdups: Option<String> = row.get(1);
+        Ok(match (segments, holdups) {
+            (None, None) => None,
+            (segments, holdups) => Some(format!(
+                "undrained segments: {}; holdups: {}",
+                segments.as_deref().unwrap_or("none"),
+                holdups.as_deref().unwrap_or("none")
+            )),
+        })
     }
 
     /// Fires one [`NoiseEvent`]'s [`NoiseEventKind`]: renders it to SQL text
@@ -1252,8 +1385,8 @@ impl ManualBackend {
     /// nothing here can affect the tracked convergence check regardless of
     /// whether it succeeds.
     pub async fn fire_noise_event(&self, table: Option<&Table>, event: &NoiseEvent) {
-        let sql = match &event.kind {
-            NoiseEventKind::Admin(sql) => sql.clone(),
+        let (sql, admin) = match &event.kind {
+            NoiseEventKind::Admin(sql) => (sql.clone(), true),
             NoiseEventKind::Table(action) => {
                 let Some(table) = table else {
                     eprintln!(
@@ -1262,10 +1395,15 @@ impl ManualBackend {
                     );
                     return;
                 };
-                render_noise_action(table, action)
+                (render_noise_action(table, action), false)
             }
         };
-        if let Err(err) = self.execute_raw(&sql).await {
+        let result = if admin {
+            self.execute_admin(&sql).await
+        } else {
+            self.execute_raw(&sql).await
+        };
+        if let Err(err) = result {
             eprintln!("generative: noise statement {sql:?} failed (expected/ignored): {err:?}");
         }
     }
@@ -1314,6 +1452,7 @@ impl ManualBackend {
     /// restart action tests.
     pub async fn reconnect_after_server_restart(&mut self) -> Result<(), ManualBackendError> {
         self.raw = connect_raw(&self.config).await?;
+        self.app = connect_app(&self.roles).await?;
         await_pool_usable(&self.pool).await
     }
 
@@ -1354,14 +1493,28 @@ impl ManualBackend {
         &self,
         dsn: impl Into<String>,
     ) -> Result<Self, ManualBackendError> {
+        let dsn = dsn.into();
+        // The restored server carries the roles over; only the address
+        // changed.
+        let roles = if self.roles.separate_app() {
+            Roles {
+                trellis: super::as_role(&dsn, super::TRELLIS_ROLE),
+                app: super::as_role(&dsn, super::APP_ROLE),
+                admin: dsn.clone(),
+            }
+        } else {
+            Roles::single(dsn.clone())
+        };
         let mut restored = Self::connect_with_instance(
-            dsn,
+            roles.trellis.clone(),
             self.config.schema(),
             self.target_schema.clone(),
             self.application_threads,
             Some(self.maintenance_interval),
         )
         .await?;
+        restored.app = connect_app(&roles).await?;
+        restored.roles = roles;
         restored.client_options = self.client_options.clone();
         restored.tables = self.tables.clone();
         restored.defs = self.defs.clone();
@@ -1450,7 +1603,8 @@ impl super::Backend for ManualBackend {
     /// cast discipline, the transactional count-then-truncate) lives there
     /// now, shared verbatim with [`super::SubprocessBackend::apply`].
     async fn apply(&mut self, op: &Op) -> Result<u64, ManualBackendError> {
-        sql::apply_op(&mut self.raw, &self.tables, op)
+        let session = self.app.as_mut().unwrap_or(&mut self.raw);
+        sql::apply_op(session, &self.tables, op)
             .await
             .map_err(|err| match err {
                 sql::ApplyOpError::UnknownTable(table) => {
@@ -1507,7 +1661,8 @@ impl super::Backend for ManualBackend {
         &mut self,
         defs: &[TransformDef],
     ) -> Result<Vec<DefinitionState>, ManualBackendError> {
-        Ok(sql::definition_states(&self.raw, defs).await?)
+        let reported = sql::reported_statuses(self.config.clone()).await?;
+        Ok(sql::definition_states(&self.raw, defs, &reported).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, ManualBackendError> {
@@ -1539,6 +1694,11 @@ impl super::Backend for ManualBackend {
                 }
                 // The 1-1 JOIN tier: a target keyed by `a`'s primary key,
                 // read as a 1-1 target is.
+                // A 1-1 target over a `KEY (...)` source is keyed by the key.
+                KeySpace::OneToOne if def.source_key.is_some() => {
+                    let key = def.source_key.as_deref().unwrap_or_default();
+                    sql::read_keyed_table(&self.raw, &qualified, key, &def.fields).await?
+                }
                 KeySpace::JoinOneToOne(_) | KeySpace::OneToOne => {
                     // `source_primary_key` accepts an arbitrary-arity source
                     // primary key, and the
@@ -1741,8 +1901,12 @@ impl super::ConcurrentBackend for ManualBackend {
     }
 
     async fn applier(&self) -> Result<ManualApplier, ManualBackendError> {
+        let raw = match connect_app(&self.roles).await? {
+            Some(app) => app,
+            None => connect_raw(&self.config).await?,
+        };
         Ok(ManualApplier {
-            raw: connect_raw(&self.config).await?,
+            raw,
             tables: self.tables.clone(),
         })
     }
@@ -1913,6 +2077,68 @@ impl super::ConcurrentBackend for ManualBackend {
                         def.target
                     ))
                     .await?;
+            }
+            BurstAction::EditField { def, edit } => {
+                // As for `Alter`: the statement refuses a transform that
+                // isn't `live`.
+                sql::await_settled(&self.raw, std::slice::from_ref(&**def), QUIESCE_TIMEOUT)
+                    .await?;
+                let expr = |field: &str| {
+                    let field = def
+                        .fields
+                        .iter()
+                        .find(|f| f.name == field)
+                        .expect("an added or altered field is in the definition it leaves");
+                    sql::render_expr(&field.expr)
+                };
+                let change = match edit {
+                    FieldEdit::Add { field, .. } => format!("ADD {} AS {field}", expr(field)),
+                    FieldEdit::Alter { field } => format!("ALTER {field} AS {}", expr(field)),
+                    FieldEdit::Drop { field } => format!("DROP {field}"),
+                };
+                operator
+                    .apply(&format!("ALTER TRANSFORM {} {change}", def.target))
+                    .await?;
+                let at = self
+                    .defs
+                    .iter()
+                    .position(|d| d.target == def.target)
+                    .expect("an edit names an installed definition — a generator bug");
+                self.defs[at] = (**def).clone();
+            }
+            BurstAction::Drop { target } => {
+                operator.apply(&format!("PAUSE TRANSFORM {target}")).await?;
+                operator.apply(&format!("DROP TRANSFORM {target}")).await?;
+                // The oracle stops checking the definition, so check here
+                // that the drop took its target with it.
+                if let Some(def) = self.defs.iter().find(|def| &def.target == target) {
+                    let qualified = qualified_target_table(&self.target_schema, def);
+                    let remains: bool = self
+                        .raw
+                        .query_one("select to_regclass($1) is not null", &[&qualified])
+                        .await?
+                        .get(0);
+                    if remains {
+                        return Err(ManualBackendError::DroppedTargetRemains {
+                            target: target.clone(),
+                        });
+                    }
+                }
+                self.defs.retain(|def| &def.target != target);
+            }
+            BurstAction::Define { def, .. } => {
+                super::Backend::install(
+                    self,
+                    &Program {
+                        tables: Vec::new(),
+                        defs: vec![(**def).clone()],
+                        def_install_after_op: vec![0],
+                        ops: Vec::new(),
+                        restart_after_ops: Vec::new(),
+                        scale_out_after_ops: Vec::new(),
+                    },
+                )
+                .await?;
             }
             BurstAction::Install { .. } => unreachable!("handled above"),
         }

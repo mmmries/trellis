@@ -43,8 +43,12 @@
 //!
 //!    Pass [`fires`] a condition that is true only when the plant actually
 //!    changes what the engine does here, so [`fired`] counts real
-//!    misbehavior, not visits. Keep the hook to a few lines: the correct
-//!    path must read exactly as it did before.
+//!    misbehavior, not visits, and [`reached`] counts the times it would
+//!    have. Compute the condition armed or not, so an unarmed baseline
+//!    counts its reaches; where it costs a query the correct path doesn't
+//!    run, guard the query with [`visit`] and name the plant in
+//!    [`Plant::reach_counts_passes`]. Keep the hook to a few lines: the
+//!    correct path must read exactly as it did before.
 //! 3. Pin it: name the deterministic interleaving test that fails with it
 //!    armed (`TRELLIS_TEST_PLANT=<name> cargo test -p trellis --test <file>
 //!    <test>`) in its doc comment.
@@ -54,7 +58,9 @@
 //!    `one_to_one_join_planted_bugs_are_caught`, the chained-reader tier's
 //!    `chained_join_planted_bugs_are_caught`, the `MIN`/`MAX` tampering
 //!    tier's `extremes_tamper_planted_bugs_are_caught`), list it in the
-//!    `not_gated` of the tiers that don't, and record its catch rate.
+//!    `not_gated` of the tiers that don't, and record its catch rate. The
+//!    sweep's reachability floor then holds each tier's baseline to
+//!    reaching the site (`generative::reach_floor`).
 //!
 //! A plant is never "fixed": it is the regression the tier exists to catch.
 //! If the engine code it hooks is rewritten,
@@ -865,6 +871,18 @@ pub enum Plant {
     /// and pinned by its
     /// `erroring_inserts_and_updates_follow_the_held_key_model`.
     HeldKeyDeleteApplies,
+    /// #2130 (`isolation_pauses_every_reader`): when a page fails and one
+    /// definition's share of it fails alone
+    /// (`staging::quarantine::pause_definitions_failing_alone`), every
+    /// definition reading the page's tables is paused (T0247), not just the
+    /// one that fails: an innocent reader of the same table stops with it.
+    /// Fires only when such a page has a reader whose share applies.
+    ///
+    /// Gated by the held-key tier's isolation draw
+    /// (`held_key_planted_bugs_are_caught`), whose failing definition has a
+    /// sibling reader of its table, and pinned by its
+    /// `a_sum_overflowing_in_one_page_pauses_only_its_definition`.
+    IsolationPausesEveryReader,
     /// ADR-0002, #1991 (`gb_where_old_image`): a plain aggregate's page
     /// stages an update's old image whatever its `WHERE` gives
     /// (`staging::group_basis`'s stage statement), so a row that was no
@@ -986,6 +1004,41 @@ pub enum Plant {
     /// Pinned by `capture_reread`'s
     /// `a_nested_write_in_a_subtransaction_is_the_live_row`.
     CaptureSkipNestedReread,
+    /// #2183 (`field_release_before_widen`): a field build releases a field
+    /// an `ALTER TRANSFORM … ADD` or `ALTER` holds out of Apply until its
+    /// source's capture images the column it reads, without waiting for the
+    /// capture widen to land or for its gate to clear (`staging::build`'s
+    /// `capture_release`). A row staged without the column, by the old
+    /// capture body, then reaches the field, and its key is quarantined.
+    /// Fires on every release check of a field that awaits its capture.
+    ///
+    /// Pinned by `capture_join`'s
+    /// `a_widened_field_waits_for_the_rows_staged_before_the_widen` and
+    /// `an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen`.
+    FieldReleaseBeforeWiden,
+    /// The drain compares transaction ids truncated to 32 bits: a batch's
+    /// fenced read (`staging::seal`'s `window_over_fence`) takes its fences
+    /// with each id cut to its low 32 bits, while the ring's `row_txid`s stay
+    /// full `xid8`s. Past the first 32-bit epoch a fence then sees none of
+    /// the rows it fenced, and their changes never apply.
+    ///
+    /// Pinned by `staging`'s `sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows`.
+    /// Only the `db_admin` property's xid-aging action crosses the
+    /// boundary, so no planted-bug sweep tier gates it
+    /// (`generative::plant_sweep`'s `PlantPath::XidEpoch`).
+    FenceXid32,
+    /// #2126 (`null_key_as_empty`): capture renders a nullable `KEY (...)`
+    /// column's part of the ring key as its bare text
+    /// (`capture::sql`'s `key_expr`), so a `NULL` part reads as `''` rather
+    /// than taking the build's `NULL` encoding. The `NULL`-keyed row's
+    /// changes then stage under the `''` row's key. Fires only on a source
+    /// read through a `KEY (...)` with a nullable column.
+    ///
+    /// Pinned by `source_keys`'s `nullable_key_capture` tests (every one
+    /// fails with it armed, e.g.
+    /// `a_null_key_is_a_row_of_its_own_through_every_write`), and gated by
+    /// the concurrent tier's `source_key` sweep (#2171).
+    NullKeyAsEmpty,
 }
 
 impl Plant {
@@ -1072,6 +1125,7 @@ impl Plant {
         Plant::StarReadsFirstOnly,
         Plant::HeldKeyUnlisted,
         Plant::HeldKeyDeleteApplies,
+        Plant::IsolationPausesEveryReader,
         Plant::GbWhereOldImage,
         Plant::GbWhereNullAsTrue,
         Plant::GbWhereBuildUnfiltered,
@@ -1085,6 +1139,9 @@ impl Plant {
         Plant::GbWhereColumnNotImaged,
         Plant::CaptureSlotFromSnapshot,
         Plant::CaptureSkipNestedReread,
+        Plant::FieldReleaseBeforeWiden,
+        Plant::FenceXid32,
+        Plant::NullKeyAsEmpty,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -1171,6 +1228,7 @@ impl Plant {
             Plant::StarReadsFirstOnly => "star_reads_first_only",
             Plant::HeldKeyUnlisted => "held_key_unlisted",
             Plant::HeldKeyDeleteApplies => "held_key_delete_applies",
+            Plant::IsolationPausesEveryReader => "isolation_pauses_every_reader",
             Plant::GbWhereOldImage => "gb_where_old_image",
             Plant::GbWhereNullAsTrue => "gb_where_null_as_true",
             Plant::GbWhereBuildUnfiltered => "gb_where_build_unfiltered",
@@ -1184,12 +1242,33 @@ impl Plant {
             Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
             Plant::CaptureSlotFromSnapshot => "capture_slot_from_snapshot",
             Plant::CaptureSkipNestedReread => "capture_skip_nested_reread",
+            Plant::FieldReleaseBeforeWiden => "field_release_before_widen",
+
+            Plant::FenceXid32 => "fence_xid32",
+            Plant::NullKeyAsEmpty => "null_key_as_empty",
         }
     }
 
     /// The plant [`Plant::name`] names, if any.
     pub fn from_name(name: &str) -> Option<Plant> {
         Plant::ALL.iter().copied().find(|p| p.name() == name)
+    }
+
+    /// Whether the site's reach counts passes of its hook ([`visit`],
+    /// [`reach_pass`]) rather than times its precondition held: a reach
+    /// shows only that the path ran.
+    pub fn reach_counts_passes(self) -> bool {
+        matches!(
+            self,
+            Plant::GbEarlyZeroGc
+                | Plant::GbLsnNotVisibility
+                | Plant::JoinOtherSideBeforeJ
+                | Plant::JoinDropFlip
+                | Plant::StarReadsFirstOnly
+                | Plant::Join1FanOutHeldRow
+                | Plant::SeamTokenEarly
+                | Plant::CaptureSlotFromSnapshot
+        )
     }
 }
 
@@ -1235,13 +1314,78 @@ pub fn armed() -> Option<Plant> {
 /// The hook every plant site calls: true when `plant` is the armed one and
 /// `changes_behavior` says acting on it would change what the engine does
 /// here, in which case the caller takes the planted path. Each true return
-/// is counted in [`fired`].
+/// is counted in [`fired`]; each true `changes_behavior`, armed or not, is
+/// counted as a reach of `plant`'s site ([`reached`]).
 pub fn fires(plant: Plant, changes_behavior: bool) -> bool {
+    if changes_behavior {
+        reach_plant(plant);
+    }
     let fires = changes_behavior && armed() == Some(plant);
     if fires {
         FIRED.fetch_add(1, Ordering::Relaxed);
     }
     fires
+}
+
+/// Whether a `pg_snapshot`'s text names an id past the first 32-bit epoch,
+/// so cutting its ids to 32 bits changes it ([`Plant::FenceXid32`]).
+pub(crate) fn snapshot_past_first_epoch(snapshot: &str) -> bool {
+    snapshot_ids(snapshot).any(|id| id > u64::from(u32::MAX))
+}
+
+/// A `pg_snapshot`'s text with each id cut to its low 32 bits
+/// ([`Plant::FenceXid32`]).
+pub(crate) fn snapshot_as_32_bit(snapshot: &str) -> String {
+    let (head, xip) = snapshot.rsplit_once(':').unwrap_or((snapshot, ""));
+    let cut = |part: &str| {
+        part.split(',')
+            .filter(|id| !id.is_empty())
+            .map(|id| (id.parse::<u64>().expect("a snapshot id") & u64::from(u32::MAX)).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (xmin, xmax) = head.split_once(':').expect("xmin:xmax:xip");
+    format!("{}:{}:{}", cut(xmin), cut(xmax), cut(xip))
+}
+
+fn snapshot_ids(snapshot: &str) -> impl Iterator<Item = u64> + '_ {
+    snapshot
+        .split([':', ','])
+        .filter(|id| !id.is_empty())
+        .map(|id| id.parse::<u64>().expect("a snapshot id"))
+}
+
+/// The hook of a site whose precondition costs a query the correct path
+/// doesn't run: true when `plant` is armed, and the caller runs the query
+/// and passes its answer to [`fires`]. Unarmed, it counts a reach of the
+/// site for each pass of the hook instead ([`reached`]): a count of the
+/// path, not of the precondition.
+pub fn visit(plant: Plant) -> bool {
+    if armed() == Some(plant) {
+        return true;
+    }
+    reach_pass(plant);
+    false
+}
+
+/// Counts one pass of `plant`'s hook as a reach of its site, for a site
+/// that can't see its precondition unarmed. The plant must be one
+/// [`Plant::reach_counts_passes`] names, so a report can say its count is
+/// of the path.
+pub fn reach_pass(plant: Plant) {
+    debug_assert!(
+        plant.reach_counts_passes(),
+        "{} counts passes of its hook: add it to Plant::reach_counts_passes",
+        plant.name()
+    );
+    reach_plant(plant);
+}
+
+/// Counts one reach of `plant`'s site: for a site whose precondition shows
+/// only where the correct path acts on it (a statement it fails), not at
+/// its hook.
+pub fn reach_plant(plant: Plant) {
+    reach_slot(&REACHED, plant as usize, plant.name()).fetch_add(1, Ordering::Relaxed);
 }
 
 /// How many times the armed plant has changed the engine's behavior in this
@@ -1251,9 +1395,193 @@ pub fn fired() -> u64 {
     FIRED.load(Ordering::Relaxed)
 }
 
+/// A reach marker: an engine path with no planted bug, counted the way a
+/// plant's site is, so a sweep can show its tier's programs run it.
+///
+/// # Adding a marker
+///
+/// Add a variant, with a doc comment naming the path, to [`Marker::ALL`]
+/// and [`Marker::name`], and at the site one gated line:
+///
+/// ```ignore
+/// #[cfg(any(test, feature = "test-util"))]
+/// crate::plant::reach(crate::plant::Marker::MyPath);
+/// ```
+///
+/// A marker is a site like a plant's, so the reachability floor
+/// (`generative::reach_floor`) holds every tier to it, or to an exemption
+/// that says why the tier can't reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Marker {
+    /// Capture renders a trigger function whose key has a nullable column
+    /// (an explicit `KEY (…)`), which escapes the column's `NULL`
+    /// (`capture::sql`'s `key_expr`).
+    CaptureNullableKey,
+    /// Reconciliation widens an installed table's capture functions to
+    /// image a column, key or group-key column they didn't
+    /// (`capture::install`'s `reconcile_for`).
+    CaptureWiden,
+    /// A drain's failure is Postgres refusing the role a privilege (or
+    /// row-level security), which halts the definitions it reaches rather
+    /// than isolating keys (`staging::quarantine`'s `classify`).
+    PrivilegeHalts,
+}
+
+impl Marker {
+    /// Every marker.
+    pub const ALL: &'static [Marker] = &[
+        Marker::CaptureNullableKey,
+        Marker::CaptureWiden,
+        Marker::PrivilegeHalts,
+    ];
+
+    /// The marker's site name, which no plant's name repeats.
+    pub fn name(self) -> &'static str {
+        match self {
+            Marker::CaptureNullableKey => "capture_nullable_key",
+            Marker::CaptureWiden => "capture_widen",
+            Marker::PrivilegeHalts => "privilege_halts",
+        }
+    }
+}
+
+static REACHED: [AtomicU64; Plant::ALL.len()] = [const { AtomicU64::new(0) }; Plant::ALL.len()];
+static MARKED: [AtomicU64; Marker::ALL.len()] = [const { AtomicU64::new(0) }; Marker::ALL.len()];
+
+/// The counter at `index`, for the site `name`.
+///
+/// # Panics
+///
+/// When the variant is missing from its `ALL` list, which sizes the
+/// counters.
+fn reach_slot<'a>(counters: &'a [AtomicU64], index: usize, name: &str) -> &'a AtomicU64 {
+    counters
+        .get(index)
+        .unwrap_or_else(|| panic!("site {name} has no reach counter: add it to its ALL list"))
+}
+
+/// Counts one pass of `marker`'s path.
+pub fn reach(marker: Marker) {
+    reach_slot(&MARKED, marker as usize, marker.name()).fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether `site`'s reach counts passes of a path rather than times a
+/// plant's precondition held: a marker's, or a plant's that
+/// [`Plant::reach_counts_passes`] names.
+pub fn counts_passes(site: &str) -> bool {
+    Plant::from_name(site).map_or(Marker::ALL.iter().any(|m| m.name() == site), |p| {
+        p.reach_counts_passes()
+    })
+}
+
+/// Every site's name: each plant's, then each marker's.
+pub fn sites() -> impl Iterator<Item = &'static str> {
+    Plant::ALL
+        .iter()
+        .map(|p| p.name())
+        .chain(Marker::ALL.iter().map(|m| m.name()))
+}
+
+/// How many times this process has reached each site, by [`sites`]'s
+/// name and in its order, zeros included: a plant's site when its
+/// precondition held (armed or not), a marker's when its path ran.
+pub fn reached() -> Vec<(&'static str, u64)> {
+    Plant::ALL
+        .iter()
+        .map(|&p| (p.name(), reach_slot(&REACHED, p as usize, p.name())))
+        .chain(
+            Marker::ALL
+                .iter()
+                .map(|&m| (m.name(), reach_slot(&MARKED, m as usize, m.name()))),
+        )
+        .map(|(name, counter)| (name, counter.load(Ordering::Relaxed)))
+        .collect()
+}
+
+/// Adds another process's counts to this one's: `fired` to [`fired`], and
+/// each `(site, count)` to [`reached`]. A harness that runs the engine in a
+/// child process folds the child's counts in this way, so one reading
+/// covers both. Returns the site names it doesn't know.
+pub fn absorb<'a>(fired: u64, reached: impl IntoIterator<Item = (&'a str, u64)>) -> Vec<String> {
+    FIRED.fetch_add(fired, Ordering::Relaxed);
+    let mut unknown = Vec::new();
+    for (name, count) in reached {
+        let counter = if let Some(p) = Plant::from_name(name) {
+            reach_slot(&REACHED, p as usize, name)
+        } else if let Some(&m) = Marker::ALL.iter().find(|m| m.name() == name) {
+            reach_slot(&MARKED, m as usize, name)
+        } else {
+            unknown.push(name.to_string());
+            continue;
+        };
+        counter.fetch_add(count, Ordering::Relaxed);
+    }
+    unknown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every variant indexes its own counter (the `ALL` lists hold each
+    /// variant once), and no site name repeats across plants and markers.
+    #[test]
+    fn every_site_has_its_own_counter_and_name() {
+        let mut plants: Vec<usize> = Plant::ALL.iter().map(|&p| p as usize).collect();
+        plants.sort_unstable();
+        assert_eq!(plants, (0..Plant::ALL.len()).collect::<Vec<_>>());
+        let mut markers: Vec<usize> = Marker::ALL.iter().map(|&m| m as usize).collect();
+        markers.sort_unstable();
+        assert_eq!(markers, (0..Marker::ALL.len()).collect::<Vec<_>>());
+        let mut names: Vec<&str> = sites().collect();
+        let all = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all, "site names must be unique");
+    }
+
+    /// A site counts as reached when its precondition holds, whether or not
+    /// its plant is armed; a marker when its path runs; and absorbed counts
+    /// add to both readings. Other tests in this process can reach the same
+    /// sites, so the counts are checked as lower bounds.
+    #[test]
+    fn reach_counts_preconditions_markers_and_absorbed_counts() {
+        let count = |name: &str| {
+            reached()
+                .into_iter()
+                .find(|(site, _)| *site == name)
+                .map(|(_, n)| n)
+                .expect("a site")
+        };
+        let plant = Plant::GbWhereColumnNotImaged;
+        let plant_before = count(plant.name());
+        assert!(!fires(plant, true), "nothing is armed in the default suite");
+        assert!(count(plant.name()) > plant_before);
+
+        let marker = Marker::CaptureWiden;
+        let marker_before = count(marker.name());
+        reach(marker);
+        assert!(count(marker.name()) > marker_before);
+
+        let fired_before = fired();
+        let unknown = absorb(
+            2,
+            [(plant.name(), 30), (marker.name(), 40), ("no_such_site", 1)],
+        );
+        assert_eq!(unknown, vec!["no_such_site".to_string()]);
+        assert!(fired() >= fired_before + 2);
+        assert!(count(plant.name()) >= plant_before + 31);
+        assert!(count(marker.name()) >= marker_before + 41);
+    }
+
+    #[test]
+    fn a_snapshot_cut_to_32_bits() {
+        let snapshot = "4294967300:4294967310:4294967301,4294967305";
+        assert!(snapshot_past_first_epoch(snapshot));
+        assert_eq!(snapshot_as_32_bit(snapshot), "4:14:5,9");
+        assert!(!snapshot_past_first_epoch("700:710:"));
+        assert_eq!(snapshot_as_32_bit("700:710:"), "700:710:");
+    }
 
     #[test]
     fn every_plant_round_trips_through_its_name() {

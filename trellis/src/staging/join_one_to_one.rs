@@ -319,6 +319,8 @@ fn qualify(
         | Expr::FunctionCall { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
         | Expr::Case { .. } => expr.try_map_children(&mut sub)?,
     })
 }
@@ -971,17 +973,22 @@ fn moved_key(shape: &JoinShape, side: Side, parts: &[Option<String>], k: &PageKe
     // (`star_late_skip_first`). See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     if side == Side::From && shape.is_star() {
-        let at = match crate::plant::armed() {
-            Some(plant @ crate::plant::Plant::StarLateSkipLast) => {
-                shape.positions.last().map(|p| (plant, p.position))
+        let skips = [
+            (
+                crate::plant::Plant::StarLateSkipLast,
+                shape.positions.last().map(|p| p.position),
+            ),
+            (
+                crate::plant::Plant::StarLateSkipFirst,
+                Some(Position::FIRST),
+            ),
+        ];
+        for (plant, at) in skips {
+            if let Some(at) = at
+                && crate::plant::fires(plant, missing == [at])
+            {
+                return false;
             }
-            Some(plant @ crate::plant::Plant::StarLateSkipFirst) => Some((plant, Position::FIRST)),
-            _ => None,
-        };
-        if let Some((plant, at)) = at
-            && crate::plant::fires(plant, missing == [at])
-        {
-            return false;
         }
     }
     true
@@ -1011,17 +1018,10 @@ fn key_moved(
     // (`star_recheck_skip_last`). See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     if shape.is_star() {
-        let planted = match crate::plant::armed() {
-            Some(plant @ crate::plant::Plant::StarRecheckJ) => Some(plant),
-            Some(plant @ crate::plant::Plant::StarRecheckSkipLast)
-                if shape.positions.last().map(|p| p.position) == Some(position) =>
-            {
-                Some(plant)
-            }
-            _ => None,
-        };
-        if let Some(plant) = planted
-            && crate::plant::fires(plant, !moved_key(shape, side, parts, k))
+        let held = !moved_key(shape, side, parts, k);
+        let last = shape.positions.last().map(|p| p.position) == Some(position);
+        if crate::plant::fires(crate::plant::Plant::StarRecheckJ, held)
+            || crate::plant::fires(crate::plant::Plant::StarRecheckSkipLast, held && last)
         {
             return false;
         }
@@ -1360,21 +1360,18 @@ fn root_skip_j(
 ) -> PageKeys {
     #[cfg(any(test, feature = "test-util"))]
     if shape.is_star() {
-        let at = match crate::plant::armed() {
-            Some(plant @ crate::plant::Plant::StarRootSkipJLast) => {
-                Some((plant, shape.positions.len() - 1))
-            }
-            Some(plant @ crate::plant::Plant::StarRootSkipJFirst) => Some((plant, 0)),
-            // The middle position of a star of three or more joined tables.
-            Some(plant @ crate::plant::Plant::StarRootSkipJMiddle) if shape.positions.len() > 2 => {
-                Some((plant, shape.positions.len() / 2))
-            }
-            _ => None,
-        };
-        if let Some((plant, i)) = at {
-            let root_only: BTreeSet<KeyText> =
-                root_k[i].difference(&joined_k[i]).cloned().collect();
-            if crate::plant::fires(plant, !root_only.is_empty()) {
+        let n = shape.positions.len();
+        let mut skips = vec![
+            (crate::plant::Plant::StarRootSkipJLast, n - 1),
+            (crate::plant::Plant::StarRootSkipJFirst, 0),
+        ];
+        // The middle position of a star of three or more joined tables.
+        if n > 2 {
+            skips.push((crate::plant::Plant::StarRootSkipJMiddle, n / 2));
+        }
+        for (plant, i) in skips {
+            let root_only = root_k[i].difference(&joined_k[i]).next().is_some();
+            if crate::plant::fires(plant, root_only) {
                 let mut locked = k.clone();
                 locked[i] = joined_k[i].clone();
                 return locked;
@@ -1465,53 +1462,50 @@ async fn lock_fan_rows(
 fn fan_lock_groups(shape: &JoinShape, inline: &PageKeys, root: bool) -> (Vec<PageKeys>, PageKeys) {
     #[cfg(any(test, feature = "test-util"))]
     if shape.is_star() {
-        use crate::plant::{Plant, armed, fires};
+        use crate::plant::{Plant, fires};
         let any = inline.iter().any(|keys| !keys.is_empty());
         let last = inline.len() - 1;
-        match armed() {
-            // A joined-table writer locks its own `J` but not the `R`
-            // entries it recomputes.
-            Some(plant @ Plant::StarOwnJOnly) if fires(plant, any) => {
-                return (vec![shape.empty_keys()], shape.empty_keys());
-            }
-            // The `R` entries are locked only after the page read `M`.
-            Some(plant @ Plant::StarRAfterM) if fires(plant, any) => {
-                return (vec![shape.empty_keys()], inline.clone());
-            }
-            // The last position's writer doesn't lock them.
-            Some(plant @ Plant::StarLastNoR) if fires(plant, !inline[last].is_empty()) => {
-                let mut keys = inline.clone();
-                keys[last].clear();
-                return (vec![keys], shape.empty_keys());
-            }
-            // One statement per position, or at three or more positions
-            // two: positions 1 and 2, then the rest.
-            Some(plant @ Plant::StarRSplit) => {
-                let bounds: Vec<std::ops::Range<usize>> = if inline.len() >= 3 {
-                    vec![0..2, 2..inline.len()]
-                } else {
-                    (0..inline.len()).map(|i| i..i + 1).collect()
-                };
-                let groups: Vec<PageKeys> = bounds
-                    .iter()
-                    .map(|range| {
-                        let mut keys = shape.empty_keys();
-                        for i in range.clone() {
-                            keys[i] = inline[i].clone();
-                        }
-                        keys
-                    })
-                    .collect();
-                let statements = groups
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, keys)| (*i == 0 && root) || keys.iter().any(|k| !k.is_empty()))
-                    .count();
-                if fires(plant, statements > 1) {
-                    return (groups, shape.empty_keys());
-                }
-            }
-            _ => {}
+        // A joined-table writer locks its own `J` but not the `R` entries
+        // it recomputes.
+        if fires(Plant::StarOwnJOnly, any) {
+            return (vec![shape.empty_keys()], shape.empty_keys());
+        }
+        // The `R` entries are locked only after the page read `M`.
+        if fires(Plant::StarRAfterM, any) {
+            return (vec![shape.empty_keys()], inline.clone());
+        }
+        // The last position's writer doesn't lock them.
+        if fires(Plant::StarLastNoR, !inline[last].is_empty()) {
+            let mut keys = inline.clone();
+            keys[last].clear();
+            return (vec![keys], shape.empty_keys());
+        }
+        // One statement per position, or at three or more positions two:
+        // positions 1 and 2, then the rest.
+        let bounds: Vec<std::ops::Range<usize>> = if inline.len() >= 3 {
+            vec![0..2, 2..inline.len()]
+        } else {
+            (0..inline.len()).map(|i| i..i + 1).collect()
+        };
+        let statements = bounds
+            .iter()
+            .enumerate()
+            .filter(|(i, range)| {
+                (*i == 0 && root) || (*range).clone().any(|p| !inline[p].is_empty())
+            })
+            .count();
+        if fires(Plant::StarRSplit, statements > 1) {
+            let groups: Vec<PageKeys> = bounds
+                .iter()
+                .map(|range| {
+                    let mut keys = shape.empty_keys();
+                    for i in range.clone() {
+                        keys[i] = inline[i].clone();
+                    }
+                    keys
+                })
+                .collect();
+            return (groups, shape.empty_keys());
         }
     }
     let _ = root;
@@ -2632,7 +2626,7 @@ async fn not_held_filter(
     // See `crate::plant`. Both parameters stay bound, so the statement's
     // parameters don't change with the plant.
     #[cfg(any(test, feature = "test-util"))]
-    if crate::plant::armed() == Some(crate::plant::Plant::Join1FanOutHeldRow)
+    if crate::plant::visit(crate::plant::Plant::Join1FanOutHeldRow)
         && crate::plant::fires(
             crate::plant::Plant::Join1FanOutHeldRow,
             held::holds_any(txn, shape).await?,

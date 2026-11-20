@@ -42,6 +42,33 @@ pub struct Table {
     /// (`unique_cols` is empty): Postgres requires every unique index on a
     /// partitioned table to hold the partition key.
     pub partitioning: Option<Partitioning>,
+    /// The unique index a `KEY (...)` reads the table by (ADR-0026), or
+    /// `None` for a table every definition reads by its primary key.
+    pub source_key: Option<SourceKey>,
+}
+
+/// A source [`Table`]'s `KEY (...)` (ADR-0026): the unique index every
+/// definition over the table names in its `KEY (...)`, its columns' `NULL`
+/// rule, and whether the table keeps a primary key beside it.
+///
+/// `pk_col` still names every row (ops address rows by it): without a
+/// primary key it is `NOT NULL UNIQUE`, an index no definition reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceKey {
+    /// The key's columns in index order, each a `Text` column of the table.
+    pub columns: Vec<String>,
+    /// The key columns that can hold `NULL`; the rest are `NOT NULL`. When
+    /// any can, the index is `NULLS NOT DISTINCT`.
+    pub nullable: Vec<String>,
+    /// Whether `pk_col` is the table's primary key.
+    pub primary_key: bool,
+}
+
+impl SourceKey {
+    /// Whether `column` is a key column that can hold `NULL`.
+    pub fn is_nullable(&self, column: &str) -> bool {
+        self.nullable.iter().any(|c| c == column)
+    }
 }
 
 /// A partitioned [`Table`]'s single level: the column it is partitioned by,
@@ -111,6 +138,7 @@ impl Table {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         }
     }
 
@@ -575,9 +603,11 @@ pub struct TimedAction {
 
 /// An operator action the concurrent tier takes mid-burst.
 /// Each is named after the public API call an operator makes, not the
-/// engine mechanism behind it. None of them changes what the converged
-/// targets should hold, so the oracle is unchanged: the burst is
-/// checked once it settles, like any other.
+/// engine mechanism behind it. The burst is checked once it settles, like
+/// any other, against the definitions as the last statement left them: a
+/// re-read, pause or resume changes nothing the oracle checks, and a
+/// definition change is one line on its definition list (bucket 2,
+/// `docs/generative-test-suite.md` §7).
 #[derive(Debug, Clone, PartialEq)]
 pub enum BurstAction {
     /// `Trellis::request_backfill(table)`: re-derive every definition that
@@ -615,16 +645,74 @@ pub enum BurstAction {
         field: String,
         expr: String,
     },
+    /// `ALTER TRANSFORM <target> ADD|ALTER|DROP` of one field of a plain 1-1
+    /// definition (ADR-0015), as [`FieldEdit`] says. `def` is the
+    /// definition as the statement leaves it, which the oracle checks from
+    /// then on (bucket 2, `docs/generative-test-suite.md` §7); an added or
+    /// altered field's expression is its field in `def`.
+    EditField {
+        def: Box<TransformDef>,
+        edit: FieldEdit,
+    },
+    /// `PAUSE TRANSFORM <target>` and then `DROP TRANSFORM <target>`. The
+    /// oracle stops checking the definition.
+    Drop { target: String },
+    /// `DEFINE TRANSFORM` of `def`, a definition outside
+    /// [`Program::defs`]: the definition again after a [`BurstAction::Drop`]
+    /// of it, or a second one over a source a loaded definition reads, as
+    /// [`DefineShape`] says. Its build runs under the burst's writes, and
+    /// the oracle checks it from then on.
+    Define {
+        def: Box<TransformDef>,
+        shape: DefineShape,
+    },
+}
+
+/// Which field change a [`BurstAction::EditField`] makes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldEdit {
+    /// `ADD <expr> AS <field>`. `widens` when no definition read the column
+    /// it reads at the time the plan was drawn, so the source's capture must
+    /// widen before the field applies (the capture gate).
+    Add { field: String, widens: bool },
+    /// `ALTER <field> AS <expr>`, with the same column type.
+    Alter { field: String },
+    /// `DROP <field>`.
+    Drop { field: String },
+}
+
+/// What a [`BurstAction::Define`] defines, relative to the definition it
+/// follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefineShape {
+    /// A second definition over the source of one already loaded, under a
+    /// new name; a later burst drops it when there is one.
+    Second,
+    /// The dropped definition again, under its name, unchanged.
+    Same,
+    /// The dropped definition under its name, with a field changed.
+    Changed,
+    /// The dropped definition unchanged, under a new name.
+    Renamed,
+    /// The dropped definition with a field changed, under a new name.
+    RenamedChanged,
 }
 
 impl BurstAction {
-    /// Whether the action starts a Re-derive build: an install, or a
+    /// Whether the action starts a Re-derive build: an install or define, a
     /// whole-transform resume, which rebuilds over the target's existing
-    /// ledger entries.
+    /// ledger entries, or a field `ADD` or `ALTER` of the generated
+    /// definition changes, which builds the field.
     pub fn starts_build(&self) -> bool {
         matches!(
             self,
-            BurstAction::Install { .. } | BurstAction::Resume { column: None, .. }
+            BurstAction::Install { .. }
+                | BurstAction::Resume { column: None, .. }
+                | BurstAction::Define { .. }
+                | BurstAction::EditField {
+                    edit: FieldEdit::Add { .. } | FieldEdit::Alter { .. },
+                    ..
+                }
         )
     }
 
@@ -642,6 +730,20 @@ impl BurstAction {
             } => "resume_column",
             BurstAction::Install { .. } => "install",
             BurstAction::Alter { .. } => "alter",
+            BurstAction::EditField { edit, .. } => match edit {
+                FieldEdit::Add { widens: false, .. } => "add_field",
+                FieldEdit::Add { widens: true, .. } => "add_field_widen",
+                FieldEdit::Alter { .. } => "alter_field",
+                FieldEdit::Drop { .. } => "drop_field",
+            },
+            BurstAction::Drop { .. } => "drop",
+            BurstAction::Define { shape, .. } => match shape {
+                DefineShape::Second => "define_second",
+                DefineShape::Same => "redefine_same",
+                DefineShape::Changed => "redefine_changed",
+                DefineShape::Renamed => "redefine_renamed",
+                DefineShape::RenamedChanged => "redefine_renamed_changed",
+            },
         }
     }
 }
@@ -690,6 +792,26 @@ pub enum DbAdminAction {
     /// the engine has to reconnect by itself: the harness never restarts the
     /// engine client for it.
     RestartPostgres(RestartMode),
+    /// `VACUUM FREEZE` of the whole case database as the superuser
+    /// (catalogs, Trellis's ring, ledgers and hidden tables, sources and
+    /// targets), at the same point as `Checkpoint`. A freeze keeps each
+    /// row's raw `xmin`, so capture's drift checks, which compare catalog
+    /// rows' `xmin`s with their recorded values, must read no change.
+    VacuumFreeze,
+    /// Ages the cluster's transaction ids, at the same point as
+    /// `Checkpoint`: freezes every database and moves the next id with
+    /// `pg_resetwal` to one commit-log page short of the next 32-bit epoch
+    /// boundary (`testkit::TestCluster::age_xids_to_epoch_edge`; each jump
+    /// restarts the server, as `RestartPostgres(Fast)` does), then burns all
+    /// but `tail` of the ids left. The engine's own transactions and the
+    /// program's next ops then cross the boundary while ring rows, fences
+    /// and bases from the old epoch are live. Rows written before the action
+    /// are frozen, and are usually more than `2^31` ids old after it, so
+    /// their `age(xmin)` has wrapped negative.
+    WrapXids {
+        /// Ids left before the boundary once the action ends.
+        tail: u32,
+    },
 }
 
 /// One [`DbAdminAction`], anchored to `ops[op]` (so `op < ops.len()`). See
@@ -767,6 +889,20 @@ pub fn group_key(values: &[Option<String>]) -> String {
         .iter()
         .map(|v| v.clone().unwrap_or_default())
         .map(|v| format!("{}:{v}", v.len()))
+        .collect()
+}
+
+/// The text a `KEY (...)` row is keyed by on both sides of a comparison:
+/// each part length-prefixed like [`group_key`]'s, but a `NULL` part is `-`,
+/// which no prefixed part starts with, so a `NULL` part never stands for
+/// `''` (the #2126 shape).
+pub fn source_key_text(values: &[Option<String>]) -> String {
+    values
+        .iter()
+        .map(|v| match v {
+            None => "-".to_string(),
+            Some(v) => format!("{}:{v}", v.len()),
+        })
         .collect()
 }
 
@@ -956,6 +1092,37 @@ pub struct Rewrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2171: `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and `chr(31)` each
+    /// key a row of their own, alone or as either part of a composite key.
+    #[test]
+    fn every_source_key_part_combination_keys_its_own_row() {
+        let parts: Vec<Option<String>> = std::iter::once(None)
+            .chain(
+                [
+                    "",
+                    "\u{1}",
+                    "\u{1}\u{1}",
+                    "a\u{1}\u{1}",
+                    "\u{1f}",
+                    "-",
+                    "0:",
+                    "1:a",
+                ]
+                .into_iter()
+                .map(|v| Some(v.to_string())),
+            )
+            .collect();
+        let mut keys: Vec<Vec<Option<String>>> = parts.iter().map(|p| vec![p.clone()]).collect();
+        for a in &parts {
+            for b in &parts {
+                keys.push(vec![a.clone(), b.clone()]);
+            }
+        }
+        let texts: std::collections::HashSet<String> =
+            keys.iter().map(|k| source_key_text(k)).collect();
+        assert_eq!(texts.len(), keys.len());
+    }
 
     #[test]
     fn name_pools_are_stable_and_independent_across_construction() {

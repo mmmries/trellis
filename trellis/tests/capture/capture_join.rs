@@ -1165,6 +1165,70 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
     assert_eq!(paused, 0, "b2 unpaused once its capture covered it");
 }
 
+/// #2183: once the widen an `ALTER TRANSFORM ... ADD` waits for has
+/// landed, its field still waits for every row staged before it (the
+/// widen's capture gate). A write that runs the old capture body while the
+/// widen waits is staged without `b` and is still undrained when the widen
+/// lands: releasing `b2` then would let it reach `b2` and quarantine its
+/// key. `TRELLIS_TEST_PLANT=field_release_before_widen` fails it.
+///
+/// Stepped by hand.
+#[tokio::test]
+async fn a_widened_field_waits_for_the_rows_staged_before_the_widen() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let (_trellis, holder) = edit_held_by_a_writer(db.dsn(), &mut raw, &db.pool).await;
+
+    // A write the old capture body images without b, left undrained. It
+    // changes a too, so the old body stages it.
+    raw.batch_execute("update public.u set a = 7, b = 100 where id = 1")
+        .await
+        .expect("write");
+    holder
+        .batch_execute("commit")
+        .await
+        .expect("end the holder");
+    reconcile_pass(&mut raw, &db.pool).await;
+    assert!(
+        captured_columns(&raw, "public.u")
+            .await
+            .expect("captured")
+            .contains(&"b".to_string()),
+        "the widen lands once the writer is gone"
+    );
+    settle_builds(&db.pool).await;
+    assert!(
+        b2_awaits_capture(&raw).await,
+        "b2 waits for the row staged before the widen to drain"
+    );
+
+    let mut ring = connect(db.dsn()).await;
+    for _ in 0..5 {
+        drain_to_quiescence(&db.pool, &mut ring).await;
+        reconcile_pass(&mut raw, &db.pool).await;
+        settle_builds(&db.pool).await;
+        if status(&raw, "tu").await == TransformStatus::Live {
+            break;
+        }
+    }
+    assert_eq!(status(&raw, "tu").await, TransformStatus::Live);
+    let (poisoned, wrong): (i64, i64) = {
+        let row = raw
+            .query_one(
+                "select (select count(*) from poison), \
+                        (select count(*) from public.tu t join public.u s using (id) \
+                         where t.b2 is distinct from s.b or t.a is distinct from s.a)",
+                &[],
+            )
+            .await
+            .expect("read the outcome");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(poisoned, 0, "no row met the old images");
+    assert_eq!(wrong, 0, "the target equals the source");
+}
+
 /// `tu` over `public.u (id, a, b)`, live and reading `a` only, then an
 /// `ALTER TRANSFORM tu ADD b AS b2` whose widen of `u`'s capture waits on
 /// the returned open writer through one staging-worker pass, so `b2` stays

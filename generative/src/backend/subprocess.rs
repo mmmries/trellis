@@ -50,6 +50,7 @@ use trellis::dev::pool::Pool;
 use trellis::dev::staging::StagingError;
 
 use super::ring_wait::QuiesceBudget;
+use super::roles::{Roles, connect_app};
 use super::sql;
 use super::{DefinitionState, Snapshot};
 use crate::model::{Op, Program, Table};
@@ -211,6 +212,92 @@ impl From<sql::ApplyOpError> for SubprocessBackendError {
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The environment variable naming the file an `engine_subprocess` writes
+/// its plant counts to ([`write_reach`]) when asked.
+pub const REACH_FILE_ENV: &str = "TRELLIS_TEST_REACH_FILE";
+
+/// How long [`collect_reach`] waits for a child to answer.
+const REACH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The file that asks the child holding `reach_file` for its counts; the
+/// child removes it once the counts are written.
+pub fn reach_request(reach_file: &std::path::Path) -> PathBuf {
+    reach_file.with_extension("request")
+}
+
+/// Writes this process's plant counts to `reach_file`, atomically: a
+/// `fired` line, then one `<site>\t<count>` line per site reached. The
+/// `engine_subprocess` side of [`collect_reach`].
+pub fn write_reach(reach_file: &std::path::Path) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    let mut text = format!("fired\t{}\n", trellis::dev::plant::fired());
+    for (site, count) in trellis::dev::plant::reached() {
+        if count > 0 {
+            let _ = writeln!(text, "{site}\t{count}");
+        }
+    }
+    let partial = reach_file.with_extension("partial");
+    std::fs::write(&partial, text)?;
+    std::fs::rename(&partial, reach_file)
+}
+
+/// Asks the child holding `reach_file` for its plant counts, waits (bounded
+/// by [`REACH_TIMEOUT`]) for its answer and folds them into this process's
+/// (`trellis::dev::plant::absorb`), so a sweep reading this process's
+/// counts covers the engine it ran in a child. Called just before the
+/// child is killed, since a killed child can't report; what the child
+/// reaches between the answer and the kill is lost. A child that doesn't
+/// answer (it exited, or hangs) is reported on stderr and skipped.
+fn collect_reach(reach_file: &std::path::Path) {
+    let request = reach_request(reach_file);
+    let _ = std::fs::remove_file(reach_file);
+    if let Err(err) = std::fs::write(&request, b"") {
+        eprintln!("generative: can't ask an engine subprocess for its plant counts: {err}");
+        return;
+    }
+    let deadline = Instant::now() + REACH_TIMEOUT;
+    while request.exists() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "generative: an engine subprocess didn't report its plant counts within \
+                 {REACH_TIMEOUT:?}; its reach is left out"
+            );
+            let _ = std::fs::remove_file(&request);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = match std::fs::read_to_string(reach_file) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("generative: can't read an engine subprocess's plant counts: {err}");
+            return;
+        }
+    };
+    let mut fired = 0;
+    let mut reached = Vec::new();
+    for line in text.lines() {
+        let Some((name, count)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u64>() else {
+            continue;
+        };
+        if name == "fired" {
+            fired = count;
+        } else {
+            reached.push((name, count));
+        }
+    }
+    // Not a panic: this runs in `Drop`, maybe while unwinding.
+    let unknown = trellis::dev::plant::absorb(fired, reached);
+    if !unknown.is_empty() {
+        eprintln!(
+            "generative: an engine subprocess reported sites this process doesn't know: {unknown:?}"
+        );
+    }
+}
+
 /// The subprocess-supervised backend. Owns a raw connection (DDL, DML,
 /// watermark reads, snapshot reads — identical role to `ManualBackend::raw`)
 /// and, once [`SubprocessBackend::install`] has run, a real child process
@@ -220,6 +307,10 @@ pub struct SubprocessBackend {
     dsn: String,
     pool: Pool,
     raw: tokio_postgres::Client,
+    /// The application's own session, when the backend was connected with
+    /// [`SubprocessBackend::connect_as`]: source DDL and every op's writes.
+    /// `None` runs them on `raw`. `dsn` and `raw` are the Trellis role's.
+    app: Option<tokio_postgres::Client>,
     /// Path to the `engine_subprocess` binary this backend spawns — see
     /// [`SubprocessBackend::connect`]'s doc comment for how a caller
     /// resolves this (`env!("CARGO_BIN_EXE_engine_subprocess")` from an
@@ -229,13 +320,15 @@ pub struct SubprocessBackend {
     defs: Vec<TransformDef>,
     application_threads: usize,
     maintenance_interval: Duration,
-    /// The primary engine subprocess, once spawned. `None` before the first
+    /// The primary engine subprocess, once spawned, with the file it reports
+    /// its plant counts to ([`collect_reach`]). `None` before the first
     /// [`SubprocessBackend::install`] call that has at least one table.
-    child: Option<CrashGuard>,
+    child: Option<(CrashGuard, PathBuf)>,
     /// Additional application-worker-only subprocesses started by
     /// [`SubprocessBackend::scale_out`], kept alive for this backend's own
-    /// lifetime — same role as `ManualBackend::scale_out_clients`.
-    scale_out_children: Vec<CrashGuard>,
+    /// lifetime — same role as `ManualBackend::scale_out_clients` — each
+    /// with its plant-count file.
+    scale_out_children: Vec<(CrashGuard, PathBuf)>,
     /// The exit status [`SubprocessBackend::restart`] observed the last time
     /// it killed a running child, if any — exposed via
     /// [`SubprocessBackend::last_kill_status`] so a crash test can confirm
@@ -276,6 +369,40 @@ impl SubprocessBackend {
         engine_bin: impl Into<PathBuf>,
     ) -> Result<Self, SubprocessBackendError> {
         Self::connect_with_options(dsn, engine_bin, 1, None).await
+    }
+
+    /// [`SubprocessBackend::connect`], but with the engine subprocess and the
+    /// harness's catalog reads running as `roles.trellis` and the
+    /// application's statements as `roles.app` (`super::roles`).
+    pub async fn connect_as(
+        roles: &Roles,
+        engine_bin: impl Into<PathBuf>,
+    ) -> Result<Self, SubprocessBackendError> {
+        Self::connect_as_with_options(roles, engine_bin, 1, None).await
+    }
+
+    /// [`SubprocessBackend::connect_as`]'s general form, with
+    /// [`SubprocessBackend::connect_with_options`]'s two knobs.
+    pub async fn connect_as_with_options(
+        roles: &Roles,
+        engine_bin: impl Into<PathBuf>,
+        application_threads: usize,
+        maintenance_interval: Option<Duration>,
+    ) -> Result<Self, SubprocessBackendError> {
+        let mut backend = Self::connect_with_options(
+            roles.trellis.clone(),
+            engine_bin,
+            application_threads,
+            maintenance_interval,
+        )
+        .await?;
+        backend.app = connect_app(roles).await?;
+        Ok(backend)
+    }
+
+    /// The session application statements run on.
+    fn app_session(&self) -> &tokio_postgres::Client {
+        self.app.as_ref().unwrap_or(&self.raw)
     }
 
     /// [`SubprocessBackend::connect`]'s general form — `application_threads`
@@ -323,6 +450,7 @@ impl SubprocessBackend {
             dsn,
             pool,
             raw,
+            app: None,
             engine_bin: engine_bin.into(),
             tables: HashMap::new(),
             defs: Vec::new(),
@@ -413,7 +541,7 @@ impl SubprocessBackend {
             })?
             .clone();
         let source_columns = sql::source_columns(&source_table);
-        sql::create_source_indexes(&self.raw, None, def).await?;
+        sql::create_source_indexes(self.app_session(), None, def).await?;
         let text = sql::render_definition(def);
         // Same front door real callers and `ManualBackend` use — see
         // `ManualBackend::install_definition`'s doc comment.
@@ -436,6 +564,10 @@ impl SubprocessBackend {
     /// [`SubprocessBackendError::EngineNotReady`].
     async fn spawn_engine(&mut self, staging_worker: bool) -> Result<(), SubprocessBackendError> {
         let _ = std::fs::remove_file(&self.ready_marker_path);
+        let reach_file = self.scratch_dir.join(format!(
+            "reach-{}",
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
 
         let mut command = Command::new(&self.engine_bin);
         command
@@ -457,6 +589,7 @@ impl SubprocessBackend {
                 self.maintenance_interval.as_millis().to_string(),
             )
             .env("TRELLIS_READY_MARKER", &self.ready_marker_path)
+            .env(REACH_FILE_ENV, &reach_file)
             // The pause hook — see this module's doc comment. Set
             // unconditionally (every spawned subprocess, primary or
             // scale-out): a no-op unless `arm_pause_before_commit` later
@@ -468,10 +601,10 @@ impl SubprocessBackend {
             .stderr(Stdio::inherit());
 
         let guard = CrashGuard::spawn(&mut command).map_err(SubprocessBackendError::Spawn)?;
-        let guard = if staging_worker {
-            self.child.insert(guard)
+        let (guard, _) = if staging_worker {
+            self.child.insert((guard, reach_file))
         } else {
-            self.scale_out_children.push(guard);
+            self.scale_out_children.push((guard, reach_file));
             self.scale_out_children.last_mut().expect("just pushed")
         };
 
@@ -525,8 +658,12 @@ impl Drop for SubprocessBackend {
     fn drop(&mut self) {
         // `self.child`/`self.scale_out_children` drop right after this body
         // (struct-field drop order), which is what actually SIGKILLs any
-        // still-running subprocess (`CrashGuard::drop`) — this only cleans
-        // up the scratch directory those processes' marker files lived in.
+        // still-running subprocess (`CrashGuard::drop`) — this only collects
+        // their plant counts first, and cleans up the scratch directory
+        // those processes' marker files lived in.
+        for (_, reach_file) in self.child.iter().chain(&self.scale_out_children) {
+            collect_reach(reach_file);
+        }
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
     }
 }
@@ -536,7 +673,7 @@ impl super::Backend for SubprocessBackend {
 
     async fn install(&mut self, program: &Program) -> Result<(), SubprocessBackendError> {
         for table in &program.tables {
-            sql::create_source_table(&self.raw, None, table).await?;
+            sql::create_source_table(self.app_session(), None, table).await?;
             self.tables.insert(table.name.clone(), table.clone());
         }
         for def in &program.defs {
@@ -553,7 +690,8 @@ impl super::Backend for SubprocessBackend {
     }
 
     async fn apply(&mut self, op: &Op) -> Result<u64, SubprocessBackendError> {
-        sql::apply_op(&mut self.raw, &self.tables, op)
+        let session = self.app.as_mut().unwrap_or(&mut self.raw);
+        sql::apply_op(session, &self.tables, op)
             .await
             .map_err(SubprocessBackendError::from)
     }
@@ -567,7 +705,8 @@ impl super::Backend for SubprocessBackend {
         &mut self,
         defs: &[TransformDef],
     ) -> Result<Vec<DefinitionState>, SubprocessBackendError> {
-        Ok(sql::definition_states(&self.raw, defs).await?)
+        let reported = sql::reported_statuses(Config::from_dsn(self.dsn.clone())?).await?;
+        Ok(sql::definition_states(&self.raw, defs, &reported).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SubprocessBackendError> {
@@ -593,6 +732,10 @@ impl super::Backend for SubprocessBackend {
             let rows = match &def.key_space {
                 KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {
                     unreachable!("the generator never produces a JOIN definition")
+                }
+                KeySpace::OneToOne if def.source_key.is_some() => {
+                    let key = def.source_key.as_deref().unwrap_or_default();
+                    sql::read_keyed_table(&self.raw, &qualified, key, &def.fields).await?
                 }
                 KeySpace::OneToOne => {
                     // This generative suite never itself constructs a
@@ -644,10 +787,11 @@ impl super::Backend for SubprocessBackend {
     /// transaction rollback (triggered by the killed process's connection
     /// dropping) already guarantees was never partially applied.
     async fn restart(&mut self) -> Result<(), SubprocessBackendError> {
-        let mut guard = self
+        let (mut guard, reach_file) = self
             .child
             .take()
             .ok_or(SubprocessBackendError::NoClientStarted)?;
+        collect_reach(&reach_file);
         // `kill` (SIGKILL) then `wait`, not just letting `guard` drop:
         // `CrashGuard::drop` performs the same two calls best-effort, but
         // doing it explicitly here means this method can surface the real
@@ -667,5 +811,50 @@ impl super::Backend for SubprocessBackend {
     /// `ManualBackend::scale_out`.
     async fn scale_out(&mut self) -> Result<(), SubprocessBackendError> {
         self.spawn_engine(false).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child's counts reach the parent's: the parent asks, the child
+    /// answers with [`write_reach`], and [`collect_reach`] folds the answer
+    /// in. Here the "child" is a thread of this process answering as
+    /// `engine_subprocess` does, so the fold doubles this process's counts.
+    #[test]
+    fn collect_reach_folds_the_answer_into_this_process() {
+        use trellis::dev::plant::{Marker, absorb, reached};
+        let dir = std::env::temp_dir().join(format!(
+            "trellis-reach-test-{}-{}",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch dir");
+        let reach_file = dir.join("reach");
+        let count = || {
+            reached()
+                .into_iter()
+                .find(|(site, _)| *site == Marker::PrivilegeHalts.name())
+                .map(|(_, n)| n)
+                .expect("a site")
+        };
+        absorb(0, [(Marker::PrivilegeHalts.name(), 1)]);
+        let before = count();
+        let answer = {
+            let reach_file = reach_file.clone();
+            std::thread::spawn(move || {
+                let request = reach_request(&reach_file);
+                while !request.exists() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                write_reach(&reach_file).expect("write the counts");
+                std::fs::remove_file(&request).expect("answer the request");
+            })
+        };
+        collect_reach(&reach_file);
+        answer.join().expect("the answering thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(count() >= 2 * before, "{} after {before}", count());
     }
 }
