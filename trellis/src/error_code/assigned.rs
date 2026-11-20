@@ -254,6 +254,11 @@ const ASSIGNED: &[&str] = &[
     "T0245 ValidationError::JoinPredicateReadsNoColumn",
     "T0246 ValidationError::CharKeyPaddingFunction",
     "T0247 ApplyError::DefinitionFailsAlone",
+    "T0248 ParseError::SubqueryInList",
+    "T0249 ParseError::BetweenSymmetric",
+    "T0250 ParseError::QuantifiedComparison",
+    "T0251 ParseError::RowConstructor",
+    "T0252 ValidationError::InListCommonType",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

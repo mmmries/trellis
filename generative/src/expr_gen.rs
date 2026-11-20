@@ -148,6 +148,13 @@ pub enum Rule {
     /// giving a `numeric`. The fields are the type's
     /// ([`registry::extract_fields`]).
     Extract { operand: ValueType },
+    /// `<operand> [NOT] IN (...)`: an operand of type `lhs` and one to three
+    /// elements, each of type `lhs` or `rhs`, a pair `=` admits and whose
+    /// common type agrees with each `=` (define refuses the others).
+    InList { lhs: ValueType, rhs: ValueType },
+    /// `<operand> [NOT] BETWEEN <low> AND <high>`, all of type `ty`, which the
+    /// orderings admit.
+    Between { ty: ValueType },
 }
 
 impl Rule {
@@ -160,7 +167,9 @@ impl Rule {
             Rule::Negate { ty } => *ty,
             Rule::Cast { to, .. } => *to,
             Rule::Extract { .. } => ValueType::Numeric,
-            Rule::Not | Rule::IsNull { .. } => ValueType::Boolean,
+            Rule::Not | Rule::IsNull { .. } | Rule::InList { .. } | Rule::Between { .. } => {
+                ValueType::Boolean
+            }
             Rule::Case { ty } => *ty,
             Rule::CaseMixed { out, .. } => *out,
             Rule::NullIf { lhs, .. } => *lhs,
@@ -257,6 +266,18 @@ pub fn rules() -> Vec<Rule> {
     }
     for width in FloatWidth::ALL {
         rules.push(Rule::NullIfLiteral { float: width });
+    }
+    for &ty in &types {
+        for &rhs in &types {
+            // A `real` beside an exact number is the one admitted pair
+            // whose common type can differ, and `=` refuses the pair anyway.
+            if registry::comparison_result_type(Operator::Equal, ty, rhs).is_some() {
+                rules.push(Rule::InList { lhs: ty, rhs });
+            }
+        }
+        if registry::comparison_result_type(Operator::GreaterThanOrEqual, ty, ty).is_some() {
+            rules.push(Rule::Between { ty });
+        }
     }
     for &ty in &types {
         rules.push(Rule::IsNull { ty });
@@ -599,6 +620,7 @@ fn precedence_of(expr: &Expr) -> u8 {
         Expr::BinaryOp { op, .. } => registry::operator_spec(*op).precedence,
         Expr::Not(_) => registry::precedence::NOT,
         Expr::IsNull { .. } => registry::precedence::IS,
+        Expr::InList { .. } | Expr::Between { .. } => registry::precedence::IN_BETWEEN,
         _ => u8::MAX,
     }
 }
@@ -612,10 +634,21 @@ fn negate_operand_needs_parens(expr: &Expr) -> bool {
         | Expr::Negate(_)
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
         | Expr::Case { .. } => true,
         Expr::NumberLiteral(text) => text.starts_with('-'),
         _ => false,
     }
+}
+
+/// Whether the operand of an `IN` or `BETWEEN` needs parentheses: one that
+/// binds looser, or a `BETWEEN`, whose open upper bound would take the
+/// operator (`a BETWEEN 1 AND 2 IN (TRUE)` is a syntax error).
+fn wrap_in_between_operand(operand: &Expr, style: TextStyle) -> bool {
+    !style.minimal
+        || precedence_of(operand) < registry::precedence::IN_BETWEEN
+        || matches!(operand, Expr::Between { .. })
 }
 
 fn symbol_of(op: Operator) -> &'static str {
@@ -644,7 +677,11 @@ fn write_operand(e: &Expr, wrap: bool, style: TextStyle, out: &mut String) {
     if wrap
         && matches!(
             e,
-            Expr::BinaryOp { .. } | Expr::Not(_) | Expr::IsNull { .. }
+            Expr::BinaryOp { .. }
+                | Expr::Not(_)
+                | Expr::IsNull { .. }
+                | Expr::InList { .. }
+                | Expr::Between { .. }
         )
     {
         out.push('(');
@@ -729,6 +766,55 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
                 out.push(' ');
             }
             out.push_str(&keyword(style, "NULL"));
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            write_operand(expr, wrap_in_between_operand(expr, style), style, out);
+            out.push(' ');
+            if *negated {
+                out.push_str(&keyword(style, "NOT"));
+                out.push(' ');
+            }
+            out.push_str(&keyword(style, "IN"));
+            out.push_str(" (");
+            for (i, element) in list.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                // An element is a whole expression: the list's commas and
+                // parentheses bound it.
+                write_operand(element, !style.minimal, style, out);
+            }
+            out.push(')');
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            write_operand(expr, wrap_in_between_operand(expr, style), style, out);
+            out.push(' ');
+            if *negated {
+                out.push_str(&keyword(style, "NOT"));
+                out.push(' ');
+            }
+            out.push_str(&keyword(style, "BETWEEN"));
+            out.push(' ');
+            // The lower bound is Postgres's restricted operand: an operator
+            // expression in it is parenthesized (no `NOT`, `AT TIME ZONE` or
+            // comparison reads there bare). The upper bound takes what binds
+            // tighter than `BETWEEN`.
+            write_operand(low, true, style, out);
+            out.push(' ');
+            out.push_str(&keyword(style, "AND"));
+            out.push(' ');
+            let wrap_high =
+                !style.minimal || precedence_of(high) <= registry::precedence::IN_BETWEEN;
+            write_operand(high, wrap_high, style, out);
         }
         Expr::Case {
             branches,
@@ -1146,6 +1232,76 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             kind: "nullif-first-argument-cast",
             text: format!("NULLIF(0, {numeric}) + NULLIF({int}, 1.5)"),
             needles: vec!["casts the first argument".to_string()],
+        });
+    }
+    // `IN` and `BETWEEN` (#2172): the four named refusals, an element or
+    // bound its comparison refuses, and a list whose common type reads
+    // differently.
+    if let Some(int) = int {
+        for (kind, text, needle) in [
+            ("in-subquery", format!("{int} IN (SELECT 1)"), "in (select"),
+            (
+                "in-subquery",
+                format!("{int} NOT IN (VALUES (1))"),
+                "in (select",
+            ),
+            (
+                "between-symmetric",
+                format!("{int} BETWEEN SYMMETRIC 2 AND 1"),
+                "between symmetric",
+            ),
+            (
+                "between-symmetric",
+                format!("{int} NOT BETWEEN ASYMMETRIC 1 AND 2"),
+                "between asymmetric",
+            ),
+            ("quantified-comparison", format!("{int} = ANY (1)"), "= any"),
+            (
+                "quantified-comparison",
+                format!("{int} <> ALL (1)"),
+                "<> all",
+            ),
+            (
+                "row-constructor",
+                format!("({int}, 1) IN ((1, 2))"),
+                "row constructor",
+            ),
+            ("in-empty-list", format!("{int} IN ()"), "expected"),
+            (
+                "between-lower-bound",
+                format!("{int} BETWEEN NOT TRUE AND 2"),
+                "lower bound",
+            ),
+        ] {
+            out.push(NearMiss {
+                kind,
+                text,
+                needles: vec![needle.to_string()],
+            });
+        }
+        if let Some(text) = text {
+            out.push(NearMiss {
+                kind: "in-element-type",
+                text: format!("{int} IN (1, {text})"),
+                needles: vec!["'in'".to_string()],
+            });
+            out.push(NearMiss {
+                kind: "between-bound-type",
+                text: format!("{int} NOT BETWEEN {text} AND 2"),
+                needles: vec!["'not between'".to_string()],
+            });
+            out.push(NearMiss {
+                kind: "in-common-type",
+                text: format!("NULL IN ({int}, 'a')"),
+                needles: vec!["in list".to_string()],
+            });
+        }
+    }
+    if let Some(real) = column_of(columns, ValueType::Float(FloatWidth::Float4)) {
+        out.push(NearMiss {
+            kind: "in-common-type",
+            text: format!("{real} IN (1.5, 2)"),
+            needles: vec!["in list".to_string()],
         });
     }
     if let Some(int) = int {
@@ -1801,6 +1957,51 @@ pub mod strategy {
                             .prop_map(|(a, lit)| Expr::FunctionCall {
                                 name: "NULLIF".to_string(),
                                 args: vec![a, lit],
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::InList { lhs, rhs } => {
+                    let operand = self.expr(*lhs, depth)?;
+                    let element = Union::new([self.expr(*lhs, depth)?, self.expr(*rhs, depth)?]);
+                    // A bare `NULL` operand converts the elements to the first
+                    // one's type, which define refuses for a mixed list.
+                    let nullable = self.profile.bare_null;
+                    let one_type = lhs == rhs;
+                    Some(
+                        (
+                            operand,
+                            prop::collection::vec(element, 1..=3),
+                            any::<bool>(),
+                            0..8u8,
+                        )
+                            .prop_map(move |(operand, mut list, negated, roll)| {
+                                let operand = match roll {
+                                    0 if nullable && one_type => Expr::Null,
+                                    1 if nullable => {
+                                        list.push(Expr::Null);
+                                        operand
+                                    }
+                                    _ => operand,
+                                };
+                                Expr::InList {
+                                    expr: Box::new(operand),
+                                    list,
+                                    negated,
+                                }
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::Between { ty } => {
+                    let operand = self.expr(*ty, depth)?;
+                    Some(
+                        (operand.clone(), operand.clone(), operand, any::<bool>())
+                            .prop_map(|(expr, low, high, negated)| Expr::Between {
+                                expr: Box::new(expr),
+                                low: Box::new(low),
+                                high: Box::new(high),
+                                negated,
                             })
                             .boxed(),
                     )

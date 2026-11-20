@@ -226,6 +226,8 @@ fn check_field_expr<'a>(
         | Expr::Cast { .. }
         | Expr::Not(_)
         | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
         | Expr::Case { .. } => expr
             .children()
             .into_iter()

@@ -10,11 +10,12 @@ use std::collections::HashSet;
 
 use generative::generate::{
     Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan,
-    cooling_key_case, hot_key_case, mid_burst_case, noise_plan_for, partitioned_hot_key_case,
-    partitioned_program, program_with_client_restart, program_with_mid_stream_def_install,
-    program_with_scale_out, table_streams, trivial_program, trivial_program_with,
+    cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for,
+    partitioned_hot_key_case, partitioned_program, program_with_client_restart,
+    program_with_mid_stream_def_install, program_with_scale_out, table_streams, trivial_program,
+    trivial_program_with,
 };
-use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
+use generative::model::{DbAdminAction, NoiseAction, NoiseEventKind, Op, Program, Table};
 use generative::run::{ConcurrentShape, Coverage};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
@@ -126,7 +127,11 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_column_types(operand, source, out);
         }
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+        Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Case { .. } => {
             for child in expr.children() {
                 collect_column_types(child, source, out);
             }
@@ -1153,6 +1158,49 @@ fn checkpoint_plan_for_sometimes_draws_at_least_one_checkpoint() {
         saw_checkpoint,
         "checkpoint_plan_for must sometimes draw at least one CHECKPOINT across 500 samples"
     );
+}
+
+/// The coverage floor for the `db_admin` property's aging actions: across
+/// 400 drawn plans, at least 10% hold a `VACUUM FREEZE` and at least 10% a
+/// wrap across the xid epoch boundary, and the wraps' tails draw each band:
+/// crossing at once (0), within the next few ops (1-16), and within the
+/// engine's later drains (17-256).
+#[test]
+fn db_admin_plans_draw_freezes_and_wraps_across_every_tail_band() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|program| db_admin_plan_for(&program));
+    let samples = 400;
+    let (mut freezes, mut wraps) = (0, 0);
+    let mut bands = [false; 3];
+    for _ in 0..samples {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let mut has = (false, false);
+        for event in &plan.events {
+            match event.action {
+                DbAdminAction::VacuumFreeze => has.0 = true,
+                DbAdminAction::WrapXids { tail } => {
+                    has.1 = true;
+                    bands[match tail {
+                        0 => 0,
+                        1..=16 => 1,
+                        _ => 2,
+                    }] = true;
+                }
+                _ => {}
+            }
+        }
+        freezes += usize::from(has.0);
+        wraps += usize::from(has.1);
+    }
+    assert!(
+        freezes * 10 >= samples,
+        "{freezes} of {samples} plans freeze"
+    );
+    assert!(wraps * 10 >= samples, "{wraps} of {samples} plans wrap");
+    assert_eq!(bands, [true; 3], "tail bands drawn: {bands:?}");
 }
 
 /// The coverage floor: `program_with_mid_stream_def_install`

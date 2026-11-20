@@ -263,7 +263,8 @@
 //! two test binaries never share a cluster or a database.
 
 use generative::backend::{
-    Backend, ConcurrentBackend, ManualBackend, SEAL_ON_DEMAND_INTERVAL, SPLIT_THRESHOLD_ROWS,
+    Backend, CaseDatabase, ConcurrentBackend, ManualBackend, SEAL_ON_DEMAND_INTERVAL,
+    SPLIT_THRESHOLD_ROWS,
 };
 use generative::baseline_quarantine;
 use generative::generate::min_max::{self, min_max_case};
@@ -460,10 +461,11 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
         h.coverage.borrow_mut().record_program(program);
 
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect_with_workers(db.dsn(), PROPERTY_WORKERS)
-                .await
-                .expect("connect concurrent backend");
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend =
+                ManualBackend::connect_as_with_options(db.roles(), PROPERTY_WORKERS, None)
+                    .await
+                    .expect("connect concurrent backend");
             if program.tables.iter().any(|t| t.partitioning.is_some()) {
                 backend.set_reconcile_interval(generative::generate::partition::RECONCILE_INTERVAL);
             }
@@ -535,9 +537,9 @@ fn run_concurrent_case(
             .record_concurrent_plan(&case.program, &case.plan);
 
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect_with_options(
-                db.dsn(),
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as_with_options(
+                db.roles(),
                 case.workers,
                 Some(std::time::Duration::from_millis(case.seal_interval_ms)),
             )
@@ -2039,6 +2041,10 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
             plant_sweep::NO_EXTREMES,
         ))
+        .chain(not_on_path(
+            &[PlantPath::XidEpoch],
+            plant_sweep::NO_XID_EPOCH,
+        ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
         .chain([
             LEAF_UNREACHED,
@@ -2121,6 +2127,10 @@ fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
         ],
         "the min_max tier gates the MIN/MAX extremes' plants; the plant's own path is \
          gated by the tier its comment names",
+    ));
+    out.extend(not_on_path(
+        &[PlantPath::XidEpoch],
+        generative::plant_sweep::NO_XID_EPOCH,
     ));
     out
 }

@@ -60,8 +60,8 @@ field a source column shadows, rename the field.
 ### Comparison and logic
 
 A formula compares and combines values with `=`, `<>` (or `!=`), `<`, `<=`,
-`>`, `>=`, `IS [NOT] DISTINCT FROM`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, the
-searched `CASE WHEN <boolean> THEN <value> [WHEN ...] [ELSE <value>] END` and
+`>`, `>=`, `IS [NOT] DISTINCT FROM`, `[NOT] IN`, `[NOT] BETWEEN`, `AND`, `OR`,
+`NOT`, `IS [NOT] NULL`, the searched `CASE WHEN <boolean> THEN <value> [WHEN ...] [ELSE <value>] END` and
 `NULLIF(a, b)`, over the literals `TRUE`, `FALSE` and `NULL` among other
 operands. Postgres evaluates them, so `NULL` follows its three-valued
 logic: `NULL = NULL` is `NULL`, `NULL IS NOT DISTINCT FROM NULL` is true,
@@ -74,7 +74,8 @@ support](type-support.md#comparison-and-logic)). A comparison, `IS NULL` or
 logic field is a `boolean` column, and another field may read it.
 
 An enum column compares with a string literal under `=`, in either order
-(`status = 'open'`). Postgres reads the literal as a value of the enum, so
+(`status = 'open'`), and in an `IN` or `NOT IN` list (`status IN ('open',
+'paid')`). Postgres reads the literal as a value of the enum, so
 define refuses one that is not a label of it. The label is fixed in the
 definition's text: after `ALTER TYPE … RENAME VALUE` renames it, the definition
 pauses and its `RESUME` refuses until the label is renamed back or the
@@ -82,12 +83,24 @@ definition is dropped and defined again. Nothing else takes a literal beside an
 enum: `<>`, `IS [NOT] DISTINCT FROM`, the orderings, `COALESCE`, `NULLIF` and a
 `CASE` result are refused.
 
-Binding, loosest first: `OR`, `AND`, `NOT`, `IS ...`, the comparisons, `+` and
-`-`, `*` `/` `%`, prefix `-`; so `NOT a = b` is `NOT (a = b)` and
-`a = b IS NULL` is `(a = b) IS NULL`. `NOT` and `CASE` are keywords wherever
-an operand follows (a `-` begins one: `NOT -x > 0` is `NOT ((-x) > 0)`, as in
-Postgres). Postgres promises no evaluation order inside `AND` and `OR`, so
-`y <> 0 AND x / y > 1` can still divide by zero; guard a division with
+`x [NOT] IN (a, b, ...)` and `x [NOT] BETWEEN low AND high` are Postgres's:
+`x = a OR x = b`, `x <> a AND x <> b`, and `x >= low AND x <= high`, with the
+same `NULL` logic (`1 NOT IN (2, NULL)` is `NULL`). An element is any
+expression. Each element and bound is admitted where its comparison is, so an
+enum takes no `BETWEEN`. A list is refused where Postgres's common type for it
+reads differently ([type support](type-support.md#in-lists)). A subquery,
+`SYMMETRIC`, `= ANY (...)` and a row constructor are
+[refused](errors.md#t0248-subqueryinlist).
+
+Binding, loosest first: `OR`, `AND`, `NOT`, `IS ...`, the comparisons, `IN` and
+`BETWEEN`, `+` and `-`, `*` `/` `%`, prefix `-`; so `NOT a = b` is
+`NOT (a = b)`, `a = b IS NULL` is `(a = b) IS NULL` and
+`a BETWEEN 1 AND 2 AND b` is `(a BETWEEN 1 AND 2) AND b`. A `BETWEEN`'s lower
+bound takes `NOT` and `AT TIME ZONE` only in parentheses, as in Postgres.
+`NOT` and `CASE` are keywords wherever an operand follows (a `-` begins one:
+`NOT -x > 0` is `NOT ((-x) > 0)`, as in Postgres). Postgres promises no
+evaluation order inside `AND` and `OR`, so `y <> 0 AND x / y > 1` can still
+divide by zero; guard a division with
 `CASE WHEN y <> 0 THEN x / y END` or `x / NULLIF(y, 0)`. A failure inside a
 `CASE` branch is raised only for the rows that take the branch, except a
 constant Postgres folds while planning (a `2147483647 + 1` in a branch fails
@@ -165,9 +178,9 @@ its operand types, since a predicate that raised would stop every statement
 reading the row. Admitted:
 
 * column reads, literals, `IS [NOT] NULL`, `AND`, `OR`, `NOT`;
-* every comparison and `NULLIF`, except between two text columns (their
-  collations can conflict) and a number literal beside a float that the float
-  can't hold;
+* every comparison, `IN`, `BETWEEN` and `NULLIF`, except between two text
+  columns (their collations can conflict) and a number literal beside a float
+  that the float can't hold;
 * `CASE` and `COALESCE`, unless they mix `numeric` with a float;
 * the casts but `date` to `timestamp`;
 * `-`, `ABS`, `TRUNC` of a `numeric` or a float, and `CEIL`, `FLOOR` of a

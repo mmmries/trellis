@@ -458,6 +458,28 @@ fn render_expr(expr: &Expr) -> String {
             render_expr(expr),
             if *negated { "not " } else { "" }
         ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            render_expr(expr),
+            if *negated { "not " } else { "" },
+            list.iter().map(render_expr).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render_expr(expr),
+            if *negated { "not " } else { "" },
+            render_expr(low),
+            render_expr(high)
+        ),
         Expr::Case {
             branches,
             otherwise,
@@ -736,6 +758,27 @@ async fn as_persisted(
         && join.joins[0].explicit_right_schema.is_none()
     {
         join.joins[0].explicit_right_schema = schema_of(joined);
+    }
+    // A star's joined tables past the first (`definition_join_tables`).
+    if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &mut def.key_space
+        && join.joins.len() > 1
+    {
+        let later = client
+            .query(
+                "select j.position, j.table_name from definition_join_tables j \
+                 join transform_definitions d on d.id = j.transform_id \
+                 where split_part(d.target_table, '.', 2) = $1",
+                &[&def.target],
+            )
+            .await?;
+        for row in later {
+            let position = usize::try_from(row.get::<_, i16>(0)).expect("position >= 2");
+            if let Some(joined) = join.joins.get_mut(position - 1)
+                && joined.explicit_right_schema.is_none()
+            {
+                joined.explicit_right_schema = schema_of(row.get::<_, &str>(1));
+            }
+        }
     }
     Ok(def)
 }
@@ -1179,7 +1222,9 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
             })
         }
         Expr::Cast { target, .. } => *target,
-        Expr::Not(_) | Expr::IsNull { .. } => ValueType::Boolean,
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::InList { .. } | Expr::Between { .. } => {
+            ValueType::Boolean
+        }
         // The results unify as `COALESCE`'s arguments do: an exact numeric
         // beside a float is the float, two integers the wider, otherwise
         // `numeric`; equal types are themselves.
@@ -1448,6 +1493,31 @@ fn render_join_expr(expr: &Expr) -> String {
             "({} is {}null)",
             render_join_expr(expr),
             if *negated { "not " } else { "" }
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "({} {}in ({}))",
+            render_join_expr(expr),
+            if *negated { "not " } else { "" },
+            list.iter()
+                .map(render_join_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "({} {}between {} and {})",
+            render_join_expr(expr),
+            if *negated { "not " } else { "" },
+            render_join_expr(low),
+            render_join_expr(high)
         ),
         Expr::Case {
             branches,

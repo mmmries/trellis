@@ -14,7 +14,7 @@
 //! from `tests/convergence.rs` (see that file's module doc comment for why
 //! the cluster is a `thread_local`).
 
-use generative::backend::ManualBackend;
+use generative::backend::{CaseDatabase, ManualBackend};
 use generative::generate::{
     Mutate, build_program, defer_def_install, program_with_mid_stream_def_install, schedule_restart,
 };
@@ -67,8 +67,8 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record_program(program);
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
-            let mut backend = ManualBackend::connect(db.dsn())
+            let db = CaseDatabase::provision(&h.cluster).await;
+            let mut backend = ManualBackend::connect_as(db.roles())
                 .await
                 .expect("connect manual backend");
             let pool =

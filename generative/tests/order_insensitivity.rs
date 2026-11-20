@@ -16,7 +16,7 @@
 //! from `tests/convergence.rs` (see that file's module doc comment for why
 //! the cluster is a `thread_local`).
 
-use generative::backend::{Backend, ManualBackend, Snapshot};
+use generative::backend::{Backend, CaseDatabase, ManualBackend, Snapshot};
 use generative::generate::{
     Mutate, TableSpec, build_program, build_program_multi, reordered_by_commute_groups,
     trivial_program,
@@ -67,8 +67,8 @@ fn proptest_config() -> ProptestConfig {
 /// its own commute group, and those are never reordered relative to it) —
 /// instead of that bug only surfacing as an opaque snapshot mismatch.
 async fn run_ops_to_snapshot(cluster: &TestCluster, program: &Program, ops: &[Op]) -> Snapshot {
-    let db = cluster.create_isolated_database().await;
-    let mut backend = ManualBackend::connect(db.dsn())
+    let db = CaseDatabase::provision(cluster).await;
+    let mut backend = ManualBackend::connect_as(db.roles())
         .await
         .expect("connect manual backend");
 
