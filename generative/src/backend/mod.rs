@@ -25,7 +25,9 @@ pub use manual::{
 };
 pub use roles::{APP_ROLE, CaseDatabase, Roles, TRELLIS_ROLE, as_role};
 pub use sql::HeldKeys;
-pub use subprocess::{SubprocessBackend, SubprocessBackendError};
+pub use subprocess::{
+    REACH_FILE_ENV, SubprocessBackend, SubprocessBackendError, reach_request, write_reach,
+};
 
 use std::collections::BTreeMap;
 use std::future::Future;

@@ -1359,8 +1359,7 @@ async fn write_locked(
     // Planted bug: read both sides' partials before the `J` locks.
     // See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    let before_j =
-        crate::plant::armed() == Some(crate::plant::Plant::JoinOtherSideBeforeJ) && !build;
+    let before_j = !build && crate::plant::visit(crate::plant::Plant::JoinOtherSideBeforeJ);
     #[cfg(any(test, feature = "test-util"))]
     if before_j {
         txn.batch_execute(&plan.planted_copy_before_j_sql()).await?;
@@ -1474,7 +1473,7 @@ async fn write_locked(
     // Planted bug: count the pages whose product the dropped flip
     // changes. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    if plan.left && crate::plant::armed() == Some(crate::plant::Plant::JoinDropFlip) {
+    if plan.left && crate::plant::visit(crate::plant::Plant::JoinDropFlip) {
         let flips: i64 = txn.query_one(&plan.planted_flips_sql(), &[]).await?.get(0);
         crate::plant::fires(crate::plant::Plant::JoinDropFlip, flips > 0);
     }

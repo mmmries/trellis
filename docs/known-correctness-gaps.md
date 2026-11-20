@@ -91,8 +91,8 @@ while every rule holds.
 * **Connect every Trellis process directly or through a session-mode
   pooler**
   ([below](#a-trellis-process-behind-a-transaction-mode-pooler)).
-* **Set or drop `NOT NULL` on a `KEY (…)` column only while the transforms
-  that read the table are paused**
+* **Set, drop or validate `NOT NULL` on a `KEY (…)` column only while the
+  transforms that read the table are paused**
   ([below](#a-key-columns-not-null-set-or-dropped-with-changes-in-flight)).
 * **Don't write a 1-1 `JOIN`'s joined table (`b`, or the table at any
   position of a star) under `session_replication_role = replica`** when its
@@ -270,9 +270,10 @@ research on detecting a collation change the way a retype is detected.
 ### A `KEY` column's `NOT NULL` set or dropped with changes in flight
 
 **When:** a table read through `KEY (…)` on a `UNIQUE NULLS NOT DISTINCT`
-index has `ALTER COLUMN … SET NOT NULL` or `DROP NOT NULL` run on a key
-column while changes to rows whose key holds `NULL` or `chr(1)` are captured
-but not yet applied.
+index has `ALTER COLUMN … SET NOT NULL`, `DROP NOT NULL` or (Postgres 18)
+`VALIDATE CONSTRAINT` of a `NOT NULL … NOT VALID` run on a key column while
+changes to rows whose key holds `NULL` or `chr(1)` are captured but not yet
+applied. An unvalidated `NOT NULL` column is nullable until it is validated.
 
 **What goes wrong:** a nullable key column's part is encoded (`NULL` is
 `chr(1)`, a real `chr(1)` doubled) and a `NOT NULL` one's is not. Capture

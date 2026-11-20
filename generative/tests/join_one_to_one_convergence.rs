@@ -37,7 +37,9 @@
 //! - `fan_out` (three keys) gives every `jb` row many `ja` rows on its key: one
 //!   `b` change fans out over many target rows;
 //! - `ja` primary keys are drawn from 64 ids and `jb` primary keys from as many
-//!   ids as there are keys, so an id comes back after a delete.
+//!   ids as there are keys, so an id comes back after a delete;
+//! - one case in four reads `jb` through a `KEY (...)` on `text` columns
+//!   (`generate::join_one_to_one::key_joined`), whose writes can collide.
 //!
 //! The ops are issued as the concurrent tier issues them
 //! (`generative::run::run_convergence_concurrent`). Every burst is checked once
@@ -78,8 +80,8 @@ use generative::generate::join::{
     build_coverage,
 };
 use generative::generate::join_one_to_one::{
-    OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, StarCase, one_to_one_case,
-    one_to_one_case_strategy, star_case_strategy, star_tier_enabled,
+    OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, StarCase, joined_key_case_strategy,
+    one_to_one_case, one_to_one_case_strategy, star_case_strategy, star_tier_enabled,
 };
 use generative::invariant::{self, Clause, InRunInvariant};
 use generative::model::Op;
@@ -916,6 +918,10 @@ fn sweep_tier(
         &[PlantPath::XidEpoch],
         generative::plant_sweep::NO_XID_EPOCH,
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::SourceKey],
+        generative::plant_sweep::NO_SOURCE_KEY,
+    ));
     SweepTier {
         name,
         known_misses,
@@ -958,6 +964,78 @@ fn one_to_one_join_planted_bugs_are_caught() {
             })
         },
     );
+}
+
+/// The 1-1 `JOIN` tier's sweep over a joined table read through a nullable
+/// `KEY (...)` (#2171): the sweep above over [`joined_key_case_strategy`]'s
+/// seeded cases, gating the plants on capture's key for such a table
+/// (`null_key_as_empty`, #2126's joined-side rendering) and leaving out
+/// every other plant ([`joined_key_sweep_tier`]). Returns at once without
+/// `GENERATIVE_PLANTS`. Run it with:
+///
+/// ```text
+/// GENERATIVE_PLANTS=all GENERATIVE_PLANT_CASES=6 cargo test -p generative \
+///     --test join_one_to_one_convergence joined_key_planted_bugs_are_caught \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]
+fn joined_key_planted_bugs_are_caught() {
+    let strategy = joined_key_case_strategy().boxed();
+    plant_sweep::sweep(
+        "joined_key_planted_bugs_are_caught",
+        &joined_key_sweep_tier(),
+        |seed, cases| plant_sweep::seeded_cases(&strategy, seed, cases),
+        |case: &JoinCase| {
+            run_case(case).map_err(|message| plant_sweep::CaseFailure {
+                key_spaces: case
+                    .program
+                    .defs
+                    .iter()
+                    .map(|def| Some(def.key_space.clone()))
+                    .collect(),
+                message,
+            })
+        },
+    );
+}
+
+/// [`joined_key_planted_bugs_are_caught`]'s tier: it gates the plants of
+/// [`generative::plant_sweep::PlantPath::SourceKey`] and leaves out the
+/// rest, which the two-table sweep runs over the same runner.
+fn joined_key_sweep_tier() -> SweepTier {
+    use generative::plant_sweep::{PlantPath, plant_path};
+    SweepTier {
+        name: generative::baseline_quarantine::JOIN_ONE_TO_ONE_KEY_TIER,
+        known_misses: &[],
+        not_gated: trellis::dev::plant::Plant::ALL
+            .iter()
+            .filter(|plant| plant_path(**plant) != PlantPath::SourceKey)
+            .map(|plant| {
+                (
+                    plant.name(),
+                    "the join_one_to_one_key tier gates capture's key for a joined table read \
+                     through a nullable KEY (...); the 1-1 JOIN plants are gated by the \
+                     two-table sweep",
+                )
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn the_joined_key_tier_gates_the_source_key_plants_alone() {
+    use generative::plant_sweep::{PlantPath, plant_path};
+    let tier = joined_key_sweep_tier();
+    for plant in trellis::dev::plant::Plant::ALL {
+        let gated = !tier.not_gated.iter().any(|(not, _)| *not == plant.name());
+        assert_eq!(
+            gated,
+            plant_path(*plant) == PlantPath::SourceKey,
+            "{}",
+            plant.name()
+        );
+    }
 }
 
 /// The star tier's reach sweep (#1781, #1464 section 4): the sweep above
@@ -1168,6 +1246,63 @@ fn a_hand_built_one_to_one_join_case_builds_over_rows_and_converges() {
     // so this can't tell this case's builds from another test's; it does
     // catch builds that never write a row.
     assert!(engine_build_rows() > build_rows_before);
+}
+
+/// #2171: [`hand_built_case`]'s build path with `jb` read through a `KEY
+/// (...)` (`key_joined`): a single nullable key without a primary key, and
+/// a composite key with one nullable part beside a primary key. `jb`
+/// writes `NULL`, `''` and `chr(1)` keys, collides, and moves rows onto and
+/// off the `NULL` key; `ja` rows point at the `''` and the `NULL` keys. It
+/// fails with `TRELLIS_TEST_PLANT=null_key_as_empty` (#2126's joined side).
+#[test]
+fn a_hand_built_case_over_a_keyed_joined_table_converges() {
+    use generative::generate::join_one_to_one::{JoinedKeyDraw, key_joined};
+    use generative::generate::source_key::{KeyDraw, KeyShape as SourceKeyShape};
+    let s = |v: &str| Some(v.to_string());
+    for (nullable, primary_key) in [(vec![true], false), (vec![false, true], true)] {
+        let key = |part: Option<String>| -> Vec<Option<String>> {
+            match nullable.len() {
+                1 => vec![part],
+                _ => vec![s("a"), part],
+            }
+        };
+        let draw = JoinedKeyDraw {
+            key: KeyDraw {
+                shape: SourceKeyShape {
+                    nullable: nullable.clone(),
+                    primary_key,
+                },
+                inserts: [None, s(""), s("\u{1}"), None, s("a"), s("")]
+                    .into_iter()
+                    .map(key)
+                    .collect(),
+                moves: [Some(None), Some(s("")), None, Some(s("b"))]
+                    .into_iter()
+                    .map(|m| m.map(key))
+                    .collect(),
+            },
+            a_inserts: [s(""), None, s(""), s("\u{1}"), s("a"), s("b")]
+                .into_iter()
+                .map(key)
+                .collect(),
+            a_moves: vec![Some(key(s(""))), None, Some(key(None))],
+        };
+        let mut case = hand_built_case(true);
+        case.program = key_joined(case.program, &draw);
+        let drawn = generative::generate::join_one_to_one::joined_key_drawn(&case.program);
+        for name in [
+            "collision",
+            "move_to_null",
+            "move_from_null",
+            "a_empty",
+            "twins_live",
+        ] {
+            assert!(drawn.contains(name), "{name}: {drawn:?}");
+        }
+        if let Err(message) = run_case(&case) {
+            panic!("{nullable:?} {primary_key}: {message}");
+        }
+    }
 }
 
 /// The oracle tells a corrupted 1-1 `JOIN` target from a good one: the same

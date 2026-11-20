@@ -505,7 +505,15 @@ fn render_select(def: &TransformDef, pk_column: &str, exact: &ExactFields) -> St
             unreachable!("the generator never produces a JOIN definition")
         }
         KeySpace::OneToOne => {
-            let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
+            // A `KEY (...)` source's rows are keyed by its key columns.
+            let key = def
+                .source_key
+                .clone()
+                .unwrap_or_else(|| vec![pk_column.to_string()]);
+            let mut select_list: Vec<String> = key
+                .iter()
+                .map(|c| format!("{}::text", quote_ident(c)))
+                .collect();
             for field in &def.fields {
                 select_list.push(format!(
                     "({})::text as {}",
@@ -798,12 +806,24 @@ async fn sql_oracle_exact(
         }
         KeySpace::OneToOne => {
             let mut rows: Rows = BTreeMap::new();
+            let key_len = def.source_key.as_ref().map_or(1, Vec::len);
             for db_row in db_rows {
-                let pk: Option<String> = db_row.get(0);
-                let pk = pk.expect("primary key column is never NULL");
+                let pk = match &def.source_key {
+                    // Keyed exactly as `read_keyed_table` keys the target.
+                    Some(_) => crate::model::source_key_text(
+                        &(0..key_len).map(|i| db_row.get(i)).collect::<Vec<_>>(),
+                    ),
+                    None => {
+                        let pk: Option<String> = db_row.get(0);
+                        pk.expect("primary key column is never NULL")
+                    }
+                };
                 let mut by_column = BTreeMap::new();
                 for (i, field) in def.fields.iter().enumerate() {
-                    by_column.insert(field.name.clone(), db_row.get::<_, Option<String>>(i + 1));
+                    by_column.insert(
+                        field.name.clone(),
+                        db_row.get::<_, Option<String>>(i + key_len),
+                    );
                 }
                 rows.insert(pk, by_column);
             }
@@ -864,8 +884,8 @@ pub async fn sql_oracle_per_row(
     pk_column: &str,
 ) -> Result<(Rows, std::collections::BTreeSet<String>), OracleError> {
     assert!(
-        matches!(def.key_space, KeySpace::OneToOne),
-        "the per-row oracle models a plain 1-1 definition only"
+        matches!(def.key_space, KeySpace::OneToOne) && def.source_key.is_none(),
+        "the per-row oracle models a plain 1-1 definition over a primary key only"
     );
     let mut raised = std::collections::BTreeSet::new();
     match sql_oracle(pool, def, pk_column).await {
@@ -1590,6 +1610,7 @@ pub fn one_to_one_target_table(def: &TransformDef, source: &Table) -> Table {
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     }
 }
 

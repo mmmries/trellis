@@ -42,6 +42,33 @@ pub struct Table {
     /// (`unique_cols` is empty): Postgres requires every unique index on a
     /// partitioned table to hold the partition key.
     pub partitioning: Option<Partitioning>,
+    /// The unique index a `KEY (...)` reads the table by (ADR-0026), or
+    /// `None` for a table every definition reads by its primary key.
+    pub source_key: Option<SourceKey>,
+}
+
+/// A source [`Table`]'s `KEY (...)` (ADR-0026): the unique index every
+/// definition over the table names in its `KEY (...)`, its columns' `NULL`
+/// rule, and whether the table keeps a primary key beside it.
+///
+/// `pk_col` still names every row (ops address rows by it): without a
+/// primary key it is `NOT NULL UNIQUE`, an index no definition reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceKey {
+    /// The key's columns in index order, each a `Text` column of the table.
+    pub columns: Vec<String>,
+    /// The key columns that can hold `NULL`; the rest are `NOT NULL`. When
+    /// any can, the index is `NULLS NOT DISTINCT`.
+    pub nullable: Vec<String>,
+    /// Whether `pk_col` is the table's primary key.
+    pub primary_key: bool,
+}
+
+impl SourceKey {
+    /// Whether `column` is a key column that can hold `NULL`.
+    pub fn is_nullable(&self, column: &str) -> bool {
+        self.nullable.iter().any(|c| c == column)
+    }
 }
 
 /// A partitioned [`Table`]'s single level: the column it is partitioned by,
@@ -111,6 +138,7 @@ impl Table {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         }
     }
 
@@ -741,6 +769,20 @@ pub fn group_key(values: &[Option<String>]) -> String {
         .collect()
 }
 
+/// The text a `KEY (...)` row is keyed by on both sides of a comparison:
+/// each part length-prefixed like [`group_key`]'s, but a `NULL` part is `-`,
+/// which no prefixed part starts with, so a `NULL` part never stands for
+/// `''` (the #2126 shape).
+pub fn source_key_text(values: &[Option<String>]) -> String {
+    values
+        .iter()
+        .map(|v| match v {
+            None => "-".to_string(),
+            Some(v) => format!("{}:{v}", v.len()),
+        })
+        .collect()
+}
+
 /// Small, fixed name pools (`t0`, `d0`, `c0`, ...) rather than random
 /// identifiers — a shrunk counterexample you can read at a glance beats one
 /// that is technically smaller (design doc §1). Each kind of name has its
@@ -780,6 +822,37 @@ impl NamePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2171: `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and `chr(31)` each
+    /// key a row of their own, alone or as either part of a composite key.
+    #[test]
+    fn every_source_key_part_combination_keys_its_own_row() {
+        let parts: Vec<Option<String>> = std::iter::once(None)
+            .chain(
+                [
+                    "",
+                    "\u{1}",
+                    "\u{1}\u{1}",
+                    "a\u{1}\u{1}",
+                    "\u{1f}",
+                    "-",
+                    "0:",
+                    "1:a",
+                ]
+                .into_iter()
+                .map(|v| Some(v.to_string())),
+            )
+            .collect();
+        let mut keys: Vec<Vec<Option<String>>> = parts.iter().map(|p| vec![p.clone()]).collect();
+        for a in &parts {
+            for b in &parts {
+                keys.push(vec![a.clone(), b.clone()]);
+            }
+        }
+        let texts: std::collections::HashSet<String> =
+            keys.iter().map(|k| source_key_text(k)).collect();
+        assert_eq!(texts.len(), keys.len());
+    }
 
     #[test]
     fn name_pools_are_stable_and_independent_across_construction() {

@@ -76,7 +76,7 @@ pub(crate) fn declared_by_reader<'a, T: AsRef<str>>(
 /// exactly `columns`, in any order (an `INCLUDE` column is no key column),
 /// and it is valid, immediate, not partial and over no expression, every
 /// key column is under its type's default operator class and its own
-/// collation, and every key column is `NOT NULL` or the index is
+/// collation, and every key column is a validated `NOT NULL` or the index is
 /// `NULLS NOT DISTINCT`. Any such
 /// index does: the match is by shape, never by the index's name or oid, so
 /// one built to replace it serves as well. One statement, so one snapshot.
@@ -107,7 +107,7 @@ pub(crate) async fn backing(
                               from pg_catalog.unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
                               join pg_catalog.pg_attribute a \
                                 on a.attrelid = i.indrelid and a.attnum = k.attnum \
-                              where k.ord <= i.indnkeyatts and not a.attnotnull)) \
+                              where k.ord <= i.indnkeyatts and not {not_null})) \
                        and not exists ( \
                               select 1 \
                               from rows from (pg_catalog.unnest(i.indkey::int2[]), \
@@ -121,7 +121,7 @@ pub(crate) async fn backing(
                                 and (not oc.opcdefault or k.coll <> a.attcollation)) \
                      order by i.indisprimary desc, i.indexrelid \
                      limit 1) \
-                 select a.attname::text, {}, not a.attnotnull, \
+                 select a.attname::text, {}, not {not_null}, \
                         (select pg_catalog.format('%I.%I', n.nspname, co.collname) \
                          from pg_catalog.pg_collation co \
                          join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
@@ -132,7 +132,8 @@ pub(crate) async fn backing(
                    on a.attrelid = b.indrelid and a.attnum = k.attnum \
                  where k.ord <= b.indnkeyatts \
                  order by pg_catalog.array_position($2::text[], a.attname::text)",
-                super::copy_type::type_sql("a.atttypid")
+                super::copy_type::type_sql("a.atttypid"),
+                not_null = ddl::not_null_sql!("a"),
             ),
             &[
                 (&ddl::regclass_arg(table), Type::TEXT),
