@@ -179,6 +179,7 @@ pub fn with_isolation(mut program: Program, params: &IsolationParams) -> Isolati
         unique_cols: Vec::new(),
         unique_sets: Vec::new(),
         partitioning: None,
+        source_key: None,
     });
     let failing = match kind {
         FailKind::FloatSum => {

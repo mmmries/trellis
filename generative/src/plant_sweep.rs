@@ -102,6 +102,10 @@ pub enum PlantPath {
     /// definition with `MIN` or `MAX` reaches it, which only the concurrent
     /// tier's `min_max` shape draws.
     Extremes,
+    /// Capture's ring key for a source read through a `KEY (...)` with a
+    /// nullable column (ADR-0026): only the concurrent tier's `source_key`
+    /// shape draws one, and it reaches every target over that source.
+    SourceKey,
     /// `self_check`'s comparison of a group-basis aggregate's extremes with
     /// the source (its side 7). Only a tier that audits a `MIN`/`MAX`
     /// definition by `self_check` reaches it.
@@ -210,6 +214,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarDefLockFirstOnly
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
         Plant::IsolationPausesEveryReader => PlantPath::Isolation,
+        Plant::NullKeyAsEmpty => PlantPath::SourceKey,
     }
 }
 
@@ -228,8 +233,9 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
-        // A reader of a target, or of a failing page, can be of any kind.
-        PlantPath::Chain | PlantPath::Isolation => true,
+        // A reader of a target, or of a failing page, or of a keyed source,
+        // can be of any kind.
+        PlantPath::Chain | PlantPath::Isolation | PlantPath::SourceKey => true,
     }
 }
 
@@ -844,6 +850,14 @@ pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggr
      GENERATIVE_PLANT_TIER=min_max) and the tampering tier (self_check_cross_check.rs, \
      extremes_tamper_planted_bugs_are_caught) draw";
 
+/// Why a tier that draws no table read through a nullable `KEY (...)`, or
+/// draws one only now and then, doesn't run its plants
+/// ([`PlantPath::SourceKey`]).
+pub const NO_SOURCE_KEY: &str = "it breaks capture's key for a table read through a nullable \
+     KEY (...), which the concurrent tier's source_key shape (concurrent_convergence.rs, \
+     GENERATIVE_PLANT_TIER=source_key) and the 1-1 JOIN tier's joined_key sweep \
+     (join_one_to_one_convergence.rs, joined_key_planted_bugs_are_caught) draw in every case";
+
 /// The plants whose path a tier's programs never take, each with `why`:
 /// for a tier's `not_gated`.
 pub fn not_on_path(
@@ -991,7 +1005,7 @@ mod tests {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
-                PlantPath::Chain | PlantPath::Isolation => {
+                PlantPath::Chain | PlantPath::Isolation | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");
                 }

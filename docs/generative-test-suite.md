@@ -75,7 +75,7 @@ prints on failure:
 
 ```
 Program {
-  tables:      [ { name, pk_col, columns: [{name, type}] } ]
+  tables:      [ { name, pk_col, columns: [{name, type}], source_key } ]
   defs:        [ TransformDef ]         // reuses trellis::defs::ast, see §2
   ops:         [ Insert{table,row} | Update{table,pk,changes} | Delete{table,pk} ]
 }
@@ -84,7 +84,9 @@ Program {
 Use small fixed name pools (`t0`, `d0`, `c0`): a shrunk counterexample you can
 read at a glance beats one that is technically smaller. Give every table its PK
 column **unconditionally**, so no shrink step can strand a definition referencing
-it.
+it. A table read through a `KEY (...)` (`source_key`, ADR-0026) keeps `pk_col` as
+the column ops address rows by, as its primary key or a plain `NOT NULL UNIQUE`
+column.
 
 `defs` reuses `trellis::defs::ast::TransformDef` directly — 1-1 definitions
 (including numeric `+`), `GROUP BY` aggregates, and two-table `JOIN … GROUP BY`
@@ -766,6 +768,26 @@ beside them run on every `cargo test`.
   race and several workers drain them. Every definition over the hot table
   groups by the grain, and the variant draws no partition maintenance,
   which would put the hot table in one lane.
+- **Source-key convergence** *(ADR-0026, `generate::source_key`)*. One
+  program in four drawn by the convergence property and the concurrent
+  backend's property reads its first definition's source through a
+  `KEY (...)`: one or two `text` columns, each `NOT NULL` or nullable under a
+  `NULLS NOT DISTINCT` index, beside the primary key or without one. Every
+  1-1 and `GROUP BY` definition over the table names the key. Keys take
+  `NULL`, `''`, `chr(1)`, a doubled `chr(1)` and `chr(31)`, and updates move
+  rows between keys. A model of the live keys expects a write onto a taken
+  key to fail. The oracle keeps a `NULL` key part apart from `''`. The
+  concurrent tier keeps a keyed table's writes in one lane, since which of
+  two racing writes to one key fails depends on commit order. The
+  `source_keys` coverage line counts each variant. One 1-1 JOIN tier case
+  in four reads its joined table `jb` through such a key
+  (`join_one_to_one::key_joined`): every definition joins
+  `ON ja.k0 = jb.k0 [AND ja.k1 = jb.k1]` with `jb KEY (...)`, and `ja`'s
+  `text` `ON` columns take the same values, `NULL` included, so `ja` rows
+  point at both `jb`'s `''` row and its `NULL` row. The sweep tier
+  `GENERATIVE_PLANT_TIER=source_key` and the 1-1 JOIN tier's
+  `joined_key_planted_bugs_are_caught` (a nullable key in every case) gate
+  `null_key_as_empty`, #2126's capture rendering restored, on each side.
 
 ### Two runtimes, one oracle
 
@@ -863,7 +885,8 @@ The planted-bug sweep (`generative::plant_sweep`; `planted_bugs_are_caught` in
 `join_planted_bugs_are_caught` in `generative/tests/join_convergence.rs` for the
 `JOIN` tier, `one_to_one_join_planted_bugs_are_caught` in
 `generative/tests/join_one_to_one_convergence.rs` for the 1-1 `JOIN` tier,
-`star_join_planted_bugs_are_caught` in the same file for its star tier,
+`star_join_planted_bugs_are_caught` and `joined_key_planted_bugs_are_caught`
+in the same file for its star and keyed-joined-table tiers,
 `chained_join_planted_bugs_are_caught` in
 `generative/tests/join_chained_convergence.rs` for the chained-reader tier,
 `extremes_tamper_planted_bugs_are_caught` in
@@ -875,7 +898,8 @@ once per planted bug, and judges each plant only on cases the baseline passed.
 only with **zero failures outside the quarantine list**,
 `generative/baseline-quarantine.txt`. The rule is the same for every tier
 (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
-`min_max`, `join`, `join_one_to_one`, `join_star`, `join_chained`,
+`min_max`, `source_key`, `join`, `join_one_to_one`, `join_one_to_one_key`,
+`join_star`, `join_chained`,
 `extremes_tamper`, `held_keys`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.

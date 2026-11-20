@@ -229,7 +229,8 @@ Trellis gave it. The rules and their reasons are
 - a `KEY` no unique index backs (`KeyNotBacked`). The index must be valid, not
   deferrable, not partial and over no expression, with exactly the `KEY`'s
   columns in any order, default operator classes and the columns' own
-  collations, and every column `NOT NULL` or the index `NULLS NOT DISTINCT`. A
+  collations, and every column `NOT NULL` (validated: a `NOT VALID` one counts
+  as nullable) or the index `NULLS NOT DISTINCT`. A
   partitioned table's unique index holds its partition key, so its `KEY` names
   those columns too;
 - a `KEY` on another transform's target (`KeyOnTrellisTarget`);

@@ -103,12 +103,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         KeySpace::Join(join) => {
             let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
             format!(
-                " {} {} ON {} GROUP BY {}",
+                " {} {}{} ON {} GROUP BY {}",
                 match join.joins[0].kind {
                     JoinKind::Inner => "INNER JOIN",
                     JoinKind::Left => "LEFT JOIN",
                 },
                 join.joins[0].right,
+                render_key(join.joins[0].right_key.as_deref()),
                 join.joins[0]
                     .on
                     .iter()
@@ -130,12 +131,13 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                 .iter()
                 .map(|joined| {
                     format!(
-                        " {} {} ON {}",
+                        " {} {}{} ON {}",
                         match joined.kind {
                             JoinKind::Inner => "INNER JOIN",
                             JoinKind::Left => "LEFT JOIN",
                         },
                         joined.right,
+                        render_key(joined.right_key.as_deref()),
                         joined
                             .on
                             .iter()
@@ -167,12 +169,21 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         Predicate::True => String::new(),
         Predicate::Filter(expr) => format!(" WHERE ({})", render_expr(expr)),
     };
+    let key = render_key(def.source_key.as_deref());
     format!(
-        "TRANSFORM {} FROM {}{key_space_clause}{opt_out} SELECT {}{filter}",
+        "TRANSFORM {} FROM {}{key}{key_space_clause}{opt_out} SELECT {}{filter}",
         def.target,
         def.source,
         fields.join(", ")
     )
+}
+
+/// ` KEY (<columns>)` for a table read through an explicit key (ADR-0026),
+/// or nothing.
+fn render_key(columns: Option<&[String]>) -> String {
+    columns.map_or_else(String::new, |columns| {
+        format!(" KEY ({})", columns.join(", "))
+    })
 }
 
 /// The source indexes `def` needs, as `(table, leading columns)`: an
@@ -417,14 +428,21 @@ pub(super) async fn create_source_table(
         }
         sql.push_str(&quote_ident(&column.name));
         sql.push(' ');
+        sql.push_str(&column_ddl_type(column.value_type));
         if column.name == table.pk_col {
-            sql.push_str(&column_ddl_type(column.value_type));
-            sql.push_str(" primary key");
-        } else {
-            sql.push_str(&column_ddl_type(column.value_type));
-            if table.unique_cols.iter().any(|c| c == &column.name) {
-                sql.push_str(" unique");
-            }
+            // A table read through a `KEY (...)` without a primary key
+            // still names each row by `pk_col`.
+            sql.push_str(match &table.source_key {
+                Some(key) if !key.primary_key => " not null unique",
+                _ => " primary key",
+            });
+        } else if table.unique_cols.iter().any(|c| c == &column.name) {
+            sql.push_str(" unique");
+        } else if let Some(key) = &table.source_key
+            && key.columns.contains(&column.name)
+            && !key.is_nullable(&column.name)
+        {
+            sql.push_str(" not null");
         }
     }
     for set in &table.unique_sets {
@@ -438,6 +456,21 @@ pub(super) async fn create_source_table(
         sql.push(')');
     }
     sql.push(')');
+    if let Some(key) = &table.source_key {
+        sql.push_str(&format!(
+            "; create unique index on {name} ({}){}",
+            key.columns
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if key.nullable.is_empty() {
+                ""
+            } else {
+                " nulls not distinct"
+            }
+        ));
+    }
     raw.batch_execute(&sql).await?;
     Ok(())
 }
@@ -904,6 +937,38 @@ pub(super) async fn read_table(
             by_column.insert(column.name.clone(), row.get::<_, Option<String>>(i));
         }
         result.insert(pk_value, by_column);
+    }
+    Ok(result)
+}
+
+/// Reads a 1-1 target over a `KEY (...)` source (ADR-0026) back as text,
+/// each row keyed by its `key` columns' [`crate::model::source_key_text`],
+/// with `fields` as its columns.
+pub(super) async fn read_keyed_table(
+    client: &tokio_postgres::Client,
+    qualified_table: &str,
+    key: &[String],
+    fields: &[FieldDef],
+) -> Result<
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Option<String>>>,
+    tokio_postgres::Error,
+> {
+    let select_list: Vec<String> = key
+        .iter()
+        .map(|c| c.as_str())
+        .chain(fields.iter().map(|f| f.name.as_str()))
+        .map(|c| format!("{}::text", quote_ident(c)))
+        .collect();
+    let sql = format!("select {} from {qualified_table}", select_list.join(", "));
+    let mut result = std::collections::BTreeMap::new();
+    for row in client.query(&sql, &[]).await? {
+        let parts: Vec<Option<String>> = (0..key.len()).map(|i| row.get(i)).collect();
+        let by_column = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), row.get(key.len() + i)))
+            .collect();
+        result.insert(crate::model::source_key_text(&parts), by_column);
     }
     Ok(result)
 }
@@ -1397,6 +1462,7 @@ mod tests {
             unique_cols: Vec::new(),
             unique_sets: Vec::new(),
             partitioning: None,
+            source_key: None,
         };
         let ddl = |strategy| {
             partitioned_source_ddl(
@@ -1504,6 +1570,26 @@ mod tests {
                     assert_eq!(reparsed, def, "{text}");
                 }
             }
+        }
+    }
+
+    /// A joined table's `KEY (...)` (#2171) renders back after the table's
+    /// name, beside the `FROM` side's: dropped, the definition would read
+    /// the joined table by its primary key, or fail define without one.
+    #[test]
+    fn render_definition_round_trips_a_joined_tables_key() {
+        for text in [
+            "TRANSFORM j FROM ja KEY (k0) LEFT JOIN jb KEY (k0, k1) \
+             ON ja.k0 = jb.k0 AND ja.k1 = jb.k1 SELECT jb.y AS y",
+            "TRANSFORM j FROM ja INNER JOIN jb KEY (k0) ON ja.k0 = jb.k0 SELECT jb.y AS y",
+            "TRANSFORM j FROM ja LEFT JOIN jb KEY (k0) ON ja.k0 = jb.k0 \
+             GROUP BY ja.t SELECT COUNT(*) AS n",
+        ] {
+            let def = parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            let rendered = render_definition(&def);
+            assert!(rendered.contains("jb KEY (k0"), "{rendered}");
+            let reparsed = parse(&rendered).unwrap_or_else(|e| panic!("{rendered}: {e:?}"));
+            assert_eq!(reparsed, def, "{rendered}");
         }
     }
 

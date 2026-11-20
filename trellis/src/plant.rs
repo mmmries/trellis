@@ -981,6 +981,18 @@ pub enum Plant {
     /// Pinned by `group_basis_where`'s
     /// `an_image_without_the_predicate_column_fails_the_page`.
     GbWhereColumnNotImaged,
+    /// #2126 (`null_key_as_empty`): capture renders a nullable `KEY (...)`
+    /// column's part of the ring key as its bare text
+    /// (`capture::sql`'s `key_expr`), so a `NULL` part reads as `''` rather
+    /// than taking the build's `NULL` encoding. The `NULL`-keyed row's
+    /// changes then stage under the `''` row's key. Fires only on a source
+    /// read through a `KEY (...)` with a nullable column.
+    ///
+    /// Pinned by `source_keys`'s `nullable_key_capture` tests (every one
+    /// fails with it armed, e.g.
+    /// `a_null_key_is_a_row_of_its_own_through_every_write`), and gated by
+    /// the concurrent tier's `source_key` sweep (#2171).
+    NullKeyAsEmpty,
 }
 
 impl Plant {
@@ -1079,6 +1091,7 @@ impl Plant {
         Plant::JoinWhereMUnfiltered,
         Plant::O2oWhereColumnNotImaged,
         Plant::GbWhereColumnNotImaged,
+        Plant::NullKeyAsEmpty,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -1177,6 +1190,7 @@ impl Plant {
             Plant::JoinWhereMUnfiltered => "join_where_m_unfiltered",
             Plant::O2oWhereColumnNotImaged => "o2o_where_column_not_imaged",
             Plant::GbWhereColumnNotImaged => "gb_where_column_not_imaged",
+            Plant::NullKeyAsEmpty => "null_key_as_empty",
         }
     }
 

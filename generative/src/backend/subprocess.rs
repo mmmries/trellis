@@ -692,6 +692,10 @@ impl super::Backend for SubprocessBackend {
                 KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {
                     unreachable!("the generator never produces a JOIN definition")
                 }
+                KeySpace::OneToOne if def.source_key.is_some() => {
+                    let key = def.source_key.as_deref().unwrap_or_default();
+                    sql::read_keyed_table(&self.raw, &qualified, key, &def.fields).await?
+                }
                 KeySpace::OneToOne => {
                     // This generative suite never itself constructs a
                     // composite-PK 1-1 definition, even though `source_primary_key`

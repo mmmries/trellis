@@ -283,8 +283,8 @@ The response follows whether the definitions are still valid as written
   `numeric` column Trellis created from it must be re-typed to the new
   scale. A widened column where define would now refuse a reader pauses it
   the same way. Where define would refuse it, the `capture_failure` names the
-  refusal and the remedies: `ALTER TRANSFORM` to a definition that
-  validates, or change the column back, then `RESUME`. `RESUME`
+  refusal and the remedies: change the column back, then `RESUME`, or
+  `DROP TRANSFORM` and define it again. `RESUME`
   re-validates, re-types and rebuilds, or refuses while define would. A key
   column's type change is left to the previous section's checks, which
   re-validate the definition too and name the refusal the same way; a key

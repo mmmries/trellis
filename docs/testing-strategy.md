@@ -160,8 +160,8 @@ runs opt in with `-- --ignored` plus a `PROPTEST_CASES` override (a healthy deep
 run is minutes, not seconds — a "pass" in one second executed nothing). It
 assumes the system *reaches* quiescence and judges *what the answer is* there; it
 structurally cannot judge timing, liveness, or long-horizon resource behavior. No
-test tier judges those: the streaming benchmark and soak runs measure them, by
-hand, before a release (a chaos tier for them is
+test tier judges those: the streaming benchmark and the chaos and soak harness
+([`soak/`](../soak/README.md)) measure them, by hand, before a release (a chaos tier for them is
 [#1884](https://github.com/salesforce-misc/trellis/issues/1884)).
 
 ---
