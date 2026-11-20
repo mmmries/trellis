@@ -815,7 +815,8 @@ After define: [Key](transforms.md#key).
 No unique index backs a `KEY (…)` exactly ([the
 key](transforms.md#the-key-a-transform-keys-each-table-by)). Create a valid,
 non-partial unique index over exactly those columns, `NULLS NOT DISTINCT` if one
-can be `NULL`. After define: [Key](transforms.md#key).
+can be `NULL`, as a `NOT NULL … NOT VALID` column can until `VALIDATE
+CONSTRAINT`. After define: [Key](transforms.md#key).
 
 ### T0117 KeyDiffersFromReaders
 

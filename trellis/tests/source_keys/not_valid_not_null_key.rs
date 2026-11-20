@@ -56,7 +56,10 @@ async fn a_not_valid_key_column_on_a_nulls_distinct_index_is_refused() {
         .to_string();
     assert!(
         message.contains("no unique index backs KEY (a)")
-            && message.contains("over a nullable column and not NULLS NOT DISTINCT"),
+            && message.contains(
+                "over a nullable column and not NULLS NOT DISTINCT (a NOT NULL ... NOT VALID \
+                 column is nullable until VALIDATE CONSTRAINT)"
+            ),
         "{message}"
     );
 }

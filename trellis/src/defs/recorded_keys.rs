@@ -329,7 +329,17 @@ pub(crate) async fn unique_indexes(
                                  where k.ord <= i.indnkeyatts and not ",
                 crate::defs::ddl::not_null_sql!("a"),
                 ") \
-                             then ', over a nullable column and not NULLS NOT DISTINCT' end)) \
+                             then ', over a nullable column and not NULLS NOT DISTINCT' end, \
+                        case when not i.indnullsnotdistinct and exists ( \
+                                 select 1 \
+                                 from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                                 join pg_catalog.pg_attribute a \
+                                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                                 where k.ord <= i.indnkeyatts and a.attnotnull and not ",
+                crate::defs::ddl::not_null_sql!("a"),
+                ") \
+                             then ' (a NOT NULL ... NOT VALID column is nullable until \
+                                   VALIDATE CONSTRAINT)' end)) \
              from pg_catalog.pg_index i \
              join pg_catalog.pg_class c on c.oid = i.indexrelid \
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisunique \
