@@ -706,11 +706,13 @@ pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggr
      GENERATIVE_PLANT_TIER=min_max) and the tampering tier (self_check_cross_check.rs, \
      extremes_tamper_planted_bugs_are_caught) draw";
 
-/// Why a tier that draws no source read through a nullable `KEY (...)`
-/// doesn't run its plants ([`PlantPath::SourceKey`]).
-pub const NO_SOURCE_KEY: &str = "it breaks capture's key for a source read through a nullable \
-     KEY (...), which only the concurrent tier's source_key shape (concurrent_convergence.rs, \
-     GENERATIVE_PLANT_TIER=source_key) draws";
+/// Why a tier that draws no table read through a nullable `KEY (...)`, or
+/// draws one only now and then, doesn't run its plants
+/// ([`PlantPath::SourceKey`]).
+pub const NO_SOURCE_KEY: &str = "it breaks capture's key for a table read through a nullable \
+     KEY (...), which the concurrent tier's source_key shape (concurrent_convergence.rs, \
+     GENERATIVE_PLANT_TIER=source_key) and the 1-1 JOIN tier's joined_key sweep \
+     (join_one_to_one_convergence.rs, joined_key_planted_bugs_are_caught) draw in every case";
 
 /// The plants whose path a tier's programs never take, each with `why`:
 /// for a tier's `not_gated`.
