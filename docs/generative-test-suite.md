@@ -393,8 +393,9 @@ beside them run on every `cargo test`.
 - **Concurrent convergence** (`tests/concurrent_convergence.rs`). The same
   programs and oracle against the real worker pool and multi-worker claiming, in
   tiers: small programs; hot keys and groups taking bursts from several
-  connections, also over a partitioned source; mid-burst re-reads, pauses, resumes and installs while change
-  capture for the same keys is in flight; cooling keys whose last write lands
+  connections, also over a partitioned source; mid-burst re-reads, pauses, resumes, installs and
+  definition changes while change capture for the same keys is in flight;
+  cooling keys whose last write lands
   mid-burst; and sweep-only steady-load and cooling-backfill tiers that stall
   pages and build chunks at their entry-lock step, and a fresh build inside its
   first statement so pages make stragglers (the stall is process-wide, so
@@ -917,9 +918,21 @@ The actions, cheapest-first (every one below is built):
 1. **Untracked-object noise** (bucket 1) — nearly free; converged state must be
    unchanged by DML/DDL on tables Trellis doesn't track.
 2. **Definition lifecycle** (bucket 2) — unlocks define-then-load ≡ load-then-define.
-   The chained-reader tier also redefines a field mid-burst (`ALTER
-   TRANSFORM`, `model::BurstAction::Alter`), after which the oracle checks the
-   definition as the statement left it.
+   The mid-burst and steady-load tiers change definitions while the lanes
+   write (`generate::add_burst_actions`): a 1-1 field `ADD`, `ALTER` and
+   `DROP` (an `ADD` of a column no definition reads widens the source's
+   capture), a `DROP TRANSFORM` defined again under the same or a new name,
+   unchanged or with a field changed, and a second definition over a loaded
+   one's source, dropped a burst later. The `JOIN`, 1-1 `JOIN` and star
+   tiers drop and redefine a definition, unchanged, and add and drop a
+   second one (`generate::join::add_join_actions`). The chained-reader tier
+   redefines a field too (`model::BurstAction::Alter`). Draws resolve in
+   burst order, so a later burst acts on the definitions as the earlier
+   changes left them, and the oracle checks each definition as the last
+   statement left it.
+   `tests/coverage.rs` floors each change; the sweeps of both tiers gate
+   `field_release_before_widen`, a field released before its capture widen
+   lands.
 3. **Engine lifecycle** (bucket 1) — kill/restart/scale workers; where resume and
    idempotent re-application get tested.
 4. **Transaction shapes** (bucket 3) — a transaction held open across a batch

@@ -526,9 +526,11 @@ pub struct TimedAction {
 
 /// An operator action the concurrent tier takes mid-burst.
 /// Each is named after the public API call an operator makes, not the
-/// engine mechanism behind it. None of them changes what the converged
-/// targets should hold, so the oracle is unchanged: the burst is
-/// checked once it settles, like any other.
+/// engine mechanism behind it. The burst is checked once it settles, like
+/// any other, against the definitions as the last statement left them: a
+/// re-read, pause or resume changes nothing the oracle checks, and a
+/// definition change is one line on its definition list (bucket 2,
+/// `docs/generative-test-suite.md` §7).
 #[derive(Debug, Clone, PartialEq)]
 pub enum BurstAction {
     /// `Trellis::request_backfill(table)`: re-derive every definition that
@@ -566,16 +568,74 @@ pub enum BurstAction {
         field: String,
         expr: String,
     },
+    /// `ALTER TRANSFORM <target> ADD|ALTER|DROP` of one field of a plain 1-1
+    /// definition (ADR-0015), as [`FieldEdit`] says. `def` is the
+    /// definition as the statement leaves it, which the oracle checks from
+    /// then on (bucket 2, `docs/generative-test-suite.md` §7); an added or
+    /// altered field's expression is its field in `def`.
+    EditField {
+        def: Box<TransformDef>,
+        edit: FieldEdit,
+    },
+    /// `PAUSE TRANSFORM <target>` and then `DROP TRANSFORM <target>`. The
+    /// oracle stops checking the definition.
+    Drop { target: String },
+    /// `DEFINE TRANSFORM` of `def`, a definition outside
+    /// [`Program::defs`]: the definition again after a [`BurstAction::Drop`]
+    /// of it, or a second one over a source a loaded definition reads, as
+    /// [`DefineShape`] says. Its build runs under the burst's writes, and
+    /// the oracle checks it from then on.
+    Define {
+        def: Box<TransformDef>,
+        shape: DefineShape,
+    },
+}
+
+/// Which field change a [`BurstAction::EditField`] makes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldEdit {
+    /// `ADD <expr> AS <field>`. `widens` when no definition read the column
+    /// it reads at the time the plan was drawn, so the source's capture must
+    /// widen before the field applies (the capture gate).
+    Add { field: String, widens: bool },
+    /// `ALTER <field> AS <expr>`, with the same column type.
+    Alter { field: String },
+    /// `DROP <field>`.
+    Drop { field: String },
+}
+
+/// What a [`BurstAction::Define`] defines, relative to the definition it
+/// follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefineShape {
+    /// A second definition over the source of one already loaded, under a
+    /// new name; a later burst drops it when there is one.
+    Second,
+    /// The dropped definition again, under its name, unchanged.
+    Same,
+    /// The dropped definition under its name, with a field changed.
+    Changed,
+    /// The dropped definition unchanged, under a new name.
+    Renamed,
+    /// The dropped definition with a field changed, under a new name.
+    RenamedChanged,
 }
 
 impl BurstAction {
-    /// Whether the action starts a Re-derive build: an install, or a
+    /// Whether the action starts a Re-derive build: an install or define, a
     /// whole-transform resume, which rebuilds over the target's existing
-    /// ledger entries.
+    /// ledger entries, or a field `ADD` or `ALTER` of the generated
+    /// definition changes, which builds the field.
     pub fn starts_build(&self) -> bool {
         matches!(
             self,
-            BurstAction::Install { .. } | BurstAction::Resume { column: None, .. }
+            BurstAction::Install { .. }
+                | BurstAction::Resume { column: None, .. }
+                | BurstAction::Define { .. }
+                | BurstAction::EditField {
+                    edit: FieldEdit::Add { .. } | FieldEdit::Alter { .. },
+                    ..
+                }
         )
     }
 
@@ -593,6 +653,20 @@ impl BurstAction {
             } => "resume_column",
             BurstAction::Install { .. } => "install",
             BurstAction::Alter { .. } => "alter",
+            BurstAction::EditField { edit, .. } => match edit {
+                FieldEdit::Add { widens: false, .. } => "add_field",
+                FieldEdit::Add { widens: true, .. } => "add_field_widen",
+                FieldEdit::Alter { .. } => "alter_field",
+                FieldEdit::Drop { .. } => "drop_field",
+            },
+            BurstAction::Drop { .. } => "drop",
+            BurstAction::Define { shape, .. } => match shape {
+                DefineShape::Second => "define_second",
+                DefineShape::Same => "redefine_same",
+                DefineShape::Changed => "redefine_changed",
+                DefineShape::Renamed => "redefine_renamed",
+                DefineShape::RenamedChanged => "redefine_renamed_changed",
+            },
         }
     }
 }

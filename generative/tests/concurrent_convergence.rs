@@ -1877,7 +1877,8 @@ const FILTERED_NAMING_UNREACHED: (&str, &str) = (
 
 /// The plants of a predicate column an image lacks (#1991 rule 11), which
 /// no concurrent tier reaches: an image lacks a column only when it was
-/// staged before a capture widen, and no tier widens a source. Each
+/// staged before a capture widen, and no tier widens a source to a column
+/// a `WHERE` reads (a field `ADD` widens it to a field's). Each
 /// `an_image_without_the_predicate_column_fails_the_page` pin
 /// (`one_to_one_where`, `group_basis_where`) gates its plant.
 const UNIMAGED_COLUMN_UNREACHED: [(&str, &str); 2] = [
@@ -1895,6 +1896,26 @@ const UNIMAGED_COLUMN_UNREACHED: [(&str, &str); 2] = [
     ),
 ];
 
+/// The plant of a field build released before its capture widen
+/// (#2183), which only a tier that adds a field reaches: the mid-burst and
+/// steady-load tiers gate it ([`with_field_edits`]), and every other
+/// concurrent tier leaves it out.
+const FIELD_WIDEN_UNREACHED: (&str, &str) = (
+    "field_release_before_widen",
+    "it releases a field an ALTER TRANSFORM ... ADD holds for its capture widen, and only the \
+     mid_burst and steady_load tiers add a field; capture_join's \
+     a_widened_field_waits_for_the_rows_staged_before_the_widen gates it",
+);
+
+/// `not_gated` for a tier that adds fields: [`FIELD_WIDEN_UNREACHED`] is
+/// gated.
+fn with_field_edits(
+    mut not_gated: Vec<(&'static str, &'static str)>,
+) -> Vec<(&'static str, &'static str)> {
+    not_gated.retain(|(plant, _)| *plant != FIELD_WIDEN_UNREACHED.0);
+    not_gated
+}
+
 /// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates, the
 /// `JOIN` plants and [`LEAF_UNREACHED`], with their reasons.
 fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
@@ -1908,7 +1929,11 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             plant_sweep::NO_EXTREMES,
         ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
-        .chain([LEAF_UNREACHED, FILTERED_NAMING_UNREACHED])
+        .chain([
+            LEAF_UNREACHED,
+            FILTERED_NAMING_UNREACHED,
+            FIELD_WIDEN_UNREACHED,
+        ])
         .chain(UNIMAGED_COLUMN_UNREACHED)
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
@@ -2030,7 +2055,7 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             SweepTier {
                 name: "mid_burst",
                 known_misses: HOT_KEY_BASED_MISSES,
-                not_gated: not_gated(
+                not_gated: with_field_edits(not_gated(
                     &[
                         MID_BURST_NOT_GATED,
                         MID_BURST_GROUP_BASIS,
@@ -2040,7 +2065,7 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
                             .collect::<Vec<_>>(),
                     ]
                     .concat(),
-                ),
+                )),
             },
             mid_burst_case().boxed(),
         ),
@@ -2048,7 +2073,7 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             SweepTier {
                 name: "steady_load",
                 known_misses: STEADY_LOAD_MISSES,
-                not_gated: not_gated(STEADY_LOAD_NOT_GATED),
+                not_gated: with_field_edits(not_gated(STEADY_LOAD_NOT_GATED)),
             },
             steady_load_case().boxed(),
         ),

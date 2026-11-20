@@ -122,7 +122,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::O2oWhereNullAsTrue
         | Plant::O2oWhereBuildUnfiltered
         | Plant::O2oWhereNoTombstone
-        | Plant::O2oWhereColumnNotImaged => PlantPath::OneToOne,
+        | Plant::O2oWhereColumnNotImaged
+        | Plant::FieldReleaseBeforeWiden => PlantPath::OneToOne,
         Plant::GbSkipGroupLock
         | Plant::GbBuildSnapshotBeforeLocks
         | Plant::GbGcIgnoresBuild

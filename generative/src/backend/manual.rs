@@ -51,7 +51,7 @@ use super::ring_wait::{ProgressDeadline, QuiesceBudget};
 use super::sql::{self, quote_ident};
 use super::{DefinitionState, Snapshot};
 use crate::model::{
-    BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
+    BurstAction, Column, FieldEdit, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
 };
 
 /// How long [`ManualBackend::quiesce`] waits without the ring making any
@@ -1881,6 +1881,53 @@ impl super::ConcurrentBackend for ManualBackend {
                         def.target
                     ))
                     .await?;
+            }
+            BurstAction::EditField { def, edit } => {
+                // As for `Alter`: the statement refuses a transform that
+                // isn't `live`.
+                sql::await_settled(&self.raw, std::slice::from_ref(&**def), QUIESCE_TIMEOUT)
+                    .await?;
+                let expr = |field: &str| {
+                    let field = def
+                        .fields
+                        .iter()
+                        .find(|f| f.name == field)
+                        .expect("an added or altered field is in the definition it leaves");
+                    sql::render_expr(&field.expr)
+                };
+                let change = match edit {
+                    FieldEdit::Add { field, .. } => format!("ADD {} AS {field}", expr(field)),
+                    FieldEdit::Alter { field } => format!("ALTER {field} AS {}", expr(field)),
+                    FieldEdit::Drop { field } => format!("DROP {field}"),
+                };
+                operator
+                    .apply(&format!("ALTER TRANSFORM {} {change}", def.target))
+                    .await?;
+                let at = self
+                    .defs
+                    .iter()
+                    .position(|d| d.target == def.target)
+                    .expect("an edit names an installed definition — a generator bug");
+                self.defs[at] = (**def).clone();
+            }
+            BurstAction::Drop { target } => {
+                operator.apply(&format!("PAUSE TRANSFORM {target}")).await?;
+                operator.apply(&format!("DROP TRANSFORM {target}")).await?;
+                self.defs.retain(|def| &def.target != target);
+            }
+            BurstAction::Define { def, .. } => {
+                super::Backend::install(
+                    self,
+                    &Program {
+                        tables: Vec::new(),
+                        defs: vec![(**def).clone()],
+                        def_install_after_op: vec![0],
+                        ops: Vec::new(),
+                        restart_after_ops: Vec::new(),
+                        scale_out_after_ops: Vec::new(),
+                    },
+                )
+                .await?;
             }
             BurstAction::Install { .. } => unreachable!("handled above"),
         }
