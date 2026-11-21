@@ -58,7 +58,6 @@
 //! value can't contain whitespace, and a token without `=` (or with an empty
 //! key) panics rather than being passed through. See [`extra_pg_options`].
 
-#[cfg(feature = "engine-access")]
 use crate::faketime::FakeClock;
 use std::fs;
 use std::io::Write;
@@ -67,6 +66,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
+#[cfg(feature = "engine-access")]
 use trellis::dev::pool::Pool;
 use trellis::{Config, migrate};
 
