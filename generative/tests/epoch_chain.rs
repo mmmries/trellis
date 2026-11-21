@@ -702,13 +702,16 @@ mod residue {
                 vec![(Some(1), Some(2)), (Some(3), None)],
                 Vec::new(),
             )],
-            defs: vec![(
-                0,
-                DefShape::Aggregate {
-                    functions: vec![AggregateFn::Sum(AggregateColumn::C1)],
-                },
-                None,
-            )],
+            defs: vec![
+                (
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![AggregateFn::Sum(AggregateColumn::C1)],
+                    },
+                    None,
+                ),
+                (0, DefShape::OneToOne, None),
+            ],
             epochs: vec![EpochDraw {
                 changes: vec![EpochChangeDraw {
                     kind: EpochChangeKind::Restart,
@@ -770,6 +773,52 @@ mod residue {
                     .batch_execute(&format!("delete from trellis.{agg} where {group} = 777"))
                     .await
                     .unwrap();
+                // Allowed: the same shape in a 1-1 ledger (#2240), and its
+                // nearby leaks.
+                let ledger: String = operator
+                    .query_one(
+                        "select relname from pg_class where relname like '%__ledger' \
+                         and relnamespace = 'public'::regnamespace",
+                        &[],
+                    )
+                    .await
+                    .map(|r| r.get(0))
+                    .unwrap_or_default();
+                assert!(!ledger.is_empty(), "the case has a 1-1 ledger");
+                {
+                    let put = |key: &str, tomb: bool, seg: i64| {
+                        format!(
+                            "insert into public.\"{ledger}\" (__from_key, __tombstone, __applied_seg) \
+                             values ('{key}', {tomb}, {seg})"
+                        )
+                    };
+                    operator.batch_execute(&put("k1", true, active)).await.unwrap();
+                    kept.hidden(std::time::Duration::ZERO)
+                        .await
+                        .expect("a tombstone at the active segment is allowed (#2240)");
+                    for (plant, what) in [
+                        (put("k2", true, active - 1), "a tombstone stamped elsewhere"),
+                        (put("k3", false, active), "a live stray entry"),
+                    ] {
+                        operator.batch_execute(&plant).await.unwrap();
+                        match kept.hidden(std::time::Duration::ZERO).await {
+                            Err(RunError::Residue { .. }) => {}
+                            other => panic!("{what} went unseen: {other:?}"),
+                        }
+                        operator
+                            .batch_execute(&format!(
+                                "delete from public.\"{ledger}\" where __from_key in ('k2', 'k3')"
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    operator
+                        .batch_execute(&format!(
+                            "delete from public.\"{ledger}\" where __from_key = 'k1'"
+                        ))
+                        .await
+                        .unwrap();
+                }
                 // Not allowed: the nearby leaks.
                 for (plant, what) in [
                     (insert(778, true, active - 1), "a zero group stamped elsewhere"),

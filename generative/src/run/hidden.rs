@@ -339,9 +339,15 @@ async fn check_hidden_once(
         // outlives an idle ring, since the drained prefix cannot pass a
         // segment that is never sealed. Only that shape is left out of the
         // count: `__n = 0`, `__zero`, and the stamp the active segment's.
+        // The same holds for a 1-1 ledger's tombstone (#2240): its GC waits
+        // for the drained prefix to reach `__applied_seg`, so a tombstone
+        // stamped at the active segment is left out, and no other.
         let left_out = match (&def.key_space, active) {
             (KeySpace::Aggregate { .. }, Some(active)) => {
                 format!(" where not (__zero and __n = 0 and __stamp = {active})")
+            }
+            (KeySpace::OneToOne, Some(active)) => {
+                format!(" where not (__tombstone and __applied_seg = {active})")
             }
             _ => String::new(),
         };
