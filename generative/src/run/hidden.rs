@@ -559,6 +559,9 @@ mod tests {
         let read = set(&["public.t0"]);
         let ever = set(&["public.t0", "public.gone"]);
         assert_eq!(unexplained(&seen, &read, &ever), vec!["public.never"]);
-        assert!(unexplained(&seen, &read, &set(&["public.never"])).len() == 2);
+        assert_eq!(
+            unexplained(&seen, &read, &set(&["public.never"])),
+            vec!["public.gone"]
+        );
     }
 }
