@@ -306,6 +306,11 @@ pub trait ClusterControl {
 
     /// Assigns and commits `count` transaction ids.
     fn burn_xids(&self, count: u32);
+
+    /// Puts the server's wall clock `seconds` ahead of real time (behind,
+    /// when negative), replacing any earlier step. The server must have been
+    /// started with a fake clock.
+    fn step_clock(&self, seconds: i64);
 }
 
 impl ClusterControl for testkit::TestCluster {
@@ -322,6 +327,10 @@ impl ClusterControl for testkit::TestCluster {
 
     fn burn_xids(&self, count: u32) {
         testkit::TestCluster::burn_xids(self, count);
+    }
+
+    fn step_clock(&self, seconds: i64) {
+        testkit::TestCluster::step_clock(self, seconds);
     }
 }
 

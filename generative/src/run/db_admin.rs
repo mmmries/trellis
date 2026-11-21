@@ -61,6 +61,8 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
         .await
         .map_err(|e| RunError::Install(format!("{e:?}")))?;
 
+    // Where the server's clock stands: the steps' sum.
+    let mut clock_offset = 0i64;
     for (op_index, op) in program.ops.iter().enumerate() {
         let events: Vec<&DbAdminAction> = plan
             .events
@@ -93,6 +95,10 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
                     cluster.age_xids_to_epoch_edge(XID_PAGE);
                     reconnect(backend, pool, op_index, action).await?;
                     cluster.burn_xids(XID_PAGE.saturating_sub(*tail));
+                }
+                DbAdminAction::StepClock(step) => {
+                    clock_offset += step.seconds();
+                    cluster.step_clock(clock_offset);
                 }
             }
         }
