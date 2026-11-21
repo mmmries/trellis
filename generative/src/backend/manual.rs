@@ -1260,10 +1260,14 @@ impl ManualBackend {
         // source lacks the index its self_check walk pages by.
         let schema = self.source_qualifier();
         // A table's owner indexes it: the application its sources, Trellis
-        // the upstream targets a chained definition reads.
+        // the upstream targets a chained definition reads, which are in the
+        // target schema.
         let source = |table: &str| self.tables.contains_key(table);
         sql::create_source_indexes_where(self.app_session(), schema, def, source).await?;
-        sql::create_source_indexes_where(&self.raw, schema, def, |table| !source(table)).await?;
+        sql::create_source_indexes_where(&self.raw, Some(&self.target_schema), def, |table| {
+            !source(table)
+        })
+        .await?;
 
         let qualified;
         let def = match &self.source_schema {

@@ -979,3 +979,33 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
     assert_converged(&mut a, &program_a, "after the drop's writes").await;
     assert_converged(&mut b, &program_b, "after the drop's writes").await;
 }
+
+/// A definition reading the instance's own target, in an instance whose
+/// sources are in a source schema of its own: Trellis indexes that target
+/// where the instance keeps its targets, not in the source schema, and the
+/// run converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chained_definition_in_an_instance_with_a_source_schema_converges() {
+    let cluster = TestCluster::start();
+    let db = CaseDatabase::provision(&cluster).await;
+
+    let mut program_a = chain_program();
+    let upstream = program_a.defs[0].target.clone();
+    program_a.defs.push(
+        trellis::dev::defs::parse(&format!(
+            "TRANSFORM {upstream}_by_total FROM {upstream} GROUP BY total \
+             SELECT total AS total, COUNT(*) AS n"
+        ))
+        .expect("a chained GROUP BY"),
+    );
+    let program_b = build_program(
+        &[(Some(7000), Some(700)), (Some(8000), Some(800))],
+        &[Mutate::Delete { pk: 1 }],
+    );
+
+    let mut a = stand_up(&db, InstanceLabel::A, "a").await;
+    let mut b = stand_up(&db, InstanceLabel::B, "b").await;
+    run_pair(&mut a, &mut b, &program_a, &program_b)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+}
