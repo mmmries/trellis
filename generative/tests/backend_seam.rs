@@ -405,8 +405,14 @@ async fn a_provisioned_case_runs_trellis_and_the_application_as_ordinary_roles()
              from pg_roles r, pg_namespace n, pg_class s, pg_class t \
              where r.rolname = $2 and n.nspname = 'trellis' \
                and s.oid = to_regclass('public.' || quote_ident($3)) \
-               and t.oid = to_regclass('public.' || quote_ident($4))",
-            &[&APP_ROLE, &TRELLIS_ROLE, &source.name, &target],
+               and t.oid = to_regclass(quote_ident($5) || '.' || quote_ident($4))",
+            &[
+                &APP_ROLE,
+                &TRELLIS_ROLE,
+                &source.name,
+                &target,
+                &backend.target_schema(),
+            ],
         )
         .await
         .expect("read roles and owners");
