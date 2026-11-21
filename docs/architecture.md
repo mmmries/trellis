@@ -69,7 +69,7 @@ module mainly writes. Hidden per-definition tables are in the
 |---|---|---|
 | `staging::claim` | Buckets, shares and the claim. | `seg_claims`, `drainers` |
 | `staging::liveness` | Heartbeats, reclaim, the fence-miss backoff. | |
-| `staging::fold` | The claim-time fold. | |
+| `staging::fold`, `staging::null_key` | The claim-time fold; the key encoding by column nullability. | |
 | `staging::page`, `staging::keyset` | Paging a share; matching keys through the key index. | `drain_cursor` |
 
 [Stage 05](staging-and-claiming/05-apply-and-exactly-once-deltas.md): apply.

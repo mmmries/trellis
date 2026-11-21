@@ -311,27 +311,29 @@ pub async fn capture_spec(
         // left.
         read.columns.retain(|c| !missing.contains(c));
     }
-    // A key column that can hold `NULL` (a `KEY` on a `NULLS NOT DISTINCT`
-    // index, ADR-0026) takes the build's `NULL` encoding in the ring key.
-    let nullable: Vec<String> = client
-        .query_typed(
-            concat!(
-                "select a.attname::text from pg_catalog.pg_attribute a \
-             where a.attrelid = pg_catalog.to_regclass($1) and a.attnum > 0 \
-               and not a.attisdropped and not ",
-                crate::defs::ddl::not_null_sql!("a"),
-                " and a.attname = any ($2::text[])"
-            ),
-            &[(&regclass, Type::TEXT), (&key, Type::TEXT_ARRAY)],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
+    // The key columns the table's recorded key encodes (a `KEY` on a
+    // `NULLS NOT DISTINCT` index, ADR-0026) take the build's `NULL` encoding
+    // in the ring key. The record, never the live catalog, says which, so a
+    // `SET NOT NULL` or `DROP NOT NULL` leaves the encoding the drain decodes
+    // by (#2147). A key the record doesn't hold (its readers pause) takes
+    // the encoding a record of it would.
+    let nullable: Vec<String> =
+        match crate::defs::recorded_keys::recorded_encoding(client, table).await? {
+            Some((recorded, encoded)) if same_columns(&recorded, &key) => encoded,
+            _ => crate::defs::recorded_keys::encoding_now(client, table, &key).await?,
+        };
     Ok(CaptureSpec::new(table, key, read.columns)?
         .with_partitioned(partitioned)
         .with_declared_key(declared.is_some())
         .with_nullable_key(nullable))
+}
+
+/// Whether `a` and `b` are the same columns, in any order.
+fn same_columns(a: &[String], b: &[String]) -> bool {
+    let (mut a, mut b) = (a.to_vec(), b.to_vec());
+    a.sort();
+    b.sort();
+    a == b
 }
 
 /// The `KEY (...)` `catalog`'s readers declare for `table` (ADR-0026), in

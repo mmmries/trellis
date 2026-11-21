@@ -418,10 +418,16 @@ pub enum SelfCheckError {
     /// The audited definition reads something the comparison can't render
     /// (a `JOIN` field outside the shapes it holds), or its recorded state
     /// is missing (a `JOIN` with no joined table, a keyset over a key that's
-    /// gone), or a page holds a `NULL` key in a column it read as `NOT NULL`.
+    /// gone).
     UnsupportedExpr {
         target: String,
         detail: String,
+    },
+    /// A page holds a `NULL` in a key column the source's recorded key
+    /// renders raw, which Postgres reads as `NOT NULL` (#2216): the
+    /// condition a drain pauses on (T0253).
+    NullInNotNullKey {
+        target: String,
     },
     /// A page of a `self_check` job ran past its budget
     /// (`super::self_check_job::page_budget`) and the server stopped it.
@@ -456,6 +462,7 @@ impl SelfCheckError {
             SelfCheckError::TargetNotFound(_) => ErrorCode::NotFound,
             SelfCheckError::UnsupportedKeySpace { .. }
             | SelfCheckError::UnsupportedExpr { .. }
+            | SelfCheckError::NullInNotNullKey { .. }
             | SelfCheckError::InvalidScope { .. } => ErrorCode::Validation,
             SelfCheckError::PageTimedOut { .. } => ErrorCode::Timeout,
             // Only a release that reads it gets past it, like a catalog
@@ -478,6 +485,9 @@ impl SelfCheckError {
             SelfCheckError::UnsupportedKeySpace { .. } => ErrorId(192),
             SelfCheckError::InvalidScope { .. } => ErrorId(193),
             SelfCheckError::UnsupportedExpr { .. } => ErrorId(194),
+            SelfCheckError::NullInNotNullKey { .. } => {
+                crate::error_code::SharedCondition::NullInNotNullKey.error_id()
+            }
             SelfCheckError::PageTimedOut { .. } => ErrorId(195),
             SelfCheckError::UnreadableJob { .. } => ErrorId(196),
             SelfCheckError::Ddl(err) => err.error_id(),
@@ -506,6 +516,13 @@ impl crate::error_code::Message for SelfCheckError {
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")
             }
+            SelfCheckError::NullInNotNullKey { target } => write!(
+                f,
+                "self_check can't audit \"{target}\": a key column of its source holds NULL \
+                 although Postgres reads it as NOT NULL, and Trellis renders that column raw. \
+                 Remove the NULLs, or fix the partition holding them (DETACH it, or VALIDATE \
+                 CONSTRAINT its NOT NULL), then RESUME the definitions reading it"
+            ),
             SelfCheckError::PageTimedOut { budget } => write!(
                 f,
                 "a self_check page ran past its {budget:?} budget, and the server stopped it"
@@ -545,6 +562,7 @@ impl std::error::Error for SelfCheckError {
             SelfCheckError::TargetNotFound(_)
             | SelfCheckError::UnsupportedKeySpace { .. }
             | SelfCheckError::UnsupportedExpr { .. }
+            | SelfCheckError::NullInNotNullKey { .. }
             | SelfCheckError::PageTimedOut { .. }
             | SelfCheckError::UnreadableJob { .. }
             | SelfCheckError::InvalidScope { .. } => None,
@@ -1175,13 +1193,12 @@ fn caught_up(waited: Result<(), StagingError>) -> Result<bool, SelfCheckError> {
     }
 }
 
-/// A page row with no key: a key column read as `NOT NULL` renders raw, so a
-/// `NULL` in it (one whose `NOT NULL` changed after the key was read) renders
-/// none. The page is refused rather than panicking.
+/// A page row with no key: a key column the source's record renders raw
+/// holds a `NULL` (#2216), so it renders none. The page is refused, naming
+/// the cause, rather than panicking.
 pub(super) fn null_key(target: &str) -> SelfCheckError {
-    SelfCheckError::UnsupportedExpr {
+    SelfCheckError::NullInNotNullKey {
         target: target.to_string(),
-        detail: "a key column read as NOT NULL holds NULL; run self_check again".to_string(),
     }
 }
 

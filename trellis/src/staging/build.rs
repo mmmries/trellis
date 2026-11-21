@@ -644,7 +644,8 @@ async fn start(
     }
     // A table the definition keys by that has lost the index over its
     // recorded key fails the start, naming it, and the caller pauses the
-    // definition with that reason (#1719).
+    // definition with that reason (#1719); so does a `NULL` in a key column
+    // the record renders raw (T0253, #2217).
     crate::defs::recorded_keys::check(&txn, definition).await?;
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
@@ -1778,10 +1779,13 @@ async fn stage_null_keys(
 ) -> Result<(), ApplyError> {
     use crate::staging::append::{self, StagedChange};
 
+    // `num_nulls`, not `is null`: on a partitioned source whose `NOT NULL`
+    // Postgres 18 validated over a `NULL`-holding partition (#2216), the
+    // planner folds `is null` to false.
     let nullable: Vec<String> = pk
         .iter()
         .filter(|c| c.nullable)
-        .map(|c| format!("{} is null", quote_ident(&c.name)))
+        .map(|c| format!("pg_catalog.num_nulls({}) > 0", quote_ident(&c.name)))
         .collect();
     if nullable.is_empty() {
         return Ok(());

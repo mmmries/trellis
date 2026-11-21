@@ -259,6 +259,8 @@ const ASSIGNED: &[&str] = &[
     "T0250 ParseError::QuantifiedComparison",
     "T0251 ParseError::RowConstructor",
     "T0252 ValidationError::InListCommonType",
+    "T0253 SharedCondition::NullInNotNullKey",
+    "T0254 SharedCondition::RawKeyNowNullable",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

@@ -21,8 +21,6 @@ pub enum Gap {
     ColumnNameSwap,
     /// `docs/known-correctness-gaps.md#nondeterministic-collation`
     NondeterministicCollation,
-    /// `docs/known-correctness-gaps.md#key-not-null-flip`
-    KeyNotNullFlip,
     /// `docs/known-correctness-gaps.md#deferrable-key-replica-duplicate`
     DeferrableKeyReplicaDuplicate,
     /// `docs/known-correctness-gaps.md#capture-disrupted-between-passes`
@@ -64,12 +62,11 @@ pub enum Repair {
 
 impl Gap {
     /// Every entry, in the register's order.
-    pub const ALL: [Gap; 16] = [
+    pub const ALL: [Gap; 15] = [
         Gap::AlterTypeRewrite,
         Gap::EnumLabelReadded,
         Gap::ColumnNameSwap,
         Gap::NondeterministicCollation,
-        Gap::KeyNotNullFlip,
         Gap::DeferrableKeyReplicaDuplicate,
         Gap::CaptureDisruptedBetweenPasses,
         Gap::UnloggedSourceReset,
@@ -90,7 +87,6 @@ impl Gap {
             Gap::EnumLabelReadded => "enum-label-readded",
             Gap::ColumnNameSwap => "column-name-swap",
             Gap::NondeterministicCollation => "nondeterministic-collation",
-            Gap::KeyNotNullFlip => "key-not-null-flip",
             Gap::DeferrableKeyReplicaDuplicate => "deferrable-key-replica-duplicate",
             Gap::CaptureDisruptedBetweenPasses => "capture-disrupted-between-passes",
             Gap::UnloggedSourceReset => "unlogged-source-reset",
@@ -123,7 +119,6 @@ impl Gap {
             Gap::AlterTypeRewrite
             | Gap::EnumLabelReadded
             | Gap::ColumnNameSwap
-            | Gap::KeyNotNullFlip
             | Gap::CaptureDisruptedBetweenPasses
             | Gap::UnloggedSourceReset
             | Gap::RepeatableReadOldKey => Repair::RequestBackfill,

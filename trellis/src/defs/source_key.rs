@@ -69,8 +69,11 @@ pub(crate) fn declared_by_reader<'a, T: AsRef<str>>(
 
 /// The unique index backing `columns` as `table`'s key (an unquoted
 /// `schema.table`), as each key column reads through it, in `columns`'
-/// order: its name, type, nullability and the index's collation for it.
-/// `None` when no index backs it.
+/// order: its name, type, encoding and the index's collation for it.
+/// `None` when no index backs it. The encoding is the table's record's when
+/// it records `columns`, and otherwise the one a record of them would take
+/// ([`super::recorded_keys::encoding_now`]): every column when the index is
+/// `NULLS NOT DISTINCT`.
 ///
 /// An index backs a key when it is a unique index whose key columns are
 /// exactly `columns`, in any order (an `INCLUDE` column is no key column),
@@ -89,7 +92,8 @@ pub(crate) async fn backing(
         .query_typed(
             &format!(
                 "with backing as ( \
-                     select i.indexrelid, i.indrelid, i.indkey, i.indnkeyatts, i.indcollation \
+                     select i.indexrelid, i.indrelid, i.indkey, i.indnkeyatts, i.indcollation, \
+                            i.indnullsnotdistinct \
                      from pg_catalog.pg_index i \
                      where i.indrelid = pg_catalog.to_regclass($1) \
                        and i.indisunique and i.indisvalid and i.indisready and i.indislive \
@@ -121,7 +125,15 @@ pub(crate) async fn backing(
                                 and (not oc.opcdefault or k.coll <> a.attcollation)) \
                      order by i.indisprimary desc, i.indexrelid \
                      limit 1) \
-                 select a.attname::text, {}, not {not_null}, \
+                 select a.attname::text, {}, \
+                        coalesce((select a.attname::text = any(k.encoded_columns) \
+                                  from definition_keys k \
+                                  where k.table_name = $3 and {tied} \
+                                    and (select pg_catalog.array_agg(c order by c) \
+                                         from pg_catalog.unnest(k.key_columns) c) \
+                                        = (select pg_catalog.array_agg(c order by c) \
+                                           from pg_catalog.unnest($2::text[]) c)), \
+                                 b.indnullsnotdistinct), \
                         (select pg_catalog.format('%I.%I', n.nspname, co.collname) \
                          from pg_catalog.pg_collation co \
                          join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
@@ -134,10 +146,12 @@ pub(crate) async fn backing(
                  order by pg_catalog.array_position($2::text[], a.attname::text)",
                 super::copy_type::type_sql("a.atttypid"),
                 not_null = ddl::not_null_sql!("a"),
+                tied = super::recorded_keys::tied_to("$1"),
             ),
             &[
                 (&ddl::regclass_arg(table), Type::TEXT),
                 (&columns, Type::TEXT_ARRAY),
+                (&table, Type::TEXT),
             ],
         )
         .await?;
@@ -258,6 +272,17 @@ pub(crate) async fn admitted_key(
                 partitioned: super::partition_tree::is_partitioned_root(client, table).await?,
             });
         };
+        // A record that renders a key column raw that can hold `NULL` now
+        // can't key a new reader: its `NULL`s would render as empty parts
+        // (#2147). A resume records the key again first, so it passes.
+        let raw = super::recorded_keys::raw_now_nullable(client, table).await?;
+        if !raw.is_empty() {
+            return Err(DdlError::RawKeyNowNullable {
+                table: table.to_string(),
+                columns: raw,
+            });
+        }
+        refuse_null_in_raw_key(client, table, &columns).await?;
         let admitted_by = ddl::admit_key_types(client, table, &columns).await?;
         return Ok((columns, admitted_by));
     }
@@ -276,7 +301,29 @@ pub(crate) async fn admitted_key(
     if let Some(deferrable) = deferrable_primary_key(client, table).await? {
         return Err(deferrable);
     }
-    ddl::admitted_primary_key(client, table).await
+    let admitted = ddl::admitted_primary_key(client, table).await?;
+    refuse_null_in_raw_key(client, table, &admitted.0).await?;
+    Ok(admitted)
+}
+
+/// Refuses `table`'s `key` when a key column it renders raw holds a `NULL`
+/// in a suspect leaf of its partition tree
+/// ([`super::recorded_keys::null_in_raw_key`], #2216): define and a
+/// resume's re-validation, before a build would key the `NULL` as an empty
+/// part. A `PRIMARY KEY` too: Postgres 18 adds one over that state.
+async fn refuse_null_in_raw_key(
+    client: &impl GenericClient,
+    table: &str,
+    key: &[PrimaryKeyColumn],
+) -> Result<(), DdlError> {
+    let columns = super::recorded_keys::null_in_raw_key(client, table, key).await?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    Err(DdlError::NullInNotNullKey {
+        table: table.to_string(),
+        columns,
+    })
 }
 
 /// How the transforms reading a table key it: by its primary key, or by a

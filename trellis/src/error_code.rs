@@ -174,6 +174,12 @@ pub(crate) enum SharedCondition {
     SourceTableNotFound,
     /// A type a literal can't be spelled as.
     UnsupportedLiteralType,
+    /// A `NULL` observed in a key column Postgres reads as `NOT NULL`, which
+    /// the table's recorded key renders raw (#2217).
+    NullInNotNullKey,
+    /// A key column the table's recorded key renders raw can hold `NULL`
+    /// now (#2147, #2217).
+    RawKeyNowNullable,
 }
 
 impl SharedCondition {
@@ -184,6 +190,8 @@ impl SharedCondition {
             SharedCondition::SourceTableNotFound => ErrorId(126),
             SharedCondition::TransformNotFound => ErrorId(148),
             SharedCondition::UnsupportedLiteralType => ErrorId(28),
+            SharedCondition::NullInNotNullKey => ErrorId(253),
+            SharedCondition::RawKeyNowNullable => ErrorId(254),
         }
     }
 }

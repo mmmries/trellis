@@ -139,6 +139,9 @@ async fn key_of(
 /// relation at the name now, for every definition that keys by it: a record
 /// it had, of this table or of one dropped since, is replaced. Nothing is
 /// recorded for a table that doesn't exist or an empty key.
+///
+/// The record carries the key's encoding ([`encoding_now`]), which stays
+/// until the key is recorded again (#2147).
 async fn write(
     client: &impl GenericClient,
     table: &str,
@@ -147,19 +150,114 @@ async fn write(
     if key.is_empty() {
         return Ok(());
     }
+    let encoded = encoding_now(client, table, key).await?;
+    write_encoded(client, table, key, &encoded).await
+}
+
+/// [`write`], with the encoding `encoded` instead of the one `key`'s index
+/// gives it now.
+async fn write_encoded(
+    client: &impl GenericClient,
+    table: &str,
+    key: &[String],
+    encoded: &[String],
+) -> Result<(), tokio_postgres::Error> {
+    if key.is_empty() {
+        return Ok(());
+    }
     client
         .execute(
-            "insert into definition_keys (table_name, key_columns, relation_oid, catalog_oid) \
-             select $1, $2, r.oid, 'definition_keys'::pg_catalog.regclass::pg_catalog.oid \
+            "insert into definition_keys \
+                 (table_name, key_columns, relation_oid, catalog_oid, encoded_columns) \
+             select $1, $2, r.oid, 'definition_keys'::pg_catalog.regclass::pg_catalog.oid, $4 \
              from (select pg_catalog.to_regclass($3)::pg_catalog.oid as oid) r \
              where r.oid is not null \
              on conflict (table_name) do update \
              set key_columns = excluded.key_columns, relation_oid = excluded.relation_oid, \
-                 catalog_oid = excluded.catalog_oid",
-            &[&table, &key, &ddl::regclass_arg(table)],
+                 catalog_oid = excluded.catalog_oid, encoded_columns = excluded.encoded_columns",
+            &[&table, &key, &ddl::regclass_arg(table), &encoded],
         )
         .await?;
     Ok(())
+}
+
+/// The encoding a record of `key` as `table`'s takes now: every key column
+/// when the index over exactly `key` is `UNIQUE ... NULLS NOT DISTINCT`
+/// (the only index a key column that can hold `NULL` is admitted on), and
+/// none otherwise (a primary key, or a plain unique index over `NOT NULL`
+/// columns). Empty when no index is over `key`.
+pub(crate) async fn encoding_now(
+    client: &impl GenericClient,
+    table: &str,
+    key: &[String],
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    Ok(ddl::identity_key_columns_over(client, table, Some(key))
+        .await?
+        .into_iter()
+        .filter(|c| c.nullable)
+        .map(|c| c.name)
+        .collect())
+}
+
+/// The encoding recorded for `table` (an unquoted `schema.table`), if it
+/// has a record tied to it: its key columns and the ones of them encoded
+/// ([`write`]).
+pub(crate) async fn recorded_encoding(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Option<(Vec<String>, Vec<String>)>, tokio_postgres::Error> {
+    Ok(client
+        .query_typed_opt(
+            &format!(
+                "select k.key_columns, k.encoded_columns from definition_keys k \
+                 where k.table_name = $1 and {}",
+                tied_to("$2")
+            ),
+            &[
+                (&table, Type::TEXT),
+                (&ddl::regclass_arg(table), Type::TEXT),
+            ],
+        )
+        .await?
+        .map(|row| (row.get(0), row.get(1))))
+}
+
+/// The key columns of `table`'s record that render raw and can hold `NULL`
+/// now (`ddl::not_null_sql`): a `DROP NOT NULL` on a key a record before
+/// #2147's encoding took raw over a `NULLS NOT DISTINCT` index, so a `NULL`
+/// in them would render as an empty part ([`PauseReason::RawKeyNowNullable`]).
+/// Empty without a record, or when every raw column is still `NOT NULL`.
+pub(crate) async fn raw_now_nullable(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    Ok(client
+        .query_typed(
+            &format!(
+                concat!(
+                    "select a.attname::text \
+                     from definition_keys k \
+                     cross join unnest(k.key_columns) with ordinality c(name, ord) \
+                     join pg_catalog.pg_attribute a \
+                       on a.attrelid = pg_catalog.to_regclass($2) and a.attname = c.name \
+                      and a.attnum > 0 and not a.attisdropped \
+                     where k.table_name = $1 and {} \
+                       and not c.name = any(k.encoded_columns) \
+                       and not ",
+                    crate::defs::ddl::not_null_sql!("a"),
+                    " order by c.ord"
+                ),
+                tied_to("$2")
+            ),
+            &[
+                (&table, Type::TEXT),
+                (&ddl::regclass_arg(table), Type::TEXT),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
 /// Records the key of each table a define of `def` keys by: its qualified
@@ -170,6 +268,10 @@ async fn write(
 /// own. A declared key is the table's for every reader of it: define
 /// refuses one that differs from another reader's
 /// ([`super::source_key::check_one_key`]).
+///
+/// A record kept keeps its encoding (#2147). Define refuses a table whose
+/// record renders a key column raw that can hold `NULL` now
+/// ([`super::source_key::admitted_key`]), so none is kept here.
 pub(crate) async fn record(
     client: &impl GenericClient,
     def: &TransformDef,
@@ -217,7 +319,19 @@ async fn record_except(
     } else {
         key_of(client, source).await?
     };
-    write(client, target, &target_key(def, &source_key)).await
+    let key = target_key(def, &source_key);
+    // A 1-1 target's key text is its source's, so its record takes the
+    // source record's encoding: a source record migrated with only some
+    // columns of a `NULLS NOT DISTINCT` key encoded would otherwise give the
+    // target, keyed by that index's shape, every column encoded.
+    if keys_target_by_source(def)
+        && unkeyed != Some(source)
+        && let Some((recorded, encoded)) = recorded_encoding(client, source).await?
+        && recorded == key
+    {
+        return write_encoded(client, target, &key, &encoded).await;
+    }
+    write(client, target, &key).await
 }
 
 /// The key recorded for `table` (an unquoted `schema.table`), if it has a
@@ -271,6 +385,82 @@ pub(crate) async fn retie_restored(
             .await?;
     }
     Ok(())
+}
+
+/// The raw key columns of `key` (`table`'s, each with its encoding) that
+/// hold a `NULL` in a suspect leaf of `table`'s partition tree: a leaf that
+/// reads the column as nullable while the root reads it as `NOT NULL`
+/// (`ddl::not_null_sql`), the shape Postgres 18 leaves when `SET NOT NULL` on
+/// a partitioned table validates over a `NOT VALID`, `NULL`-holding
+/// partition (#2216). The catalog aims the check and a scan of each suspect
+/// leaf observes it: a plain table, or a tree whose leaves read as its root
+/// does, costs one catalog query and no scan, and a suspect leaf with no
+/// `NULL` observes nothing. The scan tests `num_nulls(column) > 0`, which
+/// the planner can't fold away through the root's `NOT NULL` as it folds
+/// `column is null`.
+pub(crate) async fn null_in_raw_key(
+    client: &impl GenericClient,
+    table: &str,
+    key: &[ddl::PrimaryKeyColumn],
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    let raw: Vec<String> = key
+        .iter()
+        .filter(|c| !c.nullable)
+        .map(|c| c.name.clone())
+        .collect();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let suspects = client
+        .query_typed(
+            concat!(
+                "with recursive tree(oid) as ( \
+                     select h.inhrelid from pg_catalog.pg_inherits h \
+                     where h.inhparent = pg_catalog.to_regclass($1) \
+                     union all \
+                     select h.inhrelid from tree t \
+                     join pg_catalog.pg_inherits h on h.inhparent = t.oid) \
+                 select pg_catalog.format('%I.%I', n.nspname, c.relname), \
+                        l.attname::text \
+                 from tree t \
+                 join pg_catalog.pg_class c on c.oid = t.oid and c.relkind <> 'p' \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 join pg_catalog.pg_attribute r \
+                   on r.attrelid = pg_catalog.to_regclass($1) and r.attname::text = any($2) \
+                  and r.attnum > 0 and not r.attisdropped \
+                 join pg_catalog.pg_attribute l \
+                   on l.attrelid = t.oid and l.attname = r.attname \
+                 where ",
+                crate::defs::ddl::not_null_sql!("r"),
+                " and not ",
+                crate::defs::ddl::not_null_sql!("l"),
+                " order by 1, 2"
+            ),
+            &[
+                (&ddl::regclass_arg(table), Type::TEXT),
+                (&raw, Type::TEXT_ARRAY),
+            ],
+        )
+        .await?;
+    let mut found: Vec<String> = Vec::new();
+    for row in suspects {
+        let (leaf, column): (String, String) = (row.get(0), row.get(1));
+        let held: bool = client
+            .query_one(
+                &format!(
+                    "select exists (select 1 from only {leaf} \
+                     where pg_catalog.num_nulls({}) > 0)",
+                    crate::pool::quote_ident(&column)
+                ),
+                &[],
+            )
+            .await?
+            .get(0);
+        if held && !found.contains(&column) {
+            found.push(column);
+        }
+    }
+    Ok(found)
 }
 
 /// `table`'s unique indexes, oldest first, each as `name (key columns)` with
@@ -413,6 +603,10 @@ pub(crate) struct TableKey {
     /// its key whatever the table's primary key is, and `resolves` is then
     /// whether an index backs it ([`super::source_key::backing`]).
     pub(crate) declared: Option<Vec<String>>,
+    /// Whether a key column the record renders raw can hold `NULL` now
+    /// ([`raw_now_nullable`]): the record is taken again, in the encoding
+    /// its index gives it now.
+    pub(crate) raw_nullable: bool,
 }
 
 /// What a resume does with one table's key ([`decide`]).
@@ -457,7 +651,7 @@ pub(crate) fn decide(key: &TableKey) -> Rekey {
             };
         }
         return match &key.recorded {
-            Some((recorded, true)) if recorded == declared => Rekey::Keep,
+            Some((recorded, true)) if recorded == declared && !key.raw_nullable => Rekey::Keep,
             _ => Rekey::Record(declared.clone()),
         };
     }
@@ -470,7 +664,7 @@ pub(crate) fn decide(key: &TableKey) -> Rekey {
     let primary_key_moved =
         !key.trellis_target && !key.primary_key.is_empty() && key.primary_key != *recorded;
     if key.resolves && (*tied || key.trellis_target) && !primary_key_moved {
-        return if *tied {
+        return if *tied && !key.raw_nullable {
             Rekey::Keep
         } else {
             Rekey::Record(recorded.clone())
@@ -539,6 +733,7 @@ async fn table_key(
         primary_key: row.get(3),
         trellis_target: row.get(2),
         declared: declared.map(<[String]>::to_vec),
+        raw_nullable: !raw_now_nullable(client, table).await?.is_empty(),
     }))
 }
 
@@ -620,6 +815,9 @@ async fn refusal(
 /// otherwise read rows keyed by the new key into state keyed by the old. A
 /// re-keyed 1-1 target's own record is one of them: the transforms reading
 /// it are paused, and their own resume follows these rules over its new key.
+/// A record taken again over the same columns in another encoding (a raw
+/// key that can hold `NULL` now, [`raw_now_nullable`]) pauses them the same
+/// way ([`PauseReason::RawKeyNowNullable`]).
 pub(crate) async fn rekey_for_resume(
     txn: &tokio_postgres::Transaction<'_>,
     definition: &Definition,
@@ -631,9 +829,25 @@ pub(crate) async fn rekey_for_resume(
         columns,
     } in rekey(txn, definition, repaired.as_ref()).await?
     {
+        let encoded_before = recorded_encoding(txn, &table).await?.map(|(_, e)| e);
         write(txn, &table, &columns).await?;
         if old != columns {
-            pause_running_readers(txn, definition.id, &table, &old, &columns).await?;
+            let reason = PauseReason::KeyRerecorded {
+                table: table.clone(),
+                old: old.clone(),
+                new: columns.clone(),
+            };
+            pause_running_readers(txn, definition.id, &table, &reason).await?;
+        } else if let Some(before) = encoded_before
+            && recorded_encoding(txn, &table).await?.map(|(_, e)| e) != Some(before)
+        {
+            // Same columns, another encoding: every key the other readers
+            // stored or staged renders the old way (#2147).
+            let reason = PauseReason::RawKeyNowNullable {
+                table: table.clone(),
+                columns: columns.clone(),
+            };
+            pause_running_readers(txn, definition.id, &table, &reason).await?;
         }
         crate::instance_log::info!(
             transform = %definition.target_table,
@@ -674,8 +888,14 @@ pub(crate) async fn rekey(
             continue;
         };
         if let Some(repair) = repaired.filter(|r| r.target == table) {
+            // Recorded again over the same columns too when the repair
+            // changed only the key's encoding (a source key recorded again
+            // in another encoding, [`target_repair`]).
             let old = key.recorded.map(|(old, _)| old).unwrap_or_default();
-            if old != repair.key {
+            let encoded = recorded_encoding(client, &table)
+                .await?
+                .map(|(_, encoded)| !encoded.is_empty());
+            if old != repair.key || encoded != Some(repair.nullable) {
                 records.push(Rerecord {
                     table,
                     old,
@@ -736,8 +956,7 @@ async fn pause_running_readers(
     txn: &tokio_postgres::Transaction<'_>,
     resumed: i64,
     table: &str,
-    old: &[String],
-    new: &[String],
+    reason: &PauseReason,
 ) -> Result<(), CatalogError> {
     let running: Vec<i64> = txn
         .query(
@@ -757,13 +976,8 @@ async fn pause_running_readers(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    let reason = PauseReason::KeyRerecorded {
-        table: table.to_string(),
-        old: old.to_vec(),
-        new: new.to_vec(),
-    };
     for id in running {
-        if super::lifecycle::pause(txn, id, &reason).await? {
+        if super::lifecycle::pause(txn, id, reason).await? {
             crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
         }
     }
@@ -775,7 +989,9 @@ async fn pause_running_readers(
 /// index (a resume re-records it first, [`rekey_for_resume`]). A record of a
 /// dropped table refuses only as [`decide`] does: the table at the name is
 /// keyed by its row identity until a resume ties it. The re-validation and
-/// a build's start run it, so the definition is never keyed by a guess.
+/// a build's start run it, so the definition is never keyed by a guess. It
+/// also refuses a `NULL` in a key column the record renders raw
+/// ([`null_in_raw_key`]).
 pub(crate) async fn check(
     client: &impl GenericClient,
     definition: &Definition,
@@ -797,6 +1013,19 @@ pub(crate) async fn check(
                 if let Some(err) = refusal(client, &table, rekey).await? {
                     return Err(err);
                 }
+            }
+        }
+        // A `NULL` in a key column the record renders raw (a suspect leaf of
+        // a partitioned table, #2216) would be keyed as an empty part, or
+        // missed by a build's range comparisons.
+        if !key.trellis_target {
+            let pk = ddl::identity_key_columns(client, &table).await?;
+            let columns = null_in_raw_key(client, &table, &pk).await?;
+            if !columns.is_empty() {
+                return Err(CatalogError::Ddl(DdlError::NullInNotNullKey {
+                    table,
+                    columns,
+                }));
             }
         }
     }
@@ -1308,6 +1537,16 @@ pub(crate) async fn repair_target_key(
             .iter()
             .map(|c| format!("drop column {}", quote_ident(c))),
     );
+    // A kept key column of a key that is encoded now can hold `NULL`, as
+    // define declares one ([`ddl::pk_columns_ddl`]): a primary key left it
+    // `NOT NULL`.
+    if *nullable {
+        actions.extend(
+            key.iter()
+                .filter(|c| !added.iter().any(|a| &a.name == *c))
+                .map(|c| format!("alter column {} drop not null", quote_ident(c))),
+        );
+    }
     let key_list = key
         .iter()
         .map(|c| quote_ident(c))
@@ -1398,15 +1637,15 @@ async fn source_key_now(
     let Some(key) = table_key(client, source, declared.as_deref()).await? else {
         return Ok(None);
     };
-    let columns = match decide(&key) {
-        Rekey::Keep => match key.recorded {
-            Some((recorded, _)) => recorded,
-            None => key_names(client, source).await?,
-        },
-        Rekey::Record(columns) => columns,
+    // A kept record keeps its encoding; a key recorded again takes the one
+    // its index gives it now ([`encoding_now`]).
+    let pk = match decide(&key) {
+        Rekey::Keep => ddl::identity_key_columns(client, source).await?,
+        Rekey::Record(columns) => {
+            ddl::identity_key_columns_over(client, source, Some(&columns)).await?
+        }
         _ => return Ok(None),
     };
-    let pk = ddl::identity_key_columns_over(client, source, Some(&columns)).await?;
     Ok((!pk.is_empty()).then_some(pk))
 }
 
@@ -1511,7 +1750,7 @@ pub(crate) async fn target_repair(
     let mut legacy = None;
     for row in client
         .query_typed(
-            "select c.oid, c.conname::text, c.conindid, \
+            "select c.oid, c.conname::text, c.conindid, i.indnullsnotdistinct, \
                     array(select a.attname::text \
                           from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
                           join pg_catalog.pg_attribute a \
@@ -1527,12 +1766,13 @@ pub(crate) async fn target_repair(
         )
         .await?
     {
-        let columns: Vec<String> = row.get(3);
+        let columns: Vec<String> = row.get(4);
         let found = (
             row.get::<_, u32>(0),
             row.get::<_, String>(1),
             row.get::<_, u32>(2),
             columns.clone(),
+            row.get::<_, bool>(3),
         );
         if columns == recorded {
             exact.get_or_insert(found);
@@ -1545,10 +1785,16 @@ pub(crate) async fn target_repair(
             legacy.get_or_insert(found);
         }
     }
-    let Some((constraint_oid, constraint, index_oid, old)) = exact.or(legacy) else {
+    let Some((constraint_oid, constraint, index_oid, old, nulls_not_distinct)) = exact.or(legacy)
+    else {
         return Ok(None);
     };
-    if old == key {
+    // The target's key encodes as its source's does: a source key recorded
+    // again in the encoding its `NULLS NOT DISTINCT` index gives it now (a
+    // raw key that can hold `NULL`, [`raw_now_nullable`]) re-keys a primary
+    // key target to a `NULLS NOT DISTINCT` one over the same columns.
+    let nullable = source_key.iter().any(|c| c.nullable);
+    if old == key && nulls_not_distinct == nullable {
         return Ok(None);
     }
     let columns: Vec<String> = client
@@ -1605,7 +1851,7 @@ pub(crate) async fn target_repair(
     }
     Ok(Some(TargetRepair {
         target: target.to_string(),
-        nullable: source_key.iter().any(|c| c.nullable),
+        nullable,
         key,
         constraint,
         added,
@@ -1619,7 +1865,8 @@ pub(crate) async fn target_repair(
 /// [`ddl::identity_key_columns`] reads no record.
 #[cfg(test)]
 pub(crate) const TEST_TABLE_DDL: &str = "create table if not exists public.definition_keys \
-     (table_name text primary key, key_columns text[], relation_oid oid, catalog_oid oid)";
+     (table_name text primary key, key_columns text[], relation_oid oid, catalog_oid oid, \
+      encoded_columns text[] not null default '{}')";
 
 #[cfg(test)]
 mod tests {
@@ -1814,7 +2061,29 @@ mod tests {
             primary_key: names(pk),
             trellis_target: false,
             declared: None,
+            raw_nullable: false,
         }
+    }
+
+    /// A record whose raw key column can hold `NULL` now (a `DROP NOT NULL`
+    /// under a record from before #2147's encoding) is taken again, over the
+    /// same columns, by a resume (T0254's remedy); one that can't is kept,
+    /// whatever its index's shape now.
+    #[test]
+    fn a_resume_records_again_a_raw_key_that_can_hold_null() {
+        let k: &[&str] = &["k"];
+        let raw = |declared: bool| TableKey {
+            declared: declared.then(|| cols(k)),
+            raw_nullable: true,
+            ..table(Some((k, true)), true, if declared { &[] } else { k })
+        };
+        assert_eq!(decide(&raw(true)), Rekey::Record(cols(k)));
+        assert_eq!(decide(&raw(false)), Rekey::Record(cols(k)));
+        let kept = TableKey {
+            raw_nullable: false,
+            ..raw(true)
+        };
+        assert_eq!(decide(&kept), Rekey::Keep);
     }
 
     /// A declared `KEY` (ADR-0026) is the table's key while an index backs
