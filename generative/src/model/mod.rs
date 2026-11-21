@@ -829,6 +829,37 @@ pub struct DbAdminEvent {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DbAdminPlan {
     pub events: Vec<DbAdminEvent>,
+    /// Start the engine's counters near this limit before the install
+    /// (`ManualBackend::advance_counters`), so the definitions and the whole
+    /// program run across it. Not an event: the ring's segment number can
+    /// only be moved while the ring is pristine.
+    pub counters_near: Option<CounterLimit>,
+}
+
+/// Where [`DbAdminPlan::counters_near`] starts the engine's `bigint`
+/// counters (the ring's change ids and segment numbers, the catalog's
+/// definition, build and self-check ids). They are `bigint`s, so a program
+/// crosses `2^31` without a type change; what it asks of the engine is that
+/// nothing narrows an id to 32 bits, and that nothing breaks on one of 19
+/// digits. Each leaves the correct converged state unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterLimit {
+    /// Within `headroom` of `i32::MAX`, so the program crosses it.
+    Int32 { headroom: u16 },
+    /// A million short of `i64::MAX`: every id is huge, none reaches the
+    /// limit. A counter at the limit itself would fail on the sequence's
+    /// own `maxvalue`, which no program can be asked to survive.
+    Int64,
+}
+
+impl CounterLimit {
+    /// The value the counters start at.
+    pub fn target(self) -> i64 {
+        match self {
+            CounterLimit::Int32 { headroom } => i64::from(i32::MAX) - i64::from(headroom),
+            CounterLimit::Int64 => i64::MAX - (1 << 20),
+        }
+    }
 }
 
 /// How a [`RestorePlan`] backs the source cluster up. Trellis's

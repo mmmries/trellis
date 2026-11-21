@@ -52,7 +52,8 @@ use super::roles::{Roles, connect_app};
 use super::sql::{self, quote_ident};
 use super::{DefinitionState, Snapshot};
 use crate::model::{
-    BurstAction, Column, FieldEdit, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
+    BurstAction, Column, CounterLimit, FieldEdit, NoiseAction, NoiseEvent, NoiseEventKind, Op,
+    Program, Table,
 };
 
 /// How long [`ManualBackend::quiesce`] waits without the ring making any
@@ -1369,6 +1370,118 @@ impl ManualBackend {
         drop(admin);
         let _ = connection.await;
         Ok(result?)
+    }
+
+    /// Starts the engine's `bigint` counters near `limit`, as the operator:
+    /// every `bigint` sequence of the instance schema (the ring's
+    /// `staging_change_id_seq` and the catalog's identity ids: definitions,
+    /// builds, self-check runs, partition corrections) is set up to the
+    /// target, and the ring's segment number (`segment_pointer.active_seq`,
+    /// which every ordering argument is expressed in) moves there too. The
+    /// next ids the engine draws, and the next segments it seals, are then
+    /// past `2^31` or within a million of `2^63`.
+    ///
+    /// Nothing here touches the engine: the counters are plain Postgres
+    /// sequences and columns, so there is no hook to compile out of a release
+    /// build. `ring_slot_mirror` is a `smallint` over its own four values and
+    /// has no headroom to spend.
+    ///
+    /// A sequence only ever moves up, so ids already drawn stay unique. The
+    /// segment number moves only while the ring is pristine (its one segment
+    /// the active one, nothing parked against it): a sealed or draining
+    /// segment's `seal_step2` is written by the *next* seal, and renumbering
+    /// the active segment would strand it. Call it before the install, so the
+    /// definitions and their builds draw past the start too, and no engine
+    /// races the renumbering. Fails if the ring isn't pristine.
+    ///
+    /// The result is a state the engine reaches on its own: one active
+    /// segment numbered above every earlier one, with none left below it, is
+    /// what retiring every drained segment leaves, and what a restore's
+    /// response (`capture::restore::respond`) writes.
+    ///
+    /// Returns the segment number the ring is at afterwards.
+    pub async fn advance_counters(&self, limit: CounterLimit) -> Result<i64, ManualBackendError> {
+        let target = limit.target();
+        let q = quote_ident(self.config.schema());
+        let lit = self.config.schema().replace('\'', "''");
+        let body = format!(
+            "do $do$ \
+             declare r record; old bigint; \
+             begin \
+               for r in select c.oid::regclass as seq from pg_class c \
+                          join pg_sequence q on q.seqrelid = c.oid \
+                         where c.relnamespace = '{lit}'::regnamespace \
+                           and q.seqtypid = 'int8'::regtype \
+               loop \
+                 if coalesce(pg_sequence_last_value(r.seq), 0) < {target} then \
+                   perform setval(r.seq, {target}); \
+                 end if; \
+               end loop; \
+               lock table {q}.segment_pointer in access exclusive mode; \
+               select active_seq into old from {q}.segment_pointer; \
+               if old < {target} then \
+                 if (select count(*) from {q}.segments) <> 1 \
+                    or exists (select 1 from {q}.segments where state <> 'active') \
+                    or exists (select 1 from {q}.poison_held) \
+                    or exists (select 1 from {q}.join1_fan_out) then \
+                   raise exception 'the ring is not pristine: its segments have moved on'; \
+                 end if; \
+                 insert into {q}.segments (seg_seq, ring_slot, state, created_at, bucket_count) \
+                   select {target}, ring_slot, state, created_at, bucket_count \
+                     from {q}.segments where seg_seq = old; \
+                 update {q}.segment_pointer set active_seq = {target}; \
+                 delete from {q}.segments where seg_seq = old; \
+               end if; \
+             end $do$"
+        );
+        let (admin, connection) = tokio_postgres::connect(&self.roles.admin, NoTls).await?;
+        let connection = tokio::spawn(connection);
+        let result = async {
+            admin.batch_execute(&body).await?;
+            admin
+                .query_one(&format!("select active_seq from {q}.segment_pointer"), &[])
+                .await
+                .map(|row| row.get::<_, i64>(0))
+        }
+        .await;
+        drop(admin);
+        let _ = connection.await;
+        Ok(result?)
+    }
+
+    /// The highest value any `bigint` sequence of the instance schema has
+    /// drawn, or the ring's active segment number, whichever is greater: how
+    /// far [`Self::advance_counters`]'s counters have got.
+    pub async fn counter_high_water(&self) -> Result<i64, ManualBackendError> {
+        let q = quote_ident(self.config.schema());
+        let lit = self.config.schema().replace('\'', "''");
+        let sql = format!(
+            "select greatest( \
+               (select max(coalesce(pg_sequence_last_value(c.oid::regclass), 0)) \
+                  from pg_class c join pg_sequence s on s.seqrelid = c.oid \
+                 where c.relnamespace = '{lit}'::regnamespace and s.seqtypid = 'int8'::regtype), \
+               (select active_seq from {q}.segment_pointer))"
+        );
+        let (admin, connection) = tokio_postgres::connect(&self.roles.admin, NoTls).await?;
+        let connection = tokio::spawn(connection);
+        let result = admin.query_one(&sql, &[]).await.map(|r| r.get::<_, i64>(0));
+        drop(admin);
+        let _ = connection.await;
+        Ok(result?)
+    }
+
+    /// The ids of the instance's definitions, in order: whether
+    /// [`Self::advance_counters`] started them past a limit.
+    pub async fn definition_ids(&self) -> Result<Vec<i64>, ManualBackendError> {
+        let q = quote_ident(self.config.schema());
+        let rows = self
+            .raw
+            .query(
+                &format!("select id from {q}.transform_definitions order by id"),
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     /// The connection string every Trellis connection of this backend logs

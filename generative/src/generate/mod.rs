@@ -2836,8 +2836,8 @@ pub fn adversarial_noise_table() -> Table {
 mod strategy {
     use super::*;
     use crate::model::{
-        BackupKind, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction, NoiseEvent,
-        NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SteadyLoad,
+        BackupKind, CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction,
+        NoiseEvent, NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SteadyLoad,
     };
     use proptest::prelude::*;
 
@@ -4629,7 +4629,20 @@ mod strategy {
         let op_count = program.ops.len();
         let event =
             (0..op_count, db_admin_action()).prop_map(|(op, action)| DbAdminEvent { op, action });
-        prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
+        // Two in five plans start the counters near a limit.
+        let counters_near = prop::option::weighted(
+            0.4,
+            prop_oneof![
+                (0u16..=64).prop_map(|headroom| CounterLimit::Int32 { headroom }),
+                Just(CounterLimit::Int64),
+            ],
+        );
+        (prop::collection::vec(event, 0..=3), counters_near).prop_map(|(events, counters_near)| {
+            DbAdminPlan {
+                events,
+                counters_near,
+            }
+        })
     }
 
     /// A backup-and-restore plan for `program`, backing up after
