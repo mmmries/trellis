@@ -659,4 +659,33 @@ mod residue {
             })
         });
     }
+    /// A chain whose second epoch drops the only definition, over a table
+    /// that is then read by nothing.
+    fn last_reader_dropped() -> EpochCase {
+        use generative::generate::epoch::{EpochChangeDraw, EpochChangeKind, EpochDraw};
+        use generative::generate::{DefShape, Mutate, TableSpec};
+        EpochCase {
+            tables: vec![TableSpec::numeric_only(
+                vec![(Some(1), Some(2)), (Some(3), None)],
+                vec![Mutate::Delete { pk: 2 }],
+            )],
+            defs: vec![(0, DefShape::OneToOne, None)],
+            epochs: vec![EpochDraw {
+                changes: vec![EpochChangeDraw {
+                    kind: EpochChangeKind::Drop,
+                    target: 0,
+                }],
+                mutates: vec![Vec::new()],
+            }],
+        }
+    }
+
+    /// Dropping the last definition over a table leaves the table's
+    /// `schema_nodes` row behind. Fails until the drop reaps it.
+    #[test]
+    #[ignore = "#2238, #2239: a drop leaves the source's schema_nodes row and version-fence row"]
+    fn a_dropped_last_reader_leaves_no_schema_node() {
+        let report = run_lapping_case(&last_reader_dropped());
+        assert!(report.is_ok(), "{report:?}");
+    }
 }

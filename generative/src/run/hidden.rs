@@ -339,9 +339,21 @@ async fn check_hidden_once(
         );
         report.hidden.insert(hidden.clone(), (expected, actual));
         if actual != expected {
+            let rows: Vec<String> = match admin
+                .query(
+                    &format!(
+                        "select row_to_json(x)::text from \"{name_schema}\".\"{name}\" x limit 3"
+                    ),
+                    &[],
+                )
+                .await
+            {
+                Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
+                Err(e) => vec![e.to_string()],
+            };
             failures.push(format!(
                 "hidden tables: {hidden} holds {actual} rows, and the oracle expects {expected} \
-                 for {target}"
+                 for {target}; first rows: {rows:?}"
             ));
         }
     }
