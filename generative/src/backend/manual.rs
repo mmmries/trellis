@@ -642,6 +642,7 @@ impl ManualBackend {
         .await?;
         backend.app = connect_app(roles, None).await?;
         backend.roles = roles.clone();
+        backend.draw_target_schema = roles.separate_app() && backend.target_schema == "public";
         Ok(backend)
     }
 
@@ -663,7 +664,6 @@ impl ManualBackend {
         backend.source_schema = source_schema.map(str::to_string);
         backend.app = connect_app(roles, source_schema).await?;
         backend.roles = roles.clone();
-        backend.draw_target_schema = roles.separate_app() && backend.target_schema == "public";
         Ok(backend)
     }
 
@@ -677,7 +677,7 @@ impl ManualBackend {
             "write_as needs a backend connected with separate roles"
         );
         let dsn = dsn.unwrap_or(&self.roles.app).to_string();
-        self.app = Some(super::roles::connect_app_as(&dsn).await?);
+        self.app = Some(super::roles::connect_app_as(&dsn, self.source_schema.as_deref()).await?);
         Ok(())
     }
 

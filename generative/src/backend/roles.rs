@@ -96,13 +96,14 @@ pub(super) async fn connect_app(
     if !roles.separate_app() {
         return Ok(None);
     }
-    connect_app_as(&roles.app).await.map(Some)
+    connect_app_as(&roles.app, source_schema).await.map(Some)
 }
 
 /// An application session logged in with `dsn`, set up as [`connect_app`]
 /// sets one up.
 pub(super) async fn connect_app_as(
     dsn: &str,
+    source_schema: Option<&str>,
 ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
     let (app, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
