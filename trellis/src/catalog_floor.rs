@@ -39,7 +39,7 @@ use crate::release_version::ReleaseVersion;
 /// reads the catalog its own migrations leave. Only that catalog: once a
 /// later build of the same release has run a migration this one lacks, the
 /// floor no longer tells them apart, and the build's own version decides.
-pub(crate) const CATALOG_FLOOR: &str = "0.2.0";
+pub(crate) const CATALOG_FLOOR: &str = "0.4.0";
 
 /// One migration, applied (a row of refinery's history) or carried by a
 /// binary.

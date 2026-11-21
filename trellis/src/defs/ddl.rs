@@ -62,7 +62,7 @@ use std::fmt;
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
-use crate::error_code::{self, ErrorCode, ErrorId};
+use crate::error_code::{self, ErrorCode, ErrorId, SharedCondition};
 use crate::pool::{Pool, quote_ident};
 
 use super::ast::{FieldDef, KeySpace, TransformDef, ValueType};
@@ -137,20 +137,25 @@ pub struct PrimaryKeyColumn {
     /// to interpolate directly into DDL text since it comes from the
     /// catalog, not user input.
     pub data_type: String,
-    /// Whether this key column can actually hold SQL `NULL` (no validated
-    /// `NOT NULL`, `not_null_sql`), which is what selects between this crate's
-    /// two key-component encodings — see [`encode_key_part`]'s
+    /// Whether this key column is **encoded**: a `NULL` renders as
+    /// `chr(1)` and a real `chr(1)` is doubled. It selects between this
+    /// crate's two key-component encodings — see [`encode_key_part`]'s
     /// "[`nullable`](PrimaryKeyColumn::nullable) selects the encoding"
-    /// section.
+    /// section — and every reader treats an encoded column as one that can
+    /// hold `NULL`.
     ///
-    /// `false` for every real `PRIMARY KEY` column (Postgres makes a primary
-    /// key's columns `NOT NULL` unconditionally) and for the all-`NOT NULL`
-    /// `UNIQUE` index [`source_primary_key`] also accepts. `true` only for
-    /// a column of a `UNIQUE NULLS NOT DISTINCT` key: the grouping columns
-    /// [`create_aggregate_target_table`] puts on an aggregate target, whose
-    /// `GROUP BY` columns are deliberately nullable, a user table's `KEY
-    /// (...)` column on such an index (ADR-0026), and the same columns of a
-    /// 1-1 target over either ([`target_table_ddl`]).
+    /// It is the table's recorded encoding (`definition_keys.encoded_columns`,
+    /// [`super::recorded_keys`]), never the live catalog's nullability, so a
+    /// `SET NOT NULL` or `DROP NOT NULL` doesn't change how a staged or
+    /// stored key decodes (#2147). A record encodes every key column when
+    /// the key's index is `UNIQUE … NULLS NOT DISTINCT`, and none otherwise:
+    /// so `false` for every `PRIMARY KEY` column and for a plain `UNIQUE`
+    /// index over `NOT NULL` columns, and `true` for a user table's `KEY
+    /// (...)` on a `NULLS NOT DISTINCT` index (ADR-0026), the grouping
+    /// columns [`create_aggregate_target_table`] puts on an aggregate
+    /// target, and the same columns of a 1-1 target over either
+    /// ([`target_table_ddl`]). A table with no record takes the same rule
+    /// from its index.
     pub nullable: bool,
     /// The collation the key's index orders this column by, as a quoted,
     /// qualified name ready to interpolate after `collate`
@@ -333,6 +338,15 @@ pub enum DdlError {
     /// DDL. Define refuses every such aggregate by family before it gets
     /// here, so this is a definition that skipped validation.
     UnroutedAggregate { target: String },
+    /// `columns` of `table`, key columns Postgres reads as `NOT NULL` and
+    /// the table's recorded key renders raw, hold a `NULL`: a `NOT NULL`
+    /// that doesn't hold (Postgres 18 can validate one over a `NOT VALID`,
+    /// `NULL`-holding partition) (#2217).
+    NullInNotNullKey { table: String, columns: Vec<String> },
+    /// `columns` of `table` can hold `NULL` now, and the key Trellis
+    /// recorded for it renders them raw: a `DROP NOT NULL` on a key recorded
+    /// before its encoding was recorded (#2147, #2217).
+    RawKeyNowNullable { table: String, columns: Vec<String> },
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
     /// Acquiring a connection from the pool failed.
@@ -357,7 +371,9 @@ impl DdlError {
             | DdlError::KeyDiffersFromReaders { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::RecordedKeyMissing { .. }
-            | DdlError::NoPrimaryKeyToRecord { .. } => ErrorCode::Validation,
+            | DdlError::NoPrimaryKeyToRecord { .. }
+            | DdlError::NullInNotNullKey { .. }
+            | DdlError::RawKeyNowNullable { .. } => ErrorCode::Validation,
             // Staged-data corruption or a provenance bug, not a rejection of
             // the current call's input.
             DdlError::MalformedCompositeKey { .. } | DdlError::UnroutedAggregate { .. } => {
@@ -387,6 +403,8 @@ impl DdlError {
             DdlError::InvalidDefinition(err) => err.error_id(),
             DdlError::AliasSubstitution(err) => err.error_id(),
             DdlError::UnroutedAggregate { .. } => ErrorId(122),
+            DdlError::NullInNotNullKey { .. } => SharedCondition::NullInNotNullKey.error_id(),
+            DdlError::RawKeyNowNullable { .. } => SharedCondition::RawKeyNowNullable.error_id(),
             DdlError::Db(..) => ErrorId(123),
             DdlError::Pool(err) => err.error_id(),
         }
@@ -412,6 +430,39 @@ fn deferrable_key_remedy(table: &str, constraint: &str, key: &[String]) -> Strin
          {constraint}, ADD PRIMARY KEY ({})), or key the table by KEY (column, ...) over a \
          unique index that isn't deferrable",
         key.join(", ")
+    )
+}
+
+/// `columns` as a quoted list: `"a", "b"`.
+fn quoted_columns(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The cause of [`SharedCondition::NullInNotNullKey`] and the source fix,
+/// without a code or the step after it: every report of it (a refusal, a
+/// pause, a `self_check`) says the same.
+pub(crate) fn null_in_not_null_key(table: &str, columns: &[String]) -> String {
+    format!(
+        "key column {} of {table} holds NULL although Postgres reads it as NOT NULL (on \
+         Postgres 18, SET NOT NULL on a partitioned table can validate over a NOT VALID \
+         partition holding NULL), and Trellis renders that column raw, so the NULL can't be \
+         keyed. Remove the NULLs, or fix the partition (DETACH it, or VALIDATE CONSTRAINT \
+         its NOT NULL)",
+        quoted_columns(columns)
+    )
+}
+
+/// The cause of [`SharedCondition::RawKeyNowNullable`], without a code or
+/// a remedy.
+pub(crate) fn raw_key_now_nullable(table: &str, columns: &[String]) -> String {
+    format!(
+        "key column {} of {table} can hold NULL now (DROP NOT NULL), and the key Trellis \
+         recorded for {table} renders it raw, so a NULL in it can't be keyed",
+        quoted_columns(columns)
     )
 }
 
@@ -577,6 +628,18 @@ impl crate::error_code::Message for DdlError {
             // `err` already says what failed (a pool checkout reads
             // "failed to acquire a connection: ...").
             DdlError::Pool(err) => err.fmt_message(f),
+            DdlError::NullInNotNullKey { table, columns } => {
+                f.write_str(&null_in_not_null_key(table, columns))?;
+                f.write_str(", then define it again")
+            }
+            DdlError::RawKeyNowNullable { table, columns } => {
+                f.write_str(&raw_key_now_nullable(table, columns))?;
+                f.write_str(
+                    ". PAUSE TRANSFORM and RESUME a transform that reads it (RESUME one paused \
+                     already), which records the key again so that it encodes NULL, then define \
+                     this again",
+                )
+            }
         }
     }
 }
@@ -593,7 +656,9 @@ impl std::error::Error for DdlError {
             | DdlError::NoPrimaryKeyToRecord { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::MalformedCompositeKey { .. }
-            | DdlError::UnroutedAggregate { .. } => None,
+            | DdlError::UnroutedAggregate { .. }
+            | DdlError::NullInNotNullKey { .. }
+            | DdlError::RawKeyNowNullable { .. } => None,
             DdlError::InvalidDefinition(err) => Some(err),
             DdlError::AliasSubstitution(err) => Some(err),
             DdlError::Db(err) => Some(err),
@@ -799,12 +864,18 @@ pub(crate) async fn identity_key_columns_over(
     let rows = client
         .query_typed(
             &format!(
-                "with recorded as (
-                 select coalesce($3::text[], (
-                     select k.key_columns
-                     from definition_keys k
-                     where k.table_name = $2 and {}
-                 )) as key_columns
+                "with record as (
+                 select k.key_columns, k.encoded_columns
+                 from definition_keys k
+                 where k.table_name = $2 and {}
+             ),
+             recorded as (
+                 select coalesce($3::text[], (select key_columns from record)) as key_columns,
+                        -- A record's encoding is the key's when the key is the
+                        -- record's (#2147); a key read over other columns
+                        -- (`over`) takes the encoding a record of it would.
+                        case when $3::text[] is null
+                             then (select encoded_columns from record) end as encoded_columns
              ),
              candidate as (
                  select i.indexrelid, i.indisprimary, i.indisvalid,
@@ -863,7 +934,7 @@ pub(crate) async fn identity_key_columns_over(
              )
              select a.attname::text,
                     {},
-                    not {not_null},
+                    coalesce(a.attname::text = any(r.encoded_columns), i.indnullsnotdistinct),
                     (select pg_catalog.format('%I.%I', n.nspname, co.collname)
                      from pg_catalog.pg_collation co
                      join pg_catalog.pg_namespace n on n.oid = co.collnamespace

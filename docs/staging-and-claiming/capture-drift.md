@@ -101,6 +101,12 @@ its `RESUME` re-keys the target in place to the new one first, and records
 the target's new key, which pauses the transforms reading the target in turn
 ([`PAUSE` and `RESUME`](../operations.md#pause-and-resume)).
 
+A key column's `NOT NULL` set or dropped changes nothing: the key's encoding
+is recorded with it ([capture](01-capture-by-triggers.md)), and a `NULL`
+reaching a column it renders raw pauses the table's readers
+([T0253](../errors.md#t0253-nullinnotnullkey),
+[T0254](../errors.md#t0254-rawkeynownullable)).
+
 ## A re-typed key column, or an outgrown copy
 
 `ALTER COLUMN ... TYPE` rewrites the table but keeps its triggers, and the

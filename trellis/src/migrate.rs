@@ -589,8 +589,8 @@ mod tests {
     /// floor, as ADR-0024 has every such migration do.
     const RAISES_FLOOR: (&str, &str) = (
         "V9002__newer_raises_floor",
-        "update catalog_floor set version = '0.3.0' \
-         where string_to_array(version, '.')::int[] < '{0,3,0}'",
+        "update catalog_floor set version = '0.5.0' \
+         where string_to_array(version, '.')::int[] < '{0,5,0}'",
     );
 
     async fn history(client: &tokio_postgres::Client) -> Vec<i32> {
@@ -617,15 +617,15 @@ mod tests {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let base = Config::from_dsn(db.dsn().to_string()).expect("dsn");
-        let current = base.clone().with_binary_version("0.2.0");
-        let newer = base.clone().with_binary_version("0.3.0");
+        let current = base.clone().with_binary_version("0.4.0");
+        let newer = base.clone().with_binary_version("0.5.0");
         let pool = Pool::new(&base).expect("pool");
         let raw = pool.connect_unpooled().await.expect("connect");
         raw.batch_execute("create table public.src (id bigint primary key, v int)")
             .await
             .expect("source");
 
-        migrate_carrying(&pool, &newer, &newer_release(&[ADDITIVE], "0.2.0"))
+        migrate_carrying(&pool, &newer, &newer_release(&[ADDITIVE], "0.4.0"))
             .await
             .expect("the newer release migrates");
         let migrated = history(&raw).await;
@@ -659,7 +659,7 @@ mod tests {
         migrate_carrying(
             &pool,
             &newer,
-            &newer_release(&[ADDITIVE, RAISES_FLOOR], "0.3.0"),
+            &newer_release(&[ADDITIVE, RAISES_FLOOR], "0.5.0"),
         )
         .await
         .expect("the newer release raises the floor");
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(err.code(), crate::ErrorCode::VersionFloor, "{err}");
         let message = err.to_string();
         assert!(
-            message.contains("floor is 0.3.0") && message.contains("version 0.2.0"),
+            message.contains("floor is 0.5.0") && message.contains("version 0.4.0"),
             "{message}"
         );
         assert_eq!(history(&raw).await, raised, "the refusal changed nothing");
@@ -679,7 +679,7 @@ mod tests {
         migrate_carrying(
             &pool,
             &newer,
-            &newer_release(&[ADDITIVE, RAISES_FLOOR], "0.3.0"),
+            &newer_release(&[ADDITIVE, RAISES_FLOOR], "0.5.0"),
         )
         .await
         .expect("the newer release still attaches");
@@ -882,7 +882,13 @@ mod tests {
             .await
             .expect("floor")
             .get(0);
-        assert_eq!(floor_after, floor_before, "the migration raises no floor");
+        // Only the key-encoding migration after it raises the floor.
+        assert_ne!(floor_before, catalog_floor::CATALOG_FLOOR);
+        assert_eq!(
+            floor_after,
+            catalog_floor::CATALOG_FLOOR,
+            "the migration raises no floor"
+        );
         // Position 1 is the definition row's own: a row for it is refused.
         let refused = client
             .execute(

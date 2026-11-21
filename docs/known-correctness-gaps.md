@@ -33,7 +33,7 @@ Postgres, hidden tables included, detects and never repairs
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | documented |
 | [A read column given a nondeterministic collation](#a-read-column-given-a-nondeterministic-collation) | `self_check` | [#1643](https://github.com/salesforce-misc/trellis/issues/1643) (research) |
-| [A `KEY` column's `NOT NULL` set or dropped with changes in flight](#a-key-columns-not-null-set-or-dropped-with-changes-in-flight) | `self_check` | [#2147](https://github.com/salesforce-misc/trellis/issues/2147) |
+| [A `NULL` in a key column every partition reads as `NOT NULL`](#a-null-in-a-key-column-every-partition-reads-as-not-null) | `self_check` | a Postgres fix |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
@@ -267,26 +267,27 @@ read the column before changing its collation.
 **Ends with:** [#1643](https://github.com/salesforce-misc/trellis/issues/1643),
 research on detecting a collation change the way a retype is detected.
 
-### A `KEY` column's `NOT NULL` set or dropped with changes in flight
+### A `NULL` in a key column every partition reads as `NOT NULL`
 
-**When:** a table read through `KEY (…)` on a `UNIQUE NULLS NOT DISTINCT`
-index has `ALTER COLUMN … SET NOT NULL`, `DROP NOT NULL` or (Postgres 18)
-`VALIDATE CONSTRAINT` of a `NOT NULL … NOT VALID` run on a key column while
-changes to rows whose key holds `NULL` or `chr(1)` are captured but not yet
-applied. An unvalidated `NOT NULL` column is nullable until it is validated.
+**When:** a key column Trellis renders raw (a primary key, or a `KEY (…)` on
+an index that isn't `NULLS NOT DISTINCT`) holds a `NULL` in a partition, or a
+plain table, that Postgres reads as `NOT NULL`, and no change to that row is
+captured. No Postgres operation is known to leave this state. The one known
+way to put a `NULL` there, Postgres 18's `SET NOT NULL` validating over a
+`NOT VALID` partition ([#2216](https://github.com/salesforce-misc/trellis/issues/2216)), leaves the partition reading as nullable, and
+define, `RESUME` and builds scan such partitions and refuse or pause
+([T0253](errors.md#t0253-nullinnotnullkey)).
 
-**What goes wrong:** a nullable key column's part is encoded (`NULL` is
-`chr(1)`, a real `chr(1)` doubled) and a `NOT NULL` one's is not. Capture
-encodes by the column's nullability when it stages a change, and the drain
-decodes by its nullability when it applies it, so a change staged before the
-`ALTER` and applied after names another key. A 1-1 target gains a row under
-that key and keeps the old values under the right one.
+**What goes wrong:** a build's chunks compare keys by range, which never
+returns a row whose key part is `NULL`, so the row has no target row (a 1-1)
+or no share of its group (an aggregate). A change captured to the row pauses
+its readers with T0253 before it applies.
 
-**Detected by:** `self_check`.
+**Detected by:** `self_check`, which refuses with T0253.
 
-**Repair:** `request_backfill` the table.
+**Repair:** remove the `NULL`, then `request_backfill` the table.
 
-**Ends with:** [#2147](https://github.com/salesforce-misc/trellis/issues/2147).
+**Ends with:** a Postgres fix.
 
 ## Writes past a unique key
 
