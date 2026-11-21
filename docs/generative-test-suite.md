@@ -129,15 +129,22 @@ so an assumption only a superuser satisfies fails the run.
 - `app_owner` creates the sources in `public`, so it owns them, and makes
   every write;
 - the bootstrap superuser runs only `CHECKPOINT` and `VACUUM FREEZE`
-  (`execute_admin`), and the cluster-wide xid aging.
+  (`execute_admin`), the cluster-wide xid aging, and the privilege tier's
+  grants and owner changes (§7).
+
+Targets go in `public` or in `trellis_targets`, which `trellis_runner` owns,
+drawn from the program's digest at the first install.
 
 Every convergence property runs this way, the self-check tampering
 properties (their tampering writes as the Trellis role, which owns the
 targets) and the subprocess crash pins too; `tests/backend_seam.rs` pins the
 owners and each session's role. `connect` runs everything as the superuser.
-Hand-built pins outside a property's runner still use it, and so does
-`two_instance_noise.rs`, whose instances keep same-named sources in their own
-catalog schemas.
+Hand-built pins outside a property's runner still use it.
+
+`two_instance_noise.rs` runs both instances as these roles in one database.
+Each instance's sources are `app_owner`'s, in a schema of its own (`app_a`,
+`app_b`) that its definitions name, so same-named sources stay apart; the
+shared-source and chain shapes keep theirs in `public`.
 
 ## 2. The oracle is Postgres itself
 
@@ -947,9 +954,9 @@ would also fail without naming the cause. The reason is the definition's
 
 The allowlist is `run::pause::allowance`: a tier on it may find a definition
 paused, and a tier not on it treats any pause as a failure. On it: any program
-with partition maintenance (`Op::Partition`). A tier that starts provoking
-pauses (a source schema change or a capture disruption, say) is added there,
-with its reason.
+with partition maintenance (`Op::Partition`). The source-DDL tier (§7) is
+judged by "never silently wrong" instead, where a pause is one of the
+endings.
 
 Every divergence report, in every backend, prints each definition's status and
 pause reason under `definitions:` beside the cell diffs.
@@ -963,6 +970,13 @@ The check bites where a run excuses a target, as the isolation draw does for
 its failing definition (`RunError::StatusLies`). It runs after a quiesce, so a
 window in which the harness itself took Postgres or the engine away is over by
 then. No other window is exempt.
+
+**Bounded retries.** Every quiesce reads `drain_holdups.attempts`: the failed
+drains of a segment's pages charged to no key or definition, counted until every
+failing page commits. At 20 the quiesce fails with `RetriesUnbounded`,
+naming each segment, instead of waiting out its window. Below that, a ring that
+doesn't move is the quiesce's own timeout. The engine pauses nothing for it;
+the check only reports.
 
 **Findings terminate as deterministic pins; generative runs are lead generation.**
 A seed reproduces the *program*, not reliably a *race*, and does not survive
@@ -1133,6 +1147,22 @@ The actions, cheapest-first (every one below is built):
    rows have an `age(xmin)` wrapped negative. The `fence_xid32` plant (fences
    compared as 32-bit ids) needs that crossing, so no planted-bug sweep tier
    runs it; `db_admin.rs`'s wrap pin and `staging`'s sealing pin catch it.
+   `DbAdminPlan::counters_near` starts the engine's `bigint` counters (ring
+   change ids and segment numbers, definition, build and catalog ids) just
+   under `2^31` or a million short of `2^63` before the install, so the
+   program crosses 32 bits or runs on 19-digit ids. It is plain SQL as the
+   operator (`ManualBackend::advance_counters`): the counters are Postgres
+   sequences and columns, so there is no engine hook. The renumbered ring
+   (one active segment, none below it) is the state retiring every segment
+   leaves. `ring_slot_mirror` is a four-value `smallint` and has no headroom.
+   `DbAdminAction::StepClock` steps the server's wall clock (ten minutes or
+   three hours forward, five minutes back; steps add up) with libfaketime
+   preloaded into Postgres. `now()` and every stored timestamp move, so
+   heartbeats, claims and gauges compared against `now()` see the jump,
+   and no definition may pause for it. The engine reads no wall clock of its
+   own, and tokio's monotonic clock does not move. A steppable engine clock
+   is a later step. See [Wall-clock steps](#wall-clock-steps-libfaketime) for
+   the prerequisite.
    Backup/restore is a cold file-level copy (`model::RestorePlan`, driven by
    `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
    back up right after op *k* with its change in flight, run to the end,
@@ -1143,6 +1173,32 @@ The actions, cheapest-first (every one below is built):
    upgrade battery's `basebackup` scenario restores one taken while writers ran).
 6. **Out-of-band tampering** (bucket 1, detection) — direct writes to derived
    tables, found by `self_check` (`tests/self_check_cross_check.rs`).
+7. **Source DDL** (bucket 3) — schema and maintenance changes to a tracked
+   source with changes in flight: `model::SourceDdl`, driven by
+   `run::run_convergence_with_source_ddl`, swept by `tests/source_ddl.rs`.
+   The engine runs with a reconcile interval longer than a case and the run
+   steps the passes, so each event lands inside one interval or across a
+   pass as drawn. The oracle doesn't model the pause policy: after each op,
+   `run::judge` holds every definition to **never silently wrong**. It is
+   exact; or paused with a reason, and exact after its `RESUME` (or the
+   `RESUME` refuses with a code); or wrong only as an entry of
+   [known correctness gaps](known-correctness-gaps.md) the drawn shape names
+   (`gaps::Gap`, by the entry's stable anchor), which `self_check` reports
+   and the entry's repair fixes. Anything else fails, so the register is a
+   checked allowlist: a missing entry fails, and so does one whose detection
+   or repair doesn't hold.
+
+8. **Privilege and ownership changes** (bucket 3) — `REVOKE`/`GRANT` of
+   Trellis's `SELECT` or its schema's `USAGE`, the owner role revoked from
+   Trellis, an owner Trellis does or doesn't inherit, row-level security on a source with and without a policy
+   for its role, the application role changed, and the drain's writes to a
+   target refused, directly or by the application's trigger on it: `SourceDdl::privilege`, drawn by
+   `generate::source_ddl::privilege_plan_for`, swept by `tests/privileges.rs`,
+   on the source-DDL runner and judge. A change the application's writes
+   can't make as the owner moves them to `app_writer`, a login holding
+   grants on the sources and nothing Trellis inherits. Every run fails on an
+   application statement that fails inside a capture function
+   (`RunError::CaptureFailedWriter`, ADR-0002 I6).
 
 Two structural notes for when faults enter the stream:
 
@@ -1235,6 +1291,27 @@ judges a run:
   armed, named in its doc comment.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
+
+### Wall-clock steps (libfaketime)
+
+The clock-step tests (`generative/tests/db_admin.rs`, `*clock*`) preload
+libfaketime into the test Postgres server and move its clock by rewriting an
+offset file (`FAKETIME_TIMESTAMP_FILE` with `FAKETIME_NO_CACHE`), so a step
+needs no restart. Linux only (the preload is `LD_PRELOAD`); on macOS set
+`TRELLIS_SKIP_FAKETIME=1`.
+
+- **Install.** Fedora: `sudo dnf install libfaketime`. Debian and Ubuntu:
+  `sudo apt-get install faketime` (it pulls in the library).
+- **Lookup.** `TRELLIS_LIBFAKETIME` (a path to `libfaketime.so.1`), then
+  `/usr/lib64/`, `/usr/lib/{x86_64,aarch64}-linux-gnu/faketime/` and
+  `/usr/lib/faketime/`. A `TRELLIS_LIBFAKETIME` naming a missing file fails.
+- **Missing library.** The clock tests skip, printing `!!!! SKIPPED` to
+  stderr (run with `--nocapture` to see it on a passing run).
+- **Skip on purpose.** `TRELLIS_SKIP_FAKETIME=1` skips them with the same
+  message.
+- **CI.** `TRELLIS_REQUIRE_FAKETIME=1` turns a missing library into a failure;
+  `ci.yml` and `nightly.yml` install `faketime` and set it. Setting it
+  together with `TRELLIS_SKIP_FAKETIME` fails.
 
 ## 10. Settled decisions
 

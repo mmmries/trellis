@@ -41,7 +41,7 @@ use pipeline::connect;
 /// The advisory lock the application trigger in the no-leak tests waits on.
 const HOLD_LOCK: i64 = 623_008;
 
-async fn install_spec(client: &mut Client, spec: &CaptureSpec) {
+pub(crate) async fn install_spec(client: &mut Client, spec: &CaptureSpec) {
     match install::install(client, DEFAULT_SCHEMA, spec, None)
         .await
         .expect("install")
@@ -64,7 +64,7 @@ async fn always_reread(client: &Client, table: &str) {
         .expect("disable the begin trigger");
 }
 
-fn spec(table: &str, columns: &[&str]) -> CaptureSpec {
+pub(crate) fn spec(table: &str, columns: &[&str]) -> CaptureSpec {
     CaptureSpec::new(
         table,
         vec!["id".to_string()],
@@ -103,7 +103,7 @@ async fn ring(client: &Client, table: &str) -> Vec<Ring> {
 }
 
 /// The ring rows `txid` staged for `table`, without the txid.
-async fn staged_by(
+pub(crate) async fn staged_by(
     client: &Client,
     table: &str,
     txid: &str,
@@ -117,7 +117,7 @@ async fn staged_by(
 }
 
 /// `(key, op, old_image, new_image)` with owned strings, for comparisons.
-fn row(
+pub(crate) fn row(
     key: &str,
     op: &str,
     old: Option<&str>,
@@ -131,7 +131,7 @@ fn row(
     )
 }
 
-async fn txid(client: &Client) -> String {
+pub(crate) async fn txid(client: &Client) -> String {
     client
         .query_one("select pg_current_xact_id()::text", &[])
         .await
@@ -443,16 +443,15 @@ async fn a_version_another_session_removed_after_the_snapshot_is_never_imaged() 
     }
 }
 
-/// The re-read's `age(t.xmin) <= 0` filter after the source has aged: key
-/// 1's version was frozen more than `2^31` transaction ids ago. A frozen row
-/// keeps its raw `xmin`, so its `age` has wrapped negative and the filter
-/// reads it as one this transaction wrote. Under `REPEATABLE READ`, another
-/// session deletes key 1 after the writer's snapshot and the writer
-/// re-creates it in a statement whose nested write (the undo trigger on key
-/// 2) makes the capture re-read: the old version is still visible, and is
-/// imaged in place of the writer's own.
+/// The re-read after the source has aged: key 1's version was frozen more
+/// than `2^31` transaction ids ago. A frozen row keeps its raw `xmin`, so its
+/// `age` has wrapped negative and passes the `age(t.xmin) <= 0` filter.
+/// Under `REPEATABLE READ`, another session deletes key 1 after the writer's
+/// snapshot and the writer re-creates it in a statement whose nested write
+/// (the undo trigger on key 2) makes the capture re-read: the old version is
+/// still visible, and the probe takes the writer's own, the nearer one.
+/// `capture_reread_aged.rs` sweeps the old version's `age` across the band.
 #[tokio::test]
-#[ignore = "#2205: a frozen row more than 2^31 xids old passes `age(xmin) <= 0`"]
 async fn a_version_frozen_past_half_the_xid_space_is_never_imaged() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -894,37 +893,53 @@ async fn scan_counts(client: &Client, table: &str) -> (i64, i64) {
 /// counters as a baseline before the writes, and asserts on the delta.
 #[tokio::test]
 async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let mut raw = connect(db.dsn()).await;
-    raw.batch_execute("create table public.g (id bigint primary key, a int)")
-        .await
-        .expect("create public.g");
-    raw.batch_execute("vacuum public.g")
-        .await
-        .expect("vacuum public.g");
-    install_spec(&mut raw, &spec("public.g", &["a"])).await;
-    always_reread(&raw, "public.g").await;
+    // A primary key, and a nullable unique key, whose probe is a `UNION ALL`
+    // of branches each taking its nearest version (#2205).
+    for (table, ddl, spec) in [
+        (
+            "public.g",
+            "create table public.g (id bigint primary key, a int)",
+            spec("public.g", &["a"]),
+        ),
+        (
+            "public.h",
+            "create table public.h (id bigint unique, a int)",
+            spec("public.h", &["a"]).with_nullable_key(["id".to_string()]),
+        ),
+    ] {
+        let cluster = TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut raw = connect(db.dsn()).await;
+        raw.batch_execute(ddl).await.expect("create the table");
+        raw.batch_execute(&format!("vacuum {table}"))
+            .await
+            .expect("vacuum the table");
+        install_spec(&mut raw, &spec).await;
+        always_reread(&raw, table).await;
 
-    let (seq_before, idx_before) = scan_counts(&raw, "public.g").await;
+        let (seq_before, idx_before) = scan_counts(&raw, table).await;
 
-    let writer = connect(db.dsn()).await;
-    writer
-        .batch_execute(
-            "insert into public.g values (0, 0); \
-             insert into public.g select i, i from generate_series(1, 2000) i; \
-             insert into public.g select i, i from generate_series(2001, 4000) i; \
-             select pg_stat_force_next_flush()",
-        )
-        .await
-        .expect("writes planned against an empty table");
-    writer.batch_execute("select 1").await.expect("flush stats");
+        let writer = connect(db.dsn()).await;
+        writer
+            .batch_execute(&format!(
+                "insert into {table} values (0, 0); \
+                 insert into {table} select i, i from generate_series(1, 2000) i; \
+                 insert into {table} select i, i from generate_series(2001, 4000) i; \
+                 select pg_stat_force_next_flush()"
+            ))
+            .await
+            .expect("writes planned against an empty table");
+        writer.batch_execute("select 1").await.expect("flush stats");
 
-    let (seq_after, idx_after) = scan_counts(&raw, "public.g").await;
-    let (seq, idx) = (seq_after - seq_before, idx_after - idx_before);
-    assert_eq!(seq, 0, "the re-read scanned public.g");
-    assert!(idx >= 4001, "one probe per captured row, got {idx}");
-    assert_eq!(ring(&raw, "public.g").await.len(), 4001);
+        let (seq_after, idx_after) = scan_counts(&raw, table).await;
+        let (seq, idx) = (seq_after - seq_before, idx_after - idx_before);
+        assert_eq!(seq, 0, "the re-read scanned {table}");
+        assert!(
+            idx >= 4001,
+            "{table}: one probe per captured row, got {idx}"
+        );
+        assert_eq!(ring(&raw, table).await.len(), 4001);
+    }
 }
 
 /// A re-read runs in a subtransaction only when the catalog says Postgres

@@ -142,6 +142,15 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         .collect();
     backend.set_wiring(&plan.wiring);
     backend
+        .expect(&with_defined(
+            program,
+            plan.bursts
+                .iter()
+                .flat_map(|b| &b.actions)
+                .map(|a| &a.action),
+        ))
+        .map_err(|e| RunError::Install(format!("{e:?}")))?;
+    backend
         .install(&Program {
             tables: program.tables.clone(),
             defs: installed.clone(),
@@ -595,6 +604,22 @@ async fn prepared_in_doubt(pool: &Pool) -> bool {
         )
         .await
         .is_ok_and(|row| row.is_some())
+}
+
+/// `program` with the definitions `actions` define mid-run added, for
+/// [`Backend::expect`](crate::backend::Backend::expect).
+pub(super) fn with_defined<'a>(
+    program: &Program,
+    actions: impl Iterator<Item = &'a BurstAction>,
+) -> Program {
+    let mut every = program.clone();
+    for action in actions {
+        if let BurstAction::Define { def, .. } = action {
+            every.defs.push((**def).clone());
+            every.def_install_after_op.push(0);
+        }
+    }
+    every
 }
 
 #[cfg(test)]

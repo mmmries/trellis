@@ -38,6 +38,19 @@ pub async fn run_epochs<B: ConcurrentBackend>(
     };
 
     backend
+        .expect(&super::concurrent::with_defined(
+            program,
+            chain
+                .epochs
+                .iter()
+                .flat_map(|e| &e.steps)
+                .filter_map(|step| match step {
+                    EpochStep::Act(action) => Some(action),
+                    _ => None,
+                }),
+        ))
+        .map_err(|e| in_epoch(0)(RunError::Install(format!("{e:?}"))))?;
+    backend
         .install(&Program {
             tables: program.tables.clone(),
             defs: program.defs.clone(),

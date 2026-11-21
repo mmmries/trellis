@@ -812,6 +812,41 @@ pub enum DbAdminAction {
         /// Ids left before the boundary once the action ends.
         tail: u32,
     },
+    /// Steps the Postgres server's wall clock (libfaketime;
+    /// `testkit::TestCluster::start_with_fake_clock`), at the same point as
+    /// `Checkpoint`. Steps add up. `now()`, `clock_timestamp()` and every
+    /// timestamp the server stores move; tokio's monotonic clock and the
+    /// engine's own `Instant`s do not, as a real NTP step leaves them
+    /// alone. The engine reads no wall clock of its own, so the server is the
+    /// only process that needs the shim. A heartbeat, claim or gauge
+    /// compared against `now()` sees the jump, and none may read as the
+    /// death of a live process. The run needs a cluster with a fake clock.
+    StepClock(ClockStep),
+}
+
+/// One [`DbAdminAction::StepClock`]: two steps forward and one back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockStep {
+    /// Ten minutes forward.
+    ForwardMinutes,
+    /// Three hours forward.
+    ForwardHours,
+    /// Five minutes back (an NTP correction). A claim a server stop
+    /// stranded then waits five minutes longer for its reclaim, so the
+    /// generator fires this step before a restart at the same op, never
+    /// after it.
+    BackMinutes,
+}
+
+impl ClockStep {
+    /// How far the step moves the clock, in seconds.
+    pub fn seconds(self) -> i64 {
+        match self {
+            ClockStep::ForwardMinutes => 10 * 60,
+            ClockStep::ForwardHours => 3 * 3600,
+            ClockStep::BackMinutes => -5 * 60,
+        }
+    }
 }
 
 /// One [`DbAdminAction`], anchored to `ops[op]` (so `op < ops.len()`). See
@@ -829,6 +864,37 @@ pub struct DbAdminEvent {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DbAdminPlan {
     pub events: Vec<DbAdminEvent>,
+    /// Start the engine's counters near this limit before the install
+    /// (`ManualBackend::advance_counters`), so the definitions and the whole
+    /// program run across it. Not an event: the ring's segment number can
+    /// only be moved while the ring is pristine.
+    pub counters_near: Option<CounterLimit>,
+}
+
+/// Where [`DbAdminPlan::counters_near`] starts the engine's `bigint`
+/// counters (the ring's change ids and segment numbers, the catalog's
+/// definition, build and self-check ids). They are `bigint`s, so a program
+/// crosses `2^31` without a type change; what it asks of the engine is that
+/// nothing narrows an id to 32 bits, and that nothing breaks on one of 19
+/// digits. Each leaves the correct converged state unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterLimit {
+    /// Within `headroom` of `i32::MAX`, so the program crosses it.
+    Int32 { headroom: u16 },
+    /// A million short of `i64::MAX`: every id is huge, none reaches the
+    /// limit. A counter at the limit itself would fail on the sequence's
+    /// own `maxvalue`, which no program can be asked to survive.
+    Int64,
+}
+
+impl CounterLimit {
+    /// The value the counters start at.
+    pub fn target(self) -> i64 {
+        match self {
+            CounterLimit::Int32 { headroom } => i64::from(i32::MAX) - i64::from(headroom),
+            CounterLimit::Int64 => i64::MAX - (1 << 20),
+        }
+    }
 }
 
 /// How a [`RestorePlan`] backs the source cluster up. Trellis's
@@ -1110,6 +1176,9 @@ pub struct Rewrite {
     pub timing: Timing,
     pub values: (Option<String>, Option<String>),
 }
+
+mod source_ddl;
+pub use source_ddl::{SourceDdl, SourceDdlEvent, SourceDdlPlan};
 
 #[cfg(test)]
 mod tests {

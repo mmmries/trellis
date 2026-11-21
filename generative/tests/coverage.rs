@@ -15,7 +15,9 @@ use generative::generate::{
     program_with_mid_stream_def_install, program_with_scale_out, table_streams, trivial_program,
     trivial_program_with,
 };
-use generative::model::{DbAdminAction, NoiseAction, NoiseEventKind, Op, Program, Table};
+use generative::model::{
+    CounterLimit, DbAdminAction, NoiseAction, NoiseEventKind, Op, Program, Table,
+};
 use generative::run::{ConcurrentShape, Coverage};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
@@ -1205,6 +1207,33 @@ fn db_admin_plans_draw_freezes_and_wraps_across_every_tail_band() {
     );
     assert!(wraps * 10 >= samples, "{wraps} of {samples} plans wrap");
     assert_eq!(bands, [true; 3], "tail bands drawn: {bands:?}");
+}
+
+/// The coverage floor for the `db_admin` property's counter starts: across
+/// 400 drawn plans, at least 10% start the counters near `i32::MAX` and at
+/// least 10% near `i64::MAX`.
+#[test]
+fn db_admin_plans_start_counters_near_both_limits() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|program| db_admin_plan_for(&program));
+    let samples = 400;
+    let (mut narrow, mut wide) = (0, 0);
+    for _ in 0..samples {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        match plan.counters_near {
+            Some(CounterLimit::Int32 { .. }) => narrow += 1,
+            Some(CounterLimit::Int64) => wide += 1,
+            None => {}
+        }
+    }
+    assert!(
+        narrow * 10 >= samples,
+        "{narrow} of {samples} near i32::MAX"
+    );
+    assert!(wide * 10 >= samples, "{wide} of {samples} near i64::MAX");
 }
 
 /// The coverage floor: `program_with_mid_stream_def_install`

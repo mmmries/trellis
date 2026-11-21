@@ -52,6 +52,7 @@ Issues labelled `good first contribution`.
   - The test suite, if provided, must be complete and pass
   - Increase code coverage, not versa.
   - Use the `testkit` crate, which gives each test a throwaway, migrated Postgres database (`testkit::cluster`), and borrow inspiration from existing tests in `trellis/tests`.
+  - The wall-clock tests need libfaketime, or skip loudly: see [Wall-clock steps](docs/generative-test-suite.md#wall-clock-steps-libfaketime).
   - A new integration test file goes in its family's directory, `trellis/tests/<family>/`, with a `mod` line in that family's `main.rs`; run it with `cargo test -p trellis --test <family> <module>::` ([testing strategy](docs/testing-strategy.md#4-integration-tests)).
 - [x] Dependencies
   - Minimize number of dependencies.

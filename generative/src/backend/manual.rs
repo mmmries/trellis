@@ -52,7 +52,8 @@ use super::roles::{Roles, connect_app};
 use super::sql::{self, quote_ident};
 use super::{DefinitionState, Snapshot};
 use crate::model::{
-    BurstAction, Column, FieldEdit, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
+    BurstAction, Column, CounterLimit, FieldEdit, NoiseAction, NoiseEvent, NoiseEventKind, Op,
+    Program, Table,
 };
 
 /// How long [`ManualBackend::quiesce`] waits without the ring making any
@@ -318,6 +319,12 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// A drain page failed `ring_wait::MAX_DRAIN_ATTEMPTS` times in a
+    /// row with no commit and is still failing (#2185 6c): the engine
+    /// retries without bound. `holdups` names each such page.
+    RetriesUnbounded {
+        holdups: String,
+    },
     /// A `DROP TRANSFORM` returned and left its target table behind, which
     /// it drops (`docs/transforms.md`).
     DroppedTargetRemains {
@@ -386,6 +393,9 @@ impl From<sql::QuiesceError> for ManualBackendError {
             }
             sql::QuiesceError::PartitionsUnsettled { unsettled, waited } => {
                 ManualBackendError::PartitionSettleTimeout { unsettled, waited }
+            }
+            sql::QuiesceError::RetriesUnbounded { holdups } => {
+                ManualBackendError::RetriesUnbounded { holdups }
             }
         }
     }
@@ -568,8 +578,17 @@ pub struct ManualBackend {
     /// would collide for reasons that have nothing to do with instance
     /// isolation.
     target_schema: String,
+    /// Whether the first [`Backend::install`] draws [`Self::target_schema`]
+    /// between `public` and [`super::TARGETS_SCHEMA`]: a backend connected
+    /// as a provisioned case's roles to the default target schema.
+    draw_target_schema: bool,
     /// Where [`Backend::install`] puts a program's source tables.
     source_tables: SourceTables,
+    /// The schema of the application's own sources ([`SourceTables::Own`]
+    /// only), when it isn't left to the application session's `search_path`:
+    /// definitions and snapshot reads name it, so two instances can keep
+    /// same-named sources apart.
+    source_schema: Option<String>,
     /// The resolved [`Config`] this backend's [`Pool`] and every
     /// [`EngineClient`] it starts are built from — carrying
     /// the instance schema and [`Self::target_schema`]. Kept whole
@@ -631,9 +650,82 @@ impl ManualBackend {
             maintenance_interval,
         )
         .await?;
-        backend.app = connect_app(roles).await?;
+        backend.app = connect_app(roles, None).await?;
+        backend.roles = roles.clone();
+        backend.draw_target_schema = roles.separate_app() && backend.target_schema == "public";
+        Ok(backend)
+    }
+
+    /// [`ManualBackend::connect_as`] for one of several instances sharing a
+    /// database: Trellis in instance schema `schema` with targets in
+    /// `target_schema`. With a `source_schema`, which must exist and be the
+    /// application role's, the application's sources go there: its session
+    /// has its `search_path` at it, and definitions and reads name it.
+    /// Without one they go in `public`.
+    pub async fn connect_as_instance(
+        roles: &Roles,
+        schema: &str,
+        target_schema: &str,
+        source_schema: Option<&str>,
+    ) -> Result<Self, ManualBackendError> {
+        let mut backend =
+            Self::connect_with_instance(roles.trellis.clone(), schema, target_schema, 1, None)
+                .await?;
+        backend.source_schema = source_schema.map(str::to_string);
+        backend.app = connect_app(roles, source_schema).await?;
         backend.roles = roles.clone();
         Ok(backend)
+    }
+
+    /// Moves the application's session to a login of `dsn`
+    /// ([`super::Roles::writer`], say), or back to [`super::Roles::app`]
+    /// for `None`: the application role changed mid-stream. A backend
+    /// without a separate application role refuses.
+    pub async fn write_as(&mut self, dsn: Option<&str>) -> Result<(), ManualBackendError> {
+        assert!(
+            self.roles.separate_app(),
+            "write_as needs a backend connected with separate roles"
+        );
+        let dsn = dsn.unwrap_or(&self.roles.app).to_string();
+        self.app = Some(super::roles::connect_app_as(&dsn, self.source_schema.as_deref()).await?);
+        Ok(())
+    }
+
+    /// Who runs what.
+    pub fn roles(&self) -> &Roles {
+        &self.roles
+    }
+
+    /// The schema this backend's targets are created in.
+    pub fn target_schema(&self) -> &str {
+        &self.target_schema
+    }
+
+    /// The first install's draw (`docs/recommendations.md`, "One Trellis
+    /// role"): targets in [`super::TARGETS_SCHEMA`], which Trellis owns,
+    /// for half the programs, by the program's digest so a seed replays
+    /// it. A program with a definition reading another's target keeps
+    /// `public`: its bare source names resolve there. The first of
+    /// [`Backend::expect`] and [`Backend::install`] draws, so a runner
+    /// installing in parts draws from every definition.
+    fn draw_target_schema(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        if !std::mem::take(&mut self.draw_target_schema) {
+            return Ok(());
+        }
+        let chained = program
+            .defs
+            .iter()
+            .any(|d| !program.tables.iter().any(|t| t.name == d.source));
+        if chained || crate::generate::where_clause::digest(program) & 1 == 0 {
+            return Ok(());
+        }
+        self.target_schema = super::TARGETS_SCHEMA.to_string();
+        self.config = self
+            .config
+            .clone()
+            .with_target_schema(self.target_schema.clone())?;
+        self.pool = Pool::new(&self.config)?;
+        Ok(())
     }
 
     /// Like [`ManualBackend::connect`], but starts the underlying
@@ -754,7 +846,9 @@ impl ManualBackend {
             strict_audit: false,
             strict_audits_converged: 0,
             target_schema,
+            draw_target_schema: false,
             source_tables: SourceTables::Own,
+            source_schema: None,
             config,
             operator: None,
             held_keys: sql::HeldKeys::Block,
@@ -1143,10 +1237,7 @@ impl ManualBackend {
     /// function's doc comment for the exact DDL shape (`crate::model::PRIMARY_KEY_VALUE_TYPE`
     /// pk, per-column `UNIQUE`).
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
-        let schema = match self.source_tables {
-            SourceTables::Own => None,
-            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
-        };
+        let schema = self.source_qualifier();
         Ok(sql::create_source_table(self.app_session(), schema, table).await?)
     }
 
@@ -1234,16 +1325,26 @@ impl ManualBackend {
 
         // The engine refuses a GROUP BY or JOIN definition whose
         // source lacks the index its self_check walk pages by.
-        let schema = match self.source_tables {
-            SourceTables::Own => None,
-            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
-        };
+        let schema = self.source_qualifier();
         // A table's owner indexes it: the application its sources, Trellis
-        // the upstream targets a chained definition reads.
+        // the upstream targets a chained definition reads, which are in the
+        // target schema.
         let source = |table: &str| self.tables.contains_key(table);
         sql::create_source_indexes_where(self.app_session(), schema, def, source).await?;
-        sql::create_source_indexes_where(&self.raw, schema, def, |table| !source(table)).await?;
+        sql::create_source_indexes_where(&self.raw, Some(&self.target_schema), def, |table| {
+            !source(table)
+        })
+        .await?;
 
+        let qualified;
+        let def = match &self.source_schema {
+            Some(schema) if self.source_tables == SourceTables::Own => {
+                qualified =
+                    sql::with_source_schema(def, schema, |table| self.tables.contains_key(table));
+                &qualified
+            }
+            _ => def,
+        };
         let text = sql::render_definition(def);
 
         // `install_definition` is the same front door real
@@ -1290,6 +1391,13 @@ impl ManualBackend {
         Ok(self.app_session().execute(sql, &[]).await?)
     }
 
+    /// Runs one statement as Trellis ([`super::Roles::trellis`]), on its
+    /// instance's session: a read of the instance schema's own tables, which
+    /// the application cannot see.
+    pub async fn execute_trellis(&self, sql: &str) -> Result<u64, ManualBackendError> {
+        Ok(self.raw.execute(sql, &[]).await?)
+    }
+
     /// Runs one statement as the operator ([`super::Roles::admin`]), on a
     /// session of its own: `CHECKPOINT`, which neither the application nor
     /// Trellis may run.
@@ -1305,10 +1413,131 @@ impl ManualBackend {
         Ok(result?)
     }
 
+    /// Starts the engine's `bigint` counters near `limit`, as the operator:
+    /// every `bigint` sequence of the instance schema (the ring's
+    /// `staging_change_id_seq` and the catalog's identity ids: definitions,
+    /// builds, self-check runs, partition corrections) is set up to the
+    /// target, and the ring's segment number (`segment_pointer.active_seq`,
+    /// which every ordering argument is expressed in) moves there too. The
+    /// next ids the engine draws, and the next segments it seals, are then
+    /// past `2^31` or within a million of `2^63`.
+    ///
+    /// Nothing here touches the engine: the counters are plain Postgres
+    /// sequences and columns, so there is no hook to compile out of a release
+    /// build. `ring_slot_mirror` is a `smallint` over its own four values and
+    /// has no headroom to spend.
+    ///
+    /// A sequence only ever moves up, so ids already drawn stay unique. The
+    /// segment number moves only while the ring is pristine (its one segment
+    /// the active one, nothing parked against it): a sealed or draining
+    /// segment's `seal_step2` is written by the *next* seal, and renumbering
+    /// the active segment would strand it. Call it before the install, so the
+    /// definitions and their builds draw past the start too, and no engine
+    /// races the renumbering. Fails if the ring isn't pristine.
+    ///
+    /// The result is a state the engine reaches on its own: one active
+    /// segment numbered above every earlier one, with none left below it, is
+    /// what retiring every drained segment leaves, and what a restore's
+    /// response (`capture::restore::respond`) writes.
+    ///
+    /// Returns the segment number the ring is at afterwards.
+    pub async fn advance_counters(&self, limit: CounterLimit) -> Result<i64, ManualBackendError> {
+        let target = limit.target();
+        let q = quote_ident(self.config.schema());
+        let lit = self.config.schema().replace('\'', "''");
+        let body = format!(
+            "do $do$ \
+             declare r record; old bigint; \
+             begin \
+               for r in select c.oid::regclass as seq from pg_class c \
+                          join pg_sequence q on q.seqrelid = c.oid \
+                         where c.relnamespace = '{lit}'::regnamespace \
+                           and q.seqtypid = 'int8'::regtype \
+               loop \
+                 if coalesce(pg_sequence_last_value(r.seq), 0) < {target} then \
+                   perform setval(r.seq, {target}); \
+                 end if; \
+               end loop; \
+               lock table {q}.segment_pointer in access exclusive mode; \
+               select active_seq into old from {q}.segment_pointer; \
+               if old < {target} then \
+                 if (select count(*) from {q}.segments) <> 1 \
+                    or exists (select 1 from {q}.segments where state <> 'active') \
+                    or exists (select 1 from {q}.poison_held) \
+                    or exists (select 1 from {q}.join1_fan_out) then \
+                   raise exception 'the ring is not pristine: its segments have moved on'; \
+                 end if; \
+                 insert into {q}.segments (seg_seq, ring_slot, state, created_at, bucket_count) \
+                   select {target}, ring_slot, state, created_at, bucket_count \
+                     from {q}.segments where seg_seq = old; \
+                 update {q}.segment_pointer set active_seq = {target}; \
+                 delete from {q}.segments where seg_seq = old; \
+               end if; \
+             end $do$"
+        );
+        let (admin, connection) = tokio_postgres::connect(&self.roles.admin, NoTls).await?;
+        let connection = tokio::spawn(connection);
+        let result = async {
+            admin.batch_execute(&body).await?;
+            admin
+                .query_one(&format!("select active_seq from {q}.segment_pointer"), &[])
+                .await
+                .map(|row| row.get::<_, i64>(0))
+        }
+        .await;
+        drop(admin);
+        let _ = connection.await;
+        Ok(result?)
+    }
+
+    /// The highest value any `bigint` sequence of the instance schema has
+    /// drawn, or the ring's active segment number, whichever is greater: how
+    /// far [`Self::advance_counters`]'s counters have got.
+    pub async fn counter_high_water(&self) -> Result<i64, ManualBackendError> {
+        let q = quote_ident(self.config.schema());
+        let lit = self.config.schema().replace('\'', "''");
+        let sql = format!(
+            "select greatest( \
+               (select max(coalesce(pg_sequence_last_value(c.oid::regclass), 0)) \
+                  from pg_class c join pg_sequence s on s.seqrelid = c.oid \
+                 where c.relnamespace = '{lit}'::regnamespace and s.seqtypid = 'int8'::regtype), \
+               (select active_seq from {q}.segment_pointer))"
+        );
+        let (admin, connection) = tokio_postgres::connect(&self.roles.admin, NoTls).await?;
+        let connection = tokio::spawn(connection);
+        let result = admin.query_one(&sql, &[]).await.map(|r| r.get::<_, i64>(0));
+        drop(admin);
+        let _ = connection.await;
+        Ok(result?)
+    }
+
+    /// The ids of the instance's definitions, in order: whether
+    /// [`Self::advance_counters`] started them past a limit.
+    pub async fn definition_ids(&self) -> Result<Vec<i64>, ManualBackendError> {
+        let q = quote_ident(self.config.schema());
+        let rows = self
+            .raw
+            .query(
+                &format!("select id from {q}.transform_definitions order by id"),
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
     /// The connection string every Trellis connection of this backend logs
     /// in with ([`super::Roles::trellis`]); an oracle's pool uses it too.
     pub fn trellis_dsn(&self) -> &str {
         self.config.dsn()
+    }
+
+    /// The schema the application's source tables are in, when that is not
+    /// left to a session's `search_path`.
+    fn source_qualifier(&self) -> Option<&str> {
+        match self.source_tables {
+            SourceTables::Own => self.source_schema.as_deref(),
+            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
+        }
     }
 
     /// The session application statements run on: the application's own, or
@@ -1452,7 +1681,7 @@ impl ManualBackend {
     /// restart action tests.
     pub async fn reconnect_after_server_restart(&mut self) -> Result<(), ManualBackendError> {
         self.raw = connect_raw(&self.config).await?;
-        self.app = connect_app(&self.roles).await?;
+        self.app = connect_app(&self.roles, self.source_schema.as_deref()).await?;
         await_pool_usable(&self.pool).await
     }
 
@@ -1513,7 +1742,8 @@ impl ManualBackend {
             Some(self.maintenance_interval),
         )
         .await?;
-        restored.app = connect_app(&roles).await?;
+        restored.app = connect_app(&roles, self.source_schema.as_deref()).await?;
+        restored.source_schema = self.source_schema.clone();
         restored.roles = roles;
         restored.client_options = self.client_options.clone();
         restored.tables = self.tables.clone();
@@ -1564,7 +1794,17 @@ impl ManualBackend {
 impl super::Backend for ManualBackend {
     type Error = ManualBackendError;
 
+    fn expect(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        if self.engine_client.is_none() && self.defs.is_empty() {
+            self.draw_target_schema(program)?;
+        }
+        Ok(())
+    }
+
     async fn install(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        if self.engine_client.is_none() && self.defs.is_empty() {
+            self.draw_target_schema(program)?;
+        }
         for table in &program.tables {
             if self.source_tables != SourceTables::SharedExisting {
                 self.create_source_table(table).await?;
@@ -1669,13 +1909,11 @@ impl super::Backend for ManualBackend {
         let mut snapshot: Snapshot = BTreeMap::new();
 
         for table in self.tables.values() {
-            let rows = sql::read_table(
-                &self.raw,
-                &quote_ident(&table.name),
-                &table.pk_col,
-                &table.columns,
-            )
-            .await?;
+            let relation = match self.source_qualifier() {
+                Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
+                None => quote_ident(&table.name),
+            };
+            let rows = sql::read_table(&self.raw, &relation, &table.pk_col, &table.columns).await?;
             snapshot.insert(table.name.clone(), rows);
         }
 
@@ -1917,7 +2155,7 @@ impl super::ConcurrentBackend for ManualBackend {
     }
 
     async fn applier(&self) -> Result<ManualApplier, ManualBackendError> {
-        let raw = match connect_app(&self.roles).await? {
+        let raw = match connect_app(&self.roles, self.source_schema.as_deref()).await? {
             Some(app) => app,
             None => connect_raw(&self.config).await?,
         };

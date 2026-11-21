@@ -241,3 +241,202 @@ fn every_epoch_step_runs_on_one_instance() {
     }
     run_case(&case).unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// Residue (#2187, sub-step 8b): the chain runs as the case's roles, with
+/// the ring lapped and each Trellis table vacuumed and measured after every
+/// epoch ([`generative::run::run_epochs_lapping`]).
+mod residue {
+    use super::*;
+    use generative::backend::CaseDatabase;
+    use generative::run::{LAP_SEAL_INTERVAL, ResidueReport, check_residue, run_epochs_lapping};
+
+    /// Runs `case`'s chain, lapping the ring, against a provisioned database.
+    pub(super) fn run_lapping_case(case: &EpochCase) -> Result<ResidueReport, TestCaseError> {
+        let chain = chain(case);
+        HARNESS.with(|h| {
+            h.cases.set(h.cases.get() + 1);
+            h.runtime.block_on(async {
+                let db = CaseDatabase::provision(&h.cluster).await;
+                let mut backend = ManualBackend::connect_as_with_options(
+                    db.roles(),
+                    WORKERS,
+                    Some(LAP_SEAL_INTERVAL),
+                )
+                .await
+                .expect("connect backend");
+                backend.set_strict_audit(true);
+                backend.set_reconcile_interval(RECONCILE_INTERVAL);
+                let config = Config::from_dsn(db.dsn().to_string()).expect("config");
+                let pool = Pool::new(&config).expect("pool");
+                match run_epochs_lapping(&mut backend, &pool, &config, db.roles(), &chain).await {
+                    Ok((outcome, report)) if outcome.as_pass() => Ok(report),
+                    Ok((outcome, _)) => {
+                        Err(TestCaseError::fail(format!("run did not pass: {outcome}")))
+                    }
+                    Err(RunError::Epoch { epoch, error }) => Err(TestCaseError::fail(format!(
+                        "epoch {epoch} of {} failed: {error:?}\nsteps: {:?}",
+                        chain.epochs.len(),
+                        chain.epochs[epoch].steps
+                    ))),
+                    Err(other) => Err(TestCaseError::fail(format!("run error: {other:?}"))),
+                }
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(proptest_config())]
+
+        /// A chain on one instance laps the ring, and leaves no dead tuples
+        /// and no growth its peak live rows don't explain, in any Trellis
+        /// table after a `VACUUM`.
+        #[test]
+        #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+        fn property_epoch_chains_leave_no_residue(case in epoch_case()) {
+            run_lapping_case(&case)?;
+        }
+    }
+
+    /// Updates of one row through many epochs: the ring goes round more than
+    /// ten times, and the tables stay inside the residue bounds throughout.
+    #[test]
+    fn a_chain_laps_the_ring_within_the_residue_bounds() {
+        use generative::generate::epoch::{EpochChangeDraw, EpochChangeKind, EpochDraw};
+        use generative::generate::{AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec};
+
+        let updates = |from: i64| {
+            (0..12)
+                .map(|i| Mutate::Update {
+                    pk: 1,
+                    c1: Some(from + i),
+                    c2: Some(i),
+                })
+                .collect::<Vec<_>>()
+        };
+        let case = EpochCase {
+            tables: vec![TableSpec::numeric_only(
+                vec![(Some(1), Some(2)), (Some(3), None), (None, Some(5))],
+                Vec::new(),
+            )],
+            defs: vec![
+                (0, DefShape::OneToOne, None),
+                (
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![AggregateFn::Sum(AggregateColumn::C1)],
+                    },
+                    None,
+                ),
+            ],
+            epochs: (0..6)
+                .map(|e| EpochDraw {
+                    changes: if e % 3 == 2 {
+                        vec![EpochChangeDraw {
+                            kind: EpochChangeKind::Redefine,
+                            target: e,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    mutates: vec![updates(100 * e as i64)],
+                })
+                .collect(),
+        };
+        let report = run_lapping_case(&case).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            report.laps() >= 10,
+            "only {} laps: {report:?}",
+            report.laps()
+        );
+        assert!(!report.last.is_empty(), "no table was checked: {report:?}");
+        assert!(
+            report.last.iter().any(|t| t.table.ends_with("__ledger\"")),
+            "no 1-1 ledger was checked: {report:?}"
+        );
+    }
+
+    /// Opens a session as the operator, on `db`.
+    async fn operator(db: &CaseDatabase) -> tokio_postgres::Client {
+        let (client, connection) =
+            tokio_postgres::connect(&db.roles().admin, tokio_postgres::NoTls)
+                .await
+                .expect("connect as the operator");
+        tokio::spawn(connection);
+        client
+    }
+
+    /// Plant: a transaction holding the vacuum horizon back leaves dead
+    /// tuples `VACUUM` cannot reclaim. [`check_residue`] must name them, not
+    /// the oracle.
+    #[test]
+    fn plant_dead_tuples_are_caught() {
+        HARNESS.with(|h| {
+            h.runtime.block_on(async {
+                let db = CaseDatabase::provision(&h.cluster).await;
+                let config = Config::from_dsn(db.dsn().to_string()).expect("config");
+                let mut widths = Default::default();
+                let peaks = Default::default();
+                check_residue(&config, db.roles(), &[], &[], &peaks, &mut widths)
+                    .await
+                    .expect("a fresh instance has no residue");
+
+                let holder = operator(&db).await;
+                holder
+                    .batch_execute(
+                        "begin isolation level repeatable read; \
+                         select count(*) from trellis.catalog_floor",
+                    )
+                    .await
+                    .expect("hold a snapshot");
+                let writer = operator(&db).await;
+                for _ in 0..3 {
+                    writer
+                        .batch_execute("update trellis.catalog_floor set version = version")
+                        .await
+                        .expect("update");
+                }
+                let failed =
+                    check_residue(&config, db.roles(), &[], &[], &peaks, &mut widths).await;
+                match failed {
+                    Err(RunError::Residue { failures }) => assert!(
+                        failures
+                            .iter()
+                            .any(|f| f.contains("catalog_floor") && f.contains("n_dead_tup")),
+                        "{failures:?}"
+                    ),
+                    other => panic!("dead tuples went unseen: {other:?}"),
+                }
+            })
+        });
+    }
+
+    /// Plant: a table that grew far past its peak and kept its high-water
+    /// mark is over the pages backstop.
+    #[test]
+    fn plant_growth_past_the_peak_is_caught() {
+        HARNESS.with(|h| {
+            h.runtime.block_on(async {
+                let db = CaseDatabase::provision(&h.cluster).await;
+                let config = Config::from_dsn(db.dsn().to_string()).expect("config");
+                let operator = operator(&db).await;
+                operator
+                    .batch_execute(
+                        "create table trellis.plant (id int primary key, pad text); \
+                         insert into trellis.plant select i, repeat('x', 200) from generate_series(1, 20000) i; \
+                         delete from trellis.plant where id < 19990",
+                    )
+                    .await
+                    .expect("grow and empty a table");
+                let mut widths = Default::default();
+                let peaks = std::collections::BTreeMap::from([("t0".to_string(), 10)]);
+                match check_residue(&config, db.roles(), &[], &[], &peaks, &mut widths).await {
+                    Err(RunError::Residue { failures }) => assert!(
+                        failures.iter().any(|f| f.contains("plant") && f.contains("pages")),
+                        "{failures:?}"
+                    ),
+                    other => panic!("growth went unseen: {other:?}"),
+                }
+            })
+        });
+    }
+}
