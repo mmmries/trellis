@@ -669,7 +669,9 @@ impl ManualBackend {
     /// role"): targets in [`super::TARGETS_SCHEMA`], which Trellis owns,
     /// for half the programs, by the program's digest so a seed replays
     /// it. A program with a definition reading another's target keeps
-    /// `public`: its bare source names resolve there.
+    /// `public`: its bare source names resolve there. The first of
+    /// [`Backend::expect`] and [`Backend::install`] draws, so a runner
+    /// installing in parts draws from every definition.
     fn draw_target_schema(&mut self, program: &Program) -> Result<(), ManualBackendError> {
         if !std::mem::take(&mut self.draw_target_schema) {
             return Ok(());
@@ -1618,6 +1620,13 @@ impl ManualBackend {
 
 impl super::Backend for ManualBackend {
     type Error = ManualBackendError;
+
+    fn expect(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        if self.engine_client.is_none() && self.defs.is_empty() {
+            self.draw_target_schema(program)?;
+        }
+        Ok(())
+    }
 
     async fn install(&mut self, program: &Program) -> Result<(), ManualBackendError> {
         if self.engine_client.is_none() && self.defs.is_empty() {

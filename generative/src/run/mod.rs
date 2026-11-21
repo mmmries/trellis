@@ -434,6 +434,9 @@ pub async fn run_convergence<B: Backend>(
             .collect()
     };
 
+    backend
+        .expect(program)
+        .map_err(|e| RunError::Install(format!("{e:?}")))?;
     let start = timing_enabled.then(std::time::Instant::now);
     let initial_defs = due_defs(0);
     let install_result = backend

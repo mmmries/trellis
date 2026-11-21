@@ -104,6 +104,15 @@ pub trait Backend {
         program: &Program,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Before the first [`Backend::install`], every definition the run may
+    /// install: `program.defs`, deferred ones and those a plan defines
+    /// mid-run included. A runner that installs a program in parts calls
+    /// it, so a backend that draws its setup from the program
+    /// (`ManualBackend`'s target schema) draws from all of it.
+    fn expect(&mut self, _program: &Program) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Applies one op as raw source DML. On success, returns the number of
     /// rows the statement affected — `0` for an update/delete that named a
     /// primary key no row has (a source no-op, not an error); an `Err`
