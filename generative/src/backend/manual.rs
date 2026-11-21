@@ -570,6 +570,11 @@ pub struct ManualBackend {
     target_schema: String,
     /// Where [`Backend::install`] puts a program's source tables.
     source_tables: SourceTables,
+    /// The schema of the application's own sources ([`SourceTables::Own`]
+    /// only), when it isn't left to the application session's `search_path`:
+    /// definitions and snapshot reads name it, so two instances can keep
+    /// same-named sources apart.
+    source_schema: Option<String>,
     /// The resolved [`Config`] this backend's [`Pool`] and every
     /// [`EngineClient`] it starts are built from — carrying
     /// the instance schema and [`Self::target_schema`]. Kept whole
@@ -631,7 +636,28 @@ impl ManualBackend {
             maintenance_interval,
         )
         .await?;
-        backend.app = connect_app(roles).await?;
+        backend.app = connect_app(roles, None).await?;
+        backend.roles = roles.clone();
+        Ok(backend)
+    }
+
+    /// [`ManualBackend::connect_as`] for one of several instances sharing a
+    /// database: Trellis in instance schema `schema` with targets in
+    /// `target_schema`. With a `source_schema`, which must exist and be the
+    /// application role's, the application's sources go there: its session
+    /// has its `search_path` at it, and definitions and reads name it.
+    /// Without one they go in `public`.
+    pub async fn connect_as_instance(
+        roles: &Roles,
+        schema: &str,
+        target_schema: &str,
+        source_schema: Option<&str>,
+    ) -> Result<Self, ManualBackendError> {
+        let mut backend =
+            Self::connect_with_instance(roles.trellis.clone(), schema, target_schema, 1, None)
+                .await?;
+        backend.source_schema = source_schema.map(str::to_string);
+        backend.app = connect_app(roles, source_schema).await?;
         backend.roles = roles.clone();
         Ok(backend)
     }
@@ -755,6 +781,7 @@ impl ManualBackend {
             strict_audits_converged: 0,
             target_schema,
             source_tables: SourceTables::Own,
+            source_schema: None,
             config,
             operator: None,
             held_keys: sql::HeldKeys::Block,
@@ -1143,10 +1170,7 @@ impl ManualBackend {
     /// function's doc comment for the exact DDL shape (`crate::model::PRIMARY_KEY_VALUE_TYPE`
     /// pk, per-column `UNIQUE`).
     async fn create_source_table(&self, table: &Table) -> Result<(), ManualBackendError> {
-        let schema = match self.source_tables {
-            SourceTables::Own => None,
-            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
-        };
+        let schema = self.source_qualifier();
         Ok(sql::create_source_table(self.app_session(), schema, table).await?)
     }
 
@@ -1234,16 +1258,22 @@ impl ManualBackend {
 
         // The engine refuses a GROUP BY or JOIN definition whose
         // source lacks the index its self_check walk pages by.
-        let schema = match self.source_tables {
-            SourceTables::Own => None,
-            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
-        };
+        let schema = self.source_qualifier();
         // A table's owner indexes it: the application its sources, Trellis
         // the upstream targets a chained definition reads.
         let source = |table: &str| self.tables.contains_key(table);
         sql::create_source_indexes_where(self.app_session(), schema, def, source).await?;
         sql::create_source_indexes_where(&self.raw, schema, def, |table| !source(table)).await?;
 
+        let qualified;
+        let def = match &self.source_schema {
+            Some(schema) if self.source_tables == SourceTables::Own => {
+                qualified =
+                    sql::with_source_schema(def, schema, |table| self.tables.contains_key(table));
+                &qualified
+            }
+            _ => def,
+        };
         let text = sql::render_definition(def);
 
         // `install_definition` is the same front door real
@@ -1290,6 +1320,13 @@ impl ManualBackend {
         Ok(self.app_session().execute(sql, &[]).await?)
     }
 
+    /// Runs one statement as Trellis ([`super::Roles::trellis`]), on its
+    /// instance's session: a read of the instance schema's own tables, which
+    /// the application cannot see.
+    pub async fn execute_trellis(&self, sql: &str) -> Result<u64, ManualBackendError> {
+        Ok(self.raw.execute(sql, &[]).await?)
+    }
+
     /// Runs one statement as the operator ([`super::Roles::admin`]), on a
     /// session of its own: `CHECKPOINT`, which neither the application nor
     /// Trellis may run.
@@ -1309,6 +1346,15 @@ impl ManualBackend {
     /// in with ([`super::Roles::trellis`]); an oracle's pool uses it too.
     pub fn trellis_dsn(&self) -> &str {
         self.config.dsn()
+    }
+
+    /// The schema the application's source tables are in, when that is not
+    /// left to a session's `search_path`.
+    fn source_qualifier(&self) -> Option<&str> {
+        match self.source_tables {
+            SourceTables::Own => self.source_schema.as_deref(),
+            SourceTables::SharedCreate | SourceTables::SharedExisting => Some("public"),
+        }
     }
 
     /// The session application statements run on: the application's own, or
@@ -1452,7 +1498,7 @@ impl ManualBackend {
     /// restart action tests.
     pub async fn reconnect_after_server_restart(&mut self) -> Result<(), ManualBackendError> {
         self.raw = connect_raw(&self.config).await?;
-        self.app = connect_app(&self.roles).await?;
+        self.app = connect_app(&self.roles, self.source_schema.as_deref()).await?;
         await_pool_usable(&self.pool).await
     }
 
@@ -1513,7 +1559,8 @@ impl ManualBackend {
             Some(self.maintenance_interval),
         )
         .await?;
-        restored.app = connect_app(&roles).await?;
+        restored.app = connect_app(&roles, self.source_schema.as_deref()).await?;
+        restored.source_schema = self.source_schema.clone();
         restored.roles = roles;
         restored.client_options = self.client_options.clone();
         restored.tables = self.tables.clone();
@@ -1669,13 +1716,11 @@ impl super::Backend for ManualBackend {
         let mut snapshot: Snapshot = BTreeMap::new();
 
         for table in self.tables.values() {
-            let rows = sql::read_table(
-                &self.raw,
-                &quote_ident(&table.name),
-                &table.pk_col,
-                &table.columns,
-            )
-            .await?;
+            let relation = match self.source_qualifier() {
+                Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
+                None => quote_ident(&table.name),
+            };
+            let rows = sql::read_table(&self.raw, &relation, &table.pk_col, &table.columns).await?;
             snapshot.insert(table.name.clone(), rows);
         }
 
@@ -1901,7 +1946,7 @@ impl super::ConcurrentBackend for ManualBackend {
     }
 
     async fn applier(&self) -> Result<ManualApplier, ManualBackendError> {
-        let raw = match connect_app(&self.roles).await? {
+        let raw = match connect_app(&self.roles, self.source_schema.as_deref()).await? {
             Some(app) => app,
             None => connect_raw(&self.config).await?,
         };
