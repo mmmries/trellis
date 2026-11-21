@@ -765,6 +765,18 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // never reaps the node — every drop would leave an orphaned
     // `schema_nodes` row behind. Purely an ordering fix; both deletes commit
     // together in this same transaction either way.
+    // The tables the definition read, whose nodes may go with its last
+    // reader: its source, a JOIN's first joined table and the others.
+    let read_tables: Vec<String> = txn
+        .query_one(
+            "select array_remove(array[source_table, join_table] || coalesce( \
+                 (select array_agg(j.table_name) from definition_join_tables j \
+                  where j.transform_id = d.id), '{}'), null) \
+             from transform_definitions d where d.id = $1",
+            &[&id],
+        )
+        .await?
+        .get(0);
     txn.execute("delete from transform_definitions where id = $1", &[&id])
         .await?;
     // A table's recorded key goes with its last definition: a define over it
@@ -808,6 +820,24 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         )
         .await?;
     }
+
+    // The nodes of the tables it read go too, once nothing names them: no
+    // edge, no definition, no joined table. A source with another reader, or
+    // one that is another definition's target, keeps its node.
+    txn.execute(
+        "delete from schema_nodes n \
+         where n.table_name = any($1) \
+           and not exists ( \
+               select 1 from schema_edges e \
+               where e.from_node_id = n.id or e.to_node_id = n.id) \
+           and not exists ( \
+               select 1 from transform_definitions t \
+               where n.table_name in (t.target_table, t.source_table, t.join_table)) \
+           and not exists ( \
+               select 1 from definition_join_tables j where j.table_name = n.table_name)",
+        &[&read_tables],
+    )
+    .await?;
 
     // The data goes with the definition, unconditionally (ADR-0014, "Drop
     // always removes the associated data"). The target table is Trellis-owned,

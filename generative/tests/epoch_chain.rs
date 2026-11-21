@@ -477,6 +477,7 @@ mod residue {
                 &self.pool,
                 &self.program,
                 &self.defined,
+                &self.defined,
                 settle,
             )
             .await
@@ -681,11 +682,120 @@ mod residue {
     }
 
     /// Dropping the last definition over a table leaves the table's
-    /// `schema_nodes` row behind. Fails until the drop reaps it.
+    /// `schema_nodes` row behind (#2238). A version-fence row stays (#2239).
     #[test]
-    #[ignore = "#2238, #2239: a drop leaves the source's schema_nodes row and version-fence row"]
     fn a_dropped_last_reader_leaves_no_schema_node() {
         let report = run_lapping_case(&last_reader_dropped());
         assert!(report.is_ok(), "{report:?}");
+    }
+    /// The allowances for #2239 and #2240 take their own shapes and no
+    /// nearby leak: a version-fence row for a table never defined, a
+    /// non-zero stray group, and a zero group not stamped at the active
+    /// segment are all still named.
+    #[test]
+    fn the_allowances_accept_only_their_shape() {
+        use generative::generate::epoch::{EpochChangeDraw, EpochChangeKind, EpochDraw};
+        use generative::generate::{AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec};
+
+        let case = EpochCase {
+            tables: vec![TableSpec::numeric_only(
+                vec![(Some(1), Some(2)), (Some(3), None)],
+                Vec::new(),
+            )],
+            defs: vec![(
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Sum(AggregateColumn::C1)],
+                },
+                None,
+            )],
+            epochs: vec![EpochDraw {
+                changes: vec![EpochChangeDraw {
+                    kind: EpochChangeKind::Restart,
+                    target: 0,
+                }],
+                mutates: vec![vec![Mutate::Update {
+                    pk: 1,
+                    c1: Some(8),
+                    c2: Some(2),
+                }]],
+            }],
+        };
+        HARNESS.with(|h| {
+            h.runtime.block_on(async {
+                let kept = run_keeping(h, &case).await;
+                let operator = operator(&kept.db).await;
+                kept.hidden(generative::run::SETTLE)
+                    .await
+                    .expect("clean before any plant");
+                let agg: String = operator
+                    .query_one(
+                        "select relname from pg_class where relnamespace = 'trellis'::regnamespace \
+                         and relname ~ '^agg_[0-9]+$'",
+                        &[],
+                    )
+                    .await
+                    .expect("an aggregate's table")
+                    .get(0);
+                let group: String = operator
+                    .query_one(
+                        "select attname from pg_attribute where attrelid = ('trellis.' || $1)::regclass \
+                         and attnum > 0 order by attnum limit 1",
+                        &[&agg],
+                    )
+                    .await
+                    .expect("its group column")
+                    .get(0);
+                let active: i64 = operator
+                    .query_one("select active_seq from trellis.segment_pointer", &[])
+                    .await
+                    .expect("active")
+                    .get(0);
+                let insert = |n: i32, zero: bool, stamp: i64| {
+                    format!(
+                        "insert into trellis.{agg} ({group}, __n, __stamp) \
+                         values ({n}, {}, {stamp})",
+                        if zero { 0 } else { 3 }
+                    )
+                };
+                // Allowed: #2240's shape.
+                operator
+                    .batch_execute(&insert(777, true, active))
+                    .await
+                    .expect("plant a zero group at the active segment");
+                kept.hidden(std::time::Duration::ZERO)
+                    .await
+                    .expect("a zero group at the active segment is allowed (#2240)");
+                operator
+                    .batch_execute(&format!("delete from trellis.{agg} where {group} = 777"))
+                    .await
+                    .unwrap();
+                // Not allowed: the nearby leaks.
+                for (plant, what) in [
+                    (insert(778, true, active - 1), "a zero group stamped elsewhere"),
+                    (insert(779, false, active), "a non-zero stray group"),
+                    (
+                        "insert into trellis.source_table_versions values ('public.never_defined', 1)"
+                            .to_string(),
+                        "a version row for a table never defined (#2239)",
+                    ),
+                ] {
+                    operator.batch_execute(&plant).await.expect("plant");
+                    match kept.hidden(std::time::Duration::ZERO).await {
+                        Err(RunError::Residue { .. }) => {}
+                        other => panic!("{what} went unseen: {other:?}"),
+                    }
+                    operator
+                        .batch_execute(&format!(
+                            "delete from trellis.{agg} where {group} in (778, 779); \
+                             delete from trellis.source_table_versions \
+                             where source_table = 'public.never_defined'"
+                        ))
+                        .await
+                        .unwrap();
+                }
+                kept.hidden(generative::run::SETTLE).await.expect("clean again");
+            })
+        });
     }
 }

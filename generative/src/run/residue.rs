@@ -216,6 +216,7 @@ pub async fn run_epochs_lapping(
             pool,
             program,
             &defined,
+            &ever,
             super::hidden::SETTLE,
         )
         .await

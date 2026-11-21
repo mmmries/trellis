@@ -75,6 +75,7 @@ pub async fn check_hidden(
     pool: &Pool,
     program: &Program,
     defined: &[TransformDef],
+    ever: &[TransformDef],
     settle: Duration,
 ) -> Result<HiddenReport, RunError> {
     let (admin, connection) = tokio_postgres::connect(&roles.admin, NoTls)
@@ -85,7 +86,7 @@ pub async fn check_hidden(
     let connection = tokio::spawn(connection);
     let deadline = Instant::now() + settle;
     let result = loop {
-        let outcome = check_hidden_once(&admin, config, pool, program, defined).await;
+        let outcome = check_hidden_once(&admin, config, pool, program, defined, ever).await;
         match outcome {
             Ok(report) => break Ok(report),
             Err(failures) if Instant::now() >= deadline => {
@@ -111,6 +112,7 @@ async fn check_hidden_once(
     pool: &Pool,
     program: &Program,
     defined: &[TransformDef],
+    ever: &[TransformDef],
 ) -> Result<HiddenReport, Vec<String>> {
     let mut failures: Vec<String> = Vec::new();
     let mut report = HiddenReport::default();
@@ -333,9 +335,19 @@ async fn check_hidden_once(
             }
         };
         let (name_schema, name) = hidden.split_once('.').expect("qualified");
+        // #2240: an aggregate's zero group stamped at the active segment
+        // outlives an idle ring, since the drained prefix cannot pass a
+        // segment that is never sealed. Only that shape is left out of the
+        // count: `__n = 0`, `__zero`, and the stamp the active segment's.
+        let left_out = match (&def.key_space, active) {
+            (KeySpace::Aggregate { .. }, Some(active)) => {
+                format!(" where not (__zero and __n = 0 and __stamp = {active})")
+            }
+            _ => String::new(),
+        };
         let actual = count!(
             format!("rows of {hidden}"),
-            format!("\"{name_schema}\".\"{name}\"")
+            format!("\"{name_schema}\".\"{name}\"{left_out}")
         );
         report.hidden.insert(hidden.clone(), (expected, actual));
         if actual != expected {
@@ -421,7 +433,17 @@ async fn check_hidden_once(
             .iter()
             .map(|r| r.get::<_, String>(0))
             .collect();
-        for table in seen.difference(&read_tree) {
+        // #2239: the version fence keeps a table's row after its last
+        // definition goes. Allowed for a table a definition once read,
+        // nothing else.
+        let kept: BTreeSet<String> = if what == "source_table_versions" {
+            ever.iter()
+                .map(|d| qualified(&source_schema(d), &d.source))
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        for table in unexplained(&seen, &read_tree, &kept) {
             failures.push(format!(
                 "catalog: {what} names {table}, which no current definition reads"
             ));
@@ -496,6 +518,17 @@ async fn check_hidden_once(
     }
 }
 
+/// The names in `seen` that neither `read` nor `allowed` explains.
+fn unexplained<'a>(
+    seen: &'a BTreeSet<String>,
+    read: &BTreeSet<String>,
+    allowed: &BTreeSet<String>,
+) -> Vec<&'a String> {
+    seen.iter()
+        .filter(|t| !read.contains(*t) && !allowed.contains(*t))
+        .collect()
+}
+
 /// Pushes a failure for each name `expected` and `seen` don't share.
 fn diff_sets(
     what: &str,
@@ -508,5 +541,24 @@ fn diff_sets(
     }
     for missing in expected.difference(seen) {
         failures.push(format!("{what} has no row for {missing}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// #2239's allowance covers a table once read, and no other.
+    #[test]
+    fn a_version_row_is_allowed_for_a_table_once_read_only() {
+        let seen = set(&["public.t0", "public.gone", "public.never"]);
+        let read = set(&["public.t0"]);
+        let ever = set(&["public.t0", "public.gone"]);
+        assert_eq!(unexplained(&seen, &read, &ever), vec!["public.never"]);
+        assert!(unexplained(&seen, &read, &set(&["public.never"])).len() == 2);
     }
 }
