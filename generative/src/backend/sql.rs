@@ -111,7 +111,10 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                     JoinKind::Inner => "INNER JOIN",
                     JoinKind::Left => "LEFT JOIN",
                 },
-                join.joins[0].right,
+                table_ref(
+                    join.joins[0].explicit_right_schema.as_deref(),
+                    &join.joins[0].right
+                ),
                 render_key(join.joins[0].right_key.as_deref()),
                 join.joins[0]
                     .on
@@ -139,7 +142,7 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                             JoinKind::Inner => "INNER JOIN",
                             JoinKind::Left => "LEFT JOIN",
                         },
-                        joined.right,
+                        table_ref(joined.explicit_right_schema.as_deref(), &joined.right),
                         render_key(joined.right_key.as_deref()),
                         joined
                             .on
@@ -176,9 +179,39 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
     format!(
         "TRANSFORM {} FROM {}{key}{key_space_clause}{opt_out} SELECT {}{filter}",
         def.target,
-        def.source,
+        table_ref(def.explicit_source_schema.as_deref(), &def.source),
         fields.join(", ")
     )
+}
+
+/// `<schema>.<table>` or the bare name, as a definition's text writes a table.
+fn table_ref(schema: Option<&str>, table: &str) -> String {
+    match schema {
+        Some(schema) => format!("{schema}.{table}"),
+        None => table.to_string(),
+    }
+}
+
+/// `def` with its source and each joined table that `is_source` accepts
+/// written `<schema>.<table>`, for sources outside every session's
+/// `search_path`.
+pub(super) fn with_source_schema(
+    def: &TransformDef,
+    schema: &str,
+    is_source: impl Fn(&str) -> bool,
+) -> TransformDef {
+    let mut def = def.clone();
+    if def.explicit_source_schema.is_none() && is_source(&def.source) {
+        def.explicit_source_schema = Some(schema.to_string());
+    }
+    if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &mut def.key_space {
+        for joined in &mut join.joins {
+            if joined.explicit_right_schema.is_none() && is_source(&joined.right) {
+                joined.explicit_right_schema = Some(schema.to_string());
+            }
+        }
+    }
+    def
 }
 
 /// ` KEY (<columns>)` for a table read through an explicit key (ADR-0026),

@@ -405,7 +405,7 @@ impl SubprocessBackend {
             maintenance_interval,
         )
         .await?;
-        backend.app = connect_app(roles).await?;
+        backend.app = connect_app(roles, None).await?;
         Ok(backend)
     }
 

@@ -86,30 +86,34 @@ impl Roles {
 }
 
 /// Opens the application's session when `roles` gives it a role of its own
-/// (`super::roles`), with `search_path` at `public`, where its source
-/// tables go. `None` means application statements share the raw session.
+/// (`super::roles`), with `search_path` at `source_schema` (`public` when
+/// `None`), where its source tables go. `None` means application statements
+/// share the raw session.
 pub(super) async fn connect_app(
     roles: &Roles,
+    source_schema: Option<&str>,
 ) -> Result<Option<tokio_postgres::Client>, tokio_postgres::Error> {
     if !roles.separate_app() {
         return Ok(None);
     }
-    connect_app_as(&roles.app).await.map(Some)
+    connect_app_as(&roles.app, source_schema).await.map(Some)
 }
 
 /// An application session logged in with `dsn`, set up as [`connect_app`]
 /// sets one up.
 pub(super) async fn connect_app_as(
     dsn: &str,
+    source_schema: Option<&str>,
 ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
     let (app, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    app.batch_execute(
-        "set search_path to public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; \
+    app.batch_execute(&format!(
+        "set search_path to {}; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; \
          set timezone to 'UTC'; set intervalstyle to 'postgres'",
-    )
+        source_schema.map_or_else(|| "public".to_string(), |schema| format!("\"{schema}\""))
+    ))
     .await?;
     Ok(app)
 }

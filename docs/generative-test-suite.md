@@ -139,9 +139,12 @@ Every convergence property runs this way, the self-check tampering
 properties (their tampering writes as the Trellis role, which owns the
 targets) and the subprocess crash pins too; `tests/backend_seam.rs` pins the
 owners and each session's role. `connect` runs everything as the superuser.
-Hand-built pins outside a property's runner still use it, and so does
-`two_instance_noise.rs`, whose instances keep same-named sources in their own
-catalog schemas.
+Hand-built pins outside a property's runner still use it.
+
+`two_instance_noise.rs` runs both instances as these roles in one database.
+Each instance's sources are `app_owner`'s, in a schema of its own (`app_a`,
+`app_b`) that its definitions name, so same-named sources stay apart; the
+shared-source and chain shapes keep theirs in `public`.
 
 ## 2. The oracle is Postgres itself
 
