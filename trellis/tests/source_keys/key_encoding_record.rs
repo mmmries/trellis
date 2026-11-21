@@ -343,3 +343,45 @@ async fn validate_constraint_with_changes_staged_keeps_the_encoding() {
     both_exact(&trellis, &raw).await;
     assert_eq!(encoded(&raw, "public.nk").await, ["code"]);
 }
+
+/// A 1-1 target's record takes its source record's encoding. The migration
+/// leaves a `NULLS NOT DISTINCT` key over a `NOT NULL` and a nullable column
+/// with only the nullable one encoded; a 1-1 target defined over it later is
+/// keyed by a `NULLS NOT DISTINCT` index too, and its record must still
+/// render the key text as the source's does.
+#[tokio::test]
+async fn a_new_one_to_one_target_takes_a_mixed_records_encoding() {
+    let cluster = TestCluster::start();
+    let ddl = "create table public.mk (t text not null, code text, v int not null); \
+         create unique index on public.mk (t, code) nulls not distinct; \
+         insert into public.mk values ('y', null, 2), ('z', 'q', 3)";
+    let agg = "TRANSFORM mk_sums FROM public.mk KEY (t, code) GROUP BY v WITHOUT SOURCE INDEX \
+         SELECT COUNT(*) AS n";
+    let (db, mut raw, trellis) = setup(&cluster, ddl, &[agg]).await;
+    raw.batch_execute(
+        "update trellis.definition_keys set encoded_columns = '{code}' \
+         where table_name = 'public.mk'",
+    )
+    .await
+    .expect("a mixed record, as the migration leaves one");
+    reconcile_pass(&mut raw, &db.pool).await;
+    trellis
+        .apply("TRANSFORM mk1 FROM public.mk KEY (t, code) SELECT v AS v")
+        .await
+        .expect("a new 1-1 reader");
+    resume_passes::bring_live(&mut raw, &db.pool, &trellis, &["mk1"]).await;
+    assert_eq!(encoded(&raw, "public.mk").await, ["code"]);
+    assert_eq!(encoded(&raw, "public.mk1").await, ["code"], "the source's");
+    raw.batch_execute("insert into public.mk values ('x' || chr(1), 'p', 1), ('w', null, 4)")
+        .await
+        .expect("a chr(1) in the raw column, and a NULL in the encoded one");
+    settle(&db.pool, &mut raw).await;
+    exact(
+        &trellis,
+        &raw,
+        "mk1",
+        "select t, coalesce(code, '<null>'), v::text from public.mk1 order by 1, 2",
+        "select t, coalesce(code, '<null>'), v::text from public.mk order by 1, 2",
+    )
+    .await;
+}

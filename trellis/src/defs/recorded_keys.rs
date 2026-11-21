@@ -151,6 +151,20 @@ async fn write(
         return Ok(());
     }
     let encoded = encoding_now(client, table, key).await?;
+    write_encoded(client, table, key, &encoded).await
+}
+
+/// [`write`], with the encoding `encoded` instead of the one `key`'s index
+/// gives it now.
+async fn write_encoded(
+    client: &impl GenericClient,
+    table: &str,
+    key: &[String],
+    encoded: &[String],
+) -> Result<(), tokio_postgres::Error> {
+    if key.is_empty() {
+        return Ok(());
+    }
     client
         .execute(
             "insert into definition_keys \
@@ -305,7 +319,19 @@ async fn record_except(
     } else {
         key_of(client, source).await?
     };
-    write(client, target, &target_key(def, &source_key)).await
+    let key = target_key(def, &source_key);
+    // A 1-1 target's key text is its source's, so its record takes the
+    // source record's encoding: a source record migrated with only some
+    // columns of a `NULLS NOT DISTINCT` key encoded would otherwise give the
+    // target, keyed by that index's shape, every column encoded.
+    if keys_target_by_source(def)
+        && unkeyed != Some(source)
+        && let Some((recorded, encoded)) = recorded_encoding(client, source).await?
+        && recorded == key
+    {
+        return write_encoded(client, target, &key, &encoded).await;
+    }
+    write(client, target, &key).await
 }
 
 /// The key recorded for `table` (an unquoted `schema.table`), if it has a
