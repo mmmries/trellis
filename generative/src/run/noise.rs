@@ -82,6 +82,7 @@ pub async fn run_convergence_with_noise(
                 op_index,
                 expected: expected.clone(),
                 actual,
+                error: None,
             });
         }
 

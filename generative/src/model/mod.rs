@@ -1089,6 +1089,9 @@ pub struct Rewrite {
     pub values: (Option<String>, Option<String>),
 }
 
+mod source_ddl;
+pub use source_ddl::{SourceDdl, SourceDdlEvent, SourceDdlPlan};
+
 #[cfg(test)]
 mod tests {
     use super::*;

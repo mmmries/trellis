@@ -9,7 +9,8 @@
 //! [`allowance`] is the allowlist: the only place that says which runs may
 //! find a definition paused. A run not on it fails on any pause
 //! ([`RunError::UnexpectedPause`]). Every runner takes its [`RunKind`], so a
-//! new runner has to pick one.
+//! new runner has to pick one, except the source-DDL runner, which judges
+//! pauses itself (`super::judge`).
 
 use crate::backend::DefinitionState;
 use crate::model::{Op, Program};
@@ -62,9 +63,10 @@ pub(super) struct Allowance {
 ///   capture may pause it. It runs in the sequential, bursty and concurrent
 ///   runners, so it is read off the program.
 ///
-/// Schema change and capture disruption have no tier of their own: no
-/// generated op alters a tracked source's columns or Trellis's capture of
-/// it. One that is added joins this list, here.
+/// The source-DDL runner (`super::run_convergence_with_source_ddl`), whose
+/// changes include capture disruption, takes no `RunKind`: it judges every
+/// definition by "never silently wrong" (`super::judge`), where a pause
+/// with a reason, then a `RESUME`, is one of the endings.
 ///
 /// Not on it, with why: the sequential, bursty and concurrent runs without
 /// partition ops (every pause they take, `PAUSE TRANSFORM` or a column

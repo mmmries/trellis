@@ -14,10 +14,17 @@
 //! - The cluster's bootstrap superuser, only for [`Roles::admin`]: actions an
 //!   operator, not Trellis, takes (`CHECKPOINT`).
 //!
-//! Targets go in `public` (the default target schema). Trellis's `CREATE`
-//! there comes through its membership in [`APP_ROLE`], which holds it as the
-//! schema's application owner would; the recommendations list `CREATE` on
-//! the target schema, not how it is held.
+//! Targets go in `public` (the default target schema) or in
+//! [`TARGETS_SCHEMA`], which Trellis owns, as the recommendations set it up;
+//! `ManualBackend::install` draws which from the program. Trellis's `CREATE`
+//! on `public` comes through its membership in [`APP_ROLE`], which holds it
+//! as the schema's application owner would.
+//!
+//! The privilege tier (`crate::run::source_ddl`) uses three more roles,
+//! none of which Trellis inherits unless named: [`WRITER_ROLE`], a login
+//! the application's writes switch to while a change takes the owner's
+//! privileges away; [`OTHER_OWNER_ROLE`], an owner Trellis doesn't inherit;
+//! and [`HEIR_ROLE`], an owner Trellis and the application both inherit.
 
 use testkit::{TestCluster, TestDatabase};
 use trellis::Config;
@@ -27,6 +34,22 @@ pub const TRELLIS_ROLE: &str = "trellis_runner";
 
 /// The application role: owns the source tables and makes every write.
 pub const APP_ROLE: &str = "app_owner";
+
+/// The recommended target schema (`docs/recommendations.md`), owned by
+/// [`TRELLIS_ROLE`], with `USAGE` for [`APP_ROLE`] as a reader's.
+pub const TARGETS_SCHEMA: &str = "trellis_targets";
+
+/// A login holding `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `TRUNCATE` on
+/// the sources by grant, and no role Trellis inherits: the application's
+/// writes run as it while a change takes the owner's privileges away.
+pub const WRITER_ROLE: &str = "app_writer";
+
+/// A role neither Trellis nor the application is a member of.
+pub const OTHER_OWNER_ROLE: &str = "other_owner";
+
+/// A role both [`TRELLIS_ROLE`] and [`APP_ROLE`] are members of, with
+/// `INHERIT`.
+pub const HEIR_ROLE: &str = "app_heir";
 
 /// The connection strings of a case's three roles. [`Roles::single`] is the
 /// legacy shape: one role (the bootstrap superuser) for everything.
@@ -55,6 +78,11 @@ impl Roles {
     pub fn separate_app(&self) -> bool {
         self.app != self.trellis
     }
+
+    /// [`WRITER_ROLE`]'s connection string, for a provisioned case.
+    pub fn writer(&self) -> String {
+        as_role(&self.admin, WRITER_ROLE)
+    }
 }
 
 /// Opens the application's session when `roles` gives it a role of its own
@@ -66,7 +94,15 @@ pub(super) async fn connect_app(
     if !roles.separate_app() {
         return Ok(None);
     }
-    let (app, connection) = tokio_postgres::connect(&roles.app, tokio_postgres::NoTls).await?;
+    connect_app_as(&roles.app).await.map(Some)
+}
+
+/// An application session logged in with `dsn`, set up as [`connect_app`]
+/// sets one up.
+pub(super) async fn connect_app_as(
+    dsn: &str,
+) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+    let (app, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -75,7 +111,7 @@ pub(super) async fn connect_app(
          set timezone to 'UTC'; set intervalstyle to 'postgres'",
     )
     .await?;
-    Ok(Some(app))
+    Ok(app)
 }
 
 /// A fresh database set up as the module doc describes, migrated by
@@ -139,33 +175,40 @@ pub fn as_role(dsn: &str, role: &str) -> String {
     dsn.replace("user=postgres", &format!("user={role}"))
 }
 
-/// Creates both roles and the membership, tolerating a concurrent creator:
+/// Creates the roles and memberships, tolerating a concurrent creator:
 /// roles are cluster-wide and cases on one cluster can provision at once.
 fn create_roles_sql() -> String {
-    let create = |role: &str| {
+    let create = |role: &str, login: &str| {
         format!(
             "do $roles$ begin \
                if not exists (select from pg_roles where rolname = '{role}') then \
-                 create role {role} login nosuperuser nobypassrls; \
+                 create role {role} {login} nosuperuser nobypassrls; \
                end if; \
              exception when duplicate_object or unique_violation then null; \
              end $roles$;"
         )
     };
     format!(
-        "{} {} grant {APP_ROLE} to {TRELLIS_ROLE};",
-        create(APP_ROLE),
-        create(TRELLIS_ROLE)
+        "{} {} {} {} {} grant {APP_ROLE} to {TRELLIS_ROLE}; \
+         grant {HEIR_ROLE} to {TRELLIS_ROLE}, {APP_ROLE};",
+        create(APP_ROLE, "login"),
+        create(TRELLIS_ROLE, "login"),
+        create(WRITER_ROLE, "login"),
+        create(OTHER_OWNER_ROLE, "nologin"),
+        create(HEIR_ROLE, "nologin"),
     )
 }
 
 /// The grants on one database: what the recommendations list for
-/// [`TRELLIS_ROLE`] beyond `PUBLIC`'s defaults, and `CREATE` on `public` for
-/// [`APP_ROLE`] (`PUBLIC` holds it only before PostgreSQL 15).
+/// [`TRELLIS_ROLE`] beyond `PUBLIC`'s defaults, `CREATE` on `public` for
+/// [`APP_ROLE`] (`PUBLIC` holds it only before PostgreSQL 15), and
+/// [`TARGETS_SCHEMA`] as the recommendations' setup creates it.
 fn database_grants_sql(database: &str) -> String {
     format!(
         "grant create on database \"{database}\" to {TRELLIS_ROLE}; \
-         grant create, usage on schema public to {APP_ROLE};"
+         grant create, usage on schema public to {APP_ROLE}; \
+         create schema {TARGETS_SCHEMA} authorization {TRELLIS_ROLE}; \
+         grant usage on schema {TARGETS_SCHEMA} to {APP_ROLE};"
     )
 }
 
