@@ -252,9 +252,8 @@ async fn a_build_over_an_out_of_range_interval_sum_pauses_where_the_oracle_raise
     ];
     let program = Program {
         tables: vec![table],
-        defs: vec![def.clone()],
-        // Installed after the rows: its build reads them.
-        def_install_after_op: vec![rows.len()],
+        defs: Vec::new(),
+        def_install_after_op: Vec::new(),
         ops: rows
             .iter()
             .map(|(id, g, iv)| Op::Insert {
@@ -277,7 +276,21 @@ async fn a_build_over_an_out_of_range_interval_sum_pauses_where_the_oracle_raise
     for op in &program.ops {
         backend.apply(op).await.expect("apply");
     }
-    let _ = backend.quiesce().await;
+    // Installed after the rows, so its build reads them (a definition
+    // installed over the empty table would instead meet them in the ring).
+    // The quiesce waits for the definition to leave `backfilling`.
+    backend
+        .install(&Program {
+            tables: Vec::new(),
+            defs: vec![def.clone()],
+            def_install_after_op: vec![0],
+            ops: Vec::new(),
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
+        })
+        .await
+        .expect("install the definition over the rows");
+    backend.quiesce().await.expect("the build settles");
     let statuses = backend.definition_statuses().await.expect("statuses");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
     let oracle = sql_oracle(&pool, &def, "id").await.expect("oracle");
@@ -294,8 +307,8 @@ async fn a_build_over_an_out_of_range_interval_sum_pauses_where_the_oracle_raise
     );
     eprintln!("statuses after the build: {statuses:?}");
     assert!(
-        statuses.iter().all(|(_, s)| s != "live"),
-        "the build wrote a value for a group the oracle says raises: {statuses:?}"
+        statuses.iter().all(|(_, s)| s == "paused"),
+        "the build should pause at the group the oracle says raises: {statuses:?}"
     );
 }
 

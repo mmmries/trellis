@@ -3289,11 +3289,47 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
             assert!(
                 last_progress.elapsed() < stall,
                 "the running re-derive builds {building:?} made no progress for {stall:?} \
-                 (a chunk that fails and retries every time is no progress)"
+                 (a chunk that fails and retries every time is no progress); unfinished \
+                 rows: {}",
+                unfinished_rows(pool).await
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// The unfinished `backfill_chunks` rows, for [`settle_builds`]'s stall message.
+#[cfg(any(test, feature = "internals"))]
+async fn unfinished_rows(pool: &Pool) -> String {
+    let client = pool.get().await.expect("acquire a connection");
+    client
+        .query(
+            "select id, kind, claimed_by, attempts, charged, last_error, \
+                    next_attempt_at > now(), fence_xid::text \
+             from backfill_chunks where not done order by id",
+            &[],
+        )
+        .await
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "(id {}, {}, claimed_by {:?}, attempts {}, charged {}, error {:?}, \
+                         backing off {:?}, fence {:?})",
+                        r.get::<_, i64>(0),
+                        r.get::<_, String>(1),
+                        r.get::<_, Option<String>>(2),
+                        r.get::<_, i32>(3),
+                        r.get::<_, i32>(4),
+                        r.get::<_, Option<String>>(5),
+                        r.get::<_, Option<bool>>(6),
+                        r.get::<_, Option<String>>(7),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|err| format!("(unreadable: {err})"))
 }
 
 /// The failures `chunk`'s row has recorded and how many were charged

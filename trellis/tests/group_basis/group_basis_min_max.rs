@@ -1303,7 +1303,6 @@ async fn a_probe_behind_a_source_lock_retries_the_page() {
     // `lock_timeout` would stay in its first transaction.
     let waiting = "select pid, xact_start::text from pg_stat_activity \
                    where $1 = any(pg_blocking_pids(pid))";
-    d.wait_blocked_behind(pid).await;
     let watcher = d.user().await;
     let waiters = || async {
         watcher
@@ -1314,22 +1313,38 @@ async fn a_probe_behind_a_source_lock_retries_the_page() {
             .map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1)))
             .collect::<Vec<_>>()
     };
-    let first = waiters().await;
-    assert_eq!(first.len(), 1, "one page waits: {first:?}");
     // It waits for the source while it holds its groups: the probe, after
-    // the lock statement.
-    let held: bool = watcher
-        .query_one(
-            "select exists (select 1 from pg_locks where pid = $1 and not granted \
-                              and relation = 'public.src'::regclass) \
-                and exists (select 1 from pg_locks where pid = $1 and granted \
-                              and relation = $2::text::regclass)",
-            &[&first[0].0, &hidden(&d).await],
-        )
-        .await
-        .expect("the waiting page's locks")
-        .get(0);
-    assert!(held, "the page waits for the source holding its groups");
+    // the lock statement. A page that times out is between two transactions
+    // for a moment, so a sample can see none: poll until one is seen waiting
+    // with its groups held (one lock is `ACCESS SHARE` on the source, not
+    // granted; the other is on the hidden table, granted).
+    let hidden = hidden(&d).await;
+    let first = testkit::wait_for(
+        "a page transaction waits for the source holding its groups",
+        Duration::from_secs(60),
+        async || {
+            let seen = waiters().await;
+            for waiter in &seen {
+                let held: bool = watcher
+                    .query_one(
+                        "select exists (select 1 from pg_locks where pid = $1 and not granted \
+                                          and relation = 'public.src'::regclass) \
+                            and exists (select 1 from pg_locks where pid = $1 and granted \
+                                          and relation = $2::text::regclass)",
+                        &[&waiter.0, &hidden],
+                    )
+                    .await
+                    .expect("the waiting page's locks")
+                    .get(0);
+                if held {
+                    return Ok(waiter.clone());
+                }
+            }
+            Err(seen)
+        },
+    )
+    .await;
+    let first = [first];
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while waiters().await.iter().all(|w| *w == first[0]) {
         assert!(
