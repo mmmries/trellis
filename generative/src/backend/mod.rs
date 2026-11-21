@@ -92,6 +92,17 @@ impl std::fmt::Display for DefinitionState {
 /// must never go through an application-level notification API, and
 /// [`Backend::quiesce`] must be a client-side watermark poll, never a
 /// `sleep`.
+/// Panics unless every definition in `program` installs up front
+/// ([`Backend::install`]).
+fn assert_installs_now(program: &Program) {
+    assert!(
+        program.def_install_after_op.iter().all(|&at| at == 0),
+        "Backend::install installs every definition now; a deferred install \
+         (def_install_after_op {:?}) is the runner's to schedule",
+        program.def_install_after_op
+    );
+}
+
 pub trait Backend {
     type Error: std::fmt::Debug;
 
@@ -99,6 +110,11 @@ pub trait Backend {
     /// in `program.defs` (and its neighbor target table), and starts
     /// whatever engine machinery this backend needs to keep them
     /// incrementally maintained.
+    ///
+    /// Every definition installs now: a deferred install
+    /// ([`Program::def_install_after_op`]) is the runner's to schedule, so
+    /// an implementation panics on a nonzero entry rather than install it
+    /// early.
     fn install(
         &mut self,
         program: &Program,

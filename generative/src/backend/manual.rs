@@ -1802,6 +1802,7 @@ impl super::Backend for ManualBackend {
     }
 
     async fn install(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        super::assert_installs_now(program);
         if self.engine_client.is_none() && self.defs.is_empty() {
             self.draw_target_schema(program)?;
         }
