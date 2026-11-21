@@ -22,7 +22,7 @@ use tokio_postgres::SimpleQueryMessage;
 use tokio_postgres::types::PgLsn;
 use trellis::dev::staging::{StagingError, await_converged, await_converged_except_held};
 
-use super::sql::HeldKeys;
+use super::sql::{HeldKeys, QuiesceError};
 
 /// A quiesce's time budget.
 #[derive(Clone, Copy, Debug)]
@@ -160,7 +160,7 @@ pub(super) async fn await_ring(
     token: PgLsn,
     deadline: &mut ProgressDeadline,
     held: HeldKeys,
-) -> Result<(), StagingError> {
+) -> Result<(), QuiesceError> {
     let started = Instant::now();
     let mut expired = None;
     let result = loop {
@@ -172,15 +172,21 @@ pub(super) async fn await_ring(
         match waited {
             Ok(()) => break Ok(()),
             Err(StagingError::ConvergenceTimeout { .. }) => {}
-            Err(other) => break Err(other),
+            Err(other) => break Err(other.into()),
         }
         deadline.observe(progress_mark(raw).await, Instant::now());
+        // A page retried without bound fails the run at once, however much
+        // of the window is left (#2185 6c).
+        if let Some(holdups) = unbounded_holdups(raw).await {
+            dump_state(raw, Some(token), "a drain page is retried without bound").await;
+            break Err(QuiesceError::RetriesUnbounded { holdups });
+        }
         expired = deadline.expired(Instant::now());
         if expired.is_some() {
-            break Err(StagingError::ConvergenceTimeout {
+            break Err(QuiesceError::Staging(StagingError::ConvergenceTimeout {
                 token,
                 waited: started.elapsed(),
-            });
+            }));
         }
     };
     deadline.ring_waited += started.elapsed();
@@ -188,6 +194,27 @@ pub(super) async fn await_ring(
         dump_state(raw, Some(token), &expiry_reason(expiry, deadline)).await;
     }
     result
+}
+
+/// How many consecutive failed drains of one page, with no commit between,
+/// count as retrying without bound (#2185 6c): about the #2130 storm in 7 s.
+/// `drain_holdups.attempts` is the counter: the drain bumps it on each failure
+/// of a page charged to no key or definition. It is kept per segment, so it
+/// sums the failures of every failing page (bucket) of the segment, and goes
+/// only when the last of them commits; a restart or a reclaim keeps it.
+pub(super) const MAX_DRAIN_ATTEMPTS: i32 = 20;
+
+/// Each holdup that has reached [`MAX_DRAIN_ATTEMPTS`], one `seg_seq: N
+/// failed drains: <error>` entry per page, or `None` if there is none (or
+/// the sample failed or timed out).
+pub(super) async fn unbounded_holdups(raw: &tokio_postgres::Client) -> Option<String> {
+    let sql = format!(
+        "select string_agg(seg_seq || ': ' || attempts || ' failed drains: ' || left(error, 200), \
+                           '; ' order by seg_seq) \
+           from drain_holdups where attempts >= {MAX_DRAIN_ATTEMPTS}"
+    );
+    let rows = bounded_query(raw, &sql).await.ok()?;
+    rows.into_iter().next()?.into_iter().next()?
 }
 
 /// The line [`dump_state`] opens with for an expired `deadline`.

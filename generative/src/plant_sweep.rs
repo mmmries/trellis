@@ -332,13 +332,15 @@ pub struct SweepCase {
     pub reason: String,
 }
 
-/// Whether a failure's report is a quiesce or convergence timeout: the
-/// engine never settled, which says the plant hung it, not what it wrote.
+/// Whether a failure's report is a quiesce or convergence timeout, or a
+/// quiesce cut short by a page retried without bound: the engine never
+/// settled, which says the plant hung it, not what it wrote.
 pub fn is_quiesce_timeout(message: &str) -> bool {
     [
         "ConvergenceTimeout",
         "DefinitionsUnsettled",
         "PartitionsUnsettled",
+        "RetriesUnbounded",
     ]
     .iter()
     .any(|marker| message.contains(marker))
@@ -985,6 +987,9 @@ mod tests {
     fn quiesce_timeouts_are_told_from_other_failures() {
         assert!(is_quiesce_timeout(
             "Quiesce(Staging(ConvergenceTimeout { .. }))"
+        ));
+        assert!(is_quiesce_timeout(
+            "Quiesce(\"RetriesUnbounded { holdups: \\\"7: 21 failed drains\\\" }\")"
         ));
         assert!(!is_quiesce_timeout("concurrent case diverged in the burst"));
     }

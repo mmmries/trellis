@@ -955,6 +955,13 @@ its failing definition (`RunError::StatusLies`). It runs after a quiesce, so a
 window in which the harness itself took Postgres or the engine away is over by
 then. No other window is exempt.
 
+**Bounded retries.** Every quiesce reads `drain_holdups.attempts`: the failed
+drains of a segment's pages charged to no key or definition, counted until every
+failing page commits. At 20 the quiesce fails with `RetriesUnbounded`,
+naming each segment, instead of waiting out its window. Below that, a ring that
+doesn't move is the quiesce's own timeout. The engine pauses nothing for it;
+the check only reports.
+
 **Findings terminate as deterministic pins; generative runs are lead generation.**
 A seed reproduces the *program*, not reliably a *race*, and does not survive
 generator refactors. Three artifact kinds:
