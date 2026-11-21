@@ -137,6 +137,11 @@ pub mod staging {
     pub fn min_rows_to_split() -> i64 {
         crate::staging::claim::min_rows_to_split()
     }
+    /// One staging-worker reconcile pass, as the maintenance loop runs it,
+    /// for the generative source-DDL tier, which runs the engine with a long
+    /// reconcile interval and steps the passes itself, so a drawn DDL lands
+    /// inside one reconcile interval or across a pass as the draw says.
+    pub use crate::client::reconcile_pass;
     /// `seal_phase1`/`seal_phase2` force a seal boundary at a deterministic
     /// point so two changes land in distinct segments instead of depending on
     /// a maintenance tick's timing. There is no facade equivalent — "seal

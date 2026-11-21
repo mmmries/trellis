@@ -47,11 +47,22 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
     // A restart can strand a claim the engine then waits a reclaim TTL to
     // free (see `SERVER_STOP_RECLAIM_TTL`).
     backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
+    if let Some(limit) = plan.counters_near {
+        // Before the install, while the ring is pristine and no engine runs:
+        // the definitions, their builds and every later draw take ids past
+        // the start.
+        backend
+            .advance_counters(limit)
+            .await
+            .map_err(|e| RunError::Install(format!("counters near {limit:?}: {e:?}")))?;
+    }
     backend
         .install(program)
         .await
         .map_err(|e| RunError::Install(format!("{e:?}")))?;
 
+    // Where the server's clock stands: the steps' sum.
+    let mut clock_offset = 0i64;
     for (op_index, op) in program.ops.iter().enumerate() {
         let events: Vec<&DbAdminAction> = plan
             .events
@@ -84,6 +95,10 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
                     cluster.age_xids_to_epoch_edge(XID_PAGE);
                     reconnect(backend, pool, op_index, action).await?;
                     cluster.burn_xids(XID_PAGE.saturating_sub(*tail));
+                }
+                DbAdminAction::StepClock(step) => {
+                    clock_offset += step.seconds();
+                    cluster.step_clock(clock_offset);
                 }
             }
         }

@@ -24,7 +24,10 @@ pub use manual::{
     SERVER_STOP_RECLAIM_TTL, SHUTDOWN_TIMEOUT, SourceTables, activity_summary, activity_summary_on,
     await_pool_usable,
 };
-pub use roles::{APP_ROLE, CaseDatabase, Roles, TRELLIS_ROLE, as_role};
+pub use roles::{
+    APP_ROLE, CaseDatabase, HEIR_ROLE, OTHER_OWNER_ROLE, Roles, TARGETS_SCHEMA, TRELLIS_ROLE,
+    WRITER_ROLE, as_role,
+};
 pub use sql::HeldKeys;
 pub use subprocess::{
     REACH_FILE_ENV, SubprocessBackend, SubprocessBackendError, reach_request, write_reach,
@@ -116,6 +119,15 @@ pub trait Backend {
         &mut self,
         program: &Program,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Before the first [`Backend::install`], every definition the run may
+    /// install: `program.defs`, deferred ones and those a plan defines
+    /// mid-run included. A runner that installs a program in parts calls
+    /// it, so a backend that draws its setup from the program
+    /// (`ManualBackend`'s target schema) draws from all of it.
+    fn expect(&mut self, _program: &Program) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Applies one op as raw source DML. On success, returns the number of
     /// rows the statement affected — `0` for an update/delete that named a
@@ -310,6 +322,11 @@ pub trait ClusterControl {
 
     /// Assigns and commits `count` transaction ids.
     fn burn_xids(&self, count: u32);
+
+    /// Puts the server's wall clock `seconds` ahead of real time (behind,
+    /// when negative), replacing any earlier step. The server must have been
+    /// started with a fake clock.
+    fn step_clock(&self, seconds: i64);
 }
 
 impl ClusterControl for testkit::TestCluster {
@@ -326,6 +343,10 @@ impl ClusterControl for testkit::TestCluster {
 
     fn burn_xids(&self, count: u32) {
         testkit::TestCluster::burn_xids(self, count);
+    }
+
+    fn step_clock(&self, seconds: i64) {
+        testkit::TestCluster::step_clock(self, seconds);
     }
 }
 

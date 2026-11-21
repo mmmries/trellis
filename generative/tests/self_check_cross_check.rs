@@ -596,7 +596,7 @@ fn run_swept_tampering_case(
                         .iter()
                         .find(|t| t.name == def.source)
                         .expect("every def's source names a table in the same program");
-                    let qualified = qualified_target_table("public", def);
+                    let qualified = qualified_target_table(backend.target_schema(), def);
                     let pk_ident = format!("\"{}\"", source.pk_col);
                     let rows = client
                         .query(
@@ -633,7 +633,7 @@ fn run_swept_tampering_case(
                 source,
             );
 
-            let qualified = qualified_target_table("public", def);
+            let qualified = qualified_target_table(backend.target_schema(), def);
             let pk_ident = format!("\"{}\"", source.pk_col);
             let field_ident = format!("\"{}\"", field.name);
 
@@ -914,14 +914,18 @@ struct HiddenExtreme {
 
 /// `def`'s hidden table, qualified, and its bare name (how `self_check`
 /// names its columns in a report: `<name>.<column>`).
-async fn hidden_table(client: &tokio_postgres::Client, def: &TransformDef) -> (String, String) {
+async fn hidden_table(
+    client: &tokio_postgres::Client,
+    target_schema: &str,
+    def: &TransformDef,
+) -> (String, String) {
     let id: i64 = client
         .query_one(
             format!(
                 "select id from {DEFAULT_SCHEMA}.transform_definitions where target_table = $1"
             )
             .as_str(),
-            &[&format!("public.{}", def.target)],
+            &[&format!("{target_schema}.{}", def.target)],
         )
         .await
         .expect("read the definition's id")
@@ -1040,7 +1044,7 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
                 unreachable!("a min_max definition groups");
             };
             let client = pool.get().await.expect("pool connection");
-            let (hidden, hidden_name) = hidden_table(&client, def).await;
+            let (hidden, hidden_name) = hidden_table(&client, backend.target_schema(), def).await;
             let extremes = hidden_extremes(&client, &hidden, def).await;
             let extreme = extremes[case.column % extremes.len()].clone();
             let group_text: Vec<String> =
@@ -1100,7 +1104,7 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
                 .iter()
                 .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
-            let visible = qualified_target_table("public", def);
+            let visible = qualified_target_table(backend.target_schema(), def);
             let ty = arg_sql_type(extreme.arg);
             let current: Option<String> = client
                 .query_one(

@@ -135,6 +135,8 @@ pub mod join_chained;
 pub mod join_one_to_one;
 pub mod min_max;
 pub mod partition;
+#[cfg(feature = "proptest")]
+pub mod source_ddl;
 pub mod source_key;
 pub mod txn_shapes;
 pub mod where_clause;
@@ -2834,8 +2836,8 @@ pub fn adversarial_noise_table() -> Table {
 mod strategy {
     use super::*;
     use crate::model::{
-        BackupKind, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction, NoiseEvent,
-        NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SteadyLoad,
+        BackupKind, ClockStep, CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction,
+        NoiseEvent, NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SteadyLoad,
     };
     use proptest::prelude::*;
 
@@ -4605,8 +4607,20 @@ mod strategy {
     }
 
     /// One [`DbAdminAction`], weighted toward the cheap ones.
-    fn db_admin_action() -> impl Strategy<Value = DbAdminAction> {
+    ///
+    /// A clock step needs a cluster with a fake clock, so it is drawn only
+    /// when `clock` is set.
+    fn db_admin_action(clock: bool) -> impl Strategy<Value = DbAdminAction> {
+        let clock_step = prop_oneof![
+            Just(ClockStep::ForwardMinutes),
+            Just(ClockStep::ForwardHours),
+            Just(ClockStep::BackMinutes),
+        ]
+        .prop_map(DbAdminAction::StepClock);
         prop_oneof![
+            // Weight 0 drops the arm, so a plan without a fake clock never
+            // draws a step.
+            if clock { 6 } else { 0 } => clock_step,
             2 => Just(DbAdminAction::Checkpoint),
             2 => Just(DbAdminAction::RestartPostgres(RestartMode::Fast)),
             1 => Just(DbAdminAction::RestartPostgres(RestartMode::Immediate)),
@@ -4624,10 +4638,49 @@ mod strategy {
     ///
     /// At most three, so a short program isn't dominated by restarts.
     pub fn db_admin_plan_for(program: &Program) -> impl Strategy<Value = DbAdminPlan> + use<> {
+        db_admin_plan(program, false)
+    }
+
+    /// [`db_admin_plan_for`], with wall-clock steps ([`ClockStep`]) among the
+    /// actions. Only for a run on a cluster with a fake clock.
+    pub fn db_admin_plan_with_clock_for(
+        program: &Program,
+    ) -> impl Strategy<Value = DbAdminPlan> + use<> {
+        db_admin_plan(program, true)
+    }
+
+    fn db_admin_plan(program: &Program, clock: bool) -> impl Strategy<Value = DbAdminPlan> + use<> {
         let op_count = program.ops.len();
-        let event =
-            (0..op_count, db_admin_action()).prop_map(|(op, action)| DbAdminEvent { op, action });
-        prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
+        let event = (0..op_count, db_admin_action(clock))
+            .prop_map(|(op, action)| DbAdminEvent { op, action });
+        // Two in five plans start the counters near a limit.
+        let counters_near = prop::option::weighted(
+            0.4,
+            prop_oneof![
+                (0u16..=64).prop_map(|headroom| CounterLimit::Int32 { headroom }),
+                Just(CounterLimit::Int64),
+            ],
+        );
+        (prop::collection::vec(event, 0..=3), counters_near).prop_map(
+            |(mut events, counters_near)| {
+                // A step back fires before the other actions at its op. After
+                // a restart (or the stop an xid wrap makes), it would push a
+                // claim the stop stranded five minutes further from its
+                // reclaim TTL: a correct stall, but past the quiesce budget.
+                // The runner fires an op's events in plan order, so ordering
+                // by op as well changes nothing else.
+                events.sort_by_key(|e| {
+                    (
+                        e.op,
+                        !matches!(e.action, DbAdminAction::StepClock(ClockStep::BackMinutes)),
+                    )
+                });
+                DbAdminPlan {
+                    events,
+                    counters_near,
+                }
+            },
+        )
     }
 
     /// A backup-and-restore plan for `program`, backing up after
@@ -4839,11 +4892,11 @@ mod strategy {
 pub use strategy::{
     COOLING_BACKFILL_AT, COOLING_BACKFILL_LAG, LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS,
     MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, cooling_backfill_case,
-    cooling_key_case, db_admin_plan_for, held_key_fuse_program, held_key_program, hot_key_case,
-    mid_burst_case, noise_plan_for, partitioned_hot_key_case, partitioned_program,
-    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    restore_plan_for, steady_load_case, trivial_one_to_one_program_with, trivial_program,
-    trivial_program_with,
+    cooling_key_case, db_admin_plan_for, db_admin_plan_with_clock_for, held_key_fuse_program,
+    held_key_program, hot_key_case, mid_burst_case, noise_plan_for, partitioned_hot_key_case,
+    partitioned_program, program_with_client_restart, program_with_mid_stream_def_install,
+    program_with_scale_out, restore_plan_for, steady_load_case, trivial_one_to_one_program_with,
+    trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]
