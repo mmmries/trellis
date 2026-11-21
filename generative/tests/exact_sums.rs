@@ -310,6 +310,24 @@ async fn a_build_over_an_out_of_range_interval_sum_pauses_where_the_oracle_raise
         statuses.iter().all(|(_, s)| s == "paused"),
         "the build should pause at the group the oracle says raises: {statuses:?}"
     );
+    // The build paused it, not a drain page meeting the rows in the ring:
+    // its job recorded the raise and was charged for it.
+    let charged: Option<i32> = pool
+        .get()
+        .await
+        .expect("a connection")
+        .query_one(
+            "select max(charged) from backfill_chunks \
+             where last_error like '%interval out of range%'",
+            &[],
+        )
+        .await
+        .expect("the build's job")
+        .get(0);
+    assert!(
+        charged.is_some_and(|n| n > 0),
+        "the build's job recorded the raise"
+    );
 }
 
 /// The drawn arms happen: about half the `min_max` cases and three in ten

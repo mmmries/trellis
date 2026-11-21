@@ -672,6 +672,7 @@ impl super::Backend for SubprocessBackend {
     type Error = SubprocessBackendError;
 
     async fn install(&mut self, program: &Program) -> Result<(), SubprocessBackendError> {
+        super::assert_installs_now(program);
         for table in &program.tables {
             sql::create_source_table(self.app_session(), None, table).await?;
             self.tables.insert(table.name.clone(), table.clone());

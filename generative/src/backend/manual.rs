@@ -1565,6 +1565,7 @@ impl super::Backend for ManualBackend {
     type Error = ManualBackendError;
 
     async fn install(&mut self, program: &Program) -> Result<(), ManualBackendError> {
+        super::assert_installs_now(program);
         for table in &program.tables {
             if self.source_tables != SourceTables::SharedExisting {
                 self.create_source_table(table).await?;
