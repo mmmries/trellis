@@ -1261,8 +1261,8 @@ needs no restart. Linux only (the preload is `LD_PRELOAD`); on macOS set
 - **Skip on purpose.** `TRELLIS_SKIP_FAKETIME=1` skips them with the same
   message.
 - **CI.** `TRELLIS_REQUIRE_FAKETIME=1` turns a missing library into a failure;
-  `ci.yml` installs `faketime` and sets it. Setting it together with
-  `TRELLIS_SKIP_FAKETIME` fails.
+  `ci.yml` and `nightly.yml` install `faketime` and set it. Setting it
+  together with `TRELLIS_SKIP_FAKETIME` fails.
 
 ## 10. Settled decisions
 

@@ -4659,12 +4659,26 @@ mod strategy {
                 Just(CounterLimit::Int64),
             ],
         );
-        (prop::collection::vec(event, 0..=3), counters_near).prop_map(|(events, counters_near)| {
-            DbAdminPlan {
-                events,
-                counters_near,
-            }
-        })
+        (prop::collection::vec(event, 0..=3), counters_near).prop_map(
+            |(mut events, counters_near)| {
+                // A step back fires before the other actions at its op. After
+                // a restart (or the stop an xid wrap makes), it would push a
+                // claim the stop stranded five minutes further from its
+                // reclaim TTL: a correct stall, but past the quiesce budget.
+                // The runner fires an op's events in plan order, so ordering
+                // by op as well changes nothing else.
+                events.sort_by_key(|e| {
+                    (
+                        e.op,
+                        !matches!(e.action, DbAdminAction::StepClock(ClockStep::BackMinutes)),
+                    )
+                });
+                DbAdminPlan {
+                    events,
+                    counters_near,
+                }
+            },
+        )
     }
 
     /// A backup-and-restore plan for `program`, backing up after

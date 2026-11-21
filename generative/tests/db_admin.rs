@@ -471,6 +471,102 @@ async fn clock_steps_compose_with_restarts_and_wraps() {
     .await;
 }
 
+/// A restart strands a claim mid-build, then the clock jumps three hours: the
+/// stranded claim reads as TTL-old at once and is reclaimed, and the build
+/// finishes. (A step back here instead holds the claim five minutes longer,
+/// which is why the generator never draws one after a stop.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_step_after_a_restart_frees_the_stranded_claim() {
+    run_on_fake_clock(
+        "a_forward_step_after_a_restart_frees_the_stranded_claim",
+        &plan(&[
+            (0, DbAdminAction::RestartPostgres(RestartMode::Immediate)),
+            (0, DbAdminAction::StepClock(ClockStep::ForwardHours)),
+        ]),
+    )
+    .await;
+}
+
+/// The worker registry across a three-hour step. The live engine's row
+/// reads as dead (`has_live_drain_workers` is false) until its next
+/// heartbeat writes `last_seen` in the new time; then it is live again,
+/// under the same worker id, and no definition paused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_step_reads_the_live_engine_as_dead_until_its_next_heartbeat() {
+    use generative::backend::{Backend, SERVER_STOP_RECLAIM_TTL};
+    let test = "a_forward_step_reads_the_live_engine_as_dead_until_its_next_heartbeat";
+    let Some(lib) = testkit::faketime::require(test) else {
+        return;
+    };
+    let cluster = TestCluster::start_with_fake_clock(&lib);
+    let db = CaseDatabase::provision(&cluster).await;
+    let mut backend = ManualBackend::connect_as(db.roles())
+        .await
+        .expect("connect manual backend");
+    // As the db_admin runner does: a heartbeat every few seconds.
+    backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
+    backend
+        .install(&one_to_one_and_aggregate_program())
+        .await
+        .expect("install");
+    let config = Config::from_dsn(backend.trellis_dsn().to_string()).expect("config");
+    let trellis = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("connect the operator");
+    let raw = testkit::connect_with(db.dsn(), "").await;
+    let registry = async || -> Vec<(String, std::time::SystemTime)> {
+        raw.query(
+            "select worker_id, last_seen from trellis.worker_registry order by worker_id",
+            &[],
+        )
+        .await
+        .expect("read the registry")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+    };
+    let live_within = async |budget: std::time::Duration| {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if trellis.has_live_drain_workers().await.expect("liveness") {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    let budget = SERVER_STOP_RECLAIM_TTL * 2;
+    assert!(live_within(budget).await, "the engine never read as live");
+
+    let before = registry().await;
+    cluster.step_clock(ClockStep::ForwardHours.seconds());
+    let live = trellis.has_live_drain_workers().await.expect("liveness");
+    // Only a heartbeat between the step and the read could make it live.
+    if registry().await == before {
+        assert!(!live, "a row three hours old read as live: {before:?}");
+    }
+
+    assert!(
+        live_within(budget).await,
+        "the live engine still read as dead {budget:?} after the step"
+    );
+    let ids = |rows: Vec<(String, std::time::SystemTime)>| {
+        rows.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(registry().await),
+        ids(before),
+        "the live engine's row was replaced"
+    );
+    let statuses = backend.definition_statuses().await.expect("statuses");
+    assert!(
+        statuses.iter().all(|(_, status)| status == "live"),
+        "a definition left `live`: {statuses:?}"
+    );
+}
+
 /// No database: plans for a fake-clock cluster draw every step, and each
 /// step's direction is as named.
 #[test]
@@ -479,14 +575,25 @@ fn drawn_clock_plans_cover_every_step() {
     let strategy = trivial_program().prop_flat_map(|p| db_admin_plan_with_clock_for(&p));
     let mut seen = [false; 3];
     for _ in 0..300 {
-        for event in strategy
+        let events = strategy
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
             .current()
-            .events
-        {
+            .events;
+        for (i, event) in events.iter().enumerate() {
             if let DbAdminAction::StepClock(step) = event.action {
                 seen[step as usize] = true;
+            }
+            // A step back never follows a stop at its op (see `ClockStep::BackMinutes`).
+            if event.action == DbAdminAction::StepClock(ClockStep::BackMinutes) {
+                let stopped_before = events[..i].iter().any(|e| {
+                    e.op == event.op
+                        && matches!(
+                            e.action,
+                            DbAdminAction::RestartPostgres(_) | DbAdminAction::WrapXids { .. }
+                        )
+                });
+                assert!(!stopped_before, "a step back after a stop: {events:?}");
             }
         }
     }

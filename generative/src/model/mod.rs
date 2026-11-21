@@ -831,7 +831,10 @@ pub enum ClockStep {
     ForwardMinutes,
     /// Three hours forward.
     ForwardHours,
-    /// Five minutes back (an NTP correction).
+    /// Five minutes back (an NTP correction). A claim a server stop
+    /// stranded then waits five minutes longer for its reclaim, so the
+    /// generator fires this step before a restart at the same op, never
+    /// after it.
     BackMinutes,
 }
 
