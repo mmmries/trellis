@@ -58,6 +58,7 @@
 //! value can't contain whitespace, and a token without `=` (or with an empty
 //! key) panics rather than being passed through. See [`extra_pg_options`].
 
+use crate::faketime::FakeClock;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -264,6 +265,9 @@ pub struct TestCluster {
     /// Extra `key=value` server settings from
     /// [`TestCluster::start_with_settings`], re-applied by a restart.
     settings: Vec<String>,
+    /// The wall clock the server runs on, when it has a fake one
+    /// ([`TestCluster::start_with_fake_clock`]); a restart keeps it.
+    clock: Option<FakeClock>,
     // Behind a `Mutex` so [`TestCluster::restart`] can replace the process
     // through a shared reference: the generative suite keeps its cluster in
     // a `thread_local` and only ever hands out `&TestCluster`.
@@ -355,6 +359,32 @@ impl TestCluster {
         )
     }
 
+    /// [`TestCluster::start`], with the server preloaded with libfaketime
+    /// (`lib`, from [`crate::faketime::require`]) so [`TestCluster::step_clock`]
+    /// can move its wall clock. A restart keeps the clock and its offset.
+    pub fn start_with_fake_clock(lib: &Path) -> Self {
+        reap_orphans_once();
+        Self::start_listening_with(
+            &std::env::temp_dir(),
+            false,
+            DataDirSource::Template,
+            Vec::new(),
+            false,
+            Some(lib.to_path_buf()),
+            &mut free_loopback_port,
+        )
+    }
+
+    /// Puts the server's wall clock `seconds` ahead of real time (behind,
+    /// when negative), replacing any earlier step. Running backends see it
+    /// at once. Panics on a cluster without a fake clock.
+    pub fn step_clock(&self, seconds: i64) {
+        self.clock
+            .as_ref()
+            .expect("step_clock needs a cluster started with start_with_fake_clock")
+            .set_offset(seconds);
+    }
+
     /// [`TestCluster::start`], with each `key=value` of `settings` passed to
     /// `postgres` as `-c key=value` (and again by [`TestCluster::restart`]):
     /// for a test that needs a postmaster-level setting such as
@@ -414,7 +444,15 @@ impl TestCluster {
         settings: Vec<String>,
         tls: bool,
     ) -> Self {
-        Self::start_listening_with(parent, tcp, source, settings, tls, &mut free_loopback_port)
+        Self::start_listening_with(
+            parent,
+            tcp,
+            source,
+            settings,
+            tls,
+            None,
+            &mut free_loopback_port,
+        )
     }
 
     /// [`TestCluster::start_listening_in`], with the loopback port for a TCP
@@ -427,6 +465,7 @@ impl TestCluster {
         source: DataDirSource,
         mut settings: Vec<String>,
         tls: bool,
+        fake_clock_lib: Option<PathBuf>,
         pick_port: &mut dyn FnMut() -> u16,
     ) -> Self {
         // The template is built (or found) before taking a permit: building
@@ -477,7 +516,16 @@ impl TestCluster {
         }
 
         let log_path = root.join("postgres.log");
-        let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path, &settings);
+        let clock = fake_clock_lib.map(|lib| FakeClock::new(lib, &root));
+        let server = spawn_server(
+            &data_dir,
+            &socket_dir,
+            port,
+            tcp,
+            &log_path,
+            &settings,
+            clock.as_ref(),
+        );
 
         // Built before the wait, so a panic anywhere below drops the cluster,
         // which stops the server and deletes the directory.
@@ -490,6 +538,7 @@ impl TestCluster {
             long_lived: false,
             from_template: template.is_some(),
             settings,
+            clock,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -530,6 +579,7 @@ impl TestCluster {
                 tcp,
                 &log_path,
                 &cluster.settings,
+                cluster.clock.as_ref(),
             );
         }
     }
@@ -676,7 +726,7 @@ impl TestCluster {
 
         let port: u16 = 5432;
         let log_path = root.join("postgres.log");
-        let server = spawn_server(&data_dir, &socket_dir, port, false, &log_path, &[]);
+        let server = spawn_server(&data_dir, &socket_dir, port, false, &log_path, &[], None);
 
         let cluster = Self {
             root,
@@ -688,6 +738,7 @@ impl TestCluster {
             // The backup's own databases are what it has.
             from_template: false,
             settings: Vec::new(),
+            clock: None,
             server: Mutex::new(server),
             _permit: permit,
         };
@@ -726,6 +777,7 @@ impl TestCluster {
     /// starts it again on the same data directory, socket and port and
     /// waits until it accepts connections.
     pub(crate) fn while_stopped(&self, mode: StopMode, while_down: impl FnOnce()) {
+        self.step_off_epoch_start();
         let mut server = self.server.lock().expect("server lock");
         run_to_completion(
             Command::new("pg_ctl")
@@ -749,6 +801,7 @@ impl TestCluster {
             self.tcp,
             &log_path,
             &self.settings,
+            self.clock.as_ref(),
         );
         drop(server);
         self.wait_ready(&log_path);
@@ -1105,13 +1158,15 @@ fn spawn_server(
     tcp: bool,
     log_path: &Path,
     settings: &[String],
+    clock: Option<&FakeClock>,
 ) -> Child {
     let log_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
         .expect("create postgres log file");
-    Command::new("postgres")
+    let mut command = Command::new("postgres");
+    command
         .arg("-D")
         .arg(data_dir)
         .arg("-h")
@@ -1163,9 +1218,11 @@ fn spawn_server(
                 .flat_map(|setting| ["-c".to_string(), setting]),
         )
         .stdout(Stdio::from(log_file.try_clone().expect("clone log handle")))
-        .stderr(Stdio::from(log_file))
-        .spawn()
-        .expect("spawn postgres")
+        .stderr(Stdio::from(log_file));
+    if let Some(clock) = clock {
+        clock.apply(&mut command);
+    }
+    command.spawn().expect("spawn postgres")
 }
 
 /// The environment variable [`extra_pg_options`] reads (see the module doc).
@@ -1888,6 +1945,7 @@ mod tests {
                 false,
                 &dir.join("postgres.log"),
                 &[],
+                None,
             );
             let postmaster = Self {
                 sandbox,
@@ -2127,6 +2185,7 @@ mod tests {
             DataDirSource::Template,
             settings.iter().map(|s| s.to_string()).collect(),
             false,
+            None,
             &mut || {
                 let port = ports
                     .get(picks.len())

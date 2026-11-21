@@ -21,10 +21,13 @@ mod coverage;
 mod db_admin;
 mod epoch;
 mod held_keys;
+pub mod judge;
 mod noise;
 mod pause;
+pub mod privilege;
 mod residue;
 mod restore;
+mod source_ddl;
 mod two_instance;
 
 pub use concurrent::{
@@ -43,6 +46,9 @@ pub use residue::{
     run_epochs_lapping,
 };
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
+pub use source_ddl::{
+    SourceDdlRun, run_convergence_with_source_ddl, run_convergence_with_source_ddl_allowing,
+};
 pub use two_instance::{
     InstanceLabel, InstanceRun, TwoInstanceError, chain_off, run_two_instance_convergence,
     share_source,
@@ -248,6 +254,8 @@ pub enum RunError {
         op_index: usize,
         expected: OpOutcome,
         actual: OpOutcome,
+        /// The statement's error, when it failed.
+        error: Option<String>,
     },
     /// A definition was `paused` at a settled check in a run that never
     /// expects one (the allowlist is `pause::allowance`). `message` is one
@@ -361,6 +369,34 @@ pub enum RunError {
         epoch: usize,
         error: Box<RunError>,
     },
+    /// After op `op_index`, definition `target` ended neither exact, nor
+    /// paused with a reason and exact after its `RESUME` (or refused by it
+    /// with a code), nor a listed gap the drawn shape names, detected by
+    /// `self_check` and made exact by the entry's repair ([`judge`]).
+    /// `problem` says which step broke; `detail` holds the statuses and the
+    /// oracle's report.
+    NeverSilentlyWrong {
+        op_index: usize,
+        target: String,
+        problem: String,
+        detail: String,
+    },
+    /// Carrying out a source-DDL event failed (the harness's side of it: a
+    /// statement the generator drew that Postgres refused, or a reconcile
+    /// pass the harness stepped).
+    SourceDdl {
+        op_index: usize,
+        event: Box<crate::model::SourceDdlEvent>,
+        error: String,
+    },
+    /// Op `op_index`'s application statement failed with an error raised
+    /// inside one of Trellis's capture functions: capture failed a writer
+    /// (ADR-0002 I6, #2182). Checked whatever the op was expected to do, so
+    /// an op expected to fail can't hide it.
+    CaptureFailedWriter {
+        op_index: usize,
+        error: String,
+    },
     /// A residue invariant ([`residue`]) failed at a quiet point: a Trellis
     /// table holds dead tuples after `VACUUM`, or has grown past what its
     /// peak live rows explain. One line per table.
@@ -409,6 +445,9 @@ pub async fn run_convergence<B: Backend>(
             .collect()
     };
 
+    backend
+        .expect(program)
+        .map_err(|e| RunError::Install(format!("{e:?}")))?;
     let start = timing_enabled.then(std::time::Instant::now);
     let initial_defs = due_defs(0);
     let install_result = backend
@@ -516,11 +555,17 @@ async fn apply_and_check_outcome<B: Backend>(
 /// `op` returned: an `Err` is a rejected statement ([`OpOutcome::Fails`]),
 /// `Ok(0)` a source no-op. Shared with the concurrent runner, whose lanes
 /// apply on their own connections.
-fn check_op_outcome<E>(
+fn check_op_outcome<E: std::fmt::Debug>(
     op_index: usize,
     op: &Op,
     apply_result: &Result<u64, E>,
 ) -> Result<(), RunError> {
+    if let Err(error) = apply_result {
+        let error = format!("{error:?}");
+        if raised_in_capture(&error) {
+            return Err(RunError::CaptureFailedWriter { op_index, error });
+        }
+    }
     let actual = match apply_result {
         Err(_) => OpOutcome::Fails,
         Ok(0) => OpOutcome::AffectsNoRows,
@@ -532,9 +577,33 @@ fn check_op_outcome<E>(
             op_index,
             expected: expected.clone(),
             actual,
+            error: apply_result.as_ref().err().map(|e| format!("{e:?}")),
         });
     }
     Ok(())
+}
+
+/// Whether an error's text (a database error's `Debug`, which carries its
+/// `where` context) says it was raised inside a Trellis capture function:
+/// a PL/pgSQL frame of a function named `cap_<event>_…` in any schema.
+/// A quoted name may arrive escaped once or twice (a wrapped transaction's
+/// results are `Debug` of a `Debug`), as may a compile error's
+/// `function "…"` context.
+pub fn raised_in_capture(error: &str) -> bool {
+    error.match_indices("function ").any(|(at, _)| {
+        let name = error[at + "function ".len()..]
+            .split(|c: char| c == '(' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        let bare = name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|c| c == '"' || c == '\\');
+        ["insert", "update", "delete", "truncate", "begin"]
+            .iter()
+            .any(|event| bare.starts_with(&format!("cap_{event}_")))
+    })
 }
 
 /// Quiesces, snapshots, and runs the oracle check against `defs`,
@@ -779,41 +848,53 @@ pub async fn check_defs(
 ) -> Result<Vec<(String, OracleReport)>, String> {
     let mut diverged = Vec::new();
     for def in defs {
-        let source = source_table(program, defs, &def.source).unwrap_or_else(|| {
-            panic!(
-                "program references source table {:?} it does not declare — a generator bug",
-                def.source
-            )
-        });
-        let source_columns: HashMap<String, ValueType> = source
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.value_type))
-            .collect();
-
-        let target = snapshot.get(&def.target).ok_or_else(|| {
-            format!(
-                "target table {:?} missing from snapshot — the backend did not install it",
-                def.target
-            )
-        })?;
-
-        let report = oracle::check_over(
-            pool,
-            program,
-            defs,
-            def,
-            &source.pk_col,
-            &source_columns,
-            target,
-        )
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+        let report = check_def(pool, program, defs, def, snapshot).await?;
         if report.diverged() {
             diverged.push((def.target.clone(), report));
         }
     }
     Ok(diverged)
+}
+
+/// [`check_defs`] for one definition of `defs`: its target in `snapshot`
+/// against the oracle's recompute, diverged or not.
+pub async fn check_def(
+    pool: &Pool,
+    program: &Program,
+    defs: &[TransformDef],
+    def: &TransformDef,
+    snapshot: &Snapshot,
+) -> Result<OracleReport, String> {
+    let source = source_table(program, defs, &def.source).unwrap_or_else(|| {
+        panic!(
+            "program references source table {:?} it does not declare — a generator bug",
+            def.source
+        )
+    });
+    let source_columns: HashMap<String, ValueType> = source
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.value_type))
+        .collect();
+
+    let target = snapshot.get(&def.target).ok_or_else(|| {
+        format!(
+            "target table {:?} missing from snapshot — the backend did not install it",
+            def.target
+        )
+    })?;
+
+    oracle::check_over(
+        pool,
+        program,
+        defs,
+        def,
+        &source.pk_col,
+        &source_columns,
+        target,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))
 }
 
 /// The table `name` a definition reads: one of `program`'s tables, or the
@@ -836,8 +917,38 @@ pub fn source_table(
 
 #[cfg(test)]
 mod tests {
-    use super::{DefinitionState, Divergence, OracleReport, Outcome, bursts, status_lies};
+    use super::{
+        DefinitionState, Divergence, OracleReport, Outcome, bursts, raised_in_capture, status_lies,
+    };
     use crate::model::{Op, OpOutcome, PartitionAction, PartitionStrategy, Program};
+
+    /// #2154's error: the capture function's frame in the `where` context
+    /// marks it, in any schema and quoted or not; an application's own
+    /// trigger function doesn't.
+    #[test]
+    fn a_capture_function_frame_marks_an_error_raised_in_capture() {
+        assert!(raised_in_capture(
+            "Db(Error { kind: Db, cause: Some(DbError { message: \"permission denied for table s\", \
+             where_: Some(\"SQL statement ...\\nPL/pgSQL function trellis.cap_insert_s_0123456789abcdef() \
+             line 88 at SQL statement\") }) })"
+        ));
+        assert!(raised_in_capture(
+            "PL/pgSQL function \"inst_b\".\"cap_update_t_0123\"() line 3"
+        ));
+        // Escaped by a `Debug` of a `Debug`, and a compile error's context.
+        let quoted = "PL/pgSQL function \"inst_b\".\"cap_update_T_0123\"() line 3";
+        assert!(raised_in_capture(&format!("{:?}", format!("{quoted:?}"))));
+        assert!(raised_in_capture(&format!(
+            "{:?}",
+            "compilation of PL/pgSQL function \"cap_insert_t_0123\" near line 2"
+        )));
+        assert!(!raised_in_capture(
+            "PL/pgSQL function public.wire_rewrite_t() line 2 at SQL statement"
+        ));
+        assert!(!raised_in_capture(
+            "duplicate key value violates unique constraint"
+        ));
+    }
 
     /// A one-table program partitioned by `strategy`, its ops replaced by
     /// `ops`.

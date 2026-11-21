@@ -1142,8 +1142,12 @@ async fn a_transaction_timeout_charges_no_key_and_the_page_commits_once_it_clear
 }
 
 /// Ends every `holdup_trellis` session but `it.raw`'s, so the pool's next
-/// sessions pick up a changed role setting.
+/// sessions pick up a changed role setting. `pg_terminate_backend` only
+/// signals a backend, and the pool's fast recycle check can hand out a
+/// connection whose client hasn't read the `FATAL` yet, so the pool's idle
+/// connections are closed too: the next drain opens a fresh one.
 async fn end_pool_sessions(it: &Instance) {
+    it.pool.close_idle(std::time::Duration::ZERO);
     let own: i32 = it
         .raw
         .query_one("select pg_backend_pid()", &[])
