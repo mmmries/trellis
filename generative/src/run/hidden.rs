@@ -195,10 +195,17 @@ async fn check_hidden_once(
             .clone()
             .unwrap_or_else(|| config.target_schema().to_string())
     };
+    // A program table is in the application's schema, `public` (the tiers
+    // that call this give their instance no source schema of its own); a
+    // chained definition's source is a target, in the target schema.
     let source_schema = |d: &TransformDef| {
-        d.explicit_source_schema
-            .clone()
-            .unwrap_or_else(|| config.target_schema().to_string())
+        d.explicit_source_schema.clone().unwrap_or_else(|| {
+            if program.tables.iter().any(|t| t.name == d.source) {
+                "public".to_string()
+            } else {
+                config.target_schema().to_string()
+            }
+        })
     };
     let targets: BTreeSet<String> = defined
         .iter()

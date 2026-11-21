@@ -500,6 +500,10 @@ mod residue {
         run_epochs_lapping(&mut backend, &pool, &config, db.roles(), &chain)
             .await
             .unwrap_or_else(|e| panic!("the chain should leave no residue: {e:?}"));
+        // The install drew the targets' schema; the checks name them there.
+        let config = config
+            .with_target_schema(backend.target_schema().to_string())
+            .expect("the drawn target schema");
         let mut defined = chain.program.defs.clone();
         for epoch in &chain.epochs {
             for step in &epoch.steps {
@@ -574,6 +578,7 @@ mod residue {
                     .expect("a 1-1 definition")
                     .target
                     .clone();
+                let ts = kept.config.target_schema().to_string();
                 kept.hidden(generative::run::SETTLE).await.expect("no residue before any plant");
 
                 // Each plant, with what the failure must name, and its undo.
@@ -581,10 +586,10 @@ mod residue {
                     (
                         // A dropped key's entry, kept in a live ledger.
                         format!(
-                            "insert into public.\"{one_to_one}__ledger\" (__from_key) values ('999')"
+                            "insert into \"{ts}\".\"{one_to_one}__ledger\" (__from_key) values ('999')"
                         ),
                         "ledger",
-                        format!("delete from public.\"{one_to_one}__ledger\" where __from_key = '999'"),
+                        format!("delete from \"{ts}\".\"{one_to_one}__ledger\" where __from_key = '999'"),
                         "hidden tables",
                     ),
                     (
@@ -775,11 +780,12 @@ mod residue {
                     .unwrap();
                 // Allowed: the same shape in a 1-1 ledger (#2240), and its
                 // nearby leaks.
+                let ts = kept.config.target_schema().to_string();
                 let ledger: String = operator
                     .query_one(
                         "select relname from pg_class where relname like '%__ledger' \
-                         and relnamespace = 'public'::regnamespace",
-                        &[],
+                         and relnamespace = $1::text::regnamespace",
+                        &[&kept.config.target_schema()],
                     )
                     .await
                     .map(|r| r.get(0))
@@ -788,7 +794,7 @@ mod residue {
                 {
                     let put = |key: &str, tomb: bool, seg: i64| {
                         format!(
-                            "insert into public.\"{ledger}\" (__from_key, __tombstone, __applied_seg) \
+                            "insert into \"{ts}\".\"{ledger}\" (__from_key, __tombstone, __applied_seg) \
                              values ('{key}', {tomb}, {seg})"
                         )
                     };
@@ -807,14 +813,14 @@ mod residue {
                         }
                         operator
                             .batch_execute(&format!(
-                                "delete from public.\"{ledger}\" where __from_key in ('k2', 'k3')"
+                                "delete from \"{ts}\".\"{ledger}\" where __from_key in ('k2', 'k3')"
                             ))
                             .await
                             .unwrap();
                     }
                     operator
                         .batch_execute(&format!(
-                            "delete from public.\"{ledger}\" where __from_key = 'k1'"
+                            "delete from \"{ts}\".\"{ledger}\" where __from_key = 'k1'"
                         ))
                         .await
                         .unwrap();
