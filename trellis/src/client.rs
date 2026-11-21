@@ -2020,7 +2020,7 @@ impl LockSchedule {
 /// One staging-worker reconcile pass, exactly as the maintenance loop runs it
 /// ([`reconcile_source_tables`]), for tests that step the staging worker by
 /// hand. The error is the pass's, as text.
-#[cfg(feature = "internals")]
+#[cfg(any(test, feature = "test-util"))]
 pub async fn reconcile_pass(
     client: &mut tokio_postgres::Client,
     pool: &Pool,

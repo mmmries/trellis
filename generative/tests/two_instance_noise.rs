@@ -93,7 +93,9 @@
 //! # The shapes planned for production use
 //!
 //! Everything above runs two instances that share a database but nothing
-//! else: each has its own source tables, in its own catalog schema. Three
+//! else: each has its own source tables, in a source schema of its own
+//! (`app_a`, `app_b`) owned by `app_owner`. Both run as the deployment roles
+//! of `generative::backend::CaseDatabase`, not as the superuser. Three
 //! planned production shapes have more in common than that, and each has a
 //! property and a hand-built pin below:
 //!
@@ -129,7 +131,7 @@
 //! never depends on run order or on any other property having run.
 
 use generative::backend::Backend;
-use generative::backend::{ManualBackend, SourceTables};
+use generative::backend::{CaseDatabase, ManualBackend, SourceTables};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program, build_program_multi,
     build_program_multi_with_shapes, trivial_program,
@@ -141,7 +143,7 @@ use generative::run::{
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
-use testkit::{TestCluster, TestDatabase};
+use testkit::TestCluster;
 use trellis::Config;
 use trellis::dev::pool::Pool;
 
@@ -206,53 +208,83 @@ struct Instance {
 /// (`docs/instance-identity.md`), so the instance schema needs no explicit
 /// `CREATE SCHEMA`; the *target* schema does, since nothing in the engine
 /// creates a target schema on a caller's behalf.
-async fn stand_up(db: &TestDatabase, label: InstanceLabel, tag: &str) -> Instance {
+async fn stand_up(case: &CaseDatabase, label: InstanceLabel, tag: &str) -> Instance {
     stand_up_in(
-        db,
+        case,
         label,
         &format!("trellis_{tag}"),
         &format!("targets_{tag}"),
         SourceTables::Own,
+        Some(&format!("app_{tag}")),
     )
     .await
 }
 
+/// A connection as the bootstrap superuser, for what an operator sets up
+/// before Trellis runs: the schemas and who owns them.
+async fn admin_client(case: &CaseDatabase) -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(&case.roles().admin, tokio_postgres::NoTls)
+        .await
+        .expect("connect as the bootstrap superuser");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
 /// [`stand_up`] with the instance schema, the target schema and the place
-/// the instance's source tables live all chosen by the caller.
+/// the instance's source tables live all chosen by the caller:
+/// `source_schema` is the application's schema of its own, owned by
+/// `app_owner`, which the instance's definitions name; `None` leaves them to
+/// `sources`.
+///
+/// The instance runs as `case`'s roles: Trellis as `trellis_runner`, the
+/// writes as `app_owner`. The operator (the bootstrap superuser) creates the
+/// schemas, the source schema for the application and the target schema for
+/// Trellis, which `public`'s application-held `CREATE` stands in for.
 async fn stand_up_in(
-    db: &TestDatabase,
+    case: &CaseDatabase,
     label: InstanceLabel,
     schema: &str,
     target_schema: &str,
     sources: SourceTables,
+    source_schema: Option<&str>,
 ) -> Instance {
-    let config = Config::with_schema(db.dsn().to_string(), schema.to_string())
+    let config = Config::with_schema(case.dsn().to_string(), schema.to_string())
         .expect("valid instance schema")
         .with_target_schema(target_schema.to_string())
         .expect("valid target schema");
     let pool = Pool::new(&config).expect("build oracle pool for instance");
 
-    // The target schema: nothing in the engine creates a target schema on a
-    // caller's behalf, so the harness does it, through the database's own
-    // default-schema pool (`testkit` migrated that one already) rather than
-    // through `pool` — whose `search_path` bootstrap names `target_schema`
-    // itself, which would be needlessly circular. Callers pass plain
-    // lowercase ASCII names, so the interpolation below needs no quoting;
-    // `Config::with_target_schema` above has already validated the name.
-    db.pool
-        .get()
-        .await
-        .expect("checkout for create schema")
-        .batch_execute(&format!("create schema if not exists {target_schema}"))
-        .await
-        .expect("create target schema");
+    // Callers pass plain lowercase ASCII names, so the interpolation below
+    // needs no quoting; `Config::with_target_schema` above has already
+    // validated the target's.
+    let admin = admin_client(case).await;
+    if target_schema != "public" {
+        admin
+            .batch_execute(&format!(
+                "create schema if not exists {target_schema} authorization {}",
+                generative::backend::TRELLIS_ROLE
+            ))
+            .await
+            .expect("create target schema");
+    }
+    if let Some(source_schema) = source_schema {
+        admin
+            .batch_execute(&format!(
+                "create schema if not exists {source_schema} authorization {}",
+                generative::backend::APP_ROLE
+            ))
+            .await
+            .expect("create source schema");
+    }
 
     trellis::migrate(&config)
         .await
         .expect("migrate instance schema");
 
     let mut backend =
-        ManualBackend::connect_with_instance(db.dsn(), schema, target_schema, 1, None)
+        ManualBackend::connect_as_instance(case.roles(), schema, target_schema, source_schema)
             .await
             .expect("connect instance backend");
     backend.set_source_tables(sources);
@@ -316,7 +348,7 @@ async fn run_pair(
 fn run_one(program_a: &Program, program_b: &Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
+            let db = CaseDatabase::provision(&h.cluster).await;
             let mut a = stand_up(&db, InstanceLabel::A, "a").await;
             let mut b = stand_up(&db, InstanceLabel::B, "b").await;
             run_pair(&mut a, &mut b, program_a, program_b).await
@@ -327,13 +359,14 @@ fn run_one(program_a: &Program, program_b: &Program) -> Result<(), TestCaseError
 /// Instances over one source table (shape 1): `writer` creates and writes it
 /// in `public`, `reader` only reads it. Each instance keeps its own targets
 /// in its own schema, so both can name a target `d0`.
-async fn stand_up_sharing_a_source(db: &TestDatabase) -> (Instance, Instance) {
+async fn stand_up_sharing_a_source(db: &CaseDatabase) -> (Instance, Instance) {
     let a = stand_up_in(
         db,
         InstanceLabel::A,
         "trellis_a",
         "targets_a",
         SourceTables::SharedCreate,
+        None,
     )
     .await;
     let b = stand_up_in(
@@ -342,6 +375,7 @@ async fn stand_up_sharing_a_source(db: &TestDatabase) -> (Instance, Instance) {
         "trellis_b",
         "targets_b",
         SourceTables::SharedExisting,
+        None,
     )
     .await;
     (a, b)
@@ -350,13 +384,14 @@ async fn stand_up_sharing_a_source(db: &TestDatabase) -> (Instance, Instance) {
 /// Instances in a chain (shape 2): A keeps its targets in `public`, where B's
 /// `search_path` finds them by bare name, and B reads them as its source
 /// tables.
-async fn stand_up_chain(db: &TestDatabase) -> (Instance, Instance) {
+async fn stand_up_chain(db: &CaseDatabase) -> (Instance, Instance) {
     let a = stand_up_in(
         db,
         InstanceLabel::A,
         "trellis_a",
         "public",
         SourceTables::Own,
+        None,
     )
     .await;
     let b = stand_up_in(
@@ -365,6 +400,7 @@ async fn stand_up_chain(db: &TestDatabase) -> (Instance, Instance) {
         "trellis_b",
         "targets_b",
         SourceTables::SharedExisting,
+        None,
     )
     .await;
     (a, b)
@@ -374,7 +410,7 @@ fn run_sharing_a_source(program: &Program) -> Result<(), TestCaseError> {
     let (writer, reader) = share_source(program);
     HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
+            let db = CaseDatabase::provision(&h.cluster).await;
             let (mut a, mut b) = stand_up_sharing_a_source(&db).await;
             run_pair(&mut a, &mut b, &writer, &reader).await
         })
@@ -384,7 +420,7 @@ fn run_sharing_a_source(program: &Program) -> Result<(), TestCaseError> {
 fn run_chain(program: &Program, chained: &Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db = h.cluster.create_isolated_database().await;
+            let db = CaseDatabase::provision(&h.cluster).await;
             let (mut a, mut b) = stand_up_chain(&db).await;
             run_pair(&mut a, &mut b, program, chained).await
         })
@@ -397,14 +433,15 @@ fn run_chain(program: &Program, chained: &Program) -> Result<(), TestCaseError> 
 fn run_in_two_databases(program_a: &Program, program_b: &Program) -> Result<(), TestCaseError> {
     HARNESS.with(|h| {
         h.runtime.block_on(async {
-            let db_a = h.cluster.create_isolated_database().await;
-            let db_b = h.cluster.create_isolated_database().await;
+            let db_a = CaseDatabase::provision(&h.cluster).await;
+            let db_b = CaseDatabase::provision(&h.cluster).await;
             let mut a = stand_up_in(
                 &db_a,
                 InstanceLabel::A,
                 "trellis",
                 "public",
                 SourceTables::Own,
+                None,
             )
             .await;
             let mut b = stand_up_in(
@@ -413,6 +450,7 @@ fn run_in_two_databases(program_a: &Program, program_b: &Program) -> Result<(), 
                 "trellis",
                 "public",
                 SourceTables::Own,
+                None,
             )
             .await;
             run_pair(&mut a, &mut b, program_a, program_b).await
@@ -494,7 +532,7 @@ proptest! {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_hand_built_instances_in_one_database_each_converge_independently() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
+    let db = CaseDatabase::provision(&cluster).await;
 
     let program_a = build_program(
         &[
@@ -542,17 +580,60 @@ async fn two_hand_built_instances_in_one_database_each_converge_independently() 
         )
     });
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
+
+    // Each instance's sources are the application's, in its own schema, and
+    // nowhere else: the run proves nothing about isolation if both kept
+    // their same-named tables in one place.
+    for (tag, program) in [("a", &program_a), ("b", &program_b)] {
+        for table in &program.tables {
+            let owners = owners_of(&db, &table.name).await;
+            let mine = (
+                format!("app_{tag}"),
+                generative::backend::APP_ROLE.to_string(),
+            );
+            assert!(
+                owners.contains(&mine),
+                "{} should be in app_{tag}, owned by app_owner: {owners:?}",
+                table.name
+            );
+            assert!(
+                owners
+                    .iter()
+                    .all(|(schema, owner)| schema.starts_with("app_")
+                        && owner == generative::backend::APP_ROLE),
+                "{} should be only in a source schema, owned by app_owner: {owners:?}",
+                table.name
+            );
+        }
+    }
+}
+
+/// Every `(schema, owner)` holding a table named `table`, outside the system
+/// schemas, in schema order.
+async fn owners_of(db: &CaseDatabase, table: &str) -> Vec<(String, String)> {
+    admin_client(db)
+        .await
+        .query(
+            "select n.nspname::text, pg_get_userbyid(c.relowner)::text \
+             from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+             where c.relname = $1 and c.relkind in ('r', 'p') \
+               and n.nspname not in ('pg_catalog', 'information_schema') \
+             order by 1",
+            &[&table],
+        )
+        .await
+        .expect("read owners")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
 }
 
 /// Asserts that each instance schema in `schemas` has its capture trigger
 /// installed on `schema.table`, so a run over it is known to have captured
 /// it rather than merely not noticed it.
-async fn assert_captured_by(db: &TestDatabase, schema: &str, table: &str, instances: &[&str]) {
-    let rows = db
-        .pool
-        .get()
+async fn assert_captured_by(db: &CaseDatabase, schema: &str, table: &str, instances: &[&str]) {
+    let rows = admin_client(db)
         .await
-        .expect("checkout")
         .query(
             "select tgname from pg_trigger \
              where tgrelid = format('%I.%I', $1::text, $2::text)::regclass and not tgisinternal",
@@ -578,7 +659,7 @@ async fn assert_captured_by(db: &TestDatabase, schema: &str, table: &str, instan
 #[tokio::test(flavor = "multi_thread")]
 async fn two_instances_over_one_source_table_each_match_the_oracle() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
+    let db = CaseDatabase::provision(&cluster).await;
 
     let seeds = vec![
         (Some(10), Some(1)),
@@ -653,7 +734,7 @@ async fn two_instances_over_one_source_table_each_match_the_oracle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_instance_reading_another_instances_target_matches_the_oracle() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
+    let db = CaseDatabase::provision(&cluster).await;
 
     let program = chain_program();
     let chained = chain_off(&program).expect("a one-to-one definition to chain off");
@@ -707,14 +788,15 @@ async fn two_instances_in_two_databases_each_converge_independently() {
         &[Mutate::Delete { pk: 1 }],
     );
     let cluster = TestCluster::start();
-    let db_a = cluster.create_isolated_database().await;
-    let db_b = cluster.create_isolated_database().await;
+    let db_a = CaseDatabase::provision(&cluster).await;
+    let db_b = CaseDatabase::provision(&cluster).await;
     let mut a = stand_up_in(
         &db_a,
         InstanceLabel::A,
         "trellis",
         "public",
         SourceTables::Own,
+        None,
     )
     .await;
     let mut b = stand_up_in(
@@ -723,6 +805,7 @@ async fn two_instances_in_two_databases_each_converge_independently() {
         "trellis",
         "public",
         SourceTables::Own,
+        None,
     )
     .await;
     run_pair(&mut a, &mut b, &program_a, &program_b)
@@ -787,7 +870,7 @@ fn without_first_definition(program: &Program) -> Program {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading_it() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
+    let db = CaseDatabase::provision(&cluster).await;
 
     let seeds = vec![
         (Some(10), Some(1)),
@@ -845,7 +928,7 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
         .join(" union all ");
     assert!(
         b.backend
-            .execute_raw(&staged_for_it)
+            .execute_trellis(&staged_for_it)
             .await
             .expect("read B's ring")
             > 0,
@@ -874,7 +957,7 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
     // skipping them as a paused reader's.
     assert_eq!(
         b.backend
-            .execute_raw(&staged_for_it)
+            .execute_trellis(&staged_for_it)
             .await
             .expect("read B's ring"),
         0,
@@ -895,4 +978,34 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
     }
     assert_converged(&mut a, &program_a, "after the drop's writes").await;
     assert_converged(&mut b, &program_b, "after the drop's writes").await;
+}
+
+/// A definition reading the instance's own target, in an instance whose
+/// sources are in a source schema of its own: Trellis indexes that target
+/// where the instance keeps its targets, not in the source schema, and the
+/// run converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chained_definition_in_an_instance_with_a_source_schema_converges() {
+    let cluster = TestCluster::start();
+    let db = CaseDatabase::provision(&cluster).await;
+
+    let mut program_a = chain_program();
+    let upstream = program_a.defs[0].target.clone();
+    program_a.defs.push(
+        trellis::dev::defs::parse(&format!(
+            "TRANSFORM {upstream}_by_total FROM {upstream} GROUP BY total \
+             SELECT total AS total, COUNT(*) AS n"
+        ))
+        .expect("a chained GROUP BY"),
+    );
+    let program_b = build_program(
+        &[(Some(7000), Some(700)), (Some(8000), Some(800))],
+        &[Mutate::Delete { pk: 1 }],
+    );
+
+    let mut a = stand_up(&db, InstanceLabel::A, "a").await;
+    let mut b = stand_up(&db, InstanceLabel::B, "b").await;
+    run_pair(&mut a, &mut b, &program_a, &program_b)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
 }

@@ -101,6 +101,12 @@ its `RESUME` re-keys the target in place to the new one first, and records
 the target's new key, which pauses the transforms reading the target in turn
 ([`PAUSE` and `RESUME`](../operations.md#pause-and-resume)).
 
+A key column's `NOT NULL` set or dropped changes nothing: the key's encoding
+is recorded with it ([capture](01-capture-by-triggers.md)), and a `NULL`
+reaching a column it renders raw pauses the table's readers
+([T0253](../errors.md#t0253-nullinnotnullkey),
+[T0254](../errors.md#t0254-rawkeynownullable)).
+
 ## A re-typed key column, or an outgrown copy
 
 `ALTER COLUMN ... TYPE` rewrites the table but keeps its triggers, and the
@@ -351,7 +357,7 @@ is answered as any other re-type is
    definition's share of each, so none of them is applied or re-derived
    after the resume;
 2. deletes those changes from their ring slots once drained, since a
-   group-basis or `JOIN` rebuild names groups from the old images there, and
+   group-basis or `JOIN` rebuild names groups from the images there, and
    the definition's held keys and parked images, as every resume does;
 3. re-types each column Trellis created of the old enum to the new one
    without a cast: `USING NULL`, after deleting the rows of a table whose key

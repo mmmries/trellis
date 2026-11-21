@@ -152,7 +152,10 @@ grace period, whether or not a write arrived:
 - a 1-1 `JOIN`'s joined table losing the unique key on its `ON` columns: the
   `JOIN` pauses on the next pass;
 - a primary key redefined, or the table created again with another one: the
-  readers keyed by it pause on the next drained change or the next pass.
+  readers keyed by it pause on the next drained change or the next pass;
+- a `NULL` reaching a key column Trellis renders raw: every reader pauses on
+  the drained change ([T0253](errors.md#t0253-nullinnotnullkey),
+  [T0254](errors.md#t0254-rawkeynownullable)).
 
 A primary key made deferrable halts its readers on the next drain of a change,
 unless a unique index that isn't deferrable is over exactly its columns, which

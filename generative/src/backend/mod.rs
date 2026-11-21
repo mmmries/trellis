@@ -24,8 +24,11 @@ pub use manual::{
     SERVER_STOP_RECLAIM_TTL, SHUTDOWN_TIMEOUT, SourceTables, activity_summary, activity_summary_on,
     await_pool_usable,
 };
-pub use roles::{APP_ROLE, CaseDatabase, Roles, TRELLIS_ROLE, as_role};
-pub use sql::HeldKeys;
+pub use roles::{
+    APP_ROLE, CaseDatabase, HEIR_ROLE, OTHER_OWNER_ROLE, Roles, TARGETS_SCHEMA, TRELLIS_ROLE,
+    WRITER_ROLE, as_role,
+};
+pub use sql::{HeldKeys, PREPARED_GID_PREFIX};
 pub use subprocess::{
     REACH_FILE_ENV, SubprocessBackend, SubprocessBackendError, reach_request, write_reach,
 };
@@ -89,6 +92,17 @@ impl std::fmt::Display for DefinitionState {
 /// must never go through an application-level notification API, and
 /// [`Backend::quiesce`] must be a client-side watermark poll, never a
 /// `sleep`.
+/// Panics unless every definition in `program` installs up front
+/// ([`Backend::install`]).
+fn assert_installs_now(program: &Program) {
+    assert!(
+        program.def_install_after_op.iter().all(|&at| at == 0),
+        "Backend::install installs every definition now; a deferred install \
+         (def_install_after_op {:?}) is the runner's to schedule",
+        program.def_install_after_op
+    );
+}
+
 pub trait Backend {
     type Error: std::fmt::Debug;
 
@@ -96,10 +110,24 @@ pub trait Backend {
     /// in `program.defs` (and its neighbor target table), and starts
     /// whatever engine machinery this backend needs to keep them
     /// incrementally maintained.
+    ///
+    /// Every definition installs now: a deferred install
+    /// ([`Program::def_install_after_op`]) is the runner's to schedule, so
+    /// an implementation panics on a nonzero entry rather than install it
+    /// early.
     fn install(
         &mut self,
         program: &Program,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Before the first [`Backend::install`], every definition the run may
+    /// install: `program.defs`, deferred ones and those a plan defines
+    /// mid-run included. A runner that installs a program in parts calls
+    /// it, so a backend that draws its setup from the program
+    /// (`ManualBackend`'s target schema) draws from all of it.
+    fn expect(&mut self, _program: &Program) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Applies one op as raw source DML. On success, returns the number of
     /// rows the statement affected — `0` for an update/delete that named a
@@ -172,6 +200,25 @@ pub trait OpApplier: Send + 'static {
         wrap: &crate::model::TxnWrap,
         ops: &[Op],
     ) -> impl Future<Output = Result<TxnApplied, Self::Error>> + Send;
+
+    /// Resolves a transaction [`OpApplier::apply_txn`] left prepared
+    /// ([`TxnApplied::held`]): commits it, or rolls it back and applies
+    /// `ops` again in a transaction that commits, whose results it returns
+    /// (with no `ops`, only rolls it back).
+    fn finish_prepared(
+        &mut self,
+        held: &HeldPrepared,
+        wrap: &crate::model::TxnWrap,
+        ops: &[Op],
+    ) -> impl Future<Output = Result<TxnApplied, Self::Error>> + Send;
+}
+
+/// A transaction left in `PREPARE TRANSACTION` (#2181, 2d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldPrepared {
+    pub gid: String,
+    /// Whether the program commits it (else rolls it back).
+    pub commit: bool,
 }
 
 /// What [`OpApplier::apply_txn`] did (#2181).
@@ -184,6 +231,9 @@ pub struct TxnApplied {
     /// How many times the transaction was rolled back and run again after a
     /// serialization failure or deadlock.
     pub retries: u64,
+    /// Set when the transaction is left prepared, to be resolved by
+    /// [`OpApplier::finish_prepared`] before the oracle reads the source.
+    pub held: Option<HeldPrepared>,
 }
 
 /// A [`Backend`] the concurrent tier can drive: it hands out
@@ -294,6 +344,11 @@ pub trait ClusterControl {
 
     /// Assigns and commits `count` transaction ids.
     fn burn_xids(&self, count: u32);
+
+    /// Puts the server's wall clock `seconds` ahead of real time (behind,
+    /// when negative), replacing any earlier step. The server must have been
+    /// started with a fake clock.
+    fn step_clock(&self, seconds: i64);
 }
 
 impl ClusterControl for testkit::TestCluster {
@@ -310,6 +365,10 @@ impl ClusterControl for testkit::TestCluster {
 
     fn burn_xids(&self, count: u32) {
         testkit::TestCluster::burn_xids(self, count);
+    }
+
+    fn step_clock(&self, seconds: i64) {
+        testkit::TestCluster::step_clock(self, seconds);
     }
 }
 

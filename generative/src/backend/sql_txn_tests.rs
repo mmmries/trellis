@@ -172,6 +172,7 @@ fn wrap(ops: usize, isolation: Isolation) -> TxnWrap {
         think: Duration::ZERO,
         rehearse: false,
         savepoint: None,
+        prepare: None,
     }
 }
 
@@ -316,4 +317,56 @@ async fn retried_after_a_concurrent_update(expect: OpOutcome) {
     assert!(applied.results[0].is_ok(), "{:?}", applied.results);
     assert_eq!(applied.retries, 1);
     assert_eq!(rows(&raw).await, [row(1, "2.00")]);
+}
+
+/// Every way a transaction is prepared (#2181, 2d), at every isolation
+/// level, leaves the rows the program expects once resolved: a rolled-back
+/// prepared transaction runs again and commits, and a held one is in doubt
+/// (its row locked, listed in `pg_prepared_xacts`) until
+/// [`finish_prepared`].
+#[tokio::test]
+async fn a_prepared_transaction_leaves_the_rows_the_program_expects() {
+    use OpOutcome::Succeeds;
+    let cluster = testkit::TestCluster::start();
+    let tables = tables();
+    for isolation in Isolation::ALL {
+        for (commit, hold) in [(true, false), (false, false), (true, true), (false, true)] {
+            let db = database(&cluster).await;
+            let mut raw = connect(db.dsn()).await;
+            let other = connect(db.dsn()).await;
+            let ops = [insert(1, "1.00", Succeeds), update(1, "1.50", Succeeds)];
+            let wrap = TxnWrap {
+                prepare: Some(crate::model::PrepareWrap { commit, hold }),
+                ..wrap(ops.len(), isolation)
+            };
+            let prepared = || async {
+                other
+                    .query_one("select count(*) from pg_prepared_xacts", &[])
+                    .await
+                    .expect("read")
+                    .get::<_, i64>(0)
+            };
+            let applied = apply_txn(&mut raw, &tables, &wrap, &ops)
+                .await
+                .expect("prepared");
+            assert_eq!(applied.results.len(), 2, "{wrap:?}");
+            if !hold {
+                assert!(applied.held.is_none(), "{wrap:?}");
+                assert_eq!(prepared().await, 0, "{wrap:?}");
+            } else {
+                let held = applied.held.expect("left prepared");
+                assert_eq!(held.commit, commit);
+                assert_eq!(prepared().await, 1, "{wrap:?}");
+                // Its writes are not visible, and no session is in a transaction.
+                assert!(rows(&other).await.is_empty(), "{wrap:?}");
+                raw.batch_execute("begin; rollback").await.expect("idle");
+                let finished = finish_prepared(&mut raw, &tables, &held, &wrap, &ops)
+                    .await
+                    .expect("resolved");
+                assert_eq!(finished.results.len(), if commit { 0 } else { 2 });
+                assert_eq!(prepared().await, 0, "{wrap:?}");
+            }
+            assert_eq!(rows(&other).await, [row(1, "1.50")], "{wrap:?}");
+        }
+    }
 }

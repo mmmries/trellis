@@ -273,7 +273,7 @@
 //! A build or rebuild recomputes every group in place, as one absolute write
 //! per source (a fresh build starts from an empty hidden table, and its
 //! enumeration finds the groups in the source and the ring): lock the groups of the
-//! enumeration union (the target's, the source's, and those the ring's old
+//! enumeration union (the target's, the source's, and those the ring's
 //! images name; R8) in key order, then one statement runs the source's
 //! `GROUP BY` from its snapshot and replaces each group's partials, basis,
 //! stamp and visible row. Pages keep applying, against the new bases once it
@@ -1947,7 +1947,7 @@ pub(crate) struct GroupTargetPlan {
     source_row: String,
     /// The source as the ring names it (`src_table`), unquoted.
     source: String,
-    /// The ring's segment tables, quoted and qualified, whose old images a
+    /// The ring's segment tables, quoted and qualified, whose images a
     /// rebuild's enumeration reads ([`rebuild`]).
     ring: Vec<String>,
     /// The source's row identity, which an image-less change's key names.
@@ -2238,7 +2238,7 @@ impl GroupTargetPlan {
         self
     }
 
-    /// This plan with the ring's segment tables, whose old images a build's
+    /// This plan with the ring's segment tables, whose images a build's
     /// enumeration reads ([`enumerate_cells`]).
     pub(super) fn with_ring(mut self, catalog_schema: &str) -> Self {
         self.ring = (0..super::append::RING_SIZE)
@@ -3858,11 +3858,18 @@ impl GroupTargetPlan {
     /// A rebuild's enumeration ([`rebuild`], R8): adds to
     /// [`Self::recomputed`] every group of the target's own (its hidden
     /// rows, zero groups included, and its visible rows), every group of the
-    /// source, and the group of every old image in the ring for the source
-    /// (`$1`): an old image or a statement's transition `old` row. The ring
-    /// read covers every undrained change, and may name the groups of
-    /// drained changes whose segment is not yet retired, which costs only
-    /// their recompute.
+    /// source, and the group of every image in the ring for the source
+    /// (`$1`): an old or new image, or a statement's transition `old` or
+    /// `new` row. The ring read covers every undrained change, and may name
+    /// the groups of drained changes whose segment is not yet retired, which
+    /// costs only their recompute.
+    ///
+    /// A new image's group is usually the source's too, or an old image's
+    /// of a later change. Not after a same-type `USING` rewrite, which moves
+    /// rows between groups with no trigger (#2219): an insert staged before
+    /// it names a group the source no longer has. Left out, that group has
+    /// no basis, so its page would apply the insert, which the snapshot
+    /// already counted under the row's new group.
     ///
     /// With a `scope` (one structure of a partitioned source's rebuild) it
     /// adds only the groups the scope's predicates route to the structure,
@@ -3917,18 +3924,18 @@ impl GroupTargetPlan {
         let images: Vec<String> = self
             .ring
             .iter()
-            .flat_map(|seg| {
-                [
-                    format!(
-                        "select old_image as __i from {seg} \
-                         where src_table = {source} and jsonb_typeof(old_image) = 'object'"
-                    ),
-                    format!(
-                        "select transition_images -> 'old' from {seg} \
-                         where src_table = {source} \
-                           and jsonb_typeof(transition_images -> 'old') = 'object'"
-                    ),
-                ]
+            .map(|seg| {
+                // Only a change's images are rows of the source: a marker's
+                // object (a schema change's `{missing, key_missing}`, a node
+                // truncate's `{node, oid}`) is not.
+                format!(
+                    "select i.img as __i from {seg} r \
+                     cross join lateral (values (r.old_image), (r.new_image), \
+                         (r.transition_images -> 'old'), (r.transition_images -> 'new')) as i(img) \
+                     where r.src_table = {source} \
+                       and r.op in ('insert', 'update', 'delete', 'recompute') \
+                       and jsonb_typeof(i.img) = 'object'"
+                )
             })
             .collect();
         // The stage filter (` and …`, a `JOIN`'s joined side's: a row with a
@@ -5088,7 +5095,7 @@ async fn set_leaf_settings(txn: &Transaction<'_>) -> Result<[String; 4], ApplyEr
 
 /// A JOIN build's enumeration of one side's cells (`super::join::build`,
 /// ADR-0002's R8): every cell the side's hidden table holds, every cell of
-/// its table's rows, and the cell of every old image of the ring's changes
+/// its table's rows, and the cell of every image of the ring's changes
 /// to the table ([`GroupTargetPlan::rebuild_groups_select`]), into `cells`
 /// (a session temp table, quoted and `pg_temp.`-qualified, dropped at
 /// commit), which becomes the plan's [`GroupTargetPlan::recomputed`]. A
@@ -5506,8 +5513,8 @@ enum RebuildRead {
 /// recorded when [`leaf_settings_agree`] holds.
 ///
 /// 1. **Enumerate** ([`GroupTargetPlan::rebuild_groups_sql`], R8): the
-///    target's own groups, the source's, and those named by the old images
-///    of the ring's changes to the source.
+///    target's own groups, the source's, and those named by the images of
+///    the ring's changes to the source.
 /// 2. **Lock** them in key order, in a statement of their own (R6), creating
 ///    the hidden rows of those that have none.
 /// 3. **Replace** ([`GroupTargetPlan::rebuild_sql`]): one statement takes the

@@ -165,6 +165,9 @@ pub struct Coverage {
     /// How many times the recorded runs' drawn transactions were rolled back
     /// and run again after a serialization failure or deadlock.
     pub txn_retries: u64,
+    /// How many burst actions started while a prepared transaction was in
+    /// doubt ([`crate::run::ConcurrentRun::in_doubt_actions`]).
+    pub in_doubt_actions: u64,
 }
 
 impl Coverage {
@@ -1401,7 +1404,8 @@ impl fmt::Display for Coverage {
             write!(f, " {shape}:{key_space}={count}")?;
         }
         writeln!(f)?;
-        writeln!(f, "txn_retries: {}", self.txn_retries)
+        writeln!(f, "txn_retries: {}", self.txn_retries)?;
+        writeln!(f, "in_doubt_actions: {}", self.in_doubt_actions)
     }
 }
 

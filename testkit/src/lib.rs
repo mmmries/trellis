@@ -33,6 +33,7 @@
 pub mod blocking;
 pub mod cluster;
 pub mod crash;
+pub mod faketime;
 #[cfg(feature = "engine-access")]
 pub mod fixtures;
 pub mod locale;

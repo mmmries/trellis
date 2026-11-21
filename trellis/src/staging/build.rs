@@ -644,7 +644,8 @@ async fn start(
     }
     // A table the definition keys by that has lost the index over its
     // recorded key fails the start, naming it, and the caller pauses the
-    // definition with that reason (#1719).
+    // definition with that reason (#1719); so does a `NULL` in a key column
+    // the record renders raw (T0253, #2217).
     crate::defs::recorded_keys::check(&txn, definition).await?;
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
@@ -1778,10 +1779,13 @@ async fn stage_null_keys(
 ) -> Result<(), ApplyError> {
     use crate::staging::append::{self, StagedChange};
 
+    // `num_nulls`, not `is null`: on a partitioned source whose `NOT NULL`
+    // Postgres 18 validated over a `NULL`-holding partition (#2216), the
+    // planner folds `is null` to false.
     let nullable: Vec<String> = pk
         .iter()
         .filter(|c| c.nullable)
-        .map(|c| format!("{} is null", quote_ident(&c.name)))
+        .map(|c| format!("pg_catalog.num_nulls({}) > 0", quote_ident(&c.name)))
         .collect();
     if nullable.is_empty() {
         return Ok(());
@@ -3239,6 +3243,12 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         if building.is_empty() {
             return;
         }
+        // A failure whose record failed too (`run_claimed`'s warning) leaves
+        // this loop's claim held for the stale-claim sweep, which this loop
+        // doesn't run: free it now, as that sweep would, and count a retry.
+        if release_own_claims(pool, CLAIMED_BY).await {
+            last_retry = Some(Instant::now());
+        }
         let mut progressed = false;
         let claimed = {
             let client = pool.get().await.expect("acquire a connection");
@@ -3289,11 +3299,77 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
             assert!(
                 last_progress.elapsed() < stall,
                 "the running re-derive builds {building:?} made no progress for {stall:?} \
-                 (a chunk that fails and retries every time is no progress)"
+                 (a chunk that fails and retries every time is no progress); unfinished \
+                 rows: {}",
+                unfinished_rows(pool).await
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// Frees every unfinished chunk `claimed_by` still holds; whether it held
+/// any. A release that fails (a lock timeout behind whatever failed the
+/// record) is tried again on the next call.
+#[cfg(any(test, feature = "internals"))]
+async fn release_own_claims(pool: &Pool, claimed_by: &str) -> bool {
+    let Ok(mut client) = pool.get().await else {
+        return false;
+    };
+    let Ok(held) = client
+        .query(
+            "select id from backfill_chunks where claimed_by = $1 and not done",
+            &[&claimed_by],
+        )
+        .await
+    else {
+        return false;
+    };
+    for row in &held {
+        let _ = chunk_queue::release_chunk(&mut **client, row.get(0), claimed_by).await;
+    }
+    !held.is_empty()
+}
+
+/// The unfinished `backfill_chunks` rows, for [`settle_builds`]'s stall
+/// message: bounded by a timeout, and saying why when it can't read them.
+#[cfg(any(test, feature = "internals"))]
+async fn unfinished_rows(pool: &Pool) -> String {
+    let read = async {
+        let client = pool.get().await.map_err(|err| err.to_string())?;
+        client
+            .query(
+                "select id, kind, claimed_by, attempts, charged, last_error, \
+                        next_attempt_at > now(), fence_xid::text \
+                 from backfill_chunks where not done order by id",
+                &[],
+            )
+            .await
+            .map_err(|err| err.to_string())
+    };
+    tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .unwrap_or_else(|_| Err("timed out".to_string()))
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "(id {}, {}, claimed_by {:?}, attempts {}, charged {}, error {:?}, \
+                         backing off {:?}, fence {:?})",
+                        r.get::<_, i64>(0),
+                        r.get::<_, String>(1),
+                        r.get::<_, Option<String>>(2),
+                        r.get::<_, i32>(3),
+                        r.get::<_, i32>(4),
+                        r.get::<_, Option<String>>(5),
+                        r.get::<_, Option<bool>>(6),
+                        r.get::<_, Option<String>>(7),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|err| format!("(unreadable: {err})"))
 }
 
 /// The failures `chunk`'s row has recorded and how many were charged
@@ -3531,5 +3607,87 @@ mod tests {
             .expect("sample the quarantined keys");
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].key, "150");
+    }
+
+    /// A chunk whose failure couldn't be recorded either (both wait past the
+    /// database's `lock_timeout` behind a lock on the definition row, which a
+    /// pause or resume holds) keeps its claim until the stale-claim sweep:
+    /// [`settle_builds`] frees it and retries, instead of reading the held
+    /// claim as a stall.
+    #[tokio::test]
+    async fn settle_builds_retries_a_chunk_whose_failure_record_timed_out() {
+        use crate::defs::ast::ValueType;
+        use crate::integer::IntWidth;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (mut raw, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        raw.batch_execute(&format!(
+            "alter database \"{}\" set lock_timeout to '100ms'; \
+             set search_path to {}, public; \
+             create table public.nums (id bigint primary key, x integer); \
+             insert into public.nums select i, i from generate_series(1, 300) i",
+            db.name(),
+            crate::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("seed the source");
+        // Its connections open after the default, so they take it.
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+        let pool = Pool::new(&config).expect("build a same-crate pool");
+        let columns = HashMap::from([
+            ("id".to_string(), ValueType::Integer(IntWidth::Int8)),
+            ("x".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        crate::defs::install_definition(
+            &pool,
+            "TRANSFORM doubles FROM nums SELECT x + x AS doubled",
+            &columns,
+            "public",
+        )
+        .await
+        .expect("install_definition");
+        crate::client::reconcile_pass(&mut raw, &pool, crate::config::DEFAULT_SCHEMA)
+            .await
+            .expect("start the build");
+
+        let (holder, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        holder
+            .batch_execute(&format!(
+                "set search_path to {}; begin; select 1 from transform_definitions \
+                 where target_table like '%.doubles' for update",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("lock the definition row");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            holder.batch_execute("commit").await.expect("release");
+        });
+        settle_builds(&pool).await;
+        release.await.expect("the holder committed");
+        let (status, rows): (String, i64) = {
+            let row = raw
+                .query_one(
+                    "select (select status from transform_definitions \
+                             where target_table like '%.doubles'), \
+                            (select count(*) from public.doubles where doubled = 2 * id)",
+                    &[],
+                )
+                .await
+                .expect("read the build");
+            (row.get(0), row.get(1))
+        };
+        assert_eq!((status.as_str(), rows), ("live", 300));
     }
 }

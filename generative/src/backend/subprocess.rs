@@ -140,6 +140,12 @@ pub enum SubprocessBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
+    /// A drain page failed `ring_wait::MAX_DRAIN_ATTEMPTS` times in a
+    /// row with no commit and is still failing (#2185 6c): the engine
+    /// retries without bound. `holdups` names each such page.
+    RetriesUnbounded {
+        holdups: String,
+    },
     Config(trellis::Error),
     Trellis(trellis::TrellisError),
     Catalog(CatalogError),
@@ -158,6 +164,9 @@ impl From<sql::QuiesceError> for SubprocessBackendError {
             }
             sql::QuiesceError::PartitionsUnsettled { unsettled, waited } => {
                 SubprocessBackendError::PartitionSettleTimeout { unsettled, waited }
+            }
+            sql::QuiesceError::RetriesUnbounded { holdups } => {
+                SubprocessBackendError::RetriesUnbounded { holdups }
             }
         }
     }
@@ -396,7 +405,7 @@ impl SubprocessBackend {
             maintenance_interval,
         )
         .await?;
-        backend.app = connect_app(roles).await?;
+        backend.app = connect_app(roles, None).await?;
         Ok(backend)
     }
 
@@ -672,6 +681,7 @@ impl super::Backend for SubprocessBackend {
     type Error = SubprocessBackendError;
 
     async fn install(&mut self, program: &Program) -> Result<(), SubprocessBackendError> {
+        super::assert_installs_now(program);
         for table in &program.tables {
             sql::create_source_table(self.app_session(), None, table).await?;
             self.tables.insert(table.name.clone(), table.clone());

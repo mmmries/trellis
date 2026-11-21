@@ -340,7 +340,8 @@ async fn a_pending_migration_is_not_run_while_a_process_is_live() {
         )
         .await
         .expect("marker");
-    assert_eq!(marker.get::<_, String>(0), "0.2.0");
+    // V22 (the key encoding record) raises it to 0.4.0.
+    assert_eq!(marker.get::<_, String>(0), "0.4.0");
     assert_eq!(marker.get::<_, i32>(1), 2);
     let pass = handover_pass_as(&pool, &config(&db), "probe")
         .await
@@ -426,7 +427,8 @@ async fn a_background_process_migrates_itself_once_the_old_version_is_gone() {
         )
         .await
         .expect("marker");
-    assert_eq!(marker.get::<_, String>(0), "0.2.0");
+    // V22 (the key encoding record) raises it to 0.4.0.
+    assert_eq!(marker.get::<_, String>(0), "0.4.0");
     assert_eq!(marker.get::<_, i32>(1), 2);
     let rows = registry(&raw).await;
     assert!(
@@ -781,7 +783,7 @@ async fn migrate_beside_a_newer_version_still_refuses_below_the_catalog_floor() 
     // A release at the floor: a development build's own version is below it,
     // and its own migrations' floor doesn't cover one it lacks.
     let trellis = Trellis::connect(
-        config(&db).with_binary_version("0.2.0"),
+        config(&db).with_binary_version("0.4.0"),
         TrellisOptions::default(),
     )
     .await

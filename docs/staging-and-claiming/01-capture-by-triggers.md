@@ -24,10 +24,17 @@ segment with one `INSERT … SELECT`:
 - **Keys.** Every ring row is keyed by the table's key, in declared
   order, joined with `\x1f` for a composite key: its primary key, or the
   `KEY (…)` its definitions name ([ADR-0026](../decisions/0026-source-keys.md)).
-  A nullable `KEY` column (on a `NULLS NOT DISTINCT` index) is encoded as the
-  build encodes it: `NULL` is `\x01` and a real `\x01` is doubled, so the
-  `NULL`-keyed row is a row of its own, never the `''` row. Whether a row is
-  there is never read from such a column.
+  A `KEY` on a `NULLS NOT DISTINCT` index is encoded as the build encodes
+  it: `NULL` is `\x01` and a real `\x01` is doubled, so the `NULL`-keyed row
+  is a row of its own, never the `''` row. Any other key renders raw. The
+  encoding is recorded with the table's key when Trellis first keys it, and
+  every encoder and decoder reads the record, never the live catalog, so a
+  `SET NOT NULL`, `DROP NOT NULL` or `VALIDATE CONSTRAINT` doesn't change it;
+  only a resume that records the key again does. A `NULL` that reaches a raw
+  key column pauses the table's readers before the drain applies it
+  ([T0253](../errors.md#t0253-nullinnotnullkey),
+  [T0254](../errors.md#t0254-rawkeynownullable)). Whether a row is there is
+  never read from an encoded column.
   A table with neither, a partitioned table without a primary key, or a table in a partition or inheritance
   hierarchy is refused (see
   [supported sources and targets](../transforms.md#supported-sources-and-targets)).

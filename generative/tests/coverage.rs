@@ -15,7 +15,9 @@ use generative::generate::{
     program_with_mid_stream_def_install, program_with_scale_out, table_streams, trivial_program,
     trivial_program_with,
 };
-use generative::model::{DbAdminAction, NoiseAction, NoiseEventKind, Op, Program, Table};
+use generative::model::{
+    CounterLimit, DbAdminAction, NoiseAction, NoiseEventKind, Op, Program, Table,
+};
 use generative::run::{ConcurrentShape, Coverage};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestError, TestRng, TestRunner};
@@ -1207,6 +1209,33 @@ fn db_admin_plans_draw_freezes_and_wraps_across_every_tail_band() {
     assert_eq!(bands, [true; 3], "tail bands drawn: {bands:?}");
 }
 
+/// The coverage floor for the `db_admin` property's counter starts: across
+/// 400 drawn plans, at least 10% start the counters near `i32::MAX` and at
+/// least 10% near `i64::MAX`.
+#[test]
+fn db_admin_plans_start_counters_near_both_limits() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|program| db_admin_plan_for(&program));
+    let samples = 400;
+    let (mut narrow, mut wide) = (0, 0);
+    for _ in 0..samples {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        match plan.counters_near {
+            Some(CounterLimit::Int32 { .. }) => narrow += 1,
+            Some(CounterLimit::Int64) => wide += 1,
+            None => {}
+        }
+    }
+    assert!(
+        narrow * 10 >= samples,
+        "{narrow} of {samples} near i32::MAX"
+    );
+    assert!(wide * 10 >= samples, "{wide} of {samples} near i64::MAX");
+}
+
 /// The coverage floor: `program_with_mid_stream_def_install`
 /// must actually draw a deferred install (a nonzero `def_install_after_op`
 /// entry) across enough samples — sampled the same way as
@@ -1957,6 +1986,22 @@ fn every_transaction_shape_is_drawn_against_every_key_space() {
         }
     }
     assert!(missing.is_empty(), "never drawn: {missing:?}\n{coverage}");
+}
+
+/// #2181 2d: a held prepared transaction is drawn in a burst that pauses or
+/// resumes. This counts draws; that an action really runs while one is in
+/// doubt is floored by
+/// `prepared_transactions::generated_actions_run_while_a_transaction_is_in_doubt`.
+#[test]
+fn a_held_prepared_transaction_is_drawn_in_a_pausing_burst() {
+    let coverage = concurrent_tier_coverage(4);
+    let drawn: usize = coverage
+        .txn_shapes
+        .iter()
+        .filter(|((shape, _), _)| *shape == generative::generate::txn_shapes::HELD_ACROSS_PAUSE)
+        .map(|(_, n)| n)
+        .sum();
+    assert!(drawn > 0, "never drawn\n{coverage}");
 }
 
 /// #2181 2c: every application wiring shape (a shadow kept by each kind of

@@ -32,21 +32,33 @@ pub struct H {
     pub raw: Client,
     pub trellis: Trellis,
     pub db: TestDatabase,
-    _cluster: TestCluster,
+    pub cluster: TestCluster,
     pub targets: Vec<String>,
 }
 
 impl H {
     /// `ddl` run after the enum is created, `definitions` defined and live.
     pub async fn new(ddl: &str, definitions: &[&str]) -> H {
+        Self::new_aged(ddl, definitions, None).await
+    }
+
+    /// [`H::new`], with the cluster's transaction ids aged to `lead` ids
+    /// short of the epoch edge ([`TestCluster::age_xids_to_epoch_edge`])
+    /// after `ddl` and before the definitions, when `lead` is set.
+    pub async fn new_aged(ddl: &str, definitions: &[&str], lead: Option<u32>) -> H {
         let cluster = TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let raw = connect(db.dsn()).await;
+        let mut raw = connect(db.dsn()).await;
         raw.batch_execute(&format!(
             "create type public.tone as enum ('brisk', 'calm'); {ddl}"
         ))
         .await
         .expect("source DDL");
+        if let Some(lead) = lead {
+            drop(raw);
+            cluster.age_xids_to_epoch_edge(lead);
+            raw = connect(db.dsn()).await;
+        }
         let trellis = Trellis::connect(
             Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
             TrellisOptions::default(),
@@ -63,7 +75,7 @@ impl H {
             raw,
             trellis,
             db,
-            _cluster: cluster,
+            cluster,
             targets,
         };
         h.converge("bring live").await;

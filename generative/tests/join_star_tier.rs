@@ -40,15 +40,21 @@ fn fnv(hash: u64, bytes: &[u8]) -> u64 {
 
 /// A digest of what a case runs: its ops, its definitions' text, its plan,
 /// and its engine settings. A definition's `WHERE` and the plan's wiring are
-/// left out: the arms that draw them (#2043, `generate::where_clause`; #2181,
-/// `generate::wiring`) are derived from the program, so the rest of every
-/// case is what it was before each arm existed.
+/// left out, as is a transaction's preparation: the arms that draw them
+/// (#2043, `generate::where_clause`; #2181, `generate::wiring` and
+/// `txn_shapes`'s prepare draw) are derived from the program, so the rest of
+/// every case is what it was before each arm existed.
 fn digest(cases: &[JoinCase]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     for case in cases {
         let mut plan = case.plan.clone();
         plan.wiring.clear();
-        let plan = format!("{plan:?}").replace(", wiring: []", "");
+        for txn in &mut plan.txns {
+            txn.prepare = None;
+        }
+        let plan = format!("{plan:?}")
+            .replace(", wiring: []", "")
+            .replace(", prepare: None", "");
         for def in &case.program.defs {
             let mut def = def.clone();
             def.predicate = trellis::dev::defs::ast::Predicate::True;

@@ -143,6 +143,11 @@ pub async fn run_epochs_lapping(
         })
         .await
         .map_err(|e| in_epoch(0)(RunError::Install(format!("{e:?}"))))?;
+    // The install drew the targets' schema; residue names them there.
+    let config = &config
+        .clone()
+        .with_target_schema(backend.target_schema().to_string())
+        .map_err(|e| in_epoch(0)(RunError::Install(format!("{e:?}"))))?;
     let mut defined: Vec<TransformDef> = program.defs.clone();
     let mut ever: Vec<TransformDef> = program.defs.clone();
     let peaks = peak_live_rows(program);

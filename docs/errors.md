@@ -1252,6 +1252,27 @@ other failure leaves the page a
 Fix the data, or the trigger or constraint, then `RESUME` to rebuild it; a
 rebuild that still fails pauses as any build does.
 
+### T0253 NullInNotNullKey
+
+A key column Postgres reads as `NOT NULL` holds a `NULL`, and the table's
+[recorded key](transforms.md#the-key-a-transform-keys-each-table-by) renders
+that column raw, so the row can't be keyed. Postgres 18 can leave this state:
+`SET NOT NULL` on a partitioned table validates over a `NOT VALID` partition
+that holds `NULL`. A drain pauses every reader of the table, a build pauses
+its definition, and define, `RESUME` and `self_check` refuse. Remove the
+`NULL`s, or fix the partition (`DETACH` it, or `VALIDATE CONSTRAINT` its
+`NOT NULL`), then `RESUME`. After define: [Key](transforms.md#key).
+
+### T0254 RawKeyNowNullable
+
+A key column can hold `NULL` after a `DROP NOT NULL`, and the table's recorded
+key renders it raw: a key recorded before Trellis recorded its encoding, on a
+`NULLS NOT DISTINCT` index over `NOT NULL` columns. A `NULL` that reaches the
+drain pauses every reader of the table; define refuses a new reader. `RESUME`
+records the key again so that it encodes `NULL`, and rebuilds; to define a new
+reader first, `PAUSE TRANSFORM` and `RESUME` one already running. After
+define: [Key](transforms.md#key).
+
 ## Self-check
 
 A [`self_check`](operations.md#self_check) that can't run, or stopped.
@@ -1267,8 +1288,7 @@ A `self_check` limit that isn't a positive row count. Pass a positive limit.
 ### T0194 UnsupportedExpr
 
 A `self_check` of a field it can't render, or of a definition whose recorded
-state is missing. Report it as a bug. A `NULL` key in a column read as
-`NOT NULL` means the column's `NOT NULL` changed during the check: run it again.
+state is missing. Report it as a bug.
 
 ### T0195 PageTimedOut
 

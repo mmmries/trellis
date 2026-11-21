@@ -195,6 +195,14 @@ pub(crate) enum PauseReason {
     },
     /// A drain's page failed with a halting error on `table` (kind `halt`).
     Halt { table: String, text: String },
+    /// A drain or build observed a `NULL` in `columns` of `table`, key
+    /// columns Postgres still reads as `NOT NULL` and the table's recorded
+    /// key renders raw (T0253). Stands until a resume, which re-validates.
+    NullInNotNullKey { table: String, columns: Vec<String> },
+    /// `columns` of `table`, key columns the table's recorded key renders
+    /// raw, can hold `NULL` now (T0254). Stands: a resume records the key
+    /// again, encoded.
+    RawKeyNowNullable { table: String, columns: Vec<String> },
     /// Any other capture failure about `columns` of `table`: a column or
     /// table capture can't serve, a key or type define would refuse now, a
     /// stored definition this release refuses to load. `caused_by` is the
@@ -239,6 +247,8 @@ impl PauseReason {
             | PauseReason::Restore { table }
             | PauseReason::Relabel { table, .. }
             | PauseReason::Halt { table, .. }
+            | PauseReason::NullInNotNullKey { table, .. }
+            | PauseReason::RawKeyNowNullable { table, .. }
             | PauseReason::Capture { table, .. } => table,
             PauseReason::MissingProbeIndex { index, .. } => &index.table,
         }
@@ -247,9 +257,10 @@ impl PauseReason {
     /// The columns of [`PauseReason::table`] it is about, if any.
     pub(crate) fn columns(&self) -> &[String] {
         match self {
-            PauseReason::MissingColumns { columns, .. } | PauseReason::Capture { columns, .. } => {
-                columns
-            }
+            PauseReason::MissingColumns { columns, .. }
+            | PauseReason::Capture { columns, .. }
+            | PauseReason::NullInNotNullKey { columns, .. }
+            | PauseReason::RawKeyNowNullable { columns, .. } => columns,
             PauseReason::KeyChanged { old, .. } | PauseReason::KeyRerecorded { old, .. } => old,
             PauseReason::UnbackedKey { key, .. } => key,
             PauseReason::MissingProbeIndex { index, .. } => &index.columns,
@@ -272,6 +283,8 @@ impl PauseReason {
             | PauseReason::Restore { .. }
             | PauseReason::Relabel { .. }
             | PauseReason::Halt { .. }
+            | PauseReason::NullInNotNullKey { .. }
+            | PauseReason::RawKeyNowNullable { .. }
             | PauseReason::Capture { .. } => Recheck::Stands,
         }
     }
@@ -416,6 +429,19 @@ impl std::fmt::Display for PauseReason {
                 "{}; Trellis's staged changes and keys still name the old label; resume to \
                  rebuild the target from the source",
                 changes.join("; ")
+            ),
+            PauseReason::NullInNotNullKey { table, columns } => write!(
+                f,
+                "{}: {}, then resume the definition to rebuild it",
+                crate::error_code::SharedCondition::NullInNotNullKey.error_id(),
+                crate::defs::ddl::null_in_not_null_key(table, columns)
+            ),
+            PauseReason::RawKeyNowNullable { table, columns } => write!(
+                f,
+                "{}: {}. RESUME records the key again so that it encodes NULL, and rebuilds the \
+                 definition",
+                crate::error_code::SharedCondition::RawKeyNowNullable.error_id(),
+                crate::defs::ddl::raw_key_now_nullable(table, columns)
             ),
             PauseReason::Disruption { text, .. }
             | PauseReason::Halt { text, .. }

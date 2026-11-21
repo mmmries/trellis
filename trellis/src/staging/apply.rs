@@ -5695,6 +5695,9 @@ async fn drain_batch(
         }
         checked => checked?,
     }
+    // A `NULL` in a key column the table's record renders raw pauses the
+    // table's readers before the page computes anything for them (#2217).
+    super::null_key::pause_readers_of_null_keys(pool, &folded).await?;
 
     let mut backoff = FenceMissBackoff::new();
     let mut transient = TransientRetry::new();

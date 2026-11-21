@@ -278,6 +278,7 @@ async fn every_wiring_keeps_each_ops_outcome_and_its_shadows() {
                 end: 2,
                 rollback: true,
             }),
+            prepare: None,
         };
         let applied = apply_txn(&mut raw, &tables, &wrap, &ops)
             .await
