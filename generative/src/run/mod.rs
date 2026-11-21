@@ -363,6 +363,11 @@ pub enum RunError {
         op_index: usize,
         error: String,
     },
+    /// Transactions still prepared (#2181, 2d) when the oracle was about to
+    /// read the source: the harness resolves each as the program says before
+    /// it quiesces, so one left is a harness bug, or a prepared transaction
+    /// the run lost track of. Their gids.
+    LeftPrepared(Vec<String>),
     /// Epoch `epoch` of an epoch chain ([`run_epochs`]) failed with
     /// `error`. Epoch `0` is the chain's first program.
     Epoch {
@@ -628,6 +633,7 @@ async fn quiesce_snapshot_and_check<B: Backend>(
     timing_enabled: bool,
     kind: RunKind,
 ) -> Result<(), RunError> {
+    check_none_prepared(pool).await?;
     backend
         .quiesce()
         .await
@@ -652,6 +658,29 @@ async fn quiesce_snapshot_and_check<B: Backend>(
         return Err(RunError::Diverged(divergence));
     }
     Ok(())
+}
+
+/// Fails with [`RunError::LeftPrepared`] if a transaction of the generative
+/// suite is still prepared in the source's database.
+pub async fn check_none_prepared(pool: &Pool) -> Result<(), RunError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| RunError::Oracle(format!("read prepared transactions: {e:?}")))?;
+    let rows = client
+        .query(
+            "select gid from pg_prepared_xacts \
+             where database = current_database() and gid like $1 order by gid",
+            &[&format!("{}%", crate::backend::PREPARED_GID_PREFIX)],
+        )
+        .await
+        .map_err(|e| RunError::Oracle(format!("read prepared transactions: {e:?}")))?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    Err(RunError::LeftPrepared(
+        rows.iter().map(|r| r.get::<_, String>(0)).collect(),
+    ))
 }
 
 /// `defs`' [`DefinitionState`]s once the engine has settled, after checking

@@ -595,6 +595,7 @@ fn run_concurrent_case(
                 Ok(run) => {
                     coverage.borrow_mut().record_drain(&run.drain);
                     coverage.borrow_mut().txn_retries += run.txn_retries;
+                    coverage.borrow_mut().in_doubt_actions += run.in_doubt_actions;
                     if run.outcome.as_pass() {
                         Ok(())
                     } else {

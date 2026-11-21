@@ -388,6 +388,15 @@ draws the program it drew before.
   re-run. An op that may fail runs in its own savepoint. A serialization
   failure or deadlock reruns the transaction from the start; the coverage
   report counts these as `txn_retries`.
+- **Prepared transactions.** Some transactions end in `PREPARE TRANSACTION`
+  and then `COMMIT PREPARED` or `ROLLBACK PREPARED` (`model::PrepareWrap`); a
+  rolled-back one runs again and commits. One that ends its lane may stay
+  prepared until the burst's actions (a pause, a resume, a build) have fired,
+  so they land while it is in doubt. A prepared transaction still left when
+  the oracle is about to read the source fails the case
+  (`RunError::LeftPrepared`). Every testkit cluster allows prepared
+  transactions. No concurrent plan restarts the engine, so a restart across
+  one is `tests/prepared_transactions.rs`'s by-hand case.
 - **Application wiring.** Some tables get triggers and a foreign key, as an
   application installs them (`ConcurrentPlan::wiring`, `generate::wiring`).
   A shadow row `k + SHADOW_OFFSET` follows each row `k`, kept by a row or

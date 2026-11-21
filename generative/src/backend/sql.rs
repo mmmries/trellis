@@ -1790,6 +1790,8 @@ fn retryable(err: &ApplyOpError) -> bool {
 enum Attempt {
     /// Committed, with each op's result.
     Committed(Vec<Result<u64, String>>),
+    /// Prepared and left prepared as `gid` ([`PrepareWrap::hold`]).
+    Held(Vec<Result<u64, String>>, String),
     /// An op the program expected to succeed failed, the last result: the
     /// transaction is aborted.
     Aborted(Vec<Result<u64, String>>),
@@ -1828,10 +1830,28 @@ pub(super) async fn apply_txn(
     loop {
         let attempt = txn_attempt(raw, tables, wrap, ops).await;
         match attempt {
-            Attempt::Committed(results) => return Ok(super::TxnApplied { results, retries }),
+            Attempt::Committed(results) => {
+                return Ok(super::TxnApplied {
+                    results,
+                    retries,
+                    held: None,
+                });
+            }
+            Attempt::Held(results, gid) => {
+                let commit = wrap.prepare.is_some_and(|p| p.commit);
+                return Ok(super::TxnApplied {
+                    results,
+                    retries,
+                    held: Some(super::HeldPrepared { gid, commit }),
+                });
+            }
             Attempt::Aborted(results) => {
                 raw.batch_execute("rollback").await?;
-                return Ok(super::TxnApplied { results, retries });
+                return Ok(super::TxnApplied {
+                    results,
+                    retries,
+                    held: None,
+                });
             }
             Attempt::Retry(err) => {
                 raw.batch_execute("rollback").await?;
@@ -1882,13 +1902,28 @@ async fn txn_attempt(
         Ok(())
     };
     step!(begin(raw).await);
-    if wrap.rehearse {
+    // A prepared transaction rolled back at once is a rehearsal that ends in
+    // `PREPARE` and `ROLLBACK PREPARED`.
+    let rehearse_prepared = wrap.prepare.is_some_and(|p| !p.commit && !p.hold);
+    if wrap.rehearse || rehearse_prepared {
         match run_ops(raw, tables, wrap, ops, 0..ops.len()).await {
             Ok(Ok(_)) => {}
             Ok(Err(results)) => return Attempt::Aborted(results),
             Err(err) => return classify(err),
         }
-        step!(raw.batch_execute("rollback").await);
+        if rehearse_prepared {
+            let gid = next_gid();
+            step!(
+                raw.batch_execute(&format!("prepare transaction '{gid}'"))
+                    .await
+            );
+            step!(
+                raw.batch_execute(&format!("rollback prepared '{gid}'"))
+                    .await
+            );
+        } else {
+            step!(raw.batch_execute("rollback").await);
+        }
         step!(begin(raw).await);
     }
     let mut results = Vec::with_capacity(ops.len());
@@ -1932,8 +1967,70 @@ async fn txn_attempt(
             );
         }
     }
-    step!(raw.batch_execute("commit").await);
-    Attempt::Committed(results)
+    match wrap.prepare.filter(|p| p.commit || p.hold) {
+        None => {
+            step!(raw.batch_execute("commit").await);
+            Attempt::Committed(results)
+        }
+        Some(p) => {
+            let gid = next_gid();
+            step!(
+                raw.batch_execute(&format!("prepare transaction '{gid}'"))
+                    .await
+            );
+            if p.hold {
+                return Attempt::Held(results, gid);
+            }
+            step!(raw.batch_execute(&format!("commit prepared '{gid}'")).await);
+            Attempt::Committed(results)
+        }
+    }
+}
+
+/// A global transaction id no other prepared transaction of this process
+/// shares. The harness fails a case that leaves one prepared at the oracle
+/// ([`PREPARED_GID_PREFIX`]).
+fn next_gid() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{PREPARED_GID_PREFIX}{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Every prepared transaction the generative suite makes has a gid with this
+/// prefix.
+pub const PREPARED_GID_PREFIX: &str = "trellis_gen_";
+
+/// Resolves a transaction [`apply_txn`] left prepared, as the program says:
+/// `COMMIT PREPARED`, or `ROLLBACK PREPARED` and then `wrap`'s ops again in
+/// a transaction that commits (the oracle identity), whose result this
+/// returns. With no `ops` it only rolls back.
+pub(super) async fn finish_prepared(
+    raw: &mut tokio_postgres::Client,
+    tables: &HashMap<String, Table>,
+    held: &super::HeldPrepared,
+    wrap: &TxnWrap,
+    ops: &[Op],
+) -> Result<super::TxnApplied, ApplyOpError> {
+    let gid = &held.gid;
+    if held.commit {
+        raw.batch_execute(&format!("commit prepared '{gid}'"))
+            .await?;
+        return Ok(super::TxnApplied::default());
+    }
+    raw.batch_execute(&format!("rollback prepared '{gid}'"))
+        .await?;
+    if ops.is_empty() {
+        return Ok(super::TxnApplied::default());
+    }
+    let again = TxnWrap {
+        prepare: None,
+        rehearse: false,
+        ..wrap.clone()
+    };
+    apply_txn(raw, tables, &again, ops).await
 }
 
 #[cfg(test)]
