@@ -24,8 +24,11 @@ update definition_keys k
        select a.attname::text
          from pg_catalog.pg_attribute a
         where a.attrelid = pg_catalog.to_regclass(
-                  pg_catalog.format('%I.%I', split_part(k.table_name, '.', 1),
-                                    split_part(k.table_name, '.', 2)))
+                  -- Split on the first `.`, as `defs::ddl::regclass_arg` does:
+                  -- a table's own name can hold one.
+                  pg_catalog.format('%I.%I',
+                      substr(k.table_name, 1, strpos(k.table_name, '.') - 1),
+                      substr(k.table_name, strpos(k.table_name, '.') + 1)))
           and a.attname::text = any(k.key_columns)
           and a.attnum > 0 and not a.attisdropped
           and not (a.attnotnull and not exists (

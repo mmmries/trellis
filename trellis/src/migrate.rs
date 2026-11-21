@@ -789,6 +789,103 @@ mod tests {
         assert!(refused.is_err(), "a floor is a release: {refused:?}");
     }
 
+    /// #2147: the key-encoding migration fills each existing record from
+    /// the reading the release before it encoded by (each key column that
+    /// can hold `NULL` now), rewrites no stored key, raises the floor, and
+    /// changes nothing when it runs again.
+    #[tokio::test]
+    async fn the_key_encoding_migration_records_todays_reading() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let mut client = pool.connect_unpooled().await.expect("connect");
+        identity::prepare_attach(&mut client, &config)
+            .await
+            .expect("prepare");
+        let migrations = Migrations::embedded();
+        let encoding = migrations
+            .list
+            .iter()
+            .find(|migration| migration.name() == "definition_key_encoding")
+            .expect("the key encoding migration")
+            .version();
+        run_up_to(&mut client, &migrations, encoding - 1)
+            .await
+            .expect("migrate to before");
+        // `public.dot` is a decoy for `public."dot.ted"`, whose name holds
+        // the separator.
+        client
+            .batch_execute(
+                "create table public.pk (id int primary key); \
+                 create table public.mixed (t text not null, code text); \
+                 create unique index on public.mixed (t, code) nulls not distinct; \
+                 create table public.\"dot.ted\" (k text); \
+                 create unique index on public.\"dot.ted\" (k) nulls not distinct; \
+                 create table public.dot (k text not null unique); \
+                 insert into definition_keys (table_name, key_columns, relation_oid, catalog_oid) \
+                 select t, k, pg_catalog.to_regclass(r)::oid, \
+                        'definition_keys'::pg_catalog.regclass::oid \
+                 from (values ('public.pk', '{id}'::text[], 'public.pk'), \
+                              ('public.mixed', '{t,code}', 'public.mixed'), \
+                              ('public.dot.ted', '{k}', 'public.\"dot.ted\"'), \
+                              ('public.dot', '{k}', 'public.dot')) v(t, k, r)",
+            )
+            .await
+            .expect("records stored before the migration");
+        let keys = "select table_name, key_columns, relation_oid from definition_keys order by 1";
+        let rows = |rows: Vec<tokio_postgres::Row>| -> Vec<(String, Vec<String>, u32)> {
+            rows.iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect()
+        };
+        let before = rows(client.query(keys, &[]).await.expect("records"));
+
+        run_up_to_latest(&mut client, &migrations)
+            .await
+            .expect("migrate");
+        let encoded = "select table_name, encoded_columns from definition_keys order by 1";
+        let read = |rows: Vec<tokio_postgres::Row>| -> Vec<(String, Vec<String>)> {
+            rows.iter().map(|r| (r.get(0), r.get(1))).collect()
+        };
+        let expected: Vec<(String, Vec<String>)> = [
+            ("public.dot", &[][..]),
+            ("public.dot.ted", &["k"][..]),
+            ("public.mixed", &["code"][..]),
+            ("public.pk", &[][..]),
+        ]
+        .iter()
+        .map(|(t, e)| (t.to_string(), e.iter().map(|c| c.to_string()).collect()))
+        .collect();
+        assert_eq!(
+            read(client.query(encoded, &[]).await.expect("encodings")),
+            expected
+        );
+        assert_eq!(
+            rows(client.query(keys, &[]).await.expect("records")),
+            before,
+            "no key rewritten"
+        );
+        let floor = "select version from catalog_floor";
+        let floor_after: String = client.query_one(floor, &[]).await.expect("floor").get(0);
+        assert_eq!(floor_after, catalog_floor::CATALOG_FLOOR);
+
+        // Again, after a column's `NOT NULL` changed: nothing moves.
+        client
+            .batch_execute(concat!(
+                "alter table public.mixed alter column code set not null; ",
+                include_str!("../migrations/V22__definition_key_encoding.sql")
+            ))
+            .await
+            .expect("the migration again");
+        assert_eq!(
+            read(client.query(encoded, &[]).await.expect("encodings")),
+            expected
+        );
+        let floor_again: String = client.query_one(floor, &[]).await.expect("floor").get(0);
+        assert_eq!(floor_again, floor_after);
+    }
+
     /// #1770: the migration that adds `definition_join_tables` leaves a
     /// JOIN definition stored before it as it was, and every reader of the
     /// joined tables reads its `join_table` as position 1 and nothing after
