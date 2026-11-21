@@ -33,7 +33,6 @@ Postgres, hidden tables included, detects and never repairs
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | documented |
 | [A read column given a nondeterministic collation](#a-read-column-given-a-nondeterministic-collation) | `self_check` | [#1643](https://github.com/salesforce-misc/trellis/issues/1643) (research) |
-| [A `NULL` in a key column every partition reads as `NOT NULL`](#a-null-in-a-key-column-every-partition-reads-as-not-null) | `self_check` | a Postgres fix |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
@@ -91,9 +90,6 @@ while every rule holds.
 * **Connect every Trellis process directly or through a session-mode
   pooler**
   ([below](#a-trellis-process-behind-a-transaction-mode-pooler)).
-* **Set, drop or validate `NOT NULL` on a `KEY (…)` column only while the
-  transforms that read the table are paused**
-  ([below](#a-key-columns-not-null-set-or-dropped-with-changes-in-flight)).
 * **Don't write a 1-1 `JOIN`'s joined table (`b`, or the table at any
   position of a star) under `session_replication_role = replica`** when its
   key on its `ON` columns is a deferrable constraint
@@ -266,28 +262,6 @@ read the column before changing its collation.
 
 **Ends with:** [#1643](https://github.com/salesforce-misc/trellis/issues/1643),
 research on detecting a collation change the way a retype is detected.
-
-### A `NULL` in a key column every partition reads as `NOT NULL`
-
-**When:** a key column Trellis renders raw (a primary key, or a `KEY (…)` on
-an index that isn't `NULLS NOT DISTINCT`) holds a `NULL` in a partition, or a
-plain table, that Postgres reads as `NOT NULL`, and no change to that row is
-captured. No Postgres operation is known to leave this state. The one known
-way to put a `NULL` there, Postgres 18's `SET NOT NULL` validating over a
-`NOT VALID` partition ([#2216](https://github.com/salesforce-misc/trellis/issues/2216)), leaves the partition reading as nullable, and
-define, `RESUME` and builds scan such partitions and refuse or pause
-([T0253](errors.md#t0253-nullinnotnullkey)).
-
-**What goes wrong:** a build's chunks compare keys by range, which never
-returns a row whose key part is `NULL`, so the row has no target row (a 1-1)
-or no share of its group (an aggregate). A change captured to the row pauses
-its readers with T0253 before it applies.
-
-**Detected by:** `self_check`, which refuses with T0253.
-
-**Repair:** remove the `NULL`, then `request_backfill` the table.
-
-**Ends with:** a Postgres fix.
 
 ## Writes past a unique key
 
