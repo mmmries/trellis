@@ -69,8 +69,8 @@ wired into two workflows:
   `property_convergence_holds_for_trivial_programs` at `PROPTEST_CASES=200`,
   the epoch tier's `property_epoch_chains_converge_on_one_instance` at
   `PROPTEST_CASES=16` with `GENERATIVE_MAX_EPOCHS=50`, and the source-DDL
-  tier's `property_source_ddl_is_never_silently_wrong` at `PROPTEST_CASES=50`. The others are not
-  deep-run anywhere in this repo's CI config.
+  tier's `property_source_ddl_is_never_silently_wrong` at `PROPTEST_CASES=50`.
+  The others are not deep-run anywhere in this repo's CI config.
 
 **Failing seeds stay local; failures become pins.** Every property's
 `FileFailurePersistence::SourceParallel` config writes a failing case's seed
