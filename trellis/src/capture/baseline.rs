@@ -855,8 +855,13 @@ pub(crate) async fn check(
             )
             .await?;
         }
+        // The key capture keys the table by: a declared `KEY (...)`, else
+        // its primary key.
         let key = if found.changes.values().any(Change::retyped) {
-            crate::capture::columns::live_columns(&txn, table).await?.1
+            match crate::capture::columns::declared_key(catalog, table) {
+                Some(declared) => declared,
+                None => crate::capture::columns::live_columns(&txn, table).await?.1,
+            }
         } else {
             Vec::new()
         };

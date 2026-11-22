@@ -1200,3 +1200,86 @@ async fn a_key_narrowing_a_key_check_pauses_for_is_not_reread() {
     }
     assert_eq!(auto_rebuilds("public.pb", "column_changed"), 0);
 }
+
+/// [`a_key_narrowed_with_a_value_changing_using_is_reread`] for a table
+/// keyed by a declared `KEY (...)` rather than a primary key: the readers
+/// are found by the key capture uses, not the primary key alone.
+#[tokio::test]
+async fn a_declared_key_narrowed_with_a_value_changing_using_is_reread() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.dk (v int, u bigint not null unique); \
+         insert into public.dk values (1, 1), (3, 3);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let text = "TRANSFORM dkt FROM public.dk KEY (u) SELECT v AS v";
+    trellis.apply(text).await.expect(text);
+    bring_live_all(&mut raw, &db.pool).await;
+
+    let attver = attver::Attver::probe(&raw).await;
+    let alter = "alter table public.dk alter column u type integer using u + 10";
+    raw.batch_execute(alter).await.expect(alter);
+    attver.after(&raw, alter).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(statuses(&raw).await["dkt"], TransformStatus::Backfilling);
+    assert_eq!(auto_rebuilds("public.dk", "column_changed"), 1);
+    bring_live_all(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(&raw, "select u::text, v::text from public.dkt order by u").await,
+        rows(&raw, "select u::text, v::text from public.dk order by u").await,
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(auto_rebuilds("public.dk", "column_changed"), 1);
+}
+
+/// A key narrowing one reader pauses for and another doesn't: the pass
+/// that pauses the first stops there, and the next re-reads the second,
+/// whose 1-1 target is keyed by the changed column, without the paused one.
+#[tokio::test]
+async fn a_key_narrowing_rereads_the_readers_a_key_check_leaves_unpaused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.sa (id int primary key, g int not null, k bigint not null); \
+         create table public.sb (x int, k bigint primary key); \
+         insert into public.sa select i, i % 2, i % 4 from generate_series(1, 24) i; \
+         insert into public.sb select i, i from generate_series(0, 3) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM sjt FROM public.sa JOIN public.sb ON sa.k = sb.k \
+         GROUP BY sa.g WITHOUT SOURCE INDEX SELECT sa.g AS g, COUNT(*) AS n, SUM(sb.x) AS sx",
+        "TRANSFORM sbt FROM public.sb SELECT x AS x",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live_all(&mut raw, &db.pool).await;
+
+    let attver = attver::Attver::probe(&raw).await;
+    let alter = "alter table public.sb alter column k type integer using k + 10";
+    raw.batch_execute(alter).await.expect(alter);
+    attver.after(&raw, alter).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let first = statuses(&raw).await;
+    assert_eq!(first["sjt"], TransformStatus::Paused, "{first:?}");
+    capture_pass(&mut raw, &db.pool).await;
+    let second = statuses(&raw).await;
+    assert_eq!(second["sjt"], TransformStatus::Paused, "{second:?}");
+    assert_eq!(second["sbt"], TransformStatus::Backfilling, "{second:?}");
+    assert_eq!(auto_rebuilds("public.sb", "column_changed"), 1);
+    pipeline::bring_live(&mut raw, &db.pool, &["sbt"]).await;
+    assert_eq!(
+        rows(&raw, "select k::text, x::text from public.sbt order by k").await,
+        rows(&raw, "select k::text, x::text from public.sb order by k").await,
+    );
+    assert_eq!(statuses(&raw).await["sjt"], TransformStatus::Paused);
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(auto_rebuilds("public.sb", "column_changed"), 1);
+}

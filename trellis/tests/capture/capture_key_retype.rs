@@ -838,11 +838,10 @@ async fn a_nondeterministic_collation_on_a_group_by_column_pauses_its_reader() {
 }
 
 /// A wider `numeric` scale on a `GROUP BY` key re-renders every stored
-/// value (`1.50` reads back as `1.500`) and fires no capture trigger, yet
-/// pauses nothing: it isn't a pure widening, so the table's readers re-read
-/// it, and numeric groups are matched as numbers, so a delete or
-/// update of a row the rewrite re-rendered still retracts from the group it
-/// was counted in, and a new row joins it. The pass records the wider
+/// value (`1.50` reads back as `1.500`) and fires no capture trigger. It
+/// isn't a pure widening, so it pauses nothing and the table's readers
+/// re-read it; a delete or update of a re-rendered row then retracts from
+/// its group, and a new row at either scale joins it. The pass records the wider
 /// scale, so narrowing back to the scale define saw pauses: it rounds the
 /// values stored under the wider one, so two groups (`1.555`, `1.556`)
 /// become one (`1.56`) with no trigger firing. A resume rebuilds the groups
@@ -3678,8 +3677,8 @@ async fn a_drifted_copy_is_never_skipped() {
     capture_pass(&mut raw, &db.pool).await;
     let second = copy_checks(&raw).await;
     assert!(second["per_kind"] > first["per_kind"], "{second:?}");
-    // A narrowing pauses nothing: it re-reads (#2254).
-    assert_ne!(status(&raw, "per_kind").await, TransformStatus::Paused);
+    // A narrowing pauses nothing: it re-reads.
+    assert!(rebuilding(status(&raw, "per_kind").await));
 }
 
 /// `ALTER TRANSFORM` rewrites a definition in place, giving it a column
