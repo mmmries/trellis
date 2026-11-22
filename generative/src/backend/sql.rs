@@ -2751,8 +2751,8 @@ mod tests {
 
     /// A drain that keeps committing pages, for longer than a window in all,
     /// is waited out: each committed page restarts the window. The test
-    /// commits a page and moves the clock 500 ms at each sample, ten times,
-    /// then drains: 5 s of fake time against a 2 s window, with nothing
+    /// moves the clock 500 ms at each sample, committing a page at the first
+    /// ten, then drains: 5 s of fake time against a 2 s window, with nothing
     /// depending on real scheduling.
     #[tokio::test]
     async fn a_ring_that_keeps_draining_is_waited_out_past_the_window() {
@@ -2776,11 +2776,13 @@ mod tests {
             async || {
                 if step < 10 {
                     commit_a_page(&engine, step).await;
-                    clock.advance(Duration::from_millis(500));
                 } else {
                     drain_ring(&engine).await;
                 }
                 step += 1;
+                // Every sample moves the clock, so a drain that never
+                // converges fails at the window instead of hanging.
+                clock.advance(Duration::from_millis(500));
             },
         )
         .await
