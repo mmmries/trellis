@@ -1037,7 +1037,7 @@ fn rekey_def(def: &mut trellis::dev::defs::ast::TransformDef, columns: &[String]
         .collect();
 }
 
-/// `plan` with every definition its actions define read through `jb`'s key
+/// `plan` with every definition its actions carry read through `jb`'s key
 /// as [`key_joined`] reads the program's. A second or repeated definition
 /// is cloned from the program's before the key is drawn, so without this it
 /// keeps the unkeyed `ON`, which `jb` has no unique key for (#2233).
@@ -1052,10 +1052,9 @@ pub fn key_joined_plan(
     for burst in &mut plan.bursts {
         for timed in &mut burst.actions {
             match &mut timed.action {
-                BurstAction::Define { def, .. } => rekey_def(def, &columns),
-                BurstAction::Alter { .. } | BurstAction::EditField { .. } => {
-                    unreachable!("the 1-1 JOIN tier draws no field edits")
-                }
+                BurstAction::Define { def, .. }
+                | BurstAction::Alter { def, .. }
+                | BurstAction::EditField { def, .. } => rekey_def(def, &columns),
                 _ => {}
             }
         }
