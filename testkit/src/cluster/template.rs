@@ -11,7 +11,8 @@
 //! The template is cached across processes in the system temp dir as
 //! `trellis-template-<key>`, so one `cargo test` run builds it once for all
 //! its test binaries. The key hashes the engine's sources and migrations
-//! (`build.rs`), the Postgres binary and the `initdb` arguments, so a stale
+//! (`build.rs`), the migrations the linked engine embeds (with
+//! `engine-access`), the Postgres binary and the `initdb` arguments, so a stale
 //! template is never reused, and the day, so none outlives a temp-dir cleaner
 //! (see [`key`]). A builder holds an exclusive lock on
 //! `trellis-template-<key>.lock` and publishes the directory with a rename, so
@@ -49,8 +50,8 @@ pub(super) fn data_dir() -> &'static Path {
     &TEMPLATE.get_or_init(|| ensure(&std::env::temp_dir())).0
 }
 
-/// The cache key: the engine build (`build.rs`), the Postgres binaries, the
-/// `initdb` arguments, the user and the day.
+/// The cache key: the engine build (`build.rs`), its embedded migrations,
+/// the Postgres binaries, the `initdb` arguments, the user and the day.
 ///
 /// The `postgres` binary's path, size and mtime are in it as well as its
 /// version, so a rebuild of the same version (against a new ICU, say) or a
