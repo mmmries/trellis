@@ -97,7 +97,8 @@ fn digests(strategy: &proptest::strategy::BoxedStrategy<JoinCase>) -> Vec<u64> {
 #[test]
 fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
     use generative::generate::join_one_to_one::{
-        derived_key_draw, key_joined, unkeyed_one_to_one_case_strategy, unwidened_one_to_one_cases,
+        derived_key_draw, key_joined, key_joined_plan, unkeyed_one_to_one_case_strategy,
+        unwidened_one_to_one_cases,
     };
     let unkeyed = unkeyed_one_to_one_case_strategy().boxed();
     let (keyed_bare, unkeyed_bare) = (
@@ -110,12 +111,15 @@ fn the_two_table_tiers_draw_what_they_drew_before_the_star_tier() {
             .into_iter()
             .zip(twins)
         {
-            let want = match derived_key_draw(&twin.program, false) {
-                Some(draw) => key_joined(twin.program, &draw),
-                None => twin.program,
+            let (want, want_plan) = match derived_key_draw(&twin.program, false) {
+                Some(draw) => (
+                    key_joined(twin.program, &draw),
+                    key_joined_plan(twin.plan, &draw),
+                ),
+                None => (twin.program, twin.plan),
             };
             assert_eq!(case.program, want, "seed {seed}");
-            assert_eq!(format!("{:?}", case.plan), format!("{:?}", twin.plan));
+            assert_eq!(format!("{:?}", case.plan), format!("{want_plan:?}"));
         }
     }
     assert_eq!(

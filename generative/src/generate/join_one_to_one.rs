@@ -944,7 +944,6 @@ pub fn derived_key_draw(program: &Program, always: bool) -> Option<JoinedKeyDraw
 /// If `program` isn't a two-table 1-1 `JOIN` program, or a draw is empty.
 pub fn key_joined(mut program: Program, draw: &JoinedKeyDraw) -> Program {
     use super::source_key::{Key, key_column};
-    use trellis::dev::defs::ast::{JoinOn, KeySpace, QualifiedColumn};
     assert!(
         !draw.key.inserts.is_empty()
             && !draw.key.moves.is_empty()
@@ -977,26 +976,8 @@ pub fn key_joined(mut program: Program, draw: &JoinedKeyDraw) -> Program {
             });
         }
     }
-    let column_of = |table: &str, column: &str| QualifiedColumn {
-        schema: None,
-        table: table.to_string(),
-        column: column.to_string(),
-    };
     for def in &mut program.defs {
-        let KeySpace::JoinOneToOne(join) = &mut def.key_space else {
-            panic!("{} isn't a 1-1 JOIN", def.target);
-        };
-        let [joined] = join.joins.as_mut_slice() else {
-            panic!("{} isn't a two-table 1-1 JOIN", def.target);
-        };
-        joined.right_key = Some(columns.clone());
-        joined.on = columns
-            .iter()
-            .map(|c| JoinOn {
-                lhs: column_of(FROM_TABLE, c),
-                rhs: column_of(JOINED_TABLE, c),
-            })
-            .collect();
+        rekey_def(def, &columns);
     }
 
     let with_key = |key: &Key| -> Vec<(String, Option<String>)> {
@@ -1028,6 +1009,58 @@ pub fn key_joined(mut program: Program, draw: &JoinedKeyDraw) -> Program {
     }
     super::source_key::resimulate(&mut program, JOINED_TABLE);
     program
+}
+
+/// `def`, a two-table 1-1 `JOIN`, read through `jb KEY (columns)` and joined
+/// `ON ja.<c> = jb.<c>` for each column, as [`key_joined`] reads every
+/// definition.
+fn rekey_def(def: &mut trellis::dev::defs::ast::TransformDef, columns: &[String]) {
+    use trellis::dev::defs::ast::{JoinOn, KeySpace, QualifiedColumn};
+    let column_of = |table: &str, column: &str| QualifiedColumn {
+        schema: None,
+        table: table.to_string(),
+        column: column.to_string(),
+    };
+    let KeySpace::JoinOneToOne(join) = &mut def.key_space else {
+        panic!("{} isn't a 1-1 JOIN", def.target);
+    };
+    let [joined] = join.joins.as_mut_slice() else {
+        panic!("{} isn't a two-table 1-1 JOIN", def.target);
+    };
+    joined.right_key = Some(columns.to_vec());
+    joined.on = columns
+        .iter()
+        .map(|c| JoinOn {
+            lhs: column_of(FROM_TABLE, c),
+            rhs: column_of(JOINED_TABLE, c),
+        })
+        .collect();
+}
+
+/// `plan` with every definition its actions define read through `jb`'s key
+/// as [`key_joined`] reads the program's. A second or repeated definition
+/// is cloned from the program's before the key is drawn, so without this it
+/// keeps the unkeyed `ON`, which `jb` has no unique key for (#2233).
+pub fn key_joined_plan(
+    mut plan: crate::model::ConcurrentPlan,
+    draw: &JoinedKeyDraw,
+) -> crate::model::ConcurrentPlan {
+    use crate::model::BurstAction;
+    let columns: Vec<String> = (0..draw.key.shape.nullable.len())
+        .map(super::source_key::key_column)
+        .collect();
+    for burst in &mut plan.bursts {
+        for timed in &mut burst.actions {
+            match &mut timed.action {
+                BurstAction::Define { def, .. } => rekey_def(def, &columns),
+                BurstAction::Alter { .. } | BurstAction::EditField { .. } => {
+                    unreachable!("the 1-1 JOIN tier draws no field edits")
+                }
+                _ => {}
+            }
+        }
+    }
+    plan
 }
 
 /// What a [`key_joined`] program draws, by name, for the coverage floors:
@@ -1775,6 +1808,7 @@ pub(crate) mod strategy {
                             keyed.and_then(|always| derived_key_draw(&case.program, always))
                         {
                             case.program = key_joined(case.program, &draw);
+                            case.plan = key_joined_plan(case.plan, &draw);
                         }
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
@@ -2217,6 +2251,41 @@ mod tests {
         ] {
             assert!(drawn.contains(name), "{name}: {drawn:?}");
         }
+    }
+
+    /// A definition a keyed case's plan defines mid-run (a second or repeated
+    /// one, cloned before the key is drawn) reads `jb` through the same key
+    /// as the loaded definitions. Left on its unkeyed `ON`, it joins on
+    /// columns `jb` has no unique key for and define refuses it (#2233).
+    #[cfg(feature = "proptest")]
+    #[test]
+    fn a_keyed_cases_mid_run_definitions_join_on_the_key() {
+        use crate::model::BurstAction;
+        use proptest::strategy::Strategy;
+        use trellis::dev::defs::ast::KeySpace;
+        let strategy = joined_key_case_strategy().boxed();
+        let (mut keyed, mut defined) = (0usize, 0usize);
+        for seed in 1..=8 {
+            for case in crate::plant_sweep::seeded_cases(&strategy, seed, 40) {
+                let join_of = |def: &TransformDef| match &def.key_space {
+                    KeySpace::JoinOneToOne(join) => {
+                        format!("{:?}", (&join.joins[0].right_key, &join.joins[0].on))
+                    }
+                    other => panic!("{other:?}"),
+                };
+                keyed += 1;
+                let want = join_of(&case.program.defs[0]);
+                for burst in &case.plan.bursts {
+                    for timed in &burst.actions {
+                        if let BurstAction::Define { def, .. } = &timed.action {
+                            defined += 1;
+                            assert_eq!(join_of(def), want, "seed {seed}: {}", def.target);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(keyed > 0 && defined > 0, "{keyed} keyed, {defined} defined");
     }
 
     /// A tail truncate lands `back` ops before its burst's last op (the
