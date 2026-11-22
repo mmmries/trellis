@@ -61,9 +61,8 @@ pub enum SourceDdl {
     /// letting the writer see and write every row, and, when
     /// `trellis_policy`, one for the Trellis role that lets it see every
     /// row; disabled and the policies dropped at the close. Trellis's
-    /// sessions (`row_security = off`) are refused either way. Inside an
-    /// application statement the capture function runs with the
-    /// application's `row_security`, so the policies apply to its re-read.
+    /// sessions and its capture functions (`row_security = off`) are
+    /// refused either way.
     Rls { trellis_policy: bool },
     /// Only the application role changed: its writes run as the writer for
     /// the window.

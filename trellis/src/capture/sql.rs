@@ -311,8 +311,8 @@ pub fn pinned_output_settings() -> Vec<&'static str> {
         .collect()
 }
 
-/// Planner settings every capture function runs (and so plans) under, as
-/// `SET` clauses.
+/// Planner and row-security settings every capture function runs (and so
+/// plans) under, as `SET` clauses.
 ///
 /// PL/pgSQL plans each statement once per session, often on the first
 /// write to a table that is still empty or that a `VACUUM` last saw empty.
@@ -322,7 +322,58 @@ pub fn pinned_output_settings() -> Vec<&'static str> {
 /// off, the probe is an index scan from the first plan on. The function's
 /// other reads are transition tables (not sequential scans) and catalog
 /// probes that use their indexes anyway.
-pub const PLANNER_SETTINGS: &[&str] = &["set enable_seqscan to 'off'"];
+///
+/// `row_security` is off as on every session Trellis opens
+/// ([`crate::pool::ROW_SECURITY_OFF`]), so a policy that applies to the
+/// ring's owner makes the re-read raise instead of filtering it (see "A
+/// refused re-read" on [`function_body`]). The clause is the function's, so
+/// the application's statement keeps its own `row_security`.
+pub const PLANNER_SETTINGS: &[&str] = &["set enable_seqscan to 'off'", "set row_security to 'off'"];
+
+/// The search path every capture function pins, as its `SET` clause's value.
+const FUNCTION_SEARCH_PATH: &str = "pg_catalog, pg_temp";
+
+/// What `pg_proc.proconfig` holds for `event`'s function as
+/// [`function_ddl`] creates it, sorted, each entry `name=value` with the name
+/// lowercased. [`crate::capture::install::installed`] compares it with the
+/// installed function's (through [`normalized_config`]), so a function an
+/// older generator created under other settings isn't current.
+pub fn function_config(event: CaptureEvent) -> Vec<String> {
+    let mut config = vec![format!("search_path={FUNCTION_SEARCH_PATH}")];
+    if event != CaptureEvent::Begin {
+        for clause in pinned_output_settings()
+            .into_iter()
+            .chain(PLANNER_SETTINGS.iter().copied())
+        {
+            let (name, value) = clause
+                .strip_prefix("set ")
+                .and_then(|rest| rest.split_once(" to "))
+                .unwrap_or_else(|| panic!("setting {clause:?} is not `set <name> to <value>`"));
+            let value = value.trim();
+            let value = value
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+                .unwrap_or(value);
+            config.push(format!("{}={value}", name.trim().to_lowercase()));
+        }
+    }
+    config.sort();
+    config
+}
+
+/// `proconfig` entries in [`function_config`]'s form: each name lowercased
+/// (Postgres stores a setting's canonical spelling, `DateStyle`), sorted.
+pub fn normalized_config(proconfig: &[String]) -> Vec<String> {
+    let mut config: Vec<String> = proconfig
+        .iter()
+        .map(|entry| match entry.split_once('=') {
+            Some((name, value)) => format!("{}={value}", name.to_lowercase()),
+            None => entry.to_lowercase(),
+        })
+        .collect();
+    config.sort();
+    config
+}
 
 /// The unquoted name of `table`'s capture function for `event`, in the
 /// instance schema: `cap_<event>_<table>_<hash>`, where `<table>` is the
@@ -508,7 +559,7 @@ pub fn function_ddl(
     };
     Ok(format!(
         "create or replace function {function}()\n    returns trigger\n    language plpgsql\n    \
-         security definer\n    set search_path = pg_catalog, pg_temp{settings}\nas {tag}\n{body}{tag}"
+         security definer\n    set search_path = {FUNCTION_SEARCH_PATH}{settings}\nas {tag}\n{body}{tag}"
     ))
 }
 
@@ -755,8 +806,9 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// needs `SELECT` on the source (and `USAGE` on its schema) as that role,
 /// which holds it through ownership of the table. An ownership change to a
 /// role it doesn't inherit, a revoked grant, or row-level security that
-/// applies to it under a writer's `row_security = off` makes Postgres
-/// refuse the re-read with `insufficient_privilege` (`42501`), which would
+/// applies to it (the function pins `row_security = off`,
+/// [`PLANNER_SETTINGS`], so a policy refuses rather than filters) makes
+/// Postgres refuse the re-read with `insufficient_privilege` (`42501`), which would
 /// fail the application's statement (ADR-0002 I6). So each re-read runs in
 /// a block that traps that one condition and, instead of the statement's
 /// rows, stages a [`SCHEMA_CHANGED_OP`] marker recording the refusal
@@ -938,8 +990,7 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
 /// trapping block (see "A refused re-read" on [`function_body`]). It reads
 /// what Postgres checks, from the catalog: `SELECT` on the table (on a
 /// partitioned source, its root, which the re-read reads), `USAGE` on its
-/// schema, and whether row-level security applies to the role under the
-/// session's `row_security`. A column grant alone, rather than the table's,
+/// schema, and whether row-level security applies to the role. A column grant alone, rather than the table's,
 /// counts as exposed. The table is named by the trigger's `tg_relid`, and
 /// the schema by its name as text: a `regclass` lookup of the name would
 /// itself be refused without `USAGE`.
@@ -2129,10 +2180,48 @@ mod tests {
     fn the_live_reread_plans_as_an_index_probe_from_the_first_call() {
         for event in CaptureEvent::CAPTURED {
             assert!(
-                ddl(&spec(), event).contains("\n    set enable_seqscan to 'off'\nas "),
+                ddl(&spec(), event).contains("\n    set enable_seqscan to 'off'\n"),
                 "{event:?}"
             );
         }
+    }
+
+    /// Every function that can re-read pins `row_security = off` for itself,
+    /// so a policy that applies to the ring's owner refuses the re-read
+    /// rather than filtering it (#2227).
+    #[test]
+    fn every_capturing_function_runs_with_row_security_off() {
+        for event in CaptureEvent::ALL {
+            let sql = ddl(&spec(), event);
+            let pinned = sql.contains("\n    set row_security to 'off'\n");
+            assert_eq!(pinned, event != CaptureEvent::Begin, "{event:?}:\n{sql}");
+            assert_eq!(
+                function_config(event).contains(&"row_security=off".to_string()),
+                pinned,
+                "{event:?}"
+            );
+        }
+    }
+
+    /// `function_config` is `proconfig` as Postgres stores it, names aside.
+    #[test]
+    fn the_function_config_reads_like_proconfig() {
+        assert_eq!(
+            function_config(CaptureEvent::Begin),
+            vec!["search_path=pg_catalog, pg_temp".to_string()]
+        );
+        let config = function_config(CaptureEvent::Insert);
+        for entry in [
+            "datestyle=ISO, YMD",
+            "extra_float_digits=1",
+            "enable_seqscan=off",
+        ] {
+            assert!(config.contains(&entry.to_string()), "{config:?}");
+        }
+        assert_eq!(
+            normalized_config(&["DateStyle=ISO, YMD".to_string(), "a=b".to_string()]),
+            vec!["a=b".to_string(), "datestyle=ISO, YMD".to_string()]
+        );
     }
 
     #[test]

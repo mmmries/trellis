@@ -20,10 +20,11 @@
 //!
 //! It also reports row-level security that applies to the Trellis role, the
 //! ring's owner, or to the role `self_check` runs as
-//! ([`crate::defs::row_security`]). That doesn't break capture, which sees
-//! every change, but it filters every read of the table, the recompute's
-//! included, so a comparison would agree with a wrong answer. The staging
-//! worker's capture pass pauses the table's readers for it.
+//! ([`crate::defs::row_security`]). Capture's re-read is refused under it,
+//! which halts the table's readers, and a read that the policies would
+//! filter, the recompute's included, fails rather than agree with a wrong
+//! answer. The staging worker's capture pass pauses the table's readers for
+//! it.
 //!
 //! The same goes for the definition's target, checked for the
 //! role `self_check` runs as, standing in for the workers' role that writes
@@ -170,9 +171,9 @@ pub enum CaptureFault {
     Hierarchy(Hierarchy),
     /// The table's row-level security policies apply to the ring's owner, or
     /// to the role `self_check` runs as
-    /// (`crate::defs::row_security`). Capture still sees
-    /// every change, but each read of the table, `self_check`'s recompute
-    /// included, sees only the rows the policies allow. Checked on every
+    /// (`crate::defs::row_security`). Capture's re-read is refused, and
+    /// each read of the table, `self_check`'s recompute included, would
+    /// fail under the policies. Checked on every
     /// table the definition reads, including one the target-mutation seam
     /// feeds. Also reported for the definition's own target
     /// (`RowSecurity::target`) when the policies apply to the caller's

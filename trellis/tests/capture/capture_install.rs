@@ -525,6 +525,82 @@ async fn a_partial_install_is_reported_and_repaired() {
     assert_eq!(ring_rows(&client, "repaired").await.len(), 1);
 }
 
+/// A function an older generator created under other `SET` clauses (here,
+/// without `row_security = off`, as before #2227) has the source this build
+/// generates but isn't current, so the reconcile pass re-creates it with
+/// this build's settings, once.
+#[tokio::test]
+async fn a_function_missing_a_setting_this_build_pins_is_replaced() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect(db.dsn()).await;
+    let spec = install_t(&mut client).await;
+    let config = |event: CaptureEvent| {
+        let function = function_name("public.t", event).expect("name");
+        format!(
+            "select coalesce(p.proconfig, '{{}}')::text[] from pg_catalog.pg_proc p \
+             where p.proname = '{function}' \
+               and p.pronamespace = '{DEFAULT_SCHEMA}'::regnamespace"
+        )
+    };
+    for event in CaptureEvent::ALL {
+        let installed: Vec<String> = client
+            .query_one(&config(event), &[])
+            .await
+            .expect("read proconfig")
+            .get(0);
+        assert_eq!(
+            trellis::capture::sql::normalized_config(&installed),
+            trellis::capture::sql::function_config(event),
+            "{event:?}"
+        );
+    }
+
+    let update_function = function_name("public.t", CaptureEvent::Update).expect("name");
+    client
+        .batch_execute(&format!(
+            "alter function {DEFAULT_SCHEMA}.{update_function}() reset row_security"
+        ))
+        .await
+        .expect("drop the setting, as an older generator's function lacks it");
+    let Installed::Complete { current, .. } =
+        install::installed(&client, DEFAULT_SCHEMA, "public.t")
+            .await
+            .expect("installed")
+    else {
+        panic!("the comment and triggers still describe a complete install");
+    };
+    assert!(
+        !current,
+        "a function missing a pinned setting isn't current"
+    );
+    assert_eq!(
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &spec, None)
+                .await
+                .expect("reconcile")
+        ),
+        CaptureAction::Widen
+    );
+    let installed: Vec<String> = client
+        .query_one(&config(CaptureEvent::Update), &[])
+        .await
+        .expect("read proconfig")
+        .get(0);
+    assert!(
+        installed.contains(&"row_security=off".to_string()),
+        "{installed:?}"
+    );
+    assert_eq!(
+        landed(
+            install::reconcile(&mut client, DEFAULT_SCHEMA, &spec, None)
+                .await
+                .expect("reconcile")
+        ),
+        CaptureAction::Unchanged
+    );
+}
+
 /// Inserts into `public.t` one row at a time until `stop`.
 fn spawn_writer(
     client: Client,

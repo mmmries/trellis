@@ -1362,16 +1362,6 @@ async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// A pool as `role`, for the drains and builds after the fix.
-fn pool_as(it: &Instance, role: &str) -> trellis::pool::Pool {
-    let dsn = it
-        ._db
-        .dsn()
-        .replace("user=postgres", &format!("user={role}"));
-    let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
-    trellis::pool::Pool::new(&config).expect("pool")
-}
-
 /// The halt record `target` is paused with, after a refused read of its source.
 async fn halted(trellis: &trellis::Trellis, target: &str) -> trellis::CaptureFailure {
     let reported = status(trellis, target).await;
@@ -1427,160 +1417,6 @@ async fn source_and_targets(admin: &Client) -> [Vec<String>; 4] {
             .collect();
     }
     out
-}
-
-/// Capture's conditional live re-read runs as the ring's owner
-/// under the writing session's `row_security`. Defines a 1-1 copy and an
-/// aggregate of `c`, forces a policy hiding every row of `c` from the
-/// ring's owner, then writes as the superuser (exempt, `row_security` on)
-/// through two application triggers whose nested writes send the outer
-/// statement's capture down the re-read: updating row 1 updates row 3, and
-/// inserting row 100 rewrites it. The re-read finds neither row 1 nor row
-/// 100, so the capture stages a delete for each, though both still exist.
-/// Returns the instance with those changes staged and not yet drained.
-async fn deletes_staged_for_rows_the_policy_hides(cluster: &TestCluster) -> Instance {
-    let mut it = instance(cluster).await;
-    for ddl in [
-        "TRANSFORM c_copy FROM public.c SELECT amount AS amount",
-        "TRANSFORM c_totals FROM public.c GROUP BY pid \
-        WITHOUT SOURCE INDEX SELECT pid AS pid, SUM(amount) AS total, COUNT(*) AS n",
-    ] {
-        it.trellis.apply(ddl).await.expect(ddl);
-    }
-    capture_pass(&mut it.raw, &it.pool).await;
-    harness::settle_builds(&it.pool).await;
-    for target in ["c_copy", "c_totals"] {
-        assert_eq!(
-            status(&it.trellis, target).await.status,
-            TransformStatus::Live,
-            "{target}"
-        );
-    }
-    it.admin
-        .batch_execute(
-            "create function public.app_touch() returns trigger language plpgsql as $$ \
-             begin update public.c set amount = new.amount * 10 where id = new.id; \
-             return null; end $$; \
-             create trigger app_touch after insert on public.c \
-               for each row execute function public.app_touch(); \
-             create function public.app_other() returns trigger language plpgsql as $$ \
-             begin if pg_catalog.pg_trigger_depth() < 2 and new.id = 1 then \
-               update public.c set amount = amount + 1000 where id = 3; end if; \
-             return null; end $$; \
-             create trigger app_other after update on public.c \
-               for each row execute function public.app_other(); \
-             alter table public.c enable row level security, force row level security; \
-             create policy hide_all on public.c to public using (false);",
-        )
-        .await
-        .expect("application triggers, and policies that apply to the ring's owner");
-    it.admin
-        .batch_execute(
-            "update public.c set amount = 22 where id = 2; \
-             update public.c set amount = 11 where id = 1; \
-             insert into public.c values (100, 1, 7);",
-        )
-        .await
-        .expect("the application's writes succeed");
-
-    let staged = [
-        ("update", "2"),
-        ("update", "3"),
-        ("delete", "1"),
-        ("update", "100"),
-        ("delete", "100"),
-    ]
-    .map(|(op, key)| (op.to_string(), key.to_string()));
-    assert_eq!(
-        ring_of_c(&it.admin).await,
-        staged,
-        "the plain update and the nested writes stage their rows; the re-reads stage deletes"
-    );
-    let still_there: i64 = it
-        .admin
-        .query_one("select count(*) from public.c where id in (1, 100)", &[])
-        .await
-        .expect("read the source")
-        .get(0);
-    assert_eq!(still_there, 2, "rows 1 and 100 still exist");
-    it
-}
-
-/// A delete capture staged for a row a policy hid from its re-read (above)
-/// shows in no target when the drain's role is exempt: a 1-1 apply and an
-/// aggregate apply re-read a delete's row live as the drain's role,
-/// find it, and both targets match the source. The next capture pass then
-/// pauses both readers for the row-level security.
-#[tokio::test]
-async fn a_delete_staged_for_a_row_the_policy_hides_is_repaired_by_an_exempt_drain() {
-    let cluster = TestCluster::start();
-    let mut it = deletes_staged_for_rows_the_policy_hides(&cluster).await;
-
-    let exempt = pool_as(&it, "postgres");
-    seal_and_drain(&mut it.raw, &exempt)
-        .await
-        .expect("a drain as the superuser, which is exempt, passes");
-    let [source, copy, totals, aggregate] = source_and_targets(&it.admin).await;
-    assert_eq!(copy, source, "the 1-1 target matches the source");
-    assert_eq!(aggregate, totals, "the aggregate matches the source");
-    for target in ["c_copy", "c_totals"] {
-        assert_eq!(
-            status(&it.trellis, target).await.status,
-            TransformStatus::Live,
-            "{target}: the drain halted nothing"
-        );
-    }
-
-    capture_pass(&mut it.raw, &it.pool).await;
-    let expected = RowSecurity {
-        table: "public.c".to_string(),
-        role: "rls_trellis".to_string(),
-        owner_forced: true,
-        target: false,
-    };
-    for target in ["c_copy", "c_totals"] {
-        let reported = status(&it.trellis, target).await;
-        assert_eq!(reported.status, TransformStatus::Paused, "{target}");
-        let failure = reported
-            .capture_failure
-            .unwrap_or_else(|| panic!("{target} carries the reason"));
-        assert_eq!(failure.kind, trellis::CaptureFailureKind::Capture);
-        assert_eq!(failure.source_table, "public.c");
-        assert!(
-            failure.error.starts_with(&expected.to_string()),
-            "{target}: {failure:?}"
-        );
-    }
-    it.trellis.shutdown().await.expect("shutdown");
-}
-
-/// The same staged deletes drained as the ring's owner, which the policy
-/// applies to: the drain's live re-read of `c` is refused, and it halts both
-/// readers instead of applying the deletes.
-#[tokio::test]
-async fn a_delete_staged_for_a_row_the_policy_hides_halts_a_drain_the_policy_applies_to() {
-    let cluster = TestCluster::start();
-    let mut it = deletes_staged_for_rows_the_policy_hides(&cluster).await;
-    let [_, copy_before, _, aggregate_before] = source_and_targets(&it.admin).await;
-
-    seal_and_drain(&mut it.raw, &it.pool)
-        .await
-        .expect("the drain halts the readers and commits the page");
-    for target in ["c_copy", "c_totals"] {
-        let failure = halted(&it.trellis, target).await;
-        assert!(
-            failure
-                .error
-                .contains("row-level security on public.c applies to role rls_trellis"),
-            "{target}: {}",
-            failure.error
-        );
-    }
-    let [_, copy, _, aggregate] = source_and_targets(&it.admin).await;
-    assert_eq!(copy, copy_before, "the 1-1 target applied nothing");
-    assert_eq!(aggregate, aggregate_before, "the aggregate applied nothing");
-    assert_eq!(poison_rows(&it.admin).await, 0);
-    it.trellis.shutdown().await.expect("shutdown");
 }
 
 /// A refused read of a schema: the role loses `USAGE` on a source's schema
@@ -2173,9 +2009,7 @@ async fn a_revoke_that_lands_mid_statement_never_fails_a_write() {
 /// Row-level security that applies to the ring's owner, under a writer
 /// whose session sets `row_security = off`: Postgres refuses capture's
 /// re-read with `42501` instead of filtering it. The writes still succeed,
-/// and the readers halt and resume as for a lost privilege. (Under the
-/// default `row_security = on` the re-read is filtered instead, which
-/// `deletes_staged_for_rows_the_policy_hides` covers.)
+/// and the readers halt and resume as for a lost privilege.
 #[tokio::test]
 async fn row_security_refusing_the_re_read_never_fails_a_write() {
     let cluster = TestCluster::start();
@@ -2204,5 +2038,108 @@ async fn row_security_refusing_the_re_read_never_fails_a_write() {
         .await
         .expect("drop the policies");
     refused_capture_halts_then_resume_is_exact(&mut it, "row-level security").await;
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The same under the writer's default `row_security = on` (#2227): the
+/// capture functions pin `row_security = off` for themselves, so the
+/// re-read is refused rather than filtered, and stages the refusal instead
+/// of a delete for each row the policies hide. The pin is the function's:
+/// inside the same transaction, after its captures ran, the writer's own
+/// statements still run under `row_security = on` and see only the rows
+/// its policy allows. The readers halt and resume exact.
+#[tokio::test]
+async fn row_security_hiding_rows_from_the_re_read_is_refused_under_the_writers_own_setting() {
+    let cluster = TestCluster::start();
+    let mut it = readers_of_c_with_a_rewriting_trigger(&cluster).await;
+    it.admin
+        .batch_execute(
+            "create role app_writer nologin; \
+             grant select, insert, update, delete on public.c to app_writer; \
+             create policy writer_sees_all_but_6 on public.c to app_writer \
+               using (id <> 6) with check (true); \
+             alter table public.c enable row level security, force row level security;",
+        )
+        .await
+        .expect("a writer's policy, and none for the ring's owner");
+    let before = ring_of_c(&it.admin).await.len();
+    it.admin
+        .batch_execute(
+            "begin; set local role app_writer; \
+             insert into public.c values (100, 1, 7); \
+             update public.c set amount = 22 where id = 2;",
+        )
+        .await
+        .expect("the application's writes succeed");
+    let row = it
+        .admin
+        .query_one(
+            "select pg_catalog.current_setting('row_security'), count(*) from public.c",
+            &[],
+        )
+        .await
+        .expect("the writer reads the table after its captures ran");
+    let (setting, visible): (String, i64) = (row.get(0), row.get(1));
+    it.admin.batch_execute("commit").await.expect("commit");
+    assert_eq!(setting, "on", "the writer's own row_security is untouched");
+    assert_eq!(visible, 6, "the writer's policy still filters its reads");
+    let staged: Vec<String> = ring_of_c(&it.admin).await[before..]
+        .iter()
+        .map(|(op, _)| op.clone())
+        .collect();
+    assert!(
+        !staged.is_empty() && !staged.iter().any(|op| op == "delete"),
+        "the re-reads stage refusals, not deletes for hidden rows: {staged:?}"
+    );
+    it.admin
+        .batch_execute(
+            "drop policy writer_sees_all_but_6 on public.c; \
+             alter table public.c no force row level security, disable row level security;",
+        )
+        .await
+        .expect("drop the policies");
+    refused_capture_halts_then_resume_is_exact(&mut it, "row-level security").await;
+    it.trellis.shutdown().await.expect("shutdown");
+}
+
+/// The supported setup for a source with forced row-level security:
+/// `BYPASSRLS` on the Trellis role, which owns the ring. Capture's
+/// re-reads, the drain and the capture pass are all exempt from the
+/// policies, so nothing halts or pauses and both targets stay exact, even
+/// with no policy for the Trellis role.
+#[tokio::test]
+async fn bypassrls_on_the_trellis_role_keeps_a_forced_rls_source_exact() {
+    let cluster = TestCluster::start();
+    let mut it = readers_of_c_with_a_rewriting_trigger(&cluster).await;
+    it.admin
+        .batch_execute(
+            "alter role rls_trellis bypassrls; \
+             alter table public.c enable row level security, force row level security; \
+             create policy hide_all on public.c to public using (false);",
+        )
+        .await
+        .expect("forced policies, and BYPASSRLS on the Trellis role");
+    it.admin
+        .batch_execute(
+            "insert into public.c values (100, 1, 7); \
+             update public.c set amount = 22 where id = 2;",
+        )
+        .await
+        .expect("the application's writes succeed");
+    seal_and_drain(&mut it.raw, &it.pool)
+        .await
+        .expect("the drain applies the page");
+    capture_pass(&mut it.raw, &it.pool).await;
+    harness::settle_builds(&it.pool).await;
+    for target in ["c_copy", "c_totals"] {
+        assert_eq!(
+            status(&it.trellis, target).await.status,
+            TransformStatus::Live,
+            "{target}"
+        );
+    }
+    let [source, copy, totals, aggregate] = source_and_targets(&it.admin).await;
+    assert_eq!(copy, source, "the 1-1 target matches the source");
+    assert_eq!(aggregate, totals, "the aggregate matches the source");
     it.trellis.shutdown().await.expect("shutdown");
 }

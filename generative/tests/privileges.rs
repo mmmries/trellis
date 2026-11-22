@@ -181,11 +181,6 @@ fn drawn_privilege_plans_stay_in_bounds_and_cover_every_change() {
         "target_trigger_refused",
     ] {
         for pass in [false, true] {
-            // #2227: drawn only across a pass until the fix.
-            if (kind, pass) == ("rls", false) {
-                assert!(!seen.contains(&(kind, pass)), "{seen:?}");
-                continue;
-            }
             assert!(
                 seen.contains(&(kind, pass)),
                 "{kind} pass_inside={pass}: {seen:?}"
@@ -372,34 +367,18 @@ async fn row_level_security_on_a_source_across_a_pass_pauses_the_readers() {
     }
 }
 
-/// The same inside one reconcile interval with a policy letting the Trellis
-/// role see every row: no pass sees the policies, and the re-reads, which
-/// run under them, see every row.
+/// Row-level security forced on the source inside one reconcile interval,
+/// with and without a policy for the Trellis role (#2227): no pass sees the
+/// policies, but capture's re-reads run with `row_security = off`, so they
+/// are refused rather than filtered, even by a policy that lets the Trellis
+/// role see every row. The writes succeed and both readers halt, exact
+/// after `RESUME`.
 #[tokio::test(flavor = "multi_thread")]
-async fn row_level_security_showing_capture_every_row_inside_one_interval_stays_exact() {
-    let (_, verdicts) = run_one(
-        SourceDdl::Rls {
-            trellis_policy: true,
-        },
-        false,
-    )
-    .await;
-    assert_eq!(verdicts, vec![Verdict::Exact, Verdict::Exact]);
-}
-
-/// #2227: with no policy for the Trellis role, the re-reads inside the
-/// interval see no row, and no pass sees the policies: the 1-1 target
-/// loses the re-read rows and reports `live`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "#2227: row-level security hiding rows from capture's re-read inside one interval"]
-async fn row_level_security_hiding_rows_from_capture_inside_one_interval_leaves_a_target_wrong() {
-    run_one(
-        SourceDdl::Rls {
-            trellis_policy: false,
-        },
-        false,
-    )
-    .await;
+async fn row_level_security_on_a_source_inside_one_interval_halts_the_readers() {
+    for trellis_policy in [false, true] {
+        let (_, verdicts) = run_one(SourceDdl::Rls { trellis_policy }, false).await;
+        assert_all_paused(&verdicts, HALTED);
+    }
 }
 
 /// The application's writes move to another role and back: nothing

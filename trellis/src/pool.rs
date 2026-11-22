@@ -885,11 +885,10 @@ pub(crate) const EXPRESSION_INPUT_GUCS: &str = "set timezone_abbreviations to 'D
 /// ([`crate::staging::halt`]) instead of charging keys for it.
 ///
 /// It is applied by [`session_bootstrap`] and [`dedicated_session_setup`],
-/// so every connection Trellis opens itself carries it. It isn't part of
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], because that list is also pinned on
-/// every capture function, which runs inside the *application's* write:
-/// there it would turn a policy that applies to the ring's owner into a
-/// failed application write. The capture pass pauses those readers instead.
+/// so every connection Trellis opens itself carries it. Every capture
+/// function pins it too ([`crate::capture::sql::PLANNER_SETTINGS`]), where
+/// a refused re-read halts the table's readers rather than failing the
+/// application's write.
 pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 
 /// Turns JIT compilation off.
