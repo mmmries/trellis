@@ -24,6 +24,7 @@
 
 use crate::config::{
     Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT, POOL_IDLE_TIMEOUT,
+    POOL_MAX_LIFETIME,
 };
 use crate::error::Error;
 use deadpool::managed::QueueMode;
@@ -33,9 +34,10 @@ use deadpool_postgres::{
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Closes `pool`'s idle connections unused for `idle` or longer.
-fn close_idle(pool: &DeadpoolPool, idle: Duration) {
-    pool.retain(|_, metrics| metrics.last_used() < idle);
+/// Closes `pool`'s idle connections unused for `idle` or longer, or open
+/// for `lifetime` or longer.
+fn close_idle(pool: &DeadpoolPool, idle: Duration, lifetime: Duration) {
+    pool.retain(|_, metrics| metrics.last_used() < idle && metrics.age() < lifetime);
 }
 
 /// The size of the background pool for a client's roles, or `None` when it
@@ -391,6 +393,10 @@ pub struct Pool {
     /// checkouts are counted per task in debug builds.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     background: bool,
+    /// How long a connection may stay open (`POOL_MAX_LIFETIME`; shorter in
+    /// tests), kept for [`Pool::close_idle`].
+    #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+    lifetime: Duration,
     /// Stops the idle sweep when the last clone of the pool goes.
     _sweep: Arc<SweepTask>,
 }
@@ -433,13 +439,27 @@ impl Pool {
     ///
     /// A connection unused for `POOL_IDLE_TIMEOUT` is closed: the pool hands
     /// out its most recently used connection first, and, when built inside a
-    /// tokio runtime, a task sweeps the rest.
+    /// tokio runtime, a task sweeps the rest. So is one open for
+    /// `POOL_MAX_LIFETIME`, at its next checkout or sweep, which bounds how
+    /// long its session's temporary tables hold back `datfrozenxid`.
     pub fn with_limits(
         config: &Config,
         max_size: usize,
         wait_timeout: Duration,
     ) -> Result<Self, Error> {
-        Self::build(config, max_size, wait_timeout, false)
+        Self::build(config, max_size, wait_timeout, false, POOL_MAX_LIFETIME)
+    }
+
+    /// [`Pool::new`]'s pool with a connection lifetime of `lifetime`.
+    #[cfg(test)]
+    fn with_lifetime(config: &Config, lifetime: Duration) -> Result<Self, Error> {
+        Self::build(
+            config,
+            DEFAULT_CALL_POOL_MAX_SIZE,
+            DEFAULT_CALL_POOL_WAIT_TIMEOUT,
+            false,
+            lifetime,
+        )
     }
 
     /// Builds the pool a handle's background client runs on, of exactly
@@ -448,7 +468,13 @@ impl Pool {
     /// that holds more than [`MAX_BACKGROUND_HELD`] of them at once aborts the
     /// process.
     pub(crate) fn background(config: &Config, max_size: usize) -> Result<Self, Error> {
-        Self::build(config, max_size, DEFAULT_CALL_POOL_WAIT_TIMEOUT, true)
+        Self::build(
+            config,
+            max_size,
+            DEFAULT_CALL_POOL_WAIT_TIMEOUT,
+            true,
+            POOL_MAX_LIFETIME,
+        )
     }
 
     /// This pool, with its checkouts counted as a background pool's are: a
@@ -469,6 +495,7 @@ impl Pool {
         max_size: usize,
         wait_timeout: Duration,
         background: bool,
+        lifetime: Duration,
     ) -> Result<Self, Error> {
         if max_size == 0 {
             return Err(Error::Config(
@@ -494,6 +521,16 @@ impl Pool {
                         .map_err(HookError::Backend)
                 })
             }))
+            // A connection past its lifetime is closed at checkout rather
+            // than handed out, and the checkout takes or opens another
+            // (`POOL_MAX_LIFETIME`); the sweep below closes idle ones.
+            .pre_recycle(Hook::sync_fn(move |_, metrics| {
+                if metrics.age() >= lifetime {
+                    Err(HookError::message("past the pool's connection lifetime"))
+                } else {
+                    Ok(())
+                }
+            }))
             .max_size(max_size)
             // Reuse the hottest connection, so a burst's extra connections go
             // unused and the idle sweep can close them (first-in-first-out
@@ -517,7 +554,7 @@ impl Pool {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
-                    close_idle(&pool, POOL_IDLE_TIMEOUT);
+                    close_idle(&pool, POOL_IDLE_TIMEOUT, lifetime);
                 }
             })
         });
@@ -532,18 +569,19 @@ impl Pool {
             instance: crate::instance_log::name_of(config),
             wait_timeout,
             background,
+            lifetime,
             _sweep: Arc::new(SweepTask(sweep)),
         })
     }
 
-    /// Closes every idle connection unused for `idle` or longer. The pool's
-    /// own sweep calls this every half `POOL_IDLE_TIMEOUT`; tests call it
-    /// directly. A connection's last-use time is stamped at checkout, so one
+    /// Closes every idle connection unused for `idle` or longer, or open
+    /// past the pool's lifetime. The pool's own sweep calls this every half
+    /// `POOL_IDLE_TIMEOUT`; tests call it directly. A connection's last-use time is stamped at checkout, so one
     /// held for a long transaction counts as idle the moment it comes back,
     /// and may be closed by the next sweep (one reconnect).
     #[cfg(any(test, feature = "test-util"))]
     pub fn close_idle(&self, idle: Duration) {
-        close_idle(&self.inner, idle);
+        close_idle(&self.inner, idle, self.lifetime);
     }
 
     /// The pool's `(size, available)` connection counts: connections open,
@@ -1902,6 +1940,99 @@ mod tests {
         drop(warm);
         pool.close_idle(Duration::from_millis(15));
         assert_eq!(pool.counts(), (1, 1), "only the warm connection is left");
+    }
+
+    /// A pooled connection's `on commit delete rows` temporary table (a
+    /// group-basis working table's shape) holds its database's
+    /// `datfrozenxid` at the id it was created under: `VACUUM FREEZE` from
+    /// another session skips it, and the commit-time truncate never resets
+    /// it. A connection past the pool's lifetime is closed, at checkout
+    /// while it is busy and by the sweep while it is idle, and its table
+    /// goes with it, so the freeze advances `datfrozenxid` again (#2222).
+    #[tokio::test]
+    async fn a_connection_past_its_lifetime_stops_holding_back_datfrozenxid() {
+        const BURN: u32 = 100_000;
+        const LIFETIME: Duration = Duration::from_millis(200);
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::with_lifetime(&config, LIFETIME).expect("pool");
+        let vacuum = pool.connect_unpooled().await.expect("vacuum session");
+
+        // One page's use of a working table: created once a session, its
+        // rows gone with the transaction. Returns the backend's pid.
+        async fn page(pool: &Pool) -> i32 {
+            let mut client = pool.get().await.expect("get");
+            let txn = client.transaction().await.expect("begin");
+            txn.batch_execute(
+                "create temp table if not exists working (a int) on commit delete rows; \
+                 insert into working values (1)",
+            )
+            .await
+            .expect("page");
+            let pid = txn
+                .query_one("select pg_backend_pid()", &[])
+                .await
+                .expect("pid")
+                .get(0);
+            txn.commit().await.expect("commit");
+            pid
+        }
+        // Waits for `pid`'s backend to have exited, dropping its table.
+        async fn gone(vacuum: &tokio_postgres::Client, pid: i32) {
+            for _ in 0..500 {
+                let alive: bool = vacuum
+                    .query_one(
+                        "select exists (select from pg_stat_activity where pid = $1)",
+                        &[&pid],
+                    )
+                    .await
+                    .expect("activity")
+                    .get(0);
+                if !alive {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("backend {pid} did not exit");
+        }
+        async fn frozen_age(vacuum: &tokio_postgres::Client) -> i32 {
+            vacuum.simple_query("vacuum freeze").await.expect("freeze");
+            vacuum
+                .query_one(
+                    "select age(datfrozenxid) from pg_database \
+                     where datname = current_database()",
+                    &[],
+                )
+                .await
+                .expect("age")
+                .get(0)
+        }
+
+        // Busy: the next checkout finds the connection past its lifetime.
+        let first = page(&pool).await;
+        cluster.burn_xids(BURN);
+        tokio::time::sleep(LIFETIME).await;
+        let second = page(&pool).await;
+        assert_ne!(second, first, "the checkout replaced the old connection");
+        gone(&vacuum, first).await;
+        let age = frozen_age(&vacuum).await;
+        assert!(
+            age < (BURN / 2) as i32,
+            "a busy connection held datfrozenxid back {age} ids"
+        );
+
+        // Idle: the sweep closes it.
+        cluster.burn_xids(BURN);
+        tokio::time::sleep(LIFETIME).await;
+        pool.close_idle(Duration::from_secs(3600));
+        assert_eq!(pool.counts(), (0, 0), "the sweep closed the old connection");
+        gone(&vacuum, second).await;
+        let age = frozen_age(&vacuum).await;
+        assert!(
+            age < (BURN / 2) as i32,
+            "an idle connection held datfrozenxid back {age} ids"
+        );
     }
 
     /// A task that holds more than [`MAX_BACKGROUND_HELD`] background
