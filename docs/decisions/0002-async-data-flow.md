@@ -566,8 +566,8 @@ image-less change names.
 - **Must (R6):** a recompute is never a single `UPDATE … FROM (GROUP BY)`
   with no prior lock statement.
 - **Must (R8):** each producer states the groups it covers, and covers every
-  group it could owe: the source's groups, plus the groups named by the old
-  images of ring changes not yet drained, plus the target's own groups. A
+  group it could owe: the source's groups, plus the groups named by the
+  images, old and new, of ring changes not yet drained, plus the target's own groups. A
   build that enumerated only the source's groups missed a group whose only
   pre-existing row moved out before the enumeration, so the move's old side
   later subtracted a row nothing had counted; in my model that naive
