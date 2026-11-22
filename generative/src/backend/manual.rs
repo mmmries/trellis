@@ -1949,9 +1949,16 @@ impl super::Backend for ManualBackend {
                     // (and, for every definition this suite actually
                     // generates, only) column.
                     let source = sql::persisted_source(&self.raw, &def.target).await?;
-                    let pk = source_primary_key(&self.pool, &source).await?;
+                    let pk = match source_primary_key(&self.pool, &source).await {
+                        Ok(pk) => pk[0].name.clone(),
+                        // A source key re-typed to a type define refuses as
+                        // a key (#2184): the target, paused, still holds
+                        // the column it copied.
+                        Err(DdlError::UnsupportedPrimaryKeyType { column, .. }) => column,
+                        Err(other) => return Err(other.into()),
+                    };
                     let target_columns: Vec<Column> = std::iter::once(Column {
-                        name: pk[0].name.clone(),
+                        name: pk.clone(),
                         value_type: ValueType::Numeric,
                     })
                     .chain(def.fields.iter().map(|f| Column {
@@ -1961,7 +1968,7 @@ impl super::Backend for ManualBackend {
                         value_type: ValueType::Text,
                     }))
                     .collect();
-                    sql::read_table(&self.raw, &qualified, &pk[0].name, &target_columns).await?
+                    sql::read_table(&self.raw, &qualified, &pk, &target_columns).await?
                 }
                 KeySpace::Aggregate { group_by } => {
                     // Every key's target column name is read straight off

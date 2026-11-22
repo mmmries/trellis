@@ -19,7 +19,7 @@ use trellis::dev::pool::Pool;
 
 use crate::backend::{Backend, ManualBackend};
 use crate::gaps::Gap;
-use crate::model::{Program, SourceDdl, SourceDdlEvent, SourceDdlPlan};
+use crate::model::{Program, RetypeShape, SourceDdl, SourceDdlEvent, SourceDdlPlan};
 
 use super::judge::{Judged, PassStepper, judge};
 use super::privilege::{self, RefusalSeen};
@@ -104,6 +104,9 @@ pub async fn run_convergence_with_source_ddl_allowing(
     passes.step().await.map_err(RunError::Install)?;
 
     let mut run = SourceDdlRun::default();
+    // The program as the events have left it: the oracle reads a re-typed
+    // column's new type.
+    let mut model = program.clone();
     let mut op_index = 0;
     while op_index < program.ops.len() {
         apply_and_check_outcome(backend, op_index, &program.ops[op_index], false).await?;
@@ -118,6 +121,7 @@ pub async fn run_convergence_with_source_ddl_allowing(
                 .await
                 .map_err(fired)?;
             execute(backend, &statements.opens).await.map_err(fired)?;
+            event.follow(&mut model);
             let writer = event.action.writes_as_writer();
             if writer {
                 let dsn = backend.roles().writer();
@@ -167,8 +171,8 @@ pub async fn run_convergence_with_source_ddl_allowing(
             backend,
             &passes,
             pool,
-            program,
-            &program.defs,
+            &model,
+            &model.defs,
             op_index,
             |def| allowed_for(event, def, &gaps),
         )
@@ -265,6 +269,26 @@ impl Statements {
                         quote(column)
                     )],
                     vec![rewrite(column, &ty)],
+                )
+            }
+            SourceDdl::Retype {
+                column,
+                to,
+                using,
+                shape,
+            } => {
+                let quoted = quote(column);
+                let using = match (using, shape) {
+                    (false, _) => String::new(),
+                    (true, RetypeShape::Key) => format!(" USING {quoted} + 10"),
+                    (true, _) => format!(" USING {quoted} + 1"),
+                };
+                (
+                    vec![format!(
+                        "ALTER TABLE {table} ALTER COLUMN {quoted} TYPE {}{using}",
+                        to.sql()
+                    )],
+                    Vec::new(),
                 )
             }
             SourceDdl::DisableCaptureTriggers => {

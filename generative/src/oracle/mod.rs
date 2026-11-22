@@ -1086,10 +1086,70 @@ pub fn compare(
             .unwrap_or(Comparison::Exact)
     };
 
+    // ADR-0020: an aggregate's group holds an equal value, so a `numeric`
+    // key whose text a re-type re-rendered (`0.00` and `0.0`) is one group.
+    let (target, sql) = match &def.key_space {
+        KeySpace::Aggregate { group_by }
+            if group_by
+                .iter()
+                .any(|c| comparison_for(c) == Comparison::DecimalByValue) =>
+        {
+            let rekey = |rows: &Rows| -> Rows {
+                rows.iter()
+                    .map(|(key, columns)| {
+                        let parts = group_key_parts(key);
+                        let values: Vec<Option<String>> = group_by
+                            .iter()
+                            .zip(parts)
+                            .map(|(c, part)| match comparison_for(c) {
+                                Comparison::DecimalByValue => Some(decimal_key(&part)),
+                                _ => Some(part),
+                            })
+                            .collect();
+                        (crate::model::group_key(&values), columns.clone())
+                    })
+                    .collect()
+            };
+            (
+                std::borrow::Cow::Owned(rekey(target)),
+                std::borrow::Cow::Owned(rekey(sql)),
+            )
+        }
+        _ => (
+            std::borrow::Cow::Borrowed(target),
+            std::borrow::Cow::Borrowed(sql),
+        ),
+    };
+
     OracleReport {
-        target_vs_sql: diff(&def.target, sql, target, &comparison_for),
+        target_vs_sql: diff(&def.target, &sql, &target, &comparison_for),
         definition_states: Vec::new(),
         program: format!("{program:#?}"),
+    }
+}
+
+/// The parts [`crate::model::group_key`] joined into `key`, each
+/// length-prefixed (a `NULL` part reads as `''`, as it was written).
+fn group_key_parts(key: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = key;
+    while let Some((len, tail)) = rest.split_once(':') {
+        let len: usize = len.parse().expect("a group key part's length");
+        parts.push(tail[..len].to_string());
+        rest = &tail[len..];
+    }
+    parts
+}
+
+/// `text`, a `numeric`'s rendering, with the trailing zeros of its scale
+/// dropped: one text for every rendering of one value.
+fn decimal_key(text: &str) -> String {
+    match text.split_once('.') {
+        Some((whole, fraction)) => match fraction.trim_end_matches('0') {
+            "" => whole.to_string(),
+            fraction => format!("{whole}.{fraction}"),
+        },
+        None => text.to_string(),
     }
 }
 
@@ -1784,6 +1844,20 @@ pub async fn check_over(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each rendering of one `numeric` value keys one group.
+    #[test]
+    fn a_decimal_key_is_one_text_per_value() {
+        assert_eq!(decimal_key("0.00"), "0");
+        assert_eq!(decimal_key("0.0"), "0");
+        assert_eq!(decimal_key("10.50"), "10.5");
+        assert_eq!(decimal_key("10"), "10");
+        assert_eq!(decimal_key("NaN"), "NaN");
+        assert_ne!(decimal_key("1.05"), decimal_key("1.5"));
+        let key =
+            crate::model::group_key(&[Some("0.00".to_string()), None, Some("a:b".to_string())]);
+        assert_eq!(group_key_parts(&key), ["0.00", "", "a:b"]);
+    }
     use trellis::dev::defs::ast::Operator;
 
     /// Every expression the end-to-end tiers draw is one this oracle types:

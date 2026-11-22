@@ -1191,6 +1191,9 @@ The actions, cheapest-first (every one below is built):
    and the entry's repair fixes. Anything else fails, so the register is a
    checked allowlist: a missing entry fails, and so does one whose detection
    or repair doesn't hold.
+   An `ALTER COLUMN TYPE` changes the model's column type with it, which the
+   oracle reads; a key column's value-changing rewrite is drawn only after
+   the program's last op, since later ops address the keys.
    `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`
    and `resumed_exact`. The `capture_skip_trigger_state` plant (the capture
    audit not reading a trigger's state) needs a disabled trigger, so no
