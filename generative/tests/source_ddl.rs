@@ -896,3 +896,38 @@ async fn a_key_narrowing_rewrite_at_the_last_op_is_reread() {
         [Verdict::Exact, Verdict::Exact]
     );
 }
+
+/// The same of a `GROUP BY` key (#2254): `bigint` to `integer` with `USING`
+/// pauses nothing and re-reads nothing, so the aggregate keeps its old
+/// groups while it reports `live`. A field-read column narrowed the same way
+/// is re-read.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "#2254: a narrowing USING rewrite of a GROUP BY key isn't re-read"]
+async fn a_group_by_key_narrowing_rewrite_is_reread() {
+    let program = one_to_one_and_aggregate_program();
+    let grain = grain(&program);
+    let plan = SourceDdlPlan {
+        events: vec![
+            event(
+                &program,
+                1,
+                retype(&grain, SqlType::Int8, false, RetypeShape::Narrow),
+                0,
+                false,
+            ),
+            event(
+                &program,
+                3,
+                retype(&grain, SqlType::Int4, true, RetypeShape::Narrow),
+                1,
+                false,
+            ),
+        ],
+    };
+    let verdicts = run_plan(&program, plan).await;
+    assert_eq!(
+        verdicts[1],
+        [Verdict::Exact, Verdict::Exact],
+        "{verdicts:?}"
+    );
+}

@@ -1094,10 +1094,15 @@ pub fn compare(
                 .iter()
                 .any(|c| comparison_for(c) == Comparison::DecimalByValue) =>
         {
+            // Both sides hold one row per value (the target's key is its
+            // primary key, the oracle's a `GROUP BY`), so two rows keyed
+            // alike here is a harness bug that would hide one of them.
             let rekey = |rows: &Rows| -> Rows {
-                rows.iter()
+                let rekeyed: Rows = rows
+                    .iter()
                     .map(|(key, columns)| {
                         let parts = group_key_parts(key);
+                        assert_eq!(parts.len(), group_by.len(), "group key {key:?}");
                         let values: Vec<Option<String>> = group_by
                             .iter()
                             .zip(parts)
@@ -1108,7 +1113,13 @@ pub fn compare(
                             .collect();
                         (crate::model::group_key(&values), columns.clone())
                     })
-                    .collect()
+                    .collect();
+                assert_eq!(
+                    rekeyed.len(),
+                    rows.len(),
+                    "two groups of one value: {rows:?}"
+                );
+                rekeyed
             };
             (
                 std::borrow::Cow::Owned(rekey(target)),
@@ -1844,6 +1855,7 @@ pub async fn check_over(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trellis::dev::defs::ast::Operator;
 
     /// Each rendering of one `numeric` value keys one group.
     #[test]
@@ -1858,7 +1870,100 @@ mod tests {
             crate::model::group_key(&[Some("0.00".to_string()), None, Some("a:b".to_string())]);
         assert_eq!(group_key_parts(&key), ["0.00", "", "a:b"]);
     }
-    use trellis::dev::defs::ast::Operator;
+
+    /// `compare` matches an aggregate's `numeric` group by value, and still
+    /// tells two values apart: a group the target lacks, or holds under
+    /// another value, diverges. A 1-1 key compares by its text.
+    #[test]
+    fn compare_matches_a_numeric_group_by_value_and_no_further() {
+        let field = |name: &str, expr: Expr| trellis::dev::defs::ast::FieldDef {
+            name: name.into(),
+            expr,
+        };
+        let def = |key_space| TransformDef {
+            target: "d0".into(),
+            source: "t0".into(),
+            key_space,
+            fields: vec![
+                field("grain", Expr::Column("grain".into())),
+                field(
+                    "cnt",
+                    Expr::FunctionCall {
+                        name: "COUNT".into(),
+                        args: Vec::new(),
+                    },
+                ),
+            ],
+            predicate: Predicate::True,
+            without_source_index: false,
+            adopt_target: false,
+            source_key: None,
+            explicit_source_schema: None,
+            explicit_target_schema: None,
+        };
+        let aggregate = def(KeySpace::Aggregate {
+            group_by: vec!["grain".into()],
+        });
+        let program = Program {
+            tables: Vec::new(),
+            defs: Vec::new(),
+            def_install_after_op: Vec::new(),
+            ops: Vec::new(),
+            restart_after_ops: Vec::new(),
+            scale_out_after_ops: Vec::new(),
+        };
+        let columns = HashMap::from([("grain".to_string(), ValueType::Numeric)]);
+        let rows = |groups: &[(&str, &str)]| -> Rows {
+            groups
+                .iter()
+                .map(|(grain, cnt)| {
+                    (
+                        crate::model::group_key(&[Some(grain.to_string())]),
+                        BTreeMap::from([
+                            ("grain".to_string(), Some(grain.to_string())),
+                            ("cnt".to_string(), Some(cnt.to_string())),
+                        ]),
+                    )
+                })
+                .collect()
+        };
+        let diverged = |def: &TransformDef, target: &[(&str, &str)], sql: &[(&str, &str)]| {
+            compare(&program, def, &columns, &rows(target), &rows(sql)).diverged()
+        };
+        let sql = [("1.5", "1"), ("10", "2"), ("NaN", "3")];
+        // Equal values under other renderings: one group each.
+        assert!(!diverged(
+            &aggregate,
+            &[("1.50", "1"), ("10.0", "2"), ("NaN", "3")],
+            &sql
+        ));
+        // Another value, a group missing, or a group's count off.
+        assert!(diverged(
+            &aggregate,
+            &[("1.05", "1"), ("10", "2"), ("NaN", "3")],
+            &sql
+        ));
+        assert!(diverged(
+            &aggregate,
+            &[("1.5", "1"), ("100", "2"), ("NaN", "3")],
+            &sql
+        ));
+        assert!(diverged(&aggregate, &[("1.5", "1"), ("10", "2")], &sql));
+        let close = [("1.05", "1"), ("1.5", "1")];
+        assert!(diverged(&aggregate, &[("1.05", "1")], &close));
+        assert!(diverged(&aggregate, &[("1.5", "1")], &close));
+        assert!(diverged(
+            &aggregate,
+            &[("1.5", "1"), ("10", "3"), ("NaN", "3")],
+            &sql
+        ));
+        // A 1-1 key is exact text.
+        assert!(diverged(
+            &def(KeySpace::OneToOne),
+            &[("1.50", "1")],
+            &[("1.5", "1")]
+        ));
+    }
 
     /// Every expression the end-to-end tiers draw is one this oracle types:
     /// a bare `NULL`, which only its context types, is never among them,

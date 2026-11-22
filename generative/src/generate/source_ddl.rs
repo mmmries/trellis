@@ -4,7 +4,7 @@
 
 use proptest::prelude::*;
 use trellis::dev::defs::IntWidth;
-use trellis::dev::defs::ast::ValueType;
+use trellis::dev::defs::ast::{KeySpace, ValueType};
 
 use super::wiring::with_wiring;
 use crate::model::{
@@ -314,6 +314,10 @@ fn retype(
         .copied()
         .unwrap_or(columns[pick % columns.len()]);
     let rest = pick / columns.len();
+    let grouped = program.defs.iter().any(|d| {
+        d.source == table.name
+            && matches!(&d.key_space, KeySpace::Aggregate { group_by } if group_by.iter().any(|g| g == column))
+    });
     let using = (rest / 4) % 2 == 1;
     // `integer` holds no `NaN`: the re-type, or a later write, would fail.
     let integer = |shape| (!writes_nan(program, &table.name, column)).then_some(shape);
@@ -359,9 +363,9 @@ fn retype(
             (SqlType::Int8, 0 | 1) => (RetypeShape::Outgrow, wider(16)),
             (SqlType::Int8, _) => (RetypeShape::Narrow, SqlType::Int4),
         };
-        // #2254: an integer narrowed with `USING` may be a `GROUP BY` key,
-        // which the pass neither pauses nor re-reads.
-        let using = using && !(from == SqlType::Int8 && to == SqlType::Int4);
+        // #2254: an integer `GROUP BY` key narrowed with `USING` is neither
+        // paused nor re-read by the pass.
+        let using = using && !(from == SqlType::Int8 && to == SqlType::Int4 && grouped);
         (shape, to, using)
     };
     Some(SourceDdl::Retype {
