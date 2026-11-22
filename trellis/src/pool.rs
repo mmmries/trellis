@@ -576,9 +576,10 @@ impl Pool {
 
     /// Closes every idle connection unused for `idle` or longer, or open
     /// past the pool's lifetime. The pool's own sweep calls this every half
-    /// `POOL_IDLE_TIMEOUT`; tests call it directly. A connection's last-use time is stamped at checkout, so one
-    /// held for a long transaction counts as idle the moment it comes back,
-    /// and may be closed by the next sweep (one reconnect).
+    /// `POOL_IDLE_TIMEOUT`; tests call it directly. A connection's last-use
+    /// time is stamped at checkout, so one held for a long transaction
+    /// counts as idle the moment it comes back, and may be closed by the
+    /// next sweep (one reconnect).
     #[cfg(any(test, feature = "test-util"))]
     pub fn close_idle(&self, idle: Duration) {
         close_idle(&self.inner, idle, self.lifetime);
