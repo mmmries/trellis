@@ -94,6 +94,8 @@ claimant's buckets are freed within the reclaim TTL plus about 5 s. A full ring
 does not change that: a refused seal still lets the pass run, and the pass is what
 frees a dead claimant's hold on the oldest batch. A tombstone collection that
 stopped at its per-ledger cap runs again on the next tick rather than 5 s later.
+While the ring is idle, a tombstone stamped at the empty active segment lives
+until the next seal.
 
 The seal itself is the **liveness unblock for a saturated ring**: a seal that gets
 `RingFull` runs retirement and retries once, so a ring full of
