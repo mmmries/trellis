@@ -173,9 +173,30 @@ class Counters:
             self.errors[key] = self.errors.get(key, 0) + 1
 
 
+IDLE_PING_SECS = 2.0
+
+
+def revive(conn):
+    """A connection that sat unused may have been broken by a Postgres restart meanwhile.
+    Probe it with a statement that writes nothing, and reconnect if it fails, so the next write
+    doesn't report the harness's own dead connection as an error. A write is never retried: one
+    that fails still counts, whatever the cause."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select 1")
+        return conn
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return None
+
+
 def worker(args, weights, pacer, counters):
     names, cum = list(weights), list(weights.values())
     conn = None
+    last_used = 0.0
     while True:
         slot = pacer.take(time.time())
         if slot is None:
@@ -184,6 +205,8 @@ def worker(args, weights, pacer, counters):
         delay = due - time.time()
         if delay > 0:
             time.sleep(delay)
+        if conn is not None and time.time() - last_used > IDLE_PING_SECS:
+            conn = revive(conn)
         try:
             if conn is None:
                 conn = psycopg2.connect(args.dsn, connect_timeout=5)
@@ -192,6 +215,7 @@ def worker(args, weights, pacer, counters):
             with conn.cursor() as cur:
                 cur.execute(OPS[name][1], params(args.accounts, args.orders))
                 affected = max(cur.rowcount, 0)
+            last_used = time.time()
             with counters.lock:
                 counters.ok += 1
                 counters.seg_ok[seg] += 1
