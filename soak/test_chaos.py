@@ -323,10 +323,10 @@ class Gates(unittest.TestCase):
 
     def test_first_write_ratio(self):
         m = self.metrics()
-        m["after_idle"][1]["ratio"] = 2.1
+        m["after_idle"][1].update(latency=0.51, ratio=2.0)  # 2.04x: summarize's rounding must not pass it
         (msg,) = chaos.check_gates(m)
-        self.assertIn("first write after idle (segment 3)", msg)
-        m["after_idle"][1]["ratio"] = 2.0  # the bound itself holds
+        self.assertIn("first write after idle (segment 3) took 2.04x", msg)
+        m["after_idle"][1]["latency"] = 0.5  # the bound itself holds
         self.assertEqual(chaos.check_gates(m), [])
 
     def test_first_write_never_arrived(self):
@@ -341,6 +341,8 @@ class Gates(unittest.TestCase):
         m["segments"][1]["wal_bytes_per_hour_settled"] = int(6.6 * 1048576)
         (msg,) = chaos.check_gates(m)
         self.assertIn("idle WAL (segment 2)", msg)
+        m["segments"][1]["wal_bytes_per_hour_settled"] = int(6.5 * 1048576)  # the bound itself holds
+        self.assertEqual(chaos.check_gates(m), [])
 
     def test_non_idle_wal_is_not_gated(self):
         m = self.metrics()
@@ -352,6 +354,8 @@ class Gates(unittest.TestCase):
         m["segments"][0]["xmin_hold_s_settled_max"] = 3
         (msg,) = chaos.check_gates(m)
         self.assertIn("backend_xmin hold (steady segment 1)", msg)
+        m["segments"][0]["xmin_hold_s_settled_max"] = 2  # the bound itself holds
+        self.assertEqual(chaos.check_gates(m), [])
 
     def test_xmin_hold_deliberate_step_is_exempt(self):
         m = self.metrics()
@@ -367,7 +371,7 @@ class Gates(unittest.TestCase):
     def test_every_breach_is_reported(self):
         m = self.metrics()
         m["segments"][1].update(wal_bytes_per_hour_settled=10 * 1048576, warn={"x": 1})
-        m["after_idle"][0]["ratio"] = 5.0
+        m["after_idle"][0].update(latency=1.25, ratio=5.0)
         self.assertEqual(len(chaos.check_gates(m)), 3)
 
     def test_summarize_settled_hold_skips_the_drain(self):
@@ -412,6 +416,71 @@ class LoadgenRevive(unittest.TestCase):
         c = self.Conn(True)
         self.assertIsNone(loadgen.revive(c))
         self.assertTrue(c.closed)
+
+
+class LoadgenWorker(unittest.TestCase):
+    """worker() against fake connections: a failed write counts once and is never retried."""
+
+    class Conn:
+        def __init__(self, log, writes=(False,), probe_fails=False):
+            self.log, self.writes, self.probe_fails = log, list(writes), probe_fails  # writes: fails?
+            self.rowcount = 1
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            probe = sql == "select 1"
+            self.log.append("probe" if probe else "write")
+            if self.probe_fails if probe else self.writes.pop(0):
+                raise loadgen.psycopg2.OperationalError("server closed the connection unexpectedly")
+
+        def close(self):
+            pass
+
+    class Pacer:
+        def __init__(self, n):
+            self.n = n
+
+        def take(self, now):
+            if self.n == 0:
+                return None
+            self.n -= 1
+            return now, 0
+
+    def run_worker(self, conns, slots):
+        """Runs worker() over `slots` statements with every connection treated as idle."""
+        args = type("A", (), {"dsn": "x", "accounts": 10, "orders": 10})()
+        counters, pending = loadgen.Counters(), list(conns)
+        saved = (loadgen.psycopg2.connect, loadgen.IDLE_PING_SECS, loadgen.time.sleep)
+        loadgen.psycopg2.connect = lambda *a, **k: pending.pop(0)
+        loadgen.IDLE_PING_SECS, loadgen.time.sleep = -1, lambda s: None
+        try:
+            loadgen.worker(args, loadgen.parse_mix(""), self.Pacer(slots), counters)
+        finally:
+            loadgen.psycopg2.connect, loadgen.IDLE_PING_SECS, loadgen.time.sleep = saved
+        return (counters.ok, counters.err), pending
+
+    def test_failed_write_counts_and_is_not_retried(self):
+        log = []
+        counts, pending = self.run_worker([self.Conn(log, [True]), self.Conn(log)], slots=1)
+        self.assertEqual((counts, log, len(pending)), ((0, 1), ["write"], 1))
+
+    def test_probe_does_not_hide_a_failing_write(self):
+        log = []
+        counts, _ = self.run_worker([self.Conn(log, [False, True])], slots=2)
+        self.assertEqual((counts, log), ((1, 1), ["write", "probe", "write"]))
+
+    def test_dead_idle_connection_is_replaced_before_the_write(self):
+        log = []
+        counts, pending = self.run_worker([self.Conn(log, probe_fails=True), self.Conn(log)], slots=2)
+        self.assertEqual((counts, log, pending), ((2, 0), ["write", "probe", "write"], []))
 
 
 class RunUsage(unittest.TestCase):

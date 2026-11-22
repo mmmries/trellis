@@ -723,10 +723,12 @@ def check_gates(m):
     if not any(s["profile"] == "idle" for s in segs):
         return []
     out = []
+    p50 = m["steady_latency_p50"]
     for a in m["after_idle"]:
-        if a["ratio"] is not None and a["ratio"] > GATE_AFTER_IDLE_RATIO:
+        ratio = a["latency"] / p50 if a["latency"] is not None and p50 else None  # unrounded, unlike a["ratio"]
+        if ratio is not None and ratio > GATE_AFTER_IDLE_RATIO:
             out.append(
-                f"first write after idle (segment {a['segment']}) took {a['ratio']}x steady p50,"
+                f"first write after idle (segment {a['segment']}) took {ratio:.2f}x steady p50,"
                 f" over {GATE_AFTER_IDLE_RATIO}x"
             )
         elif a["latency"] is None:

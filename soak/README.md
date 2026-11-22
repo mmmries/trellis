@@ -32,7 +32,9 @@ soak/chaos.py stop                                     # after an interrupted ru
   `/metrics` on port 59501, 59502 and so on. `w1` connects over TCP so `blackhole` reaches it.
   A worker that exits when no action stopped it fails the run.
 - **Load.** `loadgen.py` runs `--threads` connections with the op weights in `--mix`,
-  following `--schedule` (default `steady:120`). It reconnects after every error, and probes a connection idle for 2 s before its next write (a `select 1`), so a Postgres restart in an idle doesn't count against the next segment. A write that fails is never retried or hidden.
+  following `--schedule` (default `steady:120`). It reconnects after every error. A connection
+  unused for 2 s gets a `select 1` before its next write and is replaced if dead, so a Postgres
+  restart during an idle doesn't count as load errors. A write that fails is never retried.
 - **Profiles.** A schedule is `PROFILE:SECS[:RATE],...`: `idle` (no writes), `trickle` (one
   a minute), `steady` (`--tps`) and `spike` (10× `--tps`). `RATE` is `N` per second, `N/m`
   per minute or `xN` times `--tps`.
@@ -61,18 +63,20 @@ form in the logbook note.
 A run with an idle segment is gated on these thresholds (`GATE_*` in `chaos.py`); a breach fails
 the run (outcome `fail`) with a message naming the metric and segment:
 
-- first write after an idle at most 2.0x the steady p50;
+- first write after an idle at most 2.0x the steady p50, and it must reach its target;
 - idle WAL at most 6.5 MB/h once settled;
-- `backend_xmin` hold at most 2 s once settled, in any segment except one with `long-txn` or `pg-dump`;
+- `backend_xmin` hold at most 2 s once settled, in every segment except one that starts a
+  `long-txn` or `pg-dump` step (those hold the horizon on purpose);
 - no WARN in an idle segment with no injected fault (WARNs in a faulted idle are not gated).
 
 ## Outcome
 
 `setup` and `run` each reserve a logbook entry (kind `soak`; pass `--lane` and `--issue`) and
-wait for the box to be free. It finishes the entry with the rows the load wrote. It exits 0 when the oracle
-converged and every threshold held, and 1 otherwise. The thresholds are an unexpected worker
-exit, a definition not `live` at the end, `--max-rss-mb`, `--max-age-secs` and the profile gates. It exits 2 when
-the harness itself failed and 64 on a usage error. Use `--no-logbook` only for trial runs.
+wait for the box to be free. It finishes the entry with the rows the load wrote. It exits 0 when
+the oracle converged and every threshold held, and 1 otherwise. The thresholds are an unexpected
+worker exit, a definition not `live` at the end, `--max-rss-mb`, `--max-age-secs` and the profile
+gates. It exits 2 when the harness itself failed and 64 on a usage error. Use `--no-logbook`
+only for trial runs.
 
 ## Upgrades and full volumes
 
