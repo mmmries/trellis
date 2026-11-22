@@ -2145,7 +2145,7 @@ async fn run_ops(
 
 #[cfg(test)]
 mod tests {
-    use super::super::ring_wait::MAX_DRAIN_ATTEMPTS;
+    use super::super::ring_wait::{MAX_DRAIN_ATTEMPTS, await_ring_with};
     use super::*;
     use trellis::dev::defs::parse;
 
@@ -2722,69 +2722,121 @@ mod tests {
         );
     }
 
+    /// A fake clock the test moves by hand, so the deadline is measured in
+    /// the test's time and a scheduling stall can't reach it (#2258).
+    struct FakeClock {
+        start: Instant,
+        offset: std::cell::Cell<Duration>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            FakeClock {
+                start: Instant::now(),
+                offset: std::cell::Cell::new(Duration::ZERO),
+            }
+        }
+
+        fn now(&self) -> Instant {
+            self.start + self.offset.get()
+        }
+
+        fn advance(&self, by: Duration) {
+            self.offset.set(self.offset.get() + by);
+        }
+    }
+
+    /// Fake-time slice: the real wait per sample, kept short.
+    const FAKE_SAMPLE: Duration = Duration::from_millis(50);
+
     /// A drain that keeps committing pages, for longer than a window in all,
-    /// is waited out: each committed page restarts the window.
+    /// is waited out: each committed page restarts the window. The test
+    /// commits a page and moves the clock 500 ms at each sample, ten times,
+    /// then drains: 5 s of fake time against a 2 s window, with nothing
+    /// depending on real scheduling.
     #[tokio::test]
     async fn a_ring_that_keeps_draining_is_waited_out_past_the_window() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let raw = session(db.dsn()).await;
-        let def = catalog_definition(&raw, "live").await;
         raw.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
-
         let engine = session(db.dsn()).await;
-        let engine_side = tokio::spawn(async move {
-            for step in 0..10 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                commit_a_page(&engine, step).await;
-            }
-            drain_ring(&engine).await
-        });
+        let token = watermark_token(&raw).await.expect("token");
 
-        let started = Instant::now();
-        quiesce(&raw, &[def], SHORT_WINDOW)
-            .await
-            .expect("a drain that keeps committing pages converges");
-        let returned_at = Instant::now();
-        let drained_at = engine_side.await.expect("engine side");
-        assert!(returned_at >= drained_at);
+        let clock = FakeClock::new();
+        let mut deadline = ProgressDeadline::new(SHORT_WINDOW, clock.now());
+        let mut step = 0;
+        await_ring_with(
+            &raw,
+            token,
+            &mut deadline,
+            HeldKeys::Block,
+            FAKE_SAMPLE,
+            || clock.now(),
+            async || {
+                if step < 10 {
+                    commit_a_page(&engine, step).await;
+                    clock.advance(Duration::from_millis(500));
+                } else {
+                    drain_ring(&engine).await;
+                }
+                step += 1;
+            },
+        )
+        .await
+        .expect("a drain that keeps committing pages converges");
         assert!(
-            started.elapsed() > SHORT_WINDOW.no_progress * 2,
+            clock.offset.get() > SHORT_WINDOW.no_progress * 2,
             "the drain ran past the window, so the wait must have too"
         );
+        assert!(deadline.restarts() >= 9, "each page restarts the window");
     }
 
     /// However long the ring keeps advancing, the quiesce gives up at the
-    /// cap.
+    /// cap: exactly, in fake time, 20 pages of 300 ms into a 6 s cap.
     #[tokio::test]
     async fn a_ring_that_keeps_moving_without_draining_fails_at_the_cap() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let raw = session(db.dsn()).await;
-        let def = catalog_definition(&raw, "live").await;
         raw.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
-
         let engine = session(db.dsn()).await;
-        let engine_side = tokio::spawn(async move {
-            for step in 0..=i64::MAX {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                commit_a_page(&engine, step).await;
-            }
-        });
+        let token = watermark_token(&raw).await.expect("token");
 
         let budget = QuiesceBudget {
             no_progress: Duration::from_secs(2),
             cap: Duration::from_secs(6),
         };
-        let started = Instant::now();
-        assert_ring_timeout(quiesce(&raw, &[def], budget).await);
-        let elapsed = started.elapsed();
-        engine_side.abort();
-        assert!(
-            elapsed >= budget.cap - Duration::from_millis(500)
-                && elapsed < budget.cap + Duration::from_secs(3),
-            "ended at {elapsed:?}, not the cap"
+        let clock = FakeClock::new();
+        let mut deadline = ProgressDeadline::new(budget, clock.now());
+        let mut step = 0;
+        let result = await_ring_with(
+            &raw,
+            token,
+            &mut deadline,
+            HeldKeys::Block,
+            FAKE_SAMPLE,
+            || clock.now(),
+            async || {
+                commit_a_page(&engine, step).await;
+                step += 1;
+                clock.advance(Duration::from_millis(300));
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(QuiesceError::Staging(
+                StagingError::ConvergenceTimeout { .. }
+            ))
+        ));
+        assert_eq!(
+            clock.offset.get(),
+            budget.cap,
+            "ended at {:?} of fake time, not the cap",
+            clock.offset.get()
         );
+        assert_eq!(deadline.expired(clock.now()), Some(Expiry::Cap));
     }
 
     /// A session holding the ring's bookkeeping table locked blocks the
