@@ -15,7 +15,9 @@ use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     trivial_program,
 };
-use generative::model::{Program, RetypeShape, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType};
+use generative::model::{
+    Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType,
+};
 use generative::run::judge::Verdict;
 use generative::run::{
     RunError, SourceDdlRun, run_convergence_with_source_ddl,
@@ -235,34 +237,28 @@ fn grain(program: &Program) -> String {
     grain
 }
 
-/// Whether `cluster`'s server versions attributes the way PostgreSQL's
-/// 2026-11 minors do (15.20, 16.16, 17.12, 18.7): an `ALTER COLUMN ... TYPE`
-/// stamps `pg_attver` into the `attoptions` of the column and of every
-/// column after it.
+/// Whether `cluster`'s server versions attributes ([`Server`]).
 async fn server_versions_attributes(cluster: &TestCluster) -> bool {
     let db = CaseDatabase::provision(cluster).await;
     let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
         .await
         .expect("connect the probe");
     tokio::spawn(connection);
-    client
-        .batch_execute(
-            "create temp table attver_probe (c int); \
-             alter table attver_probe alter column c type bigint",
-        )
+    Server::probe(&client)
         .await
-        .expect("probe a retype");
-    client
-        .query_one(
-            "select coalesce(array_to_string(attoptions, ','), '') like '%pg_attver=%' \
-             from pg_catalog.pg_attribute \
-             where attrelid = 'pg_temp.attver_probe'::regclass and attname = 'c'",
-            &[],
-        )
-        .await
-        .expect("read the probe")
-        .get(0)
+        .expect("probe the server")
+        .versions_attributes
 }
+
+/// Both kinds of server, for a shape the register lists on either.
+const SERVERS: [Server; 2] = [
+    Server {
+        versions_attributes: false,
+    },
+    Server {
+        versions_attributes: true,
+    },
+];
 
 /// `c1`, the column both definitions read.
 fn c1(program: &Program) -> String {
@@ -410,7 +406,12 @@ async fn a_rewrite_of_the_last_read_column_beside_a_default_is_the_listed_gap() 
         1,
         false,
     );
-    assert_eq!(event.listed_gaps(), vec![Gap::AlterTypeRewrite]);
+    for server in SERVERS {
+        assert_eq!(
+            event.listed_gaps(&program, server),
+            vec![Gap::AlterTypeRewrite]
+        );
+    }
     assert_eq!(
         run_one(&program, event).await,
         [Verdict::Exact, Verdict::ListedGap(Gap::AlterTypeRewrite)]
@@ -439,6 +440,11 @@ async fn a_rewrite_beside_a_default_is_reread_through_a_later_read_column_where_
         1,
         false,
     );
+    assert_eq!(event.listed_gaps(&program, SERVERS[1]), Vec::new());
+    assert_eq!(
+        event.listed_gaps(&program, SERVERS[0]),
+        vec![Gap::AlterTypeRewrite]
+    );
     let plan = SourceDdlPlan {
         events: vec![event.clone()],
     };
@@ -463,7 +469,9 @@ async fn a_rewrite_after_a_default_across_a_pass_is_reread() {
         1,
         true,
     );
-    assert!(event.listed_gaps().is_empty());
+    for server in SERVERS {
+        assert!(event.listed_gaps(&program, server).is_empty());
+    }
     for verdict in run_one(&program, event).await {
         assert_eq!(verdict, Verdict::Exact);
     }
@@ -491,7 +499,7 @@ async fn the_same_shape_without_its_register_entry_fails_as_silently_wrong() {
         .await
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
-    match run_convergence_with_source_ddl_allowing(&mut backend, &pool, &program, &plan, |_| {
+    match run_convergence_with_source_ddl_allowing(&mut backend, &pool, &program, &plan, |_, _| {
         Vec::new()
     })
     .await
@@ -718,7 +726,12 @@ async fn a_widening_that_changes_values_is_the_listed_gap() {
             1,
             pass_inside,
         );
-        assert_eq!(event.listed_gaps(), vec![Gap::AlterTypeRewrite]);
+        for server in SERVERS {
+            assert_eq!(
+                event.listed_gaps(&program, server),
+                vec![Gap::AlterTypeRewrite]
+            );
+        }
         assert_eq!(
             run_one(&program, event).await,
             [Verdict::Exact, Verdict::ListedGap(Gap::AlterTypeRewrite)],
@@ -768,11 +781,14 @@ async fn a_narrower_scale_is_reread() {
 /// to `bigint` (and, in the second case, with `USING`) outgrows the
 /// `bigint` sum the `RESUME` made: it pauses again. The 1-1's `total`
 /// holds no copy of the column, so the widening with `USING` is the
-/// register's listed gap there.
+/// register's listed gap there, unless the server versions attributes: then
+/// the rewrite moves the rows of the read columns after `c1`, and the pass
+/// after the pause re-reads the 1-1.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_widening_that_outgrows_a_copy_pauses_its_readers() {
     let program = one_to_one_and_aggregate_program();
     let c1 = c1(&program);
+    let versioned = server_versions_attributes(&TestCluster::start()).await;
     for using in [false, true] {
         let plan = SourceDdlPlan {
             events: vec![
@@ -797,7 +813,7 @@ async fn a_widening_that_outgrows_a_copy_pauses_its_readers() {
             verdicts[0].iter().all(is_resumed),
             "using={using}: {verdicts:?}"
         );
-        let one_to_one = if using {
+        let one_to_one = if using && !versioned {
             Verdict::ListedGap(Gap::AlterTypeRewrite)
         } else {
             Verdict::Exact

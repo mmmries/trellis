@@ -19,7 +19,7 @@ use trellis::dev::pool::Pool;
 
 use crate::backend::{Backend, ManualBackend};
 use crate::gaps::Gap;
-use crate::model::{Program, RetypeShape, SourceDdl, SourceDdlEvent, SourceDdlPlan};
+use crate::model::{Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan};
 
 use super::judge::{Judged, PassStepper, judge};
 use super::privilege::{self, RefusalSeen};
@@ -40,6 +40,8 @@ pub struct SourceDdlRun {
     /// The reconcile passes stepped inside a privilege change that failed,
     /// with their errors: the engine's own loop logs one and runs the next.
     pub refused_passes: Vec<(SourceDdlEvent, String)>,
+    /// The server the run probed, which decides the events' listed gaps.
+    pub server: Server,
 }
 
 impl SourceDdlRun {
@@ -57,26 +59,22 @@ pub async fn run_convergence_with_source_ddl(
     program: &Program,
     plan: &SourceDdlPlan,
 ) -> Result<SourceDdlRun, RunError> {
-    run_convergence_with_source_ddl_allowing(
-        backend,
-        pool,
-        program,
-        plan,
-        SourceDdlEvent::listed_gaps,
-    )
+    run_convergence_with_source_ddl_allowing(backend, pool, program, plan, |event, server| {
+        event.listed_gaps(program, server)
+    })
     .await
 }
 
 /// [`run_convergence_with_source_ddl`] with the register entries each event
-/// may reproduce given by `allowed` instead of the event's own
-/// [`SourceDdlEvent::listed_gaps`]: for the control that shows an untagged
-/// gap fails the run.
+/// may reproduce on the server given by `allowed` instead of the event's
+/// own [`SourceDdlEvent::listed_gaps`]: for the control that shows an
+/// untagged gap fails the run.
 pub async fn run_convergence_with_source_ddl_allowing(
     backend: &mut ManualBackend,
     pool: &Pool,
     program: &Program,
     plan: &SourceDdlPlan,
-    allowed: impl Fn(&SourceDdlEvent) -> Vec<Gap>,
+    allowed: impl Fn(&SourceDdlEvent, Server) -> Vec<Gap>,
 ) -> Result<SourceDdlRun, RunError> {
     let mut previous_end = None;
     for event in &plan.events {
@@ -100,10 +98,14 @@ pub async fn run_convergence_with_source_ddl_allowing(
     let passes = PassStepper::connect(backend)
         .await
         .map_err(RunError::Install)?;
+    let server = passes.server().await.map_err(RunError::Install)?;
     // The first pass installs capture, so an event on the first op finds it.
     passes.step().await.map_err(RunError::Install)?;
 
-    let mut run = SourceDdlRun::default();
+    let mut run = SourceDdlRun {
+        server,
+        ..SourceDdlRun::default()
+    };
     // The program as the events have left it: the oracle reads a re-typed
     // column's new type.
     let mut model = program.clone();
@@ -166,7 +168,7 @@ pub async fn run_convergence_with_source_ddl_allowing(
             }
             op_index = event.last_op();
         }
-        let gaps = event.map(&allowed).unwrap_or_default();
+        let gaps = event.map(|e| allowed(e, server)).unwrap_or_default();
         let judged = judge(
             backend,
             &passes,
@@ -395,7 +397,7 @@ mod tests {
             pass_inside: false,
         };
         assert_ne!(program.defs[0].source, program.defs[1].source);
-        let gaps = event.listed_gaps();
+        let gaps = event.listed_gaps(&program, Server::default());
         assert_eq!(gaps, vec![Gap::AlterTypeRewrite]);
         assert_eq!(allowed_for(Some(&event), &program.defs[0], &gaps), gaps);
         assert!(allowed_for(Some(&event), &program.defs[1], &gaps).is_empty());

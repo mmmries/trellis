@@ -8,6 +8,47 @@ use trellis::dev::defs::ast::ValueType;
 
 use crate::gaps::Gap;
 
+/// What the server under test does that decides which register shapes an
+/// event reproduces ([`SourceDdlEvent::listed_gaps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Server {
+    /// Whether an `ALTER COLUMN ... TYPE` stamps `pg_attver` into the
+    /// `attoptions` of the column and of every column after it, as
+    /// PostgreSQL 15.20, 16.16, 17.12, 18.7 and later minors do.
+    pub versions_attributes: bool,
+}
+
+impl Server {
+    /// Probes the server on a temporary table of `client`'s session, which
+    /// it drops again.
+    pub async fn probe(client: &tokio_postgres::Client) -> Result<Self, String> {
+        client
+            .batch_execute(
+                "create temp table trellis_attver_probe (c int); \
+                 alter table trellis_attver_probe alter column c type bigint",
+            )
+            .await
+            .map_err(|e| format!("probe a retype: {e}"))?;
+        let versions_attributes: bool = client
+            .query_one(
+                "select coalesce(array_to_string(attoptions, ','), '') like '%pg_attver=%' \
+                 from pg_catalog.pg_attribute \
+                 where attrelid = 'pg_temp.trellis_attver_probe'::regclass and attname = 'c'",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("read the probe: {e}"))?
+            .get(0);
+        client
+            .batch_execute("drop table pg_temp.trellis_attver_probe")
+            .await
+            .map_err(|e| format!("drop the probe: {e}"))?;
+        Ok(Self {
+            versions_attributes,
+        })
+    }
+}
+
 /// One drawn change to a tracked source table, or to who may read or write
 /// it (#2182, [`SourceDdl::privilege`]). Each runs as one or two groups of
 /// statements: one when the event fires and, for a change undone or
@@ -208,25 +249,55 @@ pub struct SourceDdlEvent {
 }
 
 impl SourceDdlEvent {
-    /// The register entries this event may reproduce: a definition may end
-    /// silently wrong after it only as one of these, detected by
-    /// `self_check` and made exact by the entry's repair.
-    pub fn listed_gaps(&self) -> Vec<Gap> {
-        match (&self.action, self.pass_inside) {
-            (SourceDdl::RewriteBesideDefault { .. }, false) => vec![Gap::AlterTypeRewrite],
+    /// The register entries this event may reproduce on `server`: a
+    /// definition may end silently wrong after it only as one of these,
+    /// detected by `self_check` and made exact by the entry's repair. Where
+    /// the server versions attributes, a rewrite also moves the catalog row
+    /// of every column after the rewritten one, so a read one shows the pass
+    /// the rewrite: the shape is the register's only with no read column
+    /// after it.
+    pub fn listed_gaps(&self, program: &crate::model::Program, server: Server) -> Vec<Gap> {
+        let column = match (&self.action, self.pass_inside) {
+            (SourceDdl::RewriteBesideDefault { column }, false) => column,
             // The register's "widening that changes values": the pass sees a
             // widening and nothing to re-read, so a reader whose copies the
             // widening doesn't outgrow keeps the old values, pass or no pass.
             (
                 SourceDdl::Retype {
+                    column,
                     using: true,
                     shape: RetypeShape::Widen | RetypeShape::Outgrow,
                     ..
                 },
                 _,
-            ) => vec![Gap::AlterTypeRewrite],
-            _ => Vec::new(),
+            ) => column,
+            _ => return Vec::new(),
+        };
+        if server.versions_attributes && self.read_column_after(program, column) {
+            return Vec::new();
         }
+        vec![Gap::AlterTypeRewrite]
+    }
+
+    /// Whether a definition reads a column of the event's table that comes
+    /// after `column` (by `attnum`). The key counts: capture images it.
+    fn read_column_after(&self, program: &crate::model::Program, column: &str) -> bool {
+        let Some(table) = program.tables.iter().find(|t| t.name == self.table) else {
+            return false;
+        };
+        let read: Vec<String> = program
+            .defs
+            .iter()
+            .filter(|d| d.source == table.name)
+            .flat_map(crate::generate::columns_read)
+            .chain([table.pk_col.clone()])
+            .collect();
+        table
+            .columns
+            .iter()
+            .skip_while(|c| c.name != column)
+            .skip(1)
+            .any(|c| read.contains(&c.name))
     }
 
     /// Makes `program`'s model of the event's table follow the event: a

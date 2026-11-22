@@ -2489,7 +2489,8 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 /// - `listed_gap`: the register's `alter-type-rewrite` shapes, which
 ///   `self_check` finds and `request_backfill` repairs: a same-type rewrite
 ///   beside a `SET DEFAULT` inside one reconcile interval, and a widening
-///   that changes values.
+///   that changes values. Only a draw the register lists on the server
+///   counts toward it (`SourceDdlEvent::listed_gaps`).
 /// - `resumed_exact`: disabling the capture triggers pauses the readers by
 ///   the capture audit; a narrowing that changes the type a reader evaluates
 ///   the column as, and a widening that outgrows a copy, pause them by the
@@ -2502,6 +2503,7 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 async fn source_ddl_actions_reach_the_listed_gap_and_resumed_exact_verdicts() {
     use generative::backend::{CaseDatabase, ManualBackend};
     use generative::generate::source_ddl::source_ddl_plan_for;
+    use generative::model::Server;
     use generative::run::run_convergence_with_source_ddl;
     use std::collections::BTreeMap;
     use trellis::Config;
@@ -2518,6 +2520,14 @@ async fn source_ddl_actions_reach_the_listed_gap_and_resumed_exact_verdicts() {
         (&["retype_outgrow", "retype_outgrow_using"], "resumed_exact"),
     ];
     let cluster = testkit::TestCluster::start();
+    let server = {
+        let db = CaseDatabase::provision(&cluster).await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect the probe");
+        tokio::spawn(connection);
+        Server::probe(&client).await.expect("probe the server")
+    };
     let mut runner = TestRunner::deterministic();
     let strategy = trivial_program().prop_flat_map(|program| {
         let plan = source_ddl_plan_for(&program);
@@ -2541,10 +2551,13 @@ async fn source_ddl_actions_reach_the_listed_gap_and_resumed_exact_verdicts() {
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
             .current();
+        // A listed gap only from an event the register lists on this
+        // server.
         let wanted = plan.events.iter().any(|e| {
-            waiting
-                .iter()
-                .any(|(actions, _)| actions.contains(&e.action.kind()))
+            waiting.iter().any(|(actions, verdict)| {
+                actions.contains(&e.action.kind())
+                    && (*verdict != "listed_gap" || !e.listed_gaps(&program, server).is_empty())
+            })
         });
         if !wanted {
             continue;
