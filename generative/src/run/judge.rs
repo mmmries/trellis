@@ -316,7 +316,9 @@ impl PassStepper {
     /// pass with nothing to do writes none of them.
     async fn pass_state(&self) -> Result<String, String> {
         let digest = |table: &str| {
-            format!("(select string_agg(t::text, ',' order by t::text) from {table} t)")
+            format!(
+                "coalesce((select string_agg(t::text, ',' order by t::text) from {table} t), '')"
+            )
         };
         let tables = [
             "transform_definitions",

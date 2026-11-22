@@ -281,6 +281,8 @@ impl SourceDdlEvent {
 
     /// Whether a definition reads a column of the event's table that comes
     /// after `column` (by `attnum`). The key counts: capture images it.
+    /// The tier draws no `JOIN`, so a definition reads the table only as
+    /// its `FROM`.
     fn read_column_after(&self, program: &crate::model::Program, column: &str) -> bool {
         let Some(table) = program.tables.iter().find(|t| t.name == self.table) else {
             return false;
