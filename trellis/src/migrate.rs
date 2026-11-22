@@ -119,6 +119,7 @@ impl Migrations {
 
     /// A key that changes whenever the set changes: every version, name and
     /// checksum, in order. Unkeyed, so stable across runs of one toolchain.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn fingerprint(&self) -> String {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut hasher = DefaultHasher::new();
@@ -546,7 +547,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// #2244: a cache of migrated databases keys on this, so it must change
-    /// when a migration is added or an existing one is edited.
+    /// when a migration is added, edited or renamed.
     #[test]
     fn the_fingerprint_changes_with_the_migration_set() {
         let base = Migrations::embedded();
@@ -567,6 +568,16 @@ mod tests {
             .expect("migration"),
         );
         assert_ne!(base.fingerprint(), edited.fingerprint());
+        let mut renamed = Migrations::embedded();
+        let last = renamed.list.pop().expect("a migration");
+        renamed.list.push(
+            refinery::Migration::unapplied(
+                &format!("V{}__{}_renamed", last.version(), last.name()),
+                last.sql().expect("embedded sql"),
+            )
+            .expect("migration"),
+        );
+        assert_ne!(base.fingerprint(), renamed.fingerprint());
     }
 
     /// Issue #599: inside a call, each migration pass runs under the budget
