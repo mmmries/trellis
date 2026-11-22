@@ -367,6 +367,10 @@ fn chained_sweep_tier() -> SweepTier {
         &[PlantPath::XidEpoch],
         generative::plant_sweep::NO_XID_EPOCH,
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::SourceDdl],
+        generative::plant_sweep::NO_SOURCE_DDL,
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_CHAINED_TIER,
         known_misses: CHAINED_KNOWN_MISSES,

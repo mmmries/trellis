@@ -65,10 +65,11 @@ wired into two workflows:
   described above; the DB-backed pins can still individually hit the quiesce
   stall, just far less often than a 16-case property's ~80 ops.
 - **`.github/workflows/nightly.yml` (scheduled, 06:00 UTC daily, plus
-  `workflow_dispatch`):** deep-runs two properties:
+  `workflow_dispatch`):** deep-runs three properties:
   `property_convergence_holds_for_trivial_programs` at `PROPTEST_CASES=200`,
-  and the epoch tier's `property_epoch_chains_converge_on_one_instance` at
-  `PROPTEST_CASES=16` with `GENERATIVE_MAX_EPOCHS=50`. The others are not
+  the epoch tier's `property_epoch_chains_converge_on_one_instance` at
+  `PROPTEST_CASES=16` with `GENERATIVE_MAX_EPOCHS=50`, and the source-DDL
+  tier's `property_source_ddl_is_never_silently_wrong` at `PROPTEST_CASES=50`. The others are not
   deep-run anywhere in this repo's CI config.
 
 **Failing seeds stay local; failures become pins.** Every property's

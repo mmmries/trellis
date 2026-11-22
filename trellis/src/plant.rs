@@ -1039,6 +1039,19 @@ pub enum Plant {
     /// `a_null_key_is_a_row_of_its_own_through_every_write`), and gated by
     /// the concurrent tier's `source_key` sweep (#2171).
     NullKeyAsEmpty,
+    /// #2184 (`capture_skip_trigger_state`): the capture audit
+    /// (`capture::triggers`'s `findings`) doesn't read a trigger's state: a
+    /// trigger that is disabled, or whose row changed under its recorded oid
+    /// (a disable and an enable again), is no finding. Writes made while it
+    /// was off never reach the ring, and no definition pauses.
+    ///
+    /// Pinned by `generative`'s `source_ddl` tests
+    /// `capture_disabled_across_a_pass_pauses_its_readers` and
+    /// `capture_disabled_and_restored_inside_one_interval_pauses_its_readers`.
+    /// Only the source-DDL property draws a disabled trigger, and it is no
+    /// planted-bug sweep tier, so no tier gates it
+    /// (`generative::plant_sweep`'s `PlantPath::SourceDdl`).
+    CaptureSkipTriggerState,
 }
 
 impl Plant {
@@ -1142,6 +1155,7 @@ impl Plant {
         Plant::FieldReleaseBeforeWiden,
         Plant::FenceXid32,
         Plant::NullKeyAsEmpty,
+        Plant::CaptureSkipTriggerState,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -1246,6 +1260,7 @@ impl Plant {
 
             Plant::FenceXid32 => "fence_xid32",
             Plant::NullKeyAsEmpty => "null_key_as_empty",
+            Plant::CaptureSkipTriggerState => "capture_skip_trigger_state",
         }
     }
 

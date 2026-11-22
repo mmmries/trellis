@@ -2477,3 +2477,99 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
     }
     assert!(twins_live >= 50, "{twins_live} of 100");
 }
+
+/// #2184: the source-DDL tier's verdicts, counted per drawn action, and the
+/// floors on the two that a green run could silently stop reaching. Every
+/// definition at the check after an event is judged `exact`,
+/// `resumed_exact`, `listed_gap` or `resume_refused`
+/// (`generative::run::judge::Verdict`); an action whose verdicts are all
+/// `exact` is coverage that proves nothing about the pause and rebuild
+/// paths.
+///
+/// - `listed_gap`: a same-type rewrite beside a `SET DEFAULT` inside one
+///   reconcile interval is the register's `alter-type-rewrite` shape, which
+///   `self_check` finds and `request_backfill` repairs.
+/// - `resumed_exact`: disabling the capture triggers pauses the readers by
+///   the capture audit, and each `RESUME` makes them exact.
+///
+/// Draws are deterministic. Only a draw with one of those two events is run,
+/// until both floors hold, so this costs a handful of cases rather than a
+/// sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_ddl_actions_reach_the_listed_gap_and_resumed_exact_verdicts() {
+    use generative::backend::{CaseDatabase, ManualBackend};
+    use generative::generate::source_ddl::source_ddl_plan_for;
+    use generative::run::run_convergence_with_source_ddl;
+    use std::collections::BTreeMap;
+    use trellis::Config;
+    use trellis::dev::pool::Pool;
+
+    const DRAWS: usize = 300;
+    const MAX_RUNS: usize = 24;
+    let cluster = testkit::TestCluster::start();
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|program| {
+        let plan = source_ddl_plan_for(&program);
+        (proptest::strategy::Just(program), plan)
+    });
+    // Action kind, then verdict kind, to the number of definitions.
+    let mut tally: BTreeMap<(&'static str, &'static str), usize> = BTreeMap::new();
+    let reached = |tally: &BTreeMap<(&'static str, &'static str), usize>, verdict: &str| {
+        tally.iter().any(|((_, v), n)| *v == verdict && *n > 0)
+    };
+    let mut runs = 0;
+    for _ in 0..DRAWS {
+        if runs == MAX_RUNS || (reached(&tally, "listed_gap") && reached(&tally, "resumed_exact")) {
+            break;
+        }
+        let (program, plan) = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let wanted = plan.events.iter().any(|e| {
+            matches!(
+                e.action.kind(),
+                "rewrite_beside_default" | "disable_capture_triggers"
+            )
+        });
+        if !wanted {
+            continue;
+        }
+        let db = CaseDatabase::provision(&cluster).await;
+        let mut backend = ManualBackend::connect_as(db.roles())
+            .await
+            .expect("connect manual backend");
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let run = run_convergence_with_source_ddl(&mut backend, &pool, &program, &plan)
+            .await
+            .unwrap_or_else(|err| panic!("{err:?}\n{program:#?}\n{plan:?}"));
+        runs += 1;
+        for (event, judged) in &run.checks {
+            let Some(event) = event else { continue };
+            for j in judged {
+                *tally
+                    .entry((event.action.kind(), j.verdict.kind()))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let report = format!("{runs} runs; verdicts per action:\n{tally:#?}");
+    eprintln!("{report}");
+    assert!(
+        tally
+            .iter()
+            .any(|((action, v), n)| *action == "rewrite_beside_default"
+                && *v == "listed_gap"
+                && *n > 0),
+        "coverage floor failed: no rewrite beside a default reached listed_gap:\n{report}"
+    );
+    assert!(
+        tally
+            .iter()
+            .any(|((action, v), n)| *action == "disable_capture_triggers"
+                && *v == "resumed_exact"
+                && *n > 0),
+        "coverage floor failed: no disabled capture trigger reached resumed_exact:\n{report}"
+    );
+}
