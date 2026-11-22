@@ -58,7 +58,7 @@ segment with one `INSERT … SELECT`:
   re-reads" below); otherwise it images the transition table. The re-read
   needs `SELECT` on the table, which the Trellis role holds as the table's
   owner; the capture audit reports it missing. A table whose row-level
-  security hides rows from the Trellis role is refused (see
+  security applies to the Trellis role is refused (see
   [supported sources and targets](../transforms.md#supported-sources-and-targets)).
 - **Updates** pair the OLD and NEW transition tables by primary key. A row
   whose key changed has no partner, so it becomes a delete of the old key and
@@ -324,11 +324,11 @@ trigger makes every capture re-read (and the capture audit reports it).
 
 Postgres refuses the re-read (`42501`) when the ring's owner has lost
 `SELECT` on the table or `USAGE` on its schema (the table handed to an owner
-it doesn't inherit, say), or a policy applies to it, permissive or not:
-the capture functions run with `row_security = off`, so a policy refuses
-the re-read rather than filtering it. That never fails the writer
-(ADR-0002 I6): the re-read runs in a block that traps that condition alone and stages a
-`schema_changed` marker recording the refusal in place of the statement's
+it doesn't inherit, say), or row-level security applies to it, whatever
+its policies allow: the capture functions run with `row_security = off`, so
+the policies refuse the re-read rather than filter it. That never fails the
+writer (ADR-0002 I6): the re-read runs in a block that traps that condition
+alone and stages a `schema_changed` marker recording the refusal in place of the statement's
 rows. The drain halts every reader of the table on the marker, whether or
 not access is back by then, and `RESUME` rebuilds them. The block is a
 subtransaction, which past 64 per transaction would overflow the backend's

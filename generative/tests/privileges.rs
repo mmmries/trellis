@@ -292,13 +292,13 @@ async fn run_one(action: SourceDdl, pass_inside: bool) -> (SourceDdlRun, Vec<Ver
 }
 
 /// Every reader paused with a reason starting `prefix` and was exact after
-/// its `RESUME`.
-fn assert_all_paused(verdicts: &[Verdict], prefix: &str) {
-    assert_eq!(verdicts.len(), 2);
+/// its `RESUME`; a failure names `case`.
+fn assert_all_paused(case: impl std::fmt::Debug, verdicts: &[Verdict], prefix: &str) {
+    assert_eq!(verdicts.len(), 2, "{case:?}");
     for verdict in verdicts {
         assert!(
             matches!(verdict, Verdict::ResumedExact { reason } if reason.starts_with(prefix)),
-            "{verdicts:?}"
+            "{case:?}: {verdicts:?}"
         );
     }
 }
@@ -316,7 +316,7 @@ const HALTED: &str = "halt: the ";
 async fn an_owner_trellis_does_not_inherit_pauses_the_readers_and_fails_no_write() {
     for pass_inside in [false, true] {
         let (_, verdicts) = run_one(SourceDdl::OwnerToOther, pass_inside).await;
-        assert_all_paused(&verdicts, HALTED);
+        assert_all_paused(("pass_inside", pass_inside), &verdicts, HALTED);
     }
 }
 
@@ -333,7 +333,7 @@ async fn an_owner_trellis_inherits_keeps_every_definition_exact() {
 async fn trellis_select_revoked_pauses_the_readers_and_fails_no_write() {
     for pass_inside in [false, true] {
         let (_, verdicts) = run_one(SourceDdl::RevokeSelect, pass_inside).await;
-        assert_all_paused(&verdicts, HALTED);
+        assert_all_paused(("pass_inside", pass_inside), &verdicts, HALTED);
     }
 }
 
@@ -343,7 +343,7 @@ async fn trellis_select_revoked_pauses_the_readers_and_fails_no_write() {
 async fn the_owner_revoked_from_trellis_pauses_the_readers_and_fails_no_write() {
     for pass_inside in [false, true] {
         let (_, verdicts) = run_one(SourceDdl::RevokeMembership, pass_inside).await;
-        assert_all_paused(&verdicts, HALTED);
+        assert_all_paused(("pass_inside", pass_inside), &verdicts, HALTED);
     }
 }
 
@@ -352,7 +352,7 @@ async fn the_owner_revoked_from_trellis_pauses_the_readers_and_fails_no_write() 
 async fn schema_usage_revoked_pauses_the_readers_and_fails_no_write() {
     for pass_inside in [false, true] {
         let (_, verdicts) = run_one(SourceDdl::RevokeSchemaUsage, pass_inside).await;
-        assert_all_paused(&verdicts, HALTED);
+        assert_all_paused(("pass_inside", pass_inside), &verdicts, HALTED);
     }
 }
 
@@ -363,7 +363,11 @@ async fn schema_usage_revoked_pauses_the_readers_and_fails_no_write() {
 async fn row_level_security_on_a_source_across_a_pass_pauses_the_readers() {
     for trellis_policy in [false, true] {
         let (_, verdicts) = run_one(SourceDdl::Rls { trellis_policy }, true).await;
-        assert_all_paused(&verdicts, "capture: row-level security on public.");
+        assert_all_paused(
+            ("trellis_policy", trellis_policy),
+            &verdicts,
+            "capture: row-level security on public.",
+        );
     }
 }
 
@@ -377,7 +381,7 @@ async fn row_level_security_on_a_source_across_a_pass_pauses_the_readers() {
 async fn row_level_security_on_a_source_inside_one_interval_halts_the_readers() {
     for trellis_policy in [false, true] {
         let (_, verdicts) = run_one(SourceDdl::Rls { trellis_policy }, false).await;
-        assert_all_paused(&verdicts, HALTED);
+        assert_all_paused(("trellis_policy", trellis_policy), &verdicts, HALTED);
     }
 }
 

@@ -808,8 +808,9 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// role it doesn't inherit, a revoked grant, or row-level security that
 /// applies to it (the function pins `row_security = off`,
 /// [`PLANNER_SETTINGS`], so a policy refuses rather than filters) makes
-/// Postgres refuse the re-read with `insufficient_privilege` (`42501`), which would
-/// fail the application's statement (ADR-0002 I6). So each re-read runs in
+/// Postgres refuse the re-read with `insufficient_privilege` (`42501`),
+/// which would fail the application's statement (ADR-0002 I6). So each
+/// re-read runs in
 /// a block that traps that one condition and, instead of the statement's
 /// rows, stages a [`SCHEMA_CHANGED_OP`] marker recording the refusal
 /// ([`refused_marker`]). The drain then halts every reader of the table
@@ -990,8 +991,8 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
 /// trapping block (see "A refused re-read" on [`function_body`]). It reads
 /// what Postgres checks, from the catalog: `SELECT` on the table (on a
 /// partitioned source, its root, which the re-read reads), `USAGE` on its
-/// schema, and whether row-level security applies to the role. A column grant alone, rather than the table's,
-/// counts as exposed. The table is named by the trigger's `tg_relid`, and
+/// schema, and whether row-level security applies to the role. A column
+/// grant alone, rather than the table's, counts as exposed. The table is named by the trigger's `tg_relid`, and
 /// the schema by its name as text: a `regclass` lookup of the name would
 /// itself be refused without `USAGE`.
 ///
