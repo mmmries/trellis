@@ -525,3 +525,10 @@ macro_rules! fixture {
         sample
     }};
 }
+
+/// A hash of the migrations this binary embeds (version, name, checksum). A
+/// cache of migrated databases keys on it, so it can't go stale against what
+/// `migrate` runs.
+pub fn migrations_fingerprint() -> String {
+    crate::migrate::Migrations::embedded().fingerprint()
+}

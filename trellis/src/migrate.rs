@@ -117,6 +117,17 @@ impl Migrations {
         refinery::Runner::new(&self.list).set_abort_missing(false)
     }
 
+    /// A key that changes whenever the set changes: every version, name and
+    /// checksum, in order. Unkeyed, so stable across runs of one toolchain.
+    pub(crate) fn fingerprint(&self) -> String {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        for migration in &self.list {
+            (migration.version(), migration.name(), migration.checksum()).hash(&mut hasher);
+        }
+        format!("{:016x}", hasher.finish())
+    }
+
     fn records(&self) -> Vec<MigrationRecord> {
         self.list
             .iter()
@@ -533,6 +544,30 @@ async fn run_up_to_latest(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// #2244: a cache of migrated databases keys on this, so it must change
+    /// when a migration is added or an existing one is edited.
+    #[test]
+    fn the_fingerprint_changes_with_the_migration_set() {
+        let base = Migrations::embedded();
+        assert_eq!(base.fingerprint(), Migrations::embedded().fingerprint());
+        let mut added = Migrations::embedded();
+        let next = added.list.len() + 1000;
+        added.list.push(
+            refinery::Migration::unapplied(&format!("V{next}__x"), "SELECT 1").expect("migration"),
+        );
+        assert_ne!(base.fingerprint(), added.fingerprint());
+        let mut edited = Migrations::embedded();
+        let last = edited.list.pop().expect("a migration");
+        edited.list.push(
+            refinery::Migration::unapplied(
+                &format!("V{}__{}", last.version(), last.name()),
+                "SELECT 2",
+            )
+            .expect("migration"),
+        );
+        assert_ne!(base.fingerprint(), edited.fingerprint());
+    }
 
     /// Issue #599: inside a call, each migration pass runs under the budget
     /// left when the pass starts, not the one the session was opened with.
