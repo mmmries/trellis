@@ -460,7 +460,7 @@ The design:
   definition change's `FOR UPDATE`. Mismatch → roll back, reload, recompute. No
   worker can commit values computed under a superseded definition, and an edit to
   one table never fences batches working on other tables.
-- **A table's row is kept for life.** Nothing deletes it, so a re-define
+- **A table's meta row is kept for life.** Nothing deletes it, so a re-define
   continues its version, and a page that loaded the old version cannot pass the
   fence against the new definition.
 - **Backstop:** the edit's re-derivation stages its rows at a higher position, so

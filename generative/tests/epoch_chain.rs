@@ -693,15 +693,15 @@ mod residue {
         let report = run_lapping_case(&last_reader_dropped());
         assert!(report.is_ok(), "{report:?}");
     }
-    /// At idle, a 1-1 tombstone and an aggregate's zero group are still
-    /// counted (#2240: no allowance), and the quiet point's forced seal is
-    /// what clears them. The tombstones are real (every source row deleted);
-    /// the zero group is planted at the active segment with a basis (a
-    /// null basis is collected at once, racing the look), the shape a build
-    /// leaves, since no write sequence reproduces it reliably.
+    /// At idle, a 1-1 tombstone and an aggregate's zero group stamped at the
+    /// active segment are still counted (#2240: no allowance), and the quiet
+    /// point's forced seal is what clears them. Both are planted once the
+    /// ring is idle, with a basis: a real one (a delete's tombstones) is
+    /// stamped before the idle seal, which collects it on its own a tick
+    /// later, so it would race the look; no write sequence leaves the idle
+    /// shape reliably.
     #[test]
     fn a_forced_seal_clears_the_tombstone_and_zero_group_left_at_idle() {
-        use generative::backend::Backend;
         use generative::generate::epoch::{EpochChangeDraw, EpochChangeKind, EpochDraw};
         use generative::generate::{AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec};
         use generative::run::seal_at_quiet_point;
@@ -754,13 +754,22 @@ mod residue {
                     .await
                     .expect("its group column")
                     .get(0);
-                // Every source row gone: the ledger keeps a tombstone per key
-                // until the drained prefix passes it.
-                operator
-                    .batch_execute("delete from public.t0")
+                let ts = kept.config.target_schema().to_string();
+                let ledger: String = operator
+                    .query_one(
+                        "select relname from pg_class where relname like '%__ledger' \
+                         and relnamespace = $1::text::regnamespace",
+                        &[&ts],
+                    )
                     .await
-                    .expect("delete every source row");
-                kept.backend.quiesce().await.expect("quiesce");
+                    .expect("the case's 1-1 ledger")
+                    .get(0);
+                // The chain's own quiet point sealed past everything, so the
+                // ring is idle: nothing seals the active segment until the
+                // forced seal below.
+                kept.hidden(generative::run::SETTLE)
+                    .await
+                    .expect("clean before any plant");
                 let active: i64 = operator
                     .query_one("select active_seq from trellis.segment_pointer", &[])
                     .await
@@ -769,14 +778,16 @@ mod residue {
                 operator
                     .batch_execute(&format!(
                         "insert into trellis.{agg} ({group}, __n, __stamp, __basis) \
-                         values (777, 0, {active}, '1:2:')"
+                         values (777, 0, {active}, '1:2:'); \
+                         insert into \"{ts}\".\"{ledger}\" (__from_key, __tombstone, __applied_seg) \
+                         values ('k1', true, {active})"
                     ))
                     .await
-                    .expect("plant a zero group at the active segment");
+                    .expect("plant a zero group and a tombstone at the active segment");
                 match kept.hidden(std::time::Duration::ZERO).await {
                     Err(RunError::Residue { failures }) => {
                         assert!(
-                            failures.iter().any(|f| f.contains("__ledger holds")),
+                            failures.iter().any(|f| f.contains(&format!("{ledger} holds"))),
                             "{failures:?}"
                         );
                         assert!(
