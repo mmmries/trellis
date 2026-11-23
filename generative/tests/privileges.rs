@@ -274,6 +274,7 @@ async fn run_one(action: SourceDdl, pass_inside: bool) -> (SourceDdlRun, Vec<Ver
     let event = event(&program, action, pass_inside);
     let cluster = TestCluster::start();
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![event.clone()],
     };
     let run = run(&cluster, &program, &wiring, &plan)

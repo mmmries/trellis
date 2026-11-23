@@ -1661,6 +1661,47 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
         program.restart_after_ops.is_empty() && program.scale_out_after_ops.is_empty(),
         "concurrent_plan: the concurrent tier doesn't schedule a restart or a scale-out"
     );
+    let indices: Vec<usize> = (0..program.ops.len()).collect();
+    let bursts = indices
+        .chunks(burst_size)
+        .map(|chunk| Burst {
+            lanes: deal_to_lanes(program, chunk, lanes),
+            actions: Vec::new(),
+        })
+        .collect();
+    let mut plan = ConcurrentPlan {
+        bursts,
+        steady_load: None,
+        settle_after_install: false,
+        commit_stall: None,
+        txns: Vec::new(),
+        wiring: Vec::new(),
+    };
+    for (def, &at) in program.def_install_after_op.iter().enumerate() {
+        if at == 0 {
+            continue;
+        }
+        plan.bursts[at / burst_size].actions.push(TimedAction {
+            after: at % burst_size,
+            action: BurstAction::Install { def },
+        });
+    }
+    sort_actions(&mut plan);
+    plan
+}
+
+/// Deals `ops`, indexes into `program.ops` in program order, to at most
+/// `lanes` lanes the way [`concurrent_plan`] deals one burst (see the
+/// section comment above): every op on one row, or on one table the
+/// program ever truncates, bulk-inserts or reads through a `KEY (…)`, in
+/// the same lane, in program order, and distinct keys dealt round-robin in
+/// order of first appearance. Empty lanes are left out.
+///
+/// # Panics
+///
+/// If `lanes` is `0`.
+pub fn deal_to_lanes(program: &Program, ops: &[usize], lanes: usize) -> Vec<Vec<usize>> {
+    assert!(lanes > 0, "deal_to_lanes: lanes must be at least 1");
     // A keyed table's writes can collide on its `KEY (...)` from any two
     // rows, so they keep to one lane (`source_key`'s module doc comment).
     let whole_table: std::collections::HashSet<&str> = program
@@ -1690,45 +1731,16 @@ pub fn concurrent_plan(program: &Program, burst_size: usize, lanes: usize) -> Co
         };
         (table.to_string(), pk)
     };
-
-    let indices: Vec<usize> = (0..program.ops.len()).collect();
-    let bursts = indices
-        .chunks(burst_size)
-        .map(|chunk| {
-            let mut lane_of: HashMap<(String, Option<String>), usize> = HashMap::new();
-            let mut out = vec![Vec::new(); lanes];
-            for &index in chunk {
-                let key = lane_key(&program.ops[index]);
-                let next = lane_of.len() % lanes;
-                let lane = *lane_of.entry(key).or_insert(next);
-                out[lane].push(index);
-            }
-            out.retain(|lane| !lane.is_empty());
-            Burst {
-                lanes: out,
-                actions: Vec::new(),
-            }
-        })
-        .collect();
-    let mut plan = ConcurrentPlan {
-        bursts,
-        steady_load: None,
-        settle_after_install: false,
-        commit_stall: None,
-        txns: Vec::new(),
-        wiring: Vec::new(),
-    };
-    for (def, &at) in program.def_install_after_op.iter().enumerate() {
-        if at == 0 {
-            continue;
-        }
-        plan.bursts[at / burst_size].actions.push(TimedAction {
-            after: at % burst_size,
-            action: BurstAction::Install { def },
-        });
+    let mut lane_of: HashMap<(String, Option<String>), usize> = HashMap::new();
+    let mut out = vec![Vec::new(); lanes];
+    for &index in ops {
+        let key = lane_key(&program.ops[index]);
+        let next = lane_of.len() % lanes;
+        let lane = *lane_of.entry(key).or_insert(next);
+        out[lane].push(index);
     }
-    sort_actions(&mut plan);
-    plan
+    out.retain(|lane| !lane.is_empty());
+    out
 }
 
 /// Orders every burst's actions by when they fire, keeping the order of

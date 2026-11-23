@@ -17,16 +17,19 @@ use std::time::Duration;
 use trellis::dev::defs::ast::TransformDef;
 use trellis::dev::pool::Pool;
 
-use crate::backend::{Backend, DefinitionState, ManualBackend};
+use tokio::task::JoinSet;
+
+use crate::backend::{Backend, ConcurrentBackend, DefinitionState, ManualBackend, OpApplier};
 use crate::gaps::Gap;
+use crate::generate::deal_to_lanes;
 use crate::model::{
     IndexChange, MOVED_SCHEMA, Op, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent,
-    SourceDdlPlan, table_away,
+    SourceDdlPlan, reads, table_away,
 };
 
 use super::judge::{Judged, PassStepper, judge};
 use super::privilege::{self, RefusalSeen};
-use super::{Outcome, RunError, apply_and_check_outcome};
+use super::{Outcome, RunError, apply_and_check_outcome, check_op_outcome};
 
 /// The engine's reconcile interval in this tier: longer than any case, so
 /// only the run's own passes run once the engine has started.
@@ -176,9 +179,14 @@ pub async fn run_convergence_with_source_ddl_allowing(
                     .map_err(|e| fired(format!("read the states after the pass: {e:?}")))?;
                 run.pass_states.push((event.clone(), states));
             }
-            for window_op in op_index + 1..=event.last_op() {
-                let op = in_window(event, &program.ops[window_op]);
-                apply_and_check_outcome(backend, window_op, &op, false).await?;
+            let window: Vec<usize> = (op_index + 1..=event.last_op()).collect();
+            if plan.lanes > 1 && event.action.issues_from_lanes() && window.len() > 1 {
+                apply_from_lanes(backend, program, event, &window, plan.lanes).await?;
+            } else {
+                for &window_op in &window {
+                    let op = in_window(event, &program.ops[window_op]);
+                    apply_and_check_outcome(backend, window_op, &op, false).await?;
+                }
             }
             if let Some(target) = event.action.refused_target() {
                 let seen =
@@ -263,9 +271,68 @@ fn refusal(error: &str) -> bool {
 /// entry never excuses a definition the shape didn't touch.
 fn allowed_for(event: Option<&SourceDdlEvent>, def: &TransformDef, gaps: &[Gap]) -> Vec<Gap> {
     match event {
-        Some(event) if def.source == event.table => gaps.to_vec(),
+        Some(event) if reads(def, &event.table) => gaps.to_vec(),
         _ => Vec::new(),
     }
+}
+
+/// Issues `window`, `event`'s window, from up to `lanes` lanes at once,
+/// each a task on its own application connection applying its ops in
+/// program order ([`deal_to_lanes`]; every op on a table with a unique
+/// key besides its primary key, a 1-1 `JOIN`'s joined table, in one lane,
+/// since two of its rows can collide on that key), and checks each op's
+/// outcome as the run's own connection would. The changes are in flight from several
+/// transactions at once, under the event, while the drain workers claim
+/// them. The first failure, by lane, is the run's.
+async fn apply_from_lanes(
+    backend: &ManualBackend,
+    program: &Program,
+    event: &SourceDdlEvent,
+    window: &[usize],
+    lanes: usize,
+) -> Result<(), RunError> {
+    let unique = |index: &usize| {
+        let table = program.ops[*index].table();
+        program
+            .tables
+            .iter()
+            .any(|t| t.name == table && !(t.unique_cols.is_empty() && t.unique_sets.is_empty()))
+    };
+    let mut dealt = deal_to_lanes(program, window, lanes);
+    let mut together: Vec<usize> = dealt
+        .iter_mut()
+        .flat_map(|lane| lane.extract_if(.., |i| unique(i)))
+        .collect();
+    together.sort_unstable();
+    dealt.push(together);
+    dealt.retain(|lane| !lane.is_empty());
+    let mut tasks = JoinSet::new();
+    for ops in dealt {
+        let mut applier = backend.applier().await.map_err(|e| RunError::SourceDdl {
+            op_index: event.op,
+            event: Box::new(event.clone()),
+            error: format!("open a lane's connection: {e:?}"),
+        })?;
+        let ops: Vec<(usize, Op)> = ops
+            .into_iter()
+            .map(|i| (i, in_window(event, &program.ops[i])))
+            .collect();
+        tasks.spawn(async move {
+            for (index, op) in &ops {
+                let applied = applier.apply(op).await;
+                check_op_outcome(*index, op, &applied)?;
+            }
+            Ok::<_, RunError>(())
+        });
+    }
+    let mut first = None;
+    while let Some(joined) = tasks.join_next().await {
+        let result = joined.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        if let Err(error) = result {
+            first.get_or_insert(error);
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// `op`, a write in `event`'s window, as the application issues it while

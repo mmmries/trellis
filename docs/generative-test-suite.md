@@ -1207,7 +1207,16 @@ The actions, cheapest-first (every one below is built):
    run probes whether the server versions attributes), which `self_check` reports
    and the entry's repair fixes. Anything else fails, so the register is a
    checked allowlist: a missing entry fails, and so does one whose detection
-   or repair doesn't hold.
+   or repair doesn't hold. An exact definition the shape may have left wrong
+   is `self_check`ed as well: the damage can sit in a `JOIN`'s hidden tables
+   until a later write carries it into the target.
+   A plan issues each event's window from up to four lanes on their own
+   connections, as the concurrent tier deals a burst, with as many drain
+   workers. A second property draws the `JOIN`, 1-1 `JOIN` and star tiers'
+   programs, cut to their first ops; a table a `JOIN` reads, `FROM` or
+   joined, draws the whole-table, maintenance, rewrite and key-index changes,
+   the key being a 1-1 `JOIN`'s unique key on its `ON` columns or the
+   primary key.
    An `ALTER COLUMN TYPE` changes the model's column type with it, which the
    oracle reads; a key column's value-changing rewrite, a column renamed
    away, dropped or made generated, and the table renamed away for good, are

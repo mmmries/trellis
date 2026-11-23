@@ -12,6 +12,11 @@
 //!    ([`Gap`]) it may reproduce, `self_check` reports the divergence, and
 //!    the entry's repair makes it exact ([`Verdict::ListedGap`]).
 //!
+//! A definition exact against the recompute that the shape may have left
+//! wrong is `self_check`ed too: the damage can sit in what Trellis keeps
+//! beside the target (a `JOIN`'s hidden tables) until a later write
+//! carries it in, and is case 3 when the check reports it.
+//!
 //! Anything else fails the run ([`RunError::NeverSilentlyWrong`]). Case 3
 //! makes `docs/known-correctness-gaps.md` a checked allowlist: a missing
 //! entry fails, and so does one whose detection doesn't detect or whose
@@ -108,8 +113,8 @@ pub fn first_look(state: &DefinitionState, diverged: Option<bool>, allowed: &[Ga
     match diverged {
         None => FirstLook::Fail("live, but the oracle can't recompute it".to_string()),
         Some(false) => FirstLook::Done(Verdict::Exact),
-        Some(true) => match allowed.iter().find(|gap| gap.repair() != Repair::None) {
-            Some(gap) => FirstLook::Repair(*gap),
+        Some(true) => match repairable(allowed) {
+            Some(gap) => FirstLook::Repair(gap),
             None if allowed.is_empty() => FirstLook::Fail(format!(
                 "silently wrong: reports {} and differs from the recompute, and the drawn \
                  shape names no listed gap",
@@ -120,6 +125,18 @@ pub fn first_look(state: &DefinitionState, diverged: Option<bool>, allowed: &[Ga
             )),
         },
     }
+}
+
+/// The entry of `allowed` the harness can repair, if any: the one a wrong
+/// definition is repaired as, and the one an exact definition is
+/// `self_check`ed for, since a shape's damage can sit in what Trellis keeps
+/// beside the target (a `JOIN`'s hidden tables) until a later change
+/// carries it into the target, after the shape's check.
+pub fn repairable(allowed: &[Gap]) -> Option<Gap> {
+    allowed
+        .iter()
+        .find(|gap| gap.repair() != Repair::None)
+        .copied()
 }
 
 /// The look after a paused definition's `RESUME` (`resumed`: its error
@@ -405,8 +422,17 @@ pub async fn judge(
     // The definitions a second look decides.
     let mut to_resume: Vec<(usize, String)> = Vec::new();
     let mut to_repair: Vec<(usize, Gap)> = Vec::new();
+    // Exact definitions the shape may have left wrong where the recompute
+    // can't see it yet (a `JOIN`'s hidden tables), for `self_check`.
+    let mut latent: Vec<(usize, Gap)> = Vec::new();
     for (i, (def, (state, diverged, report))) in defs.iter().zip(&looks).enumerate() {
         match first_look(state, *diverged, &allowed(def)) {
+            FirstLook::Done(Verdict::Exact) => {
+                judged[i] = Some(Verdict::Exact);
+                if let Some(gap) = repairable(&allowed(def)) {
+                    latent.push((i, gap));
+                }
+            }
             FirstLook::Done(verdict) => judged[i] = Some(verdict),
             FirstLook::Fail(problem) => {
                 return Err(fail(&def.target, problem, format!("{state}\n{report}")));
@@ -419,19 +445,29 @@ pub async fn judge(
     // `request_backfill` rebuilds every reader of the table, so a check
     // after it would find the others clean.
     let mut repaired: Vec<(usize, Gap, bool)> = Vec::new();
-    if !to_repair.is_empty() {
+    if !to_repair.is_empty() || !latent.is_empty() {
         let targets: Vec<String> = to_repair
             .iter()
+            .chain(&latent)
             .map(|(i, _)| defs[*i].target.clone())
             .collect();
         backend.set_strict_audit(true);
         let audited = backend.strict_audit(&targets).await;
         backend.set_strict_audit(false);
         let unclean = audited.map_err(|e| RunError::Snapshot(format!("self_check: {e:?}")))?;
+        let reported = |i: usize| {
+            let prefix = format!("{}:", defs[i].target);
+            unclean.iter().any(|line| line.starts_with(&prefix))
+        };
         for (i, gap) in &to_repair {
-            let prefix = format!("{}:", defs[*i].target);
-            let reported = unclean.iter().any(|line| line.starts_with(&prefix));
-            repaired.push((*i, *gap, reported));
+            repaired.push((*i, *gap, reported(*i)));
+        }
+        // An exact target `self_check` finds wrong underneath is the gap
+        // too, repaired before a later change brings it to the target.
+        for (i, gap) in &latent {
+            if reported(*i) {
+                repaired.push((*i, *gap, true));
+            }
         }
     }
     let mut resumed: Vec<(usize, String, Result<(), String>)> = Vec::new();
@@ -529,6 +565,16 @@ mod tests {
             reported: status.to_string(),
             reason: reason.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn only_an_entry_with_a_repair_is_checked_for_and_repaired() {
+        assert_eq!(repairable(&[]), None);
+        assert_eq!(repairable(&[Gap::TransactionPooler]), None);
+        assert_eq!(
+            repairable(&[Gap::TransactionPooler, Gap::SourceRenameRoundtrip]),
+            Some(Gap::SourceRenameRoundtrip)
+        );
     }
 
     #[test]
