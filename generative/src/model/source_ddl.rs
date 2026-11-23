@@ -183,8 +183,9 @@ pub enum SourceDdl {
     /// primary key's, or the unique key a 1-1 `JOIN`'s `b` is joined on.
     /// The pass checks the index by shape, not by oid
     /// (`docs/staging-and-claiming/capture-drift.md`), so a key left backed
-    /// at every pass keeps every reader exact, and one a pass finds
-    /// unbacked pauses its readers.
+    /// throughout keeps every reader exact; one left unbacked pauses its
+    /// readers at a pass (a `KEY (…)`'s), or halts them at a drained change
+    /// (T0118).
     KeyIndex {
         columns: Vec<String>,
         change: IndexChange,
@@ -580,10 +581,10 @@ pub fn table_away(table: &str) -> String {
 pub enum IndexChange {
     /// Dropped when the event fires (its constraint, where it is one) and
     /// created again at the close, the window's changes drained in
-    /// between ([`SourceDdl::drains_before_close`]). Within one reconcile
-    /// interval no pass sees the key unbacked; a pass in between pauses
-    /// its readers (a primary key's readers also pause on a drained
-    /// change), which resume exact once it is back.
+    /// between ([`SourceDdl::drains_before_close`]): the drained change
+    /// halts its readers (T0118), unless a pass in between paused them
+    /// first (a `KEY (…)`'s; a pass skips a table with no primary key).
+    /// They resume exact once it is back.
     Drop,
     /// Dropped and created again under its name in one transaction: a new
     /// oid of the same shape.

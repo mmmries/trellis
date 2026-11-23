@@ -168,6 +168,19 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                     "a case-insensitive collation under STRPOS or REGEXP_COUNT: {event:?}"
                 );
             }
+            if let SourceDdl::KeyIndex {
+                change: IndexChange::Drop,
+                ..
+            } = &event.action
+            {
+                assert!(
+                    program.ops[event.op + 1..=event.last_op()]
+                        .iter()
+                        .all(|o| o.table() != event.table
+                            || *o.expect() != generative::model::OpOutcome::Fails),
+                    "a write the key's index refuses inside its drop: {event:?}"
+                );
+            }
             seen.insert((event.action.kind(), event.pass_inside));
         }
     }
@@ -1559,14 +1572,14 @@ async fn a_source_renamed_away_for_good_pauses_and_its_resume_refuses() {
     }
 }
 
-/// Every change to a key's index on `program`'s first table, fired after op
-/// 2 with ops 3 to 5 in its window, inside one interval and across a pass:
-/// each verdict with the change and the pass.
-async fn key_index_verdicts(
-    program: &Program,
-    table: &str,
-    columns: &[&str],
-) -> Vec<(IndexChange, bool, Vec<Verdict>)> {
+/// Every change to a key's index on `table`, fired after op 2 with ops 3
+/// to 5 in its window, inside one interval and across a pass: each verdict
+/// with the change and the pass, and each definition's pause reason just
+/// after the in-window pass (none without one), before the close restores
+/// the index.
+type KeyIndexRun = (IndexChange, bool, Vec<Verdict>, Vec<Option<String>>);
+
+async fn key_index_verdicts(program: &Program, table: &str, columns: &[&str]) -> Vec<KeyIndexRun> {
     let mut all = Vec::new();
     for change in [
         IndexChange::Drop,
@@ -1585,7 +1598,20 @@ async fn key_index_verdicts(
                 pass_inside,
             };
             assert!(event.listed_gaps(program, Server::default()).is_empty());
-            all.push((change, pass_inside, run_one(program, event).await));
+            let cluster = TestCluster::start();
+            let plan = SourceDdlPlan {
+                events: vec![event.clone()],
+            };
+            let run = run(&cluster, program, &plan)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let at_pass = run
+                .pass_states
+                .iter()
+                .filter(|(fired, _)| fired == &event)
+                .flat_map(|(_, states)| states.iter().map(|s| s.reason.clone()))
+                .collect();
+            all.push((change, pass_inside, verdicts_after(&run, &event), at_pass));
         }
     }
     all
@@ -1604,8 +1630,21 @@ async fn a_key_index_dropped_pauses_its_readers_and_replaced_keeps_them_exact() 
     for nullable in [true, false] {
         let program = keyed_program(nullable);
         let table = program.tables[0].name.clone();
-        for (change, pass_inside, verdicts) in key_index_verdicts(&program, &table, &["k0"]).await {
+        for (change, pass_inside, verdicts, at_pass) in
+            key_index_verdicts(&program, &table, &["k0"]).await
+        {
             assert_eq!(verdicts.len(), program.defs.len());
+            if change == IndexChange::Drop && pass_inside {
+                assert_eq!(at_pass.len(), program.defs.len());
+                for reason in &at_pass {
+                    assert!(
+                        reason
+                            .as_deref()
+                            .is_some_and(|r| r.contains("no valid unique index backs KEY (k0)")),
+                        "nullable={nullable}: {at_pass:?}"
+                    );
+                }
+            }
             for verdict in &verdicts {
                 let expected = match (change, pass_inside) {
                     (IndexChange::Drop, false) => {
@@ -1637,8 +1676,15 @@ async fn a_primary_key_dropped_pauses_its_readers_and_replaced_keeps_them_exact(
     let program = one_to_one_and_aggregate_program();
     let pk = program.tables[0].pk_col.clone();
     let table = program.tables[0].name.clone();
-    for (change, pass_inside, verdicts) in key_index_verdicts(&program, &table, &[&pk]).await {
+    for (change, pass_inside, verdicts, at_pass) in
+        key_index_verdicts(&program, &table, &[&pk]).await
+    {
         assert_eq!(verdicts.len(), program.defs.len());
+        // The pass pauses nothing: the halt is the drained change's.
+        assert!(
+            at_pass.iter().all(Option::is_none),
+            "{change:?}: {at_pass:?}"
+        );
         for verdict in &verdicts {
             let expected = if change == IndexChange::Drop {
                 matches!(verdict, Verdict::ResumedExact { reason } if reason.contains("T0118"))
@@ -1697,7 +1743,7 @@ fn one_to_one_join_program() -> Program {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_joined_tables_key_dropped_pauses_the_join_only_where_a_pass_sees_it() {
     let program = one_to_one_join_program();
-    for (change, pass_inside, verdicts) in key_index_verdicts(&program, "jb", &["u"]).await {
+    for (change, pass_inside, verdicts, _) in key_index_verdicts(&program, "jb", &["u"]).await {
         assert_eq!(verdicts.len(), 1);
         let expected = if change == IndexChange::Drop && pass_inside {
             matches!(
