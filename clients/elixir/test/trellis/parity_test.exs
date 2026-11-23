@@ -120,6 +120,9 @@ defmodule Trellis.ParityTest do
           function_exported?(module, :__struct__, 0),
           # The handle, and exceptions (`Trellis.Error` is checked by code).
           module != Trellis,
+          # The release check's result is a build-tool record (git and files,
+          # never the engine), outside the fixture on both clients.
+          module != Trellis.ReleaseCheck,
           not Map.has_key?(module.__struct__(), :__exception__),
           "Trellis." <> name = inspect(module),
           into: %{} do
