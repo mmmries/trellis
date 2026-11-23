@@ -65,6 +65,42 @@ defmodule Mix.Tasks.Trellis.ReleaseCheckTest do
     assert error.message =~ "trellis.release_check: set BASE to the git ref"
   end
 
+  test "reads the migrations of each repo in :ecto_repos", %{root: root} do
+    on_exit(fn ->
+      Application.delete_env(:trellis_pg, :ecto_repos)
+      Application.delete_env(:trellis_pg, MyApp.ReportsRepo)
+    end)
+
+    # A repo whose :priv is outside priv/*: only its configuration finds it.
+    Application.put_env(:trellis_pg, :ecto_repos, [MyApp.Repo, MyApp.ReportsRepo])
+    Application.put_env(:trellis_pg, MyApp.ReportsRepo, priv: "db/reports")
+    write(root, "mix.lock", lockfile("0.3.0"))
+    write(root, "db/reports/migrations/20260201000000_define.exs", "use Trellis.Migration\n")
+
+    error = assert_raise Mix.Error, fn -> Task.run(["--base", "main"]) end
+    assert error.message =~ "  db/reports/migrations/20260201000000_define.exs"
+
+    # --migrations-path replaces the configured list.
+    Task.run(["--base", "main", "--migrations-path", "priv/repo/migrations"])
+    assert_received {:mix_shell, :info, [_]}
+  end
+
+  test "an app's repos give Ecto's migrations directories" do
+    on_exit(fn ->
+      Application.delete_env(:release_check_app, :ecto_repos)
+      Application.delete_env(:release_check_app, MyApp.Other)
+    end)
+
+    assert Task.ecto_migrations_paths(nil) == nil
+    assert Task.ecto_migrations_paths(:release_check_app) == nil
+
+    Application.put_env(:release_check_app, :ecto_repos, [MyApp.Repo, MyApp.Other])
+    Application.put_env(:release_check_app, MyApp.Other, priv: "priv/tenants")
+
+    assert Task.ecto_migrations_paths(:release_check_app) ==
+             ["priv/repo/migrations", "priv/tenants/migrations"]
+  end
+
   defp lockfile(version) do
     ~s(%{\n  "trellis_pg": {:hex, :trellis_pg, "#{version}", "0123", [:mix], [], "hexpm", "4567"},\n}\n)
   end

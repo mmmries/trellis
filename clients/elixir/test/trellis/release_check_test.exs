@@ -273,6 +273,29 @@ defmodule Trellis.ReleaseCheckTest do
     refute ReleaseCheck.ok?(result)
   end
 
+  # An umbrella child: its lockfile is the umbrella's, `../../mix.lock`.
+  test "a lockfile above the app's directory", %{root: root} do
+    File.mkdir_p!(Path.join(root, "apps/shop"))
+    git(root, ["mv", "priv", "apps/shop/priv"])
+    commit(root, "an umbrella")
+    git(root, ["checkout", "--quiet", "-B", "main"])
+    git(root, ["checkout", "--quiet", "-b", "umbrella-feature"])
+    write(root, "mix.lock", lockfile("0.3.0"))
+    write(root, "apps/shop/#{@define}", @trellis_migration)
+    commit(root, "bump and define")
+
+    assert {:ok, result} =
+             ReleaseCheck.call(
+               root: Path.join(root, "apps/shop"),
+               base: "main",
+               lockfile: "../../mix.lock"
+             )
+
+    assert {result.old_version, result.new_version} == {"0.2.0", "0.3.0"}
+    assert result.migrations == [@define]
+    refute ReleaseCheck.ok?(result)
+  end
+
   test "no base is an error that says what to pass", %{root: root} do
     for base <- ["", "  ", nil] do
       assert {:error, message} = ReleaseCheck.call(root: root, base: base)

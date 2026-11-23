@@ -6,11 +6,10 @@ defmodule Trellis.ReleaseCheck do
   Such a release fails where migrations run before the old processes stop
   (a release command, a pre-deploy job): while a worker of the old version is
   live, a define, ALTER, PAUSE, RESUME or DROP from the new version refuses
-  with `VersionHandoverError`
-  ([rolling deploys](../../docs/embedding.md#rolling-deploys)). The remedy is
-  to ship the version change by itself and the migrations in the next
-  release, and this check says so on the pull request instead of in the
-  deploy.
+  with `VersionHandoverError` (see `docs/embedding.md`, "Rolling deploys").
+  The remedy is to ship the version change by itself and the migrations in
+  the next release, and this check says so on the pull request instead of
+  in the deploy.
 
       case Trellis.ReleaseCheck.call(root: File.cwd!(), base: "origin/main") do
         {:ok, %Trellis.ReleaseCheck{} = result} -> Trellis.ReleaseCheck.message(result)

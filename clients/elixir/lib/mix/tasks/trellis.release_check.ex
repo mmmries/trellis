@@ -7,10 +7,9 @@ defmodule Mix.Tasks.Trellis.ReleaseCheck do
   Fails when a release both changes `trellis_pg`'s version in `mix.lock` and
   adds a migration that mentions `Trellis`. While a worker of the old version
   runs, a define, ALTER, PAUSE, RESUME or DROP from the new version refuses
-  with `VersionHandoverError`
-  ([rolling deploys](../../docs/embedding.md#rolling-deploys)), so a deploy
-  that migrates before the old worker stops fails at the first Trellis
-  migration. Ship the version change by itself, and the migrations in the
+  with `VersionHandoverError` (see `docs/embedding.md`, "Rolling deploys"),
+  so a deploy that migrates before the old worker stops fails at the first
+  Trellis migration. Ship the version change by itself, and the migrations in the
   next release.
 
       mix trellis.release_check --base origin/main
@@ -30,9 +29,13 @@ defmodule Mix.Tasks.Trellis.ReleaseCheck do
       requests. Also read from a `BASE=REF` argument or the `BASE`
       environment variable, in that order.
     * `--migrations-path PATH` - a migrations directory, relative to the
-      project (repeatable). Default: `priv/*/migrations`, every repo's
-      conventional directory.
-    * `--lockfile PATH` - default `mix.lock`.
+      project (repeatable). Default: each of the app's `:ecto_repos`
+      migrations directory (its `:priv`, default `priv/<repo>`, plus
+      `migrations`), or `priv/*/migrations` for an app without
+      `:ecto_repos`.
+    * `--lockfile PATH` - default the project's `:lockfile` (`mix.lock`;
+      `../../mix.lock` in an umbrella child, where the task runs, like
+      Ecto's).
   """
 
   @switches [base: :string, migrations_path: :keep, lockfile: :string]
@@ -44,8 +47,8 @@ defmodule Mix.Tasks.Trellis.ReleaseCheck do
 
     call_opts =
       [root: File.cwd!(), base: base]
-      |> put_paths(Keyword.get_values(opts, :migrations_path))
-      |> put_lockfile(opts[:lockfile])
+      |> put_paths(paths(Keyword.get_values(opts, :migrations_path)))
+      |> Keyword.put(:lockfile, opts[:lockfile] || Mix.Project.config()[:lockfile] || "mix.lock")
 
     case Trellis.ReleaseCheck.call(call_opts) do
       {:ok, result} ->
@@ -67,9 +70,35 @@ defmodule Mix.Tasks.Trellis.ReleaseCheck do
     end)
   end
 
+  defp paths([]) do
+    Mix.Task.run("loadconfig")
+    ecto_migrations_paths(Mix.Project.config()[:app]) || []
+  end
+
+  defp paths(paths), do: paths
+
+  # Each repo in `app`'s `:ecto_repos`: its `:priv` (Ecto's default
+  # `priv/<repo>`) plus `migrations`, as `mix ecto.migrate` reads them.
+  # Config only, so nothing is compiled or started. nil without repos.
+  @doc false
+  def ecto_migrations_paths(nil), do: nil
+
+  def ecto_migrations_paths(app) do
+    case Application.get_env(app, :ecto_repos, []) do
+      [] ->
+        nil
+
+      repos ->
+        for repo <- repos do
+          priv =
+            Keyword.get(Application.get_env(app, repo, []), :priv) ||
+              "priv/#{repo |> Module.split() |> List.last() |> Macro.underscore()}"
+
+          Path.join(priv, "migrations")
+        end
+    end
+  end
+
   defp put_paths(opts, []), do: opts
   defp put_paths(opts, paths), do: Keyword.put(opts, :migrations_paths, paths)
-
-  defp put_lockfile(opts, nil), do: opts
-  defp put_lockfile(opts, file), do: Keyword.put(opts, :lockfile, file)
 end

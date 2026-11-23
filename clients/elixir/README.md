@@ -290,10 +290,10 @@ mix trellis.release_check --base origin/main
 
 It compares the working tree with its merge base against the base, and exits
 1 when `trellis_pg`'s version in `mix.lock` changed and a migration added
-since then (under `priv/*/migrations`, or each `--migrations-path`) mentions
-`Trellis`. It reads git and files only: it needs no database and starts no
-application. `BASE=origin/main` as an argument, or in the environment, sets
-the base too.
+since then (in each `:ecto_repos` repo's migrations directory, or each
+`--migrations-path`) mentions `Trellis`. It reads git and files only: it
+needs no database and starts no application. `BASE=origin/main` as an
+argument, or in the environment, sets the base too.
 
 - **On a pull request**, the base is the branch it targets, and the job needs
   the history back to the merge base (`actions/checkout` with
