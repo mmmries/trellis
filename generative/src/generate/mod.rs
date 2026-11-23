@@ -4638,6 +4638,8 @@ mod strategy {
             // a few ops later.
             1 => prop_oneof![Just(0u32), 1u32..=16, 17u32..=256]
                 .prop_map(|tail| DbAdminAction::WrapXids { tail }),
+            // Fifteen seconds of the run spent waiting on the lock.
+            1 => Just(DbAdminAction::LockTargets),
         ]
     }
 

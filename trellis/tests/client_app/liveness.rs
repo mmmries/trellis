@@ -115,10 +115,16 @@ async fn reclaim_frees_a_stale_claim_and_a_fresh_claim_picks_it_up() {
     // No heartbeat at all: after the TTL, the claim is stale.
     tokio::time::sleep(ttl + Duration::from_millis(100)).await;
 
+    // A sweep on a thread carrying an engine clock counts its reclaims on
+    // that clock, for the generative tier's "no TTL expires a live process".
+    let clock = trellis::dev::clock::EngineClock::new();
+    let entered = clock.enter();
     let reclaimed = liveness::reclaim_stale(&client, ttl)
         .await
         .expect("reclaim_stale");
+    drop(entered);
     assert_eq!(reclaimed, 1, "the one stale claim must be reclaimed");
+    assert_eq!(clock.claims_reclaimed(), 1, "the clock counts the reclaim");
     assert!(
         claimed_buckets(&client, seg_seq, "dead-worker")
             .await

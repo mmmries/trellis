@@ -1172,6 +1172,14 @@ The actions, cheapest-first (every one below is built):
    server's clock left alone, so every engine deadline comes due at once, or
    late, while every server timestamp stays fresh. It needs no shim, so the
    plain property draws it.
+   `DbAdminAction::LockTargets` holds every target `ACCESS EXCLUSIVE` for
+   15 s, so a drain waits on it holding its claim. No TTL may expire a live
+   process: the run fails when the engine reclaims a claim, or a claim a hold
+   keeps waiting goes a reclaim TTL unrefreshed, at an op with no server stop
+   or forward server step (`DbAdminAction::may_reclaim_claims`). The
+   `heartbeat_on_engine_clock` plant (the heartbeat paced on the engine
+   clock) needs a step back during a hold, so no planted-bug sweep tier runs
+   it; `db_admin.rs`'s step-back pin catches it.
    Backup/restore is a cold file-level copy (`model::RestorePlan`, driven by
    `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
    back up right after op *k* with its change in flight, run to the end,

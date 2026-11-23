@@ -308,6 +308,19 @@ pub enum RunError {
         action: DbAdminAction,
         error: String,
     },
+    /// A TTL expired a live worker's claim at op `op_index`, an op with no
+    /// action that can strand or age one
+    /// ([`DbAdminAction::may_reclaim_claims`]): the engine's stale-claim
+    /// sweeps reclaimed `reclaimed` claims between the op's start and its
+    /// quiesce, or a claim stood unrefreshed past the reclaim TTL, for
+    /// `oldest_claim`, while a [`DbAdminAction::LockTargets`] held its
+    /// worker's page.
+    LiveClaimExpired {
+        op_index: usize,
+        reclaimed: u64,
+        oldest_claim: Option<std::time::Duration>,
+        actions: Vec<DbAdminAction>,
+    },
     /// Carrying out a backup or restore failed (the harness's
     /// side of it: reconnecting after the backup's stop, stopping the
     /// original engine, starting one on the restored database). `step`

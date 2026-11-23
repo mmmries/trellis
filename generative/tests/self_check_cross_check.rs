@@ -1390,8 +1390,8 @@ fn extremes_tamper_sweep_tier() -> SweepTier {
          the extremes; the plant's own path is gated by the tier its comment names",
     ));
     not_gated.extend(not_on_path(
-        &[PlantPath::XidEpoch],
-        generative::plant_sweep::NO_XID_EPOCH,
+        &[PlantPath::DbAdmin],
+        generative::plant_sweep::NO_DB_ADMIN,
     ));
     SweepTier {
         name: baseline_quarantine::EXTREMES_TAMPER_TIER,

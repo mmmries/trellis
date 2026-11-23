@@ -139,6 +139,8 @@ pub async fn reclaim_stale(
     let n = client
         .execute_typed(RECLAIM_STALE_SQL, &[(&ttl_secs, Type::FLOAT8)])
         .await?;
+    #[cfg(any(test, feature = "test-util"))]
+    crate::clock::note_claims_reclaimed(n);
     Ok(n)
 }
 
@@ -436,6 +438,10 @@ async fn run_daemon(
 ) {
     let mut client: Option<Client> = None;
     let mut idle_since: Option<Instant> = None;
+    // The engine-clock instant of the last tick the
+    // `heartbeat_on_engine_clock` plant below let through.
+    #[cfg(any(test, feature = "test-util"))]
+    let mut last_tick: Option<Instant> = None;
 
     let mut ticker = tokio::time::interval(config.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -447,6 +453,24 @@ async fn run_daemon(
             let guard = registry.lock().await;
             guard.iter().cloned().collect()
         };
+
+        // Planted bug: ticks paced on the engine clock rather than the
+        // ticker's real time, so a clock stepped back skips refreshes until it
+        // catches up and a live claim outlives its TTL. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            use crate::plant::{Plant, armed, fires};
+            let early = last_tick.is_some_and(|at| crate::clock::elapsed(at) < config.interval / 2);
+            let planted = armed() == Some(Plant::HeartbeatOnEngineClock);
+            // Counted where a registered claim misses its refresh; an idle
+            // tick the plant skips changes nothing but its pacing.
+            if fires(Plant::HeartbeatOnEngineClock, early && !snapshot.is_empty())
+                || (planted && early)
+            {
+                continue;
+            }
+            last_tick = Some(crate::clock::now());
+        }
 
         if snapshot.is_empty() {
             let since = idle_since.get_or_insert_with(crate::clock::now);
