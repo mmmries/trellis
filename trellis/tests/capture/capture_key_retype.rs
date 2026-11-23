@@ -205,7 +205,8 @@ async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trell
 /// on a `GROUP BY` key (its copy is the type's full precision, or
 /// unconstrained `numeric`), any change to a column no definition keys by,
 /// and a change between deterministic collations. No definition pauses,
-/// and every one keeps converging. The `id` widening rewrites the table, and
+/// and every one keeps converging. The scale change isn't a pure widening,
+/// so it re-reads the table's readers. The `id` widening rewrites the table, and
 /// PostgreSQL's 2026-11 minors re-version the columns after `id`, which the
 /// definitions read, so they read as a same-type rewrite and rebuild
 /// (`support/attver.rs`).
@@ -254,7 +255,7 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
         ),
         (
             "alter table public.events alter column price type numeric(12,3)",
-            TransformStatus::Live,
+            TransformStatus::Backfilling,
         ),
         (
             "alter table public.events alter column note type varchar(5)",
@@ -837,10 +838,10 @@ async fn a_nondeterministic_collation_on_a_group_by_column_pauses_its_reader() {
 }
 
 /// A wider `numeric` scale on a `GROUP BY` key re-renders every stored
-/// value (`1.50` reads back as `1.500`) and fires no capture trigger, yet
-/// pauses nothing: numeric groups are matched as numbers, so a delete or
-/// update of a row the rewrite re-rendered still retracts from the group it
-/// was counted in, and a new row joins it. The pass records the wider
+/// value (`1.50` reads back as `1.500`) and fires no capture trigger. It
+/// isn't a pure widening, so it pauses nothing and the table's readers
+/// re-read it; a delete or update of a re-rendered row then retracts from
+/// its group, and a new row at either scale joins it. The pass records the wider
 /// scale, so narrowing back to the scale define saw pauses: it rounds the
 /// values stored under the wider one, so two groups (`1.555`, `1.556`)
 /// become one (`1.56`) with no trigger firing. A resume rebuilds the groups
@@ -883,12 +884,14 @@ async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower
         .expect("change the GROUP BY key's scale");
     capture_pass(&mut raw, &db.pool).await;
     for target in ["post_authors", "post_titles", "per_kind", "per_price"] {
-        assert_eq!(
-            status(&raw, target).await,
-            TransformStatus::Live,
-            "{target}"
-        );
+        assert!(rebuilding(status(&raw, target).await), "{target}");
     }
+    bring_live(
+        &mut raw,
+        &db.pool,
+        &["post_authors", "post_titles", "per_kind", "per_price"],
+    )
+    .await;
 
     raw.batch_execute(
         "delete from public.posts where id = 1; \
@@ -3674,8 +3677,8 @@ async fn a_drifted_copy_is_never_skipped() {
     capture_pass(&mut raw, &db.pool).await;
     let second = copy_checks(&raw).await;
     assert!(second["per_kind"] > first["per_kind"], "{second:?}");
-    // A narrowing pauses nothing.
-    assert_eq!(status(&raw, "per_kind").await, TransformStatus::Live);
+    // A narrowing pauses nothing: it re-reads.
+    assert!(rebuilding(status(&raw, "per_kind").await));
 }
 
 /// `ALTER TRANSFORM` rewrites a definition in place, giving it a column
