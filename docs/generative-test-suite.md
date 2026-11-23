@@ -1213,7 +1213,8 @@ The actions, cheapest-first (every one below is built):
    away, dropped or made generated, and the table renamed away for good, are
    drawn only after the program's last op, since later ops address the keys
    and write the columns. While the table is renamed or moved away and
-   back, the window's writes name it where it is. A collation
+   back, the window's writes name it where it is, and with no pass inside,
+   the window drains before the table comes back. A collation
    change drains its window before the collation goes back, since a
    collation changes only what a drain computes.
    `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`,

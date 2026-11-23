@@ -182,8 +182,12 @@ pub async fn run_convergence_with_source_ddl_allowing(
             // window under it before it's changed back. With no pass since
             // the last check settled, nothing waits for one; after the
             // window's pass, a build it queued would, so settle beside
-            // passes, which don't see a collation.
-            if event.action.drains_before_close() {
+            // passes, which don't see a collation. A table away from its
+            // name drains too, so the window always meets the drain that
+            // purges its changes, not only when a drain happens to win the
+            // race with the close.
+            let away = event.action.moves_table() && !event.pass_inside;
+            if event.action.drains_before_close() || away {
                 if event.pass_inside {
                     passes.settle(backend).await
                 } else {
@@ -333,7 +337,8 @@ impl Statements {
                 return Ok(Self {
                     opens: vec![
                         format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
-                        format!("GRANT USAGE, CREATE ON SCHEMA {schema} TO PUBLIC"),
+                        // The application's writes reach the table there.
+                        format!("GRANT USAGE ON SCHEMA {schema} TO PUBLIC"),
                         format!("ALTER TABLE {table} SET SCHEMA {schema}"),
                     ],
                     closes: vec![format!("ALTER TABLE {moved} SET SCHEMA public")],

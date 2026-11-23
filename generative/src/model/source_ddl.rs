@@ -165,7 +165,8 @@ pub enum SourceDdl {
     RenameTable,
     /// The table moved to [`MOVED_SCHEMA`] when the event fires, the
     /// window's writes finding it there through the application's
-    /// `search_path`, and moved back at the close.
+    /// `search_path`, and moved back at the close. The same register entry
+    /// as [`Self::RenameTable`].
     MoveSchema,
     /// The table renamed to `<table>_away` for good, the program's last
     /// DDL: its readers pause, and their `RESUME` refuses while it is
@@ -256,7 +257,8 @@ impl SourceDdl {
 
     /// Whether the table leaves its name until the close: the generator
     /// keeps the table's partition maintenance out of the window, since it
-    /// names the root.
+    /// names the root, and with no pass inside the run drains the window
+    /// while the table is away, which purges its staged changes.
     pub fn moves_table(&self) -> bool {
         matches!(self, SourceDdl::RenameTable | SourceDdl::MoveSchema)
     }
@@ -420,15 +422,11 @@ impl SourceDdlEvent {
         ) {
             return vec![Gap::ColumnNameSwap];
         }
-        // A partitioned source renamed away and back, or moved to another
-        // schema and back, with no pass between: its capture stages nothing
-        // while the source's name doesn't resolve to the tree's root. A
-        // plain table's capture has no such check.
-        let partitioned = program
-            .tables
-            .iter()
-            .any(|t| t.name == self.table && t.partitioning.is_some());
-        if self.action.moves_table() && !self.pass_inside && partitioned {
+        // A source renamed away and back, or moved to another schema and
+        // back, with no pass between: a drain while it is away purges its
+        // staged changes, and a partitioned source's capture stages nothing
+        // while its name doesn't resolve to the tree's root.
+        if self.action.moves_table() && !self.pass_inside {
             return vec![Gap::SourceRenameRoundtrip];
         }
         // The pass doesn't see a read column's collation change, pass or no

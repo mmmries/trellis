@@ -1466,38 +1466,31 @@ fn assert_paused_for_the_missing_table(verdicts: Vec<Verdict>) {
     }
 }
 
-/// A plain source renamed away and back, or moved to another schema and
-/// back, with its writes in between and no pass until after, stays exact:
-/// a plain table's capture stages a write whatever the table is called.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_plain_source_renamed_or_moved_and_back_inside_one_interval_stays_exact() {
-    let program = one_to_one_and_aggregate_program();
-    for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
-        let verdicts = run_table_action(&program, action.clone(), false).await;
-        assert_eq!(verdicts, vec![Verdict::Exact; 2], "{action:?}");
-    }
-}
-
-/// The register's `source-rename-roundtrip`: a partitioned source renamed
-/// away and back, or moved to another schema and back, inside one interval
-/// loses the writes in between (its capture stages nothing while the
-/// source's name doesn't resolve to the root); `self_check` reports it and
+/// The register's `source-rename-roundtrip`: a source renamed away and
+/// back, or moved to another schema and back, inside one interval loses
+/// writes. A drain while it is away purges its staged changes, on a plain
+/// table too, and a partitioned source's capture also stages nothing while
+/// its name doesn't resolve to the root. `self_check` reports it and
 /// `PAUSE`/`RESUME` repairs it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_partitioned_source_renamed_or_moved_and_back_inside_one_interval_is_the_listed_gap() {
-    let program = partitioned_aggregate_program();
-    for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
-        let event = event(&program, 3, action.clone(), 2, false);
-        assert_eq!(
-            event.listed_gaps(&program, Server::default()),
-            vec![Gap::SourceRenameRoundtrip]
-        );
-        let verdicts = run_one(&program, event).await;
-        assert_eq!(
-            verdicts,
-            vec![Verdict::ListedGap(Gap::SourceRenameRoundtrip)],
-            "{action:?}"
-        );
+async fn a_source_renamed_or_moved_and_back_inside_one_interval_is_the_listed_gap() {
+    for program in [
+        one_to_one_and_aggregate_program(),
+        partitioned_aggregate_program(),
+    ] {
+        for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
+            let event = event(&program, 3, action.clone(), 2, false);
+            assert_eq!(
+                event.listed_gaps(&program, Server::default()),
+                vec![Gap::SourceRenameRoundtrip]
+            );
+            let verdicts = run_one(&program, event).await;
+            assert_eq!(
+                verdicts,
+                vec![Verdict::ListedGap(Gap::SourceRenameRoundtrip); program.defs.len()],
+                "{action:?}"
+            );
+        }
     }
 }
 
