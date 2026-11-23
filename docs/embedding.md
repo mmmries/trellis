@@ -148,7 +148,9 @@ background client: staging maintenance, the drain threads, `self_check`, and the
 worker's upkeep, registration and gauge tasks. Calls never use the background
 pool. Both close connections that sit idle for 60 seconds, and both reuse their
 most recently used connection first, so a burst's extra connections close once
-it is over.
+it is over. Both also replace a connection once it has been open for 30 minutes:
+a session's temporary tables hold back its database's `datfrozenxid`, and no
+`VACUUM` from another session can advance it.
 
 | Holder | Count | Held |
 |---|---|---|
