@@ -578,8 +578,10 @@ beside them run on every `cargo test`.
   No group may leave its type's range even transiently, since the engine
   would hold its key and stall the convergence wait: the `min_max` arm keeps
   a budget of every magnitude written, and the `JOIN` arm's magnitudes stay
-  in range over any product of its row counts. The raise itself is pinned
-  by a build over an out-of-range group (`tests/exact_sums.rs`).
+  in range over any product of its row counts. The wiring never flips a
+  column a definition sums in these types, and its shadows leave one `NULL`.
+  The raise itself is pinned by a build over an out-of-range group
+  (`tests/exact_sums.rs`).
 - **Join convergence** (`tests/join_convergence.rs`). Two
   tables, one to three `LEFT` or `INNER` join aggregates over them (joined on one
   column or on two, grouped by the joined table's column, by a column of each
