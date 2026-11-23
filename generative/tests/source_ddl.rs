@@ -30,7 +30,7 @@ use proptest::test_runner::{
 };
 use testkit::TestCluster;
 use trellis::Config;
-use trellis::dev::defs::ast::KeySpace;
+use trellis::dev::defs::ast::{Expr, KeySpace, Operator};
 use trellis::dev::pool::Pool;
 
 struct Harness {
@@ -146,6 +146,13 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                     "a key rewrite before the last op: {event:?}"
                 );
             }
+            if event.action.terminal() {
+                assert_eq!(
+                    (event.op + 1, event.window),
+                    (program.ops.len(), 0),
+                    "a column change later ops can't write through, before the last op: {event:?}"
+                );
+            }
             seen.insert((event.action.kind(), event.pass_inside));
         }
     }
@@ -165,6 +172,13 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         "retype_outgrow_using",
         "retype_key",
         "retype_key_using",
+        "rename_column",
+        "drop_column",
+        "drop_and_add_column",
+        "add_column",
+        "swap_column_names",
+        "shadow_column",
+        "generated_column",
     ] {
         for pass in [false, true] {
             assert!(
@@ -254,9 +268,11 @@ async fn server_versions_attributes(cluster: &TestCluster) -> bool {
 const SERVERS: [Server; 2] = [
     Server {
         versions_attributes: false,
+        sets_expressions: true,
     },
     Server {
         versions_attributes: true,
+        sets_expressions: true,
     },
 ];
 
@@ -891,12 +907,9 @@ async fn a_key_rewrite_at_the_last_op_is_reread() {
     }
 }
 
-/// The same rewrite narrowing the key to `integer` (#2254): the pass leaves
-/// a key column's re-type to the key checks, none of which pause for it,
-/// so nothing re-reads the table and the 1-1 keeps every row under its old
-/// key while it reports `live`.
+/// The same rewrite narrowing the key to `integer` (#2254): the pass
+/// re-reads the table, so the 1-1 keeps no row under an old key.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "#2254: a narrowing USING rewrite of a key column isn't re-read"]
 async fn a_key_narrowing_rewrite_at_the_last_op_is_reread() {
     let program = one_to_one_and_aggregate_program();
     let pk = program.tables[0].pk_col.clone();
@@ -914,11 +927,8 @@ async fn a_key_narrowing_rewrite_at_the_last_op_is_reread() {
 }
 
 /// The same of a `GROUP BY` key (#2254): `bigint` to `integer` with `USING`
-/// pauses nothing and re-reads nothing, so the aggregate keeps its old
-/// groups while it reports `live`. A field-read column narrowed the same way
-/// is re-read.
+/// is re-read, so the aggregate keeps no old group.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "#2254: a narrowing USING rewrite of a GROUP BY key isn't re-read"]
 async fn a_group_by_key_narrowing_rewrite_is_reread() {
     let program = one_to_one_and_aggregate_program();
     let grain = grain(&program);
@@ -946,4 +956,175 @@ async fn a_group_by_key_narrowing_rewrite_is_reread() {
         [Verdict::Exact, Verdict::Exact],
         "{verdicts:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Columns renamed, dropped and added (#2184 slice 4), on
+// `one_to_one_and_aggregate_program`: the 1-1 reads `c1` and `c2` in
+// `total` (`c1 + c2`), the aggregate `c1` in `SUM(c1)`.
+// ---------------------------------------------------------------------
+
+/// `c2`, the other numeric column, read only by the 1-1's `total`.
+fn c2(program: &Program) -> String {
+    program.tables[0].columns[2].name.clone()
+}
+
+/// A read column renamed away or dropped after the last op, with its
+/// change in flight: both readers pause, and their `RESUME` refuses with a
+/// code while the column is missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_column_renamed_or_dropped_pauses_and_its_resume_refuses() {
+    let program = one_to_one_and_aggregate_program();
+    let c1 = c1(&program);
+    for action in [
+        SourceDdl::RenameColumn { column: c1.clone() },
+        SourceDdl::DropColumn { column: c1.clone() },
+    ] {
+        for pass_inside in [false, true] {
+            let event = event(&program, 5, action.clone(), 0, pass_inside);
+            let verdicts = run_one(&program, event).await;
+            for verdict in &verdicts {
+                assert!(
+                    matches!(verdict, Verdict::ResumeRefused { code, .. } if code == "T0044"),
+                    "{action:?} pass_inside={pass_inside}: {verdicts:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A read column dropped and added again under its name and type, with
+/// changes in flight: every row holds `NULL` under a new `attnum`, and the
+/// pass re-reads the table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_column_dropped_and_added_again_is_reread() {
+    let program = one_to_one_and_aggregate_program();
+    for pass_inside in [false, true] {
+        let event = event(
+            &program,
+            2,
+            SourceDdl::DropAndAddColumn {
+                column: c1(&program),
+            },
+            2,
+            pass_inside,
+        );
+        assert_eq!(
+            run_one(&program, event).await,
+            [Verdict::Exact, Verdict::Exact],
+            "pass_inside={pass_inside}"
+        );
+    }
+}
+
+/// An unread column added with a volatile default rewrites the table and
+/// changes nothing a definition reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_column_added_keeps_every_definition_exact() {
+    let program = one_to_one_and_aggregate_program();
+    let event = event(
+        &program,
+        2,
+        SourceDdl::AddColumn {
+            column: "added_2".to_string(),
+        },
+        2,
+        false,
+    );
+    assert_eq!(
+        run_one(&program, event).await,
+        [Verdict::Exact, Verdict::Exact]
+    );
+}
+
+/// [`one_to_one_and_aggregate_program`] with the 1-1's `total` as `c1 - c2`,
+/// which a swap of the two changes, so a swap shows in both readers.
+fn swap_reading_program() -> Program {
+    let mut program = one_to_one_and_aggregate_program();
+    let total = &mut program.defs[0].fields[0];
+    assert_eq!(total.name, "total");
+    let Expr::BinaryOp { op, .. } = &mut total.expr else {
+        panic!("total is c1 + c2: {:?}", total.expr);
+    };
+    *op = Operator::Subtract;
+    program
+}
+
+/// The register's `column-name-swap`: `c1`'s name taken by `c2` (a swap) or
+/// by a column added under it, an update in between, and the names given
+/// back with no pass in between. Capture images the column that has the
+/// name, so the 1-1's `c1 - c2` and the aggregate's `SUM(c1)` take the other
+/// column's value, and after the names are back the pass sees only `xmin`
+/// moved. `self_check` reports it and `request_backfill` repairs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_columns_name_taken_and_given_back_inside_one_interval_is_the_listed_gap() {
+    let program = swap_reading_program();
+    let (c1, c2) = (c1(&program), c2(&program));
+    let gap = Verdict::ListedGap(Gap::ColumnNameSwap);
+    for action in [
+        SourceDdl::SwapColumnNames {
+            column: c1.clone(),
+            other: c2.clone(),
+        },
+        SourceDdl::ShadowColumn { column: c1.clone() },
+    ] {
+        let event = event(&program, 2, action.clone(), 1, false);
+        assert_eq!(
+            event.listed_gaps(&program, Server::default()),
+            vec![Gap::ColumnNameSwap]
+        );
+        assert_eq!(
+            run_one(&program, event).await,
+            [gap.clone(), gap.clone()],
+            "{action:?}"
+        );
+    }
+}
+
+/// The same with a pass while the other column has the name: that pass
+/// re-reads the table, and so does the one after the names are back, so
+/// every definition ends exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_columns_name_taken_across_a_pass_is_reread() {
+    let program = swap_reading_program();
+    let (c1, c2) = (c1(&program), c2(&program));
+    for action in [
+        SourceDdl::SwapColumnNames {
+            column: c1.clone(),
+            other: c2.clone(),
+        },
+        SourceDdl::ShadowColumn { column: c1.clone() },
+    ] {
+        let event = event(&program, 2, action.clone(), 1, true);
+        assert!(event.listed_gaps(&program, Server::default()).is_empty());
+        assert_eq!(
+            run_one(&program, event).await,
+            [Verdict::Exact, Verdict::Exact],
+            "{action:?}"
+        );
+    }
+}
+
+/// A read column made a stored generated column after the last op, and
+/// (PostgreSQL 17 and later) its expression replaced: the pass re-reads the
+/// table for each, inside one interval or with a pass between.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_column_made_generated_and_its_expression_replaced_is_reread() {
+    let program = one_to_one_and_aggregate_program();
+    for pass_inside in [false, true] {
+        let event = event(
+            &program,
+            5,
+            SourceDdl::GeneratedColumn {
+                column: c1(&program),
+            },
+            0,
+            pass_inside,
+        );
+        assert_eq!(
+            run_one(&program, event).await,
+            [Verdict::Exact, Verdict::Exact],
+            "pass_inside={pass_inside}"
+        );
+    }
 }

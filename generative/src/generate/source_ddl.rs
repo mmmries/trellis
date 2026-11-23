@@ -4,7 +4,7 @@
 
 use proptest::prelude::*;
 use trellis::dev::defs::IntWidth;
-use trellis::dev::defs::ast::{KeySpace, ValueType};
+use trellis::dev::defs::ast::ValueType;
 
 use super::wiring::with_wiring;
 use crate::model::{
@@ -50,7 +50,7 @@ enum Menu {
 impl Menu {
     fn actions(self) -> u8 {
         match self {
-            Menu::Maintenance => 9,
+            Menu::Maintenance => 16,
             Menu::Privilege => 11,
         }
     }
@@ -155,16 +155,16 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             .map(|d| d.target.as_str())
             .collect();
         let target = readers[pick % readers.len()].to_string();
+        let declared = |column: &str| {
+            retyped
+                .iter()
+                .rev()
+                .find(|((t, c), _)| t == &table.name && c == column)
+                .map(|(_, ty)| *ty)
+                .or_else(|| declared_type(table, column))
+        };
         let action = match (menu, action) {
             (Menu::Maintenance, 7 | 8) => {
-                let declared = |column: &str| {
-                    retyped
-                        .iter()
-                        .rev()
-                        .find(|((t, c), _)| t == &table.name && c == column)
-                        .map(|(_, ty)| *ty)
-                        .or_else(|| declared_type(table, column))
-                };
                 let prefer = integer.as_ref().map(|(_, c)| c.as_str());
                 retype(
                     program,
@@ -177,6 +177,8 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
                 )
                 .unwrap_or(SourceDdl::VacuumFull)
             }
+            (Menu::Maintenance, 9..) => columns(action, table, &numeric, &declared, op, pick)
+                .unwrap_or(SourceDdl::VacuumFull),
             (Menu::Maintenance, _) => maintenance(action, column, pick),
             (Menu::Privilege, _) => privilege(action, target),
         };
@@ -191,7 +193,12 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             SourceDdl::RevokeSchemaUsage if !referenced.is_empty() => SourceDdl::RevokeMembership,
             action => action,
         };
-        let window = window.min(ops - 1 - op);
+        // A change later ops couldn't write through fires after the last.
+        let (op, window) = if action.terminal() {
+            (ops - 1, 0)
+        } else {
+            (op, window.min(ops - 1 - op))
+        };
         let event = SourceDdlEvent {
             op,
             table: table.name.clone(),
@@ -258,6 +265,46 @@ fn maintenance(action: u8, column: Option<String>, pick: usize) -> SourceDdl {
     }
 }
 
+/// The column change `action` names (#2184 slice 4) on one of `numeric`,
+/// `table`'s numeric columns other than its key, `declared` giving each
+/// column's type now. A swap takes a second column of the same type, or
+/// shadows the first where there is none. `None` where the table has no
+/// such column, or is partitioned or read through a `KEY (…)`, as
+/// [`retype`] has it.
+fn columns(
+    action: u8,
+    table: &Table,
+    numeric: &[&str],
+    declared: &dyn Fn(&str) -> Option<SqlType>,
+    op: usize,
+    pick: usize,
+) -> Option<SourceDdl> {
+    if table.partitioning.is_some() || table.source_key.is_some() || numeric.is_empty() {
+        return None;
+    }
+    let column = numeric[pick % numeric.len()].to_string();
+    Some(match action {
+        9 => SourceDdl::RenameColumn { column },
+        10 => SourceDdl::DropColumn { column },
+        11 => SourceDdl::DropAndAddColumn { column },
+        12 => SourceDdl::AddColumn {
+            column: format!("added_{op}"),
+        },
+        13 => match numeric
+            .iter()
+            .find(|other| **other != column && declared(other) == declared(&column))
+        {
+            Some(other) => SourceDdl::SwapColumnNames {
+                column,
+                other: other.to_string(),
+            },
+            None => SourceDdl::ShadowColumn { column },
+        },
+        14 => SourceDdl::ShadowColumn { column },
+        _ => SourceDdl::GeneratedColumn { column },
+    })
+}
+
 /// `column`'s declared type as the generator creates it, where a
 /// [`SourceDdl::Retype`] can change it.
 fn declared_type(table: &Table, column: &str) -> Option<SqlType> {
@@ -306,10 +353,6 @@ fn retype(
         .copied()
         .unwrap_or(columns[pick % columns.len()]);
     let rest = pick / columns.len();
-    let grouped = program.defs.iter().any(|d| {
-        d.source == table.name
-            && matches!(&d.key_space, KeySpace::Aggregate { group_by } if group_by.iter().any(|g| g == column))
-    });
     let using = (rest / 4) % 2 == 1;
     // `integer` holds no `NaN`: the re-type, or a later write, would fail.
     let integer = |shape| (!writes_nan(program, &table.name, column)).then_some(shape);
@@ -326,11 +369,9 @@ fn retype(
             (SqlType::Int8, _) => SqlType::Int4,
             _ => SqlType::Int8,
         };
-        // Only the same-type re-type changes the keys, as a rewrite: one
-        // without `USING` would change nothing. #2254: a narrowing `USING`
-        // rewrite of a key column leaves a 1-1 target under the old keys;
-        // draw one again (`last && using`) once it's fixed.
-        let using = to == from;
+        // A key `USING` changes the keys later ops address, so only at the
+        // last op; a same-type re-type without it would change nothing.
+        let using = to == from || (last && using);
         (RetypeShape::Key, to, using)
     } else {
         let (shape, to) = match (from, rest % 4) {
@@ -355,9 +396,6 @@ fn retype(
             (SqlType::Int8, 0 | 1) => (RetypeShape::Outgrow, wider(16)),
             (SqlType::Int8, _) => (RetypeShape::Narrow, SqlType::Int4),
         };
-        // #2254: an integer `GROUP BY` key narrowed with `USING` is neither
-        // paused nor re-read by the pass.
-        let using = using && !(from == SqlType::Int8 && to == SqlType::Int4 && grouped);
         (shape, to, using)
     };
     Some(SourceDdl::Retype {
