@@ -163,12 +163,17 @@ pub async fn run_convergence_with_source_ddl_allowing(
                 run.refusals.push((event.clone(), seen));
             }
             // A collation decides only what a drain computes: drain the
-            // window under it, with no pass, before it's changed back.
+            // window under it before it's changed back. With no pass since
+            // the last check settled, nothing waits for one; after the
+            // window's pass, a build it queued would, so settle beside
+            // passes, which don't see a collation.
             if event.action.drains_before_close() {
-                backend
-                    .quiesce()
-                    .await
-                    .map_err(|e| fired(format!("drain the window: {e:?}")))?;
+                if event.pass_inside {
+                    passes.settle(backend).await
+                } else {
+                    backend.quiesce().await.map_err(|e| format!("{e:?}"))
+                }
+                .map_err(|e| fired(format!("drain the window: {e}")))?;
             }
             execute(backend, &statements.closes).await.map_err(fired)?;
             if writer {

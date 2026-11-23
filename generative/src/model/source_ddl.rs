@@ -232,8 +232,9 @@ impl SourceDdl {
     }
 
     /// Whether the run drains the window's changes before the closing
-    /// statements, with no pass: a collation changes only what a drain
-    /// computes, so without it the window could drain after the close.
+    /// statements, with no pass beyond the window's own: a collation
+    /// changes only what a drain computes, so without it the window could
+    /// drain after the close.
     pub fn drains_before_close(&self) -> bool {
         matches!(self, SourceDdl::Collate { .. })
     }
