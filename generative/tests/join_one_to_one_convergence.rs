@@ -1268,7 +1268,7 @@ fn a_hand_built_one_to_one_join_case_builds_over_rows_and_converges() {
 /// fails with `TRELLIS_TEST_PLANT=null_key_as_empty` (#2126's joined side).
 #[test]
 fn a_hand_built_case_over_a_keyed_joined_table_converges() {
-    use generative::generate::join_one_to_one::{JoinedKeyDraw, key_joined};
+    use generative::generate::join_one_to_one::{JoinedKeyDraw, key_joined, key_joined_plan};
     use generative::generate::source_key::{KeyDraw, KeyShape as SourceKeyShape};
     let s = |v: &str| Some(v.to_string());
     for (nullable, primary_key) in [(vec![true], false), (vec![false, true], true)] {
@@ -1301,6 +1301,7 @@ fn a_hand_built_case_over_a_keyed_joined_table_converges() {
         };
         let mut case = hand_built_case(true);
         case.program = key_joined(case.program, &draw);
+        case.plan = key_joined_plan(case.plan, &draw);
         let drawn = generative::generate::join_one_to_one::joined_key_drawn(&case.program);
         for name in [
             "collision",

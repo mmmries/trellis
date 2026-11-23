@@ -108,10 +108,15 @@ fn drawn_values(program: &Program, table: &Table) -> Vec<(String, Vec<Option<Str
     out
 }
 
-/// Whether a column of `table` takes part in a `UNIQUE` constraint.
+/// Whether a column of `table` takes part in a `UNIQUE` constraint or its
+/// source key's unique index: flipping it could make a write collide (#2251).
 fn unique(table: &Table, column: &str) -> bool {
     table.unique_cols.iter().any(|c| c == column)
         || table.unique_sets.iter().flatten().any(|c| c == column)
+        || table
+            .source_key
+            .as_ref()
+            .is_some_and(|key| key.columns.iter().any(|c| c == column))
 }
 
 /// Whether some definition of `program` names `column` of `table`.
@@ -127,8 +132,9 @@ fn read(program: &Program, table: &str, column: &str) -> bool {
 type Flip = (String, Option<String>, Option<String>);
 
 /// A column of `table` a [`Rewrite`] or a [`Shadow`] can flip, with two of
-/// its drawn values: one no `UNIQUE` constraint covers, which the program
-/// writes at least two values to, preferring one a definition reads.
+/// its drawn values: one no `UNIQUE` constraint or source key covers
+/// ([`unique`]), which the program writes at least two values to,
+/// preferring one a definition reads.
 fn flip_column(program: &Program, table: &Table, pick: u64) -> Option<Flip> {
     let mut candidates: Vec<Flip> = drawn_values(program, table)
         .into_iter()
@@ -166,7 +172,8 @@ fn read_by_one_to_one_join(program: &Program, table: &Table) -> bool {
 
 /// `plan` with [`ConcurrentPlan::wiring`] drawn for `program`: each
 /// [`wirable`] table, [`WIRE_SHARE`] in 256 of the time, gets a [`Shadow`]
-/// in a wirable table with no `UNIQUE` constraint not yet shadowed (three
+/// in a wirable table with no `UNIQUE` constraint or source key not yet
+/// shadowed (three
 /// times in four) and a [`Rewrite`] (three times in four, and always when
 /// it gets no shadow; `AFTER` three times in four, the one that nests a
 /// statement), each where some column can flip.
@@ -193,6 +200,7 @@ pub fn with_wiring(mut plan: ConcurrentPlan, program: &Program) -> ConcurrentPla
             .filter(|t| {
                 t.unique_cols.is_empty()
                     && t.unique_sets.is_empty()
+                    && t.source_key.is_none()
                     && !shadowed.contains(t.name.as_str())
             })
             .filter_map(|t| flip_column(program, t, d >> 40).map(|flip| (*t, flip)))
@@ -384,6 +392,62 @@ mod tests {
             },
         ]);
         assert!(!wirable(&truncated.tables[0], &truncated));
+    }
+
+    /// A keyed table's key columns never flip and it is never a shadow's
+    /// table: either would write keys the program's expectations don't
+    /// model, so a drawn write would collide on the key's unique index
+    /// (#2251).
+    #[test]
+    fn a_keyed_tables_key_is_never_flipped_or_shadowed_into() {
+        let keyed = |id: &str, c1: &str, k0: &str| {
+            let Op::Insert {
+                table,
+                mut row,
+                expect,
+            } = insert("t0", id, c1)
+            else {
+                unreachable!()
+            };
+            row.push(("k0".to_string(), Some(k0.to_string())));
+            Op::Insert { table, row, expect }
+        };
+        let mut drawn = (0, 0);
+        for seed in 0..256 {
+            let mut program = program(
+                (0..6)
+                    .flat_map(|i| {
+                        [
+                            keyed(&i.to_string(), &(seed + i).to_string(), &format!("k{i}")),
+                            insert("t1", &i.to_string(), &(seed * 7 + i).to_string()),
+                        ]
+                    })
+                    .collect(),
+            );
+            let t0 = &mut program.tables[0];
+            t0.columns.push(Column {
+                name: "k0".to_string(),
+                value_type: ValueType::Text,
+            });
+            t0.source_key = Some(crate::model::SourceKey {
+                columns: vec!["k0".to_string()],
+                nullable: Vec::new(),
+                primary_key: true,
+            });
+            let flip = flip_column(&program, &program.tables[0], seed);
+            assert_eq!(flip.map(|(c, ..)| c).as_deref(), Some("c1"), "seed {seed}");
+            for wiring in with_wiring(ConcurrentPlan::default(), &program).wiring {
+                if let Some(shadow) = &wiring.shadow {
+                    assert_eq!(shadow.table, "t1", "seed {seed}");
+                    drawn.0 += 1;
+                }
+                if let Some(rewrite) = &wiring.rewrite {
+                    assert_ne!(rewrite.column, "k0", "seed {seed}");
+                    drawn.1 += 1;
+                }
+            }
+        }
+        assert!(drawn.0 > 0 && drawn.1 > 0, "{drawn:?}");
     }
 
     /// The wiring is a function of the program alone, and each shadowed
