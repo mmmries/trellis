@@ -886,9 +886,9 @@ fn report(instance: &str, table: &str, what: &str, log: impl FnOnce()) {
     let due = with_reports(|reports| {
         let due = reports
             .get(&key)
-            .is_none_or(|(last, at)| last != what || at.elapsed() >= REPORT_INTERVAL);
+            .is_none_or(|(last, at)| last != what || crate::clock::elapsed(*at) >= REPORT_INTERVAL);
         if due {
-            reports.insert(key, (what.to_string(), Instant::now()));
+            reports.insert(key, (what.to_string(), crate::clock::now()));
         }
         due
     });

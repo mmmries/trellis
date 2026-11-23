@@ -590,7 +590,7 @@ async fn run_page(
     options: &WorkerOptions,
 ) -> Result<SelfCheckPage, SelfCheckError> {
     let budget = page_budget(options.compare_budget, claim.await_timeout);
-    let started = std::time::Instant::now();
+    let started = crate::clock::now();
     let scope = SelfCheckScope {
         after: claim.progress.after.clone(),
         limit: options.page_keys,
@@ -624,7 +624,7 @@ async fn run_page(
         // The server's timer, which fires at the budget, not before it.
         Ok(Err(SelfCheckError::Db(error)))
             if error.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
-                && started.elapsed() >= budget =>
+                && crate::clock::elapsed(started) >= budget =>
         {
             Err(SelfCheckError::PageTimedOut { budget })
         }
@@ -823,7 +823,7 @@ pub async fn run_to_end(
     options: &WorkerOptions,
 ) -> Result<SelfCheckJob, crate::TrellisError> {
     let job = trellis.self_check(target_table, mode, timeout).await?;
-    let give_up = std::time::Instant::now()
+    let give_up = crate::clock::now()
         + page_budget(options.compare_budget, job_timeout(timeout)).saturating_mul(4);
     loop {
         if work_once(trellis.pool(), "run_to_end", options)
@@ -841,7 +841,7 @@ pub async fn run_to_end(
         }
         // Another worker holds it.
         assert!(
-            std::time::Instant::now() < give_up,
+            crate::clock::now() < give_up,
             "the self_check job's worker did not finish it: {polled:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;

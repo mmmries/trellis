@@ -1467,7 +1467,7 @@ pub async fn isolate_and_evict(
     if threshold == 0 {
         return Ok(IsolationOutcome::FuseDisabled);
     }
-    let started = std::time::Instant::now();
+    let started = crate::clock::now();
     crate::instance_log::info!(
         seg_seq,
         records = folded.len(),
@@ -1481,7 +1481,7 @@ pub async fn isolate_and_evict(
         skip_frozen,
     };
     let result = isolate_and_evict_probing(pool, at, folded, threshold, &mut stats).await;
-    log_isolation_finished(seg_seq, folded.len(), &stats, &result, started.elapsed());
+    log_isolation_finished(seg_seq, folded.len(), &stats, &result, crate::clock::elapsed(started));
     result
 }
 

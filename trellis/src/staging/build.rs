@@ -152,7 +152,7 @@
 //!   field, and the walk begins after it, so every chunk's snapshot is
 //!   taken after the field applies.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio_postgres::types::Type;
 use tokio_postgres::{GenericClient, IsolationLevel, Transaction};
@@ -1515,7 +1515,7 @@ async fn run_rederive(
     hi: &str,
     options: &WorkerOptions,
 ) -> Result<(), ChunkQueueError> {
-    let setup_started = Instant::now();
+    let setup_started = crate::clock::now();
     // Before anything the plan is made from ([`plan_epoch`]).
     let epoch = plan_epoch(&**pool.get().await?, chunk.definition_id).await?;
     let definition = catalog::definition_by_id(pool, chunk.definition_id)
@@ -1552,7 +1552,7 @@ async fn run_rederive(
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
     let mut client = pool.get().await?;
-    let started = Instant::now();
+    let started = crate::clock::now();
     let txn = client
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -1575,7 +1575,7 @@ async fn run_rederive(
         txn.rollback().await?;
         return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
     }
-    metrics::record_build_statement(BuildStatement::ChunkSetup, setup_started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkSetup, crate::clock::elapsed(setup_started));
     let keys = match &plan {
         ChunkPlan::Whole(plan) => {
             let outcome = one_to_one::run_chunk(&txn, plan, lo, hi)
@@ -1591,7 +1591,7 @@ async fn run_rederive(
             outcome.keys
         }
     };
-    let commit_started = Instant::now();
+    let commit_started = crate::clock::now();
     txn.execute(
         "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
          where id = $1",
@@ -1599,8 +1599,8 @@ async fn run_rederive(
     )
     .await?;
     txn.commit().await?;
-    metrics::record_build_statement(BuildStatement::ChunkCommit, commit_started.elapsed());
-    metrics::record_build_chunk(started.elapsed(), keys as u64);
+    metrics::record_build_statement(BuildStatement::ChunkCommit, crate::clock::elapsed(commit_started));
+    metrics::record_build_chunk(crate::clock::elapsed(started), keys as u64);
     try_complete(pool, chunk.definition_id).await?;
     Ok(())
 }
@@ -2080,7 +2080,7 @@ async fn run_plan(
         }
     }
     loop {
-        let started = Instant::now();
+        let started = crate::clock::now();
         let ranges = crate::defs::backfill::next_pk_ranges(
             &**client,
             &definition.source_table,
@@ -2201,7 +2201,7 @@ async fn run_plan(
             .await?;
         }
         txn.commit().await?;
-        metrics::record_build_statement(BuildStatement::Plan, started.elapsed());
+        metrics::record_build_statement(BuildStatement::Plan, crate::clock::elapsed(started));
         if finished {
             crate::instance_log::debug!(
                 definition_id = chunk.definition_id,
@@ -2829,7 +2829,7 @@ async fn run_group_structure(
     structure: &Structure<'_>,
     readers: ReadersOnCommit,
 ) -> Result<Option<(usize, usize)>, ChunkQueueError> {
-    let started = Instant::now();
+    let started = crate::clock::now();
     let txn = client
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -2976,7 +2976,7 @@ async fn run_group_structure(
     };
     rebuilt.stamp(&txn).await?;
     txn.commit().await?;
-    metrics::record_build_chunk(started.elapsed(), (written + deleted) as u64);
+    metrics::record_build_chunk(crate::clock::elapsed(started), (written + deleted) as u64);
     Ok(Some((written, deleted)))
 }
 
@@ -3035,7 +3035,7 @@ async fn run_sweep(
         .await?
         .get(0);
     loop {
-        let started = Instant::now();
+        let started = crate::clock::now();
         let txn = client
             .build_transaction()
             .isolation_level(IsolationLevel::ReadCommitted)
@@ -3083,7 +3083,7 @@ async fn run_sweep(
         )
         .await?;
         txn.commit().await?;
-        metrics::record_build_chunk(started.elapsed(), outcome.rederived as u64);
+        metrics::record_build_chunk(crate::clock::elapsed(started), outcome.rederived as u64);
         if outcome.finished {
             crate::instance_log::debug!(
                 definition_id = chunk.definition_id,
@@ -3221,8 +3221,8 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         heartbeat_interval: Duration::from_secs(5),
         reclaim_ttl: Duration::from_secs(60),
     };
-    let mut last_progress = Instant::now();
-    let mut last_retry: Option<Instant> = None;
+    let mut last_progress = crate::clock::now();
+    let mut last_retry: Option<std::time::Instant> = None;
     // A field build's plan job that gave its claim back to wait on capture
     // is tried again now, once: the capture pass that may have readied it
     // ran before this call, not on the job's backoff.
@@ -3247,7 +3247,7 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         // this loop's claim held for the stale-claim sweep, which this loop
         // doesn't run: free it now, as that sweep would, and count a retry.
         if release_own_claims(pool, CLAIMED_BY).await {
-            last_retry = Some(Instant::now());
+            last_retry = Some(crate::clock::now());
         }
         let mut progressed = false;
         let claimed = {
@@ -3279,7 +3279,7 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
                 && failures.1 == failures_before.1
                 && backing_off(pool, chunk).await;
             if retried {
-                last_retry = Some(Instant::now());
+                last_retry = Some(crate::clock::now());
             }
             progressed |= !retried && !deferred(pool, chunk).await;
         }
@@ -3287,17 +3287,17 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
             progressed |= try_complete(pool, *id).await.expect("complete a build");
         }
         if progressed {
-            last_progress = Instant::now();
+            last_progress = crate::clock::now();
         } else if only_capture_waits(pool).await {
             return;
         } else {
             // A run of retries gets longer than `STALL`: a few lock timeouts
             // in a row behind a slow page are not a stall, and the backoff
             // between two retries alone reaches `REDERIVE_RETRY_CAP` (5s).
-            let retrying = last_retry.is_some_and(|at| at.elapsed() < STALL);
+            let retrying = last_retry.is_some_and(|at| crate::clock::elapsed(at) < STALL);
             let stall = if retrying { RETRY_STALL } else { STALL };
             assert!(
-                last_progress.elapsed() < stall,
+                crate::clock::elapsed(last_progress) < stall,
                 "the running re-derive builds {building:?} made no progress for {stall:?} \
                  (a chunk that fails and retries every time is no progress); unfinished \
                  rows: {}",

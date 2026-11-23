@@ -64,11 +64,11 @@ tokio::task_local! {
 impl CallDeadline {
     /// The time left, zero once the deadline has passed.
     pub(crate) fn remaining(&self) -> Duration {
-        self.at.saturating_duration_since(Instant::now())
+        self.at.saturating_duration_since(crate::clock::now())
     }
 
     pub(crate) fn passed(&self) -> bool {
-        Instant::now() >= self.at
+        crate::clock::now() >= self.at
     }
 
     /// `set_config('statement_timeout', ..., local)` for the time left now,
@@ -132,7 +132,7 @@ pub(crate) async fn bounded<T>(
     };
     CURRENT
         .scope(deadline, async move {
-            let backstop = tokio::time::Instant::from_std(deadline.at + BACKSTOP_GRACE);
+            let backstop = crate::clock::tokio_deadline(deadline.at + BACKSTOP_GRACE);
             match tokio::time::timeout_at(backstop, call).await {
                 Ok(Err(err)) if deadline.passed() && is_budget_error(&err) => {
                     Err(TrellisError::CallTimeout {
@@ -175,12 +175,12 @@ pub(crate) async fn within<T>(
         return Ok(work.await);
     }
     let deadline = CallDeadline {
-        at: Instant::now() + budget,
+        at: crate::clock::now() + budget,
         budget,
     };
     CURRENT
         .scope(deadline, async move {
-            let backstop = tokio::time::Instant::from_std(deadline.at + BACKSTOP_GRACE);
+            let backstop = crate::clock::tokio_deadline(deadline.at + BACKSTOP_GRACE);
             tokio::time::timeout_at(backstop, work)
                 .await
                 .map_err(|_| BudgetExpired { budget })

@@ -565,7 +565,7 @@ impl BlockingTrellis {
         let (reply_tx, reply_rx) = oneshot::channel();
         // The deadline runs from here: the time a job spends queued on the
         // channel counts against it (issue #599).
-        match self.job_tx.send((Instant::now(), make_job(reply_tx))) {
+        match self.job_tx.send((crate::clock::now(), make_job(reply_tx))) {
             Ok(()) => PendingCall::waiting(reply_rx),
             Err(_) => PendingCall::failed(TrellisError::BlockingThreadGone),
         }

@@ -1165,7 +1165,7 @@ async fn run(
     deadline: Option<Instant>,
 ) -> Result<Progress<()>, CaptureError> {
     let operation = op.operation();
-    let started = Instant::now();
+    let started = crate::clock::now();
     let mut retry = DdlRetry::new(operation.what(), USER_TABLE_DDL_LOCK_TIMEOUT, deadline);
     let mut log = BlockerLog::new(operation);
     let mut attempts = 0;
@@ -1723,7 +1723,7 @@ async fn lock_wait(
         operation: op.operation(),
         lock_mode: op.operation().lock_mode().to_string(),
         waiting_since: observed_at
-            .checked_sub(started.elapsed())
+            .checked_sub(crate::clock::elapsed(started))
             .unwrap_or(observed_at),
         attempts,
         observed_at,
@@ -1754,7 +1754,7 @@ impl BlockerLog {
 
     /// Whether a line is due, and if so, marks one logged now.
     fn due(&mut self) -> bool {
-        let now = Instant::now();
+        let now = crate::clock::now();
         if self
             .last_logged
             .is_some_and(|logged| now.duration_since(logged) < BLOCKER_LOG_INTERVAL)

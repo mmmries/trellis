@@ -505,7 +505,7 @@ async fn poll_converged(
     const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
     const MAX_BACKOFF: Duration = Duration::from_millis(250);
 
-    let started = Instant::now();
+    let started = crate::clock::now();
     let wait = Deadline {
         token,
         started,
@@ -521,7 +521,7 @@ async fn poll_converged(
         if rows.last().and_then(|row| row.get(0)) == Some("t") {
             return Ok(());
         }
-        let waited = started.elapsed();
+        let waited = crate::clock::elapsed(started);
         if waited >= timeout {
             return Err(wait.expired());
         }
@@ -539,17 +539,17 @@ struct Deadline {
 
 impl Deadline {
     fn remaining(&self) -> Duration {
-        self.timeout.saturating_sub(self.started.elapsed())
+        self.timeout.saturating_sub(crate::clock::elapsed(self.started))
     }
 
     fn passed(&self) -> bool {
-        self.started.elapsed() >= self.timeout
+        crate::clock::elapsed(self.started) >= self.timeout
     }
 
     fn expired(&self) -> StagingError {
         StagingError::ConvergenceTimeout {
             token: self.token,
-            waited: self.started.elapsed(),
+            waited: crate::clock::elapsed(self.started),
         }
     }
 }

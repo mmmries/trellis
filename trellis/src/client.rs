@@ -322,8 +322,14 @@ fn client_runtime(
     options: &ClientOptions,
     instance: std::sync::Arc<str>,
 ) -> std::io::Result<tokio::runtime::Runtime> {
+    // And its engine clock (`crate::clock`): the one the driving thread
+    // carries.
+    let clock = crate::clock::Inherit::capture();
     runtime_builder(options.worker_threads)?
-        .on_thread_start(move || crate::instance_log::enter_thread(&instance))
+        .on_thread_start(move || {
+            crate::instance_log::enter_thread(&instance);
+            clock.enter();
+        })
         .build()
 }
 
@@ -605,10 +611,12 @@ impl Client {
         let process_cannot_migrate = cannot_migrate.clone();
         let refused_steps = crate::refused_steps::RefusedSteps::default();
         let process_refused_steps = refused_steps.clone();
+        let clock = crate::clock::Inherit::capture();
         let thread = std::thread::Builder::new()
             .name("trellis-client".to_string())
             .spawn(move || {
                 crate::instance_log::enter_thread(&instance);
+                clock.enter();
                 let runtime = match client_runtime(&options, instance) {
                     Ok(rt) => rt,
                     Err(err) => {
@@ -1244,7 +1252,7 @@ async fn first_capture_pass(
 ) -> Result<(), ClientError> {
     let tables = defs::tables_to_capture(pool).await?;
     let unusable = staging::halt::halt_unusable_schemas(pool).await?;
-    let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
+    let deadline = crate::clock::now() + RECONCILE_DDL_BUDGET;
     let outcome = capture::reconcile::reconcile_with_floors(
         session.client_mut(),
         config.schema(),
@@ -1418,9 +1426,9 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     let mut session: Option<ProducerSession> = session;
     // When the next attempt at the singleton is due, while there is no session.
     let mut lock_schedule = if standby {
-        LockSchedule::standby(Instant::now())
+        LockSchedule::standby(crate::clock::now())
     } else {
-        LockSchedule::lost(Instant::now())
+        LockSchedule::lost(crate::clock::now())
     };
     let mut failures = StepFailures::default();
     let mut leader = Leader::new(LeaderConfig {
@@ -1478,11 +1486,11 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 }
             }
             // Taking over: try the singleton at once.
-            lock_schedule = LockSchedule::immediately(Instant::now());
+            lock_schedule = LockSchedule::immediately(crate::clock::now());
             continue;
         }
 
-        if session.is_none() && lock_schedule.due(Instant::now()) {
+        if session.is_none() && lock_schedule.due(crate::clock::now()) {
             match process.take_singleton(&dsn).await {
                 Ok(taken) => {
                     let _ = failures.check("connect", Ok::<_, StagingError>(()));
@@ -1504,14 +1512,14 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 }
                 // Another worker leads: not a failure of this one.
                 Err(StagingError::ProducerAlreadyRunning) => {
-                    lock_schedule.refused(Instant::now());
+                    lock_schedule.refused(crate::clock::now());
                     // Another worker runs the steps now: what this one was
                     // refused says nothing about them.
                     process.refused_steps.clear_all();
                 }
                 Err(err) => {
                     let _ = failures.check("connect", Err::<(), _>(err));
-                    lock_schedule.refused(Instant::now());
+                    lock_schedule.refused(crate::clock::now());
                 }
             }
         }
@@ -1528,14 +1536,14 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // connection still works, so the reconnect can take it again
                 // at once.
                 release_singleton(session.take(), &process).await;
-                lock_schedule = LockSchedule::lost(Instant::now());
+                lock_schedule = LockSchedule::lost(crate::clock::now());
             }
         }
 
         // Without the singleton, sleep until the next attempt at it rather
         // than tick.
         let wait = if session.is_none() {
-            lock_schedule.until_due(Instant::now())
+            lock_schedule.until_due(crate::clock::now())
         } else {
             interval
         };
@@ -1601,7 +1609,7 @@ impl Leader {
             failures: StepFailures::default(),
             ring_full: RingFullLog::default(),
             tombstone_backlog: false,
-            next_reconcile: Instant::now(),
+            next_reconcile: crate::clock::now(),
             backoff: Default::default(),
             limiter: Default::default(),
         }
@@ -1609,7 +1617,7 @@ impl Leader {
 
     /// A new leader's first pass is a capture pass, at once.
     fn reconcile_now(&mut self) {
-        self.next_reconcile = Instant::now();
+        self.next_reconcile = crate::clock::now();
     }
 
     /// Records `result` as `step`'s outcome and hands back its value. A
@@ -1650,7 +1658,7 @@ impl Leader {
     async fn refuse(&mut self, c: &tokio_postgres::Client, step: &'static str, message: String) {
         use crate::refused_steps::{REFUSAL_LOG_INTERVAL, diagnose};
         let refused = diagnose(c, &self.config.schema, step, &message).await;
-        let now = Instant::now();
+        let now = crate::clock::now();
         self.backoff.refused(step, now, self.config.refused_backoff);
         let table = refused.object.clone().unwrap_or_default();
         if self.limiter.allow(step, &table, now, REFUSAL_LOG_INTERVAL) {
@@ -1673,7 +1681,7 @@ impl Leader {
         // Runs `$call` (which borrows `c`) unless the step is backing off.
         macro_rules! step {
             ($name:literal, $failed:ident, $call:expr) => {{
-                if self.backoff.due($name, Instant::now()) {
+                if self.backoff.due($name, crate::clock::now()) {
                     let result = $call;
                     self.settle(c, $name, result, &mut $failed).await
                 } else {
@@ -1683,7 +1691,7 @@ impl Leader {
         }
         let mut failed = false;
         let wake_channel = self.config.wake_channel.clone();
-        let sealed = if self.backoff.due("seal", Instant::now()) {
+        let sealed = if self.backoff.due("seal", crate::clock::now()) {
             Some(staging::seal_if_active_nonempty(c, &wake_channel).await)
         } else {
             None
@@ -1697,12 +1705,12 @@ impl Leader {
         // it, warning only once the ring has stayed full.
         match sealed {
             Some(Err(err @ StagingError::RingFull { .. })) => {
-                self.ring_full.refused(&err, Instant::now());
+                self.ring_full.refused(&err, crate::clock::now());
                 self.failures.succeeded("seal");
             }
             Some(sealed) => {
                 if sealed.is_ok() {
-                    self.ring_full.cleared(Instant::now());
+                    self.ring_full.cleared(crate::clock::now());
                 }
                 self.settle(c, "seal", sealed, &mut failed).await;
             }
@@ -1711,7 +1719,7 @@ impl Leader {
         // Issue #273: everything but the seal runs on the housekeeping
         // cadence, not every tick. See [`HousekeepingSchedule`] for what each
         // step's added latency is.
-        if !failed && self.housekeeping.due(Instant::now()) {
+        if !failed && self.housekeeping.due(crate::clock::now()) {
             let (reclaim_ttl, drainer_window) =
                 (self.config.reclaim_ttl, self.config.drainer_window);
             if !failed {
@@ -1856,7 +1864,7 @@ impl Leader {
                 }
             }
             // A failed pass is retried on the next tick, not a cadence later.
-            self.housekeeping.finished(Instant::now(), !failed);
+            self.housekeeping.finished(crate::clock::now(), !failed);
         } else if !failed && self.tombstone_backlog {
             // A pass capped per ledger keeps collecting every tick until
             // it runs dry, so a delete-heavy workload's tombstones are
@@ -1871,14 +1879,14 @@ impl Leader {
             }
         }
         if !failed
-            && Instant::now() >= self.next_reconcile
-            && self.backoff.due("reconcile_source_tables", Instant::now())
+            && crate::clock::now() >= self.next_reconcile
+            && self.backoff.due("reconcile_source_tables", crate::clock::now())
         {
             let reconciled =
                 reconcile_source_tables(c, &self.config.pool, &self.config.schema).await;
             self.settle(c, "reconcile_source_tables", reconciled, &mut failed)
                 .await;
-            self.next_reconcile = Instant::now() + self.config.reconcile_interval;
+            self.next_reconcile = crate::clock::now() + self.config.reconcile_interval;
         }
         failed
     }
@@ -2141,7 +2149,7 @@ impl StepFailures {
     ) -> Result<T, E> {
         match &result {
             Ok(_) => self.succeeded(step),
-            Err(error) => self.failed(step, error, Instant::now()),
+            Err(error) => self.failed(step, error, crate::clock::now()),
         }
         result
     }
@@ -2444,7 +2452,7 @@ async fn reconcile_source_tables(
     // The readers of a table in a schema the role can't use pause, and the
     // pass leaves them out: any lookup of the table by name raises.
     let unusable = staging::halt::halt_unusable_schemas(pool).await?;
-    let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
+    let deadline = crate::clock::now() + RECONCILE_DDL_BUDGET;
     let outcome = capture::reconcile::reconcile_with_floors(
         client,
         schema,
@@ -2741,7 +2749,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     .map_err(|err| err.to_string()),
                 Err(err) => Err(err.to_string()),
             };
-            drain_failures.failed(error, &seg_seqs, &released, &claimed_by, Instant::now());
+            drain_failures.failed(error, &seg_seqs, &released, &claimed_by, crate::clock::now());
         }
 
         for &seg_seq in &seg_seqs {
@@ -3374,7 +3382,7 @@ async fn handover_pass(
     // A refusal that waits on an operator is tried again once a minute, and
     // reported as it was meanwhile.
     if let Some((due, pending)) = backoff
-        && Instant::now() < due
+        && crate::clock::now() < due
     {
         let verdict = Verdict::StandBy(handover::StandBy::CannotMigrate(pending.clone()));
         *process
@@ -3425,7 +3433,7 @@ async fn handover_pass(
                     .migrate_backoff
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((Instant::now() + after, pending.clone()));
+                    Some((crate::clock::now() + after, pending.clone()));
             }
             Ok(PassOutcome {
                 verdict: Verdict::StandBy(handover::StandBy::CannotMigrate(pending)),
@@ -3571,7 +3579,7 @@ pub async fn handover_pass_as(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
-                .map(|(due, _)| due.saturating_duration_since(Instant::now()));
+                .map(|(due, _)| due.saturating_duration_since(crate::clock::now()));
             HandoverPass {
                 took_over: outcome.verdict == Verdict::TakeOver,
                 migrated: outcome.migrated.unwrap_or_default(),

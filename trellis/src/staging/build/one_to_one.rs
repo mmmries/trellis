@@ -54,7 +54,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::time::Instant;
 
 use tokio_postgres::Transaction;
 
@@ -274,7 +273,7 @@ async fn run_range(
     // (`super::stage_null_keys`). A row whose `WHERE` is not `TRUE` is
     // skipped: it gets no entry, as a row gone from the source gets none. If
     // it becomes a member, its change writes it.
-    let started = Instant::now();
+    let started = crate::clock::now();
     let source_param = format!("${}", params.len() + 1);
     let target_param = format!("${}", params.len() + 2);
     let mut key_params = params.clone();
@@ -306,7 +305,7 @@ async fn run_range(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkKeys, crate::clock::elapsed(started));
     if keys.is_empty() {
         return Ok(OneToOneOutcome::default());
     }
@@ -754,7 +753,7 @@ async fn lock_chunk_entries(
             present: true,
         })
         .collect();
-    let started = Instant::now();
+    let started = crate::clock::now();
     // The segment stamp is only for an Apply the insert settles; a
     // Re-derive's placeholder takes none.
     let locked = under_chunk_lock_timeout(txn, async {
@@ -771,7 +770,7 @@ async fn lock_chunk_entries(
         Ok::<_, ApplyError>(())
     })
     .await;
-    metrics::record_build_statement(BuildStatement::ChunkLock, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkLock, crate::clock::elapsed(started));
     locked
 }
 
@@ -884,9 +883,9 @@ async fn rederive(
             deleted: 0,
         });
     };
-    let started = Instant::now();
+    let started = crate::clock::now();
     let rows = query_under_chunk_plan(txn, &sql, params).await?;
-    metrics::record_build_statement(BuildStatement::ChunkWrite, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkWrite, crate::clock::elapsed(started));
     // A `select` of scalar subqueries with no `from`: always one row.
     let row = rows.first().expect("the chunk statement returns one row");
     let written: i64 = row.get(1);

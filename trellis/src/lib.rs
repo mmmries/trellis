@@ -97,6 +97,7 @@ mod blocking;
 #[cfg(feature = "internals")]
 pub mod blocking;
 pub(crate) mod catalog_floor;
+pub(crate) mod clock;
 #[cfg(not(feature = "internals"))]
 mod client;
 #[cfg(feature = "internals")]
