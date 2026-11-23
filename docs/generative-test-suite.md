@@ -1209,10 +1209,11 @@ The actions, cheapest-first (every one below is built):
    checked allowlist: a missing entry fails, and so does one whose detection
    or repair doesn't hold.
    An `ALTER COLUMN TYPE` changes the model's column type with it, which the
-   oracle reads; a key column's value-changing rewrite is drawn only after
-   the program's last op, since later ops address the keys.
-   `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`
-   and `resumed_exact`. The `capture_skip_trigger_state` plant (the capture
+   oracle reads; a key column's value-changing rewrite, and a column renamed
+   away, dropped or made generated, is drawn only after the program's last
+   op, since later ops address the keys and write the columns.
+   `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`,
+   `resumed_exact` and `resume_refused`. The `capture_skip_trigger_state` plant (the capture
    audit not reading a trigger's state) needs a disabled trigger, so no
    planted-bug sweep tier runs it; the `capture_disabled_*` pins catch it.
 

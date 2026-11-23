@@ -1027,6 +1027,15 @@ impl ManualBackend {
         self.tables.remove(table);
     }
 
+    /// Stops reading `column` of `table`, which the table no longer has
+    /// under that name (renamed away or dropped, #2184): a later
+    /// [`Backend::snapshot`] reads the table without it.
+    pub fn forget_column(&mut self, table: &str, column: &str) {
+        if let Some(table) = self.tables.get_mut(table) {
+            table.columns.retain(|c| c.name != column);
+        }
+    }
+
     /// `PAUSE TRANSFORM <target>` and then `DROP TRANSFORM <target>` (the
     /// statement refuses a transform that isn't paused), through the public
     /// `Trellis` facade an operator would use, and forgets the definition

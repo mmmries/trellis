@@ -50,7 +50,7 @@ enum Menu {
 impl Menu {
     fn actions(self) -> u8 {
         match self {
-            Menu::Maintenance => 9,
+            Menu::Maintenance => 16,
             Menu::Privilege => 11,
         }
     }
@@ -155,16 +155,16 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             .map(|d| d.target.as_str())
             .collect();
         let target = readers[pick % readers.len()].to_string();
+        let declared = |column: &str| {
+            retyped
+                .iter()
+                .rev()
+                .find(|((t, c), _)| t == &table.name && c == column)
+                .map(|(_, ty)| *ty)
+                .or_else(|| declared_type(table, column))
+        };
         let action = match (menu, action) {
             (Menu::Maintenance, 7 | 8) => {
-                let declared = |column: &str| {
-                    retyped
-                        .iter()
-                        .rev()
-                        .find(|((t, c), _)| t == &table.name && c == column)
-                        .map(|(_, ty)| *ty)
-                        .or_else(|| declared_type(table, column))
-                };
                 let prefer = integer.as_ref().map(|(_, c)| c.as_str());
                 retype(
                     program,
@@ -177,6 +177,8 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
                 )
                 .unwrap_or(SourceDdl::VacuumFull)
             }
+            (Menu::Maintenance, 9..) => columns(action, table, &numeric, &declared, op, pick)
+                .unwrap_or(SourceDdl::VacuumFull),
             (Menu::Maintenance, _) => maintenance(action, column, pick),
             (Menu::Privilege, _) => privilege(action, target),
         };
@@ -191,7 +193,12 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             SourceDdl::RevokeSchemaUsage if !referenced.is_empty() => SourceDdl::RevokeMembership,
             action => action,
         };
-        let window = window.min(ops - 1 - op);
+        // A change later ops couldn't write through fires after the last.
+        let (op, window) = if action.terminal() {
+            (ops - 1, 0)
+        } else {
+            (op, window.min(ops - 1 - op))
+        };
         let event = SourceDdlEvent {
             op,
             table: table.name.clone(),
@@ -256,6 +263,46 @@ fn maintenance(action: u8, column: Option<String>, pick: usize) -> SourceDdl {
         (3 | 4, None) => SourceDdl::VacuumFull,
         _ => SourceDdl::DisableCaptureTriggers,
     }
+}
+
+/// The column change `action` names (#2184 slice 4) on one of `numeric`,
+/// `table`'s numeric columns other than its key, `declared` giving each
+/// column's type now. A swap takes a second column of the same type, or
+/// shadows the first where there is none. `None` where the table has no
+/// such column, or is partitioned or read through a `KEY (…)`, as
+/// [`retype`] has it.
+fn columns(
+    action: u8,
+    table: &Table,
+    numeric: &[&str],
+    declared: &dyn Fn(&str) -> Option<SqlType>,
+    op: usize,
+    pick: usize,
+) -> Option<SourceDdl> {
+    if table.partitioning.is_some() || table.source_key.is_some() || numeric.is_empty() {
+        return None;
+    }
+    let column = numeric[pick % numeric.len()].to_string();
+    Some(match action {
+        9 => SourceDdl::RenameColumn { column },
+        10 => SourceDdl::DropColumn { column },
+        11 => SourceDdl::DropAndAddColumn { column },
+        12 => SourceDdl::AddColumn {
+            column: format!("added_{op}"),
+        },
+        13 => match numeric
+            .iter()
+            .find(|other| **other != column && declared(other) == declared(&column))
+        {
+            Some(other) => SourceDdl::SwapColumnNames {
+                column,
+                other: other.to_string(),
+            },
+            None => SourceDdl::ShadowColumn { column },
+        },
+        14 => SourceDdl::ShadowColumn { column },
+        _ => SourceDdl::GeneratedColumn { column },
+    })
 }
 
 /// `column`'s declared type as the generator creates it, where a

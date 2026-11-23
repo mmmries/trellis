@@ -119,11 +119,14 @@ pub async fn run_convergence_with_source_ddl_allowing(
                 event: Box::new(event.clone()),
                 error,
             };
-            let statements = Statements::resolve(&passes, backend, program, event)
+            let statements = Statements::resolve(&passes, backend, program, event, server)
                 .await
                 .map_err(fired)?;
             execute(backend, &statements.opens).await.map_err(fired)?;
             event.follow(&mut model);
+            if let Some(column) = event.removed_column() {
+                backend.forget_column(&event.table, column);
+            }
             let writer = event.action.writes_as_writer();
             if writer {
                 let dsn = backend.roles().writer();
@@ -221,6 +224,7 @@ impl Statements {
         backend: &ManualBackend,
         program: &Program,
         event: &SourceDdlEvent,
+        server: Server,
     ) -> Result<Self, String> {
         let table = format!("public.{}", quote(&event.table));
         if event.action.privilege() {
@@ -313,6 +317,92 @@ impl Statements {
                 };
                 (alter("DISABLE"), alter("ENABLE ALWAYS"))
             }
+            SourceDdl::RenameColumn { column } => (
+                vec![format!(
+                    "ALTER TABLE {table} RENAME COLUMN {} TO {}",
+                    quote(column),
+                    quote(&away(column))
+                )],
+                Vec::new(),
+            ),
+            SourceDdl::DropColumn { column } => (
+                vec![format!("ALTER TABLE {table} DROP COLUMN {}", quote(column))],
+                Vec::new(),
+            ),
+            SourceDdl::DropAndAddColumn { column } => {
+                let ty = column_type(passes, &table, column).await?;
+                let quoted = quote(column);
+                (
+                    vec![
+                        format!("ALTER TABLE {table} DROP COLUMN {quoted}"),
+                        format!("ALTER TABLE {table} ADD COLUMN {quoted} {ty}"),
+                    ],
+                    Vec::new(),
+                )
+            }
+            SourceDdl::AddColumn { column } => (
+                vec![format!(
+                    "ALTER TABLE {table} ADD COLUMN {} double precision DEFAULT random()",
+                    quote(column)
+                )],
+                Vec::new(),
+            ),
+            SourceDdl::SwapColumnNames { column, other } => {
+                // A swap undoes itself: the close runs the same renames.
+                let rename = |from: &str, to: &str| {
+                    format!(
+                        "ALTER TABLE {table} RENAME COLUMN {} TO {}",
+                        quote(from),
+                        quote(to)
+                    )
+                };
+                let swap = vec![
+                    rename(column, &away(column)),
+                    rename(other, column),
+                    rename(&away(column), other),
+                ];
+                (swap.clone(), swap)
+            }
+            SourceDdl::ShadowColumn { column } => {
+                let ty = column_type(passes, &table, column).await?;
+                let (quoted, away) = (quote(column), quote(&away(column)));
+                (
+                    vec![
+                        format!("ALTER TABLE {table} RENAME COLUMN {quoted} TO {away}"),
+                        format!("ALTER TABLE {table} ADD COLUMN {quoted} {ty}"),
+                    ],
+                    vec![
+                        format!("ALTER TABLE {table} DROP COLUMN {quoted}"),
+                        format!("ALTER TABLE {table} RENAME COLUMN {away} TO {quoted}"),
+                    ],
+                )
+            }
+            SourceDdl::GeneratedColumn { column } => {
+                let ty = column_type(passes, &table, column).await?;
+                let quoted = quote(column);
+                let pk = program
+                    .tables
+                    .iter()
+                    .find(|t| t.name == event.table)
+                    .map(|t| quote(&t.pk_col))
+                    .ok_or_else(|| format!("{event:?} names no table of the program"))?;
+                (
+                    vec![
+                        format!("ALTER TABLE {table} DROP COLUMN {quoted}"),
+                        format!(
+                            "ALTER TABLE {table} ADD COLUMN {quoted} {ty} \
+                             GENERATED ALWAYS AS ({pk} * 2) STORED"
+                        ),
+                    ],
+                    if server.sets_expressions {
+                        vec![format!(
+                            "ALTER TABLE {table} ALTER COLUMN {quoted} SET EXPRESSION AS ({pk} * 3)"
+                        )]
+                    } else {
+                        Vec::new()
+                    },
+                )
+            }
             other => unreachable!("{other:?} is a privilege change"),
         };
         debug_assert!(program.tables.iter().any(|t| t.name == event.table));
@@ -343,6 +433,11 @@ async fn execute(backend: &ManualBackend, statements: &[String]) -> Result<(), S
             .map_err(|e| format!("{statement}: {e:?}"))?;
     }
     Ok(())
+}
+
+/// The name a renamed-away column takes.
+fn away(column: &str) -> String {
+    format!("{column}_away")
 }
 
 fn quote(name: &str) -> String {

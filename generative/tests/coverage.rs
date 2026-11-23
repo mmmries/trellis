@@ -2520,18 +2520,22 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 /// - `listed_gap`: the register's `alter-type-rewrite` shapes, which
 ///   `self_check` finds and `request_backfill` repairs: a same-type rewrite
 ///   beside a `SET DEFAULT` inside one reconcile interval, and a widening
-///   that changes values. Only a draw the register lists on the server
-///   counts toward it (`SourceDdlEvent::listed_gaps`).
+///   that changes values; and its `column-name-swap` shapes, a read
+///   column's name taken and given back inside one interval. Only a draw
+///   the register lists on the server counts toward it
+///   (`SourceDdlEvent::listed_gaps`).
 /// - `resumed_exact`: disabling the capture triggers pauses the readers by
 ///   the capture audit; a narrowing that changes the type a reader evaluates
 ///   the column as, and a widening that outgrows a copy, pause them by the
 ///   pass's type checks. Each `RESUME` makes them exact.
+/// - `resume_refused`: a read column renamed away or dropped pauses its
+///   readers, and their `RESUME` refuses while it is missing.
 ///
 /// Draws are deterministic. Only a draw with an event a floor still waits
 /// for is run, until every floor holds, so this costs a few dozen cases
 /// rather than a sweep.
 #[tokio::test(flavor = "multi_thread")]
-async fn source_ddl_actions_reach_the_listed_gap_and_resumed_exact_verdicts() {
+async fn source_ddl_actions_reach_their_verdict_floors() {
     use generative::backend::{CaseDatabase, ManualBackend};
     use generative::generate::source_ddl::source_ddl_plan_for;
     use generative::model::Server;
@@ -2549,6 +2553,8 @@ async fn source_ddl_actions_reach_the_listed_gap_and_resumed_exact_verdicts() {
         (&["retype_widen_using"], "listed_gap"),
         (&["retype_narrow", "retype_narrow_using"], "resumed_exact"),
         (&["retype_outgrow", "retype_outgrow_using"], "resumed_exact"),
+        (&["swap_column_names", "shadow_column"], "listed_gap"),
+        (&["rename_column", "drop_column"], "resume_refused"),
     ];
     let cluster = testkit::TestCluster::start();
     let server = {

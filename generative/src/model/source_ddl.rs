@@ -16,6 +16,9 @@ pub struct Server {
     /// `attoptions` of the column and of every column after it, as
     /// PostgreSQL 15.20, 16.16, 17.12, 18.7 and later minors do.
     pub versions_attributes: bool,
+    /// Whether the server has `ALTER COLUMN ... SET EXPRESSION`
+    /// (PostgreSQL 17 and later).
+    pub sets_expressions: bool,
 }
 
 impl Server {
@@ -43,8 +46,14 @@ impl Server {
             .batch_execute("drop table pg_temp.trellis_attver_probe")
             .await
             .map_err(|e| format!("drop the probe: {e}"))?;
+        let version: i32 = client
+            .query_one("select current_setting('server_version_num')::int", &[])
+            .await
+            .map_err(|e| format!("read the server version: {e}"))?
+            .get(0);
         Ok(Self {
             versions_attributes,
+            sets_expressions: version >= 170_000,
         })
     }
 }
@@ -87,6 +96,36 @@ pub enum SourceDdl {
         using: bool,
         shape: RetypeShape,
     },
+    /// `column` renamed to `<column>_away`, the program's last DDL: later
+    /// ops would name it. Its readers pause, and their `RESUME` refuses
+    /// while the column is missing.
+    RenameColumn { column: String },
+    /// `column` dropped, the program's last DDL, as
+    /// [`SourceDdl::RenameColumn`].
+    DropColumn { column: String },
+    /// `column` dropped and added again under its name and type in one
+    /// group, so every row holds `NULL` under a new `attnum`. The pass
+    /// re-reads the table for the readers still valid over it.
+    DropAndAddColumn { column: String },
+    /// `column` added, unread, with a volatile default: rewrites the table
+    /// and changes no read column.
+    AddColumn { column: String },
+    /// `column` and `other`, of one type, swap names through a third name
+    /// when the event fires, and swap back at its close: within one
+    /// reconcile interval this is the register's [`Gap::ColumnNameSwap`];
+    /// a pass in between re-reads the table each time.
+    SwapColumnNames { column: String, other: String },
+    /// `column` renamed to `<column>_away` and a column of its type added
+    /// under its name when the event fires; at the close that column is
+    /// dropped and the name given back. The register's other
+    /// [`Gap::ColumnNameSwap`] shape.
+    ShadowColumn { column: String },
+    /// `column` dropped and added again as a stored generated column
+    /// (`GENERATED ALWAYS AS (pk * 2) STORED`), the program's last DDL
+    /// (later ops would write it); at the close, on a server that has it,
+    /// its expression replaced (`SET EXPRESSION AS (pk * 3)`). The pass
+    /// re-reads the table for each.
+    GeneratedColumn { column: String },
     /// Every capture trigger on the table disabled by name when the event
     /// fires and enabled again (`ENABLE ALWAYS`, as Trellis installs them)
     /// at its close, so the window's writes are never captured. The capture
@@ -144,8 +183,24 @@ impl SourceDdl {
     pub fn closes(&self) -> bool {
         matches!(
             self,
-            SourceDdl::RewriteBesideDefault { .. } | SourceDdl::DisableCaptureTriggers
+            SourceDdl::RewriteBesideDefault { .. }
+                | SourceDdl::DisableCaptureTriggers
+                | SourceDdl::SwapColumnNames { .. }
+                | SourceDdl::ShadowColumn { .. }
+                | SourceDdl::GeneratedColumn { .. }
         ) || self.privilege()
+    }
+
+    /// Whether the change leaves the table so that a later op's write
+    /// would fail (a column gone, or made generated): the generator draws
+    /// it only after the program's last op.
+    pub fn terminal(&self) -> bool {
+        matches!(
+            self,
+            SourceDdl::RenameColumn { .. }
+                | SourceDdl::DropColumn { .. }
+                | SourceDdl::GeneratedColumn { .. }
+        )
     }
 
     /// Whether this is a privilege or ownership change (#2182): every one
@@ -209,6 +264,13 @@ impl SourceDdl {
             SourceDdl::RewriteColumn { .. } => "rewrite_column",
             SourceDdl::RewriteBesideDefault { .. } => "rewrite_beside_default",
             SourceDdl::DisableCaptureTriggers => "disable_capture_triggers",
+            SourceDdl::RenameColumn { .. } => "rename_column",
+            SourceDdl::DropColumn { .. } => "drop_column",
+            SourceDdl::DropAndAddColumn { .. } => "drop_and_add_column",
+            SourceDdl::AddColumn { .. } => "add_column",
+            SourceDdl::SwapColumnNames { .. } => "swap_column_names",
+            SourceDdl::ShadowColumn { .. } => "shadow_column",
+            SourceDdl::GeneratedColumn { .. } => "generated_column",
             SourceDdl::Retype { using, shape, .. } => shape.kind(*using),
             SourceDdl::OwnerToHeir => "owner_to_heir",
             SourceDdl::OwnerToOther => "owner_to_other",
@@ -256,6 +318,18 @@ impl SourceDdlEvent {
     /// the rewrite: the shape is the register's only with no read column
     /// after it.
     pub fn listed_gaps(&self, program: &crate::model::Program, server: Server) -> Vec<Gap> {
+        // A read column's name taken by another column and given back with
+        // no pass between: the pass that comes after sees only its catalog
+        // row's `xmin` moved.
+        if matches!(
+            (&self.action, self.pass_inside),
+            (
+                SourceDdl::SwapColumnNames { .. } | SourceDdl::ShadowColumn { .. },
+                false
+            )
+        ) {
+            return vec![Gap::ColumnNameSwap];
+        }
         let column = match (&self.action, self.pass_inside) {
             (SourceDdl::RewriteBesideDefault { column }, false) => column,
             // The register's "widening that changes values": the pass sees a
@@ -301,10 +375,26 @@ impl SourceDdlEvent {
             .any(|c| read.contains(&c.name))
     }
 
+    /// The column the event takes from the table's names for good (renamed
+    /// away or dropped), which a snapshot must no longer read.
+    pub fn removed_column(&self) -> Option<&str> {
+        match &self.action {
+            SourceDdl::RenameColumn { column } | SourceDdl::DropColumn { column } => Some(column),
+            _ => None,
+        }
+    }
+
     /// Makes `program`'s model of the event's table follow the event: a
-    /// re-typed column takes its new type, which the oracle reads. Every
-    /// other action leaves the model as it is.
+    /// re-typed column takes its new type, which the oracle reads, and a
+    /// column renamed away or dropped leaves it. Every other action leaves
+    /// the model as it is.
     pub fn follow(&self, program: &mut crate::model::Program) {
+        if let Some(column) = self.removed_column() {
+            if let Some(table) = program.tables.iter_mut().find(|t| t.name == self.table) {
+                table.columns.retain(|c| c.name != column);
+            }
+            return;
+        }
         let SourceDdl::Retype { column, to, .. } = &self.action else {
             return;
         };
