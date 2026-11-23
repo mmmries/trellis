@@ -161,10 +161,37 @@ pub(super) async fn await_ring(
     deadline: &mut ProgressDeadline,
     held: HeldKeys,
 ) -> Result<(), QuiesceError> {
+    await_ring_with(
+        raw,
+        token,
+        deadline,
+        held,
+        PROGRESS_SAMPLE,
+        Instant::now,
+        async || {},
+    )
+    .await
+}
+
+/// [`await_ring`] with its two sources of nondeterminism injected, so a test
+/// decides when the ring "makes progress" and how much time has passed:
+/// `clock` is the time the deadline is measured against, and `between` runs
+/// after each slice that didn't converge, before the progress sample (a test
+/// commits a page and advances its fake clock there). Production passes
+/// [`Instant::now`] and a no-op.
+pub(super) async fn await_ring_with(
+    raw: &tokio_postgres::Client,
+    token: PgLsn,
+    deadline: &mut ProgressDeadline,
+    held: HeldKeys,
+    sample: Duration,
+    clock: impl Fn() -> Instant,
+    mut between: impl AsyncFnMut(),
+) -> Result<(), QuiesceError> {
     let started = Instant::now();
     let mut expired = None;
     let result = loop {
-        let slice = deadline.remaining(Instant::now()).min(PROGRESS_SAMPLE);
+        let slice = deadline.remaining(clock()).min(sample);
         let waited = match held {
             HeldKeys::Block => await_converged(raw, token, slice).await,
             HeldKeys::Settle => await_converged_except_held(raw, token, slice).await,
@@ -174,14 +201,15 @@ pub(super) async fn await_ring(
             Err(StagingError::ConvergenceTimeout { .. }) => {}
             Err(other) => break Err(other.into()),
         }
-        deadline.observe(progress_mark(raw).await, Instant::now());
+        between().await;
+        deadline.observe(progress_mark(raw).await, clock());
         // A page retried without bound fails the run at once, however much
         // of the window is left (#2185 6c).
         if let Some(holdups) = unbounded_holdups(raw).await {
             dump_state(raw, Some(token), "a drain page is retried without bound").await;
             break Err(QuiesceError::RetriesUnbounded { holdups });
         }
-        expired = deadline.expired(Instant::now());
+        expired = deadline.expired(clock());
         if expired.is_some() {
             break Err(QuiesceError::Staging(StagingError::ConvergenceTimeout {
                 token,
