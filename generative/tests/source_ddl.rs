@@ -16,7 +16,7 @@ use generative::generate::{
     trivial_program,
 };
 use generative::model::{
-    Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType,
+    Collation, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType,
 };
 use generative::run::judge::Verdict;
 use generative::run::{
@@ -179,6 +179,11 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         "swap_column_names",
         "shadow_column",
         "generated_column",
+        "flip_not_null",
+        "set_default",
+        "set_default_beside_vacuum",
+        "collate_c",
+        "collate_nondeterministic",
     ] {
         for pass in [false, true] {
             assert!(
@@ -1126,5 +1131,205 @@ async fn a_read_column_made_generated_and_its_expression_replaced_is_reread() {
             [Verdict::Exact, Verdict::Exact],
             "pass_inside={pass_inside}"
         );
+    }
+}
+
+/// `c1`'s `NOT NULL` set with changes in flight and dropped again at the
+/// close, and a default set (beside a `VACUUM FULL` or not) and dropped:
+/// each moves only the column's catalog row, so every reader stays exact,
+/// inside one interval or across a pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn not_null_and_default_changes_keep_every_definition_exact() {
+    let program = one_to_one_and_aggregate_program();
+    let c1 = c1(&program);
+    for action in [
+        SourceDdl::FlipNotNull {
+            column: c1.clone(),
+            key: false,
+        },
+        SourceDdl::SetDefault {
+            column: c1.clone(),
+            rewrite: false,
+        },
+        SourceDdl::SetDefault {
+            column: c1.clone(),
+            rewrite: true,
+        },
+    ] {
+        for pass_inside in [false, true] {
+            let event = event(&program, 2, action.clone(), 3, pass_inside);
+            assert!(event.listed_gaps(&program, Server::default()).is_empty());
+            assert_eq!(
+                run_one(&program, event).await,
+                [Verdict::Exact, Verdict::Exact],
+                "{action:?} pass_inside={pass_inside}"
+            );
+        }
+    }
+}
+
+/// [`one_to_one_and_aggregate_program`] with text values a collation
+/// decides (`'OPEN' = 'open'` under a case-insensitive collation, `'B'`
+/// sorting before `'b'` under `"C"` and not under the database's ICU
+/// `en-US`), and the 1-1 also computing `text = 'open'`. Define refuses an
+/// ordering comparison over `text` (T0081). The updates at ops 3 and 5
+/// recompute rows `1` (`'B'`) and `3` (`'OPEN'`).
+fn collation_reading_program() -> Program {
+    let mut program = one_to_one_and_aggregate_program();
+    let text = text_column(&program);
+    for (op, value) in program.ops.iter_mut().take(3).zip(["B", "a", "OPEN"]) {
+        let generative::model::Op::Insert { row, .. } = op else {
+            panic!("ops 0-2 seed: {op:?}");
+        };
+        let cell = row
+            .iter_mut()
+            .find(|(c, _)| *c == text)
+            .expect("a seed writes the text column");
+        cell.1 = Some(value.to_string());
+    }
+    let compare = |op: Operator, literal: &str| Expr::BinaryOp {
+        op,
+        lhs: Box::new(Expr::Column(text.clone())),
+        rhs: Box::new(Expr::StringLiteral(literal.to_string())),
+    };
+    program.defs[0]
+        .fields
+        .push(trellis::dev::defs::ast::FieldDef {
+            name: "is_open".to_string(),
+            expr: compare(Operator::Equal, "open"),
+        });
+    program
+}
+
+/// The table's `text` column.
+fn text_column(program: &Program) -> String {
+    program.tables[0]
+        .columns
+        .iter()
+        .find(|c| c.value_type == trellis::dev::defs::ast::ValueType::Text)
+        .expect("every table has a text column")
+        .name
+        .clone()
+}
+
+/// The register's `nondeterministic-collation`: the text column made
+/// case-insensitive with the updates in flight, and given its collation back
+/// at the close. The 1-1 computed row `3`'s `text = 'open'` under the new
+/// collation, and the pass doesn't see the change, with or without a pass
+/// between. `self_check` reports it, and with the collation back,
+/// `request_backfill` repairs it. The aggregate doesn't read the column.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_column_made_case_insensitive_is_the_listed_gap() {
+    let program = collation_reading_program();
+    for pass_inside in [false, true] {
+        let event = event(
+            &program,
+            2,
+            SourceDdl::Collate {
+                column: text_column(&program),
+                collation: Collation::CaseInsensitive,
+            },
+            3,
+            pass_inside,
+        );
+        assert_eq!(
+            event.listed_gaps(&program, Server::default()),
+            vec![Gap::NondeterministicCollation]
+        );
+        assert_eq!(
+            run_one(&program, event).await,
+            [
+                Verdict::ListedGap(Gap::NondeterministicCollation),
+                Verdict::Exact
+            ],
+            "pass_inside={pass_inside}"
+        );
+    }
+}
+
+/// The text column given the deterministic `"C"` with the updates in
+/// flight, and its collation back at the close: a deterministic
+/// collation's `=` is byte equality, and define refuses the rest of what a
+/// collation decides, so every reader stays exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_column_given_another_deterministic_collation_stays_exact() {
+    let program = collation_reading_program();
+    for pass_inside in [false, true] {
+        let event = event(
+            &program,
+            2,
+            SourceDdl::Collate {
+                column: text_column(&program),
+                collation: Collation::C,
+            },
+            3,
+            pass_inside,
+        );
+        assert!(event.listed_gaps(&program, Server::default()).is_empty());
+        assert_eq!(
+            run_one(&program, event).await,
+            [Verdict::Exact, Verdict::Exact],
+            "pass_inside={pass_inside}"
+        );
+    }
+}
+
+/// [`one_to_one_and_aggregate_program`] read through `KEY (k0)`, `k0`
+/// nullable (a `NULLS NOT DISTINCT` index) or not (a plain one). The seeds
+/// write `chr(1)`, `'a' || chr(1) || chr(1)` and `''`, the keys the
+/// encoding turns on, and op 3's update moves row `1` to a doubled
+/// `chr(1)`; no op writes a `NULL` key.
+fn keyed_program(nullable: bool) -> Program {
+    let s = |v: &str| Some(v.to_string());
+    generative::generate::source_key::key_source(
+        one_to_one_and_aggregate_program(),
+        &generative::generate::source_key::KeyDraw {
+            shape: generative::generate::source_key::KeyShape {
+                nullable: vec![nullable],
+                primary_key: true,
+            },
+            inserts: vec![vec![s("\u{1}")], vec![s("a\u{1}\u{1}")], vec![s("")]],
+            moves: vec![Some(vec![s("\u{1}\u{1}")]), None],
+        },
+    )
+}
+
+/// The `NOT NULL` of a `KEY (…)` column flipped with key changes in flight,
+/// and flipped back at the close, with them still staged: the key's
+/// encoding is recorded with it, so the flip changes nothing
+/// (`docs/staging-and-claiming/capture-drift.md`, #2147). On a
+/// `NULLS NOT DISTINCT` index the set and the drop both keep every reader
+/// exact, inside one interval or across a pass. On a plain index the drop
+/// leaves the key unbacked: inside one interval nothing sees it, and a pass
+/// that does pauses the readers, which resume exact once it is back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_columns_not_null_flipped_with_changes_in_flight_is_never_silently_wrong() {
+    for nullable in [true, false] {
+        let program = keyed_program(nullable);
+        for pass_inside in [false, true] {
+            let event = event(
+                &program,
+                2,
+                SourceDdl::FlipNotNull {
+                    column: "k0".to_string(),
+                    key: true,
+                },
+                3,
+                pass_inside,
+            );
+            assert!(event.listed_gaps(&program, Server::default()).is_empty());
+            let verdicts = run_one(&program, event).await;
+            for verdict in &verdicts {
+                let expected = if !nullable && pass_inside {
+                    matches!(verdict, Verdict::ResumedExact { reason } if reason.starts_with("capture:"))
+                } else {
+                    *verdict == Verdict::Exact
+                };
+                assert!(
+                    expected,
+                    "nullable={nullable} pass_inside={pass_inside}: {verdicts:?}"
+                );
+            }
+        }
     }
 }

@@ -162,6 +162,14 @@ pub async fn run_convergence_with_source_ddl_allowing(
                         })?;
                 run.refusals.push((event.clone(), seen));
             }
+            // A collation decides only what a drain computes: drain the
+            // window under it, with no pass, before it's changed back.
+            if event.action.drains_before_close() {
+                backend
+                    .quiesce()
+                    .await
+                    .map_err(|e| fired(format!("drain the window: {e:?}")))?;
+            }
             execute(backend, &statements.closes).await.map_err(fired)?;
             if writer {
                 backend
@@ -402,6 +410,53 @@ impl Statements {
                         Vec::new()
                     },
                 )
+            }
+            SourceDdl::FlipNotNull { column, .. } => {
+                let rows = passes
+                    .query(
+                        "select attnotnull from pg_attribute \
+                         where attrelid = $1::text::regclass and attname = $2 \
+                         and not attisdropped",
+                        &[&table, column],
+                    )
+                    .await?;
+                let not_null: bool = rows
+                    .first()
+                    .ok_or_else(|| format!("{table} has no column {column}"))?
+                    .get(0);
+                let alter =
+                    |how: &str| format!("ALTER TABLE {table} ALTER COLUMN {} {how}", quote(column));
+                let (open, close) = if not_null {
+                    ("DROP NOT NULL", "SET NOT NULL")
+                } else {
+                    ("SET NOT NULL", "DROP NOT NULL")
+                };
+                (vec![alter(open)], vec![alter(close)])
+            }
+            SourceDdl::SetDefault { column, rewrite } => {
+                let alter =
+                    |how: &str| format!("ALTER TABLE {table} ALTER COLUMN {} {how}", quote(column));
+                let mut opens = vec![alter("SET DEFAULT 7")];
+                if *rewrite {
+                    opens.push(format!("VACUUM FULL {table}"));
+                }
+                (opens, vec![alter("DROP DEFAULT")])
+            }
+            SourceDdl::Collate { column, collation } => {
+                let ty = column_type(passes, &table, column).await?;
+                let collate = |to: &str| {
+                    format!(
+                        "ALTER TABLE {table} ALTER COLUMN {} TYPE {ty} COLLATE {to}",
+                        quote(column)
+                    )
+                };
+                let opens = collation
+                    .create()
+                    .map(str::to_string)
+                    .into_iter()
+                    .chain([collate(collation.sql())])
+                    .collect();
+                (opens, vec![collate("\"default\"")])
             }
             other => unreachable!("{other:?} is a privilege change"),
         };

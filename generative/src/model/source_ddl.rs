@@ -126,6 +126,31 @@ pub enum SourceDdl {
     /// its expression replaced (`SET EXPRESSION AS (pk * 3)`). The pass
     /// re-reads the table for each.
     GeneratedColumn { column: String },
+    /// `column`'s `NOT NULL` flipped when the event fires (set where the
+    /// column can hold `NULL`, dropped where it can't) and flipped back at
+    /// its close. The generator takes a column no op writes `NULL` to.
+    /// `SET`/`DROP NOT NULL` moves only the column's catalog row, so every
+    /// reader stays exact. On a `KEY (…)` column (`key`) the same holds with
+    /// changes in flight, since the key's encoding is recorded with the key
+    /// (`docs/staging-and-claiming/capture-drift.md`), except that a key
+    /// column that can hold `NULL` under a `NULLS DISTINCT` index no longer
+    /// backs the key: a pass that sees it pauses the readers.
+    FlipNotNull { column: String, key: bool },
+    /// `ALTER COLUMN column SET DEFAULT 7` when the event fires, and the
+    /// table rewritten by `VACUUM FULL` beside it when `rewrite`; `DROP
+    /// DEFAULT` at its close. No value changes, and a rewrite with the
+    /// column's default changed beside it isn't a same-type rewrite, so
+    /// every reader stays exact.
+    SetDefault { column: String, rewrite: bool },
+    /// `column`, a `text` column, given `collation` when the event fires
+    /// and the database's default collation again at its close, the
+    /// window's changes drained in between
+    /// ([`SourceDdl::drains_before_close`]). The type is unchanged and
+    /// nothing is rewritten.
+    Collate {
+        column: String,
+        collation: Collation,
+    },
     /// Every capture trigger on the table disabled by name when the event
     /// fires and enabled again (`ENABLE ALWAYS`, as Trellis installs them)
     /// at its close, so the window's writes are never captured. The capture
@@ -188,6 +213,9 @@ impl SourceDdl {
                 | SourceDdl::SwapColumnNames { .. }
                 | SourceDdl::ShadowColumn { .. }
                 | SourceDdl::GeneratedColumn { .. }
+                | SourceDdl::FlipNotNull { .. }
+                | SourceDdl::SetDefault { .. }
+                | SourceDdl::Collate { .. }
         ) || self.privilege()
     }
 
@@ -201,6 +229,13 @@ impl SourceDdl {
                 | SourceDdl::DropColumn { .. }
                 | SourceDdl::GeneratedColumn { .. }
         )
+    }
+
+    /// Whether the run drains the window's changes before the closing
+    /// statements, with no pass: a collation changes only what a drain
+    /// computes, so without it the window could drain after the close.
+    pub fn drains_before_close(&self) -> bool {
+        matches!(self, SourceDdl::Collate { .. })
     }
 
     /// Whether this is a privilege or ownership change (#2182): every one
@@ -272,6 +307,18 @@ impl SourceDdl {
             SourceDdl::ShadowColumn { .. } => "shadow_column",
             SourceDdl::GeneratedColumn { .. } => "generated_column",
             SourceDdl::Retype { using, shape, .. } => shape.kind(*using),
+            SourceDdl::FlipNotNull { key: false, .. } => "flip_not_null",
+            SourceDdl::FlipNotNull { key: true, .. } => "flip_key_not_null",
+            SourceDdl::SetDefault { rewrite: false, .. } => "set_default",
+            SourceDdl::SetDefault { rewrite: true, .. } => "set_default_beside_vacuum",
+            SourceDdl::Collate {
+                collation: Collation::C,
+                ..
+            } => "collate_c",
+            SourceDdl::Collate {
+                collation: Collation::CaseInsensitive,
+                ..
+            } => "collate_nondeterministic",
             SourceDdl::OwnerToHeir => "owner_to_heir",
             SourceDdl::OwnerToOther => "owner_to_other",
             SourceDdl::RevokeSelect => "revoke_select",
@@ -329,6 +376,16 @@ impl SourceDdlEvent {
             )
         ) {
             return vec![Gap::ColumnNameSwap];
+        }
+        // The pass doesn't see a read column's collation change, pass or no
+        // pass: the rows computed under it keep its comparisons after the
+        // close changes it back.
+        if let SourceDdl::Collate {
+            collation: Collation::CaseInsensitive,
+            ..
+        } = &self.action
+        {
+            return vec![Gap::NondeterministicCollation];
         }
         let column = match (&self.action, self.pass_inside) {
             (SourceDdl::RewriteBesideDefault { column }, false) => column,
@@ -448,6 +505,38 @@ impl SqlType {
             SqlType::Numeric { .. } | SqlType::NumericFree => ValueType::Numeric,
             SqlType::Int4 => ValueType::Integer(IntWidth::Int4),
             SqlType::Int8 => ValueType::Integer(IntWidth::Int8),
+        }
+    }
+}
+
+/// The collation a [`SourceDdl::Collate`] gives a `text` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collation {
+    /// `"C"`: deterministic, and orders by byte where the database's ICU
+    /// `en-US` doesn't (`'B' < 'b'`).
+    C,
+    /// An ICU collation that ignores case (`und-u-ks-level2`,
+    /// `deterministic = false`): `'OPEN' = 'open'`.
+    CaseInsensitive,
+}
+
+impl Collation {
+    /// The statements that create the collation where it isn't built in.
+    pub fn create(self) -> Option<&'static str> {
+        match self {
+            Collation::C => None,
+            Collation::CaseInsensitive => Some(
+                "CREATE COLLATION IF NOT EXISTS public.trellis_ci \
+                 (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+            ),
+        }
+    }
+
+    /// The collation as a `COLLATE` clause names it.
+    pub fn sql(self) -> &'static str {
+        match self {
+            Collation::C => "\"C\"",
+            Collation::CaseInsensitive => "public.trellis_ci",
         }
     }
 }

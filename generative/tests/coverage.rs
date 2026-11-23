@@ -2531,6 +2531,10 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 /// - `resume_refused`: a read column renamed away or dropped pauses its
 ///   readers, and their `RESUME` refuses while it is missing.
 ///
+/// `collate_nondeterministic` has no floor: its `nondeterministic-collation`
+/// gap needs a definition comparing the `text` column, which drawn
+/// definitions hardly ever have. A pin in `tests/source_ddl.rs` covers it.
+///
 /// Draws are deterministic. Only a draw with an event a floor still waits
 /// for is run, until every floor holds, so this costs a few dozen cases
 /// rather than a sweep.
