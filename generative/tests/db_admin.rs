@@ -161,8 +161,8 @@ proptest! {
 fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let mut runner = TestRunner::deterministic();
     let strategy = program_with_db_admin_plan();
-    let (mut checkpoint, mut fast, mut immediate, mut freeze, mut wrap) =
-        (false, false, false, false, false);
+    let (mut checkpoint, mut fast, mut immediate, mut freeze, mut wrap, mut lock) =
+        (false, false, false, false, false, false);
     let mut engine_steps = [false; 3];
     for _ in 0..300 {
         let (program, plan) = strategy
@@ -185,12 +185,14 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                     panic!("a plan for a cluster without a fake clock drew {event:?}")
                 }
                 DbAdminAction::StepEngineClock(step) => engine_steps[*step as usize] = true,
+                DbAdminAction::LockTargets => lock = true,
             }
         }
     }
     assert!(
-        checkpoint && fast && immediate && freeze && wrap,
-        "checkpoint={checkpoint} fast={fast} immediate={immediate} freeze={freeze} wrap={wrap}"
+        checkpoint && fast && immediate && freeze && wrap && lock,
+        "checkpoint={checkpoint} fast={fast} immediate={immediate} freeze={freeze} wrap={wrap} \
+         lock={lock}"
     );
     assert_eq!(
         engine_steps, [true; 3],
@@ -340,6 +342,41 @@ async fn engine_clock_steps_compose_with_restarts() {
     run(&cluster, &one_to_one_and_aggregate_program(), &plan)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// A lock on the targets holds the first seed's drain, claim in hand, for
+/// longer than the reclaim TTL, and the engine's clock steps back twenty
+/// seconds while it waits. The heartbeat keeps the live claim fresh on real
+/// time, its age stays under the reclaim TTL, and every op converges. The
+/// heartbeat's ticks must have seen the step with the claim registered.
+///
+/// With the `heartbeat_on_engine_clock` plant armed
+/// (`TRELLIS_TEST_PLANT=heartbeat_on_engine_clock`), the heartbeat stops for
+/// twenty seconds, the claim goes a TTL unrefreshed, and this fails with
+/// `RunError::LiveClaimExpired`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_claim_outlives_an_engine_clock_step_back() {
+    let reach = || {
+        trellis::dev::plant::reached()
+            .into_iter()
+            .find(|(site, _)| *site == "heartbeat_on_engine_clock")
+            .map_or(0, |(_, n)| n)
+    };
+    let cluster = TestCluster::start();
+    let back = DbAdminAction::StepEngineClock(EngineClockStep::BackSeconds);
+    let plan = plan(&[
+        (1, DbAdminAction::LockTargets),
+        (1, back.clone()),
+        (1, back),
+    ]);
+    let before = reach();
+    run(&cluster, &one_to_one_and_aggregate_program(), &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        reach() > before,
+        "the heartbeat never ticked early on the stepped clock with a claim registered"
+    );
 }
 
 /// The cluster's transaction ids aged past the 32-bit epoch boundary with

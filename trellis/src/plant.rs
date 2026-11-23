@@ -1025,7 +1025,7 @@ pub enum Plant {
     /// Pinned by `staging`'s `sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows`.
     /// Only the `db_admin` property's xid-aging action crosses the
     /// boundary, so no planted-bug sweep tier gates it
-    /// (`generative::plant_sweep`'s `PlantPath::XidEpoch`).
+    /// (`generative::plant_sweep`'s `PlantPath::DbAdmin`).
     FenceXid32,
     /// #2126 (`null_key_as_empty`): capture renders a nullable `KEY (...)`
     /// column's part of the ring key as its bare text
@@ -1039,6 +1039,18 @@ pub enum Plant {
     /// `a_null_key_is_a_row_of_its_own_through_every_write`), and gated by
     /// the concurrent tier's `source_key` sweep (#2171).
     NullKeyAsEmpty,
+    /// #2262 (`heartbeat_on_engine_clock`): the heartbeat daemon
+    /// (`staging::liveness`'s `run_daemon`) paces its ticks on the engine's
+    /// clock instead of its real-time ticker, skipping a tick that comes
+    /// less than half an interval after the last one it let through by that
+    /// clock. A clock stepped back then stops refreshes until it catches up,
+    /// and the stale-claim sweep reclaims a live worker's claim. Fires on
+    /// each skipped tick with a claim registered.
+    ///
+    /// Pinned by `generative`'s `db_admin.rs`
+    /// `a_live_claim_outlives_an_engine_clock_step_back`. Only the `db_admin`
+    /// property steps the engine clock (`PlantPath::DbAdmin`).
+    HeartbeatOnEngineClock,
     /// #2184 (`capture_skip_trigger_state`): the capture audit
     /// (`capture::triggers`'s `findings`) doesn't read a trigger's state: a
     /// trigger that is disabled, or whose row changed under its recorded oid
@@ -1155,6 +1167,7 @@ impl Plant {
         Plant::FieldReleaseBeforeWiden,
         Plant::FenceXid32,
         Plant::NullKeyAsEmpty,
+        Plant::HeartbeatOnEngineClock,
         Plant::CaptureSkipTriggerState,
     ];
 
@@ -1260,6 +1273,7 @@ impl Plant {
 
             Plant::FenceXid32 => "fence_xid32",
             Plant::NullKeyAsEmpty => "null_key_as_empty",
+            Plant::HeartbeatOnEngineClock => "heartbeat_on_engine_clock",
             Plant::CaptureSkipTriggerState => "capture_skip_trigger_state",
         }
     }

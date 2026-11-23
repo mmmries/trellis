@@ -14,13 +14,15 @@
 //! `def_install_after_op`, `restart_after_ops` and `scale_out_after_ops` are
 //! not honoured here, the same as in the noise runner.
 
+use std::time::Duration;
+
 use testkit::XID_PAGE;
 use trellis::dev::pool::Pool;
 
 use crate::backend::{
     Backend, ClusterControl, ManualBackend, SERVER_STOP_RECLAIM_TTL, await_pool_usable,
 };
-use crate::model::{DbAdminAction, DbAdminPlan, Program};
+use crate::model::{DbAdminAction, DbAdminPlan, LOCK_TARGETS_HOLD, Program};
 
 use super::pause::RunKind;
 use super::{Outcome, RunError, apply_and_check_outcome, quiesce_snapshot_and_check};
@@ -75,9 +77,12 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
             .map(|e| &e.action)
             .collect();
 
+        let reclaimed_before = engine_clock.claims_reclaimed();
         apply_and_check_outcome(backend, op_index, op, false).await?;
 
-        for action in events {
+        let mut holds = Vec::new();
+        let ttl = SERVER_STOP_RECLAIM_TTL;
+        for &action in &events {
             match action {
                 DbAdminAction::Checkpoint => {
                     backend
@@ -105,6 +110,19 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
                     cluster.step_clock(clock_offset);
                 }
                 DbAdminAction::StepEngineClock(step) => engine_clock.step(step.seconds()),
+                DbAdminAction::LockTargets => holds.push(
+                    lock_targets(backend, program)
+                        .await
+                        .map_err(|e| admin_error(op_index, action, e))?,
+                ),
+            }
+        }
+        // The oldest a claim stood while a hold kept its page waiting. A
+        // restart at the same op ends a hold early, which is no failure.
+        let mut oldest_claim = None;
+        for hold in holds {
+            if let Ok(Some(age)) = hold.await {
+                oldest_claim = oldest_claim.max(Some(age));
             }
         }
 
@@ -118,10 +136,102 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
             RunKind::DbAdmin,
         )
         .await?;
+
+        // No TTL expires a live process: past a quiesce, every claim the
+        // sweeps took was one a stop stranded or a server step aged, and no
+        // claim a hold kept waiting went a TTL without a refresh.
+        let reclaimed = engine_clock.claims_reclaimed() - reclaimed_before;
+        let expired = oldest_claim.filter(|age| *age > ttl);
+        if (reclaimed > 0 || expired.is_some()) && !events.iter().any(|a| a.may_reclaim_claims()) {
+            return Err(RunError::LiveClaimExpired {
+                op_index,
+                reclaimed,
+                oldest_claim: expired,
+                actions: events.into_iter().cloned().collect(),
+            });
+        }
     }
 
     Ok(Outcome::Ran)
 }
+
+/// Takes `ACCESS EXCLUSIVE` locks on every target of `program` on a session
+/// of the operator's own and returns the task holding them for
+/// [`LOCK_TARGETS_HOLD`] ([`DbAdminAction::LockTargets`]). While it holds
+/// them it reads how long the oldest claim has gone unrefreshed, and returns
+/// the most it saw (`None` if it never read one).
+async fn lock_targets(
+    backend: &ManualBackend,
+    program: &Program,
+) -> Result<tokio::task::JoinHandle<Option<Duration>>, tokio_postgres::Error> {
+    let targets: Vec<String> = program
+        .defs
+        .iter()
+        .map(|def| backend.qualified_target(&def.target))
+        .collect();
+    if targets.is_empty() {
+        return Ok(tokio::spawn(async { None }));
+    }
+    let oldest_claim = format!(
+        "select extract(epoch from clock_timestamp() - min(claimed_at))::float8 \
+         from {}",
+        backend.qualified_trellis_table("seg_claims")
+    );
+    let (admin, connection) =
+        tokio_postgres::connect(&backend.roles().admin, tokio_postgres::NoTls).await?;
+    let connection = tokio::spawn(connection);
+    lock_all(&admin, &targets).await?;
+    Ok(tokio::spawn(async move {
+        let until = tokio::time::Instant::now() + LOCK_TARGETS_HOLD;
+        let mut oldest: Option<Duration> = None;
+        while tokio::time::Instant::now() < until {
+            tokio::time::sleep(CLAIM_AGE_POLL).await;
+            let Ok(row) = admin.query_one(&oldest_claim, &[]).await else {
+                break;
+            };
+            if let Some(age) = row.get::<_, Option<f64>>(0) {
+                oldest = oldest.max(Some(Duration::from_secs_f64(age.max(0.0))));
+            }
+        }
+        let _ = admin.batch_execute("commit").await;
+        drop(admin);
+        let _ = connection.await;
+        oldest
+    }))
+}
+
+/// Opens a transaction on `admin` holding `ACCESS EXCLUSIVE` on every one of
+/// `tables`. A drain that wrote one of them and then reaches for one this
+/// already holds deadlocks with it, and Postgres aborts whichever waited
+/// first: this lock, when the drain comes within `deadlock_timeout`. An
+/// operator's `LOCK` would retry, so this does too.
+async fn lock_all(
+    admin: &tokio_postgres::Client,
+    tables: &[String],
+) -> Result<(), tokio_postgres::Error> {
+    const ATTEMPTS: usize = 10;
+    let lock = format!(
+        "begin; lock table {} in access exclusive mode",
+        tables.join(", ")
+    );
+    let mut attempt = 1;
+    loop {
+        match admin.batch_execute(&lock).await {
+            Err(e)
+                if attempt < ATTEMPTS
+                    && e.code()
+                        == Some(&tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED) =>
+            {
+                admin.batch_execute("rollback").await?;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// How often a [`lock_targets`] hold reads the oldest claim's age.
+const CLAIM_AGE_POLL: Duration = Duration::from_millis(250);
 
 /// Reconnects the backend's raw session and waits until `pool` works again
 /// after the server restarted under them.
@@ -145,5 +255,83 @@ fn admin_error(op_index: usize, action: &DbAdminAction, error: impl std::fmt::De
         op_index,
         action: action.clone(),
         error: format!("{error:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::lock_all;
+
+    async fn session(dsn: &str) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    /// A writer holding `b` reaches for `a` after the lock took `a` and
+    /// queued on `b`: a deadlock whose victim is the lock (the writer's
+    /// `deadlock_timeout` is long, so the lock's check finds the cycle
+    /// first). The lock retries and ends up holding both.
+    #[tokio::test]
+    async fn the_lock_retries_a_deadlock_with_a_writer() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let setup = session(db.dsn()).await;
+        setup
+            .batch_execute("create table a (k int); create table b (k int)")
+            .await
+            .expect("tables");
+
+        let writer = session(db.dsn()).await;
+        writer
+            .batch_execute("set deadlock_timeout = '60s'; begin; insert into b values (1)")
+            .await
+            .expect("writer holds b");
+        let admin = session(db.dsn()).await;
+        let tables = vec!["a".to_string(), "b".to_string()];
+        let locking = tokio::spawn(async move {
+            let result = lock_all(&admin, &tables).await;
+            (admin, result)
+        });
+        // The lock holds `a` and waits on `b`.
+        loop {
+            let waiting: bool = setup
+                .query_one(
+                    "select exists (select 1 from pg_locks l join pg_class c on c.oid = l.relation \
+                     where c.relname = 'b' and l.mode = 'AccessExclusiveLock' and not l.granted)",
+                    &[],
+                )
+                .await
+                .expect("pg_locks")
+                .get(0);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Granted once the lock gives up `a` as the deadlock's victim.
+        writer
+            .batch_execute("insert into a values (1); commit")
+            .await
+            .expect("writer takes a");
+
+        let (admin, result) = locking.await.expect("lock task");
+        result.expect("the lock retried its deadlock");
+        let held: i64 = admin
+            .query_one(
+                "select count(*) from pg_locks where pid = pg_backend_pid() \
+                 and mode = 'AccessExclusiveLock' and locktype = 'relation'",
+                &[],
+            )
+            .await
+            .expect("own locks")
+            .get(0);
+        assert_eq!(held, 2, "the lock holds both tables");
     }
 }

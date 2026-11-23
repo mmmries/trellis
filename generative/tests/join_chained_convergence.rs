@@ -364,8 +364,8 @@ fn chained_sweep_tier() -> SweepTier {
     ))
     .collect();
     not_gated.extend(not_on_path(
-        &[PlantPath::XidEpoch],
-        generative::plant_sweep::NO_XID_EPOCH,
+        &[PlantPath::DbAdmin],
+        generative::plant_sweep::NO_DB_ADMIN,
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::SourceDdl],

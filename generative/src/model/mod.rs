@@ -830,6 +830,38 @@ pub enum DbAdminAction {
     /// (a regressed `Instant`) puts each off by the step. Needs no fake-clock
     /// cluster.
     StepEngineClock(EngineClockStep),
+    /// Holds an `ACCESS EXCLUSIVE` lock on every target for
+    /// [`LOCK_TARGETS_HOLD`], as a `VACUUM FULL`, `CLUSTER` or slow migration
+    /// of them does, taken after the anchor op is applied. The op's other
+    /// events fire while it is held, and the run waits it out before the
+    /// op's quiesce. A drain that reaches a target waits on the lock holding
+    /// its claim, longer than the run's reclaim TTL, so the heartbeat must
+    /// keep the claim alive the whole time.
+    LockTargets,
+}
+
+/// How long [`DbAdminAction::LockTargets`] holds its locks: past the
+/// run's reclaim TTL (`crate::backend::SERVER_STOP_RECLAIM_TTL`), inside
+/// the engine's lock timeout and the quiesce's no-progress budget.
+pub const LOCK_TARGETS_HOLD: std::time::Duration = std::time::Duration::from_secs(15);
+
+impl DbAdminAction {
+    /// Whether the action can legitimately leave a claim a reclaim TTL old
+    /// with its worker alive. A server stop (a restart, or the stops an xid
+    /// wrap makes) strands the claims of the pages it cut off, and a forward
+    /// step of the server's clock ages every claim at once. No other action
+    /// may: the run fails when a claim is reclaimed at an op with none of
+    /// these.
+    pub fn may_reclaim_claims(&self) -> bool {
+        match self {
+            DbAdminAction::RestartPostgres(_) | DbAdminAction::WrapXids { .. } => true,
+            DbAdminAction::StepClock(step) => step.seconds() > 0,
+            DbAdminAction::Checkpoint
+            | DbAdminAction::VacuumFreeze
+            | DbAdminAction::StepEngineClock(_)
+            | DbAdminAction::LockTargets => false,
+        }
+    }
 }
 
 /// One [`DbAdminAction::StepEngineClock`].

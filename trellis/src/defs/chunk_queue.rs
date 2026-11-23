@@ -559,6 +559,8 @@ pub async fn reclaim_stale_chunks(
     let n = rows.len() as u64;
     free_or_discard_claims(&txn, &rows).await?;
     txn.commit().await?;
+    #[cfg(any(test, feature = "test-util"))]
+    crate::clock::note_claims_reclaimed(n);
     Ok(n)
 }
 

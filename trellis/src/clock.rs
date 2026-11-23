@@ -105,11 +105,21 @@ impl Inherit {
 #[cfg(any(test, feature = "test-util"))]
 pub use stepped::{EngineClock, Entered};
 
+/// Counts `n` claims the engine's stale-claim sweeps reclaimed against the
+/// current thread's [`EngineClock`], if it carries one
+/// ([`EngineClock::claims_reclaimed`]).
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn note_claims_reclaimed(n: u64) {
+    if let Some(clock) = stepped::current() {
+        clock.note_claims_reclaimed(n);
+    }
+}
+
 #[cfg(any(test, feature = "test-util"))]
 mod stepped {
     use std::cell::RefCell;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     thread_local! {
@@ -118,9 +128,14 @@ mod stepped {
 
     /// A steppable engine clock: an offset from real time, shared by every
     /// thread that carries it. **Test-only.** See the module doc.
+    ///
+    /// It also counts the claims the engine carrying it reclaims as stale
+    /// ([`Self::claims_reclaimed`]), so a test that steps it can tell a TTL
+    /// expiring a live worker's claim from a slow recovery that converges.
     #[derive(Clone, Debug, Default)]
     pub struct EngineClock {
         offset_nanos: Arc<AtomicI64>,
+        claims_reclaimed: Arc<AtomicU64>,
     }
 
     impl EngineClock {
@@ -139,6 +154,17 @@ mod stepped {
         /// How far the clock stands from real time, in seconds.
         pub fn offset_seconds(&self) -> i64 {
             self.offset_nanos.load(Ordering::SeqCst) / 1_000_000_000
+        }
+
+        /// How many segment and build-chunk claims the stale-claim sweeps
+        /// of the engines carrying this clock have reclaimed so far
+        /// (`staging::reclaim_stale`, `chunk_queue::reclaim_stale_chunks`).
+        pub fn claims_reclaimed(&self) -> u64 {
+            self.claims_reclaimed.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn note_claims_reclaimed(&self, n: u64) {
+            self.claims_reclaimed.fetch_add(n, Ordering::SeqCst);
         }
 
         /// Puts this clock on the current thread until the guard drops, so a

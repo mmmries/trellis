@@ -701,6 +701,15 @@ impl ManualBackend {
         &self.roles
     }
 
+    /// One of the engine's own tables, `table`, schema-qualified.
+    pub fn qualified_trellis_table(&self, table: &str) -> String {
+        format!(
+            "{}.{}",
+            quote_ident(self.config.schema()),
+            quote_ident(table)
+        )
+    }
+
     /// The schema this backend's targets are created in.
     pub fn target_schema(&self) -> &str {
         &self.target_schema

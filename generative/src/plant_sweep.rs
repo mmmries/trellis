@@ -121,13 +121,15 @@ pub enum PlantPath {
     /// Only the held-key tier's isolation draw makes such a page. A plant
     /// here can stop any reader of the page, whatever its key space.
     Isolation,
-    /// The drain's transaction-id comparisons past the first 32-bit epoch.
-    /// Only the `db_admin` property's xid-aging action
-    /// (`crate::model::DbAdminAction::WrapXids`) crosses the boundary, and
-    /// it is no planted-bug sweep tier, so no tier gates these: every
-    /// tier lists them in its `not_gated` with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
-    /// and `db_admin.rs`'s wrap pin gate them.
-    XidEpoch,
+    /// A path only the `db_admin` property's actions reach: the drain's
+    /// transaction-id comparisons past the first 32-bit epoch
+    /// (`crate::model::DbAdminAction::WrapXids`), and the heartbeat's pacing
+    /// under a stepped engine clock
+    /// (`crate::model::DbAdminAction::StepEngineClock`). That property is no
+    /// planted-bug sweep tier, so no tier gates these: every tier lists them
+    /// in its `not_gated` with [`NO_DB_ADMIN`], and the pins it names gate
+    /// them.
+    DbAdmin,
     /// The capture audit's read of a capture trigger's state (disabled, or
     /// altered by a disable and an enable). Only the source-DDL property
     /// (`tests/source_ddl.rs`) disables a capture trigger, and it is no
@@ -140,11 +142,12 @@ pub enum PlantPath {
 pub const NO_SOURCE_DDL: &str = "no sweep tier disables a capture trigger; the source_ddl \
      property does, and its capture_disabled_* pins gate it";
 
-/// Why no sweep tier gates a [`PlantPath::XidEpoch`] plant.
-pub const NO_XID_EPOCH: &str = "no sweep tier crosses the 32-bit xid epoch; the db_admin \
-     property's wrap action does, and staging's \
+/// Why no sweep tier gates a [`PlantPath::DbAdmin`] plant.
+pub const NO_DB_ADMIN: &str = "only the db_admin property's actions reach it (xid aging, engine \
+     clock steps) and it is no sweep tier; staging's \
      sealing::a_batch_fenced_past_the_epoch_boundary_reads_its_rows and db_admin.rs's \
-     a_wrap_across_the_epoch_boundary_with_work_in_flight_converges pin it";
+     a_wrap_across_the_epoch_boundary_with_work_in_flight_converges and \
+     a_live_claim_outlives_an_engine_clock_step_back pin them";
 
 /// The path `plant` breaks.
 pub fn plant_path(plant: Plant) -> PlantPath {
@@ -245,7 +248,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::StarReadsFirstOnly => PlantPath::OneToOneJoin,
         Plant::CaptureSlotFromSnapshot | Plant::CaptureSkipNestedReread => PlantPath::Capture,
         Plant::IsolationPausesEveryReader => PlantPath::Isolation,
-        Plant::FenceXid32 => PlantPath::XidEpoch,
+        Plant::FenceXid32 | Plant::HeartbeatOnEngineClock => PlantPath::DbAdmin,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
         Plant::CaptureSkipTriggerState => PlantPath::SourceDdl,
     }
@@ -269,8 +272,8 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         // A reader of a target, a capture's, a failing page's or a keyed source can be
         // of any kind.
         PlantPath::Chain | PlantPath::Capture | PlantPath::Isolation | PlantPath::SourceKey => true,
-        // Every target drains through the fenced read.
-        PlantPath::XidEpoch | PlantPath::SourceDdl => true,
+        // Every target drains through the fenced read and holds claims.
+        PlantPath::DbAdmin | PlantPath::SourceDdl => true,
     }
 }
 
@@ -1054,7 +1057,7 @@ mod tests {
                 PlantPath::Chain
                 | PlantPath::Capture
                 | PlantPath::Isolation
-                | PlantPath::XidEpoch
+                | PlantPath::DbAdmin
                 | PlantPath::SourceDdl
                 | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
