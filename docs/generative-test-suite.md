@@ -1163,10 +1163,15 @@ The actions, cheapest-first (every one below is built):
    three hours forward, five minutes back; steps add up) with libfaketime
    preloaded into Postgres. `now()` and every stored timestamp move, so
    heartbeats, claims and gauges compared against `now()` see the jump,
-   and no definition may pause for it. The engine reads no wall clock of its
-   own, and tokio's monotonic clock does not move. A steppable engine clock
-   is a later step. See [Wall-clock steps](#wall-clock-steps-libfaketime) for
-   the prerequisite.
+   and no definition may pause for it. See
+   [Wall-clock steps](#wall-clock-steps-libfaketime) for the prerequisite.
+   The engine reads no wall clock of its own: its schedules, backoffs,
+   budgets and graces read one monotonic clock (`trellis::clock`), which a
+   test can step under a running engine. `DbAdminAction::StepEngineClock`
+   steps it (three hours or two days forward, ten seconds back) with the
+   server's clock left alone, so every engine deadline comes due at once, or
+   late, while every server timestamp stays fresh. It needs no shim, so the
+   plain property draws it.
    Backup/restore is a cold file-level copy (`model::RestorePlan`, driven by
    `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
    back up right after op *k* with its change in flight, run to the end,

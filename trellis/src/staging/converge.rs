@@ -539,7 +539,8 @@ struct Deadline {
 
 impl Deadline {
     fn remaining(&self) -> Duration {
-        self.timeout.saturating_sub(crate::clock::elapsed(self.started))
+        self.timeout
+            .saturating_sub(crate::clock::elapsed(self.started))
     }
 
     fn passed(&self) -> bool {

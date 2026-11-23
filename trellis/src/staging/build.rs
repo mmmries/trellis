@@ -1575,7 +1575,10 @@ async fn run_rederive(
         txn.rollback().await?;
         return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
     }
-    metrics::record_build_statement(BuildStatement::ChunkSetup, crate::clock::elapsed(setup_started));
+    metrics::record_build_statement(
+        BuildStatement::ChunkSetup,
+        crate::clock::elapsed(setup_started),
+    );
     let keys = match &plan {
         ChunkPlan::Whole(plan) => {
             let outcome = one_to_one::run_chunk(&txn, plan, lo, hi)
@@ -1599,7 +1602,10 @@ async fn run_rederive(
     )
     .await?;
     txn.commit().await?;
-    metrics::record_build_statement(BuildStatement::ChunkCommit, crate::clock::elapsed(commit_started));
+    metrics::record_build_statement(
+        BuildStatement::ChunkCommit,
+        crate::clock::elapsed(commit_started),
+    );
     metrics::record_build_chunk(crate::clock::elapsed(started), keys as u64);
     try_complete(pool, chunk.definition_id).await?;
     Ok(())

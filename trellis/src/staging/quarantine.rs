@@ -1481,7 +1481,13 @@ pub async fn isolate_and_evict(
         skip_frozen,
     };
     let result = isolate_and_evict_probing(pool, at, folded, threshold, &mut stats).await;
-    log_isolation_finished(seg_seq, folded.len(), &stats, &result, crate::clock::elapsed(started));
+    log_isolation_finished(
+        seg_seq,
+        folded.len(),
+        &stats,
+        &result,
+        crate::clock::elapsed(started),
+    );
     result
 }
 

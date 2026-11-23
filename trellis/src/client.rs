@@ -1880,7 +1880,9 @@ impl Leader {
         }
         if !failed
             && crate::clock::now() >= self.next_reconcile
-            && self.backoff.due("reconcile_source_tables", crate::clock::now())
+            && self
+                .backoff
+                .due("reconcile_source_tables", crate::clock::now())
         {
             let reconciled =
                 reconcile_source_tables(c, &self.config.pool, &self.config.schema).await;
@@ -2749,7 +2751,13 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
                     .map_err(|err| err.to_string()),
                 Err(err) => Err(err.to_string()),
             };
-            drain_failures.failed(error, &seg_seqs, &released, &claimed_by, crate::clock::now());
+            drain_failures.failed(
+                error,
+                &seg_seqs,
+                &released,
+                &claimed_by,
+                crate::clock::now(),
+            );
         }
 
         for &seg_seq in &seg_seqs {

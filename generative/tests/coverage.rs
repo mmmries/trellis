@@ -1209,6 +1209,37 @@ fn db_admin_plans_draw_freezes_and_wraps_across_every_tail_band() {
     assert_eq!(bands, [true; 3], "tail bands drawn: {bands:?}");
 }
 
+/// The coverage floor for the `db_admin` property's engine clock steps:
+/// across 400 drawn plans, at least 10% step the engine's clock, and every
+/// step (hours and days forward, seconds back) is drawn.
+#[test]
+fn db_admin_plans_step_the_engine_clock_every_way() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|program| db_admin_plan_for(&program));
+    let samples = 400;
+    let mut stepping = 0;
+    let mut steps = [false; 3];
+    for _ in 0..samples {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let mut stepped = false;
+        for event in &plan.events {
+            if let DbAdminAction::StepEngineClock(step) = event.action {
+                steps[step as usize] = true;
+                stepped = true;
+            }
+        }
+        stepping += usize::from(stepped);
+    }
+    assert!(
+        stepping * 10 >= samples,
+        "{stepping} of {samples} plans step the engine clock"
+    );
+    assert_eq!(steps, [true; 3], "engine clock steps drawn: {steps:?}");
+}
+
 /// The coverage floor for the `db_admin` property's counter starts: across
 /// 400 drawn plans, at least 10% start the counters near `i32::MAX` and at
 /// least 10% near `i64::MAX`.

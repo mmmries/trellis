@@ -5164,7 +5164,11 @@ impl TransientRetry {
     /// How long ago this page first hit `lock_timeout`, starting the clock
     /// if this is the first time.
     fn lock_waited(&mut self) -> Duration {
-        crate::clock::elapsed(*self.first_lock_timeout.get_or_insert_with(crate::clock::now))
+        crate::clock::elapsed(
+            *self
+                .first_lock_timeout
+                .get_or_insert_with(crate::clock::now),
+        )
     }
 }
 

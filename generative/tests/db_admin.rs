@@ -18,7 +18,8 @@ use generative::generate::{
     db_admin_plan_for, db_admin_plan_with_clock_for, trivial_program,
 };
 use generative::model::{
-    ClockStep, CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, Op, Program, RestartMode,
+    ClockStep, CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, EngineClockStep, Op,
+    Program, RestartMode,
 };
 use generative::run::{RunError, run_convergence_with_db_admin};
 use proptest::prelude::*;
@@ -162,6 +163,7 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let strategy = program_with_db_admin_plan();
     let (mut checkpoint, mut fast, mut immediate, mut freeze, mut wrap) =
         (false, false, false, false, false);
+    let mut engine_steps = [false; 3];
     for _ in 0..300 {
         let (program, plan) = strategy
             .new_tree(&mut runner)
@@ -182,12 +184,17 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                 DbAdminAction::StepClock(_) => {
                     panic!("a plan for a cluster without a fake clock drew {event:?}")
                 }
+                DbAdminAction::StepEngineClock(step) => engine_steps[*step as usize] = true,
             }
         }
     }
     assert!(
         checkpoint && fast && immediate && freeze && wrap,
         "checkpoint={checkpoint} fast={fast} immediate={immediate} freeze={freeze} wrap={wrap}"
+    );
+    assert_eq!(
+        engine_steps, [true; 3],
+        "engine steps drawn: {engine_steps:?}"
     );
 }
 
@@ -277,6 +284,60 @@ async fn postgres_restarts_with_work_in_flight_converge() {
         (5, DbAdminAction::Checkpoint),
     ]);
     run(&cluster, &program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The engine's own clock jumps two days forward with the first seed in
+/// flight, back ten seconds after the third, and three hours forward after
+/// the delete: every deadline, schedule and grace the engine keeps comes
+/// due at once, then late. No definition pauses and every op converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_clock_steps_with_work_in_flight_converge() {
+    let cluster = TestCluster::start();
+    let plan = plan(&[
+        (
+            0,
+            DbAdminAction::StepEngineClock(EngineClockStep::ForwardDays),
+        ),
+        (
+            2,
+            DbAdminAction::StepEngineClock(EngineClockStep::BackSeconds),
+        ),
+        (
+            4,
+            DbAdminAction::StepEngineClock(EngineClockStep::ForwardHours),
+        ),
+    ]);
+    run(&cluster, &one_to_one_and_aggregate_program(), &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Engine clock steps around Postgres restarts: a step back just before a
+/// fast restart, two days forward while the leader is retaking its session
+/// after it, and three hours forward after a crash restart. The leader's
+/// lost-session schedule and every reconnect run on the stepped clock.
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_clock_steps_compose_with_restarts() {
+    let cluster = TestCluster::start();
+    let plan = plan(&[
+        (
+            0,
+            DbAdminAction::StepEngineClock(EngineClockStep::BackSeconds),
+        ),
+        (0, DbAdminAction::RestartPostgres(RestartMode::Fast)),
+        (
+            0,
+            DbAdminAction::StepEngineClock(EngineClockStep::ForwardDays),
+        ),
+        (3, DbAdminAction::RestartPostgres(RestartMode::Immediate)),
+        (
+            3,
+            DbAdminAction::StepEngineClock(EngineClockStep::ForwardHours),
+        ),
+    ]);
+    run(&cluster, &one_to_one_and_aggregate_program(), &plan)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
 }
@@ -584,8 +645,13 @@ fn drawn_clock_plans_cover_every_step() {
             if let DbAdminAction::StepClock(step) = event.action {
                 seen[step as usize] = true;
             }
-            // A step back never follows a stop at its op (see `ClockStep::BackMinutes`).
-            if event.action == DbAdminAction::StepClock(ClockStep::BackMinutes) {
+            // A step back never follows a stop at its op (see
+            // `ClockStep::BackMinutes`, `EngineClockStep::BackSeconds`).
+            if matches!(
+                event.action,
+                DbAdminAction::StepClock(ClockStep::BackMinutes)
+                    | DbAdminAction::StepEngineClock(EngineClockStep::BackSeconds)
+            ) {
                 let stopped_before = events[..i].iter().any(|e| {
                     e.op == event.op
                         && matches!(

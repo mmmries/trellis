@@ -22,7 +22,6 @@
 //! statement: a row re-inserted and applied between the read and the delete
 //! would be lost (#1481 H3).
 
-
 use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 

@@ -47,6 +47,10 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
     // A restart can strand a claim the engine then waits a reclaim TTL to
     // free (see `SERVER_STOP_RECLAIM_TTL`).
     backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
+    // The engine's own clock, which `StepEngineClock` steps. The harness's
+    // waits keep real time.
+    let engine_clock = trellis::dev::clock::EngineClock::new();
+    backend.set_engine_clock(engine_clock.clone());
     if let Some(limit) = plan.counters_near {
         // Before the install, while the ring is pristine and no engine runs:
         // the definitions, their builds and every later draw take ids past
@@ -100,6 +104,7 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
                     clock_offset += step.seconds();
                     cluster.step_clock(clock_offset);
                 }
+                DbAdminAction::StepEngineClock(step) => engine_clock.step(step.seconds()),
             }
         }
 
