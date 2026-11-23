@@ -180,12 +180,7 @@ async fn lock_targets(
     let (admin, connection) =
         tokio_postgres::connect(&backend.roles().admin, tokio_postgres::NoTls).await?;
     let connection = tokio::spawn(connection);
-    admin
-        .batch_execute(&format!(
-            "begin; lock table {} in access exclusive mode",
-            targets.join(", ")
-        ))
-        .await?;
+    lock_all(&admin, &targets).await?;
     Ok(tokio::spawn(async move {
         let until = tokio::time::Instant::now() + LOCK_TARGETS_HOLD;
         let mut oldest: Option<Duration> = None;
@@ -203,6 +198,36 @@ async fn lock_targets(
         let _ = connection.await;
         oldest
     }))
+}
+
+/// Opens a transaction on `admin` holding `ACCESS EXCLUSIVE` on every one of
+/// `tables`. A drain that wrote one of them and then reaches for one this
+/// already holds deadlocks with it, and Postgres aborts whichever waited
+/// first: this lock, when the drain comes within `deadlock_timeout`. An
+/// operator's `LOCK` would retry, so this does too.
+async fn lock_all(
+    admin: &tokio_postgres::Client,
+    tables: &[String],
+) -> Result<(), tokio_postgres::Error> {
+    const ATTEMPTS: usize = 10;
+    let lock = format!(
+        "begin; lock table {} in access exclusive mode",
+        tables.join(", ")
+    );
+    let mut attempt = 1;
+    loop {
+        match admin.batch_execute(&lock).await {
+            Err(e)
+                if attempt < ATTEMPTS
+                    && e.code()
+                        == Some(&tokio_postgres::error::SqlState::T_R_DEADLOCK_DETECTED) =>
+            {
+                admin.batch_execute("rollback").await?;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// How often a [`lock_targets`] hold reads the oldest claim's age.
@@ -230,5 +255,83 @@ fn admin_error(op_index: usize, action: &DbAdminAction, error: impl std::fmt::De
         op_index,
         action: action.clone(),
         error: format!("{error:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::lock_all;
+
+    async fn session(dsn: &str) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    /// A writer holding `b` reaches for `a` after the lock took `a` and
+    /// queued on `b`: a deadlock whose victim is the lock (the writer's
+    /// `deadlock_timeout` is long, so the lock's check finds the cycle
+    /// first). The lock retries and ends up holding both.
+    #[tokio::test]
+    async fn the_lock_retries_a_deadlock_with_a_writer() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let setup = session(db.dsn()).await;
+        setup
+            .batch_execute("create table a (k int); create table b (k int)")
+            .await
+            .expect("tables");
+
+        let writer = session(db.dsn()).await;
+        writer
+            .batch_execute("set deadlock_timeout = '60s'; begin; insert into b values (1)")
+            .await
+            .expect("writer holds b");
+        let admin = session(db.dsn()).await;
+        let tables = vec!["a".to_string(), "b".to_string()];
+        let locking = tokio::spawn(async move {
+            let result = lock_all(&admin, &tables).await;
+            (admin, result)
+        });
+        // The lock holds `a` and waits on `b`.
+        loop {
+            let waiting: bool = setup
+                .query_one(
+                    "select exists (select 1 from pg_locks l join pg_class c on c.oid = l.relation \
+                     where c.relname = 'b' and l.mode = 'AccessExclusiveLock' and not l.granted)",
+                    &[],
+                )
+                .await
+                .expect("pg_locks")
+                .get(0);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Granted once the lock gives up `a` as the deadlock's victim.
+        writer
+            .batch_execute("insert into a values (1); commit")
+            .await
+            .expect("writer takes a");
+
+        let (admin, result) = locking.await.expect("lock task");
+        result.expect("the lock retried its deadlock");
+        let held: i64 = admin
+            .query_one(
+                "select count(*) from pg_locks where pid = pg_backend_pid() \
+                 and mode = 'AccessExclusiveLock' and locktype = 'relation'",
+                &[],
+            )
+            .await
+            .expect("own locks")
+            .get(0);
+        assert_eq!(held, 2, "the lock holds both tables");
     }
 }
