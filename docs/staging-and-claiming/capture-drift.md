@@ -173,10 +173,11 @@ column is `text`), and a change between deterministic collations (byte
 equality is unchanged, even across a join pair; define and a resume still
 require a pair's collations to match; a `JOIN`'s hidden tables and target keep
 the collation they were created with, and a statement that meets two
-collations compares under one, so a rebuild and a resume still run). A change
-to a column read as a field that isn't a pure widening, a narrowing included, is
-the next section's: it rebuilds the readers, or pauses the ones it leaves
-invalid.
+collations compares under one, so a rebuild and a resume still run). Any
+change that isn't a pure widening, a key's narrowing or scale change included,
+is still the next section's, since a `USING` may have changed the values: it
+rebuilds the readers, or, for a column read as a field, pauses the ones it
+leaves invalid.
 
 A resume re-validates the definition as define would and refuses while the
 first two hold, naming the columns and what to change. Otherwise, if any
@@ -292,9 +293,10 @@ The response follows whether the definitions are still valid as written
   refusal and the remedies: change the column back, then `RESUME`, or
   `DROP TRANSFORM` and define it again. `RESUME`
   re-validates, re-types and rebuilds, or refuses while define would. A key
-  column's type change is left to the previous section's checks, which
-  re-validate the definition too and name the refusal the same way; a key
-  column dropped and re-added rebuilds.
+  column's type change pauses only by the previous section's checks, which
+  re-validate the definition too and name the refusal the same way; one they
+  leave unpaused rebuilds unless it is a pure widening, and a key column
+  dropped and re-added rebuilds.
 - **Floor stamped again.** A reader of a changed or widened column that stays
   valid has its floor ([ADR-0024](../decisions/0024-compatibility-floors-and-rollback.md))
   stamped again over the new types, in the transaction that writes the

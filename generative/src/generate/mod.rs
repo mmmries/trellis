@@ -2142,7 +2142,7 @@ pub fn add_burst_actions(
 
 /// Every source column `def` reads: its fields', its `WHERE`'s and its
 /// `GROUP BY`'s.
-fn columns_read(def: &TransformDef) -> Vec<String> {
+pub(crate) fn columns_read(def: &TransformDef) -> Vec<String> {
     let mut out = Vec::new();
     let mut add = |expr: &Expr| {
         expr.walk(&mut |e| match e {

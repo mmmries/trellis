@@ -130,7 +130,17 @@ pub enum PlantPath {
     /// in its `not_gated` with [`NO_DB_ADMIN`], and the pins it names gate
     /// them.
     DbAdmin,
+    /// The capture audit's read of a capture trigger's state (disabled, or
+    /// altered by a disable and an enable). Only the source-DDL property
+    /// (`tests/source_ddl.rs`) disables a capture trigger, and it is no
+    /// planted-bug sweep tier, so no tier gates these: every tier lists them
+    /// in its `not_gated` with [`NO_SOURCE_DDL`].
+    SourceDdl,
 }
+
+/// Why no sweep tier gates a [`PlantPath::SourceDdl`] plant.
+pub const NO_SOURCE_DDL: &str = "no sweep tier disables a capture trigger; the source_ddl \
+     property does, and its capture_disabled_* pins gate it";
 
 /// Why no sweep tier gates a [`PlantPath::DbAdmin`] plant.
 pub const NO_DB_ADMIN: &str = "only the db_admin property's actions reach it (xid aging, engine \
@@ -240,6 +250,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         Plant::IsolationPausesEveryReader => PlantPath::Isolation,
         Plant::FenceXid32 | Plant::HeartbeatOnEngineClock => PlantPath::DbAdmin,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
+        Plant::CaptureSkipTriggerState => PlantPath::SourceDdl,
     }
 }
 
@@ -262,7 +273,7 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         // of any kind.
         PlantPath::Chain | PlantPath::Capture | PlantPath::Isolation | PlantPath::SourceKey => true,
         // Every target drains through the fenced read and holds claims.
-        PlantPath::DbAdmin => true,
+        PlantPath::DbAdmin | PlantPath::SourceDdl => true,
     }
 }
 
@@ -1047,6 +1058,7 @@ mod tests {
                 | PlantPath::Capture
                 | PlantPath::Isolation
                 | PlantPath::DbAdmin
+                | PlantPath::SourceDdl
                 | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");

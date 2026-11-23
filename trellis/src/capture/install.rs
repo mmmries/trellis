@@ -215,8 +215,9 @@
 //! What is installed is read from the catalog: the triggers in
 //! `pg_trigger`, and each function's spec in its `COMMENT ON FUNCTION`
 //! ([`sql::comment_text`]). `pg_dump` carries both. [`installed`] reads them
-//! back, and also compares each function's source with what this build
-//! generates, so a function an older generator left behind is replaced.
+//! back, and also compares each function's source and `SET` clauses with
+//! what this build generates, so a function an older generator left behind
+//! is replaced.
 //!
 //! An install also records what it did, in the same transaction, so the
 //! capture pass can tell a change it made from one made under it: the
@@ -281,8 +282,8 @@ pub enum Installed {
     Absent,
     /// All five triggers exist, enabled `ALWAYS`, each calling its event's
     /// function, and all five functions' comments record `spec`. `current`
-    /// says whether every function's source is what this build generates for
-    /// `spec`.
+    /// says whether every function's source and settings are what this build
+    /// generates for `spec`.
     Complete { spec: CaptureSpec, current: bool },
     /// Some of the pieces exist and some don't, or don't agree: an install
     /// that a crash or a hand edit left incomplete. Each fault is one line
@@ -379,7 +380,8 @@ pub async fn installed(
                         where r.oid = pg_catalog.to_regclass($3) and r.relkind = 'p') \
                     then array({NODES_MISSING_CAPTURE}) end, \
                     exists (select 1 from pg_catalog.pg_class r \
-                        where r.oid = pg_catalog.to_regclass($3) and r.relkind = 'p') \
+                        where r.oid = pg_catalog.to_regclass($3) and r.relkind = 'p'), \
+                    coalesce(p.proconfig, '{{}}')::text[] \
              from unnest($2::text[], $4::text[]) with ordinality as e(function, trigger, ord) \
              left join pg_catalog.pg_proc p \
                on p.proname = e.function and p.pronargs = 0 \
@@ -438,7 +440,9 @@ pub async fn installed(
             match recorded {
                 Some(spec) => {
                     let source: String = row.get(1);
-                    current &= source == sql::function_source(schema, &spec, event);
+                    let config: Vec<String> = row.get(13);
+                    current &= source == sql::function_source(schema, &spec, event)
+                        && sql::normalized_config(&config) == sql::function_config(event);
                     specs.push(spec);
                 }
                 None => faults.push(format!(

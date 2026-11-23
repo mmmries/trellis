@@ -104,9 +104,11 @@
 //! the pass runs it after the logical-restore check, so a restored
 //! database's OIDs are never compared with the original's.
 //!
-//! The type check leaves alone a definition that uses the column as a
-//! key: `pause_readers_of_retyped` owns a key column's type. A key
-//! column dropped and re-added is the identity check's.
+//! A definition that uses the column as a key (its row key, a `GROUP BY` or
+//! `JOIN` column) is `pause_readers_of_retyped`'s to pause, which runs first.
+//! One it leaves unpaused rebuilds unless the change is a pure widening: a
+//! `USING` can change the key's values, and a narrowing that kept them looks
+//! the same. A key column dropped and re-added is the identity check's.
 //!
 //! # A type renamed
 //!
@@ -853,8 +855,13 @@ pub(crate) async fn check(
             )
             .await?;
         }
+        // The key capture keys the table by: a declared `KEY (...)`, else
+        // its primary key.
         let key = if found.changes.values().any(Change::retyped) {
-            crate::capture::columns::live_columns(&txn, table).await?.1
+            match crate::capture::columns::declared_key(catalog, table) {
+                Some(declared) => declared,
+                None => crate::capture::columns::live_columns(&txn, table).await?.1,
+            }
         } else {
             Vec::new()
         };
@@ -868,7 +875,10 @@ pub(crate) async fn check(
                 causes.insert(cause);
                 continue;
             }
-            let read_by = readers_of(catalog, table, &BTreeSet::from([column.clone()]), false);
+            // A key column is read by every reader of the table, which its
+            // fields may not name: a 1-1 or `JOIN` side's own row key.
+            let in_key = key.iter().any(|k| k == column);
+            let read_by = readers_of(catalog, table, &BTreeSet::from([column.clone()]), in_key);
             for reader in catalog
                 .definitions
                 .iter()
@@ -958,8 +968,8 @@ pub(crate) async fn check(
 }
 
 /// What `reader` needs for `change` to `column` of `table` (an identity or type change), by the
-/// validity rule: `None` when its key use of the column leaves a type
-/// change to `pause_readers_of_retyped`.
+/// validity rule: `None` when its key use of the column leaves a pure
+/// widening to `pause_readers_of_retyped`.
 #[allow(clippy::too_many_arguments)]
 async fn respond(
     txn: &tokio_postgres::Transaction<'_>,
@@ -983,8 +993,12 @@ async fn respond(
         .into_iter()
         .any(|(c, _)| c == column);
     if key_use {
-        // A key column's type is `pause_readers_of_retyped`'s.
-        return Ok(readded.then_some(Response::Rebuild));
+        // A key column's type is `pause_readers_of_retyped`'s, which ran
+        // first and pauses where the key may no longer be valid. One it
+        // left unpaused is re-read unless a pure widening kept every value
+        // (`USING` can change them, and a narrowing can't be told from one
+        // that kept them).
+        return Ok((!matches!(change, Change::Widened { .. })).then_some(Response::Rebuild));
     }
     let what = if readded {
         format!(

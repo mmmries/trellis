@@ -1224,7 +1224,8 @@ pub struct Shadow {
     pub before_capture: bool,
     pub fk: Option<FkAction>,
     /// The shadow row's values by column, each one the program writes to
-    /// that column of `table`. The key and `lnk` are the trigger's.
+    /// that column of `table` (`NULL` for a budgeted one, see
+    /// `generate::wiring`). The key and `lnk` are the trigger's.
     pub template: Vec<(String, Option<String>)>,
     /// A column of `table` and the two values the program writes to it
     /// that an update of the row flips its shadow's between.
@@ -1243,7 +1244,7 @@ pub struct Rewrite {
 }
 
 mod source_ddl;
-pub use source_ddl::{SourceDdl, SourceDdlEvent, SourceDdlPlan};
+pub use source_ddl::{RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType};
 
 #[cfg(test)]
 mod tests {

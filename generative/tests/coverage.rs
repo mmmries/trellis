@@ -2508,3 +2508,118 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
     }
     assert!(twins_live >= 50, "{twins_live} of 100");
 }
+
+/// #2184: the source-DDL tier's verdicts, counted per drawn action, and the
+/// floors on the ones that a green run could silently stop reaching. Every
+/// definition at the check after an event is judged `exact`,
+/// `resumed_exact`, `listed_gap` or `resume_refused`
+/// (`generative::run::judge::Verdict`); an action whose verdicts are all
+/// `exact` is coverage that proves nothing about the pause and rebuild
+/// paths.
+///
+/// - `listed_gap`: the register's `alter-type-rewrite` shapes, which
+///   `self_check` finds and `request_backfill` repairs: a same-type rewrite
+///   beside a `SET DEFAULT` inside one reconcile interval, and a widening
+///   that changes values. Only a draw the register lists on the server
+///   counts toward it (`SourceDdlEvent::listed_gaps`).
+/// - `resumed_exact`: disabling the capture triggers pauses the readers by
+///   the capture audit; a narrowing that changes the type a reader evaluates
+///   the column as, and a widening that outgrows a copy, pause them by the
+///   pass's type checks. Each `RESUME` makes them exact.
+///
+/// Draws are deterministic. Only a draw with an event a floor still waits
+/// for is run, until every floor holds, so this costs a few dozen cases
+/// rather than a sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn source_ddl_actions_reach_the_listed_gap_and_resumed_exact_verdicts() {
+    use generative::backend::{CaseDatabase, ManualBackend};
+    use generative::generate::source_ddl::source_ddl_plan_for;
+    use generative::model::Server;
+    use generative::run::run_convergence_with_source_ddl;
+    use std::collections::BTreeMap;
+    use trellis::Config;
+    use trellis::dev::pool::Pool;
+
+    const DRAWS: usize = 3000;
+    const MAX_RUNS: usize = 40;
+    /// The actions a floor counts, and the verdict one of them must reach.
+    const FLOORS: &[(&[&str], &str)] = &[
+        (&["rewrite_beside_default"], "listed_gap"),
+        (&["disable_capture_triggers"], "resumed_exact"),
+        (&["retype_widen_using"], "listed_gap"),
+        (&["retype_narrow", "retype_narrow_using"], "resumed_exact"),
+        (&["retype_outgrow", "retype_outgrow_using"], "resumed_exact"),
+    ];
+    let cluster = testkit::TestCluster::start();
+    let server = {
+        let db = CaseDatabase::provision(&cluster).await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect the probe");
+        tokio::spawn(connection);
+        Server::probe(&client).await.expect("probe the server")
+    };
+    let mut runner = TestRunner::deterministic();
+    let strategy = trivial_program().prop_flat_map(|program| {
+        let plan = source_ddl_plan_for(&program);
+        (proptest::strategy::Just(program), plan)
+    });
+    // Action kind, then verdict kind, to the number of definitions.
+    let mut tally: BTreeMap<(&'static str, &'static str), usize> = BTreeMap::new();
+    let holds = |tally: &BTreeMap<(&'static str, &'static str), usize>,
+                 (actions, verdict): &(&[&str], &str)| {
+        tally
+            .iter()
+            .any(|((a, v), n)| actions.contains(a) && v == verdict && *n > 0)
+    };
+    let mut runs = 0;
+    for _ in 0..DRAWS {
+        let waiting: Vec<_> = FLOORS.iter().filter(|f| !holds(&tally, f)).collect();
+        if runs == MAX_RUNS || waiting.is_empty() {
+            break;
+        }
+        let (program, plan) = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        // A listed gap only from an event the register lists on this
+        // server.
+        let wanted = plan.events.iter().any(|e| {
+            waiting.iter().any(|(actions, verdict)| {
+                actions.contains(&e.action.kind())
+                    && (*verdict != "listed_gap" || !e.listed_gaps(&program, server).is_empty())
+            })
+        });
+        if !wanted {
+            continue;
+        }
+        let db = CaseDatabase::provision(&cluster).await;
+        let mut backend = ManualBackend::connect_as(db.roles())
+            .await
+            .expect("connect manual backend");
+        let pool =
+            Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+        let run = run_convergence_with_source_ddl(&mut backend, &pool, &program, &plan)
+            .await
+            .unwrap_or_else(|err| panic!("{err:?}\n{program:#?}\n{plan:?}"));
+        runs += 1;
+        for (event, judged) in &run.checks {
+            let Some(event) = event else { continue };
+            for j in judged {
+                *tally
+                    .entry((event.action.kind(), j.verdict.kind()))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let report = format!("{runs} runs; verdicts per action:\n{tally:#?}");
+    eprintln!("{report}");
+    for floor in FLOORS {
+        assert!(
+            holds(&tally, floor),
+            "coverage floor failed: no {:?} reached {}:\n{report}",
+            floor.0,
+            floor.1
+        );
+    }
+}

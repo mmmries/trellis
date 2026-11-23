@@ -621,6 +621,9 @@ def summarize(start, segments, loadgen_segments, samples, probes, log_lines, ste
         for key, col in (("xmin_age_max", "xmin_age"), ("xmin_hold_s_max", "xmin_hold_s")):
             vals = [v for v in (num(x, col) for x in within) if v is not None]
             seg[key] = max(vals) if vals else None
+        settle = s + min(120.0, secs / 4)  # the drain of what the load before left, and autovacuum after it
+        vals = [v for v in (num(x, "xmin_hold_s") for x in within if x["epoch"] >= settle) if v is not None]
+        seg["xmin_hold_s_settled_max"] = max(vals) if vals else None
         vals = [v for v in (num(x, "idle_in_txn") for x in within) if v is not None]
         seg["idle_in_txn_max"] = max(vals) if vals else None
         if within:
@@ -631,7 +634,6 @@ def summarize(start, segments, loadgen_segments, samples, probes, log_lines, ste
         wal = [(x["epoch"], num(x, "wal_bytes")) for x in within if num(x, "wal_bytes") is not None]
         if len(wal) >= 2:
             seg["wal_bytes"] = wal[-1][1] - wal[0][1]
-            settle = s + min(120.0, secs / 4)
             settled = [w for w in wal if settle <= w[0] <= e - 2]
             if len(settled) >= 2 and settled[-1][0] - settled[0][0] >= 30:
                 span = settled[-1][0] - settled[0][0]
@@ -703,8 +705,60 @@ def metrics_lines(m):
     return lines, short
 
 
+# -- profile gates (#2189, 10b) -------------------------------------------------
+# Thresholds signed off on the issue (2026-11-21) at about 2x the 10a baselines.
+
+GATE_AFTER_IDLE_RATIO = 2.0  # first write after an idle, as a multiple of steady p50
+GATE_IDLE_WAL_MB_PER_HOUR = 6.5  # settled WAL rate of an idle segment
+GATE_XMIN_HOLD_SECS = 2.0  # settled backend_xmin hold of Trellis's sessions
+# Steps that hold the vacuum horizon back on purpose; a segment with one is exempt from the hold gate.
+HOLDS_XMIN_STEPS = ("long-txn", "pg-dump")
+
+
+def check_gates(m):
+    """Breaches of the profile thresholds in a metrics dict, as messages naming the metric and
+    segment. Empty for a run with no idle segment: those aren't profile runs. WARN and ERROR lines in an
+    idle segment that had a fault injected aren't gated."""
+    segs = m["segments"]
+    if not any(s["profile"] == "idle" for s in segs):
+        return []
+    out = []
+    p50 = m["steady_latency_p50"]
+    for a in m["after_idle"]:
+        ratio = a["latency"] / p50 if a["latency"] is not None and p50 else None  # unrounded, unlike a["ratio"]
+        if ratio is not None and ratio > GATE_AFTER_IDLE_RATIO:
+            out.append(
+                f"first write after idle (segment {a['segment']}) took {ratio:.2f}x steady p50,"
+                f" over {GATE_AFTER_IDLE_RATIO}x"
+            )
+        elif a["latency"] is None:
+            out.append(f"first write after idle (segment {a['segment']}) never reached its target: {a['error']}")
+    for seg in segs:
+        n, profile = seg["segment"], seg["profile"]
+        wal = seg.get("wal_bytes_per_hour_settled")
+        if profile == "idle" and wal is not None and wal / 1048576 > GATE_IDLE_WAL_MB_PER_HOUR:
+            out.append(
+                f"idle WAL (segment {n}) {wal / 1048576:.2f} MB/h settled, over {GATE_IDLE_WAL_MB_PER_HOUR} MB/h"
+            )
+        hold = seg.get("xmin_hold_s_settled_max")
+        deliberate = any(step.startswith(HOLDS_XMIN_STEPS) for step in seg["steps"])
+        if hold is not None and hold > GATE_XMIN_HOLD_SECS and not deliberate:
+            out.append(
+                f"backend_xmin hold ({profile} segment {n}) {hold:.0f}s settled, over {GATE_XMIN_HOLD_SECS:.0f}s"
+            )
+        if profile == "idle" and not seg["steps"]:
+            for lvl in ("WARN", "ERROR"):
+                lines = seg[lvl.lower()]
+                if lines:
+                    out.append(
+                        f"{lvl} in a quiet idle (segment {n}): {sum(lines.values())} lines, e.g. {next(iter(lines))}"
+                    )
+    return out
+
+
 def record_metrics(h, start, segments, loadgen_segments):
-    """Write metrics.json and log the summary; the logbook's short form. Never fails the run."""
+    """Write metrics.json and log the summary. Returns (the logbook's short form, gate breaches).
+    A failure to compute them is logged and doesn't fail the run."""
     try:
         log_lines = []
         for name in h.worker_names():
@@ -717,10 +771,10 @@ def record_metrics(h, start, segments, loadgen_segments):
         lines, short = metrics_lines(m)
         for line in lines:
             h.event(f"metric: {line}")
-        return short
+        return short, check_gates(m)
     except Exception as exc:
         h.event(f"metrics not recorded: {type(exc).__name__}: {exc}")
-        return "metrics not recorded"
+        return "metrics not recorded", []
 
 
 # -- fault actions -------------------------------------------------------------
@@ -1403,9 +1457,11 @@ def cmd_run(args):
             h.fail(f"peak oldest-undrained age {h.peak_age:.0f}s > {args.max_age_secs}s")
         status = h.sh([h.bin, "status", "-d", h.dsn()], check=False, capture_output=True)
         open(os.path.join(run_dir, "status.txt"), "w").write(status.stdout + status.stderr)
-        short = record_metrics(h, start_at, segments, totals.get("segments", []))
+        short, breaches = record_metrics(h, start_at, segments, totals.get("segments", []))
+        for b in breaches:
+            h.fail(f"gate: {b}")
         oracle_failed = not converged
-        outcome = "ok" if not h.failures else ("fail" if oracle_failed else "miss")
+        outcome = "ok" if not h.failures else ("fail" if oracle_failed or breaches else "miss")
         note = (
             f"{label}: {'oracle 0 diffs' if converged else 'ORACLE DIFF'} after {time.time() - t0:.0f}s; "
             f"peak RSS {h.peak_rss_kb / 1024:.0f} MB, peak age {h.peak_age:.0f}s; load err {totals['err']}"

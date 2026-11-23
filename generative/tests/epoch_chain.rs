@@ -693,12 +693,123 @@ mod residue {
         let report = run_lapping_case(&last_reader_dropped());
         assert!(report.is_ok(), "{report:?}");
     }
-    /// The allowances for #2239 and #2240 take their own shapes and no
-    /// nearby leak: a version-fence row for a table never defined, a
-    /// non-zero stray group, and a zero group not stamped at the active
-    /// segment are all still named.
+    /// At idle, a 1-1 tombstone and an aggregate's zero group stamped at the
+    /// active segment are still counted (#2240: no allowance), and the quiet
+    /// point's forced seal is what clears them. Both are planted once the
+    /// ring is idle, with a basis: a real one (a delete's tombstones) is
+    /// stamped before the idle seal, which collects it on its own a tick
+    /// later, so it would race the look; no write sequence leaves the idle
+    /// shape reliably.
     #[test]
-    fn the_allowances_accept_only_their_shape() {
+    fn a_forced_seal_clears_the_tombstone_and_zero_group_left_at_idle() {
+        use generative::generate::epoch::{EpochChangeDraw, EpochChangeKind, EpochDraw};
+        use generative::generate::{AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec};
+        use generative::run::seal_at_quiet_point;
+        let case = EpochCase {
+            tables: vec![TableSpec::numeric_only(
+                vec![(Some(1), Some(2)), (Some(3), None)],
+                Vec::new(),
+            )],
+            defs: vec![
+                (
+                    0,
+                    DefShape::Aggregate {
+                        functions: vec![AggregateFn::Sum(AggregateColumn::C1)],
+                    },
+                    None,
+                ),
+                (0, DefShape::OneToOne, None),
+            ],
+            epochs: vec![EpochDraw {
+                changes: vec![EpochChangeDraw {
+                    kind: EpochChangeKind::Restart,
+                    target: 0,
+                }],
+                mutates: vec![vec![Mutate::Update {
+                    pk: 1,
+                    c1: Some(8),
+                    c2: Some(2),
+                }]],
+            }],
+        };
+        HARNESS.with(|h| {
+            h.runtime.block_on(async {
+                let mut kept = run_keeping(h, &case).await;
+                let operator = operator(&kept.db).await;
+                let agg: String = operator
+                    .query_one(
+                        "select relname from pg_class where relnamespace = 'trellis'::regnamespace \
+                         and relname ~ '^agg_[0-9]+$'",
+                        &[],
+                    )
+                    .await
+                    .expect("an aggregate's table")
+                    .get(0);
+                let group: String = operator
+                    .query_one(
+                        "select attname from pg_attribute where attrelid = ('trellis.' || $1)::regclass \
+                         and attnum > 0 order by attnum limit 1",
+                        &[&agg],
+                    )
+                    .await
+                    .expect("its group column")
+                    .get(0);
+                let ts = kept.config.target_schema().to_string();
+                let ledger: String = operator
+                    .query_one(
+                        "select relname from pg_class where relname like '%__ledger' \
+                         and relnamespace = $1::text::regnamespace",
+                        &[&ts],
+                    )
+                    .await
+                    .expect("the case's 1-1 ledger")
+                    .get(0);
+                // The chain's own quiet point sealed past everything, so the
+                // ring is idle: nothing seals the active segment until the
+                // forced seal below.
+                kept.hidden(generative::run::SETTLE)
+                    .await
+                    .expect("clean before any plant");
+                let active: i64 = operator
+                    .query_one("select active_seq from trellis.segment_pointer", &[])
+                    .await
+                    .expect("active")
+                    .get(0);
+                operator
+                    .batch_execute(&format!(
+                        "insert into trellis.{agg} ({group}, __n, __stamp, __basis) \
+                         values (777, 0, {active}, '1:2:'); \
+                         insert into \"{ts}\".\"{ledger}\" (__from_key, __tombstone, __applied_seg) \
+                         values ('k1', true, {active})"
+                    ))
+                    .await
+                    .expect("plant a zero group and a tombstone at the active segment");
+                match kept.hidden(std::time::Duration::ZERO).await {
+                    Err(RunError::Residue { failures }) => {
+                        assert!(
+                            failures.iter().any(|f| f.contains(&format!("{ledger} holds"))),
+                            "{failures:?}"
+                        );
+                        assert!(
+                            failures.iter().any(|f| f.contains(&format!("{agg} holds"))),
+                            "{failures:?}"
+                        );
+                    }
+                    other => panic!("an idle ring's tombstone and zero group went unseen: {other:?}"),
+                }
+                seal_at_quiet_point(&mut kept.backend).await.expect("forced seal");
+                kept.hidden(generative::run::SETTLE)
+                    .await
+                    .expect("clean after the forced seal");
+            })
+        });
+    }
+    /// The one allowance left, the version fence's row for a table once
+    /// defined (#2239), takes its own shape and no nearby leak: a row for a
+    /// table never defined, and any stray hidden row (a zero group or a
+    /// tombstone at the active segment included, #2240) are all named.
+    #[test]
+    fn the_allowance_accepts_only_its_shape() {
         use generative::generate::epoch::{EpochChangeDraw, EpochChangeKind, EpochDraw};
         use generative::generate::{AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec};
 
@@ -759,27 +870,6 @@ mod residue {
                     .await
                     .expect("active")
                     .get(0);
-                let insert = |n: i32, zero: bool, stamp: i64| {
-                    format!(
-                        "insert into trellis.{agg} ({group}, __n, __stamp) \
-                         values ({n}, {}, {stamp})",
-                        if zero { 0 } else { 3 }
-                    )
-                };
-                // Allowed: #2240's shape.
-                operator
-                    .batch_execute(&insert(777, true, active))
-                    .await
-                    .expect("plant a zero group at the active segment");
-                kept.hidden(std::time::Duration::ZERO)
-                    .await
-                    .expect("a zero group at the active segment is allowed (#2240)");
-                operator
-                    .batch_execute(&format!("delete from trellis.{agg} where {group} = 777"))
-                    .await
-                    .unwrap();
-                // Allowed: the same shape in a 1-1 ledger (#2240), and its
-                // nearby leaks.
                 let ts = kept.config.target_schema().to_string();
                 let ledger: String = operator
                     .query_one(
@@ -791,44 +881,36 @@ mod residue {
                     .map(|r| r.get(0))
                     .unwrap_or_default();
                 assert!(!ledger.is_empty(), "the case has a 1-1 ledger");
-                {
-                    let put = |key: &str, tomb: bool, seg: i64| {
+                // Housekeeping runs every 250ms and collects a zero group with no
+                // basis or a stamp the drained prefix has passed, and a tombstone
+                // likewise, so a plant the look must find has a basis and a stamp
+                // at or beyond the active segment: nothing can collect it first.
+                let ahead = active + 1000;
+                let group_row = |n: i32, zero: bool, stamp: i64| {
+                    format!(
+                        "insert into trellis.{agg} ({group}, __n, __stamp, __basis) \
+                         values ({n}, {}, {stamp}, '1:2:')",
+                        if zero { 0 } else { 3 }
+                    )
+                };
+                for (plant, what) in [
+                    (group_row(777, true, active), "a zero group at the active segment"),
+                    (group_row(778, true, ahead), "a zero group stamped elsewhere"),
+                    (group_row(779, false, active), "a non-zero stray group"),
+                    (
                         format!(
                             "insert into \"{ts}\".\"{ledger}\" (__from_key, __tombstone, __applied_seg) \
-                             values ('{key}', {tomb}, {seg})"
-                        )
-                    };
-                    operator.batch_execute(&put("k1", true, active)).await.unwrap();
-                    kept.hidden(std::time::Duration::ZERO)
-                        .await
-                        .expect("a tombstone at the active segment is allowed (#2240)");
-                    for (plant, what) in [
-                        (put("k2", true, active - 1), "a tombstone stamped elsewhere"),
-                        (put("k3", false, active), "a live stray entry"),
-                    ] {
-                        operator.batch_execute(&plant).await.unwrap();
-                        match kept.hidden(std::time::Duration::ZERO).await {
-                            Err(RunError::Residue { .. }) => {}
-                            other => panic!("{what} went unseen: {other:?}"),
-                        }
-                        operator
-                            .batch_execute(&format!(
-                                "delete from \"{ts}\".\"{ledger}\" where __from_key in ('k2', 'k3')"
-                            ))
-                            .await
-                            .unwrap();
-                    }
-                    operator
-                        .batch_execute(&format!(
-                            "delete from \"{ts}\".\"{ledger}\" where __from_key = 'k1'"
-                        ))
-                        .await
-                        .unwrap();
-                }
-                // Not allowed: the nearby leaks.
-                for (plant, what) in [
-                    (insert(778, true, active - 1), "a zero group stamped elsewhere"),
-                    (insert(779, false, active), "a non-zero stray group"),
+                             values ('k1', true, {active})"
+                        ),
+                        "a tombstone at the active segment",
+                    ),
+                    (
+                        format!(
+                            "insert into \"{ts}\".\"{ledger}\" (__from_key, __tombstone, __applied_seg) \
+                             values ('k2', false, {active})"
+                        ),
+                        "a live stray ledger entry",
+                    ),
                     (
                         "insert into trellis.source_table_versions values ('public.never_defined', 1)"
                             .to_string(),
@@ -842,7 +924,8 @@ mod residue {
                     }
                     operator
                         .batch_execute(&format!(
-                            "delete from trellis.{agg} where {group} in (778, 779); \
+                            "delete from trellis.{agg} where {group} in (777, 778, 779); \
+                             delete from \"{ts}\".\"{ledger}\" where __from_key in ('k1', 'k2'); \
                              delete from trellis.source_table_versions \
                              where source_table = 'public.never_defined'"
                         ))

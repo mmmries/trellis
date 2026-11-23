@@ -11,8 +11,10 @@
 //!   `agg_<id>` exist for each current definition and no other, and each
 //!   holds as many rows as the oracle says the target has: a ledger entry
 //!   per key the target holds, a group row per group it holds. A tombstone
-//!   or a zero group is collected once the drained prefix passes it, so a
-//!   count is checked after the engine has settled, not at the first look.
+//!   or a zero group is collected once the drained prefix passes it, so the
+//!   quiet point forces one seal first (what the next write would do,
+//!   #2240) and a count is checked after the engine has settled, not at the
+//!   first look.
 //! - **Catalog and registry.** `transform_definitions` names exactly the
 //!   current definitions, the schema graph and the key and capture
 //!   registries name exactly the tables a current definition reads or
@@ -342,25 +344,9 @@ async fn check_hidden_once(
             }
         };
         let (name_schema, name) = hidden.split_once('.').expect("qualified");
-        // #2240: an aggregate's zero group stamped at the active segment
-        // outlives an idle ring, since the drained prefix cannot pass a
-        // segment that is never sealed. Only that shape is left out of the
-        // count: `__n = 0`, `__zero`, and the stamp the active segment's.
-        // The same holds for a 1-1 ledger's tombstone (#2240): its GC waits
-        // for the drained prefix to reach `__applied_seg`, so a tombstone
-        // stamped at the active segment is left out, and no other.
-        let left_out = match (&def.key_space, active) {
-            (KeySpace::Aggregate { .. }, Some(active)) => {
-                format!(" where not (__zero and __n = 0 and __stamp = {active})")
-            }
-            (KeySpace::OneToOne, Some(active)) => {
-                format!(" where not (__tombstone and __applied_seg = {active})")
-            }
-            _ => String::new(),
-        };
         let actual = count!(
             format!("rows of {hidden}"),
-            format!("\"{name_schema}\".\"{name}\"{left_out}")
+            format!("\"{name_schema}\".\"{name}\"")
         );
         report.hidden.insert(hidden.clone(), (expected, actual));
         if actual != expected {
@@ -446,9 +432,10 @@ async fn check_hidden_once(
             .iter()
             .map(|r| r.get::<_, String>(0))
             .collect();
-        // #2239: the version fence keeps a table's row after its last
-        // definition goes. Allowed for a table a definition once read,
-        // nothing else.
+        // The version fence keeps a table's row for life (#2239, decided:
+        // `docs/staging-and-claiming/05-apply-and-exactly-once-deltas.md`,
+        // "The version fence"). Allowed for a table a definition once
+        // read, nothing else.
         let kept: BTreeSet<String> = if what == "source_table_versions" {
             ever.iter()
                 .map(|d| qualified(&source_schema(d), &d.source))
@@ -565,7 +552,7 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    /// #2239's allowance covers a table once read, and no other.
+    /// The version fence's allowance (#2239) covers a table once read, and no other.
     #[test]
     fn a_version_row_is_allowed_for_a_table_once_read_only() {
         let seen = set(&["public.t0", "public.gone", "public.never"]);

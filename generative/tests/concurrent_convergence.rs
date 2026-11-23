@@ -2067,6 +2067,10 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
             plant_sweep::NO_ISOLATION,
         ))
         .chain(not_on_path(&[PlantPath::DbAdmin], plant_sweep::NO_DB_ADMIN))
+        .chain(not_on_path(
+            &[PlantPath::SourceDdl],
+            plant_sweep::NO_SOURCE_DDL,
+        ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
         .chain([
             LEAF_UNREACHED,
@@ -2154,6 +2158,10 @@ fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
     out.extend(not_on_path(
         &[PlantPath::DbAdmin],
         generative::plant_sweep::NO_DB_ADMIN,
+    ));
+    out.extend(not_on_path(
+        &[PlantPath::SourceDdl],
+        generative::plant_sweep::NO_SOURCE_DDL,
     ));
     out
 }

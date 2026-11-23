@@ -45,7 +45,7 @@ pub use hidden::{HiddenReport, SETTLE, check_hidden};
 pub use noise::run_convergence_with_noise;
 pub use residue::{
     LAP_SEAL_INTERVAL, ResidueReport, TableResidue, check_residue, peak_live_rows,
-    run_epochs_lapping,
+    run_epochs_lapping, seal_at_quiet_point,
 };
 pub use restore::{check_no_pause_after_restore, run_convergence_with_restore};
 pub use source_ddl::{

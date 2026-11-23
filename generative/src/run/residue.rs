@@ -25,7 +25,7 @@ use trellis::dev::pool::Pool;
 
 use super::pause::RunKind;
 use super::{Outcome, RunError, apply_and_check_outcome, quiesce_snapshot_and_check};
-use crate::backend::{Backend, ConcurrentBackend, ManualBackend, Roles};
+use crate::backend::{Backend, ConcurrentBackend, ManualBackend, ManualBackendError, Roles};
 use crate::generate::epoch::{EpochChain, EpochStep, apply_step};
 use crate::model::{Op, OpOutcome, Program};
 
@@ -215,6 +215,9 @@ pub async fn run_epochs_lapping(
         report.seals = sealed_segments(config, roles)
             .await
             .map_err(|e| in_epoch(index)(RunError::Quiesce(format!("seal count: {e}"))))?;
+        seal_at_quiet_point(backend)
+            .await
+            .map_err(|e| in_epoch(index)(RunError::Quiesce(format!("quiet-point seal: {e:?}"))))?;
         report.hidden = super::hidden::check_hidden(
             config,
             roles,
@@ -231,6 +234,15 @@ pub async fn run_epochs_lapping(
             .map_err(in_epoch(index))?;
     }
     Ok((Outcome::Ran, report))
+}
+
+/// Forces one seal and lets it drain: what the next write would do (#2240).
+/// A zero group or a 1-1 tombstone stamped at the empty active segment waits
+/// for the drained prefix to pass it, and while the ring is idle nothing
+/// seals that segment, so the hidden-table counts are checked after this.
+pub async fn seal_at_quiet_point(backend: &mut ManualBackend) -> Result<(), ManualBackendError> {
+    backend.force_seal_active_segment().await?;
+    backend.quiesce().await
 }
 
 /// The other sessions that could hold the vacuum horizon back, for a

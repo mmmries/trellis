@@ -77,6 +77,15 @@ pub const DEFAULT_CALL_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// (both pools; not configurable).
 pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a pooled connection may stay open before the pool replaces it
+/// (both pools; not configurable). A session's temporary tables (the
+/// group-basis and `JOIN` working tables, `on commit delete rows`) hold
+/// their database's `datfrozenxid` at the id they were created under, and
+/// no `VACUUM` from another session can move it, so a connection that lived
+/// for ever would drive its database toward wraparound. Closing the
+/// session drops its tables.
+pub const POOL_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
 /// Resolved connection configuration.
 ///
 /// Every field but `dsn` is private and every constructor validates the

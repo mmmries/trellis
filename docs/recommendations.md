@@ -78,6 +78,13 @@ for a database that builds large targets.
 To watch a build's progress, see
 [the status reference](status-reference.md#backfilling).
 
+### What an idle instance costs
+
+Measured on the soak harness (2 workers, the six-transform soak definitions), an idle instance
+writes about 2.4 to 3.2 MB of WAL per hour and holds back the vacuum horizon by at most one xid
+(`backend_xmin` never older than a second). One write a minute costs about 16 MB of WAL per hour.
+Size `max_wal_size` and archive volume from the write rate, not from these.
+
 ## Ring sizing
 
 Captured changes wait in the staging ring, which lives in your application's
@@ -460,7 +467,8 @@ The role needs:
   gives both), and `USAGE` on the schema of every source.
 * Ownership of each source table, or membership in the role that owns it, with `INHERIT`.
 * `BYPASSRLS` if row-level security applies to it on any table it reads or
-  writes, and on the ring's owner, which doesn't inherit it.
+  writes (any source with `FORCE ROW LEVEL SECURITY`, whatever its policies
+  allow), and on the ring's owner, which doesn't inherit it.
 
 Why each is needed, and what Trellis does when one is missing:
 [embedding — What the staging worker needs from the database](embedding.md#what-the-staging-worker-needs-from-the-database),

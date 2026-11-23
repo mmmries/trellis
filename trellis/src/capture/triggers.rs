@@ -368,7 +368,18 @@ pub(crate) fn findings(
         };
         if now.oid != was.oid {
             found.push(Finding::Recreated(was.name.clone()));
-        } else if now.enabled != "A" {
+            continue;
+        }
+        // Planted bug: the trigger's state isn't read (#2184). See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(
+            crate::plant::Plant::CaptureSkipTriggerState,
+            now.enabled != "A" || now.xmin != was.xmin,
+        ) {
+            continue;
+        }
+        if now.enabled != "A" {
             found.push(Finding::Mode(was.name.clone(), now.enabled.clone()));
         } else if now.xmin != was.xmin {
             found.push(Finding::Altered(was.name.clone()));

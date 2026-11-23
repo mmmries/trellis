@@ -36,7 +36,7 @@ use trellis::dev::pool::Pool;
 
 use crate::backend::{Backend, ConcurrentBackend, DefinitionState, ManualBackend};
 use crate::gaps::{Gap, Repair};
-use crate::model::{BurstAction, Program};
+use crate::model::{BurstAction, Program, Server};
 
 use super::{RunError, check_def};
 
@@ -259,10 +259,34 @@ impl PassStepper {
         client.query(sql, params).await.map_err(|e| e.to_string())
     }
 
+    /// Rounds of a pass, then [`Backend::quiesce`] with a pass every
+    /// [`SETTLE_PASS_EVERY`] beside it, until a round's passes change
+    /// nothing a pass writes ([`Self::pass_state`]). One round isn't
+    /// enough: a pass that pauses a table's readers leaves the rest of its
+    /// checks to the next pass (a widening that outgrows a copy, then the
+    /// rewrite a versioned attribute shows on a later column), and that
+    /// pass can land after the quiesce has seen every definition settled.
+    pub async fn settle(&self, backend: &mut ManualBackend) -> Result<(), String> {
+        let mut before = self.pass_state().await?;
+        for _ in 0..SETTLE_ROUNDS {
+            self.settle_round(backend).await?;
+            let after = self.pass_state().await?;
+            if after == before {
+                return Ok(());
+            }
+            before = after;
+        }
+        Err(format!(
+            "the reconcile passes still changed the catalog after {SETTLE_ROUNDS} rounds of \
+             passes and quiesce"
+        ))
+    }
+
     /// A pass, then [`Backend::quiesce`] with a pass every
     /// [`SETTLE_PASS_EVERY`] beside it: a build the pass has to start, a
-    /// re-read or a pause it queues, all land before the wait ends.
-    pub async fn settle(&self, backend: &mut ManualBackend) -> Result<(), String> {
+    /// re-read or a pause it queues, all land before the wait ends. The
+    /// passes beside it stop before this returns.
+    async fn settle_round(&self, backend: &mut ManualBackend) -> Result<(), String> {
         self.step().await?;
         let stop = Arc::new(AtomicBool::new(false));
         let ticker = {
@@ -285,7 +309,45 @@ impl PassStepper {
         quiesced?;
         ticked
     }
+
+    /// What a pass's responses write: each definition's catalog row, the
+    /// capture baselines and trigger records, the capture failures, the
+    /// per-column states and the partition fingerprints, as one digest. A
+    /// pass with nothing to do writes none of them.
+    async fn pass_state(&self) -> Result<String, String> {
+        let digest = |table: &str| {
+            format!(
+                "coalesce((select string_agg(t::text, ',' order by t::text) from {table} t), '')"
+            )
+        };
+        let tables = [
+            "transform_definitions",
+            "capture_baselines",
+            "capture_triggers",
+            "capture_failures",
+            "column_status",
+            "partition_sources",
+        ];
+        let sql = format!(
+            "select md5(concat_ws('|', {}))",
+            tables.map(digest).join(", ")
+        );
+        let rows = self.query(&sql, &[]).await?;
+        Ok(rows[0].get(0))
+    }
+
+    /// What the server does that decides which register shapes an event
+    /// reproduces ([`Server`]), probed on a temporary table of the
+    /// stepper's own session.
+    pub async fn server(&self) -> Result<Server, String> {
+        let client = self.client.lock().await;
+        Server::probe(&client).await
+    }
 }
+
+/// The most rounds [`PassStepper::settle`] runs before it gives up on the
+/// passes ever going quiet.
+const SETTLE_ROUNDS: usize = 10;
 
 /// Settles, reads each of `defs`' state and its target against the
 /// recompute (`None` where the oracle can't recompute it).

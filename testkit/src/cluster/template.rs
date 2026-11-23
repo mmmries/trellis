@@ -11,7 +11,8 @@
 //! The template is cached across processes in the system temp dir as
 //! `trellis-template-<key>`, so one `cargo test` run builds it once for all
 //! its test binaries. The key hashes the engine's sources and migrations
-//! (`build.rs`), the Postgres binary and the `initdb` arguments, so a stale
+//! (`build.rs`), the migrations the linked engine embeds (with
+//! `engine-access`), the Postgres binary and the `initdb` arguments, so a stale
 //! template is never reused, and the day, so none outlives a temp-dir cleaner
 //! (see [`key`]). A builder holds an exclusive lock on
 //! `trellis-template-<key>.lock` and publishes the directory with a rename, so
@@ -49,8 +50,8 @@ pub(super) fn data_dir() -> &'static Path {
     &TEMPLATE.get_or_init(|| ensure(&std::env::temp_dir())).0
 }
 
-/// The cache key: the engine build (`build.rs`), the Postgres binaries, the
-/// `initdb` arguments, the user and the day.
+/// The cache key: the engine build (`build.rs`), its embedded migrations,
+/// the Postgres binaries, the `initdb` arguments, the user and the day.
 ///
 /// The `postgres` binary's path, size and mtime are in it as well as its
 /// version, so a rebuild of the same version (against a new ICU, say) or a
@@ -82,10 +83,25 @@ fn key() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs() / (24 * 60 * 60));
     format!(
-        "{}-{:016x}-{day}",
+        "{}-{}-{:016x}-{day}",
         env!("TRELLIS_SOURCE_FINGERPRINT"),
+        embedded_migrations(),
         hasher.finish()
     )
+}
+
+/// A hash of the migrations compiled into the engine this crate links, so the
+/// key can't drift from what `migrate` runs even when the build script's
+/// fingerprint is stale (cargo skipped re-running it after a merge added a
+/// migration, #2244).
+#[cfg(feature = "engine-access")]
+fn embedded_migrations() -> String {
+    trellis::dev::migrations_fingerprint()
+}
+
+#[cfg(not(feature = "engine-access"))]
+fn embedded_migrations() -> String {
+    String::new()
 }
 
 /// The first `program` on `PATH`, as a spawn would find it.
@@ -225,6 +241,12 @@ fn held(tmp: &Path, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "engine-access")]
+    #[test]
+    fn the_key_carries_the_embedded_migrations_fingerprint() {
+        assert!(key().contains(&trellis::dev::migrations_fingerprint()));
+    }
 
     #[test]
     fn the_key_is_stable_within_a_build() {

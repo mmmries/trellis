@@ -1057,3 +1057,229 @@ async fn a_rewrite_of_a_where_column_with_a_change_in_flight_leaves_no_old_group
         .await,
     );
 }
+
+/// A key column retyped by other than a pure widening, with a `USING` that
+/// changes its values (#2254): `bigint` to `integer USING c0 + 10` on a 1-1
+/// source key, `integer` to `smallint USING g + 1` on a `GROUP BY` key, and
+/// `bigint` to `integer USING id + 100` on a `JOIN`ed table's own key. No
+/// key check pauses them (every value still fits, and an integer narrowing
+/// renders the stored keys as before), so the readers are re-read and
+/// converge to the new values. Each key column is its table's last, so no
+/// later column's attribute version moves with it and only the retype can
+/// rebuild (`support/attver.rs`).
+#[tokio::test]
+async fn a_key_narrowed_with_a_value_changing_using_is_reread() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.n1 (v int, c0 bigint primary key); \
+         insert into public.n1 values (1, 1), (3, 3); \
+         create table public.ng (id int primary key, b int, g int not null); \
+         insert into public.ng select i, i, i % 3 from generate_series(1, 30) i; \
+         create table public.nja (id int primary key, k int not null, g int not null); \
+         create table public.njb (k int not null, x int, id bigint primary key); \
+         insert into public.nja select i, i % 4, i % 2 from generate_series(1, 24) i; \
+         insert into public.njb select i % 4, i, i from generate_series(1, 8) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM n1t FROM public.n1 SELECT v AS v",
+        "TRANSFORM ngt FROM public.ng GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT g AS g, SUM(b) AS total, COUNT(*) AS n",
+        "TRANSFORM njt FROM public.nja JOIN public.njb ON nja.k = njb.k \
+         GROUP BY nja.g WITHOUT SOURCE INDEX SELECT nja.g AS g, COUNT(*) AS n, SUM(njb.x) AS sx",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live_all(&mut raw, &db.pool).await;
+
+    let attver = attver::Attver::probe(&raw).await;
+    for alter in [
+        "alter table public.n1 alter column c0 type integer using c0 + 10",
+        "alter table public.ng alter column g type smallint using g + 1",
+        "alter table public.njb alter column id type integer using id + 100",
+    ] {
+        raw.batch_execute(alter).await.expect(alter);
+        attver.after(&raw, alter).await;
+    }
+    capture_pass(&mut raw, &db.pool).await;
+    let statuses = statuses(&raw).await;
+    for target in ["n1t", "ngt", "njt"] {
+        assert_eq!(
+            statuses[target],
+            TransformStatus::Backfilling,
+            "{target}: {statuses:?}"
+        );
+    }
+    for table in ["public.n1", "public.ng", "public.njb"] {
+        assert_eq!(auto_rebuilds(table, "column_changed"), 1, "{table}");
+    }
+    bring_live_all(&mut raw, &db.pool).await;
+
+    // A write under each new key lands on the rebuilt state: the 1-1 row
+    // and the joined row are found by their new keys.
+    raw.batch_execute(
+        "update public.n1 set v = 30 where c0 = 13; \
+         update public.ng set g = 9 where id = 1; \
+         delete from public.njb where id = 101;",
+    )
+    .await
+    .expect("writes under the new keys");
+    reconcile_pass(&mut raw, &db.pool).await;
+    settle(&db.pool, &mut raw).await;
+
+    assert_eq!(
+        rows(&raw, "select c0::text, v::text from public.n1t order by c0").await,
+        rows(&raw, "select c0::text, v::text from public.n1 order by c0").await,
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select g::text, total::text, n::text from public.ngt where n <> 0 order by g"
+        )
+        .await,
+        rows(
+            &raw,
+            "select g::text, sum(b)::text, count(*)::text from public.ng group by g order by g"
+        )
+        .await,
+    );
+    assert_eq!(
+        rows(
+            &raw,
+            "select g::text, n::text, sx::text from public.njt where n <> 0 order by g"
+        )
+        .await,
+        rows(
+            &raw,
+            "select a.g::text, count(*)::text, sum(b.x)::text from public.nja a \
+             join public.njb b on a.k = b.k group by a.g order by a.g"
+        )
+        .await,
+    );
+    // The baseline moved with them: the next pass rebuilds nothing more.
+    capture_pass(&mut raw, &db.pool).await;
+    for table in ["public.n1", "public.ng", "public.njb"] {
+        assert_eq!(auto_rebuilds(table, "column_changed"), 1, "{table}");
+    }
+}
+
+/// A key narrowing a key check pauses for still pauses, though every
+/// non-widening key retype is re-read otherwise: `bigint` to `integer` on
+/// one side of a `JOIN`'s `ON` pair breaks the same-type pairing. No pass
+/// rebuilds it, then or after.
+#[tokio::test]
+async fn a_key_narrowing_a_key_check_pauses_for_is_not_reread() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.pa (id int primary key, g int not null, k bigint not null); \
+         create table public.pb (id int primary key, x int, k bigint not null); \
+         insert into public.pa select i, i % 2, i % 4 from generate_series(1, 24) i; \
+         insert into public.pb select i, i, i % 4 from generate_series(1, 8) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let text = "TRANSFORM pjt FROM public.pa JOIN public.pb ON pa.k = pb.k \
+                GROUP BY pa.g WITHOUT SOURCE INDEX SELECT pa.g AS g, COUNT(*) AS n, SUM(pb.x) AS sx";
+    trellis.apply(text).await.expect(text);
+    bring_live_all(&mut raw, &db.pool).await;
+
+    let attver = attver::Attver::probe(&raw).await;
+    let alter = "alter table public.pb alter column k type integer using k + 10";
+    raw.batch_execute(alter).await.expect(alter);
+    attver.after(&raw, alter).await;
+    for _ in 0..2 {
+        capture_pass(&mut raw, &db.pool).await;
+        assert_eq!(statuses(&raw).await["pjt"], TransformStatus::Paused);
+    }
+    assert_eq!(auto_rebuilds("public.pb", "column_changed"), 0);
+}
+
+/// [`a_key_narrowed_with_a_value_changing_using_is_reread`] for a table
+/// keyed by a declared `KEY (...)` rather than a primary key: the readers
+/// are found by the key capture uses, not the primary key alone.
+#[tokio::test]
+async fn a_declared_key_narrowed_with_a_value_changing_using_is_reread() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.dk (v int, u bigint not null unique); \
+         insert into public.dk values (1, 1), (3, 3);",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    let text = "TRANSFORM dkt FROM public.dk KEY (u) SELECT v AS v";
+    trellis.apply(text).await.expect(text);
+    bring_live_all(&mut raw, &db.pool).await;
+
+    let attver = attver::Attver::probe(&raw).await;
+    let alter = "alter table public.dk alter column u type integer using u + 10";
+    raw.batch_execute(alter).await.expect(alter);
+    attver.after(&raw, alter).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(statuses(&raw).await["dkt"], TransformStatus::Backfilling);
+    assert_eq!(auto_rebuilds("public.dk", "column_changed"), 1);
+    bring_live_all(&mut raw, &db.pool).await;
+    assert_eq!(
+        rows(&raw, "select u::text, v::text from public.dkt order by u").await,
+        rows(&raw, "select u::text, v::text from public.dk order by u").await,
+    );
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(auto_rebuilds("public.dk", "column_changed"), 1);
+}
+
+/// A key narrowing one reader pauses for and another doesn't: the pass
+/// that pauses the first stops there, and the next re-reads the second,
+/// whose 1-1 target is keyed by the changed column, without the paused one.
+#[tokio::test]
+async fn a_key_narrowing_rereads_the_readers_a_key_check_leaves_unpaused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.sa (id int primary key, g int not null, k bigint not null); \
+         create table public.sb (x int, k bigint primary key); \
+         insert into public.sa select i, i % 2, i % 4 from generate_series(1, 24) i; \
+         insert into public.sb select i, i from generate_series(0, 3) i;",
+    )
+    .await
+    .expect("seed");
+    let trellis = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM sjt FROM public.sa JOIN public.sb ON sa.k = sb.k \
+         GROUP BY sa.g WITHOUT SOURCE INDEX SELECT sa.g AS g, COUNT(*) AS n, SUM(sb.x) AS sx",
+        "TRANSFORM sbt FROM public.sb SELECT x AS x",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    bring_live_all(&mut raw, &db.pool).await;
+
+    let attver = attver::Attver::probe(&raw).await;
+    let alter = "alter table public.sb alter column k type integer using k + 10";
+    raw.batch_execute(alter).await.expect(alter);
+    attver.after(&raw, alter).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let first = statuses(&raw).await;
+    assert_eq!(first["sjt"], TransformStatus::Paused, "{first:?}");
+    capture_pass(&mut raw, &db.pool).await;
+    let second = statuses(&raw).await;
+    assert_eq!(second["sjt"], TransformStatus::Paused, "{second:?}");
+    assert_eq!(second["sbt"], TransformStatus::Backfilling, "{second:?}");
+    assert_eq!(auto_rebuilds("public.sb", "column_changed"), 1);
+    pipeline::bring_live(&mut raw, &db.pool, &["sbt"]).await;
+    assert_eq!(
+        rows(&raw, "select k::text, x::text from public.sbt order by k").await,
+        rows(&raw, "select k::text, x::text from public.sb order by k").await,
+    );
+    assert_eq!(statuses(&raw).await["sjt"], TransformStatus::Paused);
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(auto_rebuilds("public.sb", "column_changed"), 1);
+}
