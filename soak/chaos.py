@@ -717,7 +717,7 @@ HOLDS_XMIN_STEPS = ("long-txn", "pg-dump")
 
 def check_gates(m):
     """Breaches of the profile thresholds in a metrics dict, as messages naming the metric and
-    segment. Empty for a run with no idle segment: those aren't profile runs. WARN lines in an
+    segment. Empty for a run with no idle segment: those aren't profile runs. WARN and ERROR lines in an
     idle segment that had a fault injected aren't gated."""
     segs = m["segments"]
     if not any(s["profile"] == "idle" for s in segs):
@@ -746,9 +746,13 @@ def check_gates(m):
             out.append(
                 f"backend_xmin hold ({profile} segment {n}) {hold:.0f}s settled, over {GATE_XMIN_HOLD_SECS:.0f}s"
             )
-        if profile == "idle" and not seg["steps"] and seg["warn"]:
-            first = next(iter(seg["warn"]))
-            out.append(f"WARN in a quiet idle (segment {n}): {sum(seg['warn'].values())} lines, e.g. {first}")
+        if profile == "idle" and not seg["steps"]:
+            for lvl in ("WARN", "ERROR"):
+                lines = seg[lvl.lower()]
+                if lines:
+                    out.append(
+                        f"{lvl} in a quiet idle (segment {n}): {sum(lines.values())} lines, e.g. {next(iter(lines))}"
+                    )
     return out
 
 

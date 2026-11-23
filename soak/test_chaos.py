@@ -368,6 +368,18 @@ class Gates(unittest.TestCase):
         (msg,) = chaos.check_gates(m)
         self.assertIn("WARN in a quiet idle (segment 2)", msg)
 
+    def test_error_in_quiet_idle(self):
+        m = self.metrics()
+        m["segments"][1]["error"] = {"trellis: apply failed": 3}
+        (msg,) = chaos.check_gates(m)
+        self.assertIn("ERROR in a quiet idle (segment 2): 3 lines, e.g. trellis: apply failed", msg)
+        self.assertNotIn("WARN", msg)
+
+    def test_error_in_faulted_idle_is_not_gated(self):
+        m = self.metrics()
+        m["segments"][2]["error"] = {"trellis: apply failed": 9}
+        self.assertEqual(chaos.check_gates(m), [])
+
     def test_every_breach_is_reported(self):
         m = self.metrics()
         m["segments"][1].update(wal_bytes_per_hour_settled=10 * 1048576, warn={"x": 1})

@@ -67,7 +67,7 @@ the run (outcome `fail`) with a message naming the metric and segment:
 - idle WAL at most 6.5 MB/h once settled;
 - `backend_xmin` hold at most 2 s once settled, in every segment except one that starts a
   `long-txn` or `pg-dump` step (those hold the horizon on purpose);
-- no WARN in an idle segment with no injected fault (WARNs in a faulted idle are not gated).
+- no WARN or ERROR in an idle segment with no injected fault (neither is gated in a faulted idle).
 
 ## Outcome
 
