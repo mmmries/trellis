@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{exact_sums, where_clause};
+use super::where_clause;
 use crate::model::{
     ConcurrentPlan, FkAction, Op, PRIMARY_KEY_VALUE_TYPE, Program, Rewrite, SHADOW_OFFSET, Shadow,
     Table, Timing, Wiring,
@@ -119,14 +119,39 @@ fn unique(table: &Table, column: &str) -> bool {
             .is_some_and(|key| key.columns.iter().any(|c| c == column))
 }
 
-/// Whether another generator budgets the magnitude of `column`'s values
-/// (the [`exact_sums`] columns): a flip writes its pick into every row the
-/// trigger touches, past that budget, and a group's sum leaves the type's
-/// range (#2263). Wiring stays off columns another generator constrains.
-fn budgeted(column: &str) -> bool {
-    exact_sums::SumType::ALL
-        .iter()
-        .any(|sum| sum.column() == column)
+/// Whether a definition of `program` sums `column` of `table` (`SUM` or
+/// `AVG`) in a type whose sum keeps the argument's range: `real`, `double
+/// precision` or `interval`. The generators budget such a column's values
+/// so no group's sum leaves that range ([`super::exact_sums`]); a flip or a
+/// shadow writes one value into every row the trigger touches, past the
+/// budget (#2263). Wiring stays off columns another generator constrains.
+fn budgeted(program: &Program, table: &Table, column: &str) -> bool {
+    use trellis::dev::defs::PgType;
+    use trellis::dev::defs::ast::{Expr, ValueType};
+    if !matches!(
+        table.column_type(column),
+        Some(ValueType::Float(_) | ValueType::Other(PgType::Interval))
+    ) {
+        return false;
+    }
+    let mut summed = false;
+    for field in program.defs.iter().flat_map(|def| &def.fields) {
+        field.expr.walk(&mut |e| {
+            if let Expr::FunctionCall { name, args } = e
+                && (name == "SUM" || name == "AVG")
+            {
+                for arg in args {
+                    arg.walk(&mut |e| match e {
+                        Expr::Column(c) | Expr::SourceColumn { column: c, .. } if c == column => {
+                            summed = true;
+                        }
+                        _ => {}
+                    });
+                }
+            }
+        });
+    }
+    summed
 }
 
 /// Whether some definition of `program` names `column` of `table`.
@@ -143,12 +168,14 @@ type Flip = (String, Option<String>, Option<String>);
 
 /// A column of `table` a [`Rewrite`] or a [`Shadow`] can flip, with two of
 /// its drawn values: one no `UNIQUE` constraint or source key covers
-/// ([`unique`]) and no other generator budgets ([`budgeted`]), which the program writes at least two values to,
-/// preferring one a definition reads.
+/// ([`unique`]) and no other generator budgets ([`budgeted`]), which the
+/// program writes at least two values to, preferring one a definition reads.
 fn flip_column(program: &Program, table: &Table, pick: u64) -> Option<Flip> {
     let mut candidates: Vec<Flip> = drawn_values(program, table)
         .into_iter()
-        .filter(|(c, values)| values.len() >= 2 && !unique(table, c) && !budgeted(c))
+        .filter(|(c, values)| {
+            values.len() >= 2 && !unique(table, c) && !budgeted(program, table, c)
+        })
         .map(|(c, values)| (c, values[0].clone(), values[1].clone()))
         .collect();
     let read_ones: Vec<_> = candidates
@@ -227,9 +254,15 @@ pub fn with_wiring(mut plan: ConcurrentPlan, program: &Program) -> ConcurrentPla
                 (_, 1) => Some(FkAction::Cascade),
                 _ => Some(FkAction::SetNull),
             };
+            // A budgeted column's shadows are `NULL`: every shadow carries
+            // the template, so its first value would be summed once a row.
             let template = drawn_values(program, target)
                 .into_iter()
-                .map(|(c, values)| (c, values.into_iter().next().flatten()))
+                .map(|(c, values)| {
+                    let value = values.into_iter().next().flatten();
+                    let value = value.filter(|_| !budgeted(program, target, &c));
+                    (c, value)
+                })
                 .collect();
             shadowed.insert(target.name.as_str());
             Shadow {
@@ -460,11 +493,13 @@ mod tests {
         assert!(drawn.0 > 0 && drawn.1 > 0, "{drawn:?}");
     }
 
-    /// A column another generator budgets (`fs`, `rs`, `ivs`) is never
-    /// flipped, so wiring cannot write its extremes past the budget (#2263).
+    /// A column a definition sums in `double precision` (`fs`) is never
+    /// flipped and its shadows are `NULL`, so wiring cannot write its
+    /// extremes past the budget (#2263); one it only takes the `MIN` of
+    /// (`f`) still flips.
     #[test]
-    fn a_budgeted_column_is_never_flipped() {
-        let mut drawn = 0;
+    fn a_budgeted_column_is_never_flipped_or_copied_into_shadows() {
+        let (mut rewrites, mut shadows, mut f_flips) = (0, 0, 0);
         for seed in 0..256 {
             let mut program = program(
                 (0..6)
@@ -477,25 +512,48 @@ mod tests {
                         else {
                             unreachable!()
                         };
-                        row.push(("fs".to_string(), Some(format!("-{}e300", seed + i))));
+                        let big = Some(format!("-{}e300", seed + i));
+                        row.push(("fs".to_string(), big.clone()));
+                        row.push(("f".to_string(), big));
                         [Op::Insert { table, row, expect }]
                     })
                     .collect(),
             );
-            program.tables[0].columns.push(Column {
-                name: "fs".to_string(),
-                value_type: ValueType::Float(trellis::dev::defs::FloatWidth::Float8),
-            });
+            for name in ["fs", "f"] {
+                program.tables[0].columns.push(Column {
+                    name: name.to_string(),
+                    value_type: ValueType::Float(trellis::dev::defs::FloatWidth::Float8),
+                });
+            }
+            program.defs.push(
+                trellis::dev::defs::parse(
+                    "TRANSFORM agg FROM t0 GROUP BY c1 \
+                     SELECT c1 AS c1, SUM(fs) AS s, MIN(f) AS m",
+                )
+                .unwrap(),
+            );
             let flip = flip_column(&program, &program.tables[0], seed);
-            assert_eq!(flip.map(|(c, ..)| c).as_deref(), Some("c1"), "seed {seed}");
+            assert!(
+                matches!(flip.map(|(c, ..)| c).as_deref(), Some("c1" | "f")),
+                "seed {seed}"
+            );
             for wiring in with_wiring(ConcurrentPlan::default(), &program).wiring {
                 if let Some(rewrite) = &wiring.rewrite {
                     assert_ne!(rewrite.column, "fs", "seed {seed}");
-                    drawn += 1;
+                    f_flips += usize::from(rewrite.column == "f");
+                    rewrites += 1;
+                }
+                if let Some(shadow) = &wiring.shadow {
+                    assert_ne!(shadow.toggle.0, "fs", "seed {seed}");
+                    let fs = shadow.template.iter().find(|(c, _)| c == "fs");
+                    assert_eq!(fs, Some(&("fs".to_string(), None)), "seed {seed}");
+                    let f = shadow.template.iter().find(|(c, _)| c == "f");
+                    assert!(f.is_some_and(|(_, v)| v.is_some()), "seed {seed}");
+                    shadows += 1;
                 }
             }
         }
-        assert!(drawn > 0);
+        assert!(rewrites > 0 && shadows > 0 && f_flips > 0);
     }
 
     /// The wiring is a function of the program alone, and each shadowed
