@@ -78,11 +78,7 @@ defmodule Trellis.ReleaseCheck do
         with {:ok, merge_base} <- merge_base(root, base),
              {:ok, migrations} <-
                added_trellis_migrations(root, merge_base, Enum.map(paths, &relative(&1, root))) do
-          old =
-            case git(root, ["show", "#{merge_base}:./#{lockfile}"]) do
-              {:ok, text} -> locked_version(text)
-              {:error, _} -> nil
-            end
+          old = locked_version(committed(root, merge_base, lockfile))
 
           new = locked_version(read(Path.join(root, lockfile)))
 
@@ -141,7 +137,7 @@ defmodule Trellis.ReleaseCheck do
   end
 
   defp merge_base(root, base) do
-    with {:ok, _} <- git(root, ["rev-parse", "--is-inside-work-tree"]),
+    with {:ok, _} <- git(root, ["rev-parse", "--is-inside-work-tree"], :capture),
          {:ok, _} <- verify(root, base),
          {:ok, out} <- merge_base_commit(root, base) do
       {:ok, String.trim(out)}
@@ -149,14 +145,14 @@ defmodule Trellis.ReleaseCheck do
   end
 
   defp verify(root, base) do
-    case git_raw(root, ["rev-parse", "--verify", "--quiet", "#{base}^{commit}"]) do
+    case git_raw(root, ["rev-parse", "--verify", "--quiet", "#{base}^{commit}"], :parse) do
       {_, 0} -> {:ok, :known}
       _ -> {:error, "#{base} is not a commit this clone knows: fetch it first"}
     end
   end
 
   defp merge_base_commit(root, base) do
-    case git_raw(root, ["merge-base", base, "HEAD"]) do
+    case git_raw(root, ["merge-base", base, "HEAD"], :parse) do
       {out, 0} ->
         {:ok, out}
 
@@ -164,6 +160,17 @@ defmodule Trellis.ReleaseCheck do
         {:error,
          "this checkout has no merge base with #{base}: fetch more history " <>
            "(a shallow clone has none; with actions/checkout, set fetch-depth: 0)"}
+    end
+  end
+
+  # `path`'s text at `commit`, or nil where the commit has no such file.
+  defp committed(root, commit, path) do
+    with {_, 0} <-
+           git_raw(root, ["rev-parse", "--verify", "--quiet", "#{commit}:./#{path}"], :parse),
+         {:ok, text} <- git(root, ["show", "#{commit}:./#{path}"]) do
+      text
+    else
+      _ -> nil
     end
   end
 
@@ -219,16 +226,26 @@ defmodule Trellis.ReleaseCheck do
     if Path.type(path) == :absolute, do: Path.relative_to(path, root), else: path
   end
 
-  # git's stdout, run in `root`; a failing command is an error.
-  defp git(root, args) do
-    case git_raw(root, args) do
-      {out, 0} -> {:ok, out}
-      {err, _} -> {:error, "git #{hd(args)} failed in #{root}: #{String.trim(err)}"}
+  # git's stdout, run in `root`; a failing command is an error. Output that
+  # is parsed (`:parse`) leaves git's stderr on the console: System.cmd can't
+  # capture it apart, and a warning (core.autocrlf's, an ambiguous refname)
+  # mixed into it would corrupt the paths or the commit. Output that isn't
+  # parsed captures stderr, so the error carries git's message.
+  defp git(root, args, mode \\ :parse) do
+    case git_raw(root, args, mode) do
+      {out, 0} ->
+        {:ok, out}
+
+      {_, status} when mode == :parse ->
+        {:error, "git #{hd(args)} failed in #{root} (exit #{status}; git's message is above)"}
+
+      {err, _} ->
+        {:error, "git #{hd(args)} failed in #{root}: #{String.trim(err)}"}
     end
   end
 
-  defp git_raw(root, args) do
-    System.cmd("git", args, cd: root, stderr_to_stdout: true)
+  defp git_raw(root, args, mode) do
+    System.cmd("git", args, cd: root, stderr_to_stdout: mode == :capture)
   rescue
     e in ErlangError -> {"can't run git in #{root}: #{Exception.message(e)}", 127}
   end

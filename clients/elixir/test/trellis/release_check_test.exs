@@ -236,6 +236,43 @@ defmodule Trellis.ReleaseCheckTest do
     assert result.migrations == [@define]
   end
 
+  # git writes warnings to stderr; none of them may reach the output the
+  # check parses. core.autocrlf warns about an edited LF file in the working
+  # tree, and the warning would otherwise prefix the first added path.
+  test "a git warning doesn't hide an added migration", %{root: root} do
+    write(root, "mix.lock", lockfile("0.3.0"))
+    write(root, @define, @trellis_migration)
+    commit(root, "bump and define")
+    git(root, ["config", "core.autocrlf", "true"])
+
+    write(
+      root,
+      "priv/repo/migrations/20260101000000_create_orders.exs",
+      "defmodule CreateOrders do\n  # edited\nend\n"
+    )
+
+    assert git_stderr(root, ["diff", "--name-only", "main"]) =~ "LF will be replaced by CRLF"
+
+    result = check(root)
+    assert result.migrations == [@define]
+    refute ReleaseCheck.ok?(result)
+  end
+
+  # A tag and a branch both named `main`: git warns that the name is
+  # ambiguous while it resolves it.
+  test "an ambiguous base still yields its merge base", %{root: root} do
+    git(root, ["tag", "main", "main"])
+    write(root, "mix.lock", lockfile("0.3.0"))
+    write(root, @define, @trellis_migration)
+    commit(root, "bump and define")
+
+    assert git_stderr(root, ["merge-base", "main", "HEAD"]) =~ "ambiguous"
+
+    result = check(root)
+    assert result.base =~ ~r/\A[0-9a-f]{40}\z/
+    refute ReleaseCheck.ok?(result)
+  end
+
   test "no base is an error that says what to pass", %{root: root} do
     for base <- ["", "  ", nil] do
       assert {:error, message} = ReleaseCheck.call(root: root, base: base)
@@ -269,6 +306,13 @@ defmodule Trellis.ReleaseCheckTest do
 
     assert {:error, message} = ReleaseCheck.call(root: dir, base: "main")
     assert message =~ "git rev-parse failed"
+  end
+
+  # What git writes to stderr for `args` in `root`: a test's precondition.
+  defp git_stderr(root, args) do
+    {stdout, 0} = System.cmd("git", args, cd: root)
+    {both, 0} = System.cmd("git", args, cd: root, stderr_to_stdout: true)
+    String.replace(both, stdout, "")
   end
 
   defp check(root, opts \\ []) do
