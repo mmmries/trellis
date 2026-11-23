@@ -526,6 +526,9 @@ pub struct ManualBackend {
     /// dropped the instant `scale_out` returns.
     scale_out_clients: Vec<EngineClient>,
     tables: HashMap<String, Table>,
+    /// The name each table in it now has where it no longer has its own
+    /// ([`Self::relocate_table`]).
+    relocated: HashMap<String, String>,
     defs: Vec<TransformDef>,
     /// How many application-worker tasks [`Backend::install`] starts the
     /// underlying [`EngineClient`] with. `1` for
@@ -847,6 +850,7 @@ impl ManualBackend {
             client_options: None,
             scale_out_clients: Vec::new(),
             tables: HashMap::new(),
+            relocated: HashMap::new(),
             defs: Vec::new(),
             application_threads,
             maintenance_interval: maintenance_interval
@@ -1034,6 +1038,20 @@ impl ManualBackend {
         if let Some(table) = self.tables.get_mut(table) {
             table.columns.retain(|c| c.name != column);
         }
+    }
+
+    /// Reads `table` under `name`, in the same schema, from now on: it was
+    /// renamed away for good (#2184). A later [`Backend::snapshot`] reads
+    /// it there and still reports it as `table`.
+    pub fn relocate_table(&mut self, table: &str, name: &str) {
+        self.relocated.insert(table.to_string(), name.to_string());
+    }
+
+    /// Runs `sql` (one or more statements) on the application's session:
+    /// DDL the application makes as the tables' owner, or a `SET` its
+    /// later writes run under.
+    pub async fn execute_app(&self, sql: &str) -> Result<(), ManualBackendError> {
+        Ok(self.app_session().batch_execute(sql).await?)
     }
 
     /// `PAUSE TRANSFORM <target>` and then `DROP TRANSFORM <target>` (the
@@ -1946,9 +1964,10 @@ impl super::Backend for ManualBackend {
         let mut snapshot: Snapshot = BTreeMap::new();
 
         for table in self.tables.values() {
+            let name = self.relocated.get(&table.name).unwrap_or(&table.name);
             let relation = match self.source_qualifier() {
-                Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&table.name)),
-                None => quote_ident(&table.name),
+                Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(name)),
+                None => quote_ident(name),
             };
             let rows = sql::read_table(&self.raw, &relation, &table.pk_col, &table.columns).await?;
             snapshot.insert(table.name.clone(), rows);
@@ -1985,13 +2004,22 @@ impl super::Backend for ManualBackend {
                     // (and, for every definition this suite actually
                     // generates, only) column.
                     let source = sql::persisted_source(&self.raw, &def.target).await?;
-                    let pk = match source_primary_key(&self.pool, &source).await {
-                        Ok(pk) => pk[0].name.clone(),
-                        // A source key re-typed to a type define refuses as
-                        // a key (#2184): the target, paused, still holds
-                        // the column it copied.
-                        Err(DdlError::UnsupportedPrimaryKeyType { column, .. }) => column,
-                        Err(other) => return Err(other.into()),
+                    let relocated = self
+                        .relocated
+                        .contains_key(&def.source)
+                        .then(|| self.tables.get(&def.source))
+                        .flatten();
+                    let pk = match relocated {
+                        // Gone from its name: the key is the model's.
+                        Some(table) => table.pk_col.clone(),
+                        None => match source_primary_key(&self.pool, &source).await {
+                            Ok(pk) => pk[0].name.clone(),
+                            // A source key re-typed to a type define refuses as
+                            // a key (#2184): the target, paused, still holds
+                            // the column it copied.
+                            Err(DdlError::UnsupportedPrimaryKeyType { column, .. }) => column,
+                            Err(other) => return Err(other.into()),
+                        },
                     };
                     let target_columns: Vec<Column> = std::iter::once(Column {
                         name: pk.clone(),

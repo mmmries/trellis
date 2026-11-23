@@ -2529,11 +2529,18 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 ///   the column as, and a widening that outgrows a copy, pause them by the
 ///   pass's type checks. Each `RESUME` makes them exact.
 /// - `resume_refused`: a read column renamed away or dropped pauses its
-///   readers, and their `RESUME` refuses while it is missing.
+///   readers, and their `RESUME` refuses while it is missing; so does the
+///   table renamed away for good.
+/// - `resumed_exact` also: the table renamed, or moved to another schema,
+///   across a pass, or dropped and created again, pauses its readers by the
+///   capture audit.
 ///
 /// `collate_nondeterministic` has no floor: its `nondeterministic-collation`
 /// gap needs a definition comparing the `text` column, which drawn
 /// definitions hardly ever have. A pin in `tests/source_ddl.rs` covers it.
+/// Neither has `source-rename-roundtrip`: only a partitioned source loses
+/// writes to a rename and back, and this tier draws plain tables; pins
+/// cover it too.
 ///
 /// Draws are deterministic. Only a draw with an event a floor still waits
 /// for is run, until every floor holds, so this costs a few dozen cases
@@ -2559,6 +2566,11 @@ async fn source_ddl_actions_reach_their_verdict_floors() {
         (&["retype_outgrow", "retype_outgrow_using"], "resumed_exact"),
         (&["swap_column_names", "shadow_column"], "listed_gap"),
         (&["rename_column", "drop_column"], "resume_refused"),
+        (
+            &["rename_table", "move_schema", "recreate_table"],
+            "resumed_exact",
+        ),
+        (&["rename_table_away"], "resume_refused"),
     ];
     let cluster = testkit::TestCluster::start();
     let server = {

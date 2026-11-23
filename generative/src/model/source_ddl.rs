@@ -157,6 +157,26 @@ pub enum SourceDdl {
     /// audit sees it, so it must pause the table's readers either way
     /// (#2184's decision 4).
     DisableCaptureTriggers,
+    /// The table renamed to `<table>_away` when the event fires, the
+    /// window's writes naming it there, and its name given back at the
+    /// close. Within one reconcile interval this is the register's
+    /// [`Gap::SourceRenameRoundtrip`]; a pass in between finds the table
+    /// gone from its name and pauses its readers.
+    RenameTable,
+    /// The table moved to [`MOVED_SCHEMA`] when the event fires, the
+    /// window's writes finding it there through the application's
+    /// `search_path`, and moved back at the close.
+    MoveSchema,
+    /// The table renamed to `<table>_away` for good, the program's last
+    /// DDL: its readers pause, and their `RESUME` refuses while it is
+    /// missing.
+    RenameTableAway,
+    /// The table dropped and created again under its name as a table swap
+    /// does (`LIKE … INCLUDING ALL`, its rows copied, the old one dropped
+    /// and the new one renamed onto its name), as the application. The
+    /// window's writes reach the new table, which carries no capture
+    /// trigger: a pass pauses its readers either way.
+    RecreateTable,
     /// `OWNER TO` [`HEIR_ROLE`](crate::backend::HEIR_ROLE), which Trellis
     /// and the application both inherit, and back at the close.
     OwnerToHeir,
@@ -216,6 +236,8 @@ impl SourceDdl {
                 | SourceDdl::FlipNotNull { .. }
                 | SourceDdl::SetDefault { .. }
                 | SourceDdl::Collate { .. }
+                | SourceDdl::RenameTable
+                | SourceDdl::MoveSchema
         ) || self.privilege()
     }
 
@@ -228,7 +250,15 @@ impl SourceDdl {
             SourceDdl::RenameColumn { .. }
                 | SourceDdl::DropColumn { .. }
                 | SourceDdl::GeneratedColumn { .. }
+                | SourceDdl::RenameTableAway
         )
+    }
+
+    /// Whether the table leaves its name until the close: the generator
+    /// keeps the table's partition maintenance out of the window, since it
+    /// names the root.
+    pub fn moves_table(&self) -> bool {
+        matches!(self, SourceDdl::RenameTable | SourceDdl::MoveSchema)
     }
 
     /// Whether the run drains the window's changes before the closing
@@ -308,6 +338,10 @@ impl SourceDdl {
             SourceDdl::RewriteColumn { .. } => "rewrite_column",
             SourceDdl::RewriteBesideDefault { .. } => "rewrite_beside_default",
             SourceDdl::DisableCaptureTriggers => "disable_capture_triggers",
+            SourceDdl::RenameTable => "rename_table",
+            SourceDdl::MoveSchema => "move_schema",
+            SourceDdl::RenameTableAway => "rename_table_away",
+            SourceDdl::RecreateTable => "recreate_table",
             SourceDdl::RenameColumn { .. } => "rename_column",
             SourceDdl::DropColumn { .. } => "drop_column",
             SourceDdl::DropAndAddColumn { .. } => "drop_and_add_column",
@@ -385,6 +419,17 @@ impl SourceDdlEvent {
             )
         ) {
             return vec![Gap::ColumnNameSwap];
+        }
+        // A partitioned source renamed away and back, or moved to another
+        // schema and back, with no pass between: its capture stages nothing
+        // while the source's name doesn't resolve to the tree's root. A
+        // plain table's capture has no such check.
+        let partitioned = program
+            .tables
+            .iter()
+            .any(|t| t.name == self.table && t.partitioning.is_some());
+        if self.action.moves_table() && !self.pass_inside && partitioned {
+            return vec![Gap::SourceRenameRoundtrip];
         }
         // The pass doesn't see a read column's collation change, pass or no
         // pass: the rows computed under it keep its comparisons after the
@@ -481,6 +526,15 @@ impl SourceDdlEvent {
     pub fn last_op(&self) -> usize {
         self.op + self.window
     }
+}
+
+/// The schema a [`SourceDdl::MoveSchema`] moves the table to.
+pub const MOVED_SCHEMA: &str = "trellis_moved";
+
+/// The name a [`SourceDdl::RenameTable`] or [`SourceDdl::RenameTableAway`]
+/// gives the table.
+pub fn table_away(table: &str) -> String {
+    format!("{table}_away")
 }
 
 /// The declared type of a column a [`SourceDdl::Retype`] changes, before or

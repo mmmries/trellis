@@ -13,10 +13,11 @@ use generative::gaps::Gap;
 use generative::generate::source_ddl::{calls_collation_refusing_function, source_ddl_plan_for};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
-    trivial_program,
+    partition_table, trivial_program,
 };
 use generative::model::{
-    Collation, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType,
+    Collation, PartitionStrategy, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent,
+    SourceDdlPlan, SqlType,
 };
 use generative::run::judge::Verdict;
 use generative::run::{
@@ -119,7 +120,7 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let strategy = program_with_source_ddl_plan();
     let mut seen = std::collections::BTreeSet::new();
     let mut windows = false;
-    for _ in 0..2000 {
+    for _ in 0..3000 {
         let (program, plan) = strategy
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
@@ -195,6 +196,10 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         "set_default_beside_vacuum",
         "collate_c",
         "collate_nondeterministic",
+        "rename_table",
+        "move_schema",
+        "rename_table_away",
+        "recreate_table",
     ] {
         for pass in [false, true] {
             assert!(
@@ -1384,4 +1389,173 @@ fn a_table_read_through_a_collation_refusing_function_draws_only_c() {
         collations,
         std::collections::BTreeSet::from(["C".to_string()])
     );
+}
+
+/// One source table, `LIST`-partitioned by its grain (one leaf per value),
+/// with a `SUM`/`COUNT` aggregate grouped by it, and the same ops as
+/// [`one_to_one_and_aggregate_program`].
+fn partitioned_aggregate_program() -> Program {
+    let mut program = build_program_multi_with_shapes(
+        &[TableSpec {
+            seed_values: vec![
+                (Some(10), Some(1)),
+                (Some(20), Some(2)),
+                (Some(30), Some(3)),
+            ],
+            text_values: vec![None, None, None],
+            bool_values: vec![None, None, None],
+            uuid_values: vec![None, None, None],
+            grain_values: vec![
+                Some("0".to_string()),
+                Some("0".to_string()),
+                Some("1".to_string()),
+            ],
+            mutates: vec![
+                Mutate::Update {
+                    pk: 1,
+                    c1: Some(100),
+                    c2: Some(5),
+                },
+                Mutate::Delete { pk: 2 },
+                Mutate::Update {
+                    pk: 3,
+                    c1: Some(7),
+                    c2: None,
+                },
+            ],
+        }],
+        &[(
+            0,
+            DefShape::Aggregate {
+                functions: vec![AggregateFn::Sum(AggregateColumn::C1), AggregateFn::Count],
+            },
+        )],
+    );
+    assert_eq!(program.ops.len(), 6);
+    program = partition_table(
+        program,
+        0,
+        PartitionStrategy::List {
+            values: 2,
+            default: false,
+        },
+    );
+    program
+}
+
+/// The verdicts after `action` on `program`'s first table: fired after op
+/// 3 with ops 4 and 5 (a delete and an update) in its window, or after the
+/// last op with none for a change later ops couldn't write through.
+async fn run_table_action(program: &Program, action: SourceDdl, pass_inside: bool) -> Vec<Verdict> {
+    let (op, window) = if action.terminal() { (5, 0) } else { (3, 2) };
+    run_one(program, event(program, op, action, window, pass_inside)).await
+}
+
+/// Every verdict is a pause for the table gone from its name, exact after
+/// its `RESUME`.
+fn assert_paused_for_the_missing_table(verdicts: Vec<Verdict>) {
+    for verdict in verdicts {
+        assert!(
+            matches!(
+                &verdict,
+                Verdict::ResumedExact { reason }
+                    if reason.contains("the table public.t0 no longer exists at that name")
+            ),
+            "{verdict:?}"
+        );
+    }
+}
+
+/// A plain source renamed away and back, or moved to another schema and
+/// back, with its writes in between and no pass until after, stays exact:
+/// a plain table's capture stages a write whatever the table is called.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_source_renamed_or_moved_and_back_inside_one_interval_stays_exact() {
+    let program = one_to_one_and_aggregate_program();
+    for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
+        let verdicts = run_table_action(&program, action.clone(), false).await;
+        assert_eq!(verdicts, vec![Verdict::Exact; 2], "{action:?}");
+    }
+}
+
+/// The register's `source-rename-roundtrip`: a partitioned source renamed
+/// away and back, or moved to another schema and back, inside one interval
+/// loses the writes in between (its capture stages nothing while the
+/// source's name doesn't resolve to the root); `self_check` reports it and
+/// `PAUSE`/`RESUME` repairs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_source_renamed_or_moved_and_back_inside_one_interval_is_the_listed_gap() {
+    let program = partitioned_aggregate_program();
+    for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
+        let event = event(&program, 3, action.clone(), 2, false);
+        assert_eq!(
+            event.listed_gaps(&program, Server::default()),
+            vec![Gap::SourceRenameRoundtrip]
+        );
+        let verdicts = run_one(&program, event).await;
+        assert_eq!(
+            verdicts,
+            vec![Verdict::ListedGap(Gap::SourceRenameRoundtrip)],
+            "{action:?}"
+        );
+    }
+}
+
+/// The same with a pass while the source is away: the pass finds the table
+/// gone from its name and pauses its readers, and their `RESUME` after it
+/// is back makes them exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_renamed_or_moved_across_a_pass_pauses_its_readers() {
+    for program in [
+        one_to_one_and_aggregate_program(),
+        partitioned_aggregate_program(),
+    ] {
+        for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
+            assert_paused_for_the_missing_table(run_table_action(&program, action, true).await);
+        }
+    }
+}
+
+/// A source dropped and created again with its rows, as a table swap does,
+/// pauses its readers pass or no pass: the new table carries no capture
+/// trigger, and the window's writes reach it uncaptured. `RESUME` makes
+/// them exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_dropped_and_created_again_pauses_its_readers() {
+    let program = one_to_one_and_aggregate_program();
+    for pass_inside in [false, true] {
+        for verdict in run_table_action(&program, SourceDdl::RecreateTable, pass_inside).await {
+            assert!(
+                matches!(
+                    &verdict,
+                    Verdict::ResumedExact { reason }
+                        if reason.contains("Trellis's capture of public.t0 was changed outside Trellis")
+                            && reason.contains("is gone")
+                ),
+                "pass_inside={pass_inside}: {verdict:?}"
+            );
+        }
+    }
+}
+
+/// A source renamed away for good pauses its readers, and their `RESUME`
+/// refuses while it is missing (T0126).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_renamed_away_for_good_pauses_and_its_resume_refuses() {
+    for program in [
+        one_to_one_and_aggregate_program(),
+        partitioned_aggregate_program(),
+    ] {
+        for pass_inside in [false, true] {
+            let verdicts =
+                run_table_action(&program, SourceDdl::RenameTableAway, pass_inside).await;
+            assert!(!verdicts.is_empty());
+            for verdict in verdicts {
+                assert!(
+                    matches!(&verdict, Verdict::ResumeRefused { code, .. } if code == "T0126"),
+                    "pass_inside={pass_inside}: {verdict:?}"
+                );
+            }
+        }
+    }
 }

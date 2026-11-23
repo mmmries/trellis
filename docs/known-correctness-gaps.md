@@ -76,8 +76,8 @@ while every rule holds.
 * **Use logged tables as sources.** Postgres empties an unlogged table on a
   crash, a failover or a physical restore.
 * **On a partitioned source, change a partition key with `UPDATE`** (or
-  `DELETE` and `INSERT`), not `MERGE`; rename or re-parent the source only
-  while its transforms are paused; and let a reconcile pass run between
+  `DELETE` and `INSERT`), not `MERGE`; rename, move or re-parent the source
+  only while its transforms are paused; and let a reconcile pass run between
   creating or attaching a leaf beside a `DEFAULT` partition and removing it,
   and between partition maintenance and a `pg_upgrade`
   ([below](#a-merge-that-moves-a-row-to-another-partition)).
@@ -416,10 +416,11 @@ with `DELETE` and `INSERT`.
 
 ### The source renamed or re-parented and back within one pass
 
-**When:** before the next reconcile pass, the source is renamed away and back
-(`ALTER TABLE orders RENAME TO orders_old`, then back), or attached under
-another partitioned table and detached again. A pass that sees the source
-renamed away, or attached elsewhere, pauses its readers.
+**When:** before the next reconcile pass, a partitioned source is renamed
+away and back (`ALTER TABLE orders RENAME TO orders_old`, then back), moved
+to another schema and back, or attached under another partitioned table and
+detached again. A pass that sees the source renamed away, moved, or attached
+elsewhere, pauses its readers.
 
 **What goes wrong:** capture stages a write only while the source's name
 resolves to the root of the tree being written, so every write made in
@@ -429,8 +430,8 @@ Nothing in the catalog differs afterwards.
 **Detected by:** `self_check`.
 
 **Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
-`request_backfill` it. To avoid it, rename or re-parent a source only while
-its transforms are paused.
+`request_backfill` it. To avoid it, rename, move or re-parent a source only
+while its transforms are paused.
 
 **Ends with:** [#1652](https://github.com/salesforce-misc/trellis/issues/1652).
 
