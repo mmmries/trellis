@@ -3,7 +3,51 @@
 //! between a program's ops with changes in flight, and judged by "never
 //! silently wrong" (`crate::run::judge`).
 
+use trellis::dev::defs::IntWidth;
+use trellis::dev::defs::ast::ValueType;
+
 use crate::gaps::Gap;
+
+/// What the server under test does that decides which register shapes an
+/// event reproduces ([`SourceDdlEvent::listed_gaps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Server {
+    /// Whether an `ALTER COLUMN ... TYPE` stamps `pg_attver` into the
+    /// `attoptions` of the column and of every column after it, as
+    /// PostgreSQL 15.20, 16.16, 17.12, 18.7 and later minors do.
+    pub versions_attributes: bool,
+}
+
+impl Server {
+    /// Probes the server on a temporary table of `client`'s session, which
+    /// it drops again.
+    pub async fn probe(client: &tokio_postgres::Client) -> Result<Self, String> {
+        client
+            .batch_execute(
+                "create temp table trellis_attver_probe (c int); \
+                 alter table trellis_attver_probe alter column c type bigint",
+            )
+            .await
+            .map_err(|e| format!("probe a retype: {e}"))?;
+        let versions_attributes: bool = client
+            .query_one(
+                "select coalesce(array_to_string(attoptions, ','), '') like '%pg_attver=%' \
+                 from pg_catalog.pg_attribute \
+                 where attrelid = 'pg_temp.trellis_attver_probe'::regclass and attname = 'c'",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("read the probe: {e}"))?
+            .get(0);
+        client
+            .batch_execute("drop table pg_temp.trellis_attver_probe")
+            .await
+            .map_err(|e| format!("drop the probe: {e}"))?;
+        Ok(Self {
+            versions_attributes,
+        })
+    }
+}
 
 /// One drawn change to a tracked source table, or to who may read or write
 /// it (#2182, [`SourceDdl::privilege`]). Each runs as one or two groups of
@@ -31,6 +75,18 @@ pub enum SourceDdl {
     /// rewrite), unless the server versions attributes and a read column
     /// follows this one; across a pass the pass sees the rewrite alone.
     RewriteBesideDefault { column: String },
+    /// `ALTER COLUMN column TYPE to`, with `USING column + 1` (`+ 10` on a
+    /// key column) when `using`: a re-type the triggers don't see. `shape`
+    /// says what kind of change it is to the column's type before it, which
+    /// decides what the register expects ([`SourceDdlEvent::listed_gaps`]).
+    /// A key column's `USING` changes the keys later ops address, so the
+    /// generator draws one only at the program's last op.
+    Retype {
+        column: String,
+        to: SqlType,
+        using: bool,
+        shape: RetypeShape,
+    },
     /// Every capture trigger on the table disabled by name when the event
     /// fires and enabled again (`ENABLE ALWAYS`, as Trellis installs them)
     /// at its close, so the window's writes are never captured. The capture
@@ -154,6 +210,7 @@ impl SourceDdl {
             SourceDdl::RewriteColumn { .. } => "rewrite_column",
             SourceDdl::RewriteBesideDefault { .. } => "rewrite_beside_default",
             SourceDdl::DisableCaptureTriggers => "disable_capture_triggers",
+            SourceDdl::Retype { using, shape, .. } => shape.kind(*using),
             SourceDdl::OwnerToHeir => "owner_to_heir",
             SourceDdl::OwnerToOther => "owner_to_other",
             SourceDdl::RevokeSelect => "revoke_select",
@@ -192,19 +249,152 @@ pub struct SourceDdlEvent {
 }
 
 impl SourceDdlEvent {
-    /// The register entries this event may reproduce: a definition may end
-    /// silently wrong after it only as one of these, detected by
-    /// `self_check` and made exact by the entry's repair.
-    pub fn listed_gaps(&self) -> Vec<Gap> {
-        match (&self.action, self.pass_inside) {
-            (SourceDdl::RewriteBesideDefault { .. }, false) => vec![Gap::AlterTypeRewrite],
-            _ => Vec::new(),
+    /// The register entries this event may reproduce on `server`: a
+    /// definition may end silently wrong after it only as one of these,
+    /// detected by `self_check` and made exact by the entry's repair. Where
+    /// the server versions attributes, a rewrite also moves the catalog row
+    /// of every column after the rewritten one, so a read one shows the pass
+    /// the rewrite: the shape is the register's only with no read column
+    /// after it.
+    pub fn listed_gaps(&self, program: &crate::model::Program, server: Server) -> Vec<Gap> {
+        let column = match (&self.action, self.pass_inside) {
+            (SourceDdl::RewriteBesideDefault { column }, false) => column,
+            // The register's "widening that changes values": the pass sees a
+            // widening and nothing to re-read, so a reader whose copies the
+            // widening doesn't outgrow keeps the old values, pass or no pass.
+            (
+                SourceDdl::Retype {
+                    column,
+                    using: true,
+                    shape: RetypeShape::Widen | RetypeShape::Outgrow,
+                    ..
+                },
+                _,
+            ) => column,
+            _ => return Vec::new(),
+        };
+        if server.versions_attributes && self.read_column_after(program, column) {
+            return Vec::new();
         }
+        vec![Gap::AlterTypeRewrite]
+    }
+
+    /// Whether a definition reads a column of the event's table that comes
+    /// after `column` (by `attnum`). The key counts: capture images it.
+    /// The tier draws no `JOIN`, so a definition reads the table only as
+    /// its `FROM`.
+    fn read_column_after(&self, program: &crate::model::Program, column: &str) -> bool {
+        let Some(table) = program.tables.iter().find(|t| t.name == self.table) else {
+            return false;
+        };
+        let read: Vec<String> = program
+            .defs
+            .iter()
+            .filter(|d| d.source == table.name)
+            .flat_map(crate::generate::columns_read)
+            .chain([table.pk_col.clone()])
+            .collect();
+        table
+            .columns
+            .iter()
+            .skip_while(|c| c.name != column)
+            .skip(1)
+            .any(|c| read.contains(&c.name))
+    }
+
+    /// Makes `program`'s model of the event's table follow the event: a
+    /// re-typed column takes its new type, which the oracle reads. Every
+    /// other action leaves the model as it is.
+    pub fn follow(&self, program: &mut crate::model::Program) {
+        let SourceDdl::Retype { column, to, .. } = &self.action else {
+            return;
+        };
+        let table = program
+            .tables
+            .iter_mut()
+            .find(|t| t.name == self.table)
+            .unwrap_or_else(|| panic!("{self:?} names no table of the program"));
+        let col = table
+            .columns
+            .iter_mut()
+            .find(|c| &c.name == column)
+            .unwrap_or_else(|| panic!("{self:?} names no column of {}", table.name));
+        col.value_type = to.value_type();
     }
 
     /// The last op the event spans.
     pub fn last_op(&self) -> usize {
         self.op + self.window
+    }
+}
+
+/// The declared type of a column a [`SourceDdl::Retype`] changes, before or
+/// after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlType {
+    Numeric {
+        precision: u8,
+        scale: u8,
+    },
+    /// `numeric` with no modifier.
+    NumericFree,
+    Int4,
+    Int8,
+}
+
+impl SqlType {
+    /// The type as an `ALTER COLUMN ... TYPE` names it.
+    pub fn sql(self) -> String {
+        match self {
+            SqlType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
+            SqlType::NumericFree => "numeric".to_string(),
+            SqlType::Int4 => "integer".to_string(),
+            SqlType::Int8 => "bigint".to_string(),
+        }
+    }
+
+    /// The model's type for a column of this type, which the oracle reads.
+    pub fn value_type(self) -> ValueType {
+        match self {
+            SqlType::Numeric { .. } | SqlType::NumericFree => ValueType::Numeric,
+            SqlType::Int4 => ValueType::Integer(IntWidth::Int4),
+            SqlType::Int8 => ValueType::Integer(IntWidth::Int8),
+        }
+    }
+}
+
+/// What a [`SourceDdl::Retype`] does to the column's type
+/// (`docs/staging-and-claiming/capture-drift.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetypeShape {
+    /// A pure widening every copy Trellis keeps still holds: more `numeric`
+    /// precision at the same scale, or the modifier dropped. Without
+    /// `USING` no value changes, and nothing needs doing.
+    Widen,
+    /// Neither a widening nor a re-type of the key: a narrower `numeric`
+    /// scale, or `numeric` to `integer`. A changed column: its readers are
+    /// re-read, or paused where define would now read them otherwise.
+    Narrow,
+    /// A widening that outgrows a copy a reader may keep: `integer` to
+    /// `bigint` or to `numeric`. Those readers pause, and `RESUME` re-types
+    /// and rebuilds them.
+    Outgrow,
+    /// A re-type of the primary key column.
+    Key,
+}
+
+impl RetypeShape {
+    fn kind(self, using: bool) -> &'static str {
+        match (self, using) {
+            (RetypeShape::Widen, false) => "retype_widen",
+            (RetypeShape::Widen, true) => "retype_widen_using",
+            (RetypeShape::Narrow, false) => "retype_narrow",
+            (RetypeShape::Narrow, true) => "retype_narrow_using",
+            (RetypeShape::Outgrow, false) => "retype_outgrow",
+            (RetypeShape::Outgrow, true) => "retype_outgrow_using",
+            (RetypeShape::Key, false) => "retype_key",
+            (RetypeShape::Key, true) => "retype_key_using",
+        }
     }
 }
 

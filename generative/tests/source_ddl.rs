@@ -15,7 +15,9 @@ use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     trivial_program,
 };
-use generative::model::{Program, SourceDdl, SourceDdlEvent, SourceDdlPlan};
+use generative::model::{
+    Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType,
+};
 use generative::run::judge::Verdict;
 use generative::run::{
     RunError, SourceDdlRun, run_convergence_with_source_ddl,
@@ -117,7 +119,7 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let strategy = program_with_source_ddl_plan();
     let mut seen = std::collections::BTreeSet::new();
     let mut windows = false;
-    for _ in 0..500 {
+    for _ in 0..2000 {
         let (program, plan) = strategy
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
@@ -132,6 +134,18 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
             assert!(end.is_none_or(|end| event.op > end), "{plan:?}");
             end = Some(event.last_op());
             windows |= event.window > 0;
+            if let SourceDdl::Retype {
+                using: true,
+                shape: RetypeShape::Key,
+                ..
+            } = &event.action
+            {
+                assert_eq!(
+                    event.op + 1,
+                    program.ops.len(),
+                    "a key rewrite before the last op: {event:?}"
+                );
+            }
             seen.insert((event.action.kind(), event.pass_inside));
         }
     }
@@ -143,6 +157,14 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         "rewrite_column",
         "rewrite_beside_default",
         "disable_capture_triggers",
+        "retype_widen",
+        "retype_widen_using",
+        "retype_narrow",
+        "retype_narrow_using",
+        "retype_outgrow",
+        "retype_outgrow_using",
+        "retype_key",
+        "retype_key_using",
     ] {
         for pass in [false, true] {
             assert!(
@@ -215,34 +237,28 @@ fn grain(program: &Program) -> String {
     grain
 }
 
-/// Whether `cluster`'s server versions attributes the way PostgreSQL's
-/// 2026-11 minors do (15.20, 16.16, 17.12, 18.7): an `ALTER COLUMN ... TYPE`
-/// stamps `pg_attver` into the `attoptions` of the column and of every
-/// column after it.
+/// Whether `cluster`'s server versions attributes ([`Server`]).
 async fn server_versions_attributes(cluster: &TestCluster) -> bool {
     let db = CaseDatabase::provision(cluster).await;
     let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
         .await
         .expect("connect the probe");
     tokio::spawn(connection);
-    client
-        .batch_execute(
-            "create temp table attver_probe (c int); \
-             alter table attver_probe alter column c type bigint",
-        )
+    Server::probe(&client)
         .await
-        .expect("probe a retype");
-    client
-        .query_one(
-            "select coalesce(array_to_string(attoptions, ','), '') like '%pg_attver=%' \
-             from pg_catalog.pg_attribute \
-             where attrelid = 'pg_temp.attver_probe'::regclass and attname = 'c'",
-            &[],
-        )
-        .await
-        .expect("read the probe")
-        .get(0)
+        .expect("probe the server")
+        .versions_attributes
 }
+
+/// Both kinds of server, for a shape the register lists on either.
+const SERVERS: [Server; 2] = [
+    Server {
+        versions_attributes: false,
+    },
+    Server {
+        versions_attributes: true,
+    },
+];
 
 /// `c1`, the column both definitions read.
 fn c1(program: &Program) -> String {
@@ -390,7 +406,12 @@ async fn a_rewrite_of_the_last_read_column_beside_a_default_is_the_listed_gap() 
         1,
         false,
     );
-    assert_eq!(event.listed_gaps(), vec![Gap::AlterTypeRewrite]);
+    for server in SERVERS {
+        assert_eq!(
+            event.listed_gaps(&program, server),
+            vec![Gap::AlterTypeRewrite]
+        );
+    }
     assert_eq!(
         run_one(&program, event).await,
         [Verdict::Exact, Verdict::ListedGap(Gap::AlterTypeRewrite)]
@@ -419,6 +440,11 @@ async fn a_rewrite_beside_a_default_is_reread_through_a_later_read_column_where_
         1,
         false,
     );
+    assert_eq!(event.listed_gaps(&program, SERVERS[1]), Vec::new());
+    assert_eq!(
+        event.listed_gaps(&program, SERVERS[0]),
+        vec![Gap::AlterTypeRewrite]
+    );
     let plan = SourceDdlPlan {
         events: vec![event.clone()],
     };
@@ -443,7 +469,9 @@ async fn a_rewrite_after_a_default_across_a_pass_is_reread() {
         1,
         true,
     );
-    assert!(event.listed_gaps().is_empty());
+    for server in SERVERS {
+        assert!(event.listed_gaps(&program, server).is_empty());
+    }
     for verdict in run_one(&program, event).await {
         assert_eq!(verdict, Verdict::Exact);
     }
@@ -471,7 +499,7 @@ async fn the_same_shape_without_its_register_entry_fails_as_silently_wrong() {
         .await
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
-    match run_convergence_with_source_ddl_allowing(&mut backend, &pool, &program, &plan, |_| {
+    match run_convergence_with_source_ddl_allowing(&mut backend, &pool, &program, &plan, |_, _| {
         Vec::new()
     })
     .await
@@ -611,4 +639,311 @@ async fn a_rewrite_of_a_group_by_column_with_a_change_in_flight_is_reread() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rewrite_of_a_group_by_column_after_its_changes_settle_is_reread() {
     rewrite_group_by_column(&one_row_grouped_program(), 1, false).await;
+}
+
+// ---------------------------------------------------------------------
+// `ALTER COLUMN TYPE` (#2184 slice 3). On `one_to_one_and_aggregate_program`
+// the 1-1 reads `c1` in its calculated field `total` (`c1 + c2`) and the
+// aggregate reads `c1` in `SUM(c1)` and groups by the grain column.
+// ---------------------------------------------------------------------
+
+fn retype(column: &str, to: SqlType, using: bool, shape: RetypeShape) -> SourceDdl {
+    SourceDdl::Retype {
+        column: column.to_string(),
+        to,
+        using,
+        shape,
+    }
+}
+
+const NUMERIC_16_2: SqlType = SqlType::Numeric {
+    precision: 16,
+    scale: 2,
+};
+
+/// The verdicts after each of `plan`'s events, in order.
+async fn run_plan(program: &Program, plan: SourceDdlPlan) -> Vec<Vec<Verdict>> {
+    let cluster = TestCluster::start();
+    let run = run(&cluster, program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    plan.events
+        .iter()
+        .map(|event| verdicts_after(&run, event))
+        .collect()
+}
+
+fn is_resumed(verdict: &Verdict) -> bool {
+    matches!(verdict, Verdict::ResumedExact { .. })
+}
+
+/// A pure widening of a modifier (`numeric(14,2)` to `numeric(16,2)`, and to
+/// a bare `numeric`) changes only the catalog: no copy has a modifier, so
+/// nothing pauses or re-reads, and every definition stays exact with
+/// changes in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pure_widening_of_a_read_column_keeps_every_definition_exact() {
+    let program = one_to_one_and_aggregate_program();
+    let c1 = c1(&program);
+    let grain = grain(&program);
+    let plan = SourceDdlPlan {
+        events: vec![
+            event(
+                &program,
+                1,
+                retype(&c1, NUMERIC_16_2, false, RetypeShape::Widen),
+                1,
+                false,
+            ),
+            event(
+                &program,
+                3,
+                retype(&grain, SqlType::NumericFree, false, RetypeShape::Widen),
+                1,
+                true,
+            ),
+        ],
+    };
+    for verdicts in run_plan(&program, plan).await {
+        assert_eq!(verdicts, [Verdict::Exact, Verdict::Exact]);
+    }
+}
+
+/// The register's "widening that changes values" (`alter-type-rewrite`):
+/// `USING` changes every value of the `GROUP BY` column, the table's last
+/// read column, and the pass sees only a widening no copy outgrows, so the
+/// aggregate keeps its old groups. `self_check` reports them and
+/// `request_backfill` repairs them. The 1-1 doesn't read the column.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_widening_that_changes_values_is_the_listed_gap() {
+    let program = one_to_one_and_aggregate_program();
+    let grain = grain(&program);
+    for (to, pass_inside) in [(NUMERIC_16_2, false), (SqlType::NumericFree, true)] {
+        let event = event(
+            &program,
+            3,
+            retype(&grain, to, true, RetypeShape::Widen),
+            1,
+            pass_inside,
+        );
+        for server in SERVERS {
+            assert_eq!(
+                event.listed_gaps(&program, server),
+                vec![Gap::AlterTypeRewrite]
+            );
+        }
+        assert_eq!(
+            run_one(&program, event).await,
+            [Verdict::Exact, Verdict::ListedGap(Gap::AlterTypeRewrite)],
+            "{to:?}"
+        );
+    }
+}
+
+/// A narrower `numeric` scale, with `USING`, of a column read as a field is
+/// a changed column both readers are still valid over: the pass re-reads
+/// the table. The same of a `GROUP BY` column changes values, not only their
+/// text (ADR-0020), so the aggregate pauses, and its `RESUME` ends with
+/// every group equal by value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrower_scale_is_reread() {
+    let program = one_to_one_and_aggregate_program();
+    let narrower = SqlType::Numeric {
+        precision: 14,
+        scale: 1,
+    };
+    let plan = SourceDdlPlan {
+        events: vec![
+            event(
+                &program,
+                1,
+                retype(&c1(&program), narrower, true, RetypeShape::Narrow),
+                1,
+                false,
+            ),
+            event(
+                &program,
+                3,
+                retype(&grain(&program), narrower, false, RetypeShape::Narrow),
+                1,
+                true,
+            ),
+        ],
+    };
+    let verdicts = run_plan(&program, plan).await;
+    assert_eq!(verdicts[0], [Verdict::Exact, Verdict::Exact]);
+    assert_eq!(verdicts[1][0], Verdict::Exact);
+    assert!(is_resumed(&verdicts[1][1]), "{verdicts:?}");
+}
+
+/// `numeric` to `integer` changes the type both definitions evaluate `c1`
+/// as, so both pause, and `RESUME` re-types and rebuilds them. Then `integer`
+/// to `bigint` (and, in the second case, with `USING`) outgrows the
+/// `bigint` sum the `RESUME` made: it pauses again. The 1-1's `total`
+/// holds no copy of the column, so the widening with `USING` is the
+/// register's listed gap there, unless the server versions attributes: then
+/// the rewrite moves the rows of the read columns after `c1`, and the pass
+/// after the pause re-reads the 1-1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_widening_that_outgrows_a_copy_pauses_its_readers() {
+    let program = one_to_one_and_aggregate_program();
+    let c1 = c1(&program);
+    let versioned = server_versions_attributes(&TestCluster::start()).await;
+    for using in [false, true] {
+        let plan = SourceDdlPlan {
+            events: vec![
+                event(
+                    &program,
+                    1,
+                    retype(&c1, SqlType::Int4, using, RetypeShape::Narrow),
+                    1,
+                    false,
+                ),
+                event(
+                    &program,
+                    3,
+                    retype(&c1, SqlType::Int8, using, RetypeShape::Outgrow),
+                    1,
+                    using,
+                ),
+            ],
+        };
+        let verdicts = run_plan(&program, plan).await;
+        assert!(
+            verdicts[0].iter().all(is_resumed),
+            "using={using}: {verdicts:?}"
+        );
+        let one_to_one = if using && !versioned {
+            Verdict::ListedGap(Gap::AlterTypeRewrite)
+        } else {
+            Verdict::Exact
+        };
+        assert_eq!(verdicts[1][0], one_to_one, "using={using}");
+        assert!(is_resumed(&verdicts[1][1]), "using={using}: {verdicts:?}");
+    }
+}
+
+/// The primary key narrowed from `bigint` to `integer` with changes in
+/// flight: every stored key renders the same and every copy still holds
+/// the column, so no definition pauses, and the pass re-reads the table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_narrowing_every_copy_holds_keeps_every_definition_exact() {
+    let program = one_to_one_and_aggregate_program();
+    let pk = program.tables[0].pk_col.clone();
+    for pass_inside in [false, true] {
+        let event = event(
+            &program,
+            2,
+            retype(&pk, SqlType::Int4, false, RetypeShape::Key),
+            2,
+            pass_inside,
+        );
+        assert_eq!(
+            run_one(&program, event).await,
+            [Verdict::Exact, Verdict::Exact],
+            "pass_inside={pass_inside}"
+        );
+    }
+}
+
+/// The primary key made a `numeric`, which define refuses as a source key:
+/// both readers pause, and their `RESUME` refuses with its code.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_retyped_to_a_refused_type_pauses_and_its_resume_refuses() {
+    let program = one_to_one_and_aggregate_program();
+    let pk = program.tables[0].pk_col.clone();
+    let event = event(
+        &program,
+        2,
+        retype(&pk, SqlType::NumericFree, false, RetypeShape::Key),
+        1,
+        false,
+    );
+    let verdicts = run_one(&program, event).await;
+    for verdict in &verdicts {
+        assert!(
+            matches!(verdict, Verdict::ResumeRefused { code, .. } if code == "T0121"),
+            "{verdicts:?}"
+        );
+    }
+}
+
+/// A same-type `USING` rewrite of the primary key at the program's last op:
+/// every key changes. The pass sees the rewrite, so the 1-1 is rebuilt
+/// under the new keys and no row stays under an old one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_rewrite_at_the_last_op_is_reread() {
+    let program = one_to_one_and_aggregate_program();
+    let pk = program.tables[0].pk_col.clone();
+    for pass_inside in [false, true] {
+        let event = event(
+            &program,
+            5,
+            retype(&pk, SqlType::Int8, true, RetypeShape::Key),
+            0,
+            pass_inside,
+        );
+        assert_eq!(
+            run_one(&program, event).await,
+            [Verdict::Exact, Verdict::Exact],
+            "pass_inside={pass_inside}"
+        );
+    }
+}
+
+/// The same rewrite narrowing the key to `integer` (#2254): the pass leaves
+/// a key column's re-type to the key checks, none of which pause for it,
+/// so nothing re-reads the table and the 1-1 keeps every row under its old
+/// key while it reports `live`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "#2254: a narrowing USING rewrite of a key column isn't re-read"]
+async fn a_key_narrowing_rewrite_at_the_last_op_is_reread() {
+    let program = one_to_one_and_aggregate_program();
+    let pk = program.tables[0].pk_col.clone();
+    let event = event(
+        &program,
+        5,
+        retype(&pk, SqlType::Int4, true, RetypeShape::Key),
+        0,
+        false,
+    );
+    assert_eq!(
+        run_one(&program, event).await,
+        [Verdict::Exact, Verdict::Exact]
+    );
+}
+
+/// The same of a `GROUP BY` key (#2254): `bigint` to `integer` with `USING`
+/// pauses nothing and re-reads nothing, so the aggregate keeps its old
+/// groups while it reports `live`. A field-read column narrowed the same way
+/// is re-read.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "#2254: a narrowing USING rewrite of a GROUP BY key isn't re-read"]
+async fn a_group_by_key_narrowing_rewrite_is_reread() {
+    let program = one_to_one_and_aggregate_program();
+    let grain = grain(&program);
+    let plan = SourceDdlPlan {
+        events: vec![
+            event(
+                &program,
+                1,
+                retype(&grain, SqlType::Int8, false, RetypeShape::Narrow),
+                0,
+                false,
+            ),
+            event(
+                &program,
+                3,
+                retype(&grain, SqlType::Int4, true, RetypeShape::Narrow),
+                1,
+                false,
+            ),
+        ],
+    };
+    let verdicts = run_plan(&program, plan).await;
+    assert_eq!(
+        verdicts[1],
+        [Verdict::Exact, Verdict::Exact],
+        "{verdicts:?}"
+    );
 }

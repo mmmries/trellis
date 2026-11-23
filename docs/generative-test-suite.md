@@ -1182,15 +1182,20 @@ The actions, cheapest-first (every one below is built):
    `run::run_convergence_with_source_ddl`, swept by `tests/source_ddl.rs`.
    The engine runs with a reconcile interval longer than a case and the run
    steps the passes, so each event lands inside one interval or across a
-   pass as drawn. The oracle doesn't model the pause policy: after each op,
+   pass as drawn. A check settles with rounds of passes until one changes
+   nothing a pass writes. The oracle doesn't model the pause policy: after each op,
    `run::judge` holds every definition to **never silently wrong**. It is
    exact; or paused with a reason, and exact after its `RESUME` (or the
    `RESUME` refuses with a code); or wrong only as an entry of
    [known correctness gaps](known-correctness-gaps.md) the drawn shape names
-   (`gaps::Gap`, by the entry's stable anchor), which `self_check` reports
+   on the server under test (`gaps::Gap`, by the entry's stable anchor; the
+   run probes whether the server versions attributes), which `self_check` reports
    and the entry's repair fixes. Anything else fails, so the register is a
    checked allowlist: a missing entry fails, and so does one whose detection
    or repair doesn't hold.
+   An `ALTER COLUMN TYPE` changes the model's column type with it, which the
+   oracle reads; a key column's value-changing rewrite is drawn only after
+   the program's last op, since later ops address the keys.
    `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`
    and `resumed_exact`. The `capture_skip_trigger_state` plant (the capture
    audit not reading a trigger's state) needs a disabled trigger, so no
