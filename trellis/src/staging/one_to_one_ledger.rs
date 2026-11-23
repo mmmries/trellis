@@ -595,7 +595,7 @@ pub(crate) async fn stale_entries(
     source_table: &str,
     target: &str,
 ) -> Result<(i64, Option<String>, Vec<String>), ApplyError> {
-    let started = std::time::Instant::now();
+    let started = crate::clock::now();
     let row = txn
         .query_one(
             &stale_entries_statement(ledger, after.is_some()),
@@ -604,7 +604,7 @@ pub(crate) async fn stale_entries(
         .await?;
     crate::metrics::record_build_statement(
         crate::metrics::BuildStatement::ChunkKeys,
-        started.elapsed(),
+        crate::clock::elapsed(started),
     );
     Ok((row.get(0), row.get(1), row.get(2)))
 }

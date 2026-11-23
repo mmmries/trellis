@@ -22,8 +22,6 @@
 //! statement: a row re-inserted and applied between the read and the delete
 //! would be lost (#1481 H3).
 
-use std::time::Instant;
-
 use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
 
@@ -77,11 +75,11 @@ pub(crate) async fn orphan_batch(
     scan: i64,
 ) -> Result<OrphanBatch, ApplyError> {
     let statement = Statement::of(walk, cursor)?;
-    let started = Instant::now();
+    let started = crate::clock::now();
     let row = txn
         .query_one(&statement.sql, &statement.params(walk, &scan))
         .await?;
-    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkKeys, crate::clock::elapsed(started));
     let scanned: i64 = row.get(0);
     let last: Option<String> = row.get(1);
     let orphans: Vec<String> = row.get(2);

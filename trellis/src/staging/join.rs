@@ -1380,13 +1380,13 @@ async fn write_locked(
         txn.execute(&plan.j_insert_sql(), &[]).await?;
     }
     pause!(txn, AfterJoinKeyInsert, &plan.target);
-    let waiting_since = std::time::Instant::now();
+    let waiting_since = crate::clock::now();
     if !skip_j_lock {
         txn.execute(&plan.j_lock_sql(), &[]).await?;
     }
     // A build's wait for the keys its pages hold is not a page's contention.
     if !build {
-        crate::metrics::record_join_lock_wait(&plan.target, waiting_since.elapsed());
+        crate::metrics::record_join_lock_wait(&plan.target, crate::clock::elapsed(waiting_since));
     }
     pause!(txn, AfterJoinLock, &plan.target);
     let sides = [&plan.from, &plan.joined];

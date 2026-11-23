@@ -556,7 +556,7 @@ impl DdlRetry {
             lock_timeout,
             deadline,
             attempts: 0,
-            started: Instant::now(),
+            started: crate::clock::now(),
             last_logged: None,
         }
     }
@@ -590,7 +590,7 @@ impl DdlRetry {
             return false;
         }
         self.attempts += 1;
-        let now = Instant::now();
+        let now = crate::clock::now();
         let next_ends = now + USER_TABLE_DDL_RETRY_INTERVAL + self.lock_timeout;
         if self.deadline.is_some_and(|deadline| next_ends > deadline) {
             crate::instance_log::info!(

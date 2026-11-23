@@ -313,7 +313,7 @@ impl Trellis {
         &'a self,
         call: impl std::future::Future<Output = Result<T, TrellisError>> + Send + 'a,
     ) -> impl std::future::Future<Output = Result<T, TrellisError>> + Send + 'a {
-        self.submitted(std::time::Instant::now(), call)
+        self.submitted(crate::clock::now(), call)
     }
 
     /// [`Trellis::call`] for a call that was submitted at `submitted`:

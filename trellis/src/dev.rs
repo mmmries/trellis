@@ -228,6 +228,12 @@ pub mod build {
     pub use crate::staging::build::CHUNK_LOCK_TIMEOUT;
 }
 
+/// The engine's steppable clock, for a harness that steps a running
+/// engine's timers. See `crate::clock`'s module doc.
+pub mod clock {
+    pub use crate::clock::{EngineClock, Entered};
+}
+
 /// Planted ordering bugs. A harness reads which plant
 /// this process runs with, how often it fired and how often each site was
 /// reached; it never arms one, since

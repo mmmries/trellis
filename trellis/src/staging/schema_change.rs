@@ -851,7 +851,7 @@ pub(crate) async fn pause_readers_of_missing_probe_index(
             continue;
         }
         let source_columns = crate::defs::catalog::source_columns_in(&*client, reader.id).await?;
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
         let mut next = drift_memo::ProbeMemo::default();
         for index in crate::defs::source_index::extreme_indexes(&reader.def, &source_columns, table)
         {

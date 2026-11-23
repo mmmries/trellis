@@ -101,6 +101,7 @@ pub(crate) mod catalog_floor;
 mod client;
 #[cfg(feature = "internals")]
 pub mod client;
+pub(crate) mod clock;
 #[cfg(not(feature = "internals"))]
 mod config;
 #[cfg(feature = "internals")]

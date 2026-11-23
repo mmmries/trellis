@@ -2836,8 +2836,9 @@ pub fn adversarial_noise_table() -> Table {
 mod strategy {
     use super::*;
     use crate::model::{
-        BackupKind, ClockStep, CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan, NoiseAction,
-        NoiseEvent, NoiseEventKind, NoisePlan, RestartMode, RestorePlan, SteadyLoad,
+        BackupKind, ClockStep, CounterLimit, DbAdminAction, DbAdminEvent, DbAdminPlan,
+        EngineClockStep, NoiseAction, NoiseEvent, NoiseEventKind, NoisePlan, RestartMode,
+        RestorePlan, SteadyLoad,
     };
     use proptest::prelude::*;
 
@@ -4617,10 +4618,17 @@ mod strategy {
             Just(ClockStep::BackMinutes),
         ]
         .prop_map(DbAdminAction::StepClock);
+        let engine_clock_step = prop_oneof![
+            Just(EngineClockStep::ForwardHours),
+            Just(EngineClockStep::ForwardDays),
+            Just(EngineClockStep::BackSeconds),
+        ]
+        .prop_map(DbAdminAction::StepEngineClock);
         prop_oneof![
             // Weight 0 drops the arm, so a plan without a fake clock never
             // draws a step.
             if clock { 6 } else { 0 } => clock_step,
+            3 => engine_clock_step,
             2 => Just(DbAdminAction::Checkpoint),
             2 => Just(DbAdminAction::RestartPostgres(RestartMode::Fast)),
             1 => Just(DbAdminAction::RestartPostgres(RestartMode::Immediate)),
@@ -4664,15 +4672,21 @@ mod strategy {
         (prop::collection::vec(event, 0..=3), counters_near).prop_map(
             |(mut events, counters_near)| {
                 // A step back fires before the other actions at its op. After
-                // a restart (or the stop an xid wrap makes), it would push a
-                // claim the stop stranded five minutes further from its
-                // reclaim TTL: a correct stall, but past the quiesce budget.
+                // a restart (or the stop an xid wrap makes), a server step
+                // would push a claim the stop stranded five minutes further
+                // from its reclaim TTL, and an engine step would put off the
+                // leader's retaking its session: correct stalls, but past the
+                // quiesce budget.
                 // The runner fires an op's events in plan order, so ordering
                 // by op as well changes nothing else.
                 events.sort_by_key(|e| {
                     (
                         e.op,
-                        !matches!(e.action, DbAdminAction::StepClock(ClockStep::BackMinutes)),
+                        !matches!(
+                            e.action,
+                            DbAdminAction::StepClock(ClockStep::BackMinutes)
+                                | DbAdminAction::StepEngineClock(EngineClockStep::BackSeconds)
+                        ),
                     )
                 });
                 DbAdminPlan {

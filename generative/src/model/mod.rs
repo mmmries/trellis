@@ -822,6 +822,39 @@ pub enum DbAdminAction {
     /// compared against `now()` sees the jump, and none may read as the
     /// death of a live process. The run needs a cluster with a fake clock.
     StepClock(ClockStep),
+    /// Steps the engine's own monotonic clock (`trellis::dev::clock`), the
+    /// one every schedule, backoff, budget and grace of the engine reads, at
+    /// the same point as `Checkpoint`. Steps add up. Postgres's clock does
+    /// not move, so a forward step brings every engine deadline and schedule
+    /// due at once while every server timestamp stays fresh, and a step back
+    /// (a regressed `Instant`) puts each off by the step. Needs no fake-clock
+    /// cluster.
+    StepEngineClock(EngineClockStep),
+}
+
+/// One [`DbAdminAction::StepEngineClock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineClockStep {
+    /// Three hours forward.
+    ForwardHours,
+    /// Two days forward.
+    ForwardDays,
+    /// Ten seconds back. A leader that lost its session to a server stop
+    /// then retakes it ten seconds later, so the generator fires this step
+    /// before a restart at the same op, never after it, as it does
+    /// [`ClockStep::BackMinutes`].
+    BackSeconds,
+}
+
+impl EngineClockStep {
+    /// How far the step moves the engine's clock, in seconds.
+    pub fn seconds(self) -> i64 {
+        match self {
+            EngineClockStep::ForwardHours => 3 * 3600,
+            EngineClockStep::ForwardDays => 2 * 86_400,
+            EngineClockStep::BackSeconds => -10,
+        }
+    }
 }
 
 /// One [`DbAdminAction::StepClock`]: two steps forward and one back.

@@ -34,7 +34,6 @@
 //! - **A sweep page** ([`rederive`]): a page of `a` Re-derives.
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::Instant;
 
 use tokio_postgres::Transaction;
 use tokio_postgres::types::ToSql;
@@ -158,7 +157,7 @@ pub(crate) async fn m_batch(
     };
     let mut params: Vec<&(dyn ToSql + Sync)> = vec![&limit];
     params.extend(decoded.iter().map(|v| v as &(dyn ToSql + Sync)));
-    let started = Instant::now();
+    let started = crate::clock::now();
     let keys: Vec<String> = txn
         .query(
             &format!(
@@ -174,7 +173,7 @@ pub(crate) async fn m_batch(
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkKeys, crate::clock::elapsed(started));
     rederive(txn, shape, Side::Joined(position), &keys, false).await?;
     let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
     Ok(if full { keys.last().cloned() } else { None })
@@ -242,7 +241,7 @@ pub(crate) async fn m_gone_batch(
 ) -> Result<Option<String>, ApplyError> {
     let key = quote_ident(schema::KEY_COLUMN);
     let tombstone = quote_ident(schema::TOMBSTONE_COLUMN);
-    let started = Instant::now();
+    let started = crate::clock::now();
     let entries: Vec<String> = txn
         .query(
             &format!(
@@ -281,7 +280,7 @@ pub(crate) async fn m_gone_batch(
         .map(|row| row.get(0))
         .collect()
     };
-    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkKeys, crate::clock::elapsed(started));
     let gone: Vec<String> = entries
         .iter()
         .filter(|key| !present.contains(*key))
@@ -327,7 +326,7 @@ pub(crate) async fn run_chunk(
 
     // 1. The range's keys and their rows' join keys, unlocked: the
     // Re-derives' part of K.
-    let started = Instant::now();
+    let started = crate::clock::now();
     let not_null: Vec<String> = idents.iter().map(|c| format!("{c} is not null")).collect();
     let live_cols: Vec<String> = shape
         .key
@@ -353,7 +352,7 @@ pub(crate) async fn run_chunk(
             &params,
         )
         .await?;
-    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkKeys, crate::clock::elapsed(started));
     if rows.is_empty() {
         return Ok(ChunkOutcome::default());
     }
@@ -490,7 +489,7 @@ async fn insert_from_read(
     let mut params: Vec<&(dyn ToSql + Sync)> = bounds.to_vec();
     let keys_param = params.len() + 1;
     params.push(&keys);
-    let started = Instant::now();
+    let started = crate::clock::now();
     let rows = txn
         .query(
             &format!(
@@ -510,7 +509,7 @@ async fn insert_from_read(
             &params,
         )
         .await?;
-    metrics::record_build_statement(BuildStatement::ChunkLock, started.elapsed());
+    metrics::record_build_statement(BuildStatement::ChunkLock, crate::clock::elapsed(started));
     // Planted bug: the chunk doesn't check the keys its insert-from-read
     // found. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]

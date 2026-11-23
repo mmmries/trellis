@@ -53,7 +53,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, IsolationLevel};
@@ -775,7 +775,7 @@ async fn attempt(
     txn.batch_execute(&partitions::pinned_settings()).await?;
     txn.batch_execute("set local standard_conforming_strings = on")
         .await?;
-    let started = Instant::now();
+    let started = crate::clock::now();
     // The lifecycle catalog first, then the bounds: see the module doc.
     let Some(first) = partitions::read_fingerprints(&txn, table).await? else {
         return Ok(Attempt::Done);
@@ -792,7 +792,7 @@ async fn attempt(
     };
     outcome.statements = 0;
     outcome.queued = false;
-    outcome.read = started.elapsed();
+    outcome.read = crate::clock::elapsed(started);
     outcome.search = Duration::ZERO;
     if complement == Pred::False {
         txn.commit().await?;
@@ -890,12 +890,12 @@ async fn attempt(
         })
         .collect();
     outcome.statements = 1;
-    let searching = Instant::now();
+    let searching = crate::clock::now();
     let hit: bool = txn
         .query_one(&format!("select {}", probes.join(" or ")), &[])
         .await?
         .get(0);
-    outcome.search = searching.elapsed();
+    outcome.search = crate::clock::elapsed(searching);
     if hit {
         let root = i64::from(first.root_oid);
         txn.execute(

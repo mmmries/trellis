@@ -832,10 +832,10 @@ async fn retry_gate<C>(
     ctx: &mut C,
     mut attempt: impl AsyncFnMut(&mut C) -> Result<SealOutcome, StagingError>,
 ) -> Result<SealOutcome, StagingError> {
-    let deadline = std::time::Instant::now() + wait;
+    let deadline = crate::clock::now() + wait;
     loop {
         match attempt(ctx).await {
-            Err(StagingError::SealGateBlocked) if std::time::Instant::now() < deadline => {
+            Err(StagingError::SealGateBlocked) if crate::clock::now() < deadline => {
                 tokio::time::sleep(poll).await;
             }
             settled => return settled,

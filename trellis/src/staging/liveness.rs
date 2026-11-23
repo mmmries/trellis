@@ -449,8 +449,8 @@ async fn run_daemon(
         };
 
         if snapshot.is_empty() {
-            let since = idle_since.get_or_insert_with(Instant::now);
-            if client.is_some() && since.elapsed() >= config.idle_timeout {
+            let since = idle_since.get_or_insert_with(crate::clock::now);
+            if client.is_some() && crate::clock::elapsed(*since) >= config.idle_timeout {
                 client = None;
                 connected.store(false, Ordering::Relaxed);
             }

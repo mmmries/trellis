@@ -173,10 +173,15 @@ impl BlockingTrellis {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Submitted>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<CallPool, TrellisError>>();
         let kept_config = config.clone();
+        // A call's submit instant is read on the caller's thread and its
+        // deadline on this thread's runtime, so both read the caller's engine
+        // clock (`crate::clock`), as does any client the connect starts.
+        let clock = crate::clock::Inherit::capture();
 
         let thread = std::thread::Builder::new()
             .name("trellis-blocking".to_string())
             .spawn(move || {
+                clock.enter();
                 let runtime = match build_runtime(options.worker_threads) {
                     Ok(runtime) => runtime,
                     Err(err) => {
@@ -565,7 +570,7 @@ impl BlockingTrellis {
         let (reply_tx, reply_rx) = oneshot::channel();
         // The deadline runs from here: the time a job spends queued on the
         // channel counts against it (issue #599).
-        match self.job_tx.send((Instant::now(), make_job(reply_tx))) {
+        match self.job_tx.send((crate::clock::now(), make_job(reply_tx))) {
             Ok(()) => PendingCall::waiting(reply_rx),
             Err(_) => PendingCall::failed(TrellisError::BlockingThreadGone),
         }

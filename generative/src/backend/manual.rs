@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
+use trellis::dev::clock::EngineClock;
 use trellis::dev::defs::ast::{KeySpace, TransformDef, ValueType};
 use trellis::dev::defs::{
     CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
@@ -567,6 +568,10 @@ pub struct ManualBackend {
     /// ([`ClientOptions::reclaim_ttl`]), when a caller sets one with
     /// [`ManualBackend::set_reclaim_ttl`]; the engine's default otherwise.
     reclaim_ttl: Option<Duration>,
+    /// The steppable clock every engine client this backend starts runs on
+    /// (`trellis::dev::clock`), when a caller sets one with
+    /// [`ManualBackend::set_engine_clock`]; real time otherwise.
+    engine_clock: Option<EngineClock>,
     /// Whether [`Backend::quiesce`](super::Backend::quiesce) retires drained
     /// segments while it waits ([`ManualBackend::set_retire_during_quiesce`]).
     retire_during_quiesce: bool,
@@ -842,6 +847,7 @@ impl ManualBackend {
             housekeeping_interval: None,
             drain_batch_cap: None,
             reclaim_ttl: None,
+            engine_clock: None,
             retire_during_quiesce: false,
             strict_audit: false,
             strict_audits_converged: 0,
@@ -968,6 +974,18 @@ impl ManualBackend {
     /// [`ManualBackend::connect_to_restore`] carries it over.
     pub fn set_reclaim_ttl(&mut self, ttl: Duration) {
         self.reclaim_ttl = Some(ttl);
+    }
+
+    /// Runs every engine client started from now on on `clock`, so a step of
+    /// it moves those engines' timers. Clients already running keep theirs.
+    pub fn set_engine_clock(&mut self, clock: EngineClock) {
+        self.engine_clock = Some(clock);
+    }
+
+    /// Starts an engine client on [`Self::engine_clock`], if one is set.
+    fn start_client(&self, options: ClientOptions) -> Result<EngineClient, ClientError> {
+        let _entered = self.engine_clock.as_ref().map(EngineClock::enter);
+        EngineClient::start_with_config(self.config.clone(), options)
     }
 
     /// Makes [`Backend::quiesce`] retire drained segments
@@ -1270,7 +1288,7 @@ impl ManualBackend {
             options.reclaim_ttl = ttl;
             options.heartbeat.interval = ttl / 3;
         }
-        let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;
+        let client = self.start_client(options.clone())?;
         self.engine_client = Some(client);
         // Remembered so `restart` can start an
         // equivalent replacement client without the caller needing to
@@ -1703,7 +1721,7 @@ impl ManualBackend {
             .clone()
             .ok_or(ManualBackendError::NoClientStarted)?;
         wait_for_producer_release(&self.config).await?;
-        let client = EngineClient::start_with_config(self.config.clone(), options)?;
+        let client = self.start_client(options)?;
         self.engine_client = Some(client);
         Ok(())
     }
@@ -2020,7 +2038,7 @@ impl super::Backend for ManualBackend {
         // Layer 2: wait out the residual window `shutdown` alone can't close
         // (see this method's own doc comment).
         wait_for_producer_release(&self.config).await?;
-        let client = EngineClient::start_with_config(self.config.clone(), options)?;
+        let client = self.start_client(options)?;
         self.engine_client = Some(client);
         Ok(())
     }
@@ -2038,7 +2056,7 @@ impl super::Backend for ManualBackend {
             application_threads: 1,
             ..Default::default()
         };
-        let client = EngineClient::start_with_config(self.config.clone(), options)?;
+        let client = self.start_client(options)?;
         self.scale_out_clients.push(client);
         Ok(())
     }
