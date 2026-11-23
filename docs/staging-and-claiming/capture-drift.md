@@ -508,7 +508,8 @@ them:
     checks it by define's rule;
   - a table read with a `KEY (…)` left with no valid unique index backing
     it (an index dropped, a failed build's `INVALID` index, a partitioned
-    root's index left invalid), by the pass, which matches it by shape;
+    root's index left invalid), by the pass, which matches it by shape, or
+    by a drained change to the table, which halts them;
   - a `MIN`/`MAX` transform's probe index (its `GROUP BY` columns, then the
     argument) found missing or invalid on every pass for 5 minutes, by the
     pass;

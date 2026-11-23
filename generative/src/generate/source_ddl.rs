@@ -8,8 +8,8 @@ use trellis::dev::defs::ast::ValueType;
 
 use super::wiring::with_wiring;
 use crate::model::{
-    Collation, ConcurrentPlan, Op, Program, RetypeShape, SourceDdl, SourceDdlEvent, SourceDdlPlan,
-    SqlType, Table,
+    Collation, ConcurrentPlan, IndexChange, Op, OpOutcome, Program, RetypeShape, SourceDdl,
+    SourceDdlEvent, SourceDdlPlan, SqlType, Table,
 };
 
 /// The most events one plan draws.
@@ -50,7 +50,7 @@ enum Menu {
 impl Menu {
     fn actions(self) -> u8 {
         match self {
-            Menu::Maintenance => 23,
+            Menu::Maintenance => 26,
             Menu::Privilege => 11,
         }
     }
@@ -182,7 +182,8 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             (Menu::Maintenance, 16..=18) => {
                 attributes(action, program, table, &numeric, pick).unwrap_or(SourceDdl::VacuumFull)
             }
-            (Menu::Maintenance, 19..) => whole_table(action, table),
+            (Menu::Maintenance, 19..=22) => whole_table(action, table),
+            (Menu::Maintenance, 23..) => key_index(action, table),
             (Menu::Maintenance, _) => maintenance(action, column, pick),
             (Menu::Privilege, _) => privilege(action, target),
         };
@@ -209,6 +210,22 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             program.ops[op + 1..=op + window]
                 .iter()
                 .position(|o| matches!(o, Op::Partition { table: t, .. } if t == &table.name))
+                .unwrap_or(window)
+        } else {
+            window
+        };
+        // A write the key's index refuses would go through while it is
+        // dropped: the window ends before the table's first.
+        let window = if matches!(
+            action,
+            SourceDdl::KeyIndex {
+                change: IndexChange::Drop,
+                ..
+            }
+        ) {
+            program.ops[op + 1..=op + window]
+                .iter()
+                .position(|o| o.table() == table.name && *o.expect() == OpOutcome::Fails)
                 .unwrap_or(window)
         } else {
             window
@@ -387,6 +404,26 @@ fn whole_table(action: u8, table: &Table) -> SourceDdl {
         _ if table.partitioning.is_some() => SourceDdl::VacuumFull,
         _ => SourceDdl::RecreateTable,
     }
+}
+
+/// The change to the index backing `table`'s key `action` names (#2184
+/// slice 7): its `KEY (…)`'s, or its primary key's. A partitioned table's
+/// key index is a tree of indexes no `CONCURRENTLY` build makes, so it
+/// draws `REINDEX TABLE CONCURRENTLY` instead.
+fn key_index(action: u8, table: &Table) -> SourceDdl {
+    if table.partitioning.is_some() {
+        return SourceDdl::Reindex { concurrently: true };
+    }
+    let columns = match &table.source_key {
+        Some(key) => key.columns.clone(),
+        None => vec![table.pk_col.clone()],
+    };
+    let change = match action {
+        23 => IndexChange::Drop,
+        24 => IndexChange::Replace,
+        _ => IndexChange::RebuildConcurrently,
+    };
+    SourceDdl::KeyIndex { columns, change }
 }
 
 /// The functions Postgres refuses over a nondeterministic collation for

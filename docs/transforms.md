@@ -148,7 +148,8 @@ The rule needs a key, or a unique index that backs it. These pause with no
 grace period, whether or not a write arrived:
 
 - a declared `KEY (…)` left with no valid backing index: every reader pauses
-  on the next pass;
+  on the next pass, or halts on the next drain of a change to the table
+  ([T0118](errors.md#t0118-recordedkeymissing));
 - a 1-1 `JOIN`'s joined table losing the unique key on its `ON` columns: the
   `JOIN` pauses on the next pass;
 - a primary key redefined, or the table created again with another one: the

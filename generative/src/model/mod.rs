@@ -1245,8 +1245,8 @@ pub struct Rewrite {
 
 mod source_ddl;
 pub use source_ddl::{
-    Collation, MOVED_SCHEMA, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan,
-    SqlType, table_away,
+    Collation, IndexChange, MOVED_SCHEMA, RetypeShape, Server, SourceDdl, SourceDdlEvent,
+    SourceDdlPlan, SqlType, table_away,
 };
 
 #[cfg(test)]

@@ -20,8 +20,8 @@ use trellis::dev::pool::Pool;
 use crate::backend::{Backend, ManualBackend};
 use crate::gaps::Gap;
 use crate::model::{
-    MOVED_SCHEMA, Op, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan,
-    table_away,
+    IndexChange, MOVED_SCHEMA, Op, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent,
+    SourceDdlPlan, table_away,
 };
 
 use super::judge::{Judged, PassStepper, judge};
@@ -125,6 +125,12 @@ pub async fn run_convergence_with_source_ddl_allowing(
             let statements = Statements::resolve(&passes, backend, program, event, server)
                 .await
                 .map_err(fired)?;
+            if event.action.drains_before_open() {
+                passes
+                    .settle(backend)
+                    .await
+                    .map_err(|e| fired(format!("drain before the event: {e}")))?;
+            }
             if event.action.holds_drain() {
                 backend
                     .stop_engine()
@@ -366,6 +372,14 @@ impl Statements {
                     ..Self::default()
                 });
             }
+            SourceDdl::KeyIndex { columns, change } => {
+                let (opens, closes) = key_index(passes, &table, columns, *change).await?;
+                return Ok(Self {
+                    opens,
+                    closes,
+                    ..Self::default()
+                });
+            }
             _ => {}
         }
         let rewrite = |column: &str, ty: &str| {
@@ -592,6 +606,103 @@ impl Statements {
             ..Self::default()
         })
     }
+}
+
+/// A [`SourceDdl::KeyIndex`]'s opening and closing statements, on the
+/// valid unique index of `table` over exactly `columns` (no predicate, no
+/// expression), read from the catalog, through its constraint where it is
+/// one.
+async fn key_index(
+    passes: &PassStepper,
+    table: &str,
+    columns: &[String],
+    change: IndexChange,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut sorted = columns.to_vec();
+    sorted.sort();
+    let rows = passes
+        .query(
+            "select ic.relname::text, pg_get_indexdef(i.indexrelid), c.conname::text, \
+             c.contype::text, pg_get_constraintdef(c.oid) \
+             from pg_index i join pg_class ic on ic.oid = i.indexrelid \
+             left join pg_constraint c on c.conindid = i.indexrelid \
+             and c.conrelid = i.indrelid and c.contype in ('p', 'u') \
+             where i.indrelid = $1::text::regclass and i.indisunique and i.indisvalid \
+             and i.indpred is null and i.indexprs is null \
+             and array(select a.attname::text from pg_attribute a \
+             where a.attrelid = i.indrelid and a.attnum = any(i.indkey::int2[]) \
+             order by a.attname) = $2::text[] \
+             order by i.indisprimary desc, i.indexrelid limit 1",
+            &[&table, &sorted],
+        )
+        .await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("{table} has no unique index over {columns:?}"))?;
+    let (name, indexdef): (String, String) = (row.get(0), row.get(1));
+    let constraint: Option<(String, String, String)> = row
+        .get::<_, Option<String>>(2)
+        .map(|conname| (conname, row.get(3), row.get(4)));
+    let index = format!("public.{}", quote(&name));
+    let copy = format!("{name}_rebuilt");
+    let shape = indexdef
+        .find(" USING ")
+        .map(|at| &indexdef[at..])
+        .ok_or_else(|| format!("unexpected index definition {indexdef}"))?;
+    Ok(match (change, constraint) {
+        (IndexChange::Drop, Some((conname, _, def))) => (
+            vec![format!(
+                "ALTER TABLE {table} DROP CONSTRAINT {}",
+                quote(&conname)
+            )],
+            vec![format!(
+                "ALTER TABLE {table} ADD CONSTRAINT {} {def}",
+                quote(&conname)
+            )],
+        ),
+        (IndexChange::Drop, None) => (vec![format!("DROP INDEX {index}")], vec![indexdef]),
+        (IndexChange::Replace, Some((conname, _, def))) => (
+            vec![format!(
+                "ALTER TABLE {table} DROP CONSTRAINT {c}, ADD CONSTRAINT {c} {def}",
+                c = quote(&conname)
+            )],
+            Vec::new(),
+        ),
+        // One statement, so one transaction.
+        (IndexChange::Replace, None) => (
+            vec![format!(
+                "DO $replace$ BEGIN DROP INDEX {index}; {indexdef}; END $replace$"
+            )],
+            Vec::new(),
+        ),
+        (IndexChange::RebuildConcurrently, constraint) => {
+            let build = format!(
+                "CREATE UNIQUE INDEX CONCURRENTLY {} ON {table}{shape}",
+                quote(&copy)
+            );
+            let swap = match constraint {
+                Some((conname, contype, _)) => vec![format!(
+                    "ALTER TABLE {table} DROP CONSTRAINT {c}, ADD CONSTRAINT {c} {} USING INDEX {}",
+                    if contype == "p" {
+                        "PRIMARY KEY"
+                    } else {
+                        "UNIQUE"
+                    },
+                    quote(&copy),
+                    c = quote(&conname)
+                )],
+                None => vec![
+                    format!("DROP INDEX CONCURRENTLY {index}"),
+                    format!(
+                        "ALTER INDEX public.{} RENAME TO {}",
+                        quote(&copy),
+                        quote(&name)
+                    ),
+                ],
+            };
+            (vec![build], swap)
+        }
+    })
 }
 
 /// `column`'s type on `table` as Postgres prints it, so a same-type rewrite

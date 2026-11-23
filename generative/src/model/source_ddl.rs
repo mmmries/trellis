@@ -178,6 +178,17 @@ pub enum SourceDdl {
     /// window's writes reach the new table, which carries no capture
     /// trigger: a pass pauses its readers either way.
     RecreateTable,
+    /// The valid unique index over exactly `columns` that backs the
+    /// table's key, changed as `change` says: a `KEY (…)`'s index, the
+    /// primary key's, or the unique key a 1-1 `JOIN`'s `b` is joined on.
+    /// The pass checks the index by shape, not by oid
+    /// (`docs/staging-and-claiming/capture-drift.md`), so a key left backed
+    /// at every pass keeps every reader exact, and one a pass finds
+    /// unbacked pauses its readers.
+    KeyIndex {
+        columns: Vec<String>,
+        change: IndexChange,
+    },
     /// `OWNER TO` [`HEIR_ROLE`](crate::backend::HEIR_ROLE), which Trellis
     /// and the application both inherit, and back at the close.
     OwnerToHeir,
@@ -239,6 +250,10 @@ impl SourceDdl {
                 | SourceDdl::Collate { .. }
                 | SourceDdl::RenameTable
                 | SourceDdl::MoveSchema
+                | SourceDdl::KeyIndex {
+                    change: IndexChange::Drop | IndexChange::RebuildConcurrently,
+                    ..
+                }
         ) || self.privilege()
     }
 
@@ -267,8 +282,32 @@ impl SourceDdl {
     /// statements, with no pass beyond the window's own: a collation
     /// changes only what a drain computes, so without it the window could
     /// drain after the close.
+    /// A key's index dropped drains too, so the window's changes always
+    /// drain while it is gone, not only when a drain wins the race with
+    /// the close.
     pub fn drains_before_close(&self) -> bool {
-        matches!(self, SourceDdl::Collate { .. })
+        matches!(
+            self,
+            SourceDdl::Collate { .. }
+                | SourceDdl::KeyIndex {
+                    change: IndexChange::Drop,
+                    ..
+                }
+        )
+    }
+
+    /// Whether the run settles the changes already staged before the
+    /// opening statements: a key's index dropped with a pass inside, so the
+    /// pass, not a drain racing it, is what first meets the key unbacked.
+    /// Only the window's changes are in flight across it.
+    pub fn drains_before_open(&self) -> bool {
+        matches!(
+            self,
+            SourceDdl::KeyIndex {
+                change: IndexChange::Drop,
+                ..
+            }
+        )
     }
 
     /// Whether the run stops the engine from the event's opens to its
@@ -344,6 +383,7 @@ impl SourceDdl {
             SourceDdl::MoveSchema => "move_schema",
             SourceDdl::RenameTableAway => "rename_table_away",
             SourceDdl::RecreateTable => "recreate_table",
+            SourceDdl::KeyIndex { change, .. } => change.kind(),
             SourceDdl::RenameColumn { .. } => "rename_column",
             SourceDdl::DropColumn { .. } => "drop_column",
             SourceDdl::DropAndAddColumn { .. } => "drop_and_add_column",
@@ -533,6 +573,36 @@ pub const MOVED_SCHEMA: &str = "trellis_moved";
 /// gives the table.
 pub fn table_away(table: &str) -> String {
     format!("{table}_away")
+}
+
+/// What a [`SourceDdl::KeyIndex`] does to the index backing a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexChange {
+    /// Dropped when the event fires (its constraint, where it is one) and
+    /// created again at the close, the window's changes drained in
+    /// between ([`SourceDdl::drains_before_close`]). Within one reconcile
+    /// interval no pass sees the key unbacked; a pass in between pauses
+    /// its readers (a primary key's readers also pause on a drained
+    /// change), which resume exact once it is back.
+    Drop,
+    /// Dropped and created again under its name in one transaction: a new
+    /// oid of the same shape.
+    Replace,
+    /// A copy built `CONCURRENTLY` when the event fires, so the window
+    /// runs with both; at the close the old one dropped `CONCURRENTLY`
+    /// and the copy renamed onto its name, or swapped in as the constraint
+    /// (`… USING INDEX`).
+    RebuildConcurrently,
+}
+
+impl IndexChange {
+    fn kind(self) -> &'static str {
+        match self {
+            IndexChange::Drop => "drop_key_index",
+            IndexChange::Replace => "replace_key_index",
+            IndexChange::RebuildConcurrently => "rebuild_key_index_concurrently",
+        }
+    }
 }
 
 /// The declared type of a column a [`SourceDdl::Retype`] changes, before or
