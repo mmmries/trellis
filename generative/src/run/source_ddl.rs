@@ -122,6 +122,12 @@ pub async fn run_convergence_with_source_ddl_allowing(
             let statements = Statements::resolve(&passes, backend, program, event, server)
                 .await
                 .map_err(fired)?;
+            if event.action.holds_drain() {
+                backend
+                    .stop_engine()
+                    .await
+                    .map_err(|e| fired(format!("hold the drain: {e:?}")))?;
+            }
             execute(backend, &statements.opens).await.map_err(fired)?;
             event.follow(&mut model);
             if let Some(column) = event.removed_column() {
@@ -181,6 +187,12 @@ pub async fn run_convergence_with_source_ddl_allowing(
                     .write_as(None)
                     .await
                     .map_err(|e| fired(format!("write as the application again: {e:?}")))?;
+            }
+            if event.action.holds_drain() {
+                backend
+                    .start_engine()
+                    .await
+                    .map_err(|e| fired(format!("release the drain: {e:?}")))?;
             }
             op_index = event.last_op();
         }

@@ -239,6 +239,14 @@ impl SourceDdl {
         matches!(self, SourceDdl::Collate { .. })
     }
 
+    /// Whether the run stops the engine from the event's opens to its
+    /// closes, so the changes in flight stay staged across both: a `KEY (…)`
+    /// column's `NOT NULL` flip, whose changes staged under one nullability
+    /// then drain under the other (#2147).
+    pub fn holds_drain(&self) -> bool {
+        matches!(self, SourceDdl::FlipNotNull { key: true, .. })
+    }
+
     /// Whether this is a privilege or ownership change (#2182): every one
     /// is undone at its close.
     pub fn privilege(&self) -> bool {
