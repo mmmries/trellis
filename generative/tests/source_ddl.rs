@@ -10,7 +10,7 @@
 
 use generative::backend::{CaseDatabase, ManualBackend};
 use generative::gaps::Gap;
-use generative::generate::source_ddl::source_ddl_plan_for;
+use generative::generate::source_ddl::{calls_collation_refusing_function, source_ddl_plan_for};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
     trivial_program,
@@ -151,6 +151,17 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                     (event.op + 1, event.window),
                     (program.ops.len(), 0),
                     "a column change later ops can't write through, before the last op: {event:?}"
+                );
+            }
+            if let SourceDdl::Collate {
+                collation: Collation::CaseInsensitive,
+                ..
+            } = &event.action
+            {
+                let table = program.tables.iter().find(|t| t.name == event.table);
+                assert!(
+                    !calls_collation_refusing_function(&program, table.expect("a drawn table")),
+                    "a case-insensitive collation under STRPOS or REGEXP_COUNT: {event:?}"
                 );
             }
             seen.insert((event.action.kind(), event.pass_inside));
@@ -1332,4 +1343,45 @@ async fn a_key_columns_not_null_flipped_with_changes_in_flight_is_never_silently
             }
         }
     }
+}
+
+/// A table a definition reads through `REGEXP_COUNT` (or `STRPOS`) only
+/// draws the `"C"` collation: under a case-insensitive one Postgres refuses
+/// the call for every changed row, whose key is held (`docs/transforms.md`,
+/// "Per row"), and the drain before the close would never converge.
+#[test]
+fn a_table_read_through_a_collation_refusing_function_draws_only_c() {
+    let mut program = one_to_one_and_aggregate_program();
+    let text = text_column(&program);
+    program.defs[0]
+        .fields
+        .push(trellis::dev::defs::ast::FieldDef {
+            name: "hits".to_string(),
+            expr: Expr::FunctionCall {
+                name: "REGEXP_COUNT".to_string(),
+                args: vec![Expr::Column(text), Expr::StringLiteral("a".to_string())],
+            },
+        });
+    assert!(calls_collation_refusing_function(
+        &program,
+        &program.tables[0]
+    ));
+    let mut runner = TestRunner::deterministic();
+    let strategy = source_ddl_plan_for(&program);
+    let mut collations = std::collections::BTreeSet::new();
+    for _ in 0..2000 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        for event in plan.events {
+            if let SourceDdl::Collate { collation, .. } = event.action {
+                collations.insert(format!("{collation:?}"));
+            }
+        }
+    }
+    assert_eq!(
+        collations,
+        std::collections::BTreeSet::from(["C".to_string()])
+    );
 }

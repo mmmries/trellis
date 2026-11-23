@@ -352,13 +352,43 @@ fn attributes(
                 .find(|c| c.name != table.pk_col && c.value_type == ValueType::Text)?
                 .name
                 .clone(),
-            collation: if pick.is_multiple_of(2) {
+            collation: if pick.is_multiple_of(2)
+                || calls_collation_refusing_function(program, table)
+            {
                 Collation::C
             } else {
                 Collation::CaseInsensitive
             },
         },
     })
+}
+
+/// The functions Postgres refuses over a nondeterministic collation for
+/// every row (`docs/errors.md`, T0109).
+pub const COLLATION_REFUSING_FUNCTIONS: [&str; 2] = ["STRPOS", "REGEXP_COUNT"];
+
+/// Whether a definition reading `table` calls one of
+/// [`COLLATION_REFUSING_FUNCTIONS`] anywhere. Under a case-insensitive
+/// collation each changed row's key is held (`docs/transforms.md`, "Per
+/// row"): reported, not a register entry, and a drain that never converges
+/// past the held keys, so such a table only draws `"C"`.
+pub fn calls_collation_refusing_function(program: &Program, table: &Table) -> bool {
+    program
+        .defs
+        .iter()
+        .filter(|d| d.source == table.name)
+        .flat_map(|d| d.fields.iter().map(|f| &f.expr).chain(d.predicate.filter()))
+        .any(|expr| {
+            let mut calls = false;
+            expr.walk(&mut |e| {
+                calls |= matches!(
+                    e,
+                    trellis::dev::defs::ast::Expr::FunctionCall { name, .. }
+                        if COLLATION_REFUSING_FUNCTIONS.contains(&name.as_str())
+                );
+            });
+            calls
+        })
 }
 
 /// `column`'s declared type as the generator creates it, where a
