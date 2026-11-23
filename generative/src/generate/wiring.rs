@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::where_clause;
+use super::{exact_sums, where_clause};
 use crate::model::{
     ConcurrentPlan, FkAction, Op, PRIMARY_KEY_VALUE_TYPE, Program, Rewrite, SHADOW_OFFSET, Shadow,
     Table, Timing, Wiring,
@@ -119,6 +119,16 @@ fn unique(table: &Table, column: &str) -> bool {
             .is_some_and(|key| key.columns.iter().any(|c| c == column))
 }
 
+/// Whether another generator budgets the magnitude of `column`'s values
+/// (the [`exact_sums`] columns): a flip writes its pick into every row the
+/// trigger touches, past that budget, and a group's sum leaves the type's
+/// range (#2263). Wiring stays off columns another generator constrains.
+fn budgeted(column: &str) -> bool {
+    exact_sums::SumType::ALL
+        .iter()
+        .any(|sum| sum.column() == column)
+}
+
 /// Whether some definition of `program` names `column` of `table`.
 fn read(program: &Program, table: &str, column: &str) -> bool {
     let quoted = format!("{column:?}");
@@ -133,12 +143,12 @@ type Flip = (String, Option<String>, Option<String>);
 
 /// A column of `table` a [`Rewrite`] or a [`Shadow`] can flip, with two of
 /// its drawn values: one no `UNIQUE` constraint or source key covers
-/// ([`unique`]), which the program writes at least two values to,
+/// ([`unique`]) and no other generator budgets ([`budgeted`]), which the program writes at least two values to,
 /// preferring one a definition reads.
 fn flip_column(program: &Program, table: &Table, pick: u64) -> Option<Flip> {
     let mut candidates: Vec<Flip> = drawn_values(program, table)
         .into_iter()
-        .filter(|(c, values)| values.len() >= 2 && !unique(table, c))
+        .filter(|(c, values)| values.len() >= 2 && !unique(table, c) && !budgeted(c))
         .map(|(c, values)| (c, values[0].clone(), values[1].clone()))
         .collect();
     let read_ones: Vec<_> = candidates
@@ -448,6 +458,44 @@ mod tests {
             }
         }
         assert!(drawn.0 > 0 && drawn.1 > 0, "{drawn:?}");
+    }
+
+    /// A column another generator budgets (`fs`, `rs`, `ivs`) is never
+    /// flipped, so wiring cannot write its extremes past the budget (#2263).
+    #[test]
+    fn a_budgeted_column_is_never_flipped() {
+        let mut drawn = 0;
+        for seed in 0..256 {
+            let mut program = program(
+                (0..6)
+                    .flat_map(|i| {
+                        let Op::Insert {
+                            table,
+                            mut row,
+                            expect,
+                        } = insert("t0", &i.to_string(), &(seed + i).to_string())
+                        else {
+                            unreachable!()
+                        };
+                        row.push(("fs".to_string(), Some(format!("-{}e300", seed + i))));
+                        [Op::Insert { table, row, expect }]
+                    })
+                    .collect(),
+            );
+            program.tables[0].columns.push(Column {
+                name: "fs".to_string(),
+                value_type: ValueType::Float(trellis::dev::defs::FloatWidth::Float8),
+            });
+            let flip = flip_column(&program, &program.tables[0], seed);
+            assert_eq!(flip.map(|(c, ..)| c).as_deref(), Some("c1"), "seed {seed}");
+            for wiring in with_wiring(ConcurrentPlan::default(), &program).wiring {
+                if let Some(rewrite) = &wiring.rewrite {
+                    assert_ne!(rewrite.column, "fs", "seed {seed}");
+                    drawn += 1;
+                }
+            }
+        }
+        assert!(drawn > 0);
     }
 
     /// The wiring is a function of the program alone, and each shadowed
