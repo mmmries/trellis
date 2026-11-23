@@ -15,7 +15,9 @@
 //! inherits the clock of the thread that starts it
 //! ([`crate::Client::start_with_config`]): its driving thread and every
 //! worker and blocking-pool thread of its runtime enter it ([`Inherit`]), as
-//! they enter its instance name (`crate::instance_log`). A harness enters a
+//! they enter its instance name (`crate::instance_log`). The blocking
+//! wrapper's thread and runtime do the same ([`crate::BlockingTrellis::connect`]),
+//! so a call's submit instant and its deadline read one clock. A harness enters a
 //! clock only around the start of the engine it steps, so its own waits
 //! keep real time.
 //!
@@ -155,8 +157,8 @@ mod stepped {
             } else {
                 real.checked_sub(by)
             };
-            // A step back past the platform's earliest instant reads as
-            // that earliest instant would: as far back as the clock goes.
+            // A step past what the platform's `Instant` can hold reads as
+            // real time.
             stepped.unwrap_or(real)
         }
     }
@@ -225,6 +227,12 @@ mod tests {
         clock.step(60);
         assert_eq!(clock.offset_seconds(), 30);
         assert!(elapsed(before) >= Duration::from_secs(29));
+        // Two days back: every comparison still saturates.
+        clock.step(-2 * 86_400);
+        let back = Instant::now().saturating_duration_since(now());
+        assert!(back >= Duration::from_secs(2 * 86_400 - 31), "{back:?}");
+        assert_eq!(elapsed(before), Duration::ZERO);
+        assert!(now() < before + Duration::from_secs(1));
     }
 
     /// `Inherit` carries the clock onto another thread.

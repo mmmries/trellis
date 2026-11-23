@@ -283,10 +283,16 @@ pub fn default_wake_channel(schema: &str) -> String {
 /// stderr. An FFI caller handing us an integer straight from Elixir or Ruby
 /// can easily pass zero, so turn it into an ordinary error the caller can
 /// read instead.
+///
+/// Its worker and blocking-pool threads carry the engine clock of the thread
+/// that builds it (`crate::clock`).
 pub(crate) fn build_runtime(
     worker_threads: Option<usize>,
 ) -> std::io::Result<tokio::runtime::Runtime> {
-    runtime_builder(worker_threads)?.build()
+    let clock = crate::clock::Inherit::capture();
+    runtime_builder(worker_threads)?
+        .on_thread_start(move || clock.enter())
+        .build()
 }
 
 /// [`build_runtime`]'s builder, before it builds, for a caller that adds
@@ -6059,6 +6065,28 @@ mod runtime_tests {
     /// background thread would surface as the generic
     /// `BlockingThreadExitedBeforeReady` plus a stray panic on stderr. A
     /// zero from an FFI caller must come back as an ordinary error instead.
+    /// The blocking wrapper's runtime carries the engine clock of the thread
+    /// that builds it, as the client's does, so a call it times and the
+    /// engine it starts read one clock.
+    #[test]
+    fn build_runtime_threads_read_the_building_threads_clock() {
+        let lead = || crate::clock::now().saturating_duration_since(std::time::Instant::now());
+        let clock = crate::clock::EngineClock::new();
+        let entered = clock.enter();
+        let runtime = build_runtime(Some(2)).expect("build runtime");
+        drop(entered);
+        clock.step(-2 * 86_400);
+        clock.step(4 * 86_400);
+        let (worker, blocking) = runtime.block_on(async move {
+            let worker = tokio::spawn(async move { lead() }).await;
+            let blocking = tokio::task::spawn_blocking(lead).await;
+            (worker.expect("worker"), blocking.expect("blocking"))
+        });
+        let day = std::time::Duration::from_secs(2 * 86_400 - 1);
+        assert!(worker >= day, "{worker:?}");
+        assert!(blocking >= day, "{blocking:?}");
+    }
+
     #[test]
     fn worker_threads_some_zero_is_an_error_not_a_panic() {
         let err = build_runtime(Some(0)).expect_err("Some(0) must not build a runtime");
