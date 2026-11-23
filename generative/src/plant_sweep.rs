@@ -128,7 +128,17 @@ pub enum PlantPath {
     /// tier lists them in its `not_gated` with [`NO_XID_EPOCH`]. `trellis`'s sealing pin
     /// and `db_admin.rs`'s wrap pin gate them.
     XidEpoch,
+    /// The capture audit's read of a capture trigger's state (disabled, or
+    /// altered by a disable and an enable). Only the source-DDL property
+    /// (`tests/source_ddl.rs`) disables a capture trigger, and it is no
+    /// planted-bug sweep tier, so no tier gates these: every tier lists them
+    /// in its `not_gated` with [`NO_SOURCE_DDL`].
+    SourceDdl,
 }
+
+/// Why no sweep tier gates a [`PlantPath::SourceDdl`] plant.
+pub const NO_SOURCE_DDL: &str = "no sweep tier disables a capture trigger; the source_ddl \
+     property does, and its capture_disabled_* pins gate it";
 
 /// Why no sweep tier gates a [`PlantPath::XidEpoch`] plant.
 pub const NO_XID_EPOCH: &str = "no sweep tier crosses the 32-bit xid epoch; the db_admin \
@@ -237,6 +247,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         Plant::IsolationPausesEveryReader => PlantPath::Isolation,
         Plant::FenceXid32 => PlantPath::XidEpoch,
         Plant::NullKeyAsEmpty => PlantPath::SourceKey,
+        Plant::CaptureSkipTriggerState => PlantPath::SourceDdl,
     }
 }
 
@@ -259,7 +270,7 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         // of any kind.
         PlantPath::Chain | PlantPath::Capture | PlantPath::Isolation | PlantPath::SourceKey => true,
         // Every target drains through the fenced read.
-        PlantPath::XidEpoch => true,
+        PlantPath::XidEpoch | PlantPath::SourceDdl => true,
     }
 }
 
@@ -1044,6 +1055,7 @@ mod tests {
                 | PlantPath::Capture
                 | PlantPath::Isolation
                 | PlantPath::XidEpoch
+                | PlantPath::SourceDdl
                 | PlantPath::SourceKey => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
                     assert!(plant_reaches(name, &group_by), "{name}");

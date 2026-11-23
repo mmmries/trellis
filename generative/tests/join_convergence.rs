@@ -439,6 +439,10 @@ fn join_sweep_tier() -> SweepTier {
         generative::plant_sweep::NO_XID_EPOCH,
     ));
     not_gated.extend(not_on_path(
+        &[PlantPath::SourceDdl],
+        generative::plant_sweep::NO_SOURCE_DDL,
+    ));
+    not_gated.extend(not_on_path(
         &[PlantPath::SourceKey],
         generative::plant_sweep::NO_SOURCE_KEY,
     ));

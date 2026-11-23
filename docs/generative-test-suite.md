@@ -1191,6 +1191,10 @@ The actions, cheapest-first (every one below is built):
    and the entry's repair fixes. Anything else fails, so the register is a
    checked allowlist: a missing entry fails, and so does one whose detection
    or repair doesn't hold.
+   `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`
+   and `resumed_exact`. The `capture_skip_trigger_state` plant (the capture
+   audit not reading a trigger's state) needs a disabled trigger, so no
+   planted-bug sweep tier runs it; the `capture_disabled_*` pins catch it.
 
 8. **Privilege and ownership changes** (bucket 3) — `REVOKE`/`GRANT` of
    Trellis's `SELECT` or its schema's `USAGE`, the owner role revoked from
