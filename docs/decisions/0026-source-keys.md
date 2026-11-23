@@ -101,7 +101,8 @@ migrations found that it fires only when no index enforces the key: every
 operation that keeps an equivalent valid index at every committed instant
 (`REINDEX CONCURRENTLY`, a build-then-drop swap, a rename, pg_repack,
 `ADD PRIMARY KEY USING INDEX`, partition maintenance) never trips it, while a
-drop-then-build swap pauses when a pass lands between the two. Its message
+drop-then-build swap pauses when a pass lands between the two, and halts
+the readers when a change drains between them. Its message
 says to build the replacement before dropping the old index and, for a
 partitioned table, to re-run `ALTER INDEX … ATTACH PARTITION` after
 repairing a leaf, whose repair alone leaves the root's index invalid. A
