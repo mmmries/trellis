@@ -30,7 +30,7 @@ use proptest::test_runner::{
 };
 use testkit::TestCluster;
 use trellis::Config;
-use trellis::dev::defs::ast::KeySpace;
+use trellis::dev::defs::ast::{Expr, KeySpace, Operator};
 use trellis::dev::pool::Pool;
 
 struct Harness {
@@ -1037,37 +1037,47 @@ async fn an_unread_column_added_keeps_every_definition_exact() {
     );
 }
 
+/// [`one_to_one_and_aggregate_program`] with the 1-1's `total` as `c1 - c2`,
+/// which a swap of the two changes, so a swap shows in both readers.
+fn swap_reading_program() -> Program {
+    let mut program = one_to_one_and_aggregate_program();
+    let total = &mut program.defs[0].fields[0];
+    assert_eq!(total.name, "total");
+    let Expr::BinaryOp { op, .. } = &mut total.expr else {
+        panic!("total is c1 + c2: {:?}", total.expr);
+    };
+    *op = Operator::Subtract;
+    program
+}
+
 /// The register's `column-name-swap`: `c1`'s name taken by `c2` (a swap) or
 /// by a column added under it, an update in between, and the names given
 /// back with no pass in between. Capture images the column that has the
-/// name, so the aggregate's `SUM(c1)` takes the other column's value, and
-/// after the names are back the pass sees only `xmin` moved. `self_check`
-/// reports it and `request_backfill` repairs it. The 1-1's `c1 + c2` is the
-/// same sum under a swap, so only the added column leaves it wrong.
+/// name, so the 1-1's `c1 - c2` and the aggregate's `SUM(c1)` take the other
+/// column's value, and after the names are back the pass sees only `xmin`
+/// moved. `self_check` reports it and `request_backfill` repairs it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_columns_name_taken_and_given_back_inside_one_interval_is_the_listed_gap() {
-    let program = one_to_one_and_aggregate_program();
+    let program = swap_reading_program();
     let (c1, c2) = (c1(&program), c2(&program));
     let gap = Verdict::ListedGap(Gap::ColumnNameSwap);
-    for (action, expected) in [
-        (
-            SourceDdl::SwapColumnNames {
-                column: c1.clone(),
-                other: c2.clone(),
-            },
-            [Verdict::Exact, gap.clone()],
-        ),
-        (
-            SourceDdl::ShadowColumn { column: c1.clone() },
-            [gap.clone(), gap.clone()],
-        ),
+    for action in [
+        SourceDdl::SwapColumnNames {
+            column: c1.clone(),
+            other: c2.clone(),
+        },
+        SourceDdl::ShadowColumn { column: c1.clone() },
     ] {
         let event = event(&program, 2, action.clone(), 1, false);
         assert_eq!(
             event.listed_gaps(&program, Server::default()),
             vec![Gap::ColumnNameSwap]
         );
-        assert_eq!(run_one(&program, event).await, expected, "{action:?}");
+        assert_eq!(
+            run_one(&program, event).await,
+            [gap.clone(), gap.clone()],
+            "{action:?}"
+        );
     }
 }
 
@@ -1076,7 +1086,7 @@ async fn a_read_columns_name_taken_and_given_back_inside_one_interval_is_the_lis
 /// every definition ends exact.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_columns_name_taken_across_a_pass_is_reread() {
-    let program = one_to_one_and_aggregate_program();
+    let program = swap_reading_program();
     let (c1, c2) = (c1(&program), c2(&program));
     for action in [
         SourceDdl::SwapColumnNames {
