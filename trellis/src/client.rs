@@ -733,6 +733,32 @@ mod client_runtime_tests {
         assert_eq!(blocking, "app/tenant_a");
     }
 
+    /// Every worker and blocking thread of the client's runtime reads the
+    /// engine clock of the thread that built it (`crate::clock`), so a test
+    /// stepping that clock moves every task of the client.
+    #[test]
+    fn every_thread_of_the_client_runtime_reads_the_starting_threads_clock() {
+        let lead = || crate::clock::now().saturating_duration_since(std::time::Instant::now());
+        let clock = crate::clock::EngineClock::new();
+        let entered = clock.enter();
+        let options = ClientOptions {
+            worker_threads: Some(2),
+            ..ClientOptions::default()
+        };
+        let runtime = client_runtime(&options, std::sync::Arc::from("app/t")).expect("runtime");
+        drop(entered);
+        clock.step(86_400);
+        let (worker, blocking) = runtime.block_on(async move {
+            let worker = tokio::spawn(async move { lead() }).await;
+            let blocking = tokio::task::spawn_blocking(lead).await;
+            (worker.expect("worker"), blocking.expect("blocking"))
+        });
+        let day = std::time::Duration::from_secs(86_399);
+        assert!(worker >= day, "{worker:?}");
+        assert!(blocking >= day, "{blocking:?}");
+        assert!(lead() < day, "the test thread left the clock");
+    }
+
     /// A running client sets its instance's gauges again on a
     /// timer, so the recorder's idle timeout drops only a stopped instance's.
     /// A client with no staging worker and no drain workers never touches the
