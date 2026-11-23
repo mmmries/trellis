@@ -139,7 +139,15 @@ fixture operation of the same name. Its other public calls
 `.named_instance`, `.migrate_all`, `.off_in?`, `.off_message`, `.release_check` and `.with_handle`, and
 `Trellis::Migration.with_handle`) are Rails-only, and `Parity::RAILS_ONLY`
 lists each with its reason. A call added to either module fails the suite
-until it's listed. `Trellis::Instance` has exactly the fixture's operations
+until it's listed. The release check is outside the fixture on both sides: it reads git and
+files, never the engine. `Trellis::ReleaseCheck` (`rails trellis:release_check`)
+and `Trellis.ReleaseCheck` (`mix trellis.release_check`) apply the same rule
+(a changed `trellis-pg` / `trellis_pg` lockfile version plus an added
+migration that mentions `Trellis` fails) and each has its own suite
+(`test/release_check_test.rb`, `test/trellis/release_check_test.exs`). A change
+to the rule changes both.
+
+`Trellis::Instance` has exactly the fixture's operations
 (`connect` as its class method) and `connected?`, since the `Trellis`
 module delegates each call to its default instance.
 

@@ -273,6 +273,36 @@ make it so: Ecto's `schema_migrations` runs each migration once. See
 Add `import_deps: [:trellis_pg]` to the app's `.formatter.exs` to keep
 `define` and `apply` free of parentheses, like Ecto's own commands.
 
+### Upgrading the package
+
+A release that changes `trellis_pg`'s version can't also define, alter,
+pause, resume or drop a transform. While a worker of the old version runs,
+those calls refuse with `VersionHandoverError`
+([rolling deploys](../../docs/embedding.md#rolling-deploys)), so a deploy that
+migrates before the old worker stops fails at its first Trellis migration.
+Ship the version change by itself, and the migrations in the next release.
+
+`mix trellis.release_check` fails a build that combines the two:
+
+```sh
+mix trellis.release_check --base origin/main
+```
+
+It compares the working tree with its merge base against the base, and exits
+1 when `trellis_pg`'s version in `mix.lock` changed and a migration added
+since then (under `priv/*/migrations`, or each `--migrations-path`) mentions
+`Trellis`. It reads git and files only: it needs no database and starts no
+application. `BASE=origin/main` as an argument, or in the environment, sets
+the base too.
+
+- **On a pull request**, the base is the branch it targets, and the job needs
+  the history back to the merge base (`actions/checkout` with
+  `fetch-depth: 0`).
+- **For a release of several merged pull requests**, the base is the last
+  deployed ref.
+- It sees migrations only. A state-changing call from a script or a console
+  is in no file it reads; the engine still refuses it.
+
 ## Testing
 
 The recipe: Trellis off in the test environment, targets filled by hand.
