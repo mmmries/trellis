@@ -336,7 +336,7 @@ partitioned on its own id is refused.
 When neither side is partitioned, a build, a `RESUME` and a rebuild in place
 are one transaction over both structures. It takes the lock row `FOR SHARE`,
 enumerates each side's cells (its hidden table's, its table's and those of the
-ring's old images), locks `J` on the union of both sides' keys in one sorted
+ring's images), locks `J` on the union of both sides' keys in one sorted
 statement, then locks the `P` cells with a `NULL` key part (they take no `J`
 row; `J` holds every other cell). Each side's snapshot statement, after every
 lock statement, is one `GROUP BY` of its table into a temporary table, so
