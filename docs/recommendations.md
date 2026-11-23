@@ -467,7 +467,8 @@ The role needs:
   gives both), and `USAGE` on the schema of every source.
 * Ownership of each source table, or membership in the role that owns it, with `INHERIT`.
 * `BYPASSRLS` if row-level security applies to it on any table it reads or
-  writes, and on the ring's owner, which doesn't inherit it.
+  writes (any source with `FORCE ROW LEVEL SECURITY`, whatever its policies
+  allow), and on the ring's owner, which doesn't inherit it.
 
 Why each is needed, and what Trellis does when one is missing:
 [embedding — What the staging worker needs from the database](embedding.md#what-the-staging-worker-needs-from-the-database),

@@ -251,8 +251,9 @@ and how it re-keys a 1-1 target, is in
 Row-level security applies to a role when RLS is enabled and the role neither
 owns the table (directly or through membership) nor has `BYPASSRLS`, or owns
 it and the table is `FORCE ROW LEVEL SECURITY`; a superuser is exempt. Every
-Trellis connection runs with `row_security = off`, so a read or write the
-policies would filter fails rather than skipping rows.
+Trellis connection and capture function runs with `row_security = off`, so a
+read or write the policies apply to fails rather than skipping rows, even
+when they would allow every row.
 
 Define checks a source for the role that owns the ring, and a table that is
 another transform's target for the defining role. It creates the target as

@@ -181,14 +181,6 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             (Menu::Privilege, _) => privilege(action, target),
         };
         let action = match action {
-            // #2227: row-level security hiding rows from capture's re-read
-            // inside one interval leaves a target wrong. Drop this with the
-            // fix.
-            SourceDdl::Rls {
-                trellis_policy: false,
-            } if !pass_inside => SourceDdl::Rls {
-                trellis_policy: true,
-            },
             // A foreign key's check reads the referenced table as its owner,
             // so taking the owner's `SELECT` or `USAGE` fails the
             // application's write in Postgres itself. Revoking the owner

@@ -643,7 +643,7 @@ fixes and what it costs:
 * **Everything Trellis refuses at define, or pauses on when it appears
   later:** a source with neither a primary key nor a `KEY (…)` backed by a
   unique index, row-level security on a role
-  Trellis runs as,
+  Trellis runs as (a policy that allows every row included),
   a logical-replication subscription into a source, a source
   in a hierarchy
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)),
