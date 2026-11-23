@@ -19,7 +19,10 @@ use trellis::dev::pool::Pool;
 
 use crate::backend::{Backend, ManualBackend};
 use crate::gaps::Gap;
-use crate::model::{Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan};
+use crate::model::{
+    MOVED_SCHEMA, Op, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan,
+    table_away,
+};
 
 use super::judge::{Judged, PassStepper, judge};
 use super::privilege::{self, RefusalSeen};
@@ -129,9 +132,15 @@ pub async fn run_convergence_with_source_ddl_allowing(
                     .map_err(|e| fired(format!("hold the drain: {e:?}")))?;
             }
             execute(backend, &statements.opens).await.map_err(fired)?;
+            execute_app(backend, &statements.app_opens)
+                .await
+                .map_err(fired)?;
             event.follow(&mut model);
             if let Some(column) = event.removed_column() {
                 backend.forget_column(&event.table, column);
+            }
+            if event.action == SourceDdl::RenameTableAway {
+                backend.relocate_table(&event.table, &table_away(&event.table));
             }
             let writer = event.action.writes_as_writer();
             if writer {
@@ -154,7 +163,8 @@ pub async fn run_convergence_with_source_ddl_allowing(
                 }
             }
             for window_op in op_index + 1..=event.last_op() {
-                apply_and_check_outcome(backend, window_op, &program.ops[window_op], false).await?;
+                let op = in_window(event, &program.ops[window_op]);
+                apply_and_check_outcome(backend, window_op, &op, false).await?;
             }
             if let Some(target) = event.action.refused_target() {
                 let seen =
@@ -172,8 +182,12 @@ pub async fn run_convergence_with_source_ddl_allowing(
             // window under it before it's changed back. With no pass since
             // the last check settled, nothing waits for one; after the
             // window's pass, a build it queued would, so settle beside
-            // passes, which don't see a collation.
-            if event.action.drains_before_close() {
+            // passes, which don't see a collation. A table away from its
+            // name drains too, so the window always meets the drain that
+            // purges its changes, not only when a drain happens to win the
+            // race with the close.
+            let away = event.action.moves_table() && !event.pass_inside;
+            if event.action.drains_before_close() || away {
                 if event.pass_inside {
                     passes.settle(backend).await
                 } else {
@@ -182,6 +196,9 @@ pub async fn run_convergence_with_source_ddl_allowing(
                 .map_err(|e| fired(format!("drain the window: {e}")))?;
             }
             execute(backend, &statements.closes).await.map_err(fired)?;
+            execute_app(backend, &statements.app_closes)
+                .await
+                .map_err(fired)?;
             if writer {
                 backend
                     .write_as(None)
@@ -237,10 +254,37 @@ fn allowed_for(event: Option<&SourceDdlEvent>, def: &TransformDef, gaps: &[Gap])
     }
 }
 
-/// An event's statements, with the names they need read from the catalog.
+/// `op`, a write in `event`'s window, as the application issues it while
+/// the event has the table: a write naming a table renamed away names it
+/// where it is ([`Op::Leaf`] names the relation, and an `ON CONFLICT`,
+/// `MERGE` or CTE form is issued as the plain write whose effect it has).
+/// The generator keeps partition maintenance out of such a window.
+fn in_window(event: &SourceDdlEvent, op: &Op) -> Op {
+    match op {
+        Op::Leaf { .. } => op.clone(),
+        _ if event.action == SourceDdl::RenameTable && op.table() == event.table => {
+            assert!(
+                !matches!(op, Op::Partition { .. }),
+                "partition maintenance in {event:?}'s window — a generator bug"
+            );
+            Op::Leaf {
+                leaf: table_away(&event.table),
+                op: Box::new(op.write().clone()),
+            }
+        }
+        _ => op.clone(),
+    }
+}
+
+/// An event's statements, with the names they need read from the catalog:
+/// the operator's (`opens`, `closes`), then the application's on its own
+/// session (`app_opens`, `app_closes`).
+#[derive(Default)]
 struct Statements {
     opens: Vec<String>,
     closes: Vec<String>,
+    app_opens: Vec<String>,
+    app_closes: Vec<String>,
 }
 
 impl Statements {
@@ -258,7 +302,71 @@ impl Statements {
                 .refused_target()
                 .map(|target| backend.qualified_target(target));
             let (opens, closes) = privilege::statements(&event.action, &table, target.as_deref());
-            return Ok(Self { opens, closes });
+            return Ok(Self {
+                opens,
+                closes,
+                ..Self::default()
+            });
+        }
+        let renamed = format!("public.{}", quote(&table_away(&event.table)));
+        let rename_away = format!(
+            "ALTER TABLE {table} RENAME TO {}",
+            quote(&table_away(&event.table))
+        );
+        match &event.action {
+            SourceDdl::RenameTable => {
+                return Ok(Self {
+                    opens: vec![rename_away],
+                    closes: vec![format!(
+                        "ALTER TABLE {renamed} RENAME TO {}",
+                        quote(&event.table)
+                    )],
+                    ..Self::default()
+                });
+            }
+            SourceDdl::RenameTableAway => {
+                return Ok(Self {
+                    opens: vec![rename_away],
+                    ..Self::default()
+                });
+            }
+            SourceDdl::MoveSchema => {
+                let schema = quote(MOVED_SCHEMA);
+                let moved = format!("{schema}.{}", quote(&event.table));
+                let path = format!(", {schema}");
+                return Ok(Self {
+                    opens: vec![
+                        format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
+                        // The application's writes reach the table there.
+                        format!("GRANT USAGE ON SCHEMA {schema} TO PUBLIC"),
+                        format!("ALTER TABLE {table} SET SCHEMA {schema}"),
+                    ],
+                    closes: vec![format!("ALTER TABLE {moved} SET SCHEMA public")],
+                    app_opens: vec![format!(
+                        "select pg_catalog.set_config('search_path', \
+                         pg_catalog.current_setting('search_path') || '{path}', false)"
+                    )],
+                    app_closes: vec![format!(
+                        "select pg_catalog.set_config('search_path', pg_catalog.replace(\
+                         pg_catalog.current_setting('search_path'), '{path}', ''), false)"
+                    )],
+                });
+            }
+            SourceDdl::RecreateTable => {
+                // One simple query: one transaction, as a swap tool runs it.
+                let new = quote(&format!("{}_new", event.table));
+                return Ok(Self {
+                    app_opens: vec![format!(
+                        "CREATE TABLE public.{new} (LIKE {table} INCLUDING ALL); \
+                         INSERT INTO public.{new} SELECT * FROM {table}; \
+                         DROP TABLE {table}; \
+                         ALTER TABLE public.{new} RENAME TO {}",
+                        quote(&event.table)
+                    )],
+                    ..Self::default()
+                });
+            }
+            _ => {}
         }
         let rewrite = |column: &str, ty: &str| {
             let column = quote(column);
@@ -478,7 +586,11 @@ impl Statements {
             other => unreachable!("{other:?} is a privilege change"),
         };
         debug_assert!(program.tables.iter().any(|t| t.name == event.table));
-        Ok(Self { opens, closes })
+        Ok(Self {
+            opens,
+            closes,
+            ..Self::default()
+        })
     }
 }
 
@@ -501,6 +613,17 @@ async fn execute(backend: &ManualBackend, statements: &[String]) -> Result<(), S
     for statement in statements {
         backend
             .execute_admin(statement)
+            .await
+            .map_err(|e| format!("{statement}: {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Runs `statements` on the application's session.
+async fn execute_app(backend: &ManualBackend, statements: &[String]) -> Result<(), String> {
+    for statement in statements {
+        backend
+            .execute_app(statement)
             .await
             .map_err(|e| format!("{statement}: {e:?}"))?;
     }

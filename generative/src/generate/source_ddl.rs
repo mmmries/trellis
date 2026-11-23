@@ -50,7 +50,7 @@ enum Menu {
 impl Menu {
     fn actions(self) -> u8 {
         match self {
-            Menu::Maintenance => 19,
+            Menu::Maintenance => 23,
             Menu::Privilege => 11,
         }
     }
@@ -179,9 +179,10 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             }
             (Menu::Maintenance, 9..=15) => columns(action, table, &numeric, &declared, op, pick)
                 .unwrap_or(SourceDdl::VacuumFull),
-            (Menu::Maintenance, 16..) => {
+            (Menu::Maintenance, 16..=18) => {
                 attributes(action, program, table, &numeric, pick).unwrap_or(SourceDdl::VacuumFull)
             }
+            (Menu::Maintenance, 19..) => whole_table(action, table),
             (Menu::Maintenance, _) => maintenance(action, column, pick),
             (Menu::Privilege, _) => privilege(action, target),
         };
@@ -201,6 +202,16 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             (ops - 1, 0)
         } else {
             (op, window.min(ops - 1 - op))
+        };
+        // Partition maintenance names the root, which a table moved away
+        // doesn't answer to: the window ends before the table's first.
+        let window = if action.moves_table() {
+            program.ops[op + 1..=op + window]
+                .iter()
+                .position(|o| matches!(o, Op::Partition { table: t, .. } if t == &table.name))
+                .unwrap_or(window)
+        } else {
+            window
         };
         let event = SourceDdlEvent {
             op,
@@ -361,6 +372,21 @@ fn attributes(
             },
         },
     })
+}
+
+/// The change to the whole table `action` names (#2184 slice 6): renamed
+/// away and back, moved to another schema and back, renamed away for good,
+/// or dropped and created again with its rows. Only a plain table is
+/// created again (a tree's leaves would have to be too); a partitioned one
+/// draws `VACUUM FULL` instead.
+fn whole_table(action: u8, table: &Table) -> SourceDdl {
+    match action {
+        19 => SourceDdl::RenameTable,
+        20 => SourceDdl::MoveSchema,
+        21 => SourceDdl::RenameTableAway,
+        _ if table.partitioning.is_some() => SourceDdl::VacuumFull,
+        _ => SourceDdl::RecreateTable,
+    }
 }
 
 /// The functions Postgres refuses over a nondeterministic collation for

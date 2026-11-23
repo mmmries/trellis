@@ -1209,9 +1209,12 @@ The actions, cheapest-first (every one below is built):
    checked allowlist: a missing entry fails, and so does one whose detection
    or repair doesn't hold.
    An `ALTER COLUMN TYPE` changes the model's column type with it, which the
-   oracle reads; a key column's value-changing rewrite, and a column renamed
-   away, dropped or made generated, is drawn only after the program's last
-   op, since later ops address the keys and write the columns. A collation
+   oracle reads; a key column's value-changing rewrite, a column renamed
+   away, dropped or made generated, and the table renamed away for good, are
+   drawn only after the program's last op, since later ops address the keys
+   and write the columns. While the table is renamed or moved away and
+   back, the window's writes name it where it is, and with no pass inside,
+   the window drains before the table comes back. A collation
    change drains its window before the collation goes back, since a
    collation changes only what a drain computes.
    `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`,

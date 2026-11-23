@@ -41,7 +41,7 @@ Postgres, hidden tables included, detects and never repairs
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1654](https://github.com/salesforce-misc/trellis/issues/1654) (study), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
 | [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix |
-| [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1652](https://github.com/salesforce-misc/trellis/issues/1652) |
+| [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#2270](https://github.com/salesforce-misc/trellis/issues/2270), [#1652](https://github.com/salesforce-misc/trellis/issues/1652) |
 | [A short-lived leaf beside a `DEFAULT` partition](#a-short-lived-leaf-beside-a-default-partition) | `self_check` | documented |
 | [A leaf detached and attached again around a `pg_upgrade`](#a-leaf-detached-and-attached-again-around-a-pg_upgrade) | `self_check` | [#1652](https://github.com/salesforce-misc/trellis/issues/1652) |
 | **Changes made outside Trellis to what it owns** | | |
@@ -75,9 +75,12 @@ while every rule holds.
   breaks the guarantee.
 * **Use logged tables as sources.** Postgres empties an unlogged table on a
   crash, a failover or a physical restore.
+* **Rename a source or move it to another schema only while its transforms
+  are paused**
+  ([below](#the-source-renamed-or-re-parented-and-back-within-one-pass)).
 * **On a partitioned source, change a partition key with `UPDATE`** (or
-  `DELETE` and `INSERT`), not `MERGE`; rename or re-parent the source only
-  while its transforms are paused; and let a reconcile pass run between
+  `DELETE` and `INSERT`), not `MERGE`; re-parent the source only while its
+  transforms are paused; and let a reconcile pass run between
   creating or attaching a leaf beside a `DEFAULT` partition and removing it,
   and between partition maintenance and a `pg_upgrade`
   ([below](#a-merge-that-moves-a-row-to-another-partition)).
@@ -416,23 +419,28 @@ with `DELETE` and `INSERT`.
 
 ### The source renamed or re-parented and back within one pass
 
-**When:** before the next reconcile pass, the source is renamed away and back
-(`ALTER TABLE orders RENAME TO orders_old`, then back), or attached under
-another partitioned table and detached again. A pass that sees the source
-renamed away, or attached elsewhere, pauses its readers.
+**When:** before the next reconcile pass, the source is renamed away and
+back (`ALTER TABLE orders RENAME TO orders_old`, then back) or moved to
+another schema and back, or a partitioned source is attached under another
+partitioned table and detached again. A pass that sees the source renamed
+away, moved, or attached elsewhere, pauses its readers.
 
-**What goes wrong:** capture stages a write only while the source's name
-resolves to the root of the tree being written, so every write made in
-between is lost, including writes named on the source and its leaves.
-Nothing in the catalog differs afterwards.
+**What goes wrong:** a drain that runs while the source is away from its
+name finds no table there and purges the changes staged for it, including
+writes made before the rename. On a partitioned source, capture also stages
+a write only while the source's name resolves to the root of the tree being
+written, so every write made in between is lost, including writes named on
+the source and its leaves. Nothing in the catalog differs afterwards.
 
 **Detected by:** `self_check`.
 
 **Repair:** `PAUSE`/`RESUME` the transforms that read the table, or
-`request_backfill` it. To avoid it, rename or re-parent a source only while
-its transforms are paused.
+`request_backfill` it. To avoid it, rename, move or re-parent a source only
+while its transforms are paused.
 
-**Ends with:** [#1652](https://github.com/salesforce-misc/trellis/issues/1652).
+**Ends with:** [#2270](https://github.com/salesforce-misc/trellis/issues/2270),
+and [#1652](https://github.com/salesforce-misc/trellis/issues/1652) for a
+partitioned source.
 
 <a id="default-partition-short-leaf"></a>
 
