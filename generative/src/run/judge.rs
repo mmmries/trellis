@@ -455,8 +455,12 @@ pub async fn judge(
     for (i, gap, _) in &repaired {
         let def = &defs[*i];
         let repair = match gap.repair() {
-            Repair::RequestBackfill if backfilled.contains(&def.source) => Vec::new(),
-            Repair::RequestBackfill => {
+            Repair::RequestBackfill | Repair::UndoThenBackfill
+                if backfilled.contains(&def.source) =>
+            {
+                Vec::new()
+            }
+            Repair::RequestBackfill | Repair::UndoThenBackfill => {
                 backfilled.push(def.source.clone());
                 vec![BurstAction::RequestBackfill {
                     table: def.source.clone(),

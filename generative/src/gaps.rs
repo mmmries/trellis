@@ -54,6 +54,11 @@ pub enum Repair {
     RequestBackfill,
     /// `PAUSE` then `RESUME` of the definition.
     PauseResume,
+    /// The source change undone first, then `request_backfill` of the
+    /// table. A drawn shape tagged with such an entry undoes the change at
+    /// its close (a collation changed back), so the harness runs only the
+    /// backfill.
+    UndoThenBackfill,
     /// The entry documents no repair the harness can run (a configuration
     /// or a restore); a shape tagged with it can't be judged by the
     /// register.
@@ -103,16 +108,16 @@ impl Gap {
 
     /// The first repair the entry's **Repair** names that the harness can
     /// run, or [`Repair::None`] when it names only a configuration change,
-    /// a restore, or a redefinition, or needs a change to the source first
-    /// (a duplicate removed, a collation changed back).
+    /// a restore, or a redefinition, or a change to the source first that no
+    /// drawn shape makes yet (a duplicate removed).
     pub fn repair(self) -> Repair {
         match self {
             Gap::MergeMovesPartition
             | Gap::SourceRenameRoundtrip
             | Gap::DefaultPartitionShortLeaf
             | Gap::LeafReattachAroundUpgrade => Repair::PauseResume,
-            Gap::NondeterministicCollation
-            | Gap::DeferrableKeyReplicaDuplicate
+            Gap::NondeterministicCollation => Repair::UndoThenBackfill,
+            Gap::DeferrableKeyReplicaDuplicate
             | Gap::OwnedTablesWritten
             | Gap::PartialRestore
             | Gap::TransactionPooler => Repair::None,

@@ -1244,7 +1244,9 @@ pub struct Rewrite {
 }
 
 mod source_ddl;
-pub use source_ddl::{RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType};
+pub use source_ddl::{
+    Collation, RetypeShape, Server, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType,
+};
 
 #[cfg(test)]
 mod tests {

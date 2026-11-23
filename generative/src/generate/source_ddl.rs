@@ -8,8 +8,8 @@ use trellis::dev::defs::ast::ValueType;
 
 use super::wiring::with_wiring;
 use crate::model::{
-    ConcurrentPlan, Op, Program, RetypeShape, SourceDdl, SourceDdlEvent, SourceDdlPlan, SqlType,
-    Table,
+    Collation, ConcurrentPlan, Op, Program, RetypeShape, SourceDdl, SourceDdlEvent, SourceDdlPlan,
+    SqlType, Table,
 };
 
 /// The most events one plan draws.
@@ -50,7 +50,7 @@ enum Menu {
 impl Menu {
     fn actions(self) -> u8 {
         match self {
-            Menu::Maintenance => 16,
+            Menu::Maintenance => 19,
             Menu::Privilege => 11,
         }
     }
@@ -177,8 +177,11 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
                 )
                 .unwrap_or(SourceDdl::VacuumFull)
             }
-            (Menu::Maintenance, 9..) => columns(action, table, &numeric, &declared, op, pick)
+            (Menu::Maintenance, 9..=15) => columns(action, table, &numeric, &declared, op, pick)
                 .unwrap_or(SourceDdl::VacuumFull),
+            (Menu::Maintenance, 16..) => {
+                attributes(action, program, table, &numeric, pick).unwrap_or(SourceDdl::VacuumFull)
+            }
             (Menu::Maintenance, _) => maintenance(action, column, pick),
             (Menu::Privilege, _) => privilege(action, target),
         };
@@ -305,6 +308,89 @@ fn columns(
     })
 }
 
+/// The `NOT NULL`, default or collation change `action` names (#2184
+/// slice 5): a `NOT NULL` flip of one of `numeric`, `table`'s numeric
+/// columns other than its key, that no op writes `NULL` to (a default set
+/// on one where none is free of them), a default set on one, beside a
+/// `VACUUM FULL` or not, or the table's `text` column given `"C"` or a
+/// case-insensitive collation. `None` where the table has no such column,
+/// or is partitioned or read through a `KEY (…)`, as [`retype`] has it.
+fn attributes(
+    action: u8,
+    program: &Program,
+    table: &Table,
+    numeric: &[&str],
+    pick: usize,
+) -> Option<SourceDdl> {
+    if table.partitioning.is_some() || table.source_key.is_some() || numeric.is_empty() {
+        return None;
+    }
+    let set_default = || SourceDdl::SetDefault {
+        column: numeric[pick % numeric.len()].to_string(),
+        rewrite: (pick / numeric.len()) % 2 == 1,
+    };
+    Some(match action {
+        16 => {
+            let never_null: Vec<&&str> = numeric
+                .iter()
+                .filter(|c| !writes_null(program, &table.name, c))
+                .collect();
+            if never_null.is_empty() {
+                set_default()
+            } else {
+                SourceDdl::FlipNotNull {
+                    column: never_null[pick % never_null.len()].to_string(),
+                    key: false,
+                }
+            }
+        }
+        17 => set_default(),
+        _ => SourceDdl::Collate {
+            column: table
+                .columns
+                .iter()
+                .find(|c| c.name != table.pk_col && c.value_type == ValueType::Text)?
+                .name
+                .clone(),
+            collation: if pick.is_multiple_of(2)
+                || calls_collation_refusing_function(program, table)
+            {
+                Collation::C
+            } else {
+                Collation::CaseInsensitive
+            },
+        },
+    })
+}
+
+/// The functions Postgres refuses over a nondeterministic collation for
+/// every row (`docs/errors.md`, T0109).
+pub const COLLATION_REFUSING_FUNCTIONS: [&str; 2] = ["STRPOS", "REGEXP_COUNT"];
+
+/// Whether a definition reading `table` calls one of
+/// [`COLLATION_REFUSING_FUNCTIONS`] anywhere. Under a case-insensitive
+/// collation each changed row's key is held (`docs/transforms.md`, "Per
+/// row"): reported, not a register entry, and a drain that never converges
+/// past the held keys, so such a table only draws `"C"`.
+pub fn calls_collation_refusing_function(program: &Program, table: &Table) -> bool {
+    program
+        .defs
+        .iter()
+        .filter(|d| d.source == table.name)
+        .flat_map(|d| d.fields.iter().map(|f| &f.expr).chain(d.predicate.filter()))
+        .any(|expr| {
+            let mut calls = false;
+            expr.walk(&mut |e| {
+                calls |= matches!(
+                    e,
+                    trellis::dev::defs::ast::Expr::FunctionCall { name, .. }
+                        if COLLATION_REFUSING_FUNCTIONS.contains(&name.as_str())
+                );
+            });
+            calls
+        })
+}
+
 /// `column`'s declared type as the generator creates it, where a
 /// [`SourceDdl::Retype`] can change it.
 fn declared_type(table: &Table, column: &str) -> Option<SqlType> {
@@ -406,24 +492,46 @@ fn retype(
     })
 }
 
+/// The column values one write names.
+type Values<'a> = &'a [(String, Option<String>)];
+
+/// The values each write of `op` names, and whether it inserts (a column
+/// it leaves out takes its default).
+fn written_values(op: &Op) -> Vec<(bool, Values<'_>)> {
+    match op.write() {
+        Op::Insert { row, .. } => vec![(true, row.as_slice())],
+        Op::Update { changes, .. } => vec![(false, changes.as_slice())],
+        Op::BulkInsert { rows, .. } => rows.iter().map(|row| (true, row.as_slice())).collect(),
+        Op::Leaf { op, .. } => written_values(op),
+        _ => Vec::new(),
+    }
+}
+
 /// Whether any of `program`'s ops writes `NaN` to `column` of `table`.
 fn writes_nan(program: &Program, table: &str, column: &str) -> bool {
-    fn values(op: &Op) -> Vec<&[(String, Option<String>)]> {
-        match op.write() {
-            Op::Insert { row, .. } => vec![row.as_slice()],
-            Op::Update { changes, .. } => vec![changes.as_slice()],
-            Op::BulkInsert { rows, .. } => rows.iter().map(Vec::as_slice).collect(),
-            Op::Leaf { op, .. } => values(op),
-            _ => Vec::new(),
-        }
-    }
     program
         .ops
         .iter()
         .filter(|op| op.table() == table)
-        .flat_map(values)
-        .flatten()
+        .flat_map(written_values)
+        .flat_map(|(_, values)| values)
         .any(|(c, v)| c == column && v.as_deref() == Some("NaN"))
+}
+
+/// Whether any of `program`'s ops writes `NULL` to `column` of `table`,
+/// or inserts a row without it.
+fn writes_null(program: &Program, table: &str, column: &str) -> bool {
+    program
+        .ops
+        .iter()
+        .filter(|op| op.table() == table)
+        .flat_map(written_values)
+        .any(
+            |(insert, values)| match values.iter().find(|(c, _)| c == column) {
+                Some((_, value)) => value.is_none(),
+                None => insert,
+            },
+        )
 }
 
 /// The privilege change `action` names, a drain refusal on `target`.

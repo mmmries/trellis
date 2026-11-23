@@ -1211,7 +1211,9 @@ The actions, cheapest-first (every one below is built):
    An `ALTER COLUMN TYPE` changes the model's column type with it, which the
    oracle reads; a key column's value-changing rewrite, and a column renamed
    away, dropped or made generated, is drawn only after the program's last
-   op, since later ops address the keys and write the columns.
+   op, since later ops address the keys and write the columns. A collation
+   change drains its window before the collation goes back, since a
+   collation changes only what a drain computes.
    `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`,
    `resumed_exact` and `resume_refused`. The `capture_skip_trigger_state` plant (the capture
    audit not reading a trigger's state) needs a disabled trigger, so no
