@@ -231,8 +231,11 @@ definition-changed error before writing, so the batch never drains — leaking a
 ring slot *and* blocking reads for its band forever.
 
 The escape hatch is a targeted purge — delete that table's rows from every ring
-table and the quarantine track — invoked only when a full schema reload still does
-not know the table. It is the **only** sanctioned write to rows a batch has
+table and the quarantine track — invoked only when a drain's live query finds no
+table at the staged name. The same transaction pauses every reader of the table
+not paused yet, with the capture pass's gone-table reason: the table may come
+back under its name before any pass sees it gone, and `RESUME` rebuilds what the
+purge dropped. It is the **only** sanctioned write to rows a batch has
 still to apply while their definitions run, and worth marking as such in code
 so nothing else grows into the exception.
 

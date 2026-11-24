@@ -131,7 +131,13 @@ pub async fn run_convergence_with_source_ddl_allowing(
             let statements = Statements::resolve(&passes, backend, program, event, server)
                 .await
                 .map_err(fired)?;
-            if event.action.drains_before_open() {
+            // A partitioned source moved away inside one interval settles
+            // first, so the drain while it is away finds nothing staged to
+            // purge (a purge would pause its readers) and the window's
+            // writes, which capture doesn't stage, are the listed gap.
+            let partitioned_away =
+                event.action.moves_table() && !event.pass_inside && event.partitioned(program);
+            if event.action.drains_before_open() || partitioned_away {
                 passes
                     .settle(backend)
                     .await
@@ -206,8 +212,8 @@ pub async fn run_convergence_with_source_ddl_allowing(
             // window's pass, a build it queued would, so settle beside
             // passes, which don't see a collation. A table away from its
             // name drains too, so the window always meets the drain that
-            // purges its changes, not only when a drain happens to win the
-            // race with the close.
+            // purges its changes and pauses its readers, not only when a
+            // drain happens to win the race with the close.
             let away = event.action.moves_table() && !event.pass_inside;
             if event.action.drains_before_close() || away {
                 if event.pass_inside {

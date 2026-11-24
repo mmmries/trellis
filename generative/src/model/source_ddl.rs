@@ -159,9 +159,11 @@ pub enum SourceDdl {
     DisableCaptureTriggers,
     /// The table renamed to `<table>_away` when the event fires, the
     /// window's writes naming it there, and its name given back at the
-    /// close. Within one reconcile interval this is the register's
-    /// [`Gap::SourceRenameRoundtrip`]; a pass in between finds the table
-    /// gone from its name and pauses its readers.
+    /// close. A pass in between finds the table gone from its name and
+    /// pauses its readers; so does the drain within one reconcile interval,
+    /// whose purge of the table's staged changes pauses them. A partitioned
+    /// source's within one interval is the register's
+    /// [`Gap::SourceRenameRoundtrip`].
     RenameTable,
     /// The table moved to [`MOVED_SCHEMA`] when the event fires, the
     /// window's writes finding it there through the application's
@@ -274,7 +276,8 @@ impl SourceDdl {
     /// Whether the table leaves its name until the close: the generator
     /// keeps the table's partition maintenance out of the window, since it
     /// names the root, and with no pass inside the run drains the window
-    /// while the table is away, which purges its staged changes.
+    /// while the table is away, which purges its staged changes and pauses
+    /// its readers.
     pub fn moves_table(&self) -> bool {
         matches!(self, SourceDdl::RenameTable | SourceDdl::MoveSchema)
     }
@@ -471,11 +474,12 @@ impl SourceDdlEvent {
         ) {
             return vec![Gap::ColumnNameSwap];
         }
-        // A source renamed away and back, or moved to another schema and
-        // back, with no pass between: a drain while it is away purges its
-        // staged changes, and a partitioned source's capture stages nothing
-        // while its name doesn't resolve to the tree's root.
-        if self.action.moves_table() && !self.pass_inside {
+        // A partitioned source renamed away and back, or moved to another
+        // schema and back, with no pass between: its capture stages nothing
+        // while its name doesn't resolve to the tree's root. A plain one's
+        // drain while it is away purges its staged changes and pauses its
+        // readers, which resume exact.
+        if self.action.moves_table() && !self.pass_inside && self.partitioned(program) {
             return vec![Gap::SourceRenameRoundtrip];
         }
         // The pass doesn't see a read column's collation change, pass or no
@@ -508,6 +512,14 @@ impl SourceDdlEvent {
             return Vec::new();
         }
         vec![Gap::AlterTypeRewrite]
+    }
+
+    /// Whether the event's table is partitioned.
+    pub fn partitioned(&self, program: &crate::model::Program) -> bool {
+        program
+            .tables
+            .iter()
+            .any(|t| t.name == self.table && t.partitioning.is_some())
     }
 
     /// Whether a definition reads a column of the event's table that comes

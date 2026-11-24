@@ -866,7 +866,7 @@ fn without_first_definition(program: &Program) -> Program {
 /// What must hold: B's ring drains rather than wedging, B's other transform
 /// (over A's second target) is still maintained and matches the oracle for
 /// the writes staged before the drop and the ones after it, and B's operator
-/// can drop the transform that lost its source.
+/// can drop the transform that lost its source, which the purge paused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading_it() {
     let cluster = TestCluster::start();
@@ -963,8 +963,21 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
         0,
         "B's ring should hold no rows naming {dropped} once it has drained"
     );
-    // B's transform over it is still `live`, with nothing to say its source is
-    // gone, so the operator drops it.
+    // The purge paused B's transform over it, for its source gone (#2270), so
+    // the operator drops it.
+    let states = b
+        .backend
+        .definition_states(&chained.defs[..1])
+        .await
+        .expect("read B's definition");
+    assert!(
+        states[0].is_paused()
+            && states[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no longer exists at that name")),
+        "{states:?}"
+    );
     let lost_source = chained.defs[0].target.clone();
     b.backend
         .drop_transform(&lost_source)
