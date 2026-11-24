@@ -283,7 +283,7 @@ fn allowed_for(event: Option<&SourceDdlEvent>, def: &TransformDef, gaps: &[Gap])
 /// since two of its rows can collide on that key), and checks each op's
 /// outcome as the run's own connection would. The changes are in flight from several
 /// transactions at once, under the event, while the drain workers claim
-/// them. The first failure, by lane, is the run's.
+/// them. The first lane to fail decides the run's error.
 async fn apply_from_lanes(
     backend: &ManualBackend,
     program: &Program,

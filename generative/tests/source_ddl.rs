@@ -1920,10 +1920,13 @@ enum JoinSpace {
 const JOIN_SPACES: [JoinSpace; 3] = [JoinSpace::Join, JoinSpace::OneToOneJoin, JoinSpace::Star];
 
 /// The first deterministic draw of `space`'s tier ([`for_source_ddl`])
-/// whose ops 1 to 4 write both `ja` and `jb`, `jb` at least twice, none
+/// whose ops 2 to 5 write both `ja` and `jb`, `jb` at least twice, none
 /// of them failing, and whose every definition reads `jb`: an event on
-/// `jb` after op 0 with a window of 4 has changes in flight on both sides,
-/// for every definition.
+/// `jb` after op 1 with a window of 4 has changes in flight on both sides,
+/// for every definition. Not after op 0: the run installs every definition
+/// up front without waiting for its build, and only the check after op 0
+/// settles them, so an event there can fire before a build has read `jb`
+/// and find nothing to disrupt.
 fn drawn_join_program(space: JoinSpace, want: impl Fn(&Program) -> bool) -> Program {
     use generative::generate::join::join_case_strategy;
     use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
@@ -1943,10 +1946,10 @@ fn drawn_join_program(space: JoinSpace, want: impl Fn(&Program) -> bool) -> Prog
                 .expect("strategy must produce a value")
                 .current(),
         );
-        if program.ops.len() < 6 {
+        if program.ops.len() < 7 {
             continue;
         }
-        let window = &program.ops[1..=4];
+        let window = &program.ops[2..=5];
         let on = |table: &str| window.iter().filter(|o| o.table() == table).count();
         if on("ja") >= 1
             && on("jb") >= 2
@@ -1962,7 +1965,7 @@ fn drawn_join_program(space: JoinSpace, want: impl Fn(&Program) -> bool) -> Prog
     panic!("no {space:?} draw fits the pins");
 }
 
-/// Runs `action` on `jb` of `program` after op 0, ops 1 to 4 in its
+/// Runs `action` on `jb` of `program` after op 1, ops 2 to 5 in its
 /// window issued from three lanes, and returns each definition's verdict
 /// at the check after it.
 async fn run_on_jb(
@@ -1972,7 +1975,7 @@ async fn run_on_jb(
     pass_inside: bool,
 ) -> Vec<(String, Verdict)> {
     let event = SourceDdlEvent {
-        op: 0,
+        op: 1,
         table: "jb".to_string(),
         action,
         window: 4,
