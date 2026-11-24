@@ -4,12 +4,12 @@
 
 use proptest::prelude::*;
 use trellis::dev::defs::IntWidth;
-use trellis::dev::defs::ast::ValueType;
+use trellis::dev::defs::ast::{KeySpace, TransformDef, ValueType};
 
 use super::wiring::with_wiring;
 use crate::model::{
     Collation, ConcurrentPlan, IndexChange, Op, OpOutcome, Program, RetypeShape, SourceDdl,
-    SourceDdlEvent, SourceDdlPlan, SqlType, Table,
+    SourceDdlEvent, SourceDdlPlan, SqlType, Table, reads,
 };
 
 /// The most events one plan draws.
@@ -66,8 +66,19 @@ fn plan_for(program: &Program, menu: Menu) -> impl Strategy<Value = SourceDdlPla
         0..=MAX_SOURCE_DDL_WINDOW,
         any::<bool>(),
     );
-    prop::collection::vec(draw, 0..=MAX_SOURCE_DDL_EVENTS)
-        .prop_map(move |draws| fit(&program, &draws, menu))
+    // A privilege change's window is the application's own session's.
+    let lanes = match menu {
+        Menu::Maintenance => prop_oneof![Just(1), 2..=super::MAX_LANES].boxed(),
+        Menu::Privilege => Just(1).boxed(),
+    };
+    (
+        prop::collection::vec(draw, 0..=MAX_SOURCE_DDL_EVENTS),
+        lanes,
+    )
+        .prop_map(move |(draws, lanes)| SourceDdlPlan {
+            lanes,
+            ..fit(&program, &draws, menu)
+        })
 }
 
 fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
@@ -102,7 +113,7 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
         let tracked: Vec<_> = program
             .tables
             .iter()
-            .filter(|t| program.defs.iter().any(|d| d.source == t.name))
+            .filter(|t| program.defs.iter().any(|d| reads(d, &t.name)))
             .collect();
         if tracked.is_empty() || op >= ops {
             continue;
@@ -151,9 +162,21 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
         let readers: Vec<&str> = program
             .defs
             .iter()
-            .filter(|d| d.source == table.name)
+            .filter(|d| reads(d, &table.name))
             .map(|d| d.target.as_str())
             .collect();
+        // A table a `JOIN` reads draws only changes to the whole table, its
+        // key's index and its rewrites: a column or attribute change there
+        // is left to a later slice of the tier, and draws a maintenance
+        // action in its place.
+        let joined = program
+            .defs
+            .iter()
+            .any(|d| reads(d, &table.name) && is_join(d));
+        let action = match action {
+            7..=18 if joined && matches!(menu, Menu::Maintenance) => action % 7,
+            action => action,
+        };
         let target = readers[pick % readers.len()].to_string();
         let declared = |column: &str| {
             retyped
@@ -183,7 +206,7 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
                 attributes(action, program, table, &numeric, pick).unwrap_or(SourceDdl::VacuumFull)
             }
             (Menu::Maintenance, 19..=22) => whole_table(action, table),
-            (Menu::Maintenance, 23..) => key_index(action, table),
+            (Menu::Maintenance, 23..) => key_index(action, program, table, pick),
             (Menu::Maintenance, _) => maintenance(action, column, pick),
             (Menu::Privilege, _) => privilege(action, target),
         };
@@ -277,7 +300,7 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             pass_inside: !last.pass_inside,
         });
     }
-    SourceDdlPlan { events }
+    SourceDdlPlan { events, lanes: 1 }
 }
 
 /// The maintenance action `action` names, on `column` where it takes one.
@@ -407,16 +430,19 @@ fn whole_table(action: u8, table: &Table) -> SourceDdl {
 }
 
 /// The change to the index backing `table`'s key `action` names (#2184
-/// slice 7): its `KEY (…)`'s, or its primary key's. A partitioned table's
-/// key index is a tree of indexes no `CONCURRENTLY` build makes, so it
-/// draws `REINDEX TABLE CONCURRENTLY` instead.
-fn key_index(action: u8, table: &Table) -> SourceDdl {
+/// slices 7 and 8): its `KEY (…)`'s, or, by `pick`'s parity, its unique
+/// key within a 1-1 `JOIN`'s `ON` columns where it is joined at a position
+/// (`docs/transforms.md`, "Key"), or its primary key's. A partitioned
+/// table's key index is a tree of indexes no `CONCURRENTLY` build makes, so
+/// it draws `REINDEX TABLE CONCURRENTLY` instead.
+fn key_index(action: u8, program: &Program, table: &Table, pick: usize) -> SourceDdl {
     if table.partitioning.is_some() {
         return SourceDdl::Reindex { concurrently: true };
     }
-    let columns = match &table.source_key {
-        Some(key) => key.columns.clone(),
-        None => vec![table.pk_col.clone()],
+    let columns = match (&table.source_key, joined_unique_key(program, table)) {
+        (Some(key), _) => key.columns.clone(),
+        (None, Some(columns)) if pick % 2 == 1 => columns,
+        _ => vec![table.pk_col.clone()],
     };
     let change = match action {
         23 => IndexChange::Drop,
@@ -424,6 +450,42 @@ fn key_index(action: u8, table: &Table) -> SourceDdl {
         _ => IndexChange::RebuildConcurrently,
     };
     SourceDdl::KeyIndex { columns, change }
+}
+
+/// The columns of `table`'s unique key within the `ON` columns of a 1-1
+/// `JOIN` joining it, where it has one: a unique column, or set of
+/// columns, all of which the `ON` names on `table`'s side.
+fn joined_unique_key(program: &Program, table: &Table) -> Option<Vec<String>> {
+    let on: Vec<&str> = program
+        .defs
+        .iter()
+        .filter_map(|d| match &d.key_space {
+            KeySpace::JoinOneToOne(spec) => Some(spec),
+            _ => None,
+        })
+        .flat_map(|spec| &spec.joins)
+        .filter(|j| j.right == table.name)
+        .flat_map(|j| j.on.iter().flat_map(|on| [&on.lhs, &on.rhs]))
+        .filter(|c| c.table == table.name)
+        .map(|c| c.column.as_str())
+        .collect();
+    let single = table
+        .unique_cols
+        .iter()
+        .find(|c| on.contains(&c.as_str()))
+        .map(|c| vec![c.clone()]);
+    single.or_else(|| {
+        table
+            .unique_sets
+            .iter()
+            .find(|set| set.iter().all(|c| on.contains(&c.as_str())))
+            .cloned()
+    })
+}
+
+/// Whether `def` joins tables.
+fn is_join(def: &TransformDef) -> bool {
+    matches!(def.key_space, KeySpace::Join(_) | KeySpace::JoinOneToOne(_))
 }
 
 /// The functions Postgres refuses over a nondeterministic collation for

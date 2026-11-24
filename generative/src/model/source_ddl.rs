@@ -4,7 +4,7 @@
 //! silently wrong" (`crate::run::judge`).
 
 use trellis::dev::defs::IntWidth;
-use trellis::dev::defs::ast::ValueType;
+use trellis::dev::defs::ast::{Expr, JoinedTable, KeySpace, TransformDef, ValueType};
 
 use crate::gaps::Gap;
 
@@ -357,6 +357,14 @@ impl SourceDdl {
         )
     }
 
+    /// Whether a plan's lanes may issue the event's window
+    /// ([`SourceDdlPlan::lanes`]): not when the window's writes need the
+    /// application's own session as the event leaves it (a schema on its
+    /// `search_path`, the writer role) or the change is a privilege one.
+    pub fn issues_from_lanes(&self) -> bool {
+        !self.privilege() && !self.writes_as_writer() && *self != SourceDdl::MoveSchema
+    }
+
     /// The target the change refuses the drain's writes to, for the
     /// drain's own refusals.
     pub fn refused_target(&self) -> Option<&str> {
@@ -504,8 +512,6 @@ impl SourceDdlEvent {
 
     /// Whether a definition reads a column of the event's table that comes
     /// after `column` (by `attnum`). The key counts: capture images it.
-    /// The tier draws no `JOIN`, so a definition reads the table only as
-    /// its `FROM`.
     fn read_column_after(&self, program: &crate::model::Program, column: &str) -> bool {
         let Some(table) = program.tables.iter().find(|t| t.name == self.table) else {
             return false;
@@ -513,8 +519,8 @@ impl SourceDdlEvent {
         let read: Vec<String> = program
             .defs
             .iter()
-            .filter(|d| d.source == table.name)
-            .flat_map(crate::generate::columns_read)
+            .filter(|d| reads(d, &table.name))
+            .flat_map(|d| columns_read_of(d, &table.name))
             .chain([table.pk_col.clone()])
             .collect();
         table
@@ -708,9 +714,67 @@ impl RetypeShape {
     }
 }
 
+/// Whether `def` reads `table`: as its `FROM`, or as a table it joins.
+pub fn reads(def: &TransformDef, table: &str) -> bool {
+    def.source == table || joined(def).any(|j| j.right == table)
+}
+
+/// The tables `def` joins, none for a definition without a `JOIN`.
+fn joined(def: &TransformDef) -> impl Iterator<Item = &JoinedTable> {
+    match &def.key_space {
+        KeySpace::Join(spec) | KeySpace::JoinOneToOne(spec) => spec.joins.as_slice(),
+        _ => &[],
+    }
+    .iter()
+}
+
+/// The columns of `table` that `def` reads. A definition without a `JOIN`
+/// reads only its `FROM`, by bare names; a `JOIN` names each column with
+/// its table, in its fields, filter, `ON` terms and `GROUP BY`.
+fn columns_read_of(def: &TransformDef, table: &str) -> Vec<String> {
+    let (KeySpace::Join(spec) | KeySpace::JoinOneToOne(spec)) = &def.key_space else {
+        return crate::generate::columns_read(def);
+    };
+    let mut out = Vec::new();
+    let mut add = |expr: &Expr| {
+        expr.walk(&mut |e| {
+            if let Expr::SourceColumn {
+                table: t, column, ..
+            } = e
+                && t == table
+            {
+                out.push(column.clone());
+            }
+        });
+    };
+    for field in &def.fields {
+        add(&field.expr);
+    }
+    if let Some(predicate) = def.predicate.filter() {
+        add(predicate);
+    }
+    let qualified = spec
+        .joins
+        .iter()
+        .flat_map(|j| j.on.iter().flat_map(|on| [&on.lhs, &on.rhs]))
+        .chain(&spec.group_by);
+    out.extend(
+        qualified
+            .filter(|c| c.table == table)
+            .map(|c| c.column.clone()),
+    );
+    out
+}
+
 /// The source-DDL schedule for one program run: events in op order, none
 /// starting before the previous one's window has ended.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SourceDdlPlan {
     pub events: Vec<SourceDdlEvent>,
+    /// How many lanes issue each event's window, each on its own
+    /// connection and in program order, racing the others, as the
+    /// concurrent tier deals a burst (`crate::generate::deal_to_lanes`).
+    /// `0` or `1` issues it in order on the run's own connection, as does
+    /// an event whose action doesn't [`SourceDdl::issues_from_lanes`].
+    pub lanes: usize,
 }

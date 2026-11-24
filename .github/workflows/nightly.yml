@@ -9,9 +9,10 @@ name: Nightly
 #   (`property_convergence_holds_for_trivial_programs`), at a much higher case count
 #   than its 16-case default, and the epoch tier's chains
 #   (`property_epoch_chains_converge_on_one_instance`) at 50 epochs, and the
-#   source-DDL property (`property_source_ddl_is_never_silently_wrong`). Every
+#   source-DDL properties (`property_source_ddl_is_never_silently_wrong`,
+#   `property_join_source_ddl_is_never_silently_wrong`). Every
 #   property is `#[ignore]`d, so PR-time CI never runs them; this lane opts in
-#   with `-- --ignored`. Only these three of the crate's properties get an
+#   with `-- --ignored`. Only these four of the crate's properties get an
 #   in-repo deep run; a separate, out-of-repo nightly (not part of this repo's
 #   CI config) calibrates case counts across the rest -- see
 #   generative/README.md.
@@ -77,6 +78,12 @@ jobs:
         run: cargo test -p generative --test source_ddl property_source_ddl_is_never_silently_wrong -- --ignored
         env:
           PROPTEST_CASES: "50"
+
+      - name: Generative deep property -- property_join_source_ddl_is_never_silently_wrong at PROPTEST_CASES=25
+        # The same over the JOIN, 1-1 JOIN and star key spaces (#2184 slice 8).
+        run: cargo test -p generative --test source_ddl property_join_source_ddl_is_never_silently_wrong -- --ignored
+        env:
+          PROPTEST_CASES: "25"
 
   pg-versions:
     # The workspace test suite (what ci.yml's `test` shards cover, in one job)

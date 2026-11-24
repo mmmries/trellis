@@ -17,7 +17,7 @@ use generative::generate::{
 };
 use generative::model::{
     Collation, IndexChange, PartitionStrategy, Program, RetypeShape, Server, SourceDdl,
-    SourceDdlEvent, SourceDdlPlan, SqlType,
+    SourceDdlEvent, SourceDdlPlan, SqlType, reads,
 };
 use generative::run::judge::Verdict;
 use generative::run::{
@@ -69,7 +69,9 @@ async fn run(
     plan: &SourceDdlPlan,
 ) -> Result<SourceDdlRun, String> {
     let db = CaseDatabase::provision(cluster).await;
-    let mut backend = ManualBackend::connect_as(db.roles())
+    // As many drain workers as the plan has lanes, so the lanes' changes
+    // are claimed by several at once.
+    let mut backend = ManualBackend::connect_as_with_options(db.roles(), plan.lanes.max(1), None)
         .await
         .expect("connect manual backend");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
@@ -97,8 +99,57 @@ fn program_with_source_ddl_plan() -> impl Strategy<Value = (Program, SourceDdlPl
     })
 }
 
+/// The most ops a `JOIN` program keeps for this tier: every op is judged,
+/// so the `JOIN` tiers' streams of hundreds are cut to their first ones.
+const MAX_JOIN_OPS: usize = 16;
+
+/// A `JOIN` tier's program as this tier runs it: its first
+/// [`MAX_JOIN_OPS`] ops (a prefix of a stream is one: each op's outcome
+/// depends only on those before it), every definition installed up front.
+/// Its concurrent plan is the `JOIN` tier's, not this one's: the source-DDL
+/// plan draws its own lanes.
+fn for_source_ddl(mut program: Program) -> Program {
+    program.ops.truncate(MAX_JOIN_OPS);
+    program.def_install_after_op = vec![0; program.defs.len()];
+    program.restart_after_ops.clear();
+    program.scale_out_after_ops.clear();
+    program
+}
+
+/// A `JOIN`, 1-1 `JOIN` or star program from those tiers' strategies
+/// ([`for_source_ddl`]), with a source-DDL plan over the tables it reads,
+/// joined ones included.
+fn join_program_with_source_ddl_plan() -> impl Strategy<Value = (Program, SourceDdlPlan)> {
+    use generative::generate::join::join_case_strategy;
+    use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
+    prop_oneof![
+        join_case_strategy().prop_map(|case| case.program),
+        one_to_one_case_strategy().prop_map(|case| case.program),
+        star_case_strategy().prop_map(|star| star.case.program),
+    ]
+    .prop_map(for_source_ddl)
+    .prop_flat_map(|program| {
+        let plan = source_ddl_plan_for(&program);
+        (Just(program), plan)
+    })
+}
+
 proptest! {
     #![proptest_config(proptest_config())]
+
+    /// `property_source_ddl_is_never_silently_wrong` over the `JOIN`
+    /// key spaces: a `JOIN`, a 1-1 `JOIN` and a star, the change on their
+    /// `FROM` or a joined table.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_join_source_ddl_is_never_silently_wrong((program, plan) in join_program_with_source_ddl_plan()) {
+        HARNESS.with(|h| {
+            h.runtime
+                .block_on(run(&h.cluster, &program, &plan))
+                .map(|_| ())
+                .map_err(TestCaseError::fail)
+        })?;
+    }
 
     /// Source DDL anywhere in a generated program never leaves a definition
     /// silently wrong outside a listed gap.
@@ -116,13 +167,14 @@ proptest! {
 
 /// No database: every drawn plan stays inside its program, its events don't
 /// overlap, and across enough draws every action shows up, with and
-/// without a pass inside, and with ops in flight.
+/// without a pass inside, and with ops in flight, some from several lanes.
 #[test]
 fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     let mut runner = TestRunner::deterministic();
     let strategy = program_with_source_ddl_plan();
     let mut seen = std::collections::BTreeSet::new();
     let mut windows = false;
+    let mut from_lanes = false;
     for _ in 0..3000 {
         let (program, plan) = strategy
             .new_tree(&mut runner)
@@ -132,12 +184,13 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         for event in &plan.events {
             assert!(event.last_op() < program.ops.len(), "{event:?}");
             assert!(
-                program.defs.iter().any(|d| d.source == event.table),
+                program.defs.iter().any(|d| reads(d, &event.table)),
                 "{event:?} is on a table no definition reads"
             );
             assert!(end.is_none_or(|end| event.op > end), "{plan:?}");
             end = Some(event.last_op());
             windows |= event.window > 0;
+            from_lanes |= plan.lanes > 1 && event.window > 1 && event.action.issues_from_lanes();
             if let SourceDdl::Retype {
                 using: true,
                 shape: RetypeShape::Key,
@@ -228,6 +281,92 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         }
     }
     assert!(windows, "no event drew ops in flight");
+    assert!(
+        from_lanes,
+        "no event's window was issued from several lanes"
+    );
+}
+
+/// No database: the `JOIN` key spaces' plans fire on joined tables as well
+/// as `FROM` tables, in each key space, from several lanes with ops in
+/// flight, and a 1-1 `JOIN`'s joined key's index is dropped; and a joined
+/// table draws no column or attribute change.
+#[test]
+fn drawn_join_plans_reach_joined_tables_from_several_lanes() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = join_program_with_source_ddl_plan();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..1500 {
+        let (program, plan) = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        assert!(program.ops.len() <= MAX_JOIN_OPS);
+        for event in &plan.events {
+            assert!(event.last_op() < program.ops.len(), "{event:?}");
+            let readers: Vec<_> = program
+                .defs
+                .iter()
+                .filter(|d| reads(d, &event.table))
+                .collect();
+            assert!(
+                !readers.is_empty(),
+                "{event:?} on a table no definition reads"
+            );
+            let kind = event.action.kind();
+            assert!(
+                !kind.starts_with("retype")
+                    && ![
+                        "rename_column",
+                        "drop_column",
+                        "drop_and_add_column",
+                        "add_column",
+                        "swap_column_names",
+                        "shadow_column",
+                        "generated_column",
+                        "flip_not_null",
+                        "set_default",
+                        "set_default_beside_vacuum",
+                        "collate_c",
+                        "collate_nondeterministic",
+                    ]
+                    .contains(&kind),
+                "a column or attribute change on a table a JOIN reads: {event:?}"
+            );
+            let space = match &readers[0].key_space {
+                KeySpace::Join(_) => "join",
+                KeySpace::JoinOneToOne(spec) if spec.joins.len() > 1 => "star",
+                KeySpace::JoinOneToOne(_) => "one_to_one_join",
+                _ => "other",
+            };
+            let joined = readers.iter().all(|d| d.source != event.table);
+            seen.insert((space, joined));
+            if plan.lanes > 1 && event.window > 1 && event.action.issues_from_lanes() {
+                seen.insert(("lanes", true));
+            }
+            if let SourceDdl::KeyIndex {
+                columns,
+                change: IndexChange::Drop,
+            } = &event.action
+                && joined
+                && columns.iter().all(|c| c != "id")
+            {
+                seen.insert(("joined_key_drop", true));
+            }
+        }
+    }
+    for want in [
+        ("join", false),
+        ("join", true),
+        ("one_to_one_join", false),
+        ("one_to_one_join", true),
+        ("star", false),
+        ("star", true),
+        ("lanes", true),
+        ("joined_key_drop", true),
+    ] {
+        assert!(seen.contains(&want), "never drew {want:?}: {seen:?}");
+    }
 }
 
 /// One source table with a 1-1 and an aggregate transform over it:
@@ -352,6 +491,7 @@ fn verdicts_after(run: &SourceDdlRun, event: &SourceDdlEvent) -> Vec<Verdict> {
 async fn run_one(program: &Program, event: SourceDdlEvent) -> Vec<Verdict> {
     let cluster = TestCluster::start();
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![event.clone()],
     };
     let run = run(&cluster, program, &plan)
@@ -402,6 +542,7 @@ async fn table_maintenance_with_changes_in_flight_keeps_every_definition_exact()
     let program = one_to_one_and_aggregate_program();
     let cluster = TestCluster::start();
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![
             event(&program, 0, SourceDdl::VacuumFull, 1, false),
             event(&program, 2, SourceDdl::Cluster, 0, false),
@@ -502,6 +643,7 @@ async fn a_rewrite_beside_a_default_is_reread_through_a_later_read_column_where_
         vec![Gap::AlterTypeRewrite]
     );
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![event.clone()],
     };
     let run = run(&cluster, &program, &plan)
@@ -541,6 +683,7 @@ async fn the_same_shape_without_its_register_entry_fails_as_silently_wrong() {
     let program = one_to_one_and_aggregate_program();
     let column = grain(&program);
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![event(
             &program,
             3,
@@ -743,6 +886,7 @@ async fn a_pure_widening_of_a_read_column_keeps_every_definition_exact() {
     let c1 = c1(&program);
     let grain = grain(&program);
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![
             event(
                 &program,
@@ -809,6 +953,7 @@ async fn a_narrower_scale_is_reread() {
         scale: 1,
     };
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![
             event(
                 &program,
@@ -847,6 +992,7 @@ async fn a_widening_that_outgrows_a_copy_pauses_its_readers() {
     let versioned = server_versions_attributes(&TestCluster::start()).await;
     for using in [false, true] {
         let plan = SourceDdlPlan {
+            lanes: 1,
             events: vec![
                 event(
                     &program,
@@ -973,6 +1119,7 @@ async fn a_group_by_key_narrowing_rewrite_is_reread() {
     let program = one_to_one_and_aggregate_program();
     let grain = grain(&program);
     let plan = SourceDdlPlan {
+        lanes: 1,
         events: vec![
             event(
                 &program,
@@ -1600,6 +1747,7 @@ async fn key_index_verdicts(program: &Program, table: &str, columns: &[&str]) ->
             assert!(event.listed_gaps(program, Server::default()).is_empty());
             let cluster = TestCluster::start();
             let plan = SourceDdlPlan {
+                lanes: 1,
                 events: vec![event.clone()],
             };
             let run = run(&cluster, program, &plan)
@@ -1757,6 +1905,241 @@ async fn a_joined_tables_key_dropped_pauses_the_join_only_where_a_pass_sees_it()
             expected,
             "{change:?} pass_inside={pass_inside}: {verdicts:?}\n{:#?}",
             program.ops
+        );
+    }
+}
+
+/// The `JOIN` key spaces the slice-8 pins run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSpace {
+    Join,
+    OneToOneJoin,
+    Star,
+}
+
+const JOIN_SPACES: [JoinSpace; 3] = [JoinSpace::Join, JoinSpace::OneToOneJoin, JoinSpace::Star];
+
+/// The first deterministic draw of `space`'s tier ([`for_source_ddl`])
+/// whose ops 2 to 5 write both `ja` and `jb`, `jb` at least twice, none
+/// of them failing, and whose every definition reads `jb`: an event on
+/// `jb` after op 1 with a window of 4 has changes in flight on both sides,
+/// for every definition. Not after op 0: the run installs every definition
+/// up front without waiting for its build, and only the check after op 0
+/// settles them, so an event there can fire before a build has read `jb`
+/// and find nothing to disrupt.
+fn drawn_join_program(space: JoinSpace, want: impl Fn(&Program) -> bool) -> Program {
+    use generative::generate::join::join_case_strategy;
+    use generative::generate::join_one_to_one::{one_to_one_case_strategy, star_case_strategy};
+    let strategy = match space {
+        JoinSpace::Join => join_case_strategy().prop_map(|c| c.program).boxed(),
+        JoinSpace::OneToOneJoin => one_to_one_case_strategy().prop_map(|c| c.program).boxed(),
+        JoinSpace::Star => star_case_strategy()
+            .prop_filter("a star joins three tables or more", |s| s.tables > 2)
+            .prop_map(|s| s.case.program)
+            .boxed(),
+    };
+    let mut runner = TestRunner::deterministic();
+    for _ in 0..2000 {
+        let program = for_source_ddl(
+            strategy
+                .new_tree(&mut runner)
+                .expect("strategy must produce a value")
+                .current(),
+        );
+        if program.ops.len() < 7 {
+            continue;
+        }
+        let window = &program.ops[2..=5];
+        let on = |table: &str| window.iter().filter(|o| o.table() == table).count();
+        if on("ja") >= 1
+            && on("jb") >= 2
+            && window
+                .iter()
+                .all(|o| *o.expect() != generative::model::OpOutcome::Fails)
+            && program.defs.iter().all(|d| reads(d, "jb"))
+            && want(&program)
+        {
+            return program;
+        }
+    }
+    panic!("no {space:?} draw fits the pins");
+}
+
+/// Runs `action` on `jb` of `program` after op 1, ops 2 to 5 in its
+/// window issued from three lanes, and returns each definition's verdict
+/// at the check after it.
+async fn run_on_jb(
+    cluster: &TestCluster,
+    program: &Program,
+    action: SourceDdl,
+    pass_inside: bool,
+) -> Vec<(String, Verdict)> {
+    let event = SourceDdlEvent {
+        op: 1,
+        table: "jb".to_string(),
+        action,
+        window: 4,
+        pass_inside,
+    };
+    let plan = SourceDdlPlan {
+        lanes: 3,
+        events: vec![event.clone()],
+    };
+    let run = run(cluster, program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    run.checks
+        .iter()
+        .find(|(fired, _)| fired.as_ref() == Some(&event))
+        .unwrap_or_else(|| panic!("no check after {event:?}"))
+        .1
+        .iter()
+        .map(|judged| (judged.target.clone(), judged.verdict.clone()))
+        .collect()
+}
+
+/// #2184 decision 4 over the `JOIN` key spaces (slice 8): `jb`'s capture
+/// triggers disabled and enabled again by name, with changes in flight on
+/// both sides from three lanes, pause every `JOIN`, 1-1 `JOIN` and star
+/// reading it, pass or no pass; their `RESUME` makes them exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joined_tables_capture_disabled_from_several_lanes_pauses_its_joins() {
+    let cluster = TestCluster::start();
+    for space in JOIN_SPACES {
+        let program = drawn_join_program(space, |_| true);
+        for pass_inside in [false, true] {
+            let verdicts = run_on_jb(
+                &cluster,
+                &program,
+                SourceDdl::DisableCaptureTriggers,
+                pass_inside,
+            )
+            .await;
+            assert!(!verdicts.is_empty());
+            for (target, verdict) in verdicts {
+                assert!(
+                    matches!(
+                        &verdict,
+                        Verdict::ResumedExact { reason }
+                            if reason.contains("capture of public.jb")
+                                && reason.contains("was changed outside Trellis")
+                    ),
+                    "{space:?} pass_inside={pass_inside} {target}: {verdict:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Table maintenance and the key's index rebuilt on a joined table, with
+/// changes in flight on both sides from three lanes, keep every `JOIN`, 1-1
+/// `JOIN` and star exact (`docs/staging-and-claiming/capture-drift.md`:
+/// none of them changes a value or a key).
+#[tokio::test(flavor = "multi_thread")]
+async fn joined_table_maintenance_from_several_lanes_keeps_every_join_exact() {
+    let cluster = TestCluster::start();
+    let id = || vec!["id".to_string()];
+    for space in JOIN_SPACES {
+        let program = drawn_join_program(space, |_| true);
+        for (action, pass_inside) in [
+            (SourceDdl::VacuumFull, false),
+            (SourceDdl::Cluster, true),
+            (SourceDdl::Reindex { concurrently: true }, false),
+            (
+                SourceDdl::KeyIndex {
+                    columns: id(),
+                    change: IndexChange::Replace,
+                },
+                true,
+            ),
+            (
+                SourceDdl::KeyIndex {
+                    columns: id(),
+                    change: IndexChange::RebuildConcurrently,
+                },
+                false,
+            ),
+        ] {
+            for (target, verdict) in
+                run_on_jb(&cluster, &program, action.clone(), pass_inside).await
+            {
+                assert_eq!(
+                    verdict,
+                    Verdict::Exact,
+                    "{space:?} {action:?} pass_inside={pass_inside} {target}"
+                );
+            }
+        }
+    }
+}
+
+/// The register's `source-rename-roundtrip` on a joined table: renamed
+/// away and back inside one interval, with changes in flight from three
+/// lanes, a `JOIN` reading it is exact or the listed gap, which
+/// `self_check` reports and `PAUSE`/`RESUME` repairs; renamed across a
+/// pass, its readers pause and resume exact. The lost write can sit in a
+/// `JOIN`'s hidden tables with the target still exact, until a later
+/// write to `ja` joins it: the judge `self_check`s an exact reader the
+/// shape may have left wrong.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joined_table_renamed_and_back_is_at_most_the_listed_gap() {
+    let cluster = TestCluster::start();
+    let mut reproduced = false;
+    for space in JOIN_SPACES {
+        let program = drawn_join_program(space, |_| true);
+        for pass_inside in [false, true] {
+            for (target, verdict) in
+                run_on_jb(&cluster, &program, SourceDdl::RenameTable, pass_inside).await
+            {
+                reproduced |= verdict == Verdict::ListedGap(Gap::SourceRenameRoundtrip);
+                let expected = if pass_inside {
+                    matches!(&verdict, Verdict::ResumedExact { .. })
+                } else {
+                    matches!(
+                        &verdict,
+                        Verdict::Exact | Verdict::ListedGap(Gap::SourceRenameRoundtrip)
+                    )
+                };
+                assert!(
+                    expected,
+                    "{space:?} pass_inside={pass_inside} {target}: {verdict:?}"
+                );
+            }
+        }
+    }
+    assert!(reproduced, "no JOIN reading jb lost a write to the rename");
+}
+
+/// The register's `alter-type-rewrite` on a `JOIN`'s joined table: a
+/// same-type rewrite of `jb.y`, its last column and an aggregate's
+/// argument, beside a `SET DEFAULT` inside one interval, with changes in
+/// flight from three lanes, leaves the `JOIN` wrong, which `self_check`
+/// reports and `request_backfill` repairs ("an aggregate or `JOIN` target
+/// stays wrong until it's rebuilt"); across a pass it is re-read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joined_tables_rewrite_beside_a_default_is_the_listed_gap_for_a_join() {
+    let cluster = TestCluster::start();
+    let program = drawn_join_program(JoinSpace::Join, |program| {
+        program
+            .tables
+            .iter()
+            .find(|t| t.name == "jb")
+            .and_then(|t| t.column_type("y"))
+            == Some(trellis::dev::defs::ValueType::Numeric)
+    });
+    for pass_inside in [false, true] {
+        let action = SourceDdl::RewriteBesideDefault {
+            column: "y".to_string(),
+        };
+        let verdicts = run_on_jb(&cluster, &program, action, pass_inside).await;
+        let gap = Verdict::ListedGap(Gap::AlterTypeRewrite);
+        for (target, verdict) in &verdicts {
+            let expected = *verdict == Verdict::Exact || (!pass_inside && *verdict == gap);
+            assert!(expected, "pass_inside={pass_inside} {target}: {verdict:?}");
+        }
+        assert!(
+            pass_inside || verdicts.iter().any(|(_, v)| *v == gap),
+            "no JOIN reading jb.y was left wrong: {verdicts:?}"
         );
     }
 }
