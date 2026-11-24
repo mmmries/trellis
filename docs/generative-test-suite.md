@@ -1216,7 +1216,10 @@ The actions, cheapest-first (every one below is built):
    back, the window's writes name it where it is, and with no pass inside,
    the window drains before the table comes back. A collation
    change drains its window before the collation goes back, since a
-   collation changes only what a drain computes.
+   collation changes only what a drain computes. One program in four reads
+   a source through a `KEY (…)`; a key's index dropped settles the changes
+   before it, drains its window while it is gone, and ends the window
+   before a write the index would refuse.
    `tests/coverage.rs` counts the verdicts per action and floors `listed_gap`,
    `resumed_exact` and `resume_refused`. The `capture_skip_trigger_state` plant (the capture
    audit not reading a trigger's state) needs a disabled trigger, so no

@@ -13,11 +13,11 @@ use generative::gaps::Gap;
 use generative::generate::source_ddl::{calls_collation_refusing_function, source_ddl_plan_for};
 use generative::generate::{
     AggregateColumn, AggregateFn, DefShape, Mutate, TableSpec, build_program_multi_with_shapes,
-    partition_table, trivial_program,
+    partition_table,
 };
 use generative::model::{
-    Collation, PartitionStrategy, Program, RetypeShape, Server, SourceDdl, SourceDdlEvent,
-    SourceDdlPlan, SqlType,
+    Collation, IndexChange, PartitionStrategy, Program, RetypeShape, Server, SourceDdl,
+    SourceDdlEvent, SourceDdlPlan, SqlType,
 };
 use generative::run::judge::Verdict;
 use generative::run::{
@@ -87,8 +87,11 @@ async fn run(
     }
 }
 
+/// A [`trivial_program`], or one time in four one whose first
+/// definition's source is read through a `KEY (…)`, so the key's index has
+/// something to change.
 fn program_with_source_ddl_plan() -> impl Strategy<Value = (Program, SourceDdlPlan)> {
-    trivial_program().prop_flat_map(|program| {
+    generative::generate::source_key::trivial_or_keyed_program().prop_flat_map(|program| {
         let plan = source_ddl_plan_for(&program);
         (Just(program), plan)
     })
@@ -165,6 +168,19 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
                     "a case-insensitive collation under STRPOS or REGEXP_COUNT: {event:?}"
                 );
             }
+            if let SourceDdl::KeyIndex {
+                change: IndexChange::Drop,
+                ..
+            } = &event.action
+            {
+                assert!(
+                    program.ops[event.op + 1..=event.last_op()]
+                        .iter()
+                        .all(|o| o.table() != event.table
+                            || *o.expect() != generative::model::OpOutcome::Fails),
+                    "a write the key's index refuses inside its drop: {event:?}"
+                );
+            }
             seen.insert((event.action.kind(), event.pass_inside));
         }
     }
@@ -200,6 +216,9 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
         "move_schema",
         "rename_table_away",
         "recreate_table",
+        "drop_key_index",
+        "replace_key_index",
+        "rebuild_key_index_concurrently",
     ] {
         for pass in [false, true] {
             assert!(
@@ -1550,5 +1569,194 @@ async fn a_source_renamed_away_for_good_pauses_and_its_resume_refuses() {
                 );
             }
         }
+    }
+}
+
+/// Every change to a key's index on `table`, fired after op 2 with ops 3
+/// to 5 in its window, inside one interval and across a pass: each verdict
+/// with the change and the pass, and each definition's pause reason just
+/// after the in-window pass (none without one), before the close restores
+/// the index.
+type KeyIndexRun = (IndexChange, bool, Vec<Verdict>, Vec<Option<String>>);
+
+async fn key_index_verdicts(program: &Program, table: &str, columns: &[&str]) -> Vec<KeyIndexRun> {
+    let mut all = Vec::new();
+    for change in [
+        IndexChange::Drop,
+        IndexChange::Replace,
+        IndexChange::RebuildConcurrently,
+    ] {
+        for pass_inside in [false, true] {
+            let event = SourceDdlEvent {
+                op: 2,
+                table: table.to_string(),
+                action: SourceDdl::KeyIndex {
+                    columns: columns.iter().map(|c| c.to_string()).collect(),
+                    change,
+                },
+                window: 3,
+                pass_inside,
+            };
+            assert!(event.listed_gaps(program, Server::default()).is_empty());
+            let cluster = TestCluster::start();
+            let plan = SourceDdlPlan {
+                events: vec![event.clone()],
+            };
+            let run = run(&cluster, program, &plan)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let at_pass = run
+                .pass_states
+                .iter()
+                .filter(|(fired, _)| fired == &event)
+                .flat_map(|(_, states)| states.iter().map(|s| s.reason.clone()))
+                .collect();
+            all.push((change, pass_inside, verdicts_after(&run, &event), at_pass));
+        }
+    }
+    all
+}
+
+/// A `KEY (…)`'s index (plain, or `NULLS NOT DISTINCT` over a nullable
+/// key), with key changes in flight: the pass checks it by shape, so
+/// replaced in one transaction, or rebuilt `CONCURRENTLY` with the window
+/// running over both, every reader stays exact. Dropped and created again,
+/// with the window's changes drained while it is gone: a pass in between
+/// pauses every reader, and inside one interval the drained change halts
+/// them (T0118, `docs/transforms.md` "Key"). `RESUME` once it is back
+/// makes them exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_index_dropped_pauses_its_readers_and_replaced_keeps_them_exact() {
+    for nullable in [true, false] {
+        let program = keyed_program(nullable);
+        let table = program.tables[0].name.clone();
+        for (change, pass_inside, verdicts, at_pass) in
+            key_index_verdicts(&program, &table, &["k0"]).await
+        {
+            assert_eq!(verdicts.len(), program.defs.len());
+            if change == IndexChange::Drop && pass_inside {
+                assert_eq!(at_pass.len(), program.defs.len());
+                for reason in &at_pass {
+                    assert!(
+                        reason
+                            .as_deref()
+                            .is_some_and(|r| r.contains("no valid unique index backs KEY (k0)")),
+                        "nullable={nullable}: {at_pass:?}"
+                    );
+                }
+            }
+            for verdict in &verdicts {
+                let expected = match (change, pass_inside) {
+                    (IndexChange::Drop, false) => {
+                        matches!(verdict, Verdict::ResumedExact { reason } if reason.contains("T0118"))
+                    }
+                    (IndexChange::Drop, true) => {
+                        matches!(verdict, Verdict::ResumedExact { reason } if reason.starts_with("capture:"))
+                    }
+                    _ => *verdict == Verdict::Exact,
+                };
+                assert!(
+                    expected,
+                    "nullable={nullable} {change:?} pass_inside={pass_inside}: {verdicts:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The same on a plain table's primary key: replaced or rebuilt
+/// `CONCURRENTLY` (swapped in by `ADD PRIMARY KEY USING INDEX`) on the same
+/// column keeps every reader exact. Dropped, with the window's changes
+/// drained before it is back, the drained change halts its readers
+/// (T0118), pass or no pass: a pass doesn't pause a table with no primary
+/// key (`docs/transforms.md` "Key"). `RESUME` once it is back makes them
+/// exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_primary_key_dropped_pauses_its_readers_and_replaced_keeps_them_exact() {
+    let program = one_to_one_and_aggregate_program();
+    let pk = program.tables[0].pk_col.clone();
+    let table = program.tables[0].name.clone();
+    for (change, pass_inside, verdicts, at_pass) in
+        key_index_verdicts(&program, &table, &[&pk]).await
+    {
+        assert_eq!(verdicts.len(), program.defs.len());
+        // The pass pauses nothing: the halt is the drained change's.
+        assert!(
+            at_pass.iter().all(Option::is_none),
+            "{change:?}: {at_pass:?}"
+        );
+        for verdict in &verdicts {
+            let expected = if change == IndexChange::Drop {
+                matches!(verdict, Verdict::ResumedExact { reason } if reason.contains("T0118"))
+            } else {
+                *verdict == Verdict::Exact
+            };
+            assert!(
+                expected,
+                "{change:?} pass_inside={pass_inside}: {verdicts:?}"
+            );
+        }
+    }
+}
+
+/// A `LEFT` 1-1 `JOIN` of `ja` to `jb` on `ja.k = jb.u`, `jb.u` unique,
+/// over ten writes to both tables: `jb`'s key within its `ON` columns is
+/// that unique constraint.
+fn one_to_one_join_program() -> Program {
+    use generative::generate::join::{JoinOpKind, KeyShape};
+    use generative::generate::join_one_to_one::{
+        OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, build_one_to_one_program,
+    };
+    let spec = OneToOneSpec {
+        left: true,
+        on: OnShape::KeyUnique,
+        fields: vec![OneToOneField::BId, OneToOneField::CoalesceXy],
+        more: Vec::new(),
+    };
+    let draws: Vec<OneToOneOpDraw> = (0..10u8)
+        .map(|i| OneToOneOpDraw {
+            position: u8::from(i % 2 == 1),
+            kind: match i {
+                0..=3 | 6 => JoinOpKind::Insert,
+                4 | 7 | 9 => JoinOpKind::Update,
+                _ => JoinOpKind::Delete,
+            },
+            pick: usize::from(i),
+            key: i % 3,
+            id: i,
+            t: i,
+            half_null: false,
+            value: Some(i as i8),
+            columns: if i == 7 { 1 } else { 8 },
+            own_keys: [0; 3],
+            on_key: false,
+            key_scope: None,
+        })
+        .collect();
+    build_one_to_one_program(&[spec], KeyShape::Spread, &draws, &[])
+}
+
+/// A 1-1 `JOIN`'s `b` key (#2184 slice 7), with writes to both tables in
+/// flight: dropped and created again, it pauses the `JOIN` only where a
+/// pass sees it gone (`docs/transforms.md` "Key"), and `RESUME` once it is
+/// back makes it exact; replaced or rebuilt `CONCURRENTLY` it stays exact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joined_tables_key_dropped_pauses_the_join_only_where_a_pass_sees_it() {
+    let program = one_to_one_join_program();
+    for (change, pass_inside, verdicts, _) in key_index_verdicts(&program, "jb", &["u"]).await {
+        assert_eq!(verdicts.len(), 1);
+        let expected = if change == IndexChange::Drop && pass_inside {
+            matches!(
+                &verdicts[0],
+                Verdict::ResumedExact { reason } if reason.contains("the unique key on the ON columns of public.jb")
+            )
+        } else {
+            verdicts[0] == Verdict::Exact
+        };
+        assert!(
+            expected,
+            "{change:?} pass_inside={pass_inside}: {verdicts:?}\n{:#?}",
+            program.ops
+        );
     }
 }

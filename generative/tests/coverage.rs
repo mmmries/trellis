@@ -2536,6 +2536,10 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 ///   across a pass, or dropped and created again, pauses its readers by the
 ///   capture audit.
 ///
+/// - `resumed_exact` also: a key's index dropped (a `KEY (…)`'s or a
+///   primary key's) pauses its readers at a pass, or halts them at a
+///   drained change.
+///
 /// `collate_nondeterministic` has no floor: its `nondeterministic-collation`
 /// gap needs a definition comparing the `text` column, which drawn
 /// definitions hardly ever have. A pin in `tests/source_ddl.rs` covers it.
@@ -2547,6 +2551,7 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 async fn source_ddl_actions_reach_their_verdict_floors() {
     use generative::backend::{CaseDatabase, ManualBackend};
     use generative::generate::source_ddl::source_ddl_plan_for;
+    use generative::generate::source_key::trivial_or_keyed_program;
     use generative::model::Server;
     use generative::run::run_convergence_with_source_ddl;
     use std::collections::BTreeMap;
@@ -2570,6 +2575,7 @@ async fn source_ddl_actions_reach_their_verdict_floors() {
             "resumed_exact",
         ),
         (&["rename_table_away"], "resume_refused"),
+        (&["drop_key_index"], "resumed_exact"),
     ];
     let cluster = testkit::TestCluster::start();
     let server = {
@@ -2581,7 +2587,7 @@ async fn source_ddl_actions_reach_their_verdict_floors() {
         Server::probe(&client).await.expect("probe the server")
     };
     let mut runner = TestRunner::deterministic();
-    let strategy = trivial_program().prop_flat_map(|program| {
+    let strategy = trivial_or_keyed_program().prop_flat_map(|program| {
         let plan = source_ddl_plan_for(&program);
         (proptest::strategy::Just(program), plan)
     });
