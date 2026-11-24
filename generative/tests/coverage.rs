@@ -2521,10 +2521,11 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 ///   `self_check` finds and `request_backfill` repairs: a same-type rewrite
 ///   beside a `SET DEFAULT` inside one reconcile interval, and a widening
 ///   that changes values; and its `column-name-swap` shapes, a read
-///   column's name taken and given back inside one interval; and its
-///   `source-rename-roundtrip` shapes, the table renamed or moved away and
-///   back inside one interval. Only a draw the register lists on the
-///   server counts toward it (`SourceDdlEvent::listed_gaps`).
+///   column's name taken and given back inside one interval. Only a draw
+///   the register lists on the server counts toward it
+///   (`SourceDdlEvent::listed_gaps`). The partitioned
+///   `source-rename-roundtrip` shape has no floor: a pin in
+///   `tests/source_ddl.rs` covers it.
 /// - `resumed_exact`: disabling the capture triggers pauses the readers by
 ///   the capture audit; a narrowing that changes the type a reader evaluates
 ///   the column as, and a widening that outgrows a copy, pause them by the
@@ -2534,7 +2535,8 @@ fn the_joined_key_tier_always_draws_a_nullable_joined_key() {
 ///   table renamed away for good.
 /// - `resumed_exact` also: the table renamed, or moved to another schema,
 ///   across a pass, or dropped and created again, pauses its readers by the
-///   capture audit.
+///   capture audit; renamed or moved and back inside one interval, the
+///   drain's purge while it is away pauses them.
 ///
 /// - `resumed_exact` also: a key's index dropped (a `KEY (…)`'s or a
 ///   primary key's) pauses its readers at a pass, or halts them at a
@@ -2569,7 +2571,6 @@ async fn source_ddl_actions_reach_their_verdict_floors() {
         (&["retype_outgrow", "retype_outgrow_using"], "resumed_exact"),
         (&["swap_column_names", "shadow_column"], "listed_gap"),
         (&["rename_column", "drop_column"], "resume_refused"),
-        (&["rename_table", "move_schema"], "listed_gap"),
         (
             &["rename_table", "move_schema", "recreate_table"],
             "resumed_exact",

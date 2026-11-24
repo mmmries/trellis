@@ -471,8 +471,10 @@ fn disrupted_error(table: &str, what: &[String]) -> String {
     )
 }
 
-/// The `capture_failure` sentence for a definition whose `table` is gone.
-fn gone_error(table: &str) -> String {
+/// The `capture_failure` sentence for a definition whose `table` is gone:
+/// the pass's, and a drain's purge of the table's staged changes
+/// (`staging::quarantine::purge_dropped_table`).
+pub(crate) fn gone_error(table: &str) -> String {
     format!(
         "the table {table} no longer exists at that name (it was dropped, renamed away, moved \
          to another schema, or replaced by something that isn't a table). Changes made to it meanwhile may be missing from this definition, \

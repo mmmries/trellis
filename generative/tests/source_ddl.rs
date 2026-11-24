@@ -1632,31 +1632,40 @@ fn assert_paused_for_the_missing_table(verdicts: Vec<Verdict>) {
     }
 }
 
-/// The register's `source-rename-roundtrip`: a source renamed away and
-/// back, or moved to another schema and back, inside one interval loses
-/// writes. A drain while it is away purges its staged changes, on a plain
-/// table too, and a partitioned source's capture also stages nothing while
-/// its name doesn't resolve to the root. `self_check` reports it and
-/// `PAUSE`/`RESUME` repairs it.
+/// A plain source renamed away and back, or moved to another schema and
+/// back, inside one interval: the drain while it is away purges its staged
+/// changes and pauses its readers with the gone-table reason, and their
+/// `RESUME` once it is back makes them exact (#2270).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_source_renamed_or_moved_and_back_inside_one_interval_is_the_listed_gap() {
-    for program in [
-        one_to_one_and_aggregate_program(),
-        partitioned_aggregate_program(),
-    ] {
-        for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
-            let event = event(&program, 3, action.clone(), 2, false);
-            assert_eq!(
-                event.listed_gaps(&program, Server::default()),
-                vec![Gap::SourceRenameRoundtrip]
-            );
-            let verdicts = run_one(&program, event).await;
-            assert_eq!(
-                verdicts,
-                vec![Verdict::ListedGap(Gap::SourceRenameRoundtrip); program.defs.len()],
-                "{action:?}"
-            );
-        }
+async fn a_plain_source_renamed_or_moved_and_back_inside_one_interval_pauses_its_readers() {
+    let program = one_to_one_and_aggregate_program();
+    for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
+        let event = event(&program, 3, action.clone(), 2, false);
+        assert!(event.listed_gaps(&program, Server::default()).is_empty());
+        assert_paused_for_the_missing_table(run_one(&program, event).await);
+    }
+}
+
+/// The register's `source-rename-roundtrip`: a partitioned source renamed
+/// away and back, or moved to another schema and back, inside one interval
+/// loses writes, since its capture stages nothing while its name doesn't
+/// resolve to the root. `self_check` reports it and `PAUSE`/`RESUME`
+/// repairs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_source_renamed_or_moved_and_back_inside_one_interval_is_the_listed_gap() {
+    let program = partitioned_aggregate_program();
+    for action in [SourceDdl::RenameTable, SourceDdl::MoveSchema] {
+        let event = event(&program, 3, action.clone(), 2, false);
+        assert_eq!(
+            event.listed_gaps(&program, Server::default()),
+            vec![Gap::SourceRenameRoundtrip]
+        );
+        let verdicts = run_one(&program, event).await;
+        assert_eq!(
+            verdicts,
+            vec![Verdict::ListedGap(Gap::SourceRenameRoundtrip); program.defs.len()],
+            "{action:?}"
+        );
     }
 }
 
@@ -2073,33 +2082,25 @@ async fn joined_table_maintenance_from_several_lanes_keeps_every_join_exact() {
     }
 }
 
-/// The register's `source-rename-roundtrip` on a joined table: renamed
-/// away and back inside one interval, with changes in flight from three
-/// lanes, a `JOIN` reading it is exact or the listed gap, which
-/// `self_check` reports and `PAUSE`/`RESUME` repairs; renamed across a
-/// pass, its readers pause and resume exact. The lost write can sit in a
-/// `JOIN`'s hidden tables with the target still exact, until a later
-/// write to `ja` joins it: the judge `self_check`s an exact reader the
-/// shape may have left wrong.
+/// A joined table renamed away and back, with changes in flight from three
+/// lanes: inside one interval, a drain while it is away purges its staged
+/// changes and pauses every `JOIN` reading it (#2270); across a pass, the
+/// pass pauses them. Either way they resume exact, and a reader no purge
+/// reached stays exact.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_joined_table_renamed_and_back_is_at_most_the_listed_gap() {
+async fn a_joined_table_renamed_and_back_pauses_its_joins_or_leaves_them_exact() {
     let cluster = TestCluster::start();
-    let mut reproduced = false;
+    let mut purged = false;
     for space in JOIN_SPACES {
         let program = drawn_join_program(space, |_| true);
         for pass_inside in [false, true] {
             for (target, verdict) in
                 run_on_jb(&cluster, &program, SourceDdl::RenameTable, pass_inside).await
             {
-                reproduced |= verdict == Verdict::ListedGap(Gap::SourceRenameRoundtrip);
-                let expected = if pass_inside {
-                    matches!(&verdict, Verdict::ResumedExact { .. })
-                } else {
-                    matches!(
-                        &verdict,
-                        Verdict::Exact | Verdict::ListedGap(Gap::SourceRenameRoundtrip)
-                    )
-                };
+                let paused = matches!(&verdict, Verdict::ResumedExact { reason }
+                    if reason.contains("no longer exists at that name"));
+                purged |= paused && !pass_inside;
+                let expected = paused || (!pass_inside && verdict == Verdict::Exact);
                 assert!(
                     expected,
                     "{space:?} pass_inside={pass_inside} {target}: {verdict:?}"
@@ -2107,7 +2108,7 @@ async fn a_joined_table_renamed_and_back_is_at_most_the_listed_gap() {
             }
         }
     }
-    assert!(reproduced, "no JOIN reading jb lost a write to the rename");
+    assert!(purged, "no drain purged jb's changes while it was away");
 }
 
 /// The register's `alter-type-rewrite` on a `JOIN`'s joined table: a

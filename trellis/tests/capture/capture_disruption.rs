@@ -595,6 +595,92 @@ async fn resume_waits_for_the_table_and_rebuilds_after_a_swap() {
     }
 }
 
+/// A plain source renamed away and back within one interval, with a drain in
+/// between: the drain finds no table at the staged name and purges its staged
+/// changes, and the purge pauses both readers with the pass's gone-table
+/// reason (#2270). Nothing unpauses once the name is back, and a `RESUME`
+/// rebuilds both to what the table holds.
+#[tokio::test]
+async fn a_purge_of_a_renamed_away_source_pauses_its_readers() {
+    use trellis::staging::self_check::CheckPageExt;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["rt".to_string()]).await;
+    bring_live_all(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    // Staged and undrained before the rename, then the table goes away. No
+    // pass runs until it is back.
+    app.batch_execute(
+        "update public.t_rt set b = b + 100 where id <= 5; \
+         alter table public.t_rt rename to t_rt_away",
+    )
+    .await
+    .unwrap();
+    let batch = pipeline::seal(&mut raw).await;
+    pipeline::drain(&db.pool, batch, "purge").await;
+    let left: i64 = raw
+        .query_one("select count(*) from public.r_rt where b > 100", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0, "the drain purged the staged changes");
+    for target in ["r_rt", "s_rt"] {
+        let status = trellis.status(target).await.unwrap().expect(target);
+        assert_eq!(status.status, TransformStatus::Paused, "{target}");
+        let failure = status.capture_failure.expect("a reason");
+        assert_eq!(failure.kind, trellis::CaptureFailureKind::Disruption);
+        assert!(failure.error.contains("no longer exists"), "{failure:?}");
+    }
+
+    // Back under its name: the pass finds capture intact and unpauses nothing.
+    app.batch_execute("alter table public.t_rt_away rename to t_rt")
+        .await
+        .unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    for target in ["r_rt", "s_rt"] {
+        assert_eq!(statuses(&raw).await[target], TransformStatus::Paused);
+    }
+
+    for target in ["r_rt", "s_rt"] {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|e| panic!("{target}: {e}"));
+    }
+    bring_live_all(&mut raw, &db.pool).await;
+    for target in ["r_rt", "s_rt"] {
+        let report = trellis
+            .self_check_to_end(
+                target,
+                trellis::SelfCheckMode::Strict,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("self_check");
+        assert!(
+            matches!(report.outcome, trellis::SelfCheckOutcome::Converged),
+            "{target}: {:?}",
+            report.outcome
+        );
+    }
+    assert_eq!(
+        rows(
+            &raw,
+            "select g::text, total::text from public.s_rt order by 1"
+        )
+        .await,
+        rows(
+            &raw,
+            "select g::text, sum(b)::text from public.t_rt group by g order by 1"
+        )
+        .await
+    );
+}
+
 /// A real `pg_dump` and `pg_restore` of the whole database, into another
 /// database and back over the same one with `--clean`, is a logical restore:
 /// the restored record names another `capture_triggers` oid, so the pass

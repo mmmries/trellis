@@ -6983,6 +6983,18 @@ pub(crate) fn held_keys_from(
 /// here: the error that triggers this call already reflects current
 /// database state.
 ///
+/// **Every purge pauses the table's readers** (#2270): each definition that
+/// reads it and isn't paused for a capture failure yet
+/// (`staging::schema_change::unpaused_readers`) pauses with the capture pass's
+/// gone-table reason, in the purge's own transaction, so no commit leaves
+/// staged changes deleted with a reader still running on what's left. The
+/// table may come back under its name (a rename away and back), and then no
+/// pass would see it gone; the pause is what makes `RESUME` rebuild it. A
+/// table nobody reads purges with no pause. The pauses read the catalog and
+/// lock the readers' rows (in id order) before any delete, and are idempotent
+/// against a pass pausing the same readers concurrently: a reader the pass
+/// paused first keeps its record and gets no second reason of the same text.
+///
 /// The quarantine deletes match both the canonical identity and the raw ring
 /// spelling, for the same reason [`release_key`]'s do: a leftover
 /// `poison_held` row for a table that no longer exists can never be released or
@@ -7011,6 +7023,7 @@ pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), App
     let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    pause_readers_of_purged(&txn, pool, &names).await?;
     for slot in 0..RING_SIZE {
         let table = ring_table_name(slot)?;
         txn.execute(
@@ -7035,6 +7048,35 @@ pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), App
     )
     .await?;
     txn.commit().await?;
+    Ok(())
+}
+
+/// [`purge_dropped_table`]'s pauses, in its transaction: every unpaused
+/// reader of the table under any of `names` (its canonical identity first),
+/// for the pass's gone-table reason.
+async fn pause_readers_of_purged(
+    txn: &Transaction<'_>,
+    pool: &Pool,
+    names: &[String],
+) -> Result<(), ApplyError> {
+    let catalog = crate::capture::columns::load_catalog_for(txn, pool.floors()).await?;
+    let table = &names[0];
+    let readers: BTreeSet<i64> = names
+        .iter()
+        .flat_map(|name| super::schema_change::unpaused_readers(&catalog, name))
+        .collect();
+    if readers.is_empty() {
+        return Ok(());
+    }
+    let text = crate::capture::triggers::gone_error(table);
+    let reason = crate::staging::pause_message::PauseReason::Disruption {
+        table: table.clone(),
+        text: text.clone(),
+    };
+    let pauses = readers.into_iter().map(|id| (id, reason.clone()));
+    for (id, _) in crate::defs::lifecycle::pause_many(txn, pauses).await? {
+        crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {text}");
+    }
     Ok(())
 }
 

@@ -179,8 +179,9 @@ pub enum ApplyError {
     /// (`42P01` from a live query against it) — the one sanctioned
     /// exception to immutability: no retry or per-key quarantine can
     /// resolve this, since the table itself is gone, not any one row.
-    /// `drain_once` routes this to `quarantine::purge_dropped_table`
-    /// rather than the ordinary isolate/evict path.
+    /// `drain_once` routes this to `quarantine::purge_dropped_table`, which
+    /// pauses the table's readers, rather than the ordinary isolate/evict
+    /// path.
     SourceTableDropped { source_table: String },
     /// `super::quarantine::resume_column` (or, indirectly,
     /// a `RESUME TRANSFORM <target>.<column>` statement,
@@ -5714,7 +5715,8 @@ async fn drain_batch(
                 // The one sanctioned exception to immutability: the
                 // table this batch's folded rows name is gone, not any one
                 // row's fault, so no retry or per-key quarantine resolves
-                // it. Purge every ring/quarantine row naming it and retry
+                // it. Purge every ring/quarantine row naming it, pausing
+                // the table's readers in the same transaction, and retry
                 // with it excluded. Not counted against
                 // `MAX_APPLY_ATTEMPTS` — this corrects `folded` itself
                 // rather than retrying the same input.

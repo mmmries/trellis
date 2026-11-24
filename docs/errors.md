@@ -1236,7 +1236,7 @@ it again.
 ### T0172 SourceTableDropped
 
 A change names a source table Postgres no longer has. Its staged changes are
-purged; put the table back, then `RESUME`.
+purged and the table's readers pause; put the table back, then `RESUME`.
 
 ### T0247 DefinitionFailsAlone
 
