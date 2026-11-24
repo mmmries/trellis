@@ -78,9 +78,10 @@ while every rule holds.
 * **On a partitioned source, change a partition key with `UPDATE`** (or
   `DELETE` and `INSERT`), not `MERGE`; rename, move or re-parent the source
   only while its transforms are paused
-  ([below](#a-partitioned-source-renamed-or-re-parented-and-back-within-one-pass)); and let a reconcile pass run between
-  creating or attaching a leaf beside a `DEFAULT` partition and removing it,
-  and between partition maintenance and a `pg_upgrade`
+  ([below](#a-partitioned-source-renamed-or-re-parented-and-back-within-one-pass));
+  and let a reconcile pass run between creating or attaching a leaf beside a
+  `DEFAULT` partition and removing it, and between partition maintenance and
+  a `pg_upgrade`
   ([below](#a-merge-that-moves-a-row-to-another-partition)).
 * **Repair after DDL that rewrites a read column's values** in one of the
   shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type).
@@ -421,7 +422,8 @@ with `DELETE` and `INSERT`.
 away and back (`ALTER TABLE orders RENAME TO orders_old`, then back), moved
 to another schema and back, or attached under another partitioned table and
 detached again. A pass that sees the source renamed away, moved, or attached
-elsewhere, pauses its readers.
+elsewhere pauses its readers, as does a drain that purges its staged changes
+while it is away.
 
 **What goes wrong:** capture stages a write only while the source's name
 resolves to the root of the tree being written, so every write made in

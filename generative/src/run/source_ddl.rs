@@ -212,8 +212,8 @@ pub async fn run_convergence_with_source_ddl_allowing(
             // window's pass, a build it queued would, so settle beside
             // passes, which don't see a collation. A table away from its
             // name drains too, so the window always meets the drain that
-            // purges its changes and pauses its readers, not only when a drain happens to win the
-            // race with the close.
+            // purges its changes and pauses its readers, not only when a
+            // drain happens to win the race with the close.
             let away = event.action.moves_table() && !event.pass_inside;
             if event.action.drains_before_close() || away {
                 if event.pass_inside {
