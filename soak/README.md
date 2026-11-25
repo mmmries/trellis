@@ -87,6 +87,54 @@ only for trial runs.
   WAL elsewhere: `setup --volume-mb 700 --accounts 10000 --orders 100000`. That tmpfs stays
   mounted for later runs; `sudo umount target/soak/vol` frees it.
 
+## The canary
+
+`canary.py` keeps one instance that is never reset, so each release is tested against state
+that is weeks or months old (#2191). It reuses this harness's cluster, workers, load, oracle
+and gates.
+
+```sh
+soak/canary.py provision --bin ~/canary/bin/0.3.1/trellis   # once
+soak/canary.py run                                          # the daemon, under systemd
+soak/canary.py upgrade --bin ~/canary/bin/0.4.0/trellis     # at a tag or release candidate
+soak/canary.py clear                                        # after a failure was looked at
+```
+
+- **Instance.** Under `~/canary` (`--home`, `$TRELLIS_CANARY_HOME`), never under `/tmp` or a
+  `target/`: 20k accounts, 200k orders, two workers, Postgres on port 56801. It defines
+  `defs.txt` less what `--without` names (0.3.x has no `WHERE`), plus `acct_names`, which every
+  release can define, for the probe; an `upgrade` defines the rest once the release accepts them.
+  The workers stay in the daemon's cgroup, so the service's memory cap and CPU weight cover them.
+- **Load.** Hourly rounds from `ROUNDS`, rotating, over 80% idle and trickle (steady is
+  20 writes/s). While a logbook reservation of kind `bench` is active the load stops and the
+  daemon waits. The daemon holds one `--background` logbook entry per release, which doesn't
+  hold the box.
+- **Quiet points.** After every round, churn and upgrade: every definition `live`, the oracle at
+  no differences, no worker lost, worker RSS under 1 GB, and a round's profile gates. Each is a
+  line in `history.tsv`.
+- **Churn.** Once a day it pauses a definition under a minute of load and resumes it, drops and
+  redefines another, and runs the next migration in `MIGRATIONS`.
+- **Weekly summary.** `summaries/<date>.md`: quiet points, rows, ring laps, sizes and RSS by day.
+- **Upgrade.** `upgrade` queues the documented [handover](../docs/upgrading.md) for the next
+  quiet point: the new release starts beside the old, the old stops, the new takes over.
+- **Failure.** A failed check stops the load and the workers, leaves Postgres up, writes
+  `reports/<time>-<kind>.md` and holds, across restarts, until `clear`.
+
+`status.json` is the alerting contract:
+
+| field | |
+|---|---|
+| `state` | `ok` or `failed` |
+| `phase` | `running`, `yielding` (to a bench), `upgrading`, `held` (failed) or `stopped` |
+| `heartbeat_at` | rewritten about every minute while the daemon is up |
+| `checked_at` | the last quiet point that passed |
+| `summary` | one line: the last check, or the failure |
+| `report` | the failure report's path, or `null` |
+| `version`, `weekly` | the release running, the latest weekly summary |
+
+Alert when `state` is `failed`, or `heartbeat_at` is more than 15 minutes old (the daemon is
+down or stuck).
+
 ## Checks
 
 ```sh
