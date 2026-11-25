@@ -3,11 +3,15 @@
 Run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s soak -p 'test_*.py'
 """
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -108,6 +112,54 @@ class Status(unittest.TestCase):
             )
             self.assertFalse(os.path.exists(os.path.join(d, "status.json.tmp")))
             self.assertEqual(canary.Canary(d).status["state"], "failed")
+
+    def test_clear_wins_over_a_holding_daemon(self):
+        with tempfile.TemporaryDirectory() as d:
+            daemon = canary.Canary(d)
+            daemon.beat("held", state="failed", summary="boom", report="/r.md")
+            with contextlib.redirect_stdout(io.StringIO()):
+                canary.cmd_clear(argparse.Namespace(home=d, port=canary.PORT))
+            h = mock.Mock()
+            with (
+                mock.patch.object(canary.time, "sleep", side_effect=AssertionError("still holding")),
+                self.assertRaises(canary.Cleared),
+            ):
+                canary.hold(daemon, h)
+            daemon.beat("stopped")  # cmd_run's teardown
+            st = canary.Canary(d).status
+            self.assertEqual((st["state"], st["phase"], st["report"]), ("ok", "stopped", None))
+
+
+class Daemon(unittest.TestCase):
+    def test_a_harness_error_fails_and_holds(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "cluster"))
+            open(os.path.join(d, "cluster", "setup.json"), "w").close()
+            h = mock.Mock()
+            h.pg_start.side_effect = RuntimeError("no postgres")
+            failed = []
+
+            def fail(c, h, kind, detail, failures, metric_lines=()):
+                failed.append((kind, failures))
+                raise KeyboardInterrupt  # fail() holds forever; stop it as SIGTERM would
+
+            args = argparse.Namespace(home=d, port=canary.PORT, converge_secs=1, rounds=1, round=None)
+            with (
+                mock.patch.object(canary.Canary, "harness", return_value=h),
+                mock.patch.object(canary, "fail", fail),
+                mock.patch.object(canary.chaos, "no_interrupts"),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                canary.cmd_run(args)
+            self.assertEqual(failed, [("error", ["harness error: RuntimeError: no postgres"])])
+
+    def test_provision_never_touches_an_existing_cluster(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "cluster", "data"))  # a provision that never wrote setup.json
+            args = argparse.Namespace(home=d, port=canary.PORT, bin="/bin/true", without="", accounts=1, orders=1)
+            with self.assertRaisesRegex(canary.UsageError, "never reset"):
+                canary.cmd_provision(args)
+            self.assertTrue(os.path.isdir(os.path.join(d, "cluster", "data")))
 
 
 class Weekly(unittest.TestCase):

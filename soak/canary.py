@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import chaos
 import loadgen
@@ -85,6 +86,10 @@ HISTORY_COLUMNS = [
 
 class UsageError(Exception):
     pass
+
+
+class Cleared(Exception):
+    """`clear` ran while this daemon held: it exits non-zero, so systemd restarts it."""
 
 
 def now_iso(t=None):
@@ -264,6 +269,10 @@ class Canary:
 
     def beat(self, phase, **changes):
         """Rewrite status.json with a fresh heartbeat; `changes` set its other fields."""
+        if self.status.get("state") == "failed" and "state" not in changes:
+            disk = read_json(self.status_path, {})
+            if disk.get("state") == "ok":  # `clear` ran while this daemon held: it wins
+                self.status = disk
         s = dict(self.status, **changes)
         self.status = status_doc(
             s["state"], phase, s["checked_at"], s["summary"], s["report"], s.get("version"), s.get("weekly")
@@ -321,7 +330,7 @@ def sizes(h):
         " on n.oid = c.relnamespace where n.nspname = 'trellis' and c.relkind = 'r'",
         "select round(sum(pg_total_relation_size(format('public.%I', t)::regclass))/1048576.0)"
         " from unnest(array['acct_view','region_totals','acct_order_totals','region_order_totals',"
-        "'order_view','big_accts']) t where to_regclass(format('public.%I', t)) is not null",
+        "'order_view','big_accts','acct_names']) t where to_regclass(format('public.%I', t)) is not null",
         "select active_seq from trellis.segment_pointer",
     ):
         try:
@@ -434,10 +443,14 @@ def fail(c, h, kind, detail, failures, metric_lines=()):
 
 
 def hold(c, h):
-    """Keep Postgres up for inspection and beat until stopped; `clear` and a restart resume."""
+    """Keep Postgres up for inspection and beat until stopped or `clear` runs (then exit, and
+    systemd's restart resumes)."""
     h.event(f"holding: {c.status['summary']}; report {c.status['report']}")
     while True:
         c.beat("held")
+        if c.status["state"] != "failed":
+            h.event("cleared: exiting for a restart")
+            raise Cleared()
         time.sleep(60)
 
 
@@ -619,8 +632,8 @@ def weekly(c, h):
 
 def cmd_provision(args):
     c = Canary(args.home, args.port)
-    if c.provisioned():
-        raise UsageError(f"{c.cluster} is already provisioned; the canary is never reset")
+    if c.provisioned() or os.path.lexists(c.cluster):
+        raise UsageError(f"{c.cluster} exists; the canary is never reset (provisioning would delete it)")
     os.makedirs(args.home, exist_ok=True)
     why = check_home(args.home, shutil.disk_usage(args.home).free)
     if why:
@@ -690,6 +703,11 @@ def cmd_run(args):
             c.state["round"] = n + 1
             c.save_state()
             done += 1
+    except Cleared:
+        raise
+    except Exception as exc:  # a harness error fails like a check, so a restart can't resume load over it
+        h.event(f"harness error:\n{traceback.format_exc()}")
+        fail(c, h, "error", "harness", [f"harness error: {type(exc).__name__}: {exc}"])
     finally:
         chaos.no_interrupts()
         try:
@@ -726,7 +744,7 @@ def cmd_clear(args):
     c = Canary(args.home, args.port)
     was = c.status.get("report")
     c.beat("stopped", state="ok", summary=f"cleared by hand after {was}", report=None)
-    print("cleared; restart the daemon: systemctl --user restart trellis-canary")
+    print("cleared; a running daemon restarts itself within about two minutes")
 
 
 def cmd_status(args):
@@ -781,6 +799,8 @@ def main(argv=None):
     except UsageError as exc:
         print(f"canary.py: {exc}", file=sys.stderr)
         return 64
+    except Cleared:
+        return 75
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

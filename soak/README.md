@@ -117,8 +117,9 @@ soak/canary.py clear                                        # after a failure wa
 - **Weekly summary.** `summaries/<date>.md`: quiet points, rows, ring laps, sizes and RSS by day.
 - **Upgrade.** `upgrade` queues the documented [handover](../docs/upgrading.md) for the next
   quiet point: the new release starts beside the old, the old stops, the new takes over.
-- **Failure.** A failed check stops the load and the workers, leaves Postgres up, writes
-  `reports/<time>-<kind>.md` and holds, across restarts, until `clear`.
+- **Failure.** A failed check or a harness error stops the load and the workers, leaves
+  Postgres up, writes `reports/<time>-<kind>.md` and holds, across restarts, until `clear`;
+  a holding daemon then exits, and systemd restarts it.
 
 `status.json` is the alerting contract:
 
