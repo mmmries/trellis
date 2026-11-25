@@ -69,6 +69,11 @@ class Harness:
         )
         self.run_dir = run_dir or os.path.join(root, "logs")
         self.workers = {}  # name -> {"proc", "bin", "expected_down"}
+        self.metrics_base = METRICS_BASE  # worker wN serves /metrics on metrics_base + N
+        # Each worker in its own `systemd-run --scope` with MemoryMax; False keeps the workers in
+        # this process's cgroup (the canary's service caps them as a whole).
+        self.scope = True
+        self.probe_target = "acct_view"  # a 1-1 target of accounts with `uname` = name, for probe()
         self.lock = threading.Lock()
         self.failures = []
         self.cleanups = []  # callables run once, after Postgres stops
@@ -199,19 +204,14 @@ class Harness:
         idx = int(name[1:])
         # w1 connects over TCP so the blackhole action reaches it; the others use the socket.
         dsn = self.dsn(tcp=(idx == 1))
-        cmd = [
-            "systemd-run",
-            "--user",
-            "--scope",
-            "-q",
-            "-p",
-            f"MemoryMax={self.memory_max}",
+        cmd = ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={self.memory_max}"] if self.scope else []
+        cmd += [
             bin_path,
             "run",
             "--drain-threads",
             str(self.drain_threads),
             "--prometheus-bind",
-            f"127.0.0.1:{METRICS_BASE + idx}",
+            f"127.0.0.1:{self.metrics_base + idx}",
             "-d",
             dsn,
         ]
@@ -258,7 +258,9 @@ class Harness:
 
     def metrics(self, name):
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{METRICS_BASE + int(name[1:])}/metrics", timeout=2) as r:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.metrics_base + int(name[1:])}/metrics", timeout=2
+            ) as r:
                 return r.read().decode()
         except Exception:
             return ""
@@ -378,9 +380,11 @@ def monitor(h, out_path, stop, interval=5.0):
     sizes = (
         "select (select round(sum(pg_total_relation_size(c.oid))/1048576.0) from pg_class c join pg_namespace n "
         "on n.oid = c.relnamespace where n.nspname = 'trellis' and c.relkind = 'r'), "
+        # Targets by name, skipping any not defined (the canary's set differs, and churns).
         "(select round(sum(pg_total_relation_size(c.oid))/1048576.0) from pg_class c where c.oid = any(array["
-        "'public.acct_view','public.region_totals','public.acct_order_totals','public.region_order_totals',"
-        "'public.order_view','public.big_accts']::regclass[])), "
+        "to_regclass('public.acct_view'),to_regclass('public.region_totals'),to_regclass('public.acct_order_totals'),"
+        "to_regclass('public.region_order_totals'),to_regclass('public.order_view'),to_regclass('public.big_accts'),"
+        "to_regclass('public.acct_names')])), "
         f"(select count(*) from pg_stat_activity where usename = '{ROLE}'), "
         "pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint, "
         # How far Trellis's sessions hold back the vacuum horizon, in xids and in seconds.
@@ -466,9 +470,19 @@ def parse_oracle(text):
     return out
 
 
-def oracle(h):
+def oracle_parts():
+    """target -> its query in oracle.sql, to check a subset of the targets."""
+    lines = [line for line in open(os.path.join(HERE, "oracle.sql")).read().splitlines() if not line.startswith("--")]
+    parts = [p.strip() for p in "\n".join(lines).strip().rstrip(";").split("\nunion all\n")]
+    return {p.split("'")[1]: p for p in parts}
+
+
+def oracle(h, parts=None):
+    """{target: differing rows} for every target in oracle.sql, or for the queries in `parts`."""
     try:
-        return parse_oracle(h.psql(file=os.path.join(HERE, "oracle.sql"), user=ROLE))
+        if parts is None:
+            return parse_oracle(h.psql(file=os.path.join(HERE, "oracle.sql"), user=ROLE))
+        return parse_oracle(h.psql("\nunion all\n".join(parts), user=ROLE))
     except subprocess.CalledProcessError as exc:
         h.event(f"oracle query failed: {(exc.stderr or '').strip()[:200]}")
         return None
@@ -521,12 +535,14 @@ def probe(h, tag, timeout=300.0):
             reader.autocommit = True
             with reader.cursor() as cur:
                 while True:
-                    cur.execute("select 1 from public.acct_view where id = %s and uname = %s", (probe_id(h), name))
+                    cur.execute(
+                        f"select 1 from public.{h.probe_target} where id = %s and uname = %s", (probe_id(h), name)
+                    )
                     if cur.fetchone():
                         rec["latency"] = time.time() - committed
                         break
                     if time.time() > deadline:
-                        raise TimeoutError(f"not in acct_view after {timeout:.0f}s")
+                        raise TimeoutError(f"not in {h.probe_target} after {timeout:.0f}s")
                     h.sleep(0.05)
         finally:
             reader.close()
@@ -756,17 +772,22 @@ def check_gates(m):
     return out
 
 
-def record_metrics(h, start, segments, loadgen_segments):
-    """Write metrics.json and log the summary. Returns (the logbook's short form, gate breaches).
-    A failure to compute them is logged and doesn't fail the run."""
+def record_metrics(h, start, segments, loadgen_segments, out_dir=None, log_offsets=None):
+    """Write metrics.json (in `out_dir`, default the run's) and log the summary. Returns (the
+    logbook's short form, gate breaches). Worker logs are read from `log_offsets` ({name: byte
+    offset}) on. A failure to compute them is logged and doesn't fail the run."""
     try:
         log_lines = []
         for name in h.worker_names():
-            with open(os.path.join(h.run_dir, f"{name}.log"), errors="replace") as f:
+            path = os.path.join(h.run_dir, f"{name}.log")
+            if not os.path.exists(path):
+                continue
+            with open(path, errors="replace") as f:
+                f.seek((log_offsets or {}).get(name, 0))
                 log_lines += parse_log_levels(f)
         steps = [(at, t) for at, t in h.step_log if not t.startswith(("until:", "sleep:"))]
         m = summarize(start, segments, loadgen_segments, h.samples, h.probes, log_lines, steps)
-        with open(os.path.join(h.run_dir, "metrics.json"), "w") as f:
+        with open(os.path.join(out_dir or h.run_dir, "metrics.json"), "w") as f:
             json.dump(m, f, indent=1)
         lines, short = metrics_lines(m)
         for line in lines:
@@ -1207,6 +1228,45 @@ def build_cli():
     subprocess.run(["cargo", "build", "--release", "-p", "trellis-cli", "--bin", "trellis"], cwd=REPO, check=True)
 
 
+def start_loadgen(h, schedule, tps, threads, mix, start_at, out_path):
+    """Start loadgen.py on `schedule` as the application role; its pid goes in loadgen.pid."""
+    lg = subprocess.Popen(
+        [
+            sys.executable,
+            os.path.join(HERE, "loadgen.py"),
+            "--dsn",
+            h.dsn(user=APP),
+            "--threads",
+            str(threads),
+            "--tps",
+            str(tps),
+            "--schedule",
+            schedule,
+            "--start-at",
+            repr(start_at),
+            "--accounts",
+            str(h.cfg["accounts"]),
+            "--orders",
+            str(h.cfg["orders"]),
+            "--mix",
+            mix,
+        ],
+        stdout=open(out_path, "w"),
+        stderr=subprocess.STDOUT,
+    )
+    h.write_pid("loadgen", lg.pid)
+    return lg
+
+
+def load_totals(out_path):
+    """The load generator's closing JSON line: {"ok", "err", "rows", "segments"}."""
+    last = open(out_path).read().strip().splitlines()[-1:] or [""]
+    try:
+        return json.loads(last[0])
+    except ValueError:
+        raise RuntimeError(f"the load generator didn't report totals; see {out_path}") from None
+
+
 def cmd_setup(args):
     h = Harness(args.dir, args.port, args.bin)
     if h.cfg and not args.force:
@@ -1230,7 +1290,9 @@ def cmd_setup(args):
             logbook_finish(h, entry, args.accounts + args.orders + 50, outcome, note)
 
 
-def setup_cluster(h, args):
+def setup_cluster(h, args, snapshot=True, defs=None, parts=None):
+    """Build, seed and define `defs` (default defs.txt), checked by the oracle `parts` (default
+    oracle.sql); with `snapshot`, copy the result to the base snapshot `run` restores."""
     h.stop_all()
     h.aborting.clear()
     for d in ("data", "data.base", "wal", "wal.base", "vol/data"):
@@ -1291,7 +1353,7 @@ log_lock_waits = on
     print(f"seeded {args.accounts} accounts and {args.orders} orders", flush=True)
     h.memory_max, h.drain_threads = args.memory_max, 4
     h.start_worker("w1")
-    defs = [d for d in open(os.path.join(HERE, "defs.txt")).read().splitlines() if d.strip()]
+    defs = defs or [d for d in open(os.path.join(HERE, "defs.txt")).read().splitlines() if d.strip()]
     # The last definition reads acct_order_totals' target, so it waits for the rest to go live.
     for batch in (defs[:-1], defs[-1:]):
         for d in batch:
@@ -1305,7 +1367,7 @@ log_lock_waits = on
                 raise RuntimeError(f"definitions not live after {args.build_secs}s: {states}")
             time.sleep(2)
     for _ in range(30):  # live can be reported a moment before the last page lands
-        bad = {k: v for k, v in (oracle(h) or {"oracle": -1}).items() if v}
+        bad = {k: v for k, v in (oracle(h, parts) or {"oracle": -1}).items() if v}
         if not bad:
             break
         time.sleep(2)
@@ -1317,11 +1379,12 @@ log_lock_waits = on
     if empty:  # an empty target makes its oracle line pass vacuously
         raise RuntimeError(f"targets empty after setup: {', '.join(empty)}; adjust the seed or defs.txt")
     h.stop_all()  # the cmd_setup teardown runs it again: it is idempotent
-    replace_tree(h.data, os.path.join(args.dir, "data.base"))
-    if args.volume_mb:
+    if snapshot:
+        replace_tree(h.data, os.path.join(args.dir, "data.base"))
+    if snapshot and args.volume_mb:
         replace_tree(h.wal, os.path.join(args.dir, "wal.base"))
     json.dump(h.cfg, open(h.cfg_path, "w"), indent=1)
-    print(f"base snapshot ready in {args.dir}", flush=True)
+    print(f"{'base snapshot' if snapshot else 'cluster'} ready in {args.dir}", flush=True)
 
 
 def cmd_stop(args):
@@ -1388,31 +1451,7 @@ def cmd_run(args):
         start_at = time.time() + 2
         h.timeline = (start_at, segments)
         load_out = os.path.join(run_dir, "load.log")
-        lg = subprocess.Popen(
-            [
-                sys.executable,
-                os.path.join(HERE, "loadgen.py"),
-                "--dsn",
-                h.dsn(user=APP),
-                "--threads",
-                str(args.threads),
-                "--tps",
-                str(args.tps),
-                "--schedule",
-                args.schedule,
-                "--start-at",
-                repr(start_at),
-                "--accounts",
-                str(h.cfg["accounts"]),
-                "--orders",
-                str(h.cfg["orders"]),
-                "--mix",
-                args.mix,
-            ],
-            stdout=open(load_out, "w"),
-            stderr=subprocess.STDOUT,
-        )
-        h.write_pid("loadgen", lg.pid)
+        lg = start_loadgen(h, args.schedule, args.tps, args.threads, args.mix, start_at, load_out)
         h.event(f"load: {args.threads} threads, {args.schedule} at {args.tps:g} tps ({args.load_secs}s)")
         probes = None
         if args.probe_secs > 0:
@@ -1423,11 +1462,7 @@ def cmd_run(args):
         lg.wait()
         if probes is not None:
             probes.join()
-        last = open(load_out).read().strip().splitlines()[-1:] or [""]
-        try:
-            totals = json.loads(last[0])
-        except ValueError:
-            raise RuntimeError(f"the load generator didn't report totals; see {load_out}") from None
+        totals = load_totals(load_out)
         rows = totals["rows"]
         h.event(f"load done: {totals['ok']} statements, {totals['err']} errors, {rows} rows")
 
