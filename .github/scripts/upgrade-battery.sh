@@ -479,8 +479,13 @@ sorted_words() { local w; for w in "$@"; do echo "$w"; done | sort | tr '\n' ' '
 # schema lacks (a new primary-key or partition-key type) adds one to
 # shapes_schema below.
 rollback_new_defs=(
-  "feature TypeRule(Comparison(EnumBesideStringLiteral));admit comparison(Equal, Other(Enum(\"enum:public.e\")), string literal) = Ok(())|tickets_open|TRANSFORM tickets_open FROM tickets SELECT id AS id, state = 'open' AS is_open"
+  "feature TypeRule(Comparison(EnumBesideStringLiteral));admit comparison(Equal, Other(Enum(\"enum:public.e\")), string literal) = Ok(())|tickets_open|TRANSFORM tickets_open FROM tickets SELECT state = 'open' AS is_open"
   "feature NeighbourTypedLiteral|codes_same|TRANSFORM codes_same FROM codes SELECT code = 'ab  ' AS same, COALESCE(code, 'zz  ') AS filled"
+  "feature Predicate(Filter)|w_filter|TRANSFORM w_filter FROM orders SELECT amount AS amount WHERE amount > 100"
+  "feature Expr(InList)|w_in|TRANSFORM w_in FROM orders SELECT customer_id IN (1, 2, 3) AS hot"
+  "feature Expr(Between)|w_btw|TRANSFORM w_btw FROM orders SELECT amount BETWEEN 10 AND 20 AS mid"
+  "feature Layout(FloatIntervalSums);feature TypeRule(AggregateAdmission(SumAvgFloat));admit aggregate_admitted(SUM, Float(Float4) typmod -1) = Ok(());admit aggregate_admitted(SUM, Float(Float4) typmod 786438) = Ok(());admit aggregate_admitted(SUM, Float(Float8) typmod -1) = Ok(());admit aggregate_admitted(SUM, Float(Float8) typmod 786438) = Ok(());admit aggregate_admitted(AVG, Float(Float4) typmod -1) = Ok(());admit aggregate_admitted(AVG, Float(Float4) typmod 786438) = Ok(());admit aggregate_admitted(AVG, Float(Float8) typmod -1) = Ok(());admit aggregate_admitted(AVG, Float(Float8) typmod 786438) = Ok(())|f_tot|TRANSFORM f_tot FROM floats GROUP BY g SELECT g AS g, SUM(f4) AS s4, AVG(f4) AS a4, SUM(f8) AS s8, AVG(f8) AS a8"
+  "feature TypeRule(Aggregate(AvgInterval));feature TypeRule(AggregateAdmission(SumAvgInterval));admit aggregate(AVG, Other(Interval)) = Some(Other(Interval));admit aggregate_admitted(SUM, Other(Interval) typmod -1) = Ok(());admit aggregate_admitted(SUM, Other(Interval) typmod 786438) = Ok(());admit aggregate_admitted(AVG, Other(Interval) typmod -1) = Ok(());admit aggregate_admitted(AVG, Other(Interval) typmod 786438) = Ok(())|i_tot|TRANSFORM i_tot FROM floats GROUP BY g SELECT g AS g, SUM(d) AS sd, AVG(d) AS ad"
 )
 # What a release before 0.2.0 says when a later release has migrated the
 # database. Its `migrate`, which its `run` and `apply` call first, refuses the
@@ -499,6 +504,8 @@ create index on nan_orders(customer_id);
 create type ticket_state as enum ('open', 'closed');
 create table tickets(id bigint primary key, state ticket_state not null);
 create table codes(id bigint primary key, code character(4));
+create table floats(id bigint primary key, g bigint not null, f4 real, f8 double precision, d interval);
+create index on floats(g);
 create table events(id bigint not null, tenant bigint not null, v bigint not null, primary key (id, tenant)) partition by hash (tenant);
 create table events_0 partition of events for values with (modulus 4, remainder 0);
 create table events_1 partition of events for values with (modulus 4, remainder 1);
@@ -511,6 +518,7 @@ insert into ledger select g, g, g % 7 from generate_series(1,100) g;
 insert into events select g, g % 20, 1 from generate_series(1,1000) g;
 insert into nan_orders values (3000, 7, 10.00, 'n'), (3003, 8, 20.00, 'n');
 insert into tickets select g, case when g % 2 = 0 then 'open'::ticket_state else 'closed'::ticket_state end from generate_series(1,10) g;
+insert into floats select g, g % 5, g / 3.0, g / 7.0, g * interval '1 minute' from generate_series(1,50) g;
 insert into codes select g, case when g % 3 = 0 then null when g % 3 = 1 then 'ab' else 'zz' end from generate_series(1,20) g;
 EOF
 )
