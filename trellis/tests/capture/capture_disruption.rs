@@ -681,6 +681,45 @@ async fn a_purge_of_a_renamed_away_source_pauses_its_readers() {
     );
 }
 
+/// A plain source renamed away between the drain's two catalog reads of its
+/// key (its key columns, then their types) is a drop, not a key type off
+/// the allowlist: the drain purges and pauses both readers with the
+/// gone-table reason (#2293), rather than halting them on `T0121`.
+#[tokio::test]
+async fn a_source_renamed_away_between_the_key_reads_pauses_its_readers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = definer(db.dsn()).await;
+    create_case_tables(&raw, &trellis, &["kr".to_string()]).await;
+    bring_live_all(&mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute("update public.t_kr set b = b + 100 where id <= 5")
+        .await
+        .unwrap();
+    let batch = pipeline::seal(&mut raw).await;
+    trellis::defs::ddl::test_hooks::once_between_key_reads(
+        "public.t_kr",
+        "alter table public.t_kr rename to t_kr_away",
+    );
+    pipeline::drain(&db.pool, batch, "purge").await;
+    for target in ["r_kr", "s_kr"] {
+        let status = trellis.status(target).await.unwrap().expect(target);
+        assert_eq!(status.status, TransformStatus::Paused, "{target}");
+        let failure = status
+            .capture_failure
+            .clone()
+            .unwrap_or_else(|| panic!("{target}: no capture failure: {status:?}"));
+        assert_eq!(
+            failure.kind,
+            trellis::CaptureFailureKind::Disruption,
+            "{failure:?}"
+        );
+        assert!(failure.error.contains("no longer exists"), "{failure:?}");
+    }
+}
+
 /// A real `pg_dump` and `pg_restore` of the whole database, into another
 /// database and back over the same one with `--clean`, is a logical restore:
 /// the restored record names another `capture_triggers` oid, so the pass

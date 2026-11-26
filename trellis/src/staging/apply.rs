@@ -77,7 +77,8 @@ pub enum ApplyError {
     Staging(StagingError),
     /// A failure reading the transform catalog.
     Catalog(CatalogError),
-    /// A failure introspecting a source table's primary key.
+    /// A failure introspecting a source table's primary key. Prints the
+    /// inner error's message bare: it names the table.
     Ddl(DdlError),
     /// A definition's calculated fields failed to type-infer against its own
     /// persisted `source_columns` — meaning a definition that already passed
@@ -414,7 +415,7 @@ impl crate::error_code::Message for ApplyError {
             ApplyError::Catalog(err) => {
                 write!(f, "transform catalog error: {}", err.message())
             }
-            ApplyError::Ddl(err) => write!(f, "target-table DDL error: {}", err.message()),
+            ApplyError::Ddl(err) => write!(f, "{}", err.message()),
             ApplyError::Validate(err) => {
                 write!(
                     f,
@@ -2600,7 +2601,9 @@ pub struct ApplyPlan {
 /// ([`ddl::source_primary_key`]), or `None` when the key can't be used and
 /// no definition that isn't frozen reads the table, so `compute` skips them.
 ///
-/// A dropped source is [`ApplyError::SourceTableDropped`], reported under
+/// A source gone from its name, seen by any of the key read's catalog reads
+/// ([`ddl::source_primary_key_at_name`]), is
+/// [`ApplyError::SourceTableDropped`], decided before the key gate, reported under
 /// `qualified_source`, the ring's own spelling: its consumers
 /// (`quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
 /// `folded.retain`) match it against a ring row's `src_table` as an exact
@@ -2628,17 +2631,14 @@ async fn source_key_for_apply(
     qualified_source: &str,
     source_key: &str,
 ) -> Result<Option<Vec<PrimaryKeyColumn>>, ApplyError> {
-    let err = match ddl::source_primary_key(pool, qualified_source).await {
-        Ok(pk) => return Ok(Some(pk)),
+    let dropped = || ApplyError::SourceTableDropped {
+        source_table: qualified_source.to_string(),
+    };
+    let err = match ddl::source_primary_key_at_name(pool, qualified_source).await {
+        Ok(Some(pk)) => return Ok(Some(pk)),
+        Ok(None) => return Err(dropped()),
         Err(DdlError::Db(db_err)) if quarantine::is_undefined_table(&db_err) => {
-            return Err(ApplyError::SourceTableDropped {
-                source_table: qualified_source.to_string(),
-            });
-        }
-        Err(DdlError::NoPrimaryKey { source_table })
-            if quarantine::source_table_missing(pool, &source_table).await? =>
-        {
-            return Err(ApplyError::SourceTableDropped { source_table });
+            return Err(dropped());
         }
         Err(err) => err,
     };

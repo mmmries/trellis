@@ -746,6 +746,22 @@ pub(crate) async fn source_primary_key_in_txn(
     Ok(admitted_primary_key(client, source_table).await?.0)
 }
 
+/// [`source_primary_key`], or `None` when a read finds no relation at
+/// `source_table`: the drain's key read ([`crate::staging::apply`]), for
+/// which a table gone from its name is a drop, not a key it can't use.
+/// Each of [`admitted_primary_key_at_name`]'s reads can see the table gone,
+/// one after another resolved it (a rename between two of them), and
+/// whichever sees it decides.
+pub(crate) async fn source_primary_key_at_name(
+    pool: &Pool,
+    source_table: &str,
+) -> Result<Option<Vec<PrimaryKeyColumn>>, DdlError> {
+    let client = pool.get().await?;
+    Ok(admitted_primary_key_at_name(&**client, source_table)
+        .await?
+        .map(|(columns, _)| columns))
+}
+
 /// [`source_primary_key_in_txn`] and, for each key column, the allowlist
 /// entry that admitted its type ([`super::join_key_types::JoinKey`]), in the
 /// key's column order. This is where the key type is admitted, and it runs
@@ -753,13 +769,39 @@ pub(crate) async fn source_primary_key_in_txn(
 /// so it returns the entries for the definition's floor
 /// ([`super::floor::of_live`]) instead of recording them. The columns can
 /// only be admitted by an entry, so a type can't join the allowlist without
-/// declaring the release it arrived in.
+/// declaring the release it arrived in. A table gone from its name has no
+/// key ([`DdlError::NoPrimaryKey`]).
 pub(crate) async fn admitted_primary_key(
     client: &impl GenericClient,
     source_table: &str,
 ) -> Result<(Vec<PrimaryKeyColumn>, Vec<super::join_key_types::JoinKey>), DdlError> {
+    admitted_primary_key_at_name(client, source_table)
+        .await?
+        .ok_or_else(|| DdlError::NoPrimaryKey {
+            source_table: source_table.to_string(),
+        })
+}
+
+/// [`admitted_primary_key`], or `None` when a read finds no relation at
+/// `source_table`.
+async fn admitted_primary_key_at_name(
+    client: &impl GenericClient,
+    source_table: &str,
+) -> Result<Option<(Vec<PrimaryKeyColumn>, Vec<super::join_key_types::JoinKey>)>, DdlError> {
     let columns = identity_key_columns(client, source_table).await?;
     if columns.is_empty() {
+        // No key read and no table read look alike: tell them apart
+        // before reporting the table keyless.
+        let gone: bool = client
+            .query_one(
+                "select pg_catalog.to_regclass($1) is null",
+                &[&regclass_arg(source_table)],
+            )
+            .await?
+            .get(0);
+        if gone {
+            return Ok(None);
+        }
         if let Some(missing) = super::recorded_keys::missing(client, source_table).await? {
             return Err(missing);
         }
@@ -773,8 +815,12 @@ pub(crate) async fn admitted_primary_key(
             source_table: source_table.to_string(),
         });
     }
-    let admitted_by = admit_key_types(client, source_table, &columns).await?;
-    Ok((columns, admitted_by))
+    #[cfg(any(test, feature = "test-util"))]
+    test_hooks::between_key_reads(client, source_table).await;
+    let Some(admitted_by) = admit_key_types_at_name(client, source_table, &columns).await? else {
+        return Ok(None);
+    };
+    Ok(Some((columns, admitted_by)))
 }
 
 /// The allowlist entry that admits each of `columns`' types as a key of
@@ -782,13 +828,32 @@ pub(crate) async fn admitted_primary_key(
 /// one [`super::live_table::LiveTable::read`]); refuses the first type it
 /// doesn't admit ([`DdlError::UnsupportedPrimaryKeyType`]). Every key
 /// Trellis keys a table by passes it: a primary key's and a declared `KEY`'s
-/// (`super::source_key::admitted_key`).
+/// (`super::source_key::admitted_key`). A table gone from its name has no
+/// key ([`DdlError::NoPrimaryKey`]).
 pub(crate) async fn admit_key_types(
     client: &impl GenericClient,
     source_table: &str,
     columns: &[PrimaryKeyColumn],
 ) -> Result<Vec<super::join_key_types::JoinKey>, DdlError> {
+    admit_key_types_at_name(client, source_table, columns)
+        .await?
+        .ok_or_else(|| DdlError::NoPrimaryKey {
+            source_table: source_table.to_string(),
+        })
+}
+
+/// [`admit_key_types`], or `None` when the read finds no relation at
+/// `source_table`: a table holding a key has a column, so a read of none is
+/// a table gone, not a key column of a type off the allowlist.
+async fn admit_key_types_at_name(
+    client: &impl GenericClient,
+    source_table: &str,
+    columns: &[PrimaryKeyColumn],
+) -> Result<Option<Vec<super::join_key_types::JoinKey>>, DdlError> {
     let live = super::live_table::LiveTable::read(client, source_table).await?;
+    if live.columns.is_empty() {
+        return Ok(None);
+    }
     columns
         .iter()
         .map(|column| {
@@ -806,7 +871,43 @@ pub(crate) async fn admit_key_types(
                     .to_string(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Test hooks into the key read ([`source_primary_key_at_name`]).
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use tokio_postgres::GenericClient;
+
+    fn hooks() -> &'static Mutex<HashMap<String, String>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+
+    /// Runs `sql` once, on the reading connection, the next time a key read
+    /// of `table` (an unquoted `schema.table`) has read its key columns and
+    /// not yet their types: a rename between the two reads, deterministically.
+    #[cfg_attr(not(feature = "internals"), allow(dead_code))]
+    pub fn once_between_key_reads(table: &str, sql: &str) {
+        hooks()
+            .lock()
+            .unwrap()
+            .insert(table.to_string(), sql.to_string());
+    }
+
+    pub(super) async fn between_key_reads(client: &impl GenericClient, table: &str) {
+        let sql = hooks().lock().unwrap().remove(table);
+        if let Some(sql) = sql {
+            client
+                .batch_execute(&sql)
+                .await
+                .expect("the between-key-reads hook's statement");
+        }
+    }
 }
 
 /// The catalog half of [`source_primary_key_in_txn`], with none of its
