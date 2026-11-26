@@ -192,3 +192,88 @@ async fn a_build_start_refused_halts_that_definition_only() {
         "{refused:?}"
     );
 }
+
+/// Strips `row_security = off` from every capture function of `public.u`,
+/// as postgres: what a capture function an older release created looks like
+/// to this one (#2227 added the setting), so the next pass finds it stale.
+async fn age_capture_functions(raw: &Client) {
+    raw.batch_execute(
+        "do $$ declare f regprocedure; begin \
+           for f in select p.oid::regprocedure from pg_catalog.pg_proc p \
+             where p.pronamespace = 'trellis'::regnamespace and p.proname like 'cap\\_%\\_u\\_%' \
+               and p.proconfig::text like '%row_security%' \
+           loop execute format('alter function %s reset row_security', f); end loop; end $$",
+    )
+    .await
+    .expect("age the capture functions");
+}
+
+/// #2291: after an upgrade, a DML-only worker can't replace the older
+/// release's capture functions. A definition made after the upgrade, whose
+/// columns those functions already image, still starts its build.
+#[tokio::test]
+#[ignore = "#2291: fails until the design decision on who re-creates stale capture functions lands"]
+async fn a_stale_capture_function_the_worker_cannot_replace_does_not_hold_a_new_definition() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let admin = setup(db.dsn(), &mut raw, &db.pool).await;
+    age_capture_functions(&raw).await;
+    let worker = dml_worker(db.dsn(), &raw).await;
+    let Worker {
+        role,
+        mut client,
+        mut tick,
+    } = worker;
+
+    admin
+        .apply("TRANSFORM t2 FROM public.u SELECT a AS a")
+        .await
+        .expect("define t2");
+    raw.batch_execute(&format!(
+        "grant select, insert, update, delete on all tables in schema trellis to {role}; \
+         grant select, insert, update, delete on all tables in schema public to {role}"
+    ))
+    .await
+    .expect("grants on t2's tables");
+    assert!(!tick.tick(&mut client).await);
+    let started = status_of(&admin, "t2").await;
+    assert_eq!(started.status, TransformStatus::Backfilling, "{started:?}");
+    assert_eq!(status_of(&admin, "t").await.status, TransformStatus::Live);
+}
+
+/// A fresh deployment: a definition on a table nothing captures yet waits
+/// for a role that owns it to install capture (docs/operations.md, "Grants
+/// for a worker role"), and says so.
+#[tokio::test]
+async fn a_dml_only_worker_cannot_install_capture_on_a_new_source() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let admin = setup(db.dsn(), &mut raw, &db.pool).await;
+    raw.batch_execute("create table public.v (id int primary key, b int)")
+        .await
+        .expect("a second source");
+    let worker = dml_worker(db.dsn(), &raw).await;
+    let Worker {
+        role,
+        mut client,
+        mut tick,
+    } = worker;
+    admin
+        .apply("TRANSFORM t3 FROM public.v SELECT b AS b")
+        .await
+        .expect("define t3");
+    raw.batch_execute(&format!(
+        "grant select, insert, update, delete on all tables in schema trellis to {role}; \
+         grant select, insert, update, delete on all tables in schema public to {role}"
+    ))
+    .await
+    .expect("grants on t3's tables");
+    assert!(!tick.tick(&mut client).await);
+    let waiting = status_of(&admin, "t3").await;
+    assert_eq!(waiting.status, TransformStatus::WaitingToBackfill);
+    let failure = waiting.capture_failure.expect("t3 reports why it waits");
+    assert_eq!(failure.source_table, "public.v", "{failure:?}");
+    assert!(failure.error.contains("permission denied"), "{failure:?}");
+}
