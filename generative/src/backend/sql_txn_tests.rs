@@ -370,3 +370,31 @@ async fn a_prepared_transaction_leaves_the_rows_the_program_expects() {
         }
     }
 }
+
+/// [`raised_in_trellis`] reads the PL/pgSQL context Postgres gives a
+/// failure raised inside a capture function, which names it
+/// schema-qualified even when the writer's session has the instance schema
+/// on its path. A failure in the application's own function is the
+/// application's.
+#[tokio::test]
+async fn a_failure_inside_a_capture_function_is_told_from_the_applications() {
+    let cluster = testkit::TestCluster::start();
+    let db = cluster.create_empty_database().await;
+    let raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create schema trellis;
+         create function trellis.cap_probe() returns void language plpgsql
+             security definer set search_path = pg_catalog, pg_temp
+             as $$ begin raise exception 'probe' using errcode = '40001'; end $$;
+         create function trellis.app_probe() returns void language plpgsql
+             as $$ begin raise exception 'probe' using errcode = '40001'; end $$;
+         set search_path to trellis, public",
+    )
+    .await
+    .expect("set up");
+    for (call, inside) in [("select cap_probe()", true), ("select app_probe()", false)] {
+        let err = ApplyOpError::from(raw.batch_execute(call).await.expect_err("raises"));
+        assert!(retryable(&err), "{err:?}");
+        assert_eq!(raised_in_trellis(&err), inside, "{call}: {err:?}");
+    }
+}

@@ -1781,9 +1781,13 @@ async fn apply_statement_form(
 /// settles in, not an attempt count.
 const TXN_RETRY_BUDGET: Duration = Duration::from_secs(60);
 
-/// How many times a failure raised inside Trellis's own `cap_*` trigger
-/// functions is retried: a bounded count, so a Trellis-caused loop fails the
-/// run instead of being absorbed by the time budget.
+/// How many times a transaction is retried once a failure is raised inside
+/// Trellis's own `cap_*` trigger functions: a bounded count, so a loop there
+/// fails the run instead of being absorbed by the time budget. It is a lower
+/// bound on Trellis's share: under SSI the transaction that fails is not
+/// always the one whose reads made the conflict, and a failure at `COMMIT`
+/// names no function, so a conflict capture's reads cause can still surface
+/// in the application's statements (#2245).
 const MAX_TRELLIS_TXN_RETRIES: u64 = 50;
 
 /// The longest back-off between two attempts.
