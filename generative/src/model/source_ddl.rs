@@ -273,6 +273,19 @@ impl SourceDdl {
         )
     }
 
+    /// The column whose indexes the change drops for good: one dropped and
+    /// added again under its name, which carries none of them. Every other
+    /// change keeps a column's indexes while it keeps its name, or gives
+    /// them back at the close.
+    pub fn unindexes(&self) -> Option<&str> {
+        match self {
+            SourceDdl::DropAndAddColumn { column } | SourceDdl::GeneratedColumn { column } => {
+                Some(column)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the table leaves its name until the close: the generator
     /// keeps the table's partition maintenance out of the window, since it
     /// names the root, and with no pass inside the run drains the window

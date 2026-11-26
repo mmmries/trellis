@@ -242,6 +242,12 @@ pub async fn run_convergence_with_source_ddl_allowing(
             op_index = event.last_op();
         }
         let gaps = event.map(|e| allowed(e, server)).unwrap_or_default();
+        let unindexed: Vec<(String, String)> = plan
+            .events
+            .iter()
+            .filter(|e| e.op <= op_index)
+            .filter_map(|e| Some((e.table.clone(), e.action.unindexes()?.to_string())))
+            .collect();
         let judged = judge(
             backend,
             &passes,
@@ -249,6 +255,7 @@ pub async fn run_convergence_with_source_ddl_allowing(
             &model,
             &model.defs,
             op_index,
+            &unindexed,
             |def| allowed_for(event, def, &gaps),
         )
         .await?;
