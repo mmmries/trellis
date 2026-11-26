@@ -135,8 +135,9 @@ proptest! {
 
     /// Wall-clock steps (and every other action) anywhere in a generated
     /// program never perturb convergence. Steps accumulate across a thread's
-    /// cases, which is harmless: each case reads time only relative to its
-    /// own database's writes.
+    /// cases (each moves the clock from where the last case left it), which
+    /// is harmless: each case reads time only relative to its own database's
+    /// writes.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_clock_steps_never_perturb_convergence(
@@ -533,6 +534,37 @@ async fn forward_clock_steps_with_work_in_flight_converge() {
         ]),
     )
     .await;
+}
+
+/// A run moves the clock by its plan's steps from wherever an earlier run on
+/// the same long-lived cluster left it, as the clock-step property's cases
+/// share one. A run that set the steps' sum instead turned a case's
+/// `ForwardHours` after an earlier case's `ForwardHours` + `ForwardMinutes`
+/// into a ten-minute step back, which a backfill claim the same op's restart
+/// stranded waited out on top of its TTL, past the quiesce (#2286).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_steps_the_clock_from_where_an_earlier_run_left_it() {
+    let test = "a_run_steps_the_clock_from_where_an_earlier_run_left_it";
+    let Some(lib) = testkit::faketime::require(test) else {
+        return;
+    };
+    let cluster = TestCluster::start_with_fake_clock(&lib);
+    let earlier = ClockStep::ForwardHours.seconds() + ClockStep::ForwardMinutes.seconds();
+    cluster.step_clock(earlier);
+    run(
+        &cluster,
+        &one_to_one_and_aggregate_program(),
+        &clock_plan(&[(0, ClockStep::ForwardHours)]),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    let want = earlier + ClockStep::ForwardHours.seconds();
+    assert_eq!(cluster.clock_offset(), want);
+    let lead = server_clock_lead(&cluster).await;
+    assert!(
+        (lead - want as f64).abs() < 5.0,
+        "the server's clock leads by {lead}s, not {want}s"
+    );
 }
 
 /// The clock steps back five minutes (an NTP correction) after the seeds,

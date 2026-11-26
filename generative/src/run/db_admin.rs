@@ -67,8 +67,21 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
         .await
         .map_err(|e| RunError::Install(format!("{e:?}")))?;
 
-    // Where the server's clock stands: the steps' sum.
-    let mut clock_offset = 0i64;
+    // A long-lived cluster keeps an earlier run's clock offset. Each step
+    // moves the clock by exactly its own seconds from where it stands:
+    // setting the steps' sum would turn a forward step into a step back from
+    // a larger inherited offset (#2286). A replay starts on a fresh cluster
+    // at zero, so the starting offset goes in the log.
+    if plan
+        .events
+        .iter()
+        .any(|e| matches!(e.action, DbAdminAction::StepClock(_)))
+    {
+        eprintln!(
+            "db_admin: the server clock starts {:+}s from real time",
+            cluster.clock_offset()
+        );
+    }
     for (op_index, op) in program.ops.iter().enumerate() {
         let events: Vec<&DbAdminAction> = plan
             .events
@@ -106,8 +119,7 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
                     cluster.burn_xids(XID_PAGE.saturating_sub(*tail));
                 }
                 DbAdminAction::StepClock(step) => {
-                    clock_offset += step.seconds();
-                    cluster.step_clock(clock_offset);
+                    cluster.step_clock(cluster.clock_offset() + step.seconds());
                 }
                 DbAdminAction::StepEngineClock(step) => engine_clock.step(step.seconds()),
                 DbAdminAction::LockTargets => holds.push(
