@@ -395,6 +395,56 @@ async fn look(
     Ok(looks)
 }
 
+/// The statements that create the indexes `err` says a source lacks, when
+/// it is `self_check`'s refusal to walk one (T0134, `SourceIndexMissing`):
+/// the remedy docs/errors.md names, the operator's `create index`.
+fn missing_index_statements(err: &crate::backend::ManualBackendError) -> Option<Vec<String>> {
+    use crate::backend::ManualBackendError::Facade;
+    use trellis::dev::defs::CatalogError::SourceIndexMissing;
+    match err {
+        Facade(trellis::TrellisError::SelfCheck(trellis::SelfCheckError::Catalog(
+            SourceIndexMissing { missing, .. },
+        ))) => Some(missing.iter().map(|m| m.create_index()).collect()),
+        _ => None,
+    }
+}
+
+/// `backend`'s strict `self_check` of `targets`. A shape that drops and
+/// re-adds an indexed column (`DropAndAddColumn`) drops the source index
+/// the walk pages by with it, and `self_check` then refuses (T0134, the
+/// decided behaviour, not a divergence): as an operator does, this creates
+/// the index the refusal names and checks again.
+async fn audit_creating_missing_indexes(
+    backend: &mut ManualBackend,
+    pool: &Pool,
+    targets: &[String],
+) -> Result<Vec<String>, RunError> {
+    // One refusal per index the definitions of `targets` need.
+    for _ in 0..=targets.len() * 4 {
+        match backend.strict_audit(targets).await {
+            Ok(lines) => return Ok(lines),
+            Err(err) => {
+                let Some(statements) = missing_index_statements(&err) else {
+                    return Err(RunError::Snapshot(format!("self_check: {err:?}")));
+                };
+                let client = pool
+                    .get()
+                    .await
+                    .map_err(|e| RunError::Snapshot(format!("create index: {e:?}")))?;
+                for statement in statements {
+                    client
+                        .batch_execute(&statement)
+                        .await
+                        .map_err(|e| RunError::Snapshot(format!("{statement}: {e:?}")))?;
+                }
+            }
+        }
+    }
+    Err(RunError::Snapshot(
+        "self_check kept refusing for a missing source index after it was created".to_string(),
+    ))
+}
+
 /// Judges every one of `defs` at the check after op `op_index`, letting a
 /// definition end silently wrong only as one of `allowed(def)`: the entries
 /// the drawn shape may reproduce in that definition (none for one that
@@ -452,9 +502,9 @@ pub async fn judge(
             .map(|(i, _)| defs[*i].target.clone())
             .collect();
         backend.set_strict_audit(true);
-        let audited = backend.strict_audit(&targets).await;
+        let audited = audit_creating_missing_indexes(backend, pool, &targets).await;
         backend.set_strict_audit(false);
-        let unclean = audited.map_err(|e| RunError::Snapshot(format!("self_check: {e:?}")))?;
+        let unclean = audited?;
         let reported = |i: usize| {
             let prefix = format!("{}:", defs[i].target);
             unclean.iter().any(|line| line.starts_with(&prefix))

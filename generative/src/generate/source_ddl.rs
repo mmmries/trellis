@@ -238,7 +238,8 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
             window
         };
         // A write the key's index refuses would go through while it is
-        // dropped: the window ends before the table's first.
+        // dropped, and an `ON CONFLICT (<key>)` upsert has no arbiter index
+        // to infer (42P10): the window ends before the table's first.
         let window = if matches!(
             action,
             SourceDdl::KeyIndex {
@@ -248,7 +249,10 @@ fn fit(program: &Program, draws: &[Draw], menu: Menu) -> SourceDdlPlan {
         ) {
             program.ops[op + 1..=op + window]
                 .iter()
-                .position(|o| o.table() == table.name && *o.expect() == OpOutcome::Fails)
+                .position(|o| {
+                    o.table() == table.name
+                        && (*o.expect() == OpOutcome::Fails || matches!(o, Op::Upsert { .. }))
+                })
                 .unwrap_or(window)
         } else {
             window

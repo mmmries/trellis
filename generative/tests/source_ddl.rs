@@ -287,6 +287,57 @@ fn drawn_plans_stay_in_bounds_and_cover_every_action() {
     );
 }
 
+/// No database (#2285): a key's index dropped never has an `ON CONFLICT
+/// (<key>)` upsert in its window, which has no arbiter index to infer
+/// (42P10): the window ends before the table's first.
+#[test]
+fn a_dropped_key_index_window_ends_before_an_upsert_on_its_key() {
+    use generative::model::{Op, OpOutcome};
+    let mut program = one_row_grouped_program();
+    program.ops = program
+        .ops
+        .into_iter()
+        .map(|op| match op {
+            Op::Insert { .. } | Op::Update { .. } => Op::Upsert {
+                op: Box::new(op),
+                update: true,
+                expect: OpOutcome::Succeeds,
+            },
+            op => op,
+        })
+        .collect();
+    assert!(
+        program.ops.iter().any(|o| matches!(o, Op::Upsert { .. })),
+        "the program draws no upserts"
+    );
+    let mut runner = TestRunner::deterministic();
+    let strategy = source_ddl_plan_for(&program);
+    let mut drops = 0;
+    for _ in 0..2000 {
+        let plan = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        for event in &plan.events {
+            let SourceDdl::KeyIndex {
+                change: IndexChange::Drop,
+                ..
+            } = &event.action
+            else {
+                continue;
+            };
+            drops += 1;
+            assert!(
+                program.ops[event.op + 1..=event.last_op()]
+                    .iter()
+                    .all(|o| o.table() != event.table || !matches!(o, Op::Upsert { .. })),
+                "an ON CONFLICT upsert inside a key index's drop: {event:?}"
+            );
+        }
+    }
+    assert!(drops > 0, "no plan dropped a key's index");
+}
+
 /// No database: the `JOIN` key spaces' plans fire on joined tables as well
 /// as `FROM` tables, in each key space, from several lanes with ops in
 /// flight, and a 1-1 `JOIN`'s joined key's index is dropped; and a joined
