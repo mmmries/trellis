@@ -165,7 +165,8 @@ impl fmt::Display for ErrorId {
 
 /// A condition that several error enums report, so it has one code: each
 /// variant that means it reports [`SharedCondition::error_id`]. One condition,
-/// one code, whichever layer found it.
+/// one code, whichever layer found it. A condition only status text reports,
+/// with no error enum of its own, has its code here too.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SharedCondition {
     /// A transform name that names no definition.
@@ -180,6 +181,10 @@ pub(crate) enum SharedCondition {
     /// A key column the table's recorded key renders raw can hold `NULL`
     /// now (#2147, #2217).
     RawKeyNowNullable,
+    /// The staging worker's role was refused re-creating a table's capture
+    /// functions that are out of date but capture what their readers need:
+    /// reported in `maintenance_refusals`, and nothing waits on it (#2291).
+    CaptureRefreshRefused,
 }
 
 impl SharedCondition {
@@ -192,6 +197,7 @@ impl SharedCondition {
             SharedCondition::UnsupportedLiteralType => ErrorId(28),
             SharedCondition::NullInNotNullKey => ErrorId(253),
             SharedCondition::RawKeyNowNullable => ErrorId(254),
+            SharedCondition::CaptureRefreshRefused => ErrorId(255),
         }
     }
 }

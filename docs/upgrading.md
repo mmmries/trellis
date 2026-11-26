@@ -45,6 +45,14 @@ starts its pipeline once a role that can has run `migrate`. A process that
 can't migrate logs why, `status()` carries it in
 `migrations_pending.cannot_run`, and the process tries again every minute.
 
+The first capture pass under the new release re-creates any capture function
+the release generates differently, which needs the role that owns the
+sources. If your workers run as a role that doesn't
+([grants](operations.md#grants-for-a-worker-role)), run the staging worker
+once as the source owner after upgrading. Until then every definition, new
+ones included, runs on the older release's functions, and the worker reports
+[T0255](errors.md#t0255-capturerefreshrefused).
+
 A state-changing call an old-release process is in the middle of when the new
 release takes over, or when `migrate` raises the [catalog
 floor](#the-catalog-floor), refuses at its next write with the

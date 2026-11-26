@@ -326,6 +326,16 @@ pub fn plan(installed: &Installed, desired: &CaptureSpec) -> CaptureAction {
     }
 }
 
+/// Whether bringing `installed` to `desired` only refreshes the functions:
+/// they already record `desired`, every column its readers need, and only
+/// their source or settings differ from what this build generates (an older
+/// release's functions, say). A refresh the worker's role is refused leaves
+/// the table captured as it was, so its readers start anyway (#2291); a
+/// first install, or a widen that adds capture, still needs the source owner.
+pub fn is_refresh(installed: &Installed, desired: &CaptureSpec) -> bool {
+    matches!(installed, Installed::Complete { spec, current: false } if spec == desired)
+}
+
 /// Whether `desired` images nothing `installed` doesn't: the same table and
 /// key, keyed the same way (its nullable columns), and a subset of its image
 /// columns.
@@ -1890,6 +1900,31 @@ mod tests {
             current: false,
         };
         assert_eq!(plan(&stale_wide, &desired), CaptureAction::Widen);
+    }
+
+    #[test]
+    fn only_stale_functions_of_the_same_spec_are_a_refresh() {
+        let desired = spec(&["a"]);
+        let stale = |columns: &[&str]| Installed::Complete {
+            spec: spec(columns),
+            current: false,
+        };
+        assert!(is_refresh(&stale(&["a"]), &desired));
+        // Current functions need no refresh at all.
+        assert!(!is_refresh(&complete(desired.clone()), &desired));
+        // A widen that adds a column, or one from a wider stale spec, adds
+        // or changes what is captured: not a refresh.
+        assert!(!is_refresh(&stale(&[]), &desired));
+        assert!(!is_refresh(&stale(&["a", "b"]), &desired));
+        let rekeyed = CaptureSpec::new("public.orders", vec!["a".to_string()], ["a".to_string()])
+            .expect("valid spec");
+        assert!(!is_refresh(&stale(&["a"]), &rekeyed));
+        // Nothing installed, or a partial install, is a first install.
+        assert!(!is_refresh(&Installed::Absent, &desired));
+        let partial = Installed::Partial {
+            faults: vec!["the insert trigger is missing".to_string()],
+        };
+        assert!(!is_refresh(&partial, &desired));
     }
 
     fn blocker(backend_type: &str, query: &str) -> Blocker {

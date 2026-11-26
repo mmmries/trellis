@@ -2645,7 +2645,9 @@ pub struct DefinitionStatus {
     /// The ring and maintenance steps this handle's staging worker is
     /// refused (`42501`), such as retiring a drained segment without
     /// `TRUNCATE`: each names the step, the role, the table and the
-    /// privileges the role lacks. Instance-level, so every definition
+    /// privileges the role lacks, or re-creating a source's out-of-date
+    /// capture functions (T0255, one entry per source, which holds no
+    /// definition back). Instance-level, so every definition
     /// reports the same list. Nothing is paused: no definition's correctness
     /// waits on these steps, but the ring isn't housekept until the
     /// privilege is granted. An entry clears itself once a pass of its step

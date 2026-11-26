@@ -100,6 +100,9 @@
 //!
 //! 1. its source is captured and current after this pass, or is another
 //!    definition's target (the target-mutation seam feeds it, not a trigger);
+//!    a source whose functions capture every column its readers need counts
+//!    as captured even when the worker's role is refused their refresh
+//!    ([`PassOutcome::refused_refreshes`]);
 //! 2. so is a `JOIN`'s joined table;
 //! 3. and the joined table (other than the source itself) has no capture gate
 //!    its install or widen recorded ([`super::gate`]) that a pending change
@@ -145,6 +148,12 @@ pub struct PassOutcome {
     /// reason (no primary key, a missing column, a failed statement), with
     /// the error. The pass goes on with the other tables.
     pub failed: Vec<(String, CaptureError)>,
+    /// Each table whose capture functions are out of date but capture what
+    /// its readers need, and which the worker's role was refused re-creating
+    /// (`42501`), with the message to report (T0255). It counts as captured:
+    /// its readers start, and nothing is paused, on the functions as they
+    /// are (#2291).
+    pub refused_refreshes: Vec<(String, String)>,
     /// Each partitioned source whose tree the pass read in full because a
     /// fingerprint changed, none was stored, the process had not yet checked
     /// it, or it was non-compliant (ADR-0017, [`super::partitions`]).
@@ -312,7 +321,17 @@ pub(crate) async fn reconcile_with_floors(
                 continue;
             }
         };
-        match install::reconcile_for(client, schema, floors, &spec, Some(deadline)).await {
+        let mut reconciled =
+            install::reconcile_for(client, schema, floors, &spec, Some(deadline)).await;
+        if let Err(err) = &reconciled
+            && refresh_refused(&*client, schema, &spec, err).await
+        {
+            outcome
+                .refused_refreshes
+                .push((table.clone(), refresh_refusal(table, err)));
+            reconciled = Ok(Progress::Done(CaptureAction::Unchanged));
+        }
+        match reconciled {
             Ok(Progress::Done(action)) => {
                 if action != CaptureAction::Unchanged {
                     crate::instance_log::info!(table = %table, action = ?action, "capture reconciled");
@@ -486,6 +505,33 @@ pub(crate) async fn reconcile_with_floors(
     let gated = super::gate::held_tables(&*client).await?;
     outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);
     Ok(outcome)
+}
+
+/// Whether `err`, from bringing `spec`'s table to `spec`, is the worker's
+/// role refused (`42501`) a refresh of functions that already capture
+/// `spec` ([`install::is_refresh`]). Any other failure, or one the catalog
+/// can't be read back for, stays a failure.
+async fn refresh_refused(
+    client: &impl GenericClient,
+    schema: &str,
+    spec: &super::sql::CaptureSpec,
+    err: &CaptureError,
+) -> bool {
+    crate::staging::quarantine::is_insufficient_privilege(err)
+        && install::installed(client, schema, spec.table())
+            .await
+            .is_ok_and(|installed| install::is_refresh(&installed, spec))
+}
+
+/// The T0255 message of a refused refresh of `table`'s capture functions.
+fn refresh_refusal(table: &str, err: &CaptureError) -> String {
+    let error = crate::staging::quarantine::pg_message(err).unwrap_or_else(|| err.to_string());
+    format!(
+        "{}: the capture functions of {table} are out of date and the worker's role can't \
+         re-create them ({error}); its definitions run on them as they are. Run the staging \
+         worker once as the role that owns the sources",
+        crate::error_code::SharedCondition::CaptureRefreshRefused.error_id()
+    )
 }
 
 /// The checks that pause `table`'s readers before its capture is

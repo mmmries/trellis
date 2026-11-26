@@ -210,9 +210,10 @@ async fn age_capture_functions(raw: &Client) {
 
 /// #2291: after an upgrade, a DML-only worker can't replace the older
 /// release's capture functions. A definition made after the upgrade, whose
-/// columns those functions already image, still starts its build.
+/// columns those functions already image, still starts its build, and the
+/// refused refresh is reported (T0255), pausing nothing. Once the source
+/// owner runs a pass, the functions are current and the report clears.
 #[tokio::test]
-#[ignore = "#2291: fails until the design decision on who re-creates stale capture functions lands"]
 async fn a_stale_capture_function_the_worker_cannot_replace_does_not_hold_a_new_definition() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -239,7 +240,91 @@ async fn a_stale_capture_function_the_worker_cannot_replace_does_not_hold_a_new_
     assert!(!tick.tick(&mut client).await);
     let started = status_of(&admin, "t2").await;
     assert_eq!(started.status, TransformStatus::Backfilling, "{started:?}");
+    assert!(started.capture_failure.is_none(), "{started:?}");
+    assert!(started.capture_wait.is_none(), "{started:?}");
     assert_eq!(status_of(&admin, "t").await.status, TransformStatus::Live);
+
+    let refused = tick.refused();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    let step = &refused[0];
+    assert_eq!(step.step, "refresh_capture_functions", "{step:?}");
+    assert_eq!(step.role.as_deref(), Some(role.as_str()), "{step:?}");
+    assert_eq!(step.object.as_deref(), Some("public.u"), "{step:?}");
+    assert!(step.error.starts_with("T0255: "), "{step:?}");
+    assert!(step.error.contains("permission denied"), "{step:?}");
+    assert!(
+        step.error.contains("as the role that owns the sources"),
+        "{step:?}"
+    );
+    let stale = trellis::capture::install::installed(&raw, "trellis", "public.u")
+        .await
+        .expect("installed");
+    assert!(
+        matches!(
+            stale,
+            trellis::capture::install::Installed::Complete { current: false, .. }
+        ),
+        "{stale:?}"
+    );
+
+    // The source owner's pass re-creates the functions; the worker's next
+    // pass finds them current and the report clears itself.
+    pipeline::reconcile_pass(&mut raw, &db.pool).await;
+    let current = trellis::capture::install::installed(&raw, "trellis", "public.u")
+        .await
+        .expect("installed");
+    assert!(
+        matches!(
+            current,
+            trellis::capture::install::Installed::Complete { current: true, .. }
+        ),
+        "{current:?}"
+    );
+    assert!(!tick.tick(&mut client).await);
+    assert!(tick.refused().is_empty(), "{:?}", tick.refused());
+}
+
+/// Stale functions that lack a column a new definition reads need a widen
+/// that adds capture, not a refresh: the definition still waits for the
+/// source owner, as on a fresh source, and nothing reports a refresh.
+#[tokio::test]
+async fn a_stale_capture_function_missing_a_new_column_still_holds_its_reader() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let admin = setup(db.dsn(), &mut raw, &db.pool).await;
+    age_capture_functions(&raw).await;
+    raw.batch_execute("alter table public.u add column b int")
+        .await
+        .expect("a new column");
+    let worker = dml_worker(db.dsn(), &raw).await;
+    let Worker {
+        role,
+        mut client,
+        mut tick,
+    } = worker;
+    admin
+        .apply("TRANSFORM t2 FROM public.u SELECT b AS b")
+        .await
+        .expect("define t2");
+    raw.batch_execute(&format!(
+        "grant select, insert, update, delete on all tables in schema trellis to {role}; \
+         grant select, insert, update, delete on all tables in schema public to {role}"
+    ))
+    .await
+    .expect("grants on t2's tables");
+    assert!(!tick.tick(&mut client).await);
+    let waiting = status_of(&admin, "t2").await;
+    assert_eq!(waiting.status, TransformStatus::WaitingToBackfill);
+    let failure = waiting.capture_failure.expect("t2 reports why it waits");
+    assert!(failure.error.contains("permission denied"), "{failure:?}");
+    assert!(
+        tick.refused()
+            .iter()
+            .all(|step| step.step != "refresh_capture_functions"),
+        "{:?}",
+        tick.refused()
+    );
 }
 
 /// A fresh deployment: a definition on a table nothing captures yet waits
