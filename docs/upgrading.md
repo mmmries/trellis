@@ -50,8 +50,8 @@ the release generates differently, which needs the role that owns the
 sources. If your workers run as a role that doesn't
 ([grants](operations.md#grants-for-a-worker-role)), run the staging worker
 once as the source owner after upgrading. Until then every definition, new
-ones included, runs on the older release's functions, and the worker reports
-[T0255](errors.md#t0255-capturerefreshrefused).
+ones included, runs on the older release's functions, and the staging
+worker's log shows [T0255](errors.md#t0255-capturerefreshrefused).
 
 A state-changing call an old-release process is in the middle of when the new
 release takes over, or when `migrate` raises the [catalog

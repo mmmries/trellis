@@ -284,6 +284,67 @@ async fn a_stale_capture_function_the_worker_cannot_replace_does_not_hold_a_new_
     assert!(tick.refused().is_empty(), "{:?}", tick.refused());
 }
 
+/// An `ALTER TRANSFORM` field reading a column another definition already
+/// reads, on a source whose functions an older release created: the field
+/// is released and built on the functions as they are, as a new definition
+/// starts on them, instead of waiting for a refresh the worker is refused.
+#[tokio::test]
+async fn a_stale_capture_function_the_worker_cannot_replace_does_not_hold_an_altered_field() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.u (id int primary key, a int, b int); \
+         insert into public.u values (1, 1, 2)",
+    )
+    .await
+    .expect("seed");
+    let admin = definer(db.dsn()).await;
+    for text in [
+        "TRANSFORM t FROM public.u SELECT a AS a",
+        "TRANSFORM tb FROM public.u SELECT b AS b",
+    ] {
+        admin.apply(text).await.expect("define");
+    }
+    bring_live(&mut raw, &db.pool, &["t", "tb"]).await;
+    age_capture_functions(&raw).await;
+    let Worker {
+        role,
+        mut client,
+        mut tick,
+    } = dml_worker(db.dsn(), &raw).await;
+    admin
+        .apply("ALTER TRANSFORM t ADD b AS b2")
+        .await
+        .expect("alter t");
+    raw.batch_execute(&format!(
+        "grant select, insert, update, delete on all tables in schema trellis to {role}; \
+         grant select, insert, update, delete on all tables in schema public to {role}"
+    ))
+    .await
+    .expect("grants on t's tables");
+    assert!(!tick.tick(&mut client).await);
+    assert!(
+        tick.refused()
+            .iter()
+            .any(|step| step.step == "refresh_capture_functions"),
+        "{:?}",
+        tick.refused()
+    );
+    pipeline::start_and_settle_builds(&db.pool).await;
+    let awaiting = pipeline::rows(
+        &raw,
+        "select column_name from trellis.column_status where awaiting_capture",
+    )
+    .await;
+    assert!(awaiting.is_empty(), "{awaiting:?}");
+    assert_eq!(status_of(&admin, "t").await.status, TransformStatus::Live);
+    assert_eq!(
+        pipeline::rows(&raw, "select b2 from public.t").await,
+        vec!["(2)".to_string()]
+    );
+}
+
 /// Stale functions that lack a column a new definition reads need a widen
 /// that adds capture, not a refresh: the definition still waits for the
 /// source owner, as on a fresh source, and nothing reports a refresh.
