@@ -396,35 +396,59 @@ async fn look(
 }
 
 /// The statements that create the indexes `err` says a source lacks, when
-/// it is `self_check`'s refusal to walk one (T0134, `SourceIndexMissing`):
-/// the remedy docs/errors.md names, the operator's `create index`.
-fn missing_index_statements(err: &crate::backend::ManualBackendError) -> Option<Vec<String>> {
+/// it is `self_check`'s refusal to walk one (T0134, `SourceIndexMissing`)
+/// and the run's own changes dropped every one of them: each has a column
+/// `unindexed` names on its table (`(table, column)`,
+/// [`SourceDdl::unindexes`]). The remedy docs/errors.md names, the operator's `create
+/// index`. Any other missing index is one define should have built and
+/// nothing the run did dropped, so the refusal stays fatal.
+///
+/// [`SourceDdl::unindexes`]: crate::model::SourceDdl::unindexes
+fn missing_index_statements(
+    err: &crate::backend::ManualBackendError,
+    unindexed: &[(String, String)],
+) -> Option<Vec<String>> {
     use crate::backend::ManualBackendError::Facade;
     use trellis::dev::defs::CatalogError::SourceIndexMissing;
-    match err {
-        Facade(trellis::TrellisError::SelfCheck(trellis::SelfCheckError::Catalog(
-            SourceIndexMissing { missing, .. },
-        ))) => Some(missing.iter().map(|m| m.create_index()).collect()),
-        _ => None,
-    }
+    let Facade(trellis::TrellisError::SelfCheck(trellis::SelfCheckError::Catalog(
+        SourceIndexMissing { missing, .. },
+    ))) = err
+    else {
+        return None;
+    };
+    missing
+        .iter()
+        .all(|index| dropped_by_the_run(&index.table, &index.columns, unindexed))
+        .then(|| missing.iter().map(|m| m.create_index()).collect())
 }
 
-/// `backend`'s strict `self_check` of `targets`. A shape that drops and
-/// re-adds an indexed column (`DropAndAddColumn`) drops the source index
-/// the walk pages by with it, and `self_check` then refuses (T0134, the
-/// decided behaviour, not a divergence): as an operator does, this creates
-/// the index the refusal names and checks again.
+/// Whether the index on `columns` of `table` (qualified) is one the run's
+/// changes dropped: `unindexed` names one of the columns on that table.
+fn dropped_by_the_run(table: &str, columns: &[String], unindexed: &[(String, String)]) -> bool {
+    let table = table.split_once('.').map_or(table, |(_, t)| t);
+    unindexed
+        .iter()
+        .any(|(t, column)| t == table && columns.contains(column))
+}
+
+/// `backend`'s strict `self_check` of `targets`. A change that drops and
+/// re-adds an indexed column drops the source index the walk pages by with
+/// it, and `self_check` then refuses (T0134, the decided behaviour, not a
+/// divergence): as an operator does, this creates the index the refusal
+/// names and checks again, when `unindexed` says the run dropped it
+/// ([`missing_index_statements`]).
 async fn audit_creating_missing_indexes(
     backend: &mut ManualBackend,
     pool: &Pool,
     targets: &[String],
+    unindexed: &[(String, String)],
 ) -> Result<Vec<String>, RunError> {
     // One refusal per index the definitions of `targets` need.
     for _ in 0..=targets.len() * 4 {
         match backend.strict_audit(targets).await {
             Ok(lines) => return Ok(lines),
             Err(err) => {
-                let Some(statements) = missing_index_statements(&err) else {
+                let Some(statements) = missing_index_statements(&err, unindexed) else {
                     return Err(RunError::Snapshot(format!("self_check: {err:?}")));
                 };
                 let client = pool
@@ -451,7 +475,11 @@ async fn audit_creating_missing_indexes(
 /// doesn't read what the shape changed). Takes each step
 /// the verdict needs (a `RESUME`, a `self_check` and a repair) through the
 /// library calls an operator would make, and leaves every definition exact
-/// or refused by its `RESUME`.
+/// or refused by its `RESUME`. `unindexed` is each `(table, column)` whose
+/// indexes the run's changes so far have dropped
+/// ([`SourceDdl::unindexes`](crate::model::SourceDdl::unindexes)): a source
+/// index `self_check` finds missing is created only when it is one of them.
+#[allow(clippy::too_many_arguments)]
 pub async fn judge(
     backend: &mut ManualBackend,
     passes: &PassStepper,
@@ -459,6 +487,7 @@ pub async fn judge(
     program: &Program,
     defs: &[TransformDef],
     op_index: usize,
+    unindexed: &[(String, String)],
     allowed: impl Fn(&TransformDef) -> Vec<Gap>,
 ) -> Result<Vec<Judged>, RunError> {
     let fail = |target: &str, problem: String, detail: String| RunError::NeverSilentlyWrong {
@@ -502,7 +531,7 @@ pub async fn judge(
             .map(|(i, _)| defs[*i].target.clone())
             .collect();
         backend.set_strict_audit(true);
-        let audited = audit_creating_missing_indexes(backend, pool, &targets).await;
+        let audited = audit_creating_missing_indexes(backend, pool, &targets, unindexed).await;
         backend.set_strict_audit(false);
         let unclean = audited?;
         let reported = |i: usize| {
@@ -734,5 +763,36 @@ mod tests {
         );
         assert_eq!(error_code("AT0247 T12345 T12"), None);
         assert_eq!(error_code("x T9999"), Some("T9999".to_string()));
+    }
+
+    /// #2284: the judge creates a missing source index only when the run's
+    /// own changes dropped a column of it on its table.
+    #[test]
+    fn only_an_index_the_run_dropped_is_created() {
+        let columns = |names: &[&str]| names.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        let unindexed = [("t0".to_string(), "c6".to_string())];
+        assert!(dropped_by_the_run(
+            "public.t0",
+            &columns(&["c6"]),
+            &unindexed
+        ));
+        assert!(dropped_by_the_run(
+            "public.t0",
+            &columns(&["c5", "c6"]),
+            &unindexed
+        ));
+        // Nothing dropped: define's own index went missing.
+        assert!(!dropped_by_the_run("public.t0", &columns(&["c6"]), &[]));
+        // Another column, or the same name on another table.
+        assert!(!dropped_by_the_run(
+            "public.t0",
+            &columns(&["c5"]),
+            &unindexed
+        ));
+        assert!(!dropped_by_the_run(
+            "public.t1",
+            &columns(&["c6"]),
+            &unindexed
+        ));
     }
 }

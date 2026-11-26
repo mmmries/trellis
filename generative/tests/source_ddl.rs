@@ -1255,6 +1255,125 @@ async fn a_read_column_dropped_and_added_again_is_reread() {
     }
 }
 
+/// #2284: dropping and re-adding the `GROUP BY` column drops the source
+/// index `self_check` pages by, so the swap's strict check refuses (T0134);
+/// the judge creates the index the refusal names, as an operator does, and
+/// checks again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_by_column_dropped_and_added_again_before_a_swap_is_self_checked() {
+    let program = one_row_grouped_program();
+    assert!(program.ops.len() > 1, "two events need two ops");
+    let (c1, c2, grain) = (
+        c1(&program),
+        c2(&program),
+        program.tables[0].columns[6].name.clone(),
+    );
+    let drop_and_add = event(
+        &program,
+        0,
+        SourceDdl::DropAndAddColumn { column: grain },
+        0,
+        false,
+    );
+    let swap = event(
+        &program,
+        1,
+        SourceDdl::SwapColumnNames {
+            column: c1,
+            other: c2,
+        },
+        0,
+        false,
+    );
+    let plan = SourceDdlPlan {
+        lanes: 1,
+        events: vec![drop_and_add, swap.clone()],
+    };
+    let cluster = TestCluster::start();
+    let run = run(&cluster, &program, &plan)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let verdicts = verdicts_after(&run, &swap);
+    assert!(
+        matches!(
+            verdicts[..],
+            [Verdict::Exact | Verdict::ListedGap(Gap::ColumnNameSwap)]
+        ),
+        "{verdicts:?}"
+    );
+}
+
+/// #2284's limit: a source index missing that none of the run's changes
+/// dropped (here, by hand) is one define should have built, so `self_check`'s
+/// refusal (T0134) fails the judgement; the same refusal with the index's
+/// column among the run's dropped ones is answered by creating it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_index_no_change_dropped_fails_the_judgement() {
+    use generative::backend::Backend;
+    use generative::run::judge::{PassStepper, judge};
+    let program = one_row_grouped_program();
+    let (table, grain) = (
+        program.tables[0].name.clone(),
+        program.tables[0].columns[6].name.clone(),
+    );
+    let cluster = TestCluster::start();
+    let db = CaseDatabase::provision(&cluster).await;
+    let mut backend = ManualBackend::connect_as_with_options(db.roles(), 1, None)
+        .await
+        .expect("connect manual backend");
+    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+    backend.install(&program).await.expect("install");
+    let passes = PassStepper::connect(&backend).await.expect("passes");
+    passes.step().await.expect("first pass");
+    let client = pool.get().await.expect("client");
+    let index: String = client
+        .query_one(
+            "select i.indexrelid::regclass::text from pg_index i \
+             join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0] \
+             where i.indrelid = $1::text::regclass and not i.indisunique and a.attname = $2",
+            &[&format!("public.{table}"), &grain],
+        )
+        .await
+        .expect("define's GROUP BY index")
+        .get(0);
+    client
+        .batch_execute(&format!("drop index {index}"))
+        .await
+        .expect("drop the index");
+    let swap = |_: &trellis::dev::defs::ast::TransformDef| vec![Gap::ColumnNameSwap];
+    let refused = judge(
+        &mut backend,
+        &passes,
+        &pool,
+        &program,
+        &program.defs,
+        0,
+        &[],
+        swap,
+    )
+    .await;
+    assert!(
+        matches!(&refused, Err(RunError::Snapshot(e)) if e.contains("SourceIndexMissing")),
+        "{refused:?}"
+    );
+    let judged = judge(
+        &mut backend,
+        &passes,
+        &pool,
+        &program,
+        &program.defs,
+        0,
+        &[(table, grain)],
+        swap,
+    )
+    .await
+    .expect("the index is created and checked");
+    assert!(
+        judged.iter().all(|j| j.verdict == Verdict::Exact),
+        "{judged:?}"
+    );
+}
+
 /// An unread column added with a volatile default rewrites the table and
 /// changes nothing a definition reads.
 #[tokio::test(flavor = "multi_thread")]
