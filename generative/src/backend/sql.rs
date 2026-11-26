@@ -1774,9 +1774,55 @@ async fn apply_statement_form(
     Ok(raw.execute(&rendered.sql, &rendered.params()).await?)
 }
 
-/// How many times [`apply_txn`] runs a transaction again after a
-/// serialization failure or deadlock before it gives up.
-const MAX_TXN_RETRIES: u64 = 50;
+/// How long [`apply_txn`] keeps retrying a transaction on a serialization
+/// failure or deadlock before it gives up. A well-behaved application retries
+/// those until it succeeds (under SERIALIZABLE they are the normal outcome of
+/// contention, #2283), so the budget is time, well above the 45 s a case
+/// settles in, not an attempt count.
+const TXN_RETRY_BUDGET: Duration = Duration::from_secs(60);
+
+/// How many times a transaction is retried once a failure is raised inside
+/// Trellis's own `cap_*` trigger functions: a bounded count, so a loop there
+/// fails the run instead of being absorbed by the time budget. It is a lower
+/// bound on Trellis's share: under SSI the transaction that fails is not
+/// always the one whose reads made the conflict, and a failure at `COMMIT`
+/// names no function, so a conflict capture's reads cause can still surface
+/// in the application's statements (#2245).
+const MAX_TRELLIS_TXN_RETRIES: u64 = 50;
+
+/// The longest back-off between two attempts.
+const MAX_TXN_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Whether the failure came from inside a Trellis `cap_*` function (the
+/// error's PL/pgSQL context names it), not from the application's own
+/// statements or triggers.
+fn raised_in_trellis(err: &ApplyOpError) -> bool {
+    matches!(err, ApplyOpError::Db(e)
+        if e.as_db_error().and_then(|d| d.where_()).is_some_and(|w| w.contains("trellis.cap_")))
+}
+
+/// What to do after the `retries`-th serialization failure, `elapsed` into
+/// the transaction: the pause before the next attempt (capped exponential;
+/// `jitter` in `0..1000` places it between half and all of the cap), or
+/// `None` to give up.
+fn retry_pause(retries: u64, elapsed: Duration, in_trellis: bool, jitter: u64) -> Option<Duration> {
+    if in_trellis {
+        if retries > MAX_TRELLIS_TXN_RETRIES {
+            return None;
+        }
+    } else if elapsed >= TXN_RETRY_BUDGET {
+        return None;
+    }
+    let ceiling = Duration::from_millis(1u64 << retries.min(7)).min(MAX_TXN_BACKOFF);
+    Some(ceiling / 2 + ceiling / 2 * (jitter.min(999) as u32) / 1000)
+}
+
+/// A jitter in `0..1000` from the clock: the harness needs no better.
+fn jitter() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()) / 7 % 1000)
+}
 
 /// Whether `err` is a serialization failure or a deadlock: the errors an
 /// application retries its transaction on.
@@ -1827,6 +1873,7 @@ pub(super) async fn apply_txn(
         "apply_txn: a TRUNCATE or partition maintenance never runs in a wrap — a generator bug"
     );
     let mut retries = 0;
+    let started = Instant::now();
     loop {
         let attempt = txn_attempt(raw, tables, wrap, ops).await;
         match attempt {
@@ -1856,10 +1903,17 @@ pub(super) async fn apply_txn(
             Attempt::Retry(err) => {
                 raw.batch_execute("rollback").await?;
                 retries += 1;
-                if retries > MAX_TXN_RETRIES {
+                let in_trellis = raised_in_trellis(&err);
+                let Some(pause) = retry_pause(retries, started.elapsed(), in_trellis, jitter())
+                else {
+                    eprintln!(
+                        "generative: transaction gave up after {retries} retries in {:?} \
+                         (raised in trellis: {in_trellis}): {err:?}",
+                        started.elapsed(),
+                    );
                     return Err(err);
-                }
-                tokio::time::sleep(Duration::from_millis(retries.min(20))).await;
+                };
+                tokio::time::sleep(pause).await;
             }
             Attempt::Fatal(err) => {
                 // The session may already be out of the transaction.
@@ -2145,6 +2199,31 @@ async fn run_ops(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retry_budget_is_time_for_the_app_and_a_count_for_trellis() {
+        use super::{MAX_TRELLIS_TXN_RETRIES, TXN_RETRY_BUDGET, retry_pause};
+        let early = Duration::from_millis(5);
+        // The application's failures retry past the old 50-attempt cap...
+        let pause = retry_pause(500, early, false, 999).expect("retries");
+        assert!(pause <= Duration::from_millis(100), "{pause:?}");
+        assert!(pause >= Duration::from_millis(50), "{pause:?}");
+        // ...until the budget is spent.
+        assert_eq!(retry_pause(3, TXN_RETRY_BUDGET, false, 0), None);
+        // A failure inside a cap_* function keeps the attempt cap, whatever
+        // the clock says.
+        assert!(retry_pause(MAX_TRELLIS_TXN_RETRIES, early, true, 0).is_some());
+        assert_eq!(
+            retry_pause(MAX_TRELLIS_TXN_RETRIES + 1, early, true, 0),
+            None
+        );
+        // Back-off grows then caps, jitter stays within half to all of it.
+        assert_eq!(
+            retry_pause(1, early, false, 0),
+            Some(Duration::from_millis(1))
+        );
+        assert!(retry_pause(2, early, false, 500).unwrap() >= Duration::from_millis(2));
+    }
+
     use super::super::ring_wait::{MAX_DRAIN_ATTEMPTS, await_ring_with};
     use super::*;
     use trellis::dev::defs::parse;

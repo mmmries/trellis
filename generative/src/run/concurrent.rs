@@ -131,6 +131,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
     let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
     let txn_at = txn_starts(plan);
     let txn_retries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let max_txn_retries = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut in_doubt_actions = 0u64;
 
     let mut installed: Vec<TransformDef> = program
@@ -220,6 +221,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
             let progress = Arc::clone(&progress);
             let actions_fired = Arc::clone(&actions_fired);
             let txn_retries = Arc::clone(&txn_retries);
+            let max_txn_retries = Arc::clone(&max_txn_retries);
             tasks.spawn(async move {
                 let mut result = Ok(());
                 let mut done = 0;
@@ -232,6 +234,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                             let checked = apply_wrapped(&mut applier, wrap, span).await;
                             if let Ok((retries, _)) = &checked {
                                 txn_retries.fetch_add(*retries, Ordering::Relaxed);
+                                max_txn_retries.fetch_max(*retries, Ordering::Relaxed);
                             }
                             (
                                 span.len(),
@@ -457,6 +460,15 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         .drain_audit()
         .await
         .map_err(|e| RunError::Snapshot(format!("drain audit: {e:?}")))?;
+    // Starvation shows up as a long tail, not a total: say when one
+    // transaction needed many attempts (#2283).
+    let max_retries = max_txn_retries.load(Ordering::Relaxed);
+    if max_retries >= 20 {
+        eprintln!(
+            "generative: a transaction needed {max_retries} retries (run total {})",
+            txn_retries.load(Ordering::Relaxed)
+        );
+    }
     Ok(ConcurrentRun {
         outcome: Outcome::Ran,
         drain,
