@@ -385,6 +385,16 @@ impl TestCluster {
             .set_offset(seconds);
     }
 
+    /// How far the server's wall clock stands ahead of real time (behind,
+    /// when negative): the last [`TestCluster::step_clock`], or zero. Panics
+    /// on a cluster without a fake clock.
+    pub fn clock_offset(&self) -> i64 {
+        self.clock
+            .as_ref()
+            .expect("clock_offset needs a cluster started with start_with_fake_clock")
+            .offset()
+    }
+
     /// [`TestCluster::start`], with each `key=value` of `settings` passed to
     /// `postgres` as `-c key=value` (and again by [`TestCluster::restart`]):
     /// for a test that needs a postmaster-level setting such as

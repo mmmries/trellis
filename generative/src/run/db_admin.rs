@@ -67,8 +67,21 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
         .await
         .map_err(|e| RunError::Install(format!("{e:?}")))?;
 
-    // Where the server's clock stands: the steps' sum.
-    let mut clock_offset = 0i64;
+    // Where the server's clock stands: where this run found it plus the
+    // steps' sum. A long-lived cluster keeps an earlier run's offset, and
+    // each step must move the clock by exactly its own seconds from there:
+    // setting the sum alone would turn a forward step into a step back from
+    // a larger inherited offset, which a claim a restart stranded then waits
+    // out on top of its TTL (#2286).
+    let mut clock_offset = if plan
+        .events
+        .iter()
+        .any(|e| matches!(e.action, DbAdminAction::StepClock(_)))
+    {
+        cluster.clock_offset()
+    } else {
+        0
+    };
     for (op_index, op) in program.ops.iter().enumerate() {
         let events: Vec<&DbAdminAction> = plan
             .events

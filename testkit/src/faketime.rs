@@ -132,6 +132,16 @@ impl FakeClock {
         fs::rename(&partial, &self.file).expect("swap in the clock offset");
     }
 
+    /// How far ahead of real time the clock stands (behind, when negative):
+    /// the last [`FakeClock::set_offset`].
+    pub fn offset(&self) -> i64 {
+        let text = fs::read_to_string(&self.file).expect("read the clock offset");
+        text.trim()
+            .strip_suffix('s')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("a malformed clock offset: {text:?}"))
+    }
+
     /// Makes `command` run on this clock.
     pub(crate) fn apply(&self, command: &mut Command) {
         let preload = match std::env::var("LD_PRELOAD") {
@@ -161,6 +171,19 @@ mod tests {
             },
             &|path| files.iter().any(|f| Path::new(f) == path),
         )
+    }
+
+    #[test]
+    fn the_offset_reads_back_what_was_set() {
+        let dir = std::env::temp_dir().join(format!("faketime-offset-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create the dir");
+        let clock = FakeClock::new(PathBuf::from("/unused.so"), &dir);
+        assert_eq!(clock.offset(), 0);
+        clock.set_offset(11_400);
+        assert_eq!(clock.offset(), 11_400);
+        clock.set_offset(-300);
+        assert_eq!(clock.offset(), -300);
+        fs::remove_dir_all(&dir).expect("remove the dir");
     }
 
     #[test]

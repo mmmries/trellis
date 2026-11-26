@@ -349,6 +349,11 @@ pub trait ClusterControl {
     /// when negative), replacing any earlier step. The server must have been
     /// started with a fake clock.
     fn step_clock(&self, seconds: i64);
+
+    /// Where the last [`ClusterControl::step_clock`] put the server's wall
+    /// clock, or zero. A long-lived cluster keeps it from one run to the
+    /// next. The server must have been started with a fake clock.
+    fn clock_offset(&self) -> i64;
 }
 
 impl ClusterControl for testkit::TestCluster {
@@ -369,6 +374,10 @@ impl ClusterControl for testkit::TestCluster {
 
     fn step_clock(&self, seconds: i64) {
         testkit::TestCluster::step_clock(self, seconds);
+    }
+
+    fn clock_offset(&self) -> i64 {
+        testkit::TestCluster::clock_offset(self)
     }
 }
 
