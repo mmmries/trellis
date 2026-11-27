@@ -566,7 +566,8 @@ const MIGRATE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// `migrate`'s refresh of capture (ADR-0023): re-creates the capture
 /// functions of every table `tables` lists (those some definition reads)
 /// that are out of date but image what their readers need
-/// ([`install::is_refresh`]), with `install::refresh`. Each table it leaves
+/// ([`install::is_refresh`]), with `install::refresh`, which keeps the
+/// columns they image (the leader narrows them). Each table it leaves
 /// out of date is returned with the message to show the operator: one its
 /// role can't refresh (T0255), one whose lock wasn't free within
 /// [`MIGRATE_REFRESH_BUDGET`], or one whose refresh failed. It installs,
@@ -605,7 +606,10 @@ pub(crate) async fn refresh_stale(
         if !install::is_refresh(&installed, &spec) {
             continue;
         }
-        let message = match install::refresh(client, schema, floors, &spec, deadline).await {
+        let install::Installed::Complete { spec: recorded, .. } = &installed else {
+            continue;
+        };
+        let message = match install::refresh(client, schema, recorded, deadline).await {
             Ok(install::Refreshed::Done) => {
                 crate::instance_log::info!(table = %table, "capture functions refreshed");
                 continue;

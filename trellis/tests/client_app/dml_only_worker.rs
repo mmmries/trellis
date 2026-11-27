@@ -597,8 +597,10 @@ fn imaged(installed: &trellis::capture::install::Installed) -> Vec<String> {
     }
 }
 
+/// `migrate` refreshes them keeping the columns they image, so no reader
+/// that started meanwhile loses one; the staging leader narrows them later.
 #[tokio::test]
-async fn migrate_refreshes_out_of_date_capture_functions_to_a_narrower_spec() {
+async fn migrate_refreshes_out_of_date_capture_functions_that_image_more_than_needed() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -610,8 +612,8 @@ async fn migrate_refreshes_out_of_date_capture_functions_to_a_narrower_spec() {
     assert!(migrated.stale_capture.is_empty(), "{migrated:?}");
     let after = installed(&raw, "public.u").await;
     assert!(is_current(&after), "{after:?}");
-    assert!(!imaged(&after).contains(&"b".to_string()), "{after:?}");
-    assert!(imaged(&after).contains(&"a".to_string()), "{after:?}");
+    assert!(row_security_off(&raw, "u").await > 0);
+    assert_eq!(imaged(&after), imaged(&before), "{after:?}");
 }
 
 #[tokio::test]

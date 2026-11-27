@@ -179,14 +179,16 @@
 //! nothing. It takes the lock a widen takes, so it never interleaves with
 //! the staging leader's install, widen or uninstall of the table, and under
 //! the lock it reads what is installed again: a table the leader changed
-//! meanwhile is left as it is. Only out-of-date functions are refreshed,
-//! and the leader narrows only current ones, so neither overwrites the
-//! other's narrow. A refresh to a narrower spec reads the readers again
-//! under the lock, so no column a reader started on since is dropped.
+//! meanwhile is left as it is. It re-creates the functions with the spec
+//! they record, even when the readers need fewer columns now: it changes no
+//! column set, so no reader that started while it ran (one a DML-only
+//! leader started on the old functions, say) loses a column. The leader
+//! narrows them afterwards; it narrows only current functions, and
+//! `migrate` refreshes only out-of-date ones, so neither undoes the other.
 //!
 //! A table it can't lock within its budget, or whose functions its role
-//! can't re-create ([`missing_refresh_privilege`], read before the lock), is left for
-//! the leader or another `migrate`, and reported.
+//! can't re-create ([`missing_refresh_privilege`], read before the lock),
+//! is left for the leader or another `migrate`, and reported.
 //!
 //! # Partitioned tables (ADR-0017)
 //!
@@ -391,8 +393,8 @@ pub(crate) async fn missing_refresh_privilege(
 pub(crate) enum Refreshed {
     /// The functions are current now.
     Done,
-    /// Under the lock, the table was no longer a refresh ([`is_refresh`]):
-    /// the staging leader changed it, or its readers need more. Nothing
+    /// Under the lock, the functions were no longer out of date with the
+    /// spec read before it: the staging leader changed them. Nothing
     /// changed.
     NotARefresh,
     /// The role can't re-create the functions: the reason, as Postgres
@@ -402,19 +404,18 @@ pub(crate) enum Refreshed {
     Waiting,
 }
 
-/// `migrate`'s refresh of `desired.table()`'s out-of-date capture functions
-/// to `desired` (see "Refreshing from `migrate`"). `desired` is the spec
-/// before the lock; a narrower one is read again under it from the catalog
-/// with `floors`. `deadline` bounds the retries of a locked table, as
+/// `migrate`'s refresh of `installed`'s capture functions (see "Refreshing
+/// from `migrate`"): `installed` is the spec they record, read before the
+/// lock, and they are re-created with it, imaging the same columns, so no
+/// reader loses one. `deadline` bounds the retries of a locked table, as
 /// [`DdlRetry::new`]'s does.
 pub(crate) async fn refresh(
     client: &mut Client,
     schema: &str,
-    floors: &Floors,
-    desired: &CaptureSpec,
+    installed: &CaptureSpec,
     deadline: Instant,
 ) -> Result<Refreshed, CaptureError> {
-    if let Some(reason) = missing_refresh_privilege(&*client, schema, desired.table()).await? {
+    if let Some(reason) = missing_refresh_privilege(&*client, schema, installed.table()).await? {
         return Ok(Refreshed::Refused(reason));
     }
     let owner = foreign_ring_owner(&*client, schema).await?;
@@ -427,8 +428,7 @@ pub(crate) async fn refresh(
         let attempt = refresh_attempt(
             client,
             schema,
-            floors,
-            desired,
+            installed,
             owner.as_deref(),
             retry.lock_timeout(),
         );
@@ -452,29 +452,19 @@ pub(crate) async fn refresh(
 async fn refresh_attempt(
     client: &mut Client,
     schema: &str,
-    floors: &Floors,
-    desired: &CaptureSpec,
+    spec: &CaptureSpec,
     owner: Option<&str>,
     lock_timeout: Duration,
 ) -> Result<Refreshed, CaptureError> {
-    let table = desired.table();
     let txn = client.transaction().await?;
     locks::set_local_lock_timeout(&txn, lock_timeout).await?;
-    txn.batch_execute(&Op::Widen(desired).lock_statement()?)
+    txn.batch_execute(&Op::Widen(spec).lock_statement()?)
         .await?;
-    let now = installed(&txn, schema, table).await?;
-    let spec = match &now {
-        Installed::Complete {
-            spec,
-            current: false,
-        } if spec == desired => desired.clone(),
-        Installed::Complete { current: false, .. } => {
-            let catalog = super::columns::load_catalog_for(&txn, floors).await?;
-            super::columns::capture_spec(&txn, &catalog, table).await?
-        }
-        _ => return Ok(Refreshed::NotARefresh),
+    let stale = Installed::Complete {
+        spec: spec.clone(),
+        current: false,
     };
-    if !is_refresh(&now, &spec) {
+    if installed(&txn, schema, spec.table()).await? != stale {
         return Ok(Refreshed::NotARefresh);
     }
     // After the lock, as a widen's (see "Widening and the capture gate").
@@ -482,8 +472,8 @@ async fn refresh_attempt(
         .query_one("select pg_catalog.pg_current_wal_insert_lsn()", &[])
         .await?
         .get(0);
-    replace_functions(&txn, schema, &spec, owner).await?;
-    super::gate::record(&txn, table, gate).await?;
+    replace_functions(&txn, schema, spec, owner).await?;
+    super::gate::record(&txn, spec.table(), gate).await?;
     txn.commit().await?;
     Ok(Refreshed::Done)
 }
@@ -2173,5 +2163,103 @@ mod tests {
                 .ends_with("; no conflicting lock is held now"),
             "{wait}"
         );
+    }
+
+    /// `migrate`'s refresh re-creates out-of-date functions with the spec
+    /// they record, and only when, under the lock, they still record the
+    /// spec read before it and are still out of date: one the staging
+    /// leader changed meanwhile (a different spec, or current again) is
+    /// [`Refreshed::NotARefresh`], with nothing changed.
+    #[tokio::test]
+    async fn a_refresh_leaves_functions_changed_since_its_read() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        crate::migrate::migrate(&config).await.expect("migrate");
+        let mut client = crate::pool::Pool::new(&config)
+            .expect("pool")
+            .connect_unpooled()
+            .await
+            .expect("connect");
+        client
+            .batch_execute("create table public.orders (id int primary key, a int, b int)")
+            .await
+            .expect("source");
+        let schema = config.schema();
+        let wide = spec(&["a", "b"]);
+        assert_eq!(
+            install(&mut client, schema, &wide, None)
+                .await
+                .expect("install"),
+            Progress::Done(true)
+        );
+        async fn versions(client: &Client, schema: &str) -> Vec<String> {
+            client
+                .query(
+                    "select p.oid::text || ':' || p.xmin::text from pg_catalog.pg_proc p \
+                     where p.pronamespace = $1::text::regnamespace \
+                       and p.proname like 'cap\\_%\\_orders\\_%' order by p.proname",
+                    &[&schema],
+                )
+                .await
+                .expect("versions")
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect()
+        }
+        let age = format!(
+            "do $$ declare f regprocedure; begin \
+               for f in select p.oid::regprocedure from pg_catalog.pg_proc p \
+                 where p.pronamespace = '{schema}'::regnamespace \
+                   and p.proname like 'cap\\_%\\_orders\\_%' \
+               loop execute format('alter function %s reset row_security', f); end loop; end $$"
+        );
+        client.batch_execute(&age).await.expect("age");
+        let stale = Installed::Complete {
+            spec: wide.clone(),
+            current: false,
+        };
+        assert_eq!(
+            installed(&client, schema, "public.orders")
+                .await
+                .expect("read"),
+            stale
+        );
+        let aged = versions(&client, schema).await;
+        let deadline = || Instant::now() + Duration::from_secs(1);
+
+        // The leader changed the spec since the read: nothing changes.
+        let narrow = spec(&["a"]);
+        assert_eq!(
+            refresh(&mut client, schema, &narrow, deadline())
+                .await
+                .expect("refresh"),
+            Refreshed::NotARefresh
+        );
+        assert_eq!(versions(&client, schema).await, aged);
+
+        // Still the spec read, still out of date: re-created with it.
+        assert_eq!(
+            refresh(&mut client, schema, &wide, deadline())
+                .await
+                .expect("refresh"),
+            Refreshed::Done
+        );
+        assert_eq!(
+            installed(&client, schema, "public.orders")
+                .await
+                .expect("read"),
+            complete(wide.clone())
+        );
+
+        // Current again (the leader refreshed it first): nothing changes.
+        let current = versions(&client, schema).await;
+        assert_eq!(
+            refresh(&mut client, schema, &wide, deadline())
+                .await
+                .expect("refresh"),
+            Refreshed::NotARefresh
+        );
+        assert_eq!(versions(&client, schema).await, current);
     }
 }
