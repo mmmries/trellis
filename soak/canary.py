@@ -92,6 +92,11 @@ class Cleared(Exception):
     """`clear` ran while this daemon held: it exits non-zero, so systemd restarts it."""
 
 
+# A first write after idle fails the canary only when it is over chaos.GATE_AFTER_IDLE_RATIO and
+# slower than this: one sample against the canary's fast steady p50 is noisy (user, 2026-11-27).
+AFTER_IDLE_FLOOR_S = 0.5
+
+
 def now_iso(t=None):
     return datetime.datetime.fromtimestamp(time.time() if t is None else t, datetime.timezone.utc).isoformat(
         timespec="seconds"
@@ -505,7 +510,9 @@ def run_round(c, h, n, schedule):
         mon.join()
         if yielded:
             return [], []
-        _, breaches = chaos.record_metrics(h, start_at, segments, totals["segments"], round_dir, offsets)
+        _, breaches = chaos.record_metrics(
+            h, start_at, segments, totals["segments"], round_dir, offsets, after_idle_floor_s=AFTER_IDLE_FLOOR_S
+        )
         try:
             with open(os.path.join(round_dir, "metrics.json")) as f:
                 lines = chaos.metrics_lines(json.load(f))[0]
