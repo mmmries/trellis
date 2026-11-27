@@ -329,6 +329,17 @@ class Gates(unittest.TestCase):
         m["after_idle"][1]["latency"] = 0.5  # the bound itself holds
         self.assertEqual(chaos.check_gates(m), [])
 
+    def test_first_write_floor(self):
+        # The canary's case: 2.34x a fast steady p50, but only 0.36 s, is under a 0.5 s floor.
+        m = self.metrics(steady_latency_p50=0.154)
+        m["after_idle"][1].update(latency=0.359, ratio=2.3)
+        (msg,) = chaos.check_gates(m)  # no floor: a breach, as for chaos runs
+        self.assertIn("2.33x", msg)
+        self.assertEqual(chaos.check_gates(m, after_idle_floor_s=0.5), [])
+        m["after_idle"][1]["latency"] = 0.51  # over both the ratio and the floor
+        (msg,) = chaos.check_gates(m, after_idle_floor_s=0.5)
+        self.assertIn("first write after idle (segment 3)", msg)
+
     def test_first_write_never_arrived(self):
         m = self.metrics()
         m["after_idle"][0].update(latency=None, ratio=None, error="timeout")

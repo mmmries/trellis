@@ -731,10 +731,12 @@ GATE_XMIN_HOLD_SECS = 2.0  # settled backend_xmin hold of Trellis's sessions
 HOLDS_XMIN_STEPS = ("long-txn", "pg-dump")
 
 
-def check_gates(m):
+def check_gates(m, after_idle_floor_s=0.0):
     """Breaches of the profile thresholds in a metrics dict, as messages naming the metric and
-    segment. Empty for a run with no idle segment: those aren't profile runs. WARN and ERROR lines in an
-    idle segment that had a fault injected aren't gated."""
+    segment. A first write after idle breaches only when it is over the ratio and slower than
+    `after_idle_floor_s` (0 for chaos runs; the canary passes a floor, since one sample against a
+    fast steady p50 is noisy). Empty for a run with no idle segment: those aren't profile runs.
+    WARN and ERROR lines in an idle segment that had a fault injected aren't gated."""
     segs = m["segments"]
     if not any(s["profile"] == "idle" for s in segs):
         return []
@@ -742,7 +744,7 @@ def check_gates(m):
     p50 = m["steady_latency_p50"]
     for a in m["after_idle"]:
         ratio = a["latency"] / p50 if a["latency"] is not None and p50 else None  # unrounded, unlike a["ratio"]
-        if ratio is not None and ratio > GATE_AFTER_IDLE_RATIO:
+        if ratio is not None and ratio > GATE_AFTER_IDLE_RATIO and a["latency"] > after_idle_floor_s:
             out.append(
                 f"first write after idle (segment {a['segment']}) took {ratio:.2f}x steady p50,"
                 f" over {GATE_AFTER_IDLE_RATIO}x"
@@ -772,7 +774,7 @@ def check_gates(m):
     return out
 
 
-def record_metrics(h, start, segments, loadgen_segments, out_dir=None, log_offsets=None):
+def record_metrics(h, start, segments, loadgen_segments, out_dir=None, log_offsets=None, after_idle_floor_s=0.0):
     """Write metrics.json (in `out_dir`, default the run's) and log the summary. Returns (the
     logbook's short form, gate breaches). Worker logs are read from `log_offsets` ({name: byte
     offset}) on. A failure to compute them is logged and doesn't fail the run."""
@@ -792,7 +794,7 @@ def record_metrics(h, start, segments, loadgen_segments, out_dir=None, log_offse
         lines, short = metrics_lines(m)
         for line in lines:
             h.event(f"metric: {line}")
-        return short, check_gates(m)
+        return short, check_gates(m, after_idle_floor_s)
     except Exception as exc:
         h.event(f"metrics not recorded: {type(exc).__name__}: {exc}")
         return "metrics not recorded", []
