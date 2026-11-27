@@ -356,28 +356,6 @@ pub(super) fn is_undefined_table(err: &tokio_postgres::Error) -> bool {
     err.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)
 }
 
-/// Whether `source_table` no longer exists, checked directly via
-/// `to_regclass` — the live-truth signal [`super::apply::compute`] uses
-/// alongside [`is_undefined_table`]. `pg_catalog.to_regclass` returns `NULL`
-/// for a name that resolves to nothing rather than raising `42P01`, which is
-/// exactly what makes `ddl::source_primary_key`'s own query come back with
-/// zero rows (and thus `DdlError::NoPrimaryKey`) for a dropped table — the
-/// same shape a real table that genuinely lacks a primary key produces. This
-/// is what tells the two apart before either is trusted.
-pub(super) async fn source_table_missing(
-    pool: &Pool,
-    source_table: &str,
-) -> Result<bool, ApplyError> {
-    let client = pool.get().await?;
-    let row = client
-        .query_one(
-            "select pg_catalog.to_regclass($1) is null",
-            &[&ddl::regclass_arg(source_table)],
-        )
-        .await?;
-    Ok(row.get(0))
-}
-
 // ---------------------------------------------------------------------
 // The poison marker
 // ---------------------------------------------------------------------
