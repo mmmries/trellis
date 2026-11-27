@@ -11,7 +11,7 @@ in any number of processes) share one catalog, one staging ring and one claim
 model. Two releases of Trellis may read the catalog differently, generate
 different capture functions, or build and drain a definition differently, and
 nothing in the claim model keeps them apart: claims are per segment bucket, not
-per definition, and one staging leader generates every capture function. A
+per definition, and one staging leader generates the capture functions. A
 deploy that starts the new release beside the old one, which is what
 [Rolling deploys](../embedding.md#rolling-deploys) describes, would run two
 engines over one instance.
@@ -76,9 +76,11 @@ stage, drain or change state side by side.
    explicit `migrate` still works, before or instead of that (`trellis run`
    migrates before it starts its pipeline, a deploy step, a release task): it
    is idempotent, and leaves a background process of its version nothing to
-   run. A
-   define-only handle runs no background process, so nothing migrates for it
-   but its own `migrate`.
+   run. An explicit `migrate` that takes over also re-creates the capture
+   functions that are out of date but of the same or a narrower spec, when its
+   role can; it installs, widens and drops none, which stay the staging
+   leader's. A define-only handle runs no background process, so nothing
+   migrates for it but its own `migrate`.
 4. **Standby.** While another version is live, or this binary's migrations are
    pending and it can't run them, a background process stages nothing, drains
    nothing, dispatches no builds and runs no `self_check` job. A leader
@@ -156,7 +158,7 @@ deploy step has to.
 * **Each version drains what it knows.** A release's behaviour toward
   definitions it can't parse is fixed (it pauses them at attach), claims are
   per segment bucket rather than per definition, one staging leader generates
-  every capture function, and definitions both versions know would be written
+  the capture functions, and definitions both versions know would be written
   by two engines. It needs an epic-sized change to the claim and progress
   model, for a benefit only long-lived mixed fleets see.
 

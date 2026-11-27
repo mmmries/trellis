@@ -197,6 +197,7 @@ async fn a_call_stuck_on_a_lock_ends_at_its_deadline_and_the_server_drops_it() {
     let token = f.trellis.watermark_token().await.expect("a token");
     let holder = f.hold(None, "access exclusive").await;
     stuck!(f, "migrate", t => t.migrate());
+    stuck!(f, "migrate_with_report", t => t.migrate_with_report());
     stuck!(f, "apply (define)", t => t.apply("TRANSFORM other FROM public.widgets SELECT price AS p"));
     stuck!(f, "apply (pause)", t => t.apply("PAUSE TRANSFORM widget_totals"));
     stuck!(f, "apply (resume)", t => t.apply("RESUME TRANSFORM widget_totals"));
@@ -384,6 +385,7 @@ async fn a_shorter_session_timeout_is_kept() {
 fn every_public_method_is_tested_or_exempt() {
     const TESTED: &[&str] = &[
         "migrate",
+        "migrate_with_report",
         "apply",
         "definitions",
         "status",

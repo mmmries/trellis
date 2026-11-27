@@ -1441,15 +1441,15 @@ version.
 
 ### T0255 CaptureRefreshRefused
 
-The staging worker's role can't re-create a source's capture functions that
-an older release created (they capture every column their readers need, but
-their source or settings are out of date): it doesn't own the source. Nothing
+A source's capture functions are out of date (an older release created them;
+they capture every column their readers need, but their source or settings
+differ), and the role can't re-create them: it doesn't own the source. Nothing
 waits on it: every definition on the source runs on the functions as they
-are, new ones included. It is a
+are, new ones included. The staging worker reports it as a
 [`maintenance_refusals`](status-reference.md#maintenance_refusals) entry,
-logged once a minute, and clears once the functions are current. Run the
-staging worker once as the role that owns the sources
-([upgrading](upgrading.md#upgrading)).
+logged once a minute, until the functions are current; `migrate` reports it
+as a line of its output and succeeds. Run `trellis migrate` as the role that
+owns the sources ([upgrading](upgrading.md#upgrading)).
 
 ## Retried by Trellis
 

@@ -110,7 +110,15 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
 /// Applies migrations, then runs `grammar` through the one facade entrypoint
 /// and describes what came back.
 async fn apply(trellis: &Trellis, grammar: &str) -> Result<String, String> {
-    trellis.migrate().await.map_err(|err| err.to_string())?;
+    let migrated = trellis
+        .migrate_with_report()
+        .await
+        .map_err(|err| err.to_string())?;
+    // Out-of-date capture `migrate` couldn't refresh: the operator's to fix,
+    // and no reason to refuse the statement.
+    for (_, message) in &migrated.stale_capture {
+        eprintln!("{}", super::migrate::stale_line(message));
+    }
 
     let applied = trellis
         .apply(grammar)

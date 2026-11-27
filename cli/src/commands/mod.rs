@@ -6,6 +6,7 @@
 
 pub mod apply;
 pub mod dump;
+pub mod migrate;
 pub mod release;
 pub mod restore;
 pub mod run;

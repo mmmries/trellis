@@ -119,9 +119,10 @@ alter default privileges for role applier in schema trellis
 
 Installing and removing capture needs ownership of the source table, so the
 role that owns the sources must run the worker, or the capture is already in
-place. So does re-creating the capture functions after an upgrade
-([upgrading](upgrading.md#upgrading)); a worker refused it reports
-[T0255](errors.md#t0255-capturerefreshrefused) and holds nothing up. A missing grant shows as above: a refused ring step is a
+place. So does re-creating the capture functions after an upgrade: run
+`trellis migrate` as the source owner ([upgrading](upgrading.md#upgrading)).
+A worker refused it reports [T0255](errors.md#t0255-capturerefreshrefused) and
+holds nothing up. A missing grant shows as above: a refused ring step is a
 `maintenance_refusals` entry, and a refused build start pauses its definition
 with kind `halt`; grant it, and `RESUME` the paused definition. A role that
 holds every privilege here but can't alter Trellis's tables stands by when

@@ -380,10 +380,18 @@ impl Trellis {
     }
 
     /// Applies Trellis's schema migrations. Idempotent — safe to call on
-    /// every startup.
+    /// every startup. Then re-creates any out-of-date capture functions it
+    /// can, as [`Trellis::migrate_with_report`] does.
     pub async fn migrate(&self) -> Result<(), TrellisError> {
+        self.migrate_with_report().await.map(drop)
+    }
+
+    /// [`Trellis::migrate`], returning what it left for the operator: the
+    /// source tables whose capture functions are still out of date
+    /// ([`crate::Migrated`]).
+    pub async fn migrate_with_report(&self) -> Result<crate::Migrated, TrellisError> {
         self.call(async {
-            crate::migrate::migrate_with_pool(&self.pool, &self.config)
+            crate::migrate::migrate_with_report(&self.pool, &self.config)
                 .await
                 .map_err(|err| match err {
                     crate::error::Error::OtherVersionLive(seen) => {

@@ -181,9 +181,10 @@ pub(crate) enum SharedCondition {
     /// A key column the table's recorded key renders raw can hold `NULL`
     /// now (#2147, #2217).
     RawKeyNowNullable,
-    /// The staging worker's role was refused re-creating a table's capture
-    /// functions that are out of date but capture what their readers need:
-    /// reported in `maintenance_refusals`, and nothing waits on it (#2291).
+    /// The role can't re-create a table's capture functions that are out of
+    /// date but capture what their readers need: the staging worker reports
+    /// it in `maintenance_refusals`, `migrate` in its output, and nothing
+    /// waits on it (#2291).
     CaptureRefreshRefused,
 }
 

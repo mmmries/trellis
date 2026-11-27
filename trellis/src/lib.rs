@@ -240,7 +240,7 @@ pub use error::Error;
 pub use error_code::{ErrorCode, ErrorId};
 pub use handover::{MigrationsPending, OtherProcess, OtherVersionLive};
 pub use metrics::Metrics;
-pub use migrate::migrate;
+pub use migrate::{Migrated, migrate};
 #[cfg(feature = "otlp")]
 pub use otel::OtelError;
 pub use staging::quarantine::HeldKeyRetry;
