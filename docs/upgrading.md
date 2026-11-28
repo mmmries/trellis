@@ -45,6 +45,16 @@ starts its pipeline once a role that can has run `migrate`. A process that
 can't migrate logs why, `status()` carries it in
 `migrations_pending.cannot_run`, and the process tries again every minute.
 
+`migrate`, and the first capture pass under the new release, re-create any
+capture function the release generates differently. That needs the role that
+owns the sources. With one role for everything, it happens on its own. If your
+workers run as a role that doesn't own the sources
+([grants](operations.md#grants-for-a-worker-role)), run `trellis migrate` (or
+your deploy's `migrate` step) as the source owner as an upgrade step. Until a
+role that can has run it, every definition, new ones included, runs on the
+older release's functions, and `migrate`'s output and the staging worker's log
+show [T0255](errors.md#t0255-capturerefreshrefused).
+
 A state-changing call an old-release process is in the middle of when the new
 release takes over, or when `migrate` raises the [catalog
 floor](#the-catalog-floor), refuses at its next write with the

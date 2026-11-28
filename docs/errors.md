@@ -1439,6 +1439,18 @@ A schema dump still names this instance's capture functions after the
 filter, so it wouldn't load. Report it as a bug, with the dump's Postgres
 version.
 
+### T0255 CaptureRefreshRefused
+
+A source's capture functions are out of date (an older release created them;
+they capture every column their readers need, but their source or settings
+differ), and the role can't re-create them: it doesn't own the source. Nothing
+waits on it: every definition on the source runs on the functions as they
+are, new ones included. The staging worker reports it as a
+[`maintenance_refusals`](status-reference.md#maintenance_refusals) entry,
+logged once a minute, until the functions are current; `migrate` reports it
+as a line of its output and succeeds. Run `trellis migrate` as the role that
+owns the sources ([upgrading](upgrading.md#upgrading)).
+
 ## Retried by Trellis
 
 A worker lost a race or a claim, or waits on another. Nothing applied twice

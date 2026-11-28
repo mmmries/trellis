@@ -64,6 +64,7 @@ use crate::staging::{SelfCheckJob, SelfCheckMode};
 /// background thread's loop.
 enum Job {
     Migrate(oneshot::Sender<Result<(), TrellisError>>),
+    MigrateWithReport(oneshot::Sender<Result<crate::Migrated, TrellisError>>),
     Apply(String, oneshot::Sender<Result<Applied, TrellisError>>),
     Definitions(oneshot::Sender<Result<Vec<DefinitionSummary>, TrellisError>>),
     DumpDefinitionsSql(oneshot::Sender<Result<String, TrellisError>>),
@@ -242,6 +243,18 @@ impl BlockingTrellis {
     /// Submits [`BlockingTrellis::migrate`] and returns without waiting for it.
     pub fn start_migrate(&self) -> PendingCall<()> {
         self.start(Job::Migrate)
+    }
+
+    /// [`BlockingTrellis::migrate`], returning what it left for the operator.
+    /// See [`Trellis::migrate_with_report`].
+    pub fn migrate_with_report(&self) -> Result<crate::Migrated, TrellisError> {
+        self.start_migrate_with_report().wait()
+    }
+
+    /// Submits [`BlockingTrellis::migrate_with_report`] and returns without
+    /// waiting for it.
+    pub fn start_migrate_with_report(&self) -> PendingCall<crate::Migrated> {
+        self.start(Job::MigrateWithReport)
     }
 
     /// A handle onto this process's in-process metrics registry. See
@@ -737,6 +750,11 @@ async fn run(
             Job::Migrate(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
                 Box::pin(async move { t.submitted(at, t.migrate()).await })
             }),
+            Job::MigrateWithReport(reply) => {
+                calls.spawn(trellis, submitted, reply, move |t, at| {
+                    Box::pin(async move { t.submitted(at, t.migrate_with_report()).await })
+                })
+            }
             Job::Apply(text, reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
                 Box::pin(async move { t.submitted(at, t.apply(&text)).await })
             }),

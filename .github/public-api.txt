@@ -51,6 +51,7 @@ function BlockingTrellis::has_live_staging_worker
 function BlockingTrellis::max_call_pool_size
 function BlockingTrellis::metrics
 function BlockingTrellis::migrate
+function BlockingTrellis::migrate_with_report
 function BlockingTrellis::poisoned_since
 function BlockingTrellis::quarantine_status
 function BlockingTrellis::quarantined
@@ -69,6 +70,7 @@ function BlockingTrellis::start_dump_definitions_sql
 function BlockingTrellis::start_has_live_drain_workers
 function BlockingTrellis::start_has_live_staging_worker
 function BlockingTrellis::start_migrate
+function BlockingTrellis::start_migrate_with_report
 function BlockingTrellis::start_poisoned_since
 function BlockingTrellis::start_quarantine_status
 function BlockingTrellis::start_quarantined
@@ -146,6 +148,7 @@ function Trellis::has_live_drain_workers
 function Trellis::has_live_staging_worker
 function Trellis::metrics
 function Trellis::migrate
+function Trellis::migrate_with_report
 function Trellis::poisoned_since
 function Trellis::quarantine_status
 function Trellis::quarantined
@@ -185,6 +188,7 @@ struct HeldKeys
 struct HiddenTableSize
 struct JoinStatus
 struct Metrics
+struct Migrated
 struct MigrationsPending
 struct OtherProcess
 struct OtherVersionLive

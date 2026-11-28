@@ -603,7 +603,9 @@ The Elixir and Ruby bindings report it as `below_catalog_floor`.
 
 The ring and maintenance steps the staging worker's role is refused, such as
 retiring a drained segment without `TRUNCATE`: each names the step, the role,
-the table and the privileges it lacks. It pauses nothing and clears itself
+the table and the privileges it lacks. A refused re-create of a source's
+out-of-date capture functions is one entry per source
+([T0255](errors.md#t0255-capturerefreshrefused)). It pauses nothing and clears itself
 once a pass of the step succeeds. Only the process that leads the staging
 worker knows it, so every other handle reports it empty
 ([operations — Other stops and waits](operations.md#other-stops-and-waits)).

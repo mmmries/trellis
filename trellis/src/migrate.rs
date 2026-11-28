@@ -272,9 +272,30 @@ pub async fn migrate(config: &Config) -> Result<(), Error> {
 /// [`migrate`] on `pool`'s connection settings rather than a pool of its own
 /// built from `config`.
 pub async fn migrate_with_pool(pool: &Pool, config: &Config) -> Result<(), Error> {
-    migrate_carrying(pool, config, &Migrations::embedded())
-        .await
-        .map(|_| ())
+    migrate_with_report(pool, config).await.map(drop)
+}
+
+/// What a `migrate` left for the operator to act on
+/// ([`crate::Trellis::migrate_with_report`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Migrated {
+    /// Each source table whose capture functions are out of date and that
+    /// `migrate` couldn't re-create, by name, with the message saying why
+    /// and what to do: `T0255` when its role can't. `migrate` succeeds
+    /// anyway; the table's definitions run on the functions as they are.
+    pub stale_capture: Vec<(String, String)>,
+}
+
+/// [`migrate_with_pool`], returning what it couldn't do. After the
+/// migrations it re-creates every capture function that is out of date but
+/// captures what its readers need, when its role can (ADR-0023): see
+/// [`Migrated::stale_capture`] for what it leaves. Each table left is also
+/// logged at `warn`.
+pub async fn migrate_with_report(pool: &Pool, config: &Config) -> Result<Migrated, Error> {
+    Ok(migrate_carrying(pool, config, &Migrations::embedded())
+        .await?
+        .migrated)
 }
 
 /// [`migrate_with_pool`] as a background process runs it when it takes over
@@ -287,7 +308,20 @@ pub(crate) async fn migrate_reporting(
     pool: &Pool,
     config: &Config,
 ) -> Result<Option<Vec<String>>, Error> {
-    attach_with_lock(pool, config, &Migrations::embedded(), Attach::WhenDue).await
+    Ok(
+        attach_with_lock(pool, config, &Migrations::embedded(), Attach::WhenDue)
+            .await?
+            .map(|attached| attached.ran),
+    )
+}
+
+/// What an attach that took over did.
+#[derive(Debug, Default)]
+struct Attached {
+    /// The migrations it ran, by name, oldest first.
+    ran: Vec<String>,
+    /// What it left for the operator.
+    migrated: Migrated,
 }
 
 /// [`migrate_with_pool`] for a binary carrying `migrations`: a test stands
@@ -296,7 +330,7 @@ async fn migrate_carrying(
     pool: &Pool,
     config: &Config,
     migrations: &Migrations,
-) -> Result<Vec<String>, Error> {
+) -> Result<Attached, Error> {
     attach_with_lock(pool, config, migrations, Attach::Always)
         .await
         .map(Option::unwrap_or_default)
@@ -316,7 +350,7 @@ async fn attach_with_lock(
     config: &Config,
     migrations: &Migrations,
     when: Attach,
-) -> Result<Option<Vec<String>>, Error> {
+) -> Result<Option<Attached>, Error> {
     // One attach at a time per database: the instance-conflict check reads
     // the markers other attaches write. The attach runs on the lock's own
     // session, so the lock can't end before it. See `identity::AttachLock`.
@@ -332,7 +366,7 @@ async fn attach(
     config: &Config,
     migrations: &Migrations,
     when: Attach,
-) -> Result<Option<Vec<String>>, Error> {
+) -> Result<Option<Attached>, Error> {
     identity::prepare_attach(pg_client, config).await?;
 
     // ADR-0024: refuse a catalog this binary can't read before anything
@@ -375,7 +409,7 @@ async fn attach_under_handover(
     config: &Config,
     migrations: &Migrations,
     when: Attach,
-) -> Result<Option<Vec<String>>, Error> {
+) -> Result<Option<Attached>, Error> {
     let observed = handover::observe(&*pg_client, config.schema(), true).await?;
     let other_version =
         match handover::decide(config.binary_version(), &observed, handover::Asker::Migrate) {
@@ -435,7 +469,47 @@ async fn attach_under_handover(
     // defined (`crate::dump`): restore them now, with the catalog current.
     crate::dump::restore_queued(pool, config).await?;
 
-    Ok(Some(ran))
+    // ADR-0023: an explicit `migrate` brings out-of-date capture functions
+    // current. A background takeover leaves it to its staging leader's pass.
+    let migrated = if when == Attach::Always {
+        Migrated {
+            stale_capture: refresh_capture(pg_client, pool, config).await,
+        }
+    } else {
+        Migrated::default()
+    };
+    Ok(Some(Attached { ran, migrated }))
+}
+
+/// [`crate::capture::reconcile::refresh_stale`] on the attach's session:
+/// the tables it left out of date. A catalog read that fails is logged and
+/// leaves the refresh to the staging leader: the migrations have run, and
+/// `migrate` doesn't fail for it.
+async fn refresh_capture(
+    pg_client: &mut tokio_postgres::Client,
+    pool: &Pool,
+    config: &Config,
+) -> Vec<(String, String)> {
+    let refreshed = async {
+        let tables = crate::defs::catalog::tables_to_capture(pool).await?;
+        crate::capture::reconcile::refresh_stale(
+            pg_client,
+            config.schema(),
+            &config.floors(),
+            &tables,
+        )
+        .await
+    };
+    match refreshed.await {
+        Ok(left) => left,
+        Err(err) => {
+            crate::instance_log::warn!(
+                "migrate couldn't check the capture functions for an out-of-date one; the \
+                 staging worker re-creates them: {err}"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Whether a schema dump's restore queue is waiting in `config`'s schema

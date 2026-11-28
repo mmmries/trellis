@@ -261,6 +261,7 @@ const ASSIGNED: &[&str] = &[
     "T0252 ValidationError::InListCommonType",
     "T0253 SharedCondition::NullInNotNullKey",
     "T0254 SharedCondition::RawKeyNowNullable",
+    "T0255 SharedCondition::CaptureRefreshRefused",
 ];
 
 /// Every `.rs` file under `src/` but this one, as (path, text): read at test

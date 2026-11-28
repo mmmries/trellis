@@ -8,7 +8,10 @@
 //! ([`LogLimiter`]), and reports it on every `status()` of the handle that
 //! runs the loop ([`RefusedStep`]) until a pass of the step succeeds. A
 //! definition's own refused build start is not here: it halts and pauses
-//! that definition (`staging::halt::halt_failed_start`).
+//! that definition (`staging::halt::halt_failed_start`). A capture pass's
+//! refused refresh of out-of-date capture functions is
+//! ([`REFRESH_CAPTURE_STEP`], one entry per table): its readers start on the
+//! functions as they are (`capture::reconcile`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -19,6 +22,10 @@ use tokio_postgres::GenericClient;
 
 /// How long a refused step waits before it tries again.
 pub(crate) const REFUSED_STEP_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The step of a capture function refresh the worker's role is refused
+/// (T0255), reported once per table.
+pub(crate) const REFRESH_CAPTURE_STEP: &str = "refresh_capture_functions";
 
 /// How often the same refusal is logged at `warn`.
 pub(crate) const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -31,11 +38,14 @@ pub struct RefusedStep {
     pub step: String,
     /// The role the staging worker runs as, when it could be read.
     pub role: Option<String>,
-    /// The table or sequence refused, as Postgres names it.
+    /// The table or sequence refused, as Postgres names it; for
+    /// `refresh_capture_functions`, the source table whose capture
+    /// functions it couldn't re-create.
     pub object: Option<String>,
     /// The privileges the role lacks on `object`, when they could be read.
     pub missing: Vec<String>,
-    /// Postgres's own message.
+    /// Postgres's own message; for `refresh_capture_functions`, the coded
+    /// message (T0255) with its remedy.
     pub error: String,
 }
 
@@ -55,6 +65,13 @@ impl RefusedStep {
 impl fmt::Display for RefusedStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "maintenance step {} was refused", self.step)?;
+        // Its coded message says what was refused and what to do.
+        if self.step == REFRESH_CAPTURE_STEP {
+            if let Some(role) = &self.role {
+                write!(f, " to role {role}")?;
+            }
+            return write!(f, ": {}", self.error);
+        }
         if let Some(role) = &self.role {
             write!(f, " to role {role}")?;
         }
@@ -76,16 +93,32 @@ impl fmt::Display for RefusedStep {
 /// The refusals the loop has met and not yet seen recover, shared with the
 /// [`crate::Client`] that runs it.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RefusedSteps(Arc<Mutex<BTreeMap<String, RefusedStep>>>);
+pub(crate) struct RefusedSteps(Arc<Mutex<BTreeMap<(String, String), RefusedStep>>>);
 
 impl RefusedSteps {
+    /// Records `refused` as its step's one refusal.
     pub(crate) fn set(&self, refused: RefusedStep) {
-        self.lock().insert(refused.step.clone(), refused);
+        self.lock()
+            .insert((refused.step.clone(), String::new()), refused);
     }
 
-    /// Clears `step`'s refusal; whether it had one.
+    /// Replaces `step`'s refusals with `refused`, one per object (all of
+    /// `step`); whether it had any before.
+    pub(crate) fn set_each(&self, step: &str, refused: Vec<RefusedStep>) -> bool {
+        let mut steps = self.lock();
+        let before = steps.len();
+        steps.retain(|(s, _), _| s != step);
+        let had = steps.len() != before;
+        for refused in refused {
+            let object = refused.object.clone().unwrap_or_default();
+            steps.insert((refused.step.clone(), object), refused);
+        }
+        had
+    }
+
+    /// Clears `step`'s refusals; whether it had any.
     pub(crate) fn clear(&self, step: &str) -> bool {
-        self.lock().remove(step).is_some()
+        self.set_each(step, Vec::new())
     }
 
     /// Clears every refusal: this process no longer leads, so it no longer
@@ -98,7 +131,7 @@ impl RefusedSteps {
         self.lock().values().cloned().collect()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, RefusedStep>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), RefusedStep>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -295,5 +328,35 @@ mod tests {
         ));
         shared.clear_all();
         assert!(shared.snapshot().is_empty(), "a standby reports none");
+    }
+
+    #[test]
+    fn a_refused_refresh_is_one_entry_per_table_and_reads_as_its_remedy() {
+        let shared = RefusedSteps::default();
+        let refusal = |table: &str| RefusedStep {
+            step: REFRESH_CAPTURE_STEP.to_string(),
+            role: Some("worker".to_string()),
+            object: Some(table.to_string()),
+            missing: Vec::new(),
+            error: format!("T0255: the capture functions of {table} are out of date; run it"),
+        };
+        shared.set(RefusedStep::from_message(
+            "seal",
+            "permission denied for table a",
+        ));
+        assert!(!shared.set_each(
+            REFRESH_CAPTURE_STEP,
+            vec![refusal("public.u"), refusal("public.v")]
+        ));
+        assert_eq!(shared.snapshot().len(), 3, "{:?}", shared.snapshot());
+        // A later pass reports only what it was refused.
+        assert!(shared.set_each(REFRESH_CAPTURE_STEP, vec![refusal("public.v")]));
+        assert_eq!(shared.snapshot().len(), 2);
+        let text = refusal("public.v").to_string();
+        assert!(text.contains("to role worker: T0255"), "{text}");
+        assert!(!text.contains("grant it"), "{text}");
+        assert!(shared.clear(REFRESH_CAPTURE_STEP));
+        assert!(!shared.clear(REFRESH_CAPTURE_STEP));
+        assert_eq!(shared.snapshot().len(), 1, "the seal refusal stays");
     }
 }

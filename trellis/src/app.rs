@@ -380,10 +380,18 @@ impl Trellis {
     }
 
     /// Applies Trellis's schema migrations. Idempotent — safe to call on
-    /// every startup.
+    /// every startup. Then re-creates any out-of-date capture functions it
+    /// can, as [`Trellis::migrate_with_report`] does.
     pub async fn migrate(&self) -> Result<(), TrellisError> {
+        self.migrate_with_report().await.map(drop)
+    }
+
+    /// [`Trellis::migrate`], returning what it left for the operator: the
+    /// source tables whose capture functions are still out of date
+    /// ([`crate::Migrated`]).
+    pub async fn migrate_with_report(&self) -> Result<crate::Migrated, TrellisError> {
         self.call(async {
-            crate::migrate::migrate_with_pool(&self.pool, &self.config)
+            crate::migrate::migrate_with_report(&self.pool, &self.config)
                 .await
                 .map_err(|err| match err {
                     crate::error::Error::OtherVersionLive(seen) => {
@@ -2645,7 +2653,9 @@ pub struct DefinitionStatus {
     /// The ring and maintenance steps this handle's staging worker is
     /// refused (`42501`), such as retiring a drained segment without
     /// `TRUNCATE`: each names the step, the role, the table and the
-    /// privileges the role lacks. Instance-level, so every definition
+    /// privileges the role lacks, or re-creating a source's out-of-date
+    /// capture functions (T0255, one entry per source, which holds no
+    /// definition back). Instance-level, so every definition
     /// reports the same list. Nothing is paused: no definition's correctness
     /// waits on these steps, but the ring isn't housekept until the
     /// privilege is granted. An entry clears itself once a pass of its step

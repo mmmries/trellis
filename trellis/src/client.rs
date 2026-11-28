@@ -1707,6 +1707,54 @@ impl Leader {
         self.config.refused.set(refused);
     }
 
+    /// Reports the capture function refreshes the latest capture pass was
+    /// refused (T0255), one entry per table, replacing the last pass's: a
+    /// table the pass refreshed, or no longer captures, clears its entry.
+    async fn refused_refreshes(
+        &mut self,
+        c: &tokio_postgres::Client,
+        refreshes: Vec<(String, String)>,
+    ) {
+        use crate::refused_steps::{REFRESH_CAPTURE_STEP, REFUSAL_LOG_INTERVAL, RefusedStep};
+        let role = if refreshes.is_empty() {
+            None
+        } else {
+            c.query_one("select current_user::text", &[])
+                .await
+                .ok()
+                .map(|row| row.get::<_, String>(0))
+        };
+        let now = crate::clock::now();
+        let mut refused = Vec::with_capacity(refreshes.len());
+        for (table, error) in refreshes {
+            if self
+                .limiter
+                .allow(REFRESH_CAPTURE_STEP, &table, now, REFUSAL_LOG_INTERVAL)
+            {
+                crate::instance_log::warn!(
+                    step = REFRESH_CAPTURE_STEP,
+                    role = role.as_deref().unwrap_or("unknown"),
+                    table = %table,
+                    error = %error,
+                    "capture functions refresh refused to the worker's role; their readers \
+                     run on them as they are"
+                );
+            }
+            refused.push(RefusedStep {
+                step: REFRESH_CAPTURE_STEP.to_string(),
+                role: role.clone(),
+                object: Some(table),
+                missing: Vec::new(),
+                error,
+            });
+        }
+        let none = refused.is_empty();
+        if self.config.refused.set_each(REFRESH_CAPTURE_STEP, refused) && none {
+            self.limiter.forget(REFRESH_CAPTURE_STEP);
+            crate::instance_log::info!(step = REFRESH_CAPTURE_STEP, "capture functions refreshed");
+        }
+    }
+
     /// One tick on the leader's session `c`; whether a step failed in a way
     /// that calls for dropping the session.
     async fn tick(&mut self, c: &mut tokio_postgres::Client) -> bool {
@@ -1918,8 +1966,12 @@ impl Leader {
         {
             let reconciled =
                 reconcile_source_tables(c, &self.config.pool, &self.config.schema).await;
-            self.settle(c, "reconcile_source_tables", reconciled, &mut failed)
-                .await;
+            if let Some(refreshes) = self
+                .settle(c, "reconcile_source_tables", reconciled, &mut failed)
+                .await
+            {
+                self.refused_refreshes(c, refreshes).await;
+            }
             self.next_reconcile = crate::clock::now() + self.config.reconcile_interval;
         }
         failed
@@ -2070,6 +2122,7 @@ pub async fn reconcile_pass(
 ) -> Result<(), String> {
     reconcile_source_tables(client, pool, schema)
         .await
+        .map(drop)
         .map_err(|err| err.to_string())
 }
 
@@ -2477,11 +2530,14 @@ impl From<IntakeError> for ReconcileError {
 ///
 /// The pass gives locked tables [`RECONCILE_DDL_BUDGET`] in all, then leaves
 /// them for the next pass, which comes one `reconcile_interval` later.
+///
+/// Returns each table whose capture function refresh the role was refused,
+/// with its message ([`capture::reconcile::PassOutcome::refused_refreshes`]).
 async fn reconcile_source_tables(
     client: &mut tokio_postgres::Client,
     pool: &Pool,
     schema: &str,
-) -> Result<(), ReconcileError> {
+) -> Result<Vec<(String, String)>, ReconcileError> {
     let desired = defs::tables_to_capture(pool).await?;
     // The readers of a table in a schema the role can't use pause, and the
     // pass leaves them out: any lookup of the table by name raises.
@@ -2501,7 +2557,7 @@ async fn reconcile_source_tables(
     // safe to overlap with another leader's, so this only skips work that is
     // no longer ours.
     if client.is_closed() {
-        return Ok(());
+        return Ok(outcome.refused_refreshes);
     }
     release_retyped_keys(pool).await;
     release_upstream_rebuilt_keys(pool).await;
@@ -2520,10 +2576,10 @@ async fn reconcile_source_tables(
     }
     // A ready definition's Re-derive build starts here.
     if client.is_closed() {
-        return Ok(());
+        return Ok(outcome.refused_refreshes);
     }
     staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
-    Ok(())
+    Ok(outcome.refused_refreshes)
 }
 
 /// Opens a standalone `tokio_postgres` connection with `search_path`

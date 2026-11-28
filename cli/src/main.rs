@@ -10,8 +10,8 @@
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is
 //! just the top-level usage/help and the match that dispatches to one.
-//! The commands are `apply`, `run`, `status`, `release`, `dump` and
-//! `restore`.
+//! The commands are `apply`, `migrate`, `run`, `status`, `release`, `dump`
+//! and `restore`.
 
 mod commands;
 mod connection;
@@ -25,6 +25,8 @@ Usage: trellis <COMMAND> [OPTIONS]
 Commands:
   apply <GRAMMAR>     Run one Trellis statement: TRANSFORM, PAUSE, RESUME,
                        DROP or ALTER.
+  migrate             Apply Trellis's migrations and refresh out-of-date
+                       capture functions, then exit.
   run                 Run the live CDC/apply pipeline until interrupted.
   status              Print registered definitions and exit.
   release <TRANSFORM> <SOURCE_TABLE> <KEY>
@@ -99,6 +101,7 @@ fn run(mut args: Vec<String>) -> ExitCode {
     let command = args.remove(0);
     match command.as_str() {
         "apply" => run_apply(args, database_url),
+        "migrate" => run_migrate(args, database_url),
         "run" => run_run(args, database_url),
         "status" => run_status(args, database_url),
         "release" => run_release(args, database_url),
@@ -184,6 +187,40 @@ fn run_run(args: Vec<String>, database_url: Option<String>) -> ExitCode {
     };
 
     match runtime.block_on(commands::run::run(parsed, database_url)) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Dispatches `trellis migrate`: handles `-h`/`--help` itself (so it works
+/// without a database connection), otherwise migrates on a single-use tokio
+/// runtime.
+fn run_migrate(args: Vec<String>, database_url: Option<String>) -> ExitCode {
+    if wants_help(&args) {
+        print!("{}", commands::migrate::USAGE);
+        return ExitCode::SUCCESS;
+    }
+    let parsed = match commands::migrate::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: failed to start async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(commands::migrate::run(parsed, database_url)) {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS
@@ -457,6 +494,18 @@ mod tests {
             );
         }
         assert_eq!(run(vec!["restore".to_string()]), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn migrate_help_and_stray_arguments_need_no_database() {
+        assert_eq!(
+            run(vec!["migrate".to_string(), "--help".to_string()]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(vec!["migrate".to_string(), "bogus".to_string()]),
+            ExitCode::FAILURE
+        );
     }
 
     #[test]

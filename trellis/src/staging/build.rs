@@ -1166,8 +1166,10 @@ pub(crate) async fn bump_version_fences(
 /// ([`field_build_ready`]): `table` is another definition's target, fed by
 /// the target-mutation seam rather than captured; or nothing is installed on
 /// it, so no row lacking a column can exist and the install, from a catalog
-/// read after the edit, images them all; or its installed functions are
-/// current and image every one of `columns`.
+/// read after the edit, images them all; or its installed functions image
+/// every one of `columns`. Functions an older release created count: a
+/// staging worker refused their refresh leaves them as they are
+/// (`capture::reconcile`, T0255), and they image what their comments record.
 async fn capture_images(
     client: &impl GenericClient,
     table: &str,
@@ -1191,9 +1193,7 @@ async fn capture_images(
     Ok(match installed {
         Installed::Absent => true,
         Installed::Partial { .. } => false,
-        Installed::Complete { spec, current } => {
-            current && columns.iter().all(|c| spec.columns().contains(c))
-        }
+        Installed::Complete { spec, .. } => columns.iter().all(|c| spec.columns().contains(c)),
     })
 }
 

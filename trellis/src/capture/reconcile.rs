@@ -100,6 +100,9 @@
 //!
 //! 1. its source is captured and current after this pass, or is another
 //!    definition's target (the target-mutation seam feeds it, not a trigger);
+//!    a source whose functions capture every column its readers need counts
+//!    as captured even when the worker's role is refused their refresh
+//!    ([`PassOutcome::refused_refreshes`]);
 //! 2. so is a `JOIN`'s joined table;
 //! 3. and the joined table (other than the source itself) has no capture gate
 //!    its install or widen recorded ([`super::gate`]) that a pending change
@@ -145,6 +148,13 @@ pub struct PassOutcome {
     /// reason (no primary key, a missing column, a failed statement), with
     /// the error. The pass goes on with the other tables.
     pub failed: Vec<(String, CaptureError)>,
+    /// Each table whose capture functions are out of date but capture what
+    /// its readers need, and which the worker's role can't re-create (as the
+    /// catalog shows, before any lock, or as `42501`), with the message to
+    /// report (T0255). It counts as captured:
+    /// its readers start, and nothing is paused, on the functions as they
+    /// are (#2291).
+    pub refused_refreshes: Vec<(String, String)>,
     /// Each partitioned source whose tree the pass read in full because a
     /// fingerprint changed, none was stored, the process had not yet checked
     /// it, or it was non-compliant (ADR-0017, [`super::partitions`]).
@@ -312,7 +322,52 @@ pub(crate) async fn reconcile_with_floors(
                 continue;
             }
         };
-        match install::reconcile_for(client, schema, floors, &spec, Some(deadline)).await {
+        let installed_now = match install::installed(&*client, schema, table).await {
+            Ok(installed) => installed,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        };
+        // A refresh the role can't do is reported without taking the table
+        // lock it would wait for (#2296); a refusal the catalog doesn't show
+        // is caught as the DDL's `42501` below.
+        let missing = if install::is_refresh(&installed_now, &spec) {
+            install::missing_refresh_privilege(&*client, schema, table).await
+        } else {
+            Ok(None)
+        };
+        let mut reconciled = match missing {
+            Ok(Some(reason)) => {
+                outcome
+                    .refused_refreshes
+                    .push((table.clone(), refresh_refusal(table, &reason)));
+                Ok(Progress::Done(CaptureAction::Unchanged))
+            }
+            Ok(None) => {
+                install::reconcile_for(
+                    client,
+                    schema,
+                    floors,
+                    &installed_now,
+                    &spec,
+                    Some(deadline),
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(err) = &reconciled
+            && refresh_refused(&*client, schema, &spec, err).await
+        {
+            let reason =
+                crate::staging::quarantine::pg_message(err).unwrap_or_else(|| err.to_string());
+            outcome
+                .refused_refreshes
+                .push((table.clone(), refresh_refusal(table, &reason)));
+            reconciled = Ok(Progress::Done(CaptureAction::Unchanged));
+        }
+        match reconciled {
             Ok(Progress::Done(action)) => {
                 if action != CaptureAction::Unchanged {
                     crate::instance_log::info!(table = %table, action = ?action, "capture reconciled");
@@ -486,6 +541,106 @@ pub(crate) async fn reconcile_with_floors(
     let gated = super::gate::held_tables(&*client).await?;
     outcome.ready = ready_definitions(&snapshot, desired, &outcome.captured, &gated, &seam_held);
     Ok(outcome)
+}
+
+/// Whether `err`, from bringing `spec`'s table to `spec`, is the worker's
+/// role refused (`42501`) a refresh of functions that already capture
+/// `spec` ([`install::is_refresh`]). Any other failure, or one the catalog
+/// can't be read back for, stays a failure.
+async fn refresh_refused(
+    client: &impl GenericClient,
+    schema: &str,
+    spec: &super::sql::CaptureSpec,
+    err: &CaptureError,
+) -> bool {
+    crate::staging::quarantine::is_insufficient_privilege(err)
+        && install::installed(client, schema, spec.table())
+            .await
+            .is_ok_and(|installed| install::is_refresh(&installed, spec))
+}
+
+/// How long `migrate`'s refresh waits, in all, for the locks of the tables
+/// it refreshes ([`refresh_stale`]): the staging leader's pass budget.
+const MIGRATE_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `migrate`'s refresh of capture (ADR-0023): re-creates the capture
+/// functions of every table `tables` lists (those some definition reads)
+/// that are out of date but image what their readers need
+/// ([`install::is_refresh`]), with `install::refresh`, which keeps the
+/// columns they image (the leader narrows them). Each table it leaves
+/// out of date is returned with the message to show the operator: one its
+/// role can't refresh (T0255), one whose lock wasn't free within
+/// [`MIGRATE_REFRESH_BUDGET`], or one whose refresh failed. It installs,
+/// widens and drops nothing, and a table that needs any of those is the
+/// staging leader's.
+///
+/// What it costs when nothing is out of date: one catalog read per table.
+pub(crate) async fn refresh_stale(
+    client: &mut Client,
+    schema: &str,
+    floors: &crate::defs::floor::Floors,
+    tables: &[String],
+) -> Result<Vec<(String, String)>, CaptureError> {
+    let mut stale = Vec::new();
+    for table in tables {
+        // A table it can't read (in a schema its role can't use) is the
+        // staging leader's, as one that needs more than a refresh is.
+        if let Ok(installed @ install::Installed::Complete { current: false, .. }) =
+            install::installed(&*client, schema, table).await
+        {
+            stale.push((table, installed));
+        }
+    }
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+    let catalog = load_catalog_for(&*client, floors).await?;
+    let deadline = crate::clock::now() + MIGRATE_REFRESH_BUDGET;
+    let mut left = Vec::new();
+    for (table, installed) in stale {
+        // A table whose spec can't be built is the staging leader's to
+        // report, with the definitions it pauses.
+        let Ok(spec) = capture_spec(&*client, &catalog, table).await else {
+            continue;
+        };
+        if !install::is_refresh(&installed, &spec) {
+            continue;
+        }
+        let install::Installed::Complete { spec: recorded, .. } = &installed else {
+            continue;
+        };
+        let message = match install::refresh(client, schema, recorded, deadline).await {
+            Ok(install::Refreshed::Done) => {
+                crate::instance_log::info!(table = %table, "capture functions refreshed");
+                continue;
+            }
+            Ok(install::Refreshed::NotARefresh) => continue,
+            Ok(install::Refreshed::Refused(reason)) => refresh_refusal(table, &reason),
+            Ok(install::Refreshed::Waiting) => format!(
+                "the capture functions of {table} are out of date, and its lock wasn't free \
+                 to re-create them; the staging worker re-creates them if its role owns the \
+                 sources, or run `trellis migrate` again"
+            ),
+            Err(err) => format!(
+                "the capture functions of {table} are out of date, and re-creating them \
+                 failed: {err}"
+            ),
+        };
+        crate::instance_log::warn!(table = %table, "{message}");
+        left.push((table.clone(), message));
+    }
+    Ok(left)
+}
+
+/// The T0255 message of a refused refresh of `table`'s capture functions,
+/// for `reason`, as Postgres words the refusal. `migrate` reports it too.
+pub(crate) fn refresh_refusal(table: &str, reason: &str) -> String {
+    format!(
+        "{}: the capture functions of {table} are out of date and this role can't re-create \
+         them ({reason}); its definitions run on them as they are. Run `trellis migrate` as \
+         the role that owns the sources",
+        crate::error_code::SharedCondition::CaptureRefreshRefused.error_id()
+    )
 }
 
 /// The checks that pause `table`'s readers before its capture is

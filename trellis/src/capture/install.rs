@@ -14,6 +14,7 @@
 //! | [`install`] | nothing, or a partial install, is there | `SHARE ROW EXCLUSIVE` | the table's capture gate, and a rebuild of each of the table's applying readers ([`park_table_catch_ups`]) |
 //! | [`widen`] | the table must image a column, key or group-key column it doesn't yet, or a function body is stale | `SHARE ROW EXCLUSIVE` | the table's capture gate |
 //! | [`narrow`] | the table images columns no reader needs any more | none | nothing |
+//! | [`refresh`] | `migrate`: the functions are out of date but image what their readers need ([`is_refresh`]) | `SHARE ROW EXCLUSIVE`, or skipped | the table's capture gate |
 //! | [`uninstall`] | nothing reads the table any more | `ACCESS EXCLUSIVE` (`DROP TRIGGER`'s) | nothing |
 //!
 //! [`park_table_catch_ups`]: crate::intake::catch_up::park_table_catch_ups
@@ -170,6 +171,25 @@
 //! definition that read the dropped columns committed, since the next rows
 //! lack them.
 //!
+//! # Refreshing from `migrate` (ADR-0023)
+//!
+//! `migrate` re-creates functions that are out of date but image what their
+//! readers need ([`refresh`]), so a role that owns the sources brings them
+//! current with no staging worker of its own. It installs, widens and drops
+//! nothing. It takes the lock a widen takes, so it never interleaves with
+//! the staging leader's install, widen or uninstall of the table, and under
+//! the lock it reads what is installed again: a table the leader changed
+//! meanwhile is left as it is. It re-creates the functions with the spec
+//! they record, even when the readers need fewer columns now: it changes no
+//! column set, so no reader that started while it ran (one a DML-only
+//! leader started on the old functions, say) loses a column. The leader
+//! narrows them afterwards; it narrows only current functions, and
+//! `migrate` refreshes only out-of-date ones, so neither undoes the other.
+//!
+//! A table it can't lock within its budget, or whose functions its role
+//! can't re-create ([`missing_refresh_privilege`], read before the lock),
+//! is left for the leader or another `migrate`, and reported.
+//!
 //! # Partitioned tables (ADR-0017)
 //!
 //! A statement trigger fires only for the table a statement names, so a
@@ -324,6 +344,167 @@ pub fn plan(installed: &Installed, desired: &CaptureSpec) -> CaptureAction {
             }
         }
     }
+}
+
+/// Whether bringing `installed` to `desired` only refreshes the functions:
+/// they already image every column `desired` needs, with the same key, and
+/// only their source or settings differ from what this build generates (an
+/// older release's functions, say). The spec may narrow. A refresh the
+/// worker's role is refused leaves the table captured as it was, so its
+/// readers start anyway (#2291), and `migrate` performs one ([`refresh`]); a
+/// first install, or a widen that adds capture, still needs the staging
+/// leader and the source owner.
+pub fn is_refresh(installed: &Installed, desired: &CaptureSpec) -> bool {
+    matches!(installed, Installed::Complete { spec, current: false } if narrows(spec, desired))
+}
+
+/// Why the session's role can't re-create `table`'s capture functions in
+/// instance `schema`, read from the catalog without taking a lock: it lacks
+/// `CREATE` on the schema, or the privileges of a function's owner. `None`
+/// when it has both (the DDL can still be refused, by a privilege this
+/// doesn't read).
+pub(crate) async fn missing_refresh_privilege(
+    client: &impl GenericClient,
+    schema: &str,
+    table: &str,
+) -> Result<Option<String>, CaptureError> {
+    let row = client
+        .query_one(
+            "select pg_catalog.has_schema_privilege(n.oid, 'CREATE'), \
+                    (select p.proname::text from pg_catalog.pg_proc p \
+                     where p.pronamespace = n.oid and p.proname = any($2) \
+                       and not pg_catalog.pg_has_role(p.proowner, 'USAGE') \
+                     order by p.proname limit 1) \
+             from pg_catalog.pg_namespace n where n.nspname = $1",
+            &[&schema, &function_names(table)?],
+        )
+        .await?;
+    let create: bool = row.get(0);
+    let foreign: Option<String> = row.get(1);
+    Ok(if !create {
+        Some(format!("permission denied for schema {schema}"))
+    } else {
+        foreign.map(|function| format!("permission denied: must be owner of function {function}"))
+    })
+}
+
+/// What [`refresh`] did to one table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refreshed {
+    /// The functions are current now.
+    Done,
+    /// Under the lock, the functions were no longer out of date with the
+    /// spec read before it: the staging leader changed them. Nothing
+    /// changed.
+    NotARefresh,
+    /// The role can't re-create the functions: the reason, as Postgres
+    /// words it. Nothing changed.
+    Refused(String),
+    /// The table lock wasn't free by the deadline. Nothing changed.
+    Waiting,
+}
+
+/// `migrate`'s refresh of `installed`'s capture functions (see "Refreshing
+/// from `migrate`"): `installed` is the spec they record, read before the
+/// lock, and they are re-created with it, imaging the same columns, so no
+/// reader loses one. `deadline` bounds the retries of a locked table, as
+/// [`DdlRetry::new`]'s does.
+pub(crate) async fn refresh(
+    client: &mut Client,
+    schema: &str,
+    installed: &CaptureSpec,
+    deadline: Instant,
+) -> Result<Refreshed, CaptureError> {
+    if let Some(reason) = missing_refresh_privilege(&*client, schema, installed.table()).await? {
+        return Ok(Refreshed::Refused(reason));
+    }
+    let owner = foreign_ring_owner(&*client, schema).await?;
+    let mut retry = DdlRetry::new(
+        "refresh capture functions",
+        USER_TABLE_DDL_LOCK_TIMEOUT,
+        Some(deadline),
+    );
+    loop {
+        let attempt = refresh_attempt(
+            client,
+            schema,
+            installed,
+            owner.as_deref(),
+            retry.lock_timeout(),
+        );
+        match attempt.await {
+            Err(err) if locks::is_lock_not_available(&err) => {
+                if !retry.again(&err).await {
+                    return Ok(Refreshed::Waiting);
+                }
+            }
+            Err(err) if crate::staging::quarantine::is_insufficient_privilege(&err) => {
+                let reason =
+                    crate::staging::quarantine::pg_message(&err).unwrap_or_else(|| err.to_string());
+                return Ok(Refreshed::Refused(reason));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// One attempt of [`refresh`], in one transaction under the table lock.
+async fn refresh_attempt(
+    client: &mut Client,
+    schema: &str,
+    spec: &CaptureSpec,
+    owner: Option<&str>,
+    lock_timeout: Duration,
+) -> Result<Refreshed, CaptureError> {
+    let txn = client.transaction().await?;
+    locks::set_local_lock_timeout(&txn, lock_timeout).await?;
+    txn.batch_execute(&Op::Widen(spec).lock_statement()?)
+        .await?;
+    let stale = Installed::Complete {
+        spec: spec.clone(),
+        current: false,
+    };
+    if installed(&txn, schema, spec.table()).await? != stale {
+        return Ok(Refreshed::NotARefresh);
+    }
+    // After the lock, as a widen's (see "Widening and the capture gate").
+    let gate: PgLsn = txn
+        .query_one("select pg_catalog.pg_current_wal_insert_lsn()", &[])
+        .await?
+        .get(0);
+    replace_functions(&txn, schema, spec, owner).await?;
+    super::gate::record(&txn, spec.table(), gate).await?;
+    txn.commit().await?;
+    Ok(Refreshed::Done)
+}
+
+/// Replaces an installed table's capture functions with `spec`'s, hands
+/// them to the ring's `owner` when the session's role isn't it, and records
+/// the columns they image and the triggers, as a widen does.
+async fn replace_functions(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    spec: &CaptureSpec,
+    owner: Option<&str>,
+) -> Result<(), CaptureError> {
+    for statement in sql::function_statements(schema, spec)? {
+        txn.batch_execute(&statement).await?;
+    }
+    if let Some(owner) = owner {
+        for statement in sql::owner_statements(schema, spec.table(), owner)? {
+            txn.batch_execute(&statement).await?;
+        }
+    }
+    super::baseline::record(txn, spec.table(), spec.columns()).await?;
+    super::triggers::record(
+        txn,
+        schema,
+        spec.table(),
+        super::triggers::Mode::IfAbsent,
+        super::triggers::Covers::Whole,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Whether `desired` images nothing `installed` doesn't: the same table and
@@ -759,29 +940,30 @@ pub async fn reconcile(
     desired: &CaptureSpec,
     deadline: Option<Instant>,
 ) -> Result<Progress<CaptureAction>, CaptureError> {
+    let installed = installed(&*client, schema, desired.table()).await?;
     reconcile_for(
         client,
         schema,
         &crate::defs::floor::Floors::of_this_binary(),
+        &installed,
         desired,
         deadline,
     )
     .await
 }
 
-/// [`reconcile`] for a binary running as `floors` says: an install's
-/// catch-up reads the definitions it rebuilds (`intake::catch_up`).
+/// [`reconcile`] from `installed`, what the caller just read [`installed`],
+/// for a binary running as `floors` says: an install's catch-up reads the
+/// definitions it rebuilds (`intake::catch_up`).
 pub(crate) async fn reconcile_for(
     client: &mut Client,
     schema: &str,
     floors: &Floors,
+    installed: &Installed,
     desired: &CaptureSpec,
     deadline: Option<Instant>,
 ) -> Result<Progress<CaptureAction>, CaptureError> {
-    let action = plan(
-        &installed(&*client, schema, desired.table()).await?,
-        desired,
-    );
+    let action = plan(installed, desired);
     let progress = match action {
         CaptureAction::Unchanged => Progress::Done(()),
         CaptureAction::Install => install_tree(client, schema, floors, desired, deadline).await?,
@@ -961,23 +1143,7 @@ pub async fn narrow(
 ) -> Result<(), CaptureError> {
     let owner = foreign_ring_owner(&*client, schema).await?;
     let txn = client.transaction().await?;
-    for statement in sql::function_statements(schema, spec)? {
-        txn.batch_execute(&statement).await?;
-    }
-    if let Some(owner) = owner {
-        for statement in sql::owner_statements(schema, spec.table(), &owner)? {
-            txn.batch_execute(&statement).await?;
-        }
-    }
-    super::baseline::record(&txn, spec.table(), spec.columns()).await?;
-    super::triggers::record(
-        &txn,
-        schema,
-        spec.table(),
-        super::triggers::Mode::IfAbsent,
-        super::triggers::Covers::Whole,
-    )
-    .await?;
+    replace_functions(&txn, schema, spec, owner.as_deref()).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -1892,6 +2058,33 @@ mod tests {
         assert_eq!(plan(&stale_wide, &desired), CaptureAction::Widen);
     }
 
+    #[test]
+    fn only_stale_functions_of_the_same_or_a_wider_spec_are_a_refresh() {
+        let desired = spec(&["a"]);
+        let stale = |columns: &[&str]| Installed::Complete {
+            spec: spec(columns),
+            current: false,
+        };
+        assert!(is_refresh(&stale(&["a"]), &desired));
+        // Stale functions imaging more than the readers need: a refresh that
+        // narrows.
+        assert!(is_refresh(&stale(&["a", "b"]), &desired));
+        // Current functions need no refresh at all.
+        assert!(!is_refresh(&complete(desired.clone()), &desired));
+        // A widen that adds a column adds capture: not a refresh.
+        assert!(!is_refresh(&stale(&[]), &desired));
+        assert!(!is_refresh(&stale(&["b"]), &desired));
+        let rekeyed = CaptureSpec::new("public.orders", vec!["a".to_string()], ["a".to_string()])
+            .expect("valid spec");
+        assert!(!is_refresh(&stale(&["a"]), &rekeyed));
+        // Nothing installed, or a partial install, is a first install.
+        assert!(!is_refresh(&Installed::Absent, &desired));
+        let partial = Installed::Partial {
+            faults: vec!["the insert trigger is missing".to_string()],
+        };
+        assert!(!is_refresh(&partial, &desired));
+    }
+
     fn blocker(backend_type: &str, query: &str) -> Blocker {
         Blocker {
             pid: Some(42),
@@ -1970,5 +2163,103 @@ mod tests {
                 .ends_with("; no conflicting lock is held now"),
             "{wait}"
         );
+    }
+
+    /// `migrate`'s refresh re-creates out-of-date functions with the spec
+    /// they record, and only when, under the lock, they still record the
+    /// spec read before it and are still out of date: one the staging
+    /// leader changed meanwhile (a different spec, or current again) is
+    /// [`Refreshed::NotARefresh`], with nothing changed.
+    #[tokio::test]
+    async fn a_refresh_leaves_functions_changed_since_its_read() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        crate::migrate::migrate(&config).await.expect("migrate");
+        let mut client = crate::pool::Pool::new(&config)
+            .expect("pool")
+            .connect_unpooled()
+            .await
+            .expect("connect");
+        client
+            .batch_execute("create table public.orders (id int primary key, a int, b int)")
+            .await
+            .expect("source");
+        let schema = config.schema();
+        let wide = spec(&["a", "b"]);
+        assert_eq!(
+            install(&mut client, schema, &wide, None)
+                .await
+                .expect("install"),
+            Progress::Done(true)
+        );
+        async fn versions(client: &Client, schema: &str) -> Vec<String> {
+            client
+                .query(
+                    "select p.oid::text || ':' || p.xmin::text from pg_catalog.pg_proc p \
+                     where p.pronamespace = $1::text::regnamespace \
+                       and p.proname like 'cap\\_%\\_orders\\_%' order by p.proname",
+                    &[&schema],
+                )
+                .await
+                .expect("versions")
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect()
+        }
+        let age = format!(
+            "do $$ declare f regprocedure; begin \
+               for f in select p.oid::regprocedure from pg_catalog.pg_proc p \
+                 where p.pronamespace = '{schema}'::regnamespace \
+                   and p.proname like 'cap\\_%\\_orders\\_%' \
+               loop execute format('alter function %s reset row_security', f); end loop; end $$"
+        );
+        client.batch_execute(&age).await.expect("age");
+        let stale = Installed::Complete {
+            spec: wide.clone(),
+            current: false,
+        };
+        assert_eq!(
+            installed(&client, schema, "public.orders")
+                .await
+                .expect("read"),
+            stale
+        );
+        let aged = versions(&client, schema).await;
+        let deadline = || Instant::now() + Duration::from_secs(1);
+
+        // The leader changed the spec since the read: nothing changes.
+        let narrow = spec(&["a"]);
+        assert_eq!(
+            refresh(&mut client, schema, &narrow, deadline())
+                .await
+                .expect("refresh"),
+            Refreshed::NotARefresh
+        );
+        assert_eq!(versions(&client, schema).await, aged);
+
+        // Still the spec read, still out of date: re-created with it.
+        assert_eq!(
+            refresh(&mut client, schema, &wide, deadline())
+                .await
+                .expect("refresh"),
+            Refreshed::Done
+        );
+        assert_eq!(
+            installed(&client, schema, "public.orders")
+                .await
+                .expect("read"),
+            complete(wide.clone())
+        );
+
+        // Current again (the leader refreshed it first): nothing changes.
+        let current = versions(&client, schema).await;
+        assert_eq!(
+            refresh(&mut client, schema, &wide, deadline())
+                .await
+                .expect("refresh"),
+            Refreshed::NotARefresh
+        );
+        assert_eq!(versions(&client, schema).await, current);
     }
 }
